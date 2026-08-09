@@ -47,7 +47,8 @@ import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
-import { openingNoticeFor } from "./document-types.js";
+import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
+import { projectDocumentText, parseJsonDocument, jsonKeyOperations } from "./document-json.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
@@ -276,7 +277,25 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // state, so the same proposal sent twice would produce different bytes and a different
       // document_id — and the id is meant to be a function of what was proposed.
       seed.clientID = 1;
-      seed.getText("content").insert(0, startingText);
+      // SEEDED INTO THE ROOT THE TYPE USES. A JSON document seeded into the text root would be
+      // accepted, materialize as `{}`, and read as empty on both sides — the starting content
+      // silently discarded while every surface reported success.
+      if (rootForDocumentType(documentType) === "map") {
+        const seeded = parseJsonDocument(startingText);
+        if (!seeded.ok) {
+          return {
+            ok: false,
+            reason: "document_content_unparseable",
+            guidance:
+              `This is a JSON document and starting_content is not valid JSON (${seeded.detail}). ` +
+              `Nothing was created, so there is nothing to clean up.`,
+          };
+        }
+        const map = seed.getMap("data");
+        for (const [key, value] of Object.entries(seeded.value)) map.set(key, value);
+      } else {
+        seed.getText("content").insert(0, startingText);
+      }
       startingContent = Y.encodeStateAsUpdate(seed);
     }
 
@@ -624,7 +643,10 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // THROWS rather than returning empty when the log cannot be rebuilt — see LiveDocuments.get. An
     // empty document handed to an agent here would be written back over the peer's real content.
     const doc = layer.live.get(who.ownerAgentId, documentId);
-    const content = doc.getText("content").toString();
+    // TYPE-AWARE. A JSON document's content is in the MAP root; reading the text root would answer
+    // `content: ""` for a full document — the exact "an empty document handed to an agent gets
+    // written back over the peer's real content" hazard this path warns about above.
+    const content = projectDocumentText(doc, document.documentType);
     // THE READ IS THE BOOKMARK. `cello_doc_diff` answers "what changed since I looked", and looking
     // is this call. Marking on an arriving update instead would erase the very change the diff
     // exists to show, silently, at the moment it arrived.
@@ -658,7 +680,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
 
-    const after = layer.live.get(who.ownerAgentId, documentId).getText("content").toString();
+    const after = projectDocumentText(layer.live.get(who.ownerAgentId, documentId), document.documentType);
     const before = layer.notifications.lastSeen(who.ownerAgentId, documentId);
     if (before === null) {
       // NEVER READ is not "nothing changed", and it is not an empty before either. Diffing against
@@ -740,7 +762,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const doc = layer.live.get(who.ownerAgentId, documentId);
     const text = doc.getText("content");
-    const before = text.toString();
+    const before = projectDocumentText(doc, document.documentType);
+    const isMapRoot = rootForDocumentType(document.documentType) === "map";
+
+    // PARSED BEFORE ANYTHING IS TOUCHED. A structured document must not partially apply a write
+    // that does not parse — the operator would be left with half their edit in a signed envelope
+    // and no way to tell which half.
+    const parsedWrite = isMapRoot ? parseJsonDocument(content) : null;
+    if (parsedWrite !== null && !parsedWrite.ok) {
+      return {
+        ok: false,
+        reason: "document_content_unparseable",
+        guidance:
+          `This is a JSON document and what you sent is not valid JSON (${parsedWrite.detail}). ` +
+          `Nothing was changed. Send the COMPLETE document, not a fragment — cello_doc_read gives ` +
+          `you the current text to edit.`,
+      };
+    }
     if (before === content) {
       // NO TEXT CHANGE IS NOT ALWAYS NOTHING TO DO, and this returned here unconditionally — which
       // made an applied-but-unpublished edit UNRECOVERABLE.
@@ -764,7 +802,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       if (unpublishedEdits.has(unpublishedKey(who.ownerAgentId, documentId))) {
         // Screened here too. A flush publishes text that was folded in on an EARLIER call, so
         // skipping it would be a way for content to reach the peer without ever passing the check.
-        const stuckFault = screenText(doc.getText("content").toString());
+        const stuckFault = screenText(projectDocumentText(doc, document.documentType));
         if (stuckFault) {
           return {
             ok: false,
@@ -944,16 +982,34 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
 
-    const hunks = lineHunks(before, content);
-    // ONE TRANSACTION, so the whole edit is a single Yjs update rather than several — a peer
-    // applying them separately would pass through states no operator ever wrote.
-    doc.transact(() => {
-      // Back to front, so earlier offsets stay valid as later ones are rewritten.
-      for (const hunk of [...hunks].reverse()) {
-        if (hunk.to > hunk.from) text.delete(hunk.from, hunk.to - hunk.from);
-        if (hunk.insert.length > 0) text.insert(hunk.from, hunk.insert);
-      }
-    });
+    // ONE TRANSACTION either way, so the whole edit is a single Yjs update rather than several — a
+    // peer applying them separately would pass through states no operator ever wrote.
+    if (parsedWrite !== null && parsedWrite.ok) {
+      // PER KEY, which is the whole reason a JSON document uses the map root. Two agents editing
+      // different fields produce disjoint key sets and both survive; line-merging the serialized
+      // form would have them rewriting the same lines and interleaving into invalid JSON.
+      //
+      // Untouched keys are not rewritten at all — see `jsonKeyOperations`. Writing a key back with
+      // an identical value is still a CRDT operation and would clobber a peer's concurrent edit to
+      // a field this agent never looked at.
+      const map = doc.getMap("data");
+      const ops = jsonKeyOperations(map, parsedWrite.value);
+      doc.transact(() => {
+        for (const [key, value] of ops) {
+          if (value === undefined) map.delete(key);
+          else map.set(key, value);
+        }
+      });
+    } else {
+      const hunks = lineHunks(before, content);
+      doc.transact(() => {
+        // Back to front, so earlier offsets stay valid as later ones are rewritten.
+        for (const hunk of [...hunks].reverse()) {
+          if (hunk.to > hunk.from) text.delete(hunk.from, hunk.to - hunk.from);
+          if (hunk.insert.length > 0) text.insert(hunk.from, hunk.insert);
+        }
+      });
+    }
 
     const result = await publish.publish(who.ownerAgentId, documentId, doc, deps.now());
     if (!result.ok) {
@@ -1163,7 +1219,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           return { ok: true, documentId, changed: false, published: false, reason: flushed.reason, guidance: flushed.detail };
         }
         unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
-        layer.notifications.markWritten(who.ownerAgentId, documentId, doc.getText("content").toString());
+        layer.notifications.markWritten(who.ownerAgentId, documentId, projectDocumentText(doc, document.documentType));
         return { ok: true, documentId, changed: true, published: true, envelopeHash: flushed.envelopeHash };
       }
       // A publish is an INTENT. Nothing changed on disk, so there is nothing to say, and saying it
@@ -1181,7 +1237,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // already in the local document when this refuses. The flag is deliberately NOT set: flushing
     // later would publish the offending bytes unscreened. Correcting the file is what removes it,
     // and the guidance says so.
-    const publishScreenFault = screenText(doc.getText("content").toString());
+    const publishScreenFault = screenText(projectDocumentText(doc, document.documentType));
     if (publishScreenFault) {
       return {
         ok: false,
@@ -1209,7 +1265,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       unpublishedEdits.add(unpublishedKey(who.ownerAgentId, documentId));
       return { ok: true, documentId, changed: true, published: false, reason: result.reason, guidance: result.detail };
     }
-    layer.notifications.markWritten(who.ownerAgentId, documentId, doc.getText("content").toString());
+    layer.notifications.markWritten(who.ownerAgentId, documentId, projectDocumentText(doc, document.documentType));
     return { ok: true, documentId, changed: true, published: true, envelopeHash: result.envelopeHash };
   });
 

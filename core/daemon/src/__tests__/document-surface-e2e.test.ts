@@ -236,6 +236,89 @@ describe("two parties converge through the operator surface", () => {
     });
   });
 
+  it("DOD-DOC-TYPES-1: a JSON document converges, and two agents editing DIFFERENT KEYS both survive", async () => {
+    // The use case JSON exists for: two agents working a shared structured goal, each owning
+    // different fields. On a text root their concurrent edits are overlapping rewrites of the same
+    // lines and the CRDT interleaves them into broken JSON. On the map root they are edits to
+    // different keys, and both hold.
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const proposed = await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      document_type: "json",
+      starting_content: JSON.stringify({ status: "open" }),
+    });
+    expect(proposed, "json is still refused at the door").toMatchObject({ ok: true, proposalSent: true });
+    const documentId = proposed.documentId as string;
+
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    expect(await b.call("cello_doc_accept", { document_id: documentId })).toMatchObject({ ok: true });
+
+    // Both READ it as canonical JSON — the same bytes on both sides, which is what makes a paste of
+    // it something the other party can confirm.
+    const readA = await a.call("cello_doc_read", { document_id: documentId });
+    const readB = await b.call("cello_doc_read", { document_id: documentId });
+    expect(readA.content).toBe(readB.content);
+    expect(JSON.parse(readA.content as string)).toEqual({ status: "open" });
+
+    // Alice sets `owner`. Bob CONCURRENTLY sets `due` — neither has seen the other's write.
+    expect(
+      await a.call("cello_doc_write", {
+        document_id: documentId,
+        content: JSON.stringify({ status: "open", owner: "alice" }, null, 2) + "\n",
+      }),
+    ).toMatchObject({ ok: true, published: true });
+    expect(
+      await b.call("cello_doc_write", {
+        document_id: documentId,
+        content: JSON.stringify({ status: "open", due: "friday" }, null, 2) + "\n",
+      }),
+    ).toMatchObject({ ok: true, published: true });
+
+    await a.sweep();
+    await b.sweep();
+
+    // BOTH keys survive on BOTH sides. A line merge would have lost one or produced invalid JSON.
+    const expected = { status: "open", owner: "alice", due: "friday" };
+    await vi.waitFor(async () => {
+      const fromA = await a.call("cello_doc_read", { document_id: documentId });
+      const fromB = await b.call("cello_doc_read", { document_id: documentId });
+      expect(JSON.parse(fromA.content as string)).toEqual(expected);
+      expect(JSON.parse(fromB.content as string)).toEqual(expected);
+      // And BYTE-identical, not merely equal as objects — the two arrived at these keys in opposite
+      // orders, so this is the determinism the file diff and paste-and-agree both depend on.
+      expect(fromA.content).toBe(fromB.content);
+    });
+  });
+
+  it("DOD-DOC-TYPES-1: a write that is not valid JSON is refused, and changes nothing", async () => {
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+    const documentId = (
+      await a.call("cello_doc_propose", {
+        peer_pubkey: b.owner,
+        document_type: "json",
+        starting_content: JSON.stringify({ a: 1 }),
+      })
+    ).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    const bad = await a.call("cello_doc_write", { document_id: documentId, content: '{ "a": 1' });
+    expect(bad.ok, "a truncated write was accepted into a structured document").toBe(false);
+    expect(bad.reason).toBe("document_content_unparseable");
+    // Unchanged — a half-parsed write must not partially apply.
+    expect(JSON.parse((await a.call("cello_doc_read", { document_id: documentId })).content as string))
+      .toEqual({ a: 1 });
+  });
+
   it("a REFUSED proposal converges nothing, and Alice's writes go nowhere", async () => {
     const a = await makeParty("alice");
     const b = await makeParty("bob");

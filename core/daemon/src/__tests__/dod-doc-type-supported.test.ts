@@ -46,10 +46,16 @@ describe("the supported document types are exactly what every verb can serve", (
     }
   });
 
-  it("REFUSES json — the write path handles it but read, write and diff do not", () => {
-    // The specific trap: `DocumentWritePath` has real JSON support, so a reader of that file alone
-    // would conclude the feature works. It is the three content verbs that do not.
-    expect(isSupportedDocumentType("json")).toBe(false);
+  it("ADMITS json now that the three content verbs serve it (DOD-DOC-TYPES-1)", () => {
+    // This asserted `false`, and the reason was right at the time: the write path had real JSON
+    // support while read/write/diff read the TEXT root, so a JSON document read as empty and that
+    // emptiness would be written back over the peer's content. Half-support reads as done in every
+    // review and loses content in silence, so it was refused rather than finished.
+    //
+    // It has now been finished, not merely re-enabled: the three verbs project through the document's
+    // ROOT, the fold is per-key, and the rendering is deterministic. The condition that justified the
+    // refusal is gone, so the refusal goes with it.
+    expect(isSupportedDocumentType("json")).toBe(true);
   });
 
   it("refuses anything else rather than creating a document with no file", () => {
@@ -60,6 +66,6 @@ describe("the supported document types are exactly what every verb can serve", (
 
   it("the exported set is what the refusal message can name, so guidance cannot drift from behaviour", () => {
     // A hardcoded list in a guidance string is how the message and the check stop agreeing.
-    expect([...SUPPORTED_DOCUMENT_TYPES].sort()).toEqual(["html", "markdown", "plaintext", "text"]);
+    expect([...SUPPORTED_DOCUMENT_TYPES].sort()).toEqual(["html", "json", "markdown", "plaintext", "text"]);
   });
 });

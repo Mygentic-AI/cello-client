@@ -32,10 +32,11 @@ export interface DocumentTypeRow {
   /**
    * Whether `propose`/`accept` may admit it.
    *
-   * `json` is present and NOT admitted: the write path serves it (map root) while read/write/diff
-   * assume the text root, so it reads as empty, writes into a root nothing projects, and diffs as
-   * unchanged forever. A type only some verbs can serve is worse than an absent one — it reads as
-   * done and loses content in silence. The flag flips when the map path lands.
+   * Every type here is admitted today. The flag exists because `json` was NOT, for a real reason
+   * worth keeping: the write path served it (map root) while read/write/diff assumed the text root,
+   * so it read as empty, wrote into a root nothing projects, and diffed as unchanged forever. A type
+   * only some verbs can serve is worse than an absent one — it reads as done and loses content in
+   * silence. The flag is how the next half-built type gets refused instead of shipped.
    */
   readonly admitted: boolean;
   /**
@@ -64,7 +65,7 @@ export const DOCUMENT_TYPES: ReadonlyMap<string, DocumentTypeRow> = new Map<stri
   ["text", TEXT],
   ["plaintext", TEXT],
   ["html", { root: "text", extension: "html", admitted: true, executableWhenOpened: true }],
-  ["json", { root: "map", extension: "json", admitted: false }],
+  ["json", { root: "map", extension: "json", admitted: true }],
 ]);
 
 /** The row for a type, or `undefined` for one this build does not know. */

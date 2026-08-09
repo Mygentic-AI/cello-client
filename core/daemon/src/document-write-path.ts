@@ -28,6 +28,7 @@ import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
 import { lineRuns, toChunks } from "./line-lcs.js";
+import { serializeJsonDocument, parseJsonDocument, jsonKeyOperations, type JsonValue } from "./document-json.js";
 import { extensionForDocumentType, admittedDocumentTypes, rootForDocumentType, DOCUMENT_TYPES } from "./document-types.js";
 
 /** Yjs roots a materialized document projects from. TEXT_ROOT must match DocumentEngine's. */
@@ -381,7 +382,10 @@ export class DocumentWritePath {
 
   #project(doc: Y.Doc, documentType: string): string {
     if (rootForDocumentType(documentType) === "map") {
-      return `${JSON.stringify(doc.getMap(MAP_ROOT).toJSON(), null, 2)}\n`;
+      // DETERMINISTIC, not `JSON.stringify` of the map: `Y.Map.toJSON()` is in INSERTION order, so
+      // two peers holding the same document would render different files, and this projection is
+      // what publish diffs the file against — a reorder would publish as a rewrite of every line.
+      return serializeJsonDocument(doc.getMap(MAP_ROOT).toJSON() as JsonValue);
     }
     return this.engine.readTextRoot(doc);
   }
@@ -444,34 +448,32 @@ export class DocumentWritePath {
   }
 
   /** Key diff: set what changed, delete what is gone. Returns the keys written. */
+  /**
+   * Fold the FILE's JSON into the map root, per key.
+   *
+   * Shares `jsonKeyOperations` with `cello_doc_write`, so the file path and the tool path cannot
+   * disagree about what counts as a changed key — the same rule the text path already follows for
+   * `lineHunks`.
+   */
   #foldJson(doc: Y.Doc, onDisk: string): string[] {
-    let parsed: Record<string, unknown>;
-    try {
-      parsed = JSON.parse(onDisk) as Record<string, unknown>;
-    } catch (err: unknown) {
+    const parsed = parseJsonDocument(onDisk);
+    if (!parsed.ok) {
       throw new DocumentWriteError(
         "document_file_unparseable",
-        `the document's file is not valid JSON — ${err instanceof Error ? err.message : String(err)}`,
+        `the document's file is not valid JSON — ${parsed.detail}`,
       );
     }
 
     const map = doc.getMap(MAP_ROOT);
-    const written: string[] = [];
+    const ops = jsonKeyOperations(map, parsed.value);
+    if (ops.length === 0) return [];
     doc.transact(() => {
-      for (const [key, value] of Object.entries(parsed)) {
-        if (JSON.stringify(map.get(key)) !== JSON.stringify(value)) {
-          map.set(key, value);
-          written.push(key);
-        }
-      }
-      for (const key of [...map.keys()]) {
-        if (!(key in parsed)) {
-          map.delete(key);
-          written.push(key);
-        }
+      for (const [key, value] of ops) {
+        if (value === undefined) map.delete(key);
+        else map.set(key, value);
       }
     });
-    return written;
+    return ops.map(([key]) => key);
   }
 
   /** tmp + rename, so an interrupted write cannot leave a truncated file a later diff reads as
