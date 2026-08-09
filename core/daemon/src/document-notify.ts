@@ -179,6 +179,21 @@ export class DocumentNotifications {
    * against, and inventing one would make the first diff after a write report the whole document as
    * a conflict.
    */
+  /**
+   * Every text this agent demonstrably held for this document — what it last READ and what it last
+   * WROTE, in no particular order, with nulls dropped.
+   *
+   * Used by the stale-write guard to answer "could this author have seen the thing their write
+   * removes?". Both sources are needed: a read establishes a baseline, and a write is text the
+   * author obviously saw because they composed it.
+   */
+  knownTexts(agentId: string, documentId: string): string[] {
+    const row = this.#store.rawDb
+      .prepare("SELECT seen_text, my_text FROM document_read_marks WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { seen_text?: string | null; my_text?: string | null } | undefined;
+    return [row?.seen_text ?? null, row?.my_text ?? null].filter((t): t is string => t !== null);
+  }
+
   markWritten(agentId: string, documentId: string, text: string): void {
     this.#store.rawDb
       .prepare("UPDATE document_read_marks SET my_text = ? WHERE agent_id = ? AND document_id = ?")

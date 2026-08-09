@@ -49,6 +49,7 @@ import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
 import { projectDocumentText, parseJsonDocument, jsonKeyOperations } from "./document-json.js";
+import { classifyRemovals } from "./document-write-guard.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
@@ -940,6 +941,57 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         detail: JSON.stringify(profileFault),
       };
     }
+    // DOD-DOC-STALE-WRITE-1 — WOULD THIS WRITE DELETE SOMETHING THE AUTHOR NEVER SAW?
+    //
+    // `content` is the COMPLETE text, so anything absent from it is a deletion. That contract is
+    // right — a patch API means stale offsets, which in a CRDT is permanent corruption both sides
+    // converge on — but it cannot distinguish "I read their paragraph and do not want it" from
+    // "their paragraph arrived while I was typing". Both are the same bytes.
+    //
+    // Measured live 2026-08-09: a peer's paragraph admitted at 12:35:41.807 was destroyed by a write
+    // published at 12:35:42.033. The lost text was the smaller harm — the signed record cannot tell
+    // the two apart either, so the accident is permanently attributed as a deliberate rejection of
+    // the counterparty's work.
+    //
+    // The read mark holds the exact text last read, durably, which is enough to tell them apart.
+    // Refusal is conditioned on REMOVAL, never on staleness alone: a write that only ADDS is never
+    // refused, or proposing a document and writing to it before reading would refuse for nothing.
+    // GATED ON WHETHER THE DOCUMENT MOVED UNDER THEM. If no peer update has been admitted since
+    // this agent last looked, its view IS current by construction and every removal in its text is
+    // something it put there or read — nothing to protect, and refusing would be pure friction.
+    //
+    // This is what makes the guard quiet. The first version asked only "was this line in your last
+    // read", which refused every EDIT of an existing line by an author who had not called read —
+    // changing a line removes the old line's text. Two existing tests caught it.
+    const unreadFromPeer = layer.notifications.unreadFromPeer(who.ownerAgentId, documentId);
+    const verdict =
+      unreadFromPeer > 0
+        ? classifyRemovals(before, content, layer.notifications.knownTexts(who.ownerAgentId, documentId))
+        : { removed: [], deliberate: [], unseen: [], refuse: false };
+    if (verdict.refuse) {
+      // The diff travels WITH the refusal. This is the moment the author can still act: they are
+      // about to destroy it, rather than the peer discovering it gone hours later — and unlike the
+      // peer, the author can tell whether they meant it.
+      logger.info("document.write.refused.unseen_removal", {
+        documentId,
+        unseen: verdict.unseen.length,
+        unreadFromPeer,
+      });
+      return {
+        ok: false,
+        reason: "document_write_would_delete_unseen",
+        currentContent: before,
+        unseenRemovals: verdict.unseen,
+        guidance:
+          `This write would delete ${verdict.unseen.length} line(s) you have not read — your ` +
+          `counterparty changed the document after you last looked at it. Nothing was changed. ` +
+          `The current text is in 'currentContent' and what you would have removed is in ` +
+          `'unseenRemovals'. Re-apply your edit on top of the current text and write again. If you ` +
+          `DO want those lines gone, read the document first — a removal you have read is recorded ` +
+          `as a deliberate act rather than refused.`,
+      };
+    }
+
     // LINE HUNKS, never a whole-text replace — and this is not a preference, it is measured.
     //
     // `delete(0, len); insert(0, content)` can only delete the items THIS side has seen. A peer's
@@ -1032,6 +1084,14 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // back to us as "what changed since I looked" — which the tool description frames as the
     // COUNTERPARTY's contribution — and `overlap` has nothing to separate mine from theirs.
     unpublishedEdits.delete(unpublishedKey(who.ownerAgentId, documentId));
+    // A removal the author HAD read is the "second refusal" — a deliberate editorial act. Recorded
+    // as one, so it is distinguishable later from the accident this guard now prevents.
+    if (verdict.deliberate.length > 0) {
+      logger.info("document.write.removal.deliberate", {
+        documentId,
+        lines: verdict.deliberate.length,
+      });
+    }
     layer.notifications.markWritten(who.ownerAgentId, documentId, content);
     // AND THE FILE. `cello_doc_write` changes the document; without this the operator's own
     // projection on disk is stale the moment they use it, and the two surfaces disagree about the

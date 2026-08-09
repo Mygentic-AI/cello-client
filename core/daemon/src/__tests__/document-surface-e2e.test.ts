@@ -406,6 +406,79 @@ describe("concurrent writes MERGE — they do not concatenate the two documents"
    * That is the same class of permanent, silently-converged corruption the whole-text contract was
    * chosen to PREVENT. The fix is line hunks: touch only what changed.
    */
+  it("DOD-DOC-STALE-WRITE-1: a write does NOT delete a peer edit that arrived after your read", async () => {
+    // The 226ms incident, end to end. Alice reads, Bob's paragraph is admitted, Alice writes the
+    // text she read — which no longer contains it. Before the guard this published a deletion,
+    // returned ok/published, and both copies converged on it with nobody told.
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "line one\nline two\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Alice LOOKS. This is the baseline the guard measures against.
+    const seen = (await a.call("cello_doc_read", { document_id: documentId })).content as string;
+    expect(seen).toBe("line one\nline two\n");
+
+    // Bob writes and it reaches Alice — she has not looked since.
+    await b.call("cello_doc_write", { document_id: documentId, content: "line one\nline two\nBOB WAS HERE\n" });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.text(documentId)).toContain("BOB WAS HERE"));
+
+    // Alice writes the text she read, plus her own line. Bob's line is absent from it.
+    const refused = await a.call("cello_doc_write", {
+      document_id: documentId,
+      content: "line one\nline two\nALICE WAS HERE\n",
+    });
+
+    expect(refused.ok, "the write was accepted and Bob's line is gone").toBe(false);
+    expect(refused.reason).toBe("document_write_would_delete_unseen");
+    expect(refused.unseenRemovals).toEqual(["BOB WAS HERE"]);
+    // The diff travels WITH the refusal — this is the moment Alice can still act.
+    expect(refused.currentContent).toContain("BOB WAS HERE");
+    // And NOTHING was changed. A refusal that half-applied would be worse than the bug.
+    expect(a.text(documentId)).toBe("line one\nline two\nBOB WAS HERE\n");
+    expect(a.text(documentId)).not.toContain("ALICE WAS HERE");
+  });
+
+  it("DOD-DOC-STALE-WRITE-1: after READING it, the same removal is allowed as deliberate", async () => {
+    // The second refusal. Alice reads Bob's line and still leaves it out — that is an editorial act,
+    // and the system must let her perform it rather than trapping her in a refusal loop.
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      starting_content: "line one\n",
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    await b.call("cello_doc_write", { document_id: documentId, content: "line one\nBOB WAS HERE\n" });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.text(documentId)).toContain("BOB WAS HERE"));
+
+    // She looks at it — which is exactly what the refusal told her to do.
+    await a.call("cello_doc_read", { document_id: documentId });
+
+    const accepted = await a.call("cello_doc_write", { document_id: documentId, content: "line one\n" });
+    expect(accepted, "a removal the author has READ must not be refused").toMatchObject({
+      ok: true,
+      changed: true,
+    });
+    expect(a.text(documentId)).toBe("line one\n");
+  });
+
   it("a peer's edit to an untouched line SURVIVES our write of a different line", async () => {
     const a = await makeParty("alice");
     const b = await makeParty("bob");
