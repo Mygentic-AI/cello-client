@@ -22,7 +22,7 @@
  * intent. Measured, so the projection is written to disk beside the document and read back.
  */
 
-import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, access, rm } from "node:fs/promises";
 import { join } from "node:path";
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
@@ -35,6 +35,48 @@ const MAP_ROOT = "data";
 
 const TEXT_TYPES = new Set(["markdown", "text", "plaintext"]);
 const JSON_TYPES = new Set(["json"]);
+
+/**
+ * The file extension each document type is materialized under — ONE table, read by both the
+ * document path and its projection path.
+ *
+ * It used to be `JSON_TYPES.has(documentType) ? "json" : "md"`, written out twice. Everything that
+ * was not JSON became `.md`, so a `text` document — explicitly not markdown, which is the entire
+ * reason the type exists — reached the agent as `<id>.md`. The file IS the editing surface, and the
+ * extension is what every editor and every agent reads to decide how to treat the bytes; markdown
+ * autoformatting applied to non-markdown content gets diffed and PUBLISHED to the peer as
+ * deliberate edits.
+ *
+ * A table rather than a branch because three more types are queued behind this one, and a ternary
+ * is how the fourth wrong extension arrives without anyone deciding it.
+ */
+const DOCUMENT_EXTENSIONS: ReadonlyMap<string, string> = new Map([
+  ["markdown", "md"],
+  ["text", "txt"],
+  ["plaintext", "txt"],
+  ["json", "json"],
+]);
+
+/**
+ * The extension for a type, or `undefined` for one this build does not know.
+ *
+ * Undefined rather than a default: a type nothing can serve must not be handed a plausible-looking
+ * path. A silent default is what let `yaml` create a real signed peer-accepted document with no
+ * file and no explanation.
+ */
+export function extensionForDocumentType(documentType: string): string | undefined {
+  return DOCUMENT_EXTENSIONS.get(documentType);
+}
+
+/**
+ * The extension every type was materialized under before `DOCUMENT_EXTENSIONS` existed.
+ *
+ * Documents created then are on operators' disks right now. The CONTENT of one is never at risk —
+ * it lives in the CRDT and would be rewritten at the new path. What is at risk is whatever the
+ * agent typed into the old file and has NOT published: those bytes exist nowhere else, and leaving
+ * them at a path nothing reads again loses work silently.
+ */
+const LEGACY_EXTENSION = "md";
 
 /**
  * The document types EVERY verb can serve — the ones `propose` and `accept` will admit.
@@ -107,13 +149,73 @@ export class DocumentWritePath {
   filePath(agentId: string, documentId: string, documentType: string): string {
     this.#assertId(agentId, "agent_id");
     this.#assertId(documentId, "document_id");
-    const extension = JSON_TYPES.has(documentType) ? "json" : "md";
-    return join(this.#root, agentId, `${documentId}.${extension}`);
+    return join(this.#root, agentId, `${documentId}.${this.#extension(documentType)}`);
+  }
+
+  /** The extension, refusing a type this build has no path rule for rather than defaulting. */
+  #extension(documentType: string): string {
+    const extension = extensionForDocumentType(documentType);
+    if (extension === undefined) {
+      throw new DocumentWriteError(
+        "document_type_unsupported",
+        `no file extension is defined for document type '${documentType}'`,
+      );
+    }
+    return extension;
+  }
+
+  /**
+   * Move a document created under the old everything-is-`.md` rule onto its typed path.
+   *
+   * The file and its projection move TOGETHER. Moving only the file leaves publish with no recorded
+   * baseline (`document_file_missing`); moving only the projection leaves it diffing an absent file.
+   *
+   * A file already at the new path wins: both present means the new one is the live document and
+   * the old one is a leftover, so preferring the old file would replay stale content over current
+   * work — the reverse of the bug this fixes. The leftover is removed so a later run cannot find it.
+   */
+  async #migrateLegacyPath(agentId: string, documentId: string, documentType: string): Promise<void> {
+    const extension = this.#extension(documentType);
+    if (extension === LEGACY_EXTENSION) return;
+
+    const pairs: Array<[string, string]> = [
+      [
+        join(this.#root, agentId, `${documentId}.${LEGACY_EXTENSION}`),
+        join(this.#root, agentId, `${documentId}.${extension}`),
+      ],
+      [
+        join(this.#root, ".cello", agentId, `${documentId}.${LEGACY_EXTENSION}.projection`),
+        this.#projectionPath(agentId, documentId, documentType),
+      ],
+    ];
+
+    let moved = false;
+    for (const [from, to] of pairs) {
+      try {
+        await access(from);
+      } catch {
+        continue; // nothing there — the ordinary case for every document created since.
+      }
+      try {
+        await access(to);
+        await rm(from, { force: true }); // the new path is live; this is a leftover.
+        continue;
+      } catch {
+        // no file at the new path — the legacy one IS the document.
+      }
+      await rename(from, to);
+      moved = true;
+    }
+
+    if (moved) {
+      this.#logger.info("document.file.migrated", { documentId, documentType, extension });
+    }
   }
 
   /** Write the document's projection to disk and record it as the diff baseline. */
   async materialize(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<string> {
     this.#assertSupported(documentType);
+    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
     const content = this.#project(doc, documentType);
     await this.#writeAtomic(agentId, path, content);
@@ -131,6 +233,7 @@ export class DocumentWritePath {
    */
   async publish(agentId: string, documentId: string, documentType: string, doc: Y.Doc): Promise<Uint8Array | null> {
     this.#assertSupported(documentType);
+    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
     const onDisk = await this.#readOrRefuse(path, documentId);
     const projection = await this.#loadProjection(agentId, documentId, documentType);
@@ -180,6 +283,7 @@ export class DocumentWritePath {
     incoming: Uint8Array,
   ): Promise<AdmitResult> {
     this.#assertSupported(documentType);
+    await this.#migrateLegacyPath(agentId, documentId, documentType);
     const path = this.filePath(agentId, documentId, documentType);
 
     // 1. FOLD unpublished local edits in as local operations.
@@ -426,8 +530,7 @@ export class DocumentWritePath {
    * the document.
    */
   #projectionPath(agentId: string, documentId: string, documentType: string): string {
-    const extension = JSON_TYPES.has(documentType) ? "json" : "md";
-    return join(this.#root, ".cello", agentId, `${documentId}.${extension}.projection`);
+    return join(this.#root, ".cello", agentId, `${documentId}.${this.#extension(documentType)}.projection`);
   }
 
   /** The projection is persisted so it survives a restart — see the header. */
