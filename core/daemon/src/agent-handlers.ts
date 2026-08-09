@@ -497,7 +497,16 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     // MCP-002: Update dispatcher's routing table and send notification to this connection only
     getNotificationDispatcher().setCurrentAgent(connectionId, name);
     getNotificationDispatcher().dispatchAgentCurrentChanged(connectionId, fromAgent, name);
-    logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name });
+    // DOD-AGENT-SELECTION-UNWARRANTED-1: WHO asked. The names were always logged; what was missing
+    // is that an operator's explicit selection and the shim's reconnect replay arrive here
+    // identically, so a switch nobody made could not be told apart from one they did. Two switches
+    // fired one second after a reconnect on 2026-08-09 and neither could be attributed.
+    //
+    // Whitelisted, not passed through: this is a caller-supplied string that lands in the log, and
+    // an unrecognised value is recorded as such rather than echoed.
+    const claimed = params?.trigger;
+    const trigger = claimed === undefined ? "explicit" : claimed === "replay" ? "replay" : "unrecognized";
+    logger.info("agent.current.switched", { connectionId, fromAgent, toAgent: name, trigger });
     // ─── DOD-COATTEND-VISIBLE-1 AC4: you find out at ATTACH time that you are not alone ───
     //
     // Attach is NOT refused, and must never become refusable: exclusivity is rejected permanently

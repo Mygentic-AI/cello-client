@@ -280,14 +280,30 @@ export class IpcProxy {
       // `agent_already_current` is SUCCESS: it means this connection already holds it. Anything
       // else means the daemon did not give it back, so the cache must stop claiming it — a stale
       // mirror is worse than an empty one, because the operator reads the mirror.
+      // `trigger` is diagnostic, not behavioural — the daemon logs it and changes nothing on it.
+      // DOD-AGENT-SELECTION-UNWARRANTED-1: a connection changed identity twice and neither switch
+      // could be attributed, because an operator's explicit cello_use_agent and this replay reach
+      // the same handler byte-identical. The daemon could log the name but never who asked.
+      const wanted = this.#currentAgent;
       const replayed = (await this.#rawCall(
         "cello_use_agent",
-        { name: this.#currentAgent },
+        { name: wanted, trigger: "replay" },
         HANDSHAKE_TIMEOUT_MS,
       )) as { ok?: boolean; reason?: string } | null;
       const restored = replayed !== null
         && (replayed.ok === true || replayed.reason === "agent_already_current");
-      if (!restored) this.#currentAgent = null;
+      if (!restored) {
+        this.#currentAgent = null;
+        // Dropping the cache here is CORRECT (R1) — a stale mirror is worse than an empty one. But
+        // it used to happen without a word anywhere, and that silence IS the "my selection just
+        // vanished" report: tools start answering no_current_agent and nothing says why. Name the
+        // agent and the daemon's own reason, so the operator can re-select instead of debugging.
+        const why = replayed === null ? "no response" : (replayed.reason ?? "refused");
+        process.stderr.write(
+          `cello-mcp: the daemon did not restore agent '${wanted}' after reconnect (${why}) — ` +
+          `this connection is now attending nothing. Call cello_use_agent to select again.\n`,
+        );
+      }
     }
   }
 

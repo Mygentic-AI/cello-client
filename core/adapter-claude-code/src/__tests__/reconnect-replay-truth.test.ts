@@ -60,6 +60,35 @@ function fakeDaemon(socketPath: string, reply: (method: string) => Record<string
   return new Promise((resolve) => server.listen(socketPath, () => resolve(server)));
 }
 
+/** As above, but records every request so a test can assert on what the shim actually sent. */
+function recordingDaemon(
+  socketPath: string,
+  seen: Array<{ method: string; params?: Record<string, unknown> }>,
+  reply: (method: string) => Record<string, unknown>,
+): Promise<Server> {
+  const live = new Set<Socket>();
+  const server = createServer((sock: Socket) => {
+    live.add(sock);
+    sock.on("close", () => live.delete(sock));
+    let buf = "";
+    sock.on("data", (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const req = JSON.parse(line) as { id?: string; method?: string; params?: Record<string, unknown> };
+        seen.push({ method: req.method ?? "", params: req.params });
+        sock.write(JSON.stringify({ id: req.id, result: reply(req.method ?? "") }) + "\n");
+      }
+    });
+    sock.on("error", () => { /* the test closes sockets abruptly on purpose */ });
+  });
+  (server as Server & { destroyLive?: () => void }).destroyLive = () => { for (const s of live) s.destroy(); };
+  return new Promise((resolve) => server.listen(socketPath, () => resolve(server)));
+}
+
 const closeServer = (s: Server | null): Promise<void> => {
   if (!s) return Promise.resolve();
   (s as Server & { destroyLive?: () => void }).destroyLive?.();
@@ -109,6 +138,72 @@ describe("reconnect replay: the shim reports the DAEMON's agent, never its own c
     // THE FIX: the daemon said no, so the shim must not go on claiming the agent. Before this,
     // the cache survived the refusal and every surface built from it lied.
     expect(proxy.currentAgent, "a refused replay must not leave the agent cached").toBeNull();
+  });
+
+  // ─── DOD-AGENT-SELECTION-UNWARRANTED-1 — making the switch attributable ───
+  //
+  // A connection changed identity twice on 2026-08-08/09 and neither could be attributed from any
+  // log. Reading the code narrows it: `cello_use_agent` is the ONLY writer of a connection's current
+  // agent (agent-handlers.ts:487 — every other site writes null), so no daemon-side fallback can
+  // bind a connection. What the daemon cannot see is WHO called it: an operator's explicit
+  // selection and the shim's reconnect replay arrive on the same handler, byte-identical.
+  //
+  // And the refusal path is silent. R1 above is correct behaviour — a refused replay must drop the
+  // cache — but it drops it without a word anywhere, which is exactly the "my selection vanished"
+  // report. The daemon logs no name for a switch that did not happen, and the shim logs nothing at
+  // all. These two tests close that.
+
+  it("R4: the replay identifies ITSELF, so a switch can be attributed to it rather than to the operator", async () => {
+    const seen: Array<{ method: string; params?: Record<string, unknown> }> = [];
+    server = await recordingDaemon(socketPath, seen, () => ({ ok: true }));
+    proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+    await proxy.connect();
+    await proxy.call("ipc.connect", { clientType: "mcp" });
+    await proxy.call("cello_use_agent", { name: "Miss_Chelly" });
+
+    // An operator's own call must NOT claim to be a replay, or the field is worthless.
+    const explicit = seen.find((r) => r.method === "cello_use_agent");
+    expect(explicit?.params?.["trigger"]).toBeUndefined();
+
+    seen.length = 0;
+    await closeServer(server);
+    const reconnected = new Promise<void>((resolve) => proxy!.onReconnect(() => resolve()));
+    server = await recordingDaemon(socketPath, seen, () => ({ ok: true }));
+    await reconnected;
+
+    const replayed = seen.find((r) => r.method === "cello_use_agent");
+    expect(replayed, "the replay must happen at all").toBeDefined();
+    expect(replayed!.params?.["trigger"]).toBe("replay");
+  });
+
+  it("R5: a refused replay SAYS SO — dropping a selection silently is the reported defect", async () => {
+    const written: string[] = [];
+    const origWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => { written.push(String(chunk)); return true; }) as typeof process.stderr.write;
+    try {
+      server = await fakeDaemon(socketPath, () => ({ ok: true }));
+      proxy = new IpcProxy(socketPath, { clientType: "mcp" });
+      await proxy.connect();
+      await proxy.call("ipc.connect", { clientType: "mcp" });
+      await proxy.call("cello_use_agent", { name: "Miss_Chelly" });
+
+      await closeServer(server);
+      const reconnected = new Promise<void>((resolve) => proxy!.onReconnect(() => resolve()));
+      server = await fakeDaemon(socketPath, (method) =>
+        method === "cello_use_agent"
+          ? { ok: false, reason: "agent_start_failed", guidance: "not online" }
+          : { ok: true },
+      );
+      await reconnected;
+
+      const all = written.join("");
+      // The operator has to be able to tell "my selection was dropped, and why" from "the tools are
+      // just broken". Name the agent and the daemon's own reason.
+      expect(all).toContain("Miss_Chelly");
+      expect(all).toContain("agent_start_failed");
+    } finally {
+      process.stderr.write = origWrite;
+    }
   });
 
   it("R2 (the control): a SUCCESSFUL replay keeps the agent — reconnect must not lose routing", async () => {

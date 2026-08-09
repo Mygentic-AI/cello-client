@@ -135,6 +135,50 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     expect(onlineEventsAfter).toHaveLength(1); // Still just one
   });
 
+  // ─── DOD-AGENT-SELECTION-UNWARRANTED-1: a switch must say WHO asked for it ───
+  //
+  // A connection changed identity twice (2026-08-08 bound to an agent it never selected, 2026-08-09
+  // silently dropped one it had) and neither could be attributed from any log. The names were
+  // always recorded; what was missing is that an operator's explicit cello_use_agent and the shim's
+  // reconnect replay arrive on this handler byte-identical. Two switches fired one second after a
+  // reconnect and there was no way to say which kind either was.
+  it("an operator's own selection is logged as explicit", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const ev = logEvents.find((e) => e.event === "agent.current.switched");
+    expect(ev!.context.trigger).toBe("explicit");
+  });
+
+  it("the shim's reconnect replay is logged as replay — the distinction the diagnosis needs", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+
+    await client.send("cello_use_agent", { name: "alice", trigger: "replay" });
+
+    const ev = logEvents.find((e) => e.event === "agent.current.switched");
+    expect(ev!.context.trigger).toBe("replay");
+  });
+
+  it("an unrecognised trigger is recorded as such, never echoed into the log", async () => {
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
+
+    // Caller-supplied strings that land in a log get whitelisted, not passed through.
+    await client.send("cello_use_agent", { name: "alice", trigger: "explicit\n[forged] log line" });
+
+    const ev = logEvents.find((e) => e.event === "agent.current.switched");
+    expect(ev!.context.trigger).toBe("unrecognized");
+  });
+
   // ─── AC-003: cello_use_agent sets current agent per-connection ───
   it("AC-003: cello_use_agent sets current agent and emits agent.current.switched", async () => {
     const config = await setupWithAgents("alice");
