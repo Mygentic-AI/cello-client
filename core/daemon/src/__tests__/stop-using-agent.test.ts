@@ -22,6 +22,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+// These tests assert the agent is RUNNING, not which rung it landed on: the rung depends on
+// attendance and whether a directory is reachable, neither of which is what they are testing.
+import { isAgentRunning } from "../agent-state.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -128,7 +131,7 @@ describe("DOD-RELEASE-1: cello_stop_using_agent", () => {
 
     const after = await client.send("cello_list_agents") as AgentList;
     const alice = after.agents.find((a) => a.name === "alice");
-    expect(alice?.state).toBe("online");
+    expect(isAgentRunning(alice?.state), "releasing the desk must not stop the agent — it stays reachable and answers with its away message").toBe(true);
     // The assertion that kills the bypass: the standing receiver is what accepts inbound sessions
     // and produces the away reply. Tear it down and the agent is deaf while still reading "online".
     expect(alice?.standing_receiver_ready).toBe(true);

@@ -33,6 +33,7 @@ import type {
   DaemonConfig,
   DaemonStatusResponse,
   AgentInfo,
+  AgentState,
   InterruptedSessionInfo,
   ActiveSessionInfo,
   DirectorySignalingState,
@@ -102,6 +103,7 @@ import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
+import { resolveAgentState } from "./agent-state.js";
 import { registerInitiateSessionHandler } from "./initiate-session-handler.js";
 import { createContentPark } from "./content-park.js";
 import { createInboundSealRequestHandler } from "./inbound-seal-request.js";
@@ -316,7 +318,7 @@ async function startDaemonHoldingLock(
   // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
   // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
   // because only we hold the DB handle and the singleton lock a refusal has to release.
-  const { manifestVerified, verifiedManifestVersion, verifiedManifest, unresolvedNodes: startupUnresolvedNodes } = await verifyStartupManifest({
+  const { manifestVerified, verifiedManifestVersion, verifiedManifest, unresolvedNodes: startupUnresolvedNodes, unresolvedSweptAt: startupSweptAt } = await verifyStartupManifest({
     manifestProvider,
     manifestRootKeys,
     manifestThreshold,
@@ -341,7 +343,7 @@ async function startDaemonHoldingLock(
   }
 
   // The manifest poll starts only AFTER the refuse above — a refused startup must not leak a timer.
-  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, stopHttpManifestPoll } =
+  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, stopHttpManifestPoll } =
     createConsortiumRouting({
       manifestProvider,
       manifestRootKeys,
@@ -354,6 +356,7 @@ async function startDaemonHoldingLock(
       // empty until a ceremony resolves a roster — i.e. empty exactly when someone whose sessions
       // are all failing goes looking for why.
       initialUnresolvedNodes: startupUnresolvedNodes,
+      initialUnresolvedSweptAt: startupSweptAt,
       logger,
     });
 
@@ -386,11 +389,14 @@ async function startDaemonHoldingLock(
   const getPersistence = (agentName: string): DbRegistrationPersistence =>
     new DbRegistrationPersistence({ db: sessionNodeManager.getDb(), agentName, logger });
 
-  // Build agent state (all start in 'registered' state — no auto-start)
+  // Build agent state. `state` here is the LOAD outcome only — whether the identity opened at all.
+  // The state an operator sees is derived per call by resolveAgentState (agent-state.ts), because
+  // most of what it depends on (started, signaling, attendance, paused) changes while the daemon
+  // runs and cannot be baked into a record at boot.
   const agents: AgentInfo[] = [
     ...loadedAgents.map((a) => ({
       name: a.name,
-      state: "registered" as const,
+      state: "stopped" as const,
       pubkey: a.pubkey,
     })),
     ...failedAgents.map((a) => ({
@@ -1794,12 +1800,11 @@ async function startDaemonHoldingLock(
     return agents
       .filter((a) => a.state !== "load_failed")
       .map((a) => {
-        // `state` reports READINESS only (online vs registered); selection is a SEPARATE `selected`
-        // flag. Never fold selection into `state` — a selected agent is not at a different level of
-        // readiness than a second healthy online agent.
-        const online = onlineAgents.has(a.name);
-        const state: AgentInfo["state"] = online ? "online" : "registered";
-        const selected = online && a.name === currentAgent;
+        // `state` reports READINESS only; selection is a SEPARATE `selected` flag. Never fold
+        // selection into `state` — a selected agent is not at a different level of readiness than a
+        // second healthy online agent. (This is why `current` was dropped from the enum.)
+        const state = agentStateFor(a);
+        const selected = onlineAgents.has(a.name) && a.name === currentAgent;
         return {
           name: a.name,
           state,
@@ -1903,6 +1908,46 @@ async function startDaemonHoldingLock(
     }));
   }
 
+  /**
+   * The state an operator sees, for one agent — used by BOTH status surfaces.
+   *
+   * Deliberately one function. The daemon-wide status and the per-connection `cello_status` used to
+   * compute this separately, and separate copies of a truth claim are how the directory-health block
+   * came to exist on one surface and not the other earlier today.
+   */
+  function agentStateFor(a: AgentInfo): AgentState {
+    return resolveAgentState({
+      loadFailed: a.state === "load_failed",
+      // `unregistered` is BUILT and tested (agent-state.ts) and deliberately NOT EMITTED yet.
+      //
+      // The truthful signal is whether the DKG left a FROST share — registration's durable product,
+      // rather than a flag anyone could forget to set. But every test fixture creates an agent
+      // WITHOUT one, so switching this on relabels the agents in 29 tests across 8 files, and the
+      // alternative — fabricating share material in fixtures — plants fake crypto material that a
+      // later reader takes for real. Neither is worth it for a state that lasts the few seconds
+      // between `cello create-agent` and `cello register-agent`.
+      //
+      // So the daemon asserts exactly what it asserted before this change: a loaded agent is treated
+      // as registered. That is not a regression, and it is not silent — it is this comment. The VALUE
+      // stays in AgentState, so turning it on once fixtures can register for real is a one-line
+      // change here and NOT a second wire change for every consumer.
+      hasFrostShare: true,
+      deliberatelyOffline: explicitlyOfflineAgents.has(a.name),
+      started: onlineAgents.has(a.name),
+      // This agent's OWN stream where it has one — an agent whose connection is severed while its
+      // siblings are fine must not read as healthy.
+      //
+      // Falls back to the shared manager, mirroring directorySignalingStatus(): production gives
+      // every agent its own connection, but the M6 back-compat/test path has ONE shared manager and
+      // no per-agent entry at all. Reading only the per-agent map there returns undefined for every
+      // agent, so all of them reported `connecting` — which then made isAgentReady false and refused
+      // real commands with `selected_agent_offline`. Absent is not the same as disconnected.
+      signalingConnected:
+        (perAgentSignaling.get(a.name)?.signaling.status ?? sharedSignaling?.status) === "connected",
+      attendance: countAttendance(perConnectionState, a.name),
+    });
+  }
+
   // Build status response factory
   function getStatus(): DaemonStatusResponse {
     // M7-SESSION-001 AC-006/AC-007: surface interrupted sessions
@@ -1931,15 +1976,11 @@ async function startDaemonHoldingLock(
       // the MCP surface. A load_failed agent keeps its state so a broken agent stays visible as broken.
       // (No `selected` here: this is the daemon-wide surface; selection is a per-connection concept and
       // the CLI opens an ephemeral connection that never runs cello_use_agent — see M8C-DECISIONS D24.)
-      agents: agents.map((a) => {
-        const online = onlineAgents.has(a.name);
-        const state: AgentInfo["state"] = a.state === "load_failed" ? "load_failed" : online ? "online" : "registered";
-        return {
-          ...a,
-          state,
-          standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
-        };
-      }),
+      agents: agents.map((a) => ({
+        ...a,
+        state: agentStateFor(a),
+        standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+      })),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
       interrupted_sessions,
@@ -2916,9 +2957,15 @@ async function startDaemonHoldingLock(
     if (failures.length === 0) return undefined;
     return {
       directory_endpoints_unresolved: {
+        // WHEN this was measured. Without it the block asserts the PRESENT, and a transient blip
+        // reads as an ongoing outage: on 2026-08-09 all three endpoints failed with ENETUNREACH for
+        // under a minute — a network transition on the operator's machine — and the block went on
+        // reporting them unreachable long after they answered again. True when taken, false when read.
+        checked_at: getUnresolvedSweptAt(),
         nodes: failures.map((f) => ({ node: f.nodeId, endpoint: f.endpoint, reason: f.reason, detail: f.detail })),
         guidance:
-          "This daemon cannot resolve these directory endpoints, so the consortium roster is short and " +
+          "AS OF checked_at (this is a point-in-time reading, not necessarily now), this daemon could not "
+          + "resolve these directory endpoints, so the consortium roster was short and " +
           "threshold ceremonies will fail — sessions surface that as counterparty_offline, " +
           "directory_below_threshold, or ceremony_exhausted, none of which name the real cause. " +
           "Agents can still show 'online': signaling dials multiaddrs and does not need DNS. " +

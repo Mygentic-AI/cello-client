@@ -92,3 +92,10 @@ export {
   runNetworkRefresh,
 } from "./network-directory-node.js";
 export type { FrostAuthSigner } from "./network-directory-node.js";
+
+// The agent-state ladder. `isAgentReady` is exported because the CLI needs it: narrowing `online` to
+// also require an attendee silently changed the meaning of every `state === "online"` check, and the
+// compiler cannot catch that — the string stays valid. A shared predicate is what stops each caller
+// re-deciding what "usable" means.
+export { resolveAgentState, isAgentRunning } from "./agent-state.js";
+export type { AgentStateInputs } from "./agent-state.js";

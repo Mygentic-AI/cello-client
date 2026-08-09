@@ -94,7 +94,11 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       keyProviders.set(name, keyProvider);
       const loaded: LoadedAgent = { name, pubkey: pubkeyHex, keyProvider };
       loadedAgents.push(loaded);
-      agents.push({ name, state: "registered", pubkey: pubkeyHex });
+      // The LOAD outcome, not the operator-facing state — that is derived per call by
+      // resolveAgentState. This agent has just been created and has no FROST share, so it derives as
+      // `unregistered` until `cello register-agent` runs. It used to be recorded as "registered"
+      // here, which was false at the moment it was written: nobody could reach this agent yet.
+      agents.push({ name, state: "stopped", pubkey: pubkeyHex });
       // CELLO-M7-CONN-001 (DOD-CONN-1, supersedes ONBOARD-001 keystone election): on a fresh install
       // the daemon started with zero agents, so there were no directory connections. Bring up THIS
       // agent's OWN directory connection now (production: getAgentSignaling creates + connects a

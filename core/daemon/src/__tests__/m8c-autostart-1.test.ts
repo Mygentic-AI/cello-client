@@ -14,6 +14,9 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+// These tests assert the agent is RUNNING, not which rung it landed on: the rung depends on
+// attendance and whether a directory is reachable, neither of which is what they are testing.
+import { isAgentRunning } from "../agent-state.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -87,7 +90,7 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
 
     const status = (await client.send("cello_status", {})) as Result;
     const alice = agentsOf(status).find((a) => a.name === "alice")!;
-    expect(alice.state).toBe("online");
+    expect(isAgentRunning(alice.state), "auto-start must leave it RUNNING; which rung depends on attendance and the directory").toBe(true);
     expect(alice.selected).toBe(true);
   });
 
@@ -102,7 +105,7 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
 
     const status = (await client.send("cello_status", {})) as Result;
     const alice = agentsOf(status).find((a) => a.name === "alice")!;
-    expect(alice.state).toBe("online");
+    expect(isAgentRunning(alice.state)).toBe(true);
     expect(alice.selected ?? false).toBe(false); // online but NOT selected
   });
 
@@ -195,9 +198,9 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
 
     const alice = all.find((a) => a.name === "alice")!;
     const bob = all.find((a) => a.name === "bob")!;
-    expect(alice.state).toBe("online");
+    expect(isAgentRunning(alice.state)).toBe(true);
     expect(alice.selected).toBe(true);
-    expect(bob.state).toBe("online");
+    expect(isAgentRunning(bob.state)).toBe(true);
     expect(bob.selected ?? false).toBe(false);
   });
 });

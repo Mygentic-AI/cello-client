@@ -26,6 +26,9 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+// These assert the agent is RUNNING, not which rung it landed on — the rung depends on attendance
+// and on whether a directory is reachable, neither of which these tests are about.
+import { isAgentRunning } from "../agent-state.js";
 
 describe("MCP-001: agent lifecycle and per-connection state", () => {
   let tempDir: string;
@@ -118,7 +121,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     // Verify agent is now online
     const list1 = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice1 = list1.agents.find((a) => a.name === "alice");
-    expect(alice1?.state).toBe("online");
+    expect(isAgentRunning(alice1?.state)).toBe(true);
 
     // Verify agent.online event fired
     const onlineEvents = logEvents.filter((e) => e.event === "agent.online");
@@ -268,7 +271,10 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     // Verify agent is now registered
     const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice = list.agents.find((a) => a.name === "alice");
-    expect(alice?.state).toBe("registered");
+    // `paused`, not merely "not running": the operator pressed the switch. The old enum
+    // collapsed this with "never started", so the kill switch working was indistinguishable
+    // from an agent that had simply never been brought up.
+    expect(alice?.state).toBe("paused");
 
     // Verify agent.offline event
     const offlineEvent = logEvents.find((e) => e.event === "agent.offline");
@@ -305,13 +311,13 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     // Connection 1: alice=current, bob=online, charlie=registered
     expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
-    expect(list1.agents.find((a) => a.name === "bob")?.state).toBe("online");
-    expect(list1.agents.find((a) => a.name === "charlie")?.state).toBe("registered");
+    expect(isAgentRunning(list1.agents.find((a) => a.name === "bob")?.state)).toBe(true);
+    expect(list1.agents.find((a) => a.name === "charlie")?.state).toBe("stopped");
 
     // Connection 2: alice=online, bob=current, charlie=registered
-    expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("online");
+    expect(isAgentRunning(list2.agents.find((a) => a.name === "alice")?.state)).toBe(true);
     expect(list2.agents.find((a) => a.name === "bob")?.selected).toBe(true);
-    expect(list2.agents.find((a) => a.name === "charlie")?.state).toBe("registered");
+    expect(list2.agents.find((a) => a.name === "charlie")?.state).toBe("stopped");
 
     // Verify two distinct connectionIds
     const connectEvents = logEvents.filter(
@@ -710,7 +716,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     const list = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     const alice = list.agents.find((a) => a.name === "alice");
-    expect(alice?.state).toBe("online");
+    expect(isAgentRunning(alice?.state)).toBe(true);
     expect(alice?.selected).toBe(true);
   });
 
@@ -844,12 +850,12 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     // Connection 2 calls cello_list_agents and sees bob as current, not alice
     const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     expect(list2.agents.find((a) => a.name === "bob")?.selected).toBe(true);
-    expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("online");
+    expect(isAgentRunning(list2.agents.find((a) => a.name === "alice")?.state)).toBe(true);
 
     // Connection 1 still sees alice as current
     const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     expect(list1.agents.find((a) => a.name === "alice")?.selected).toBe(true);
-    expect(list1.agents.find((a) => a.name === "bob")?.state).toBe("online");
+    expect(isAgentRunning(list1.agents.find((a) => a.name === "bob")?.state)).toBe(true);
   });
 
   // ─── cello_set_agent_offline clears current for affected connections ───
@@ -869,10 +875,10 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     // Both connections should now see alice as registered, not current
     const list1 = await client1.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
-    expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("registered");
+    expect(list1.agents.find((a) => a.name === "alice")?.state).toBe("paused");
 
     const list2 = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
-    expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("registered");
+    expect(list2.agents.find((a) => a.name === "alice")?.state).toBe("paused");
   });
 
   // ─── cello_start_agent with unknown agent ───
@@ -940,6 +946,6 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const client2 = await connect(config.socketPath);
     const list = await client2.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
     // Alice is still online (agent state persists), but not current for new connection
-    expect(list.agents.find((a) => a.name === "alice")?.state).toBe("online");
+    expect(isAgentRunning(list.agents.find((a) => a.name === "alice")?.state)).toBe(true);
   });
 });

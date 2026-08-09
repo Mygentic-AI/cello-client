@@ -103,13 +103,21 @@ describe("launch triage item 6 — a daemon that cannot reach a directory must n
     // THE FIX. Without it this surface is silent, and the operator reads `daemon: running` plus a
     // list of online agents and concludes everything is fine.
     const block = status["directory_endpoints_unresolved"] as
-      | { nodes: Array<{ node: string; reason: string }>; guidance: string }
+      | { nodes: Array<{ node: string; reason: string }>; guidance: string; checked_at: string }
       | undefined;
     expect(block).toBeDefined();
     expect(block!.nodes.map((n) => n.node)).toContain("dead-1");
     // The guidance has to name the errors the operator will actually be shown, or it does not close
     // the gap between "three misleading errors" and "the cause".
     expect(block!.guidance).toContain("counterparty_offline");
+
+    // WHEN it was measured. A reading with no timestamp asserts the present tense, and on
+    // 2026-08-09 a sub-minute ENETUNREACH blip on the operator's machine therefore read as an
+    // ongoing outage minutes after the endpoints were answering again.
+    expect(block!.checked_at, "the reading must say when it was taken").toEqual(expect.any(String));
+    expect(Number.isNaN(Date.parse(block!.checked_at))).toBe(false);
+    // And it must describe itself as point-in-time, not as now.
+    expect(block!.guidance).toContain("AS OF");
   }, 30_000);
 
   it("the MCP surface (`cello_status`) carries the identical block — the two must not drift", async () => {

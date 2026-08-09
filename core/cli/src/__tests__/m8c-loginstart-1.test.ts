@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { isAgentRunning } from "@cello-protocol/daemon";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -60,7 +61,10 @@ describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
     expect(res.failed).toEqual([]);
 
     const status = (await client.send("cello_status")) as { agents: Array<{ name: string; state: string }> };
-    expect(status.agents.filter((a) => a.state === "online").map((a) => a.name).sort()).toEqual(["alice", "bob"]);
+    // RUNNING, not the specific rung: login's job is to bring every agent up, and whether each then
+    // reads `connecting`, `unattended` or `online` depends on the directory and on who is attending —
+    // neither of which this test is about.
+    expect(status.agents.filter((a) => isAgentRunning(a.state)).map((a) => a.name).sort()).toEqual(["alice", "bob"]);
 
     // L3: idempotent — a second login pass starts the (already-online) agents again with no failures.
     const again = await autoStartAllAgents(client);

@@ -32,7 +32,7 @@ cello status
 `cello login` starts the daemon and brings the agents back online. Confirm with:
 
 ```bash
-cello agents      # every agent you expect: state "online", standing_receiver_ready true
+cello agents      # every agent you expect: state "unattended" or "online", standing_receiver_ready true
 ```
 
 `standing_receiver_ready: true` is the load-bearing field. An agent that is `online` without it will

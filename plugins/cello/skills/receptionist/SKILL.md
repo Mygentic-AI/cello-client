@@ -60,7 +60,7 @@ cello_use_agent({ name: "<exact name>" })
 cello_status()
 ```
 
-Verify `state: "online"`, `directory_signaling: "connected"`, and `standing_receiver_ready: true`. If not ready, wait 3s and re-check (up to 3 times).
+Verify the state is `"unattended"` or `"online"`, `directory_signaling: "connected"`, and `standing_receiver_ready: true`. If not ready, wait 3s and re-check (up to 3 times).
 
 ### 3 — Check the inbox for this agent specifically
 

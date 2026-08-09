@@ -80,6 +80,15 @@ export interface ManifestGateResult {
    * nodes failed rather than asserting all-good, for exactly that reason.
    */
   unresolvedNodes: NodeResolveFailure[];
+  /**
+   * When the sweep above ran (ISO), or null if none did.
+   *
+   * A reading with no timestamp asserts the PRESENT. On 2026-08-09 all three endpoints failed with
+   * ENETUNREACH — a real network blip on the operator's machine, gone within a minute — and the
+   * status block went on reporting "this daemon cannot resolve these directory endpoints" as a
+   * current fact long after it had recovered. True when taken, false when read.
+   */
+  unresolvedSweptAt: string | null;
 }
 
 /**
@@ -96,9 +105,10 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
   let consortiumEndpoints: ConsortiumEndpoint[] = [];
   let verifiedManifest: ConsortiumManifest | null = null;
   const unresolvedNodes: NodeResolveFailure[] = [];
+  let unresolvedSweptAt: string | null = null;
 
   if (!manifestProvider || !manifestRootKeys || manifestThreshold === undefined) {
-    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
+    return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
   }
 
   try {
@@ -113,14 +123,14 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         notBefore: manifest.not_before,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
     }
     if (expiresAt <= now) {
       logger.error("directory.auth.manifest.expired", {
         manifestVersion: manifest.version,
         expiresAt: manifest.expires,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
     }
 
     // Anti-rollback. Equal versions are fine (a restart on an unchanged manifest); only a STRICTLY
@@ -131,7 +141,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
         manifestVersion: manifest.version,
         lastSeenVersion: lastSeen,
       });
-      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
     }
 
     await manifestVersionStore.persistVersion(manifest.version);
@@ -155,6 +165,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
       // The detail this sweep used to throw away. See ManifestGateResult.unresolvedNodes.
       onNodeUnresolved: (f) => unresolvedNodes.push(f),
     });
+    unresolvedSweptAt = new Date().toISOString();
     const declaredNodes = manifest.nodes.length;
     const resolvedNodes = consortiumEndpoints.length;
     // Carry the nodeId↔peerId pairing (not just peerIds) so a consumer can verify each manifest
@@ -179,7 +190,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
     });
   }
 
-  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes };
+  return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
 }
 
 export interface ConsortiumRoutingDeps {
@@ -197,6 +208,8 @@ export interface ConsortiumRoutingDeps {
    * boot rather than from whenever the first ceremony happens to run. See the seeding note inside.
    */
   initialUnresolvedNodes?: readonly NodeResolveFailure[];
+  /** When that startup sweep ran, so the surface can say how old the reading is. */
+  initialUnresolvedSweptAt?: string | null;
 }
 
 export interface ConsortiumRouting {
@@ -223,6 +236,8 @@ export interface ConsortiumRouting {
    * endpoint — the roster, and therefore every threshold ceremony — fails.
    */
   getUnresolvedNodes: () => NodeResolveFailure[];
+  /** When the reading getUnresolvedNodes returns was taken (ISO), or null if no sweep has run. */
+  getUnresolvedSweptAt: () => string | null;
   /** Null-safe accessor for the ceremony/handler getDirectoryEndpoint sites. */
   getFailoverEndpoint: () => Promise<DirectoryEndpoint | null>;
   /** Stops the daemon-level HTTP manifest poll. Undefined when no poll was started. */
@@ -244,7 +259,9 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   // window. That silence is the whole reason item 6 exists. The seed is a starting value, not a
   // floor: the first real sweep replaces it, so a node that has recovered stops being reported.
   let unresolvedNodes: NodeResolveFailure[] = [...(deps.initialUnresolvedNodes ?? [])];
+  let unresolvedSweptAt: string | null = deps.initialUnresolvedSweptAt ?? null;
   const getUnresolvedNodes = (): NodeResolveFailure[] => [...unresolvedNodes];
+  const getUnresolvedSweptAt = (): string | null => unresolvedSweptAt;
 
   const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {
     const m = manifestProvider?.getCurrentManifest();
@@ -256,6 +273,7 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
       onNodeUnresolved: (f) => failures.push(f),
     });
     unresolvedNodes = failures;
+    unresolvedSweptAt = new Date().toISOString();
     return endpoints;
   };
 
@@ -299,5 +317,5 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
     });
   }
 
-  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, stopHttpManifestPoll };
+  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, stopHttpManifestPoll };
 }

@@ -20,6 +20,7 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { readLock } from "../lock-file.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { isAgentRunning } from "../agent-state.js";
 import type { Logger, DaemonConfig, DaemonStatusResponse } from "../types.js";
 
 describe("daemon", () => {
@@ -118,7 +119,9 @@ describe("daemon", () => {
     const status = handle.getStatus();
     expect(status.agents).toHaveLength(1);
     expect(status.agents[0].name).toBe("test-agent");
-    expect(status.agents[0].state).toBe("registered");
+    // Not started in this daemon. `stopped` — the old enum called this "registered", which said
+    // nothing about whether it was running.
+    expect(status.agents[0].state).toBe("stopped");
     expect(status.agents[0].pubkey).toBe(pubkey);
   });
 
@@ -130,10 +133,10 @@ describe("daemon", () => {
     const config = makeConfig();
     handle = await startDaemon(config);
 
-    // Offline: "registered". Pre-CC-8 the daemon-wide status (what the CLI `cello status` reads) showed
-    // "registered" even AFTER the agent came online — startAgentInternal only adds to onlineAgents, it
-    // never mutates the stored record — so an operator couldn't tell online from offline via the CLI.
-    expect(handle.getStatus().agents[0].state).toBe("registered");
+    // Not started yet. Pre-CC-8 the daemon-wide status (what the CLI `cello status` reads) showed the
+    // same value AFTER the agent came online too — startAgentInternal only adds to onlineAgents and
+    // never mutates the stored record — so an operator couldn't tell running from stopped via the CLI.
+    expect(handle.getStatus().agents[0].state).toBe("stopped");
 
     const client = await connectToDaemon(config.socketPath);
     try {
@@ -143,8 +146,12 @@ describe("daemon", () => {
       client.close();
     }
 
-    // CC-8: now derived from onlineAgents → "online" (matches the MCP cello_status F5 surface).
-    expect(handle.getStatus().agents[0].state).toBe("online");
+    // CC-8's point is PARITY: the daemon-wide status the CLI reads must reflect that the agent is
+    // running, exactly as the MCP surface does. It is asserted as RUNNING rather than the literal
+    // "online" because that rung now additionally requires an attendee, and this test closes its
+    // connection before asking — so the agent is genuinely unattended by the time it looks.
+    expect(isAgentRunning(handle.getStatus().agents[0].state)).toBe(true);
+    expect(handle.getStatus().agents[0].state).not.toBe("stopped");
   });
 
   it("reports agentCount in daemon.started event", async () => {

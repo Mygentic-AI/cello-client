@@ -95,7 +95,41 @@ export const STANDING_RECEIVER_AGENT_NAME = "__standing_receiver__" as const;
 
 // --- Agent state ---
 
-export type AgentState = "registered" | "online" | "current" | "load_failed";
+/**
+ * What an agent can actually do right now — a strict ladder, worst fact first.
+ *
+ * Every value is a fact about THIS AGENT. Nothing system-wide is smuggled in: a consortium that is
+ * short of threshold affects every agent equally, so it was never a property of an agent and lives
+ * on the daemon-level `directory` block instead. (Andre, 2026-08-09 — `isolated` was proposed for
+ * this enum and rejected on exactly that ground.)
+ *
+ *   load_failed  — the identity would not load. Bad key file or database; nothing else will work.
+ *   unregistered — created on this machine, never registered with the directory. Nobody can reach
+ *                  it. Determined by whether the DKG left a FROST share, which is registration's
+ *                  durable product — not by a flag anyone could forget to set.
+ *   stopped      — registered, not running in this daemon.
+ *   paused       — deliberately taken offline by the operator. This is the kill switch WORKING;
+ *                  it is not a failure and must never read as one.
+ *   connecting   — started, directory signaling not up yet. Normal for a minute after registering.
+ *   unattended   — fully ready to receive, and NOBODY IS HOME to answer. Callers get the away
+ *                  message. Its own rung because this state was invisible and load-bearing: the
+ *                  witness stall happened precisely because BOTH sides were unattended, both away
+ *                  responders fired, and the away flow ends a session — so two agents sealed a
+ *                  conversation nobody had.
+ *   online       — ready AND at least one connection attending. The final good state.
+ *
+ * REPLACES `"registered" | "online" | "current" | "load_failed"`, which collapsed five distinct
+ * conditions into "online" and carried `current` as a state — selection is a per-connection concept
+ * and already has its own `selected` boolean, so a state value for it was two sources of truth.
+ */
+export type AgentState =
+  | "load_failed"
+  | "unregistered"
+  | "stopped"
+  | "paused"
+  | "connecting"
+  | "unattended"
+  | "online";
 
 export interface AgentInfo {
   name: string;

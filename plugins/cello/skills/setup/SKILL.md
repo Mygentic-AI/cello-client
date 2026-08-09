@@ -54,8 +54,13 @@ reach it. Until this succeeds, the agent is local-only.
 
 ```bash
 cello status      # expect: daemon running, agent online
-cello agents      # expect: state "online", standing_receiver_ready true
+cello agents      # expect: state "unattended" or "online", standing_receiver_ready true
 ```
+
+**`unattended` is a healthy state, not a failure.** It means the agent is registered, online and
+reachable — but no session is currently attending it, so a caller gets its away message instead of a
+live reply. It becomes `online` the moment a session attends it (`cello_use_agent`, or a Claude Code
+window with the plugin). Right after setup, `unattended` is exactly what you should see.
 
 `standing_receiver_ready: true` is the one that matters — it is what accepts inbound sessions. An
 agent that is online but not receiver-ready will silently fail to take calls.
