@@ -95,6 +95,7 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   { mcp: "cello_doc_list", cli: "cello doc list" },
   { mcp: "cello_doc_read", cli: "cello doc read" },
   { mcp: "cello_doc_diff", cli: "cello doc diff" },
+  { mcp: "cello_doc_watch", cli: "cello doc watch" },
   { mcp: "cello_doc_write", cli: "cello doc write" },
   { mcp: "cello_doc_publish", cli: "cello doc publish" },
   { mcp: "cello_doc_close", cli: "cello doc close" },

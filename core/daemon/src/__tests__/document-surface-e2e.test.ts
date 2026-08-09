@@ -56,6 +56,10 @@ async function makeParty(agentName: string) {
   db.exec("PRAGMA foreign_keys = ON");
 
   const wire: Wire = { deliverToPeer: null, online: true };
+  // DOD-DOC-WATCH-1 — every nudge this party received. The seam the daemon fills with the doorbell
+  // dispatcher; collected here so the test asserts on what the operator's agent would actually be
+  // woken by rather than on the store.
+  const nudges: Array<{ documentId: string; paths: string[] }> = [];
 
   // Declared before the layer because the notifier needs the store, and the store is inside the
   // layer. Assigned immediately after; the notifier is only ever called from lifecycle, long after
@@ -66,6 +70,9 @@ async function makeParty(agentName: string) {
     db,
     logger,
     publicKeyFor: agentPublicKeyFromId,
+    nudge: (_owner, documentId, paths) => {
+      nudges.push({ documentId, paths: [...paths] });
+    },
     // The NAME→KEY map, exactly as the daemon does it. Both halves resolve through this one
     // function; when they did not, every row landed where the other half never looked.
     ownerKeyFor: (n) => (n === agentName ? owner : null),
@@ -134,6 +141,8 @@ async function makeParty(agentName: string) {
     layer,
     wire,
     worker,
+    /** DOD-DOC-WATCH-1 — the doorbells this party was rung with, in order. */
+    nudges,
     // Exposed so a test can author an update the way a HOSTILE PEER would — below the operator
     // surface, whose authoring screen a patched client simply would not run. Reaching the
     // receiver's gate is the whole point of the screening case, and going through cello_doc_write
@@ -152,6 +161,8 @@ async function makeParty(agentName: string) {
         { senderAgentId: owner },
       ),
     text: (documentId: string) => layer.live.get(owner, documentId).getText("content").toString(),
+    /** The map root as JSON — a `text` read is empty for a JSON document, whose content is the map. */
+    json: (documentId: string) => layer.live.get(owner, documentId).getMap("data").toJSON() as Record<string, unknown>,
   };
 }
 
@@ -406,6 +417,67 @@ describe("concurrent writes MERGE — they do not concatenate the two documents"
    * That is the same class of permanent, silently-converged corruption the whole-text contract was
    * chosen to PREVENT. The fix is line hunks: touch only what changed.
    */
+  it("DOD-DOC-WATCH-1: a watched field wakes you; an unwatched one does not", async () => {
+    // The wiring, not the matcher. A watch feature whose store and matcher are both correct and whose
+    // inbound hook is never called is exactly the shape this milestone keeps finding.
+    const a = await makeParty("alice");
+    const b = await makeParty("bob");
+    connect(a, b);
+
+    const documentId = (await a.call("cello_doc_propose", {
+      peer_pubkey: b.owner,
+      document_type: "json",
+      starting_content: JSON.stringify({ blocking_flags: { funds: false }, note: "x" }),
+    })).documentId as string;
+    await vi.waitFor(async () =>
+      expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
+    );
+    await b.call("cello_doc_accept", { document_id: documentId });
+
+    // Alice watches the flags, and READS — the read is what establishes the baseline a nudge is
+    // measured against.
+    expect(await a.call("cello_doc_watch", { document_id: documentId, paths: ["blocking_flags"] }))
+      .toMatchObject({ ok: true, paths: ["blocking_flags"] });
+    await a.call("cello_doc_read", { document_id: documentId });
+
+    // Bob changes something she is NOT watching.
+    await b.call("cello_doc_write", {
+      document_id: documentId,
+      content: JSON.stringify({ blocking_flags: { funds: false }, note: "y" }, null, 2) + "\n",
+    });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.json(documentId).note).toBe("y"));
+    expect(a.nudges, "an unwatched field woke her — the nudge is not selective").toEqual([]);
+
+    // Now he changes the flag she IS watching.
+    await b.call("cello_doc_write", {
+      document_id: documentId,
+      content: JSON.stringify({ blocking_flags: { funds: true }, note: "y" }, null, 2) + "\n",
+    });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.nudges.length).toBeGreaterThan(0));
+    expect(a.nudges[0]).toMatchObject({ documentId, paths: ["blocking_flags.funds"] });
+
+    // RINGS ONCE. A peer editing for ten minutes must produce one nudge, not forty.
+    await b.call("cello_doc_write", {
+      document_id: documentId,
+      content: JSON.stringify({ blocking_flags: { funds: true, other: true }, note: "y" }, null, 2) + "\n",
+    });
+    await b.sweep();
+    await vi.waitFor(() => expect((a.json(documentId).blocking_flags as Record<string, unknown>).other).toBe(true));
+    expect(a.nudges.length, "it rang again without her having read").toBe(1);
+
+    // Reading re-arms it — otherwise a document nudges once in its life and then goes quiet, which
+    // is worse than never nudging because the operator would trust the silence.
+    await a.call("cello_doc_read", { document_id: documentId });
+    await b.call("cello_doc_write", {
+      document_id: documentId,
+      content: JSON.stringify({ blocking_flags: { funds: false, other: true }, note: "y" }, null, 2) + "\n",
+    });
+    await b.sweep();
+    await vi.waitFor(() => expect(a.nudges.length).toBe(2));
+  });
+
   it("DOD-DOC-STALE-WRITE-1: a write does NOT delete a peer edit that arrived after your read", async () => {
     // The 226ms incident, end to end. Alice reads, Bob's paragraph is admitted, Alice writes the
     // text she read — which no longer contains it. Before the guard this published a deletion,

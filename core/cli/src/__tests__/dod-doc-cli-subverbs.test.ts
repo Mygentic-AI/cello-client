@@ -43,7 +43,7 @@ function docRunBody(): string {
 /** Every sub-verb the help text advertises to an operator. */
 const ADVERTISED = [
   "inbox", "list", "propose", "accept", "refuse",
-  "read", "write", "diff", "publish", "close", "kill",
+  "read", "write", "diff", "watch", "publish", "close", "kill",
 ];
 
 describe("every advertised `cello doc` sub-verb is actually routed", () => {

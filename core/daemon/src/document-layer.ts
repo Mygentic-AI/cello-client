@@ -33,7 +33,10 @@ import { DocumentAckInbound } from "./document-ack-inbound.js";
 import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
-import { DocumentNotifications } from "./document-notify.js";
+import { DocumentNotifications, changedKeyPaths } from "./document-notify.js";
+import { matchWatchedPaths } from "./document-watch.js";
+import { projectDocumentText } from "./document-json.js";
+import { rootForDocumentType } from "./document-types.js";
 import { DocumentHandshake } from "./document-handshake.js";
 import { DocumentWritePath } from "./document-write-path.js";
 import {
@@ -76,6 +79,14 @@ export interface DocumentLayerDeps {
    * `DocumentFrameRouterDeps.ownerKeyFor` for what a disagreement hides.
    */
   ownerKeyFor(agentName: string): string | null;
+  /**
+   * DOD-DOC-WATCH-1 — ring the operator's agent because a path IT declared it was waiting on has
+   * moved. Injected: the doorbell is the daemon's, not this layer's.
+   *
+   * Called ONLY on a watch hit. A document update raises no doorbell otherwise (§11.3) and that
+   * stands — this is the narrow exception an agent asked for by name.
+   */
+  nudge?(ownerAgentId: string, documentId: string, paths: readonly string[]): void;
   /** Tell the peer about a unilateral end. Injected — the transport is not this layer's. */
   notifyPeer(
     documentId: string,
@@ -333,6 +344,47 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // read than there is.
       const unread = notifications.unreadFromPeer(ownerAgentId, env.document_id);
       notifications.notice(ownerAgentId, env.document_id, unread, Date.now());
+
+      // DOD-DOC-WATCH-1 — the selective nudge.
+      //
+      // Matched against what changed since THIS agent last READ, not against this envelope. Per
+      // envelope re-fires on redelivery and on the peer's every keystroke; the net difference from
+      // the read mark asks the question an operator actually has — has the thing I am waiting on
+      // moved since I saw it — and self-cancels the moment they read.
+      //
+      // Wrapped whole: a notification is a courtesy on a path whose real job (admitting the peer's
+      // update) has already succeeded, and must never be able to fail it.
+      try {
+        const watches = notifications.watches(ownerAgentId, env.document_id);
+        if (watches.length === 0) return;
+        if (!notifications.nudgeOwed(ownerAgentId, env.document_id)) return;
+        const document = store.getDocument(ownerAgentId, env.document_id);
+        if (!document) return;
+        const seen = notifications.lastSeen(ownerAgentId, env.document_id);
+        const after = projectDocumentText(live.get(ownerAgentId, env.document_id), document.documentType);
+        // NEVER READ is not "everything changed" for the purposes of a nudge — the agent has not
+        // established a baseline, so there is nothing it can be waiting on a change to.
+        if (seen === null || seen === after) return;
+        // A text document has no key paths, so the only thing it can report is that it moved. That
+        // is why the whole-document watch has to be spelled `*` rather than implied.
+        const paths =
+          rootForDocumentType(document.documentType) === "map"
+            ? changedKeyPaths(seen, after) ?? ["*"]
+            : ["*"];
+        const hits = matchWatchedPaths(watches, paths);
+        if (hits.length === 0) return;
+        notifications.markNudged(ownerAgentId, env.document_id, Date.now());
+        logger.info("document.watch.nudged", {
+          documentId: env.document_id,
+          paths: hits.length,
+        });
+        deps.nudge?.(ownerAgentId, env.document_id, hits);
+      } catch (err: unknown) {
+        logger.warn("document.watch.nudge_failed", {
+          documentId: env.document_id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     },
     sendFrameToPeer: async (ownerAgentId, inResponseTo, bytes) => {
       // Addressed to whoever AUTHORED the envelope being answered, taken from the envelope itself

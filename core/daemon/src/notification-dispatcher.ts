@@ -115,6 +115,37 @@ export class NotificationDispatcher {
    * Send session_state_changed to connections where the affected agent is current.
    * Routing rule: only connections with currentAgent === agentName receive this.
    */
+  /**
+   * DOD-DOC-WATCH-1 — the ONE doorbell a document update may ring, and only for an agent that asked
+   * for it by naming the paths.
+   *
+   * §11.3's no-doorbell-on-update rule is otherwise intact: a collaborator typing must not interrupt
+   * continuously. This fires only on a path the RECEIVER declared, once, and not again until they
+   * read the document.
+   *
+   * INV-CONTENTFREE holds. The path NAMES travel — `blocking_flags.insufficient_funds` — and no
+   * values do. A path is something this agent wrote down locally and is being told moved; it says
+   * nothing about what the peer put there, which is what `cello_doc_read` is for and what the
+   * screening runs on.
+   */
+  dispatchDocumentWatch(agentName: string, documentId: string, paths: readonly string[]): void {
+    const notification: IpcNotification = {
+      notification: "document_watch",
+      data: {
+        agent: agentName,
+        type: "document_watch",
+        agentName,
+        documentId,
+        paths: [...paths],
+      },
+    };
+    for (const connectionId of this.#getConnectionIds()) {
+      if (this.#currentAgentMap.get(connectionId) === agentName) {
+        this.#safeSend(connectionId, notification, "document_watch");
+      }
+    }
+  }
+
   dispatchSessionStateChanged(
     agentName: string,
     sessionId: string,

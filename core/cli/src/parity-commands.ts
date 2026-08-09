@@ -30,7 +30,7 @@
 
 import { join } from "node:path";
 import { readFile, writeFile, unlink } from "node:fs/promises";
-import { connectToDaemon, readLock, type IpcClient } from "@cello-protocol/daemon";
+import { connectToDaemon, readLock, isAgentRunning, type IpcClient } from "@cello-protocol/daemon";
 import { emitIpcResult, emitTransportError, type EmittedOutput, type EmitOptions } from "./json-out.js";
 
 export type CliOutput = EmittedOutput;
@@ -210,7 +210,12 @@ async function withDaemon(
  */
 async function isAgentOnline(client: IpcClient, name: string): Promise<boolean> {
   const res = (await client.send("cello_list_agents")) as { agents?: Array<{ name?: string; state?: string }> };
-  return (res.agents ?? []).some((a) => a.name === name && a.state === "online");
+  // RUNNING, not literally "online". `online` now additionally requires an attendee, so an agent that
+  // is running and reachable but has nobody at the desk reads `unattended` — and testing for the
+  // string here made every parity command refuse a perfectly healthy agent with
+  // `selected_agent_offline`. The string stayed valid, so the compiler caught none of it; this is
+  // why the predicate exists rather than a second literal comparison.
+  return (res.agents ?? []).some((a) => a.name === name && isAgentRunning(a.state));
 }
 
 /**
@@ -302,6 +307,7 @@ export const IPC_METHODS = {
   "doc-list": "cello_doc_list",
   "doc-read": "cello_doc_read",
   "doc-diff": "cello_doc_diff",
+  "doc-watch": "cello_doc_watch",
   "doc-write": "cello_doc_write",
   "doc-publish": "cello_doc_publish",
   "doc-close": "cello_doc_close",
@@ -858,6 +864,21 @@ export function docRead(celloDir: string, documentId: string, opts: ParityOption
 /** `cello doc diff <document-id>` → cello_doc_diff. What changed since you last read it. */
 export function docDiff(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["doc-diff"], { document_id: documentId }, opts);
+}
+
+/** `cello doc watch <document-id> [paths…]` → cello_doc_watch. No paths LISTS; `--clear` clears. */
+export function docWatch(
+  celloDir: string,
+  documentId: string,
+  paths: string[] | null,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["doc-watch"],
+    paths === null ? { document_id: documentId } : { document_id: documentId, paths },
+    opts,
+  );
 }
 
 /** `cello doc write <document-id> <content…>` → cello_doc_write.

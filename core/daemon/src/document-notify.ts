@@ -61,6 +61,23 @@ const CREATE_NOTICES_SQL = `
  * actually looked at; moving it on an inbound update would erase the very change the diff exists to
  * show, silently, at the moment it arrived.
  */
+/**
+ * DOD-DOC-WATCH-1 — the paths an agent asked to be nudged about, per document.
+ *
+ * `paths` is a JSON array rather than a row per path: the list is small, always read and written
+ * whole, and one row per (agent, document) means the ring-once bookkeeping has somewhere obvious to
+ * live. `nudged_at` NULL means a nudge is owed; a read clears it back to NULL.
+ */
+const CREATE_WATCHES_SQL = `
+  CREATE TABLE IF NOT EXISTS document_watches (
+    agent_id     TEXT    NOT NULL,
+    document_id  TEXT    NOT NULL,
+    paths        TEXT    NOT NULL,
+    nudged_at    INTEGER,
+    PRIMARY KEY (agent_id, document_id)
+  );
+`;
+
 const CREATE_READ_MARKS_SQL = `
   CREATE TABLE IF NOT EXISTS document_read_marks (
     agent_id     TEXT    NOT NULL,
@@ -140,6 +157,7 @@ export class DocumentNotifications {
     this.#logger = logger;
     this.#store.rawDb.exec(CREATE_NOTICES_SQL);
     this.#store.rawDb.exec(CREATE_READ_MARKS_SQL);
+    this.#store.rawDb.exec(CREATE_WATCHES_SQL);
     for (const sql of READ_MARK_COLUMNS) {
       // Birth-gated so a daemon that already holds read marks gains the column instead of losing
       // them. A failure here is either "already present" — the ordinary case — or a locked
@@ -170,6 +188,12 @@ export class DocumentNotifications {
            my_text = NULL`,
       )
       .run(agentId, documentId, text, nowMs);
+    // RE-ARM THE NUDGE. A read is what spends the previous one — see `nudgeOwed`. Without this a
+    // document nudges exactly once in its life and then goes quiet forever, which is worse than not
+    // nudging at all because the operator would trust the silence.
+    this.#store.rawDb
+      .prepare("UPDATE document_watches SET nudged_at = NULL WHERE agent_id = ? AND document_id = ?")
+      .run(agentId, documentId);
   }
 
   /**
@@ -192,6 +216,78 @@ export class DocumentNotifications {
       .prepare("SELECT seen_text, my_text FROM document_read_marks WHERE agent_id = ? AND document_id = ?")
       .get(agentId, documentId) as { seen_text?: string | null; my_text?: string | null } | undefined;
     return [row?.seen_text ?? null, row?.my_text ?? null].filter((t): t is string => t !== null);
+  }
+
+  /**
+   * The paths this agent has asked to be nudged about, for one document. Empty means none — never
+   * "all"; see `matchWatchedPaths`.
+   */
+  watches(agentId: string, documentId: string): string[] {
+    const row = this.#store.rawDb
+      .prepare("SELECT paths FROM document_watches WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { paths?: string } | undefined;
+    if (row?.paths === undefined) return [];
+    try {
+      const parsed = JSON.parse(row.paths) as unknown;
+      return Array.isArray(parsed) ? (parsed as string[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Replace the watch list. An empty list REMOVES the row, so "watching nothing" holds no state. */
+  setWatches(agentId: string, documentId: string, paths: readonly string[]): void {
+    if (paths.length === 0) {
+      this.#store.rawDb
+        .prepare("DELETE FROM document_watches WHERE agent_id = ? AND document_id = ?")
+        .run(agentId, documentId);
+      return;
+    }
+    this.#store.rawDb
+      .prepare(
+        `INSERT INTO document_watches (agent_id, document_id, paths, nudged_at)
+         VALUES (?, ?, ?, NULL)
+         ON CONFLICT (agent_id, document_id) DO UPDATE SET paths = excluded.paths, nudged_at = NULL`,
+      )
+      .run(agentId, documentId, JSON.stringify([...paths]));
+  }
+
+  /** Every document this agent is watching, for the surface that lists them. */
+  allWatches(agentId: string): Array<{ documentId: string; paths: string[] }> {
+    const rows = this.#store.rawDb
+      .prepare("SELECT document_id, paths FROM document_watches WHERE agent_id = ? ORDER BY document_id")
+      .all(agentId) as Array<{ document_id: string; paths: string }>;
+    return rows.map((r) => {
+      let paths: string[] = [];
+      try {
+        const parsed = JSON.parse(r.paths) as unknown;
+        if (Array.isArray(parsed)) paths = parsed as string[];
+      } catch {
+        paths = [];
+      }
+      return { documentId: r.document_id, paths };
+    });
+  }
+
+  /**
+   * Whether a nudge is owed — true only if one has not already fired since this agent last READ.
+   *
+   * RINGS ONCE. A peer editing for ten minutes must produce one nudge, not forty; the Telegram
+   * doorbell coalesces for the identical reason. Reading the document is what re-arms it, because
+   * reading is what makes the earlier nudge spent.
+   */
+  nudgeOwed(agentId: string, documentId: string): boolean {
+    const row = this.#store.rawDb
+      .prepare("SELECT nudged_at FROM document_watches WHERE agent_id = ? AND document_id = ?")
+      .get(agentId, documentId) as { nudged_at?: number | null } | undefined;
+    return row !== undefined && (row.nudged_at ?? null) === null;
+  }
+
+  /** Record that a nudge fired, so it does not fire again until the next read. */
+  markNudged(agentId: string, documentId: string, nowMs: number): void {
+    this.#store.rawDb
+      .prepare("UPDATE document_watches SET nudged_at = ? WHERE agent_id = ? AND document_id = ?")
+      .run(nowMs, agentId, documentId);
   }
 
   markWritten(agentId: string, documentId: string, text: string): void {
@@ -511,7 +607,12 @@ function flatten(value: unknown, prefix = ""): Map<string, string> {
 }
 
 /** The changed key paths, or null when either side does not parse. */
-function changedKeyPaths(before: string, after: string): string[] | null {
+/**
+ * Exported so the WATCH matcher (`DOD-DOC-WATCH-1`) computes paths the same way `cello_doc_diff`
+ * renders them. Two implementations would let an agent be nudged about a path the diff never shows,
+ * or shown a path no watch can name — and either makes the feature untrustworthy.
+ */
+export function changedKeyPaths(before: string, after: string): string[] | null {
   let a: Map<string, string>;
   let b: Map<string, string>;
   try {

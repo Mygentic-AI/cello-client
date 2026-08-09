@@ -22,6 +22,7 @@ cello_doc_refuse({ document_id, reason? })
 cello_doc_list()                             — yours, and where each one stands
 cello_doc_read({ document_id })              — the current text
 cello_doc_diff({ document_id })              — what changed since you last read
+cello_doc_watch({ document_id, paths })      — wake me when THESE fields change (local to you)
 cello_doc_write({ document_id, content })    — replace the text, publish the change
 cello_doc_publish({ document_id })           — publish what is in the document's FILE right now
 cello_doc_close({ document_id })             — you are done; settles when they say so too
@@ -43,6 +44,13 @@ offer something better.
 
 The document may have changed since you last looked, and writing without reading means writing over
 something you never saw.
+
+**`cello_doc_watch` stops you having to keep checking.** A document update rings no doorbell by
+default, so otherwise you learn it moved only when you next read. Name the paths you are waiting on
+and you are woken once when one moves, and not again until you read. Local to you — the counterparty
+cannot wake you by claiming a field is urgent, nor stop you watching one. And once you have declared
+what you are waiting for, silence becomes informative: *"nothing yet"* is a fact rather than an
+absence of one.
 
 **`cello_doc_diff` is the tool for this.** It shows what changed since *you* last read — not since
 the document started — so it answers the question you actually have: what did they do while I was

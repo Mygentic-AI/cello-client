@@ -50,6 +50,7 @@ import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
 import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./document-json.js";
 import { classifyRemovals } from "./document-write-guard.js";
+import { normalizeWatchPaths } from "./document-watch.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
 
@@ -661,6 +662,63 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       peerAgentId: document.peerAgentId,
       status: document.status,
       content,
+    };
+  });
+
+  /**
+   * DOD-DOC-WATCH-1 — declare which paths of a document should wake this agent.
+   *
+   * RECEIVER-LOCAL and nothing goes on the wire. A peer cannot make this agent wake by claiming a
+   * field matters, nor suppress a wake by omitting one; the receiver decides from what actually
+   * changed in its own copy.
+   *
+   * An EMPTY list clears the watch, and clearing is the only way to stop being nudged — there is no
+   * separate unwatch verb to fall out of step with this one.
+   */
+  handlers.set("cello_doc_watch", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    const document = layer.store.getDocument(who.ownerAgentId, documentId);
+    if (!document) {
+      return {
+        ok: false,
+        reason: "document_unknown",
+        guidance: `No document ${documentId.slice(0, 16)}… for this agent. See cello_doc_list.`,
+      };
+    }
+    const raw = Array.isArray(params?.paths) ? (params.paths as unknown[]).filter((p): p is string => typeof p === "string") : null;
+    if (raw === null) {
+      // LISTED, not silently treated as "clear". A caller that omits `paths` is asking what is set,
+      // and answering "cleared" would turn a read into a destructive act.
+      return { ok: true, documentId, paths: layer.notifications.watches(who.ownerAgentId, documentId) };
+    }
+    let paths: string[];
+    try {
+      paths = normalizeWatchPaths(raw);
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        reason: "watch_path_invalid",
+        guidance: err instanceof Error ? err.message : String(err),
+      };
+    }
+    layer.notifications.setWatches(who.ownerAgentId, documentId, paths);
+    logger.info("document.watch.set", { documentId, paths: paths.length });
+    return {
+      ok: true,
+      documentId,
+      paths,
+      ...(paths.length === 0
+        ? { guidance: "Watch cleared — this document will no longer wake you." }
+        : {
+            guidance:
+              `You will be woken once when any of these move, and not again until you read the ` +
+              `document. Nothing was sent to your counterparty: this is local to you.`,
+          }),
     };
   });
 

@@ -3495,6 +3495,13 @@ async function startDaemonHoldingLock(
     // how the surface tests passed while the feature did nothing: the test wired this seam to
     // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever
     // the near side did.
+    // DOD-DOC-WATCH-1 — the ONLY doorbell a document update can ring, and only for an agent that
+    // asked for it by naming the paths. §11.3's no-doorbell-on-update rule is otherwise untouched.
+    nudge: (ownerAgentId, documentId, paths) => {
+      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
+      if (!agentName) return;
+      notificationDispatcher.dispatchDocumentWatch(agentName, documentId, paths);
+    },
     notifyPeer: createDocumentControlNotifier({
       get store() {
         // Lazily, because `documentLayer` is what is being constructed. The notifier is only ever

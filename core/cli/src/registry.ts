@@ -45,6 +45,7 @@ import {
   docList,
   docRead,
   docDiff,
+  docWatch,
   docWrite,
   docPublish,
   docClose,
@@ -1027,6 +1028,10 @@ export const COMMANDS: readonly CommandSpec[] = [
     // Caught on the first command of the first live smoke, which is the only place it could be —
     // the parity tests call the exported functions directly and never go through argument parsing.
     flags: [
+      // `--clear` must be DECLARED, not merely read in the body — `checkArgs` validates against this
+      // list, so an undeclared flag is rejected before `run` executes. This is the exact trap the
+      // note above records for `--type`/`--content`/`--append-only`.
+      { name: "--clear", consumesValue: false },
       // `--agent` is `consumesValue: false` to match every other command — see the note on
       // AGENT_FLAG above: true would turn a typo like `--agent --bogus` from a loud unknown_flag
       // into a silently swallowed one.
@@ -1052,6 +1057,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  cello doc diff <document-id>                      — what changed since you last read it\n" +
       "  cello doc write <document-id> <text…>             — replace the text and publish the change\n" +
       "  cello doc publish <document-id>                   — publish what is in the FILE right now\n" +
+      "  cello doc watch <document-id> [paths…|--clear]    — wake me when these fields change; no paths lists\n" +
       "  cello doc close <document-id>                     — you are done; it settles when they say so too\n" +
       "  cello doc kill <document-id>                      — end it now, one-sided\n" +
       "\n" +
@@ -1103,6 +1109,14 @@ export const COMMANDS: readonly CommandSpec[] = [
       }
       if (sub === "read" && target) return docRead(ctx.celloDir, target, o);
       if (sub === "diff" && target) return docDiff(ctx.celloDir, target, o);
+      if (sub === "watch" && target) {
+        // No paths LISTS the current watch; `--clear` sets an empty list. Two different intents, and
+        // conflating "no arguments" with "clear" would make a read destructive.
+        const rest = positional.slice(2);
+        const clear = args.includes("--clear");
+        const paths = clear ? [] : rest.length > 0 ? rest : null;
+        return docWatch(ctx.celloDir, target, paths, o);
+      }
       if (sub === "publish" && target) return docPublish(ctx.celloDir, target, o);
       if (sub === "close" && target) return docClose(ctx.celloDir, target, o);
       if (sub === "kill" && target) return docKill(ctx.celloDir, target, o);
