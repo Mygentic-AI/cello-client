@@ -190,7 +190,15 @@ export function decodeSubmission(bytes: Uint8Array): SignedSubmission {
     throw new Error(`submission_malformed: wrong domain tag — refusing to read a foreign structure`);
   }
   const op = str(decoded[2], "op");
-  if (op !== "submit" && op !== "withdraw" && op !== "refuse") {
+  // KEEP THIS LIST IN STEP WITH `SubmissionOp`. It is the RUNTIME half, and a type has no runtime
+  // effect — widening the union alone changes nothing here.
+  //
+  // That is not hypothetical: `revoke` was added to the union, published, promoted, and the portal
+  // still threw `unknown op 'revoke'` on every revocation. The submission was then classified
+  // POISON — which is documented as unattributable and therefore reports nothing to anybody — acked,
+  // and deleted. The operator was told "queued" and would have waited forever. Caught on the live
+  // proof, after the type change had been shipped twice.
+  if (op !== "submit" && op !== "withdraw" && op !== "refuse" && op !== "revoke") {
     throw new Error(`submission_malformed: unknown op '${op}'`);
   }
   const subjectKind = str(decoded[3], "subject_kind");

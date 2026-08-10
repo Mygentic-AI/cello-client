@@ -15,6 +15,7 @@ import {
   decodeSubmission,
   submissionId,
   type SubmissionBody,
+  type SubmissionOp,
 } from "../submission.js";
 import { AGENT_REVOCATION_DOMAIN } from "../revocation.js";
 import { TRUST_SIGNAL_DOMAIN } from "../trust-signal.js";
@@ -204,5 +205,49 @@ describe("M10B-D4 — the `refuse` op", () => {
       new Uint8Array(64),
     ]);
     expect(() => decodeSubmission(bytes)).toThrow(/unknown op 'publish'/);
+  });
+});
+
+/**
+ * THE TYPE AND THE RUNTIME VALIDATOR MUST AGREE — a type has no runtime effect.
+ *
+ * `revoke` was added to `SubmissionOp`, published, and promoted to `latest`. Everything typechecked
+ * on both sides. The portal still threw `submission_malformed: unknown op 'revoke'` on every
+ * revocation, because `decodeSubmission` carries its own literal list that the union does not touch.
+ *
+ * What that cost: the submission was classified POISON — documented as unattributable, so nothing is
+ * reported to anybody — then acked and deleted. The operator was told "queued" and would have waited
+ * forever for an outcome that could never come. It survived a full unit review (which correctly
+ * flagged the symptom) and two publishes, and was only caught by running the live proof.
+ *
+ * So: every op in the union round-trips through the encoder and decoder. Add a verb to the union
+ * without adding it to the validator and this goes red.
+ */
+describe("every SubmissionOp survives a round trip — the union is not the validator", () => {
+  const ALL_OPS: SubmissionOp[] = ["submit", "withdraw", "refuse", "revoke"];
+
+  it.each(ALL_OPS)("op '%s' encodes and decodes", (op) => {
+    const body: SubmissionBody = {
+      v: 1,
+      op,
+      subject_kind: "agent",
+      subject: "aa".repeat(32),
+      submitter_pubkey: "bb".repeat(32),
+      body: "x",
+      issued_at: 1_768_000_000,
+    };
+    const encoded = encodeSubmission(body, new Uint8Array(64));
+    const decoded = decodeSubmission(encoded);
+    expect(decoded.body.op, `'${op}' is in SubmissionOp but the decoder rejects it`).toBe(op);
+  });
+
+  it("still refuses a genuinely unknown verb", () => {
+    // The validator must stay a validator. Widening it to accept anything would trade one silent
+    // failure for a worse one — an unrecognised verb minting as whatever the dispatch defaults to.
+    const body = {
+      v: 1, op: "definitely_not_a_verb", subject_kind: "agent", subject: "aa".repeat(32),
+      submitter_pubkey: "bb".repeat(32), body: "x", issued_at: 1_768_000_000,
+    } as unknown as SubmissionBody;
+    expect(() => decodeSubmission(encodeSubmission(body, new Uint8Array(64)))).toThrow(/unknown op/);
   });
 });
