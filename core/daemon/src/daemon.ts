@@ -101,6 +101,7 @@ import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
+import { revocabilityOf } from "./signal-revocability.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
 import { resolveAgentState } from "./agent-state.js";
@@ -2892,6 +2893,31 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${hashPrefix}'.` };
     }
     const signalHash = row.signalHash;
+
+    // ── CATEGORY CHECK, BEFORE ANYTHING IS DESTROYED ───────────────────────────────────────────
+    //
+    // This handler used to accept ANY signal in the wallet by hash and go — no type check at all.
+    // The signal used in the 2026-08-10 live test was a `track_record`, and the tool accepted the
+    // instruction to destroy it and deleted the local copy. Had the directory path been working,
+    // an operator could have deleted their own behavioural history: precisely what the
+    // mandatory-signal rule exists to prevent.
+    //
+    // Placed BEFORE the signing and before the local delete, because the local delete is
+    // unconditional further down — a refusal that happens after it would still have destroyed the
+    // operator's copy.
+    //
+    // This is a courtesy, NOT the enforcement: an operator can edit this file. The portal refuses
+    // mandatory revocations server-side, and the directory already makes a non-issuer's tombstone
+    // inert for attestations. See signal-revocability.ts.
+    const revocability = revocabilityOf(row.type);
+    if (!revocability.revocable) {
+      return {
+        ok: false,
+        reason: revocability.category === "mandatory" ? "signal_not_revocable" : "revoke_via_portal",
+        signal_type: row.type,
+        guidance: revocability.guidance,
+      };
+    }
 
     // Find the first loaded agent to sign the revoke request.
     const firstAgent = loadedAgents[0];
