@@ -73,35 +73,55 @@ describe("which signals an operator may revoke", () => {
 });
 
 /**
- * WHERE the check sits is as load-bearing as the check itself.
+ * WHERE the check sits is as load-bearing as the check itself — and what the handler NO LONGER does
+ * is now the stronger assertion.
  *
- * The handler's local delete is unconditional — the code says so: "Always hard-delete locally
- * regardless of directory result". A category refusal placed after it would still have destroyed
- * the operator's only copy before saying no.
+ * The handler used to sign a revoke request, POST it at the directory's health port, and then
+ * hard-delete the local copy "regardless of directory result". A category refusal placed after any
+ * of that would still have destroyed the operator's only copy before saying no.
+ *
+ * It now queues a sealed submission to the portal instead, and deletes NOTHING. So the ordering
+ * assertion becomes: refuse before you queue — and the absence assertion becomes: this handler must
+ * never delete the wallet copy, because a failure has to leave the operator able to retry.
  */
-describe("the refusal happens before anything is destroyed", () => {
+describe("the refusal happens before anything leaves, and nothing is destroyed", () => {
   const daemon = readFileSync(join(import.meta.dirname, "..", "daemon.ts"), "utf8");
   const handler = daemon.slice(daemon.indexOf('handlers.set("wallet_revoke_signal"'));
-  const body = handler.slice(0, handler.indexOf('handlers.set("', 10));
+  const withComments = handler.slice(0, handler.indexOf('handlers.set("', 10));
+  // CODE ONLY. The absence assertions below name the very things the comments EXPLAIN — the health
+  // port, the old route — so matching raw text makes the handler's own documentation fail the test.
+  // Exactly the trap the SELECT * guard hit earlier today, one layer along: comments are prose, and
+  // prose must be stripped before code is matched.
+  const body = withComments
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split("\n")
+    .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+    .join("\n");
 
   it("locates the handler (guards this check against passing vacuously)", () => {
-    expect(body).toMatch(/removeWalletSignal/);
+    expect(body).toMatch(/submitForAgent/);
     expect(body.length).toBeGreaterThan(200);
   });
 
-  it("checks revocability BEFORE the local delete", () => {
+  it("checks revocability BEFORE queueing anything", () => {
     const check = body.indexOf("revocabilityOf(");
-    const del = body.indexOf("removeWalletSignal(");
+    const submit = body.indexOf("submitForAgent(");
     expect(check, "the category check must be present").toBeGreaterThan(-1);
-    expect(check, "refusing after the delete would still destroy the operator's copy").toBeLessThan(del);
+    expect(submit, "the submission must be present").toBeGreaterThan(-1);
+    expect(check, "queueing a revocation we then refuse would put a signed request on the wire for nothing")
+      .toBeLessThan(submit);
   });
 
-  it("checks revocability BEFORE signing a revoke request", () => {
-    // Signing first would put a signed destruction request on the wire for a signal we then refuse
-    // to destroy locally — the two halves disagreeing is how divergence starts.
-    const check = body.indexOf("revocabilityOf(");
-    const sign = body.indexOf("await kp.sign(");
-    expect(sign, "the signing step must be present").toBeGreaterThan(-1);
-    expect(check).toBeLessThan(sign);
+  it("NEVER deletes the local copy — a failed retraction must leave a retry possible", () => {
+    // The old handler deleted unconditionally, so a failure destroyed the operator's copy AND the
+    // ability to try again. Since the directory half never worked, that was every retraction.
+    expect(body, "the wallet copy must survive until the portal confirms").not.toMatch(/removeWalletSignal/);
+  });
+
+  it("does NOT post to a directory over HTTP any more", () => {
+    // The route it aimed at is firewalled to the VPC and was never reachable from an operator's
+    // machine; the port it actually hit was the health check. Both are gone.
+    expect(body).not.toMatch(/internal\/signal\/revoke/);
+    expect(body).not.toMatch(/resolveDirectoryUrl/);
   });
 });

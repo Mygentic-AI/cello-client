@@ -297,7 +297,7 @@ server.tool("cello_trust_signals_disable", "Exclude a signal from the default pr
   return jsonText(result);
 });
 
-server.tool("cello_trust_signals_revoke", "Tombstone a signal at the directory AND delete it locally. This is the correct way to retract a signal: the directory stops delivering it to other agents. It is NOT reversible and it is not the same as disabling — disable hides it from your default bundle, revoke destroys it.", {
+server.tool("cello_trust_signals_revoke", "Retract a trust signal about you — your GitHub link, say. The request is QUEUED to the CELLO portal (sealed; the directory cannot read it), which checks the signal is one you may retract and then revokes it at the directory, so the answer here is `queued`, not `revoked`; the outcome arrives on the results channel. Your local copy is deliberately KEPT until it is confirmed, so a failure leaves you able to retry. Some signals are refused: your track record, verified email and phone are part of the behavioural record and are never revocable, and passkey/authenticator signals mirror a portal security factor — turn the factor off in the portal and the signal goes with it. Not the same as disabling, which just hides a signal from your default bundle.", {
   hash_prefix: z.string().describe("The signal hash, or a prefix of it (min 8 hex chars)"),
 }, async ({ hash_prefix }) => {
   const result = await proxy.call("wallet_revoke_signal", { hash_prefix });

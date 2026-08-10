@@ -50,8 +50,29 @@ export const SUBMISSION_DOMAIN = "CELLO-SUBMIT-v1";
  * changes no field and no order — so every signature already made over a `submit` or `withdraw`
  * body still verifies. For `refuse` and `withdraw` alike, `subject` is the TARGET SIGNAL HASH: both
  * act on an existing signal instead of asserting a fact about a party.
+ *
+ * `revoke` (M10B / DOD-END-REVOKE-3) is the SUBJECT retracting a signal the PORTAL issued about
+ * them — their GitHub link, say. `subject` is the TARGET SIGNAL HASH, as for `refuse`/`withdraw`.
+ *
+ * ── WHY THIS RIDES THE SUBMISSION QUEUE AND NOT A DIRECT CALL TO THE DIRECTORY ─────────────────
+ * The daemon used to POST this straight at a directory, and it could never have worked: it aimed at
+ * the health port, and the real route is on the internal API, which is firewalled to the VPC and
+ * unreachable from an operator's machine by any URL.
+ *
+ * But the deciding reason is not reachability, it is ENFORCEMENT. Certain signals must not be
+ * revocable at all — a `track_record` its subject can delete is worth nothing to anyone — and that
+ * rule cannot live at the directory, which deliberately cannot tell a `track_record` from a
+ * `github_id`: `type` is an opaque string with no enum precisely so a new signal type never needs a
+ * directory deploy (`DOD-INV-ZERO-BUMP`). Both are portal-issued, so `issuer_kind` does not separate
+ * them either. A direct agent→directory verb would therefore revoke a behavioural record on request,
+ * leaving only an editable client in the way — which is no enforcement at all.
+ *
+ * The PORTAL minted the signal and knows what it is. So the category check lives where it can
+ * actually be enforced, and this op is how the request reaches it. It costs asynchrony — the answer
+ * is "queued" and the outcome arrives on the results channel — and that is the price of the rule
+ * being real rather than advisory.
  */
-export type SubmissionOp = "submit" | "withdraw" | "refuse";
+export type SubmissionOp = "submit" | "withdraw" | "refuse" | "revoke";
 
 /** The number of elements in the TBS array, INCLUDING the domain tag. Bump only with the wire. */
 const TBS_ARITY = 8;

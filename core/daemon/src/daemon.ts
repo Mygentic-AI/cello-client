@@ -117,7 +117,7 @@ import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
 import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS } from "./away-detection.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
-import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
+import { decodeCbor } from "@cello-protocol/protocol-types";
 
 
 export interface DaemonHandle {
@@ -2916,7 +2916,7 @@ async function startDaemonHoldingLock(
     };
   });
 
-  handlers.set("wallet_revoke_signal", async (params, _connectionId) => {
+  handlers.set("wallet_revoke_signal", async (params, connectionId) => {
     const hashPrefix = typeof params?.hash_prefix === "string" ? params.hash_prefix : null;
     if (!hashPrefix || hashPrefix.length < 8) {
       return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
@@ -2958,56 +2958,55 @@ async function startDaemonHoldingLock(
       };
     }
 
-    // Find the first loaded agent to sign the revoke request.
-    const firstAgent = loadedAgents[0];
-    if (!firstAgent) {
-      return { ok: false, reason: "no_agent", guidance: "No agent loaded. Run 'cello login' first." };
-    }
-    const kp = keyProviders.get(firstAgent.name);
-    if (!kp) {
-      return { ok: false, reason: "no_agent_key", guidance: "Agent key not available." };
-    }
-
-    // Build and sign the CBOR revoke request.
-    const nowSec = Math.floor(Date.now() / 1000);
-    const bodyBytes = encodeCbor({ v: 1, op: "revoke", signal_hash: signalHash, issued_at: nowSec });
-    const sigBytes = await kp.sign(bodyBytes);
-    const pubkeyHex = firstAgent.pubkey;
-    const sigHex = Buffer.from(sigBytes).toString("hex");
-    const bodyHex = Buffer.from(bodyBytes).toString("hex");
-
-    // POST to all directory nodes (best-effort — all reachable nodes get the tombstone).
-    const directoryUrl = resolveDirectoryUrl(process.env);
-    const directoryUrls = [directoryUrl];
-    const results: Array<{ url: string; ok: boolean; detail?: string }> = [];
-    for (const url of directoryUrls) {
-      try {
-        const resp = await fetch(`${url}/internal/signal/revoke`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/cbor",
-            "x-cello-signer-pubkey": pubkeyHex,
-            "x-cello-signature": sigHex,
-            "x-body-hex": bodyHex,
-          },
-          body: bodyBytes,
-        });
-        const json = await resp.json() as { ok?: boolean; error?: string; detail?: string };
-        results.push({ url, ok: !!json.ok, detail: json.error ?? json.detail });
-        if (!resp.ok && !json.ok) {
-          logger.warn("signal.wallet.revoke.directory_rejected", { url, signalHash, detail: json.error ?? json.detail });
-        }
-      } catch (err: unknown) {
-        const detail = err instanceof Error ? err.message : String(err);
-        results.push({ url, ok: false, detail });
-        logger.warn("signal.wallet.revoke.directory_unreachable", { url, signalHash, detail });
-      }
+    // ── VIA THE PORTAL'S SUBMISSION QUEUE, NOT A DIRECT CALL TO A DIRECTORY ────────────────────
+    //
+    // What was here POSTed `/internal/signal/revoke` to port 9090 — the HEALTH port — took the 404
+    // as an answer, returned `ok: true` regardless, and hard-deleted the local copy "regardless of
+    // directory result". Measured 2026-08-10 against the live fleet: all three nodes unchanged, the
+    // operator's copy gone, and the tool reporting success. It also asked ONE node under a comment
+    // claiming it asked all three.
+    //
+    // The route is not the fix for a wrong port. The real route lives on the internal API, which is
+    // firewalled to the VPC subnets and unreachable from an operator's machine by any URL. And the
+    // deciding reason is ENFORCEMENT, not reachability: the directory deliberately cannot tell a
+    // `track_record` from a `github_id` (opaque `type`, no enum, so a new signal type never needs a
+    // directory deploy), and both are portal-issued, so `issuer_kind` does not separate them. A
+    // direct verb would revoke a behavioural record on request with only an editable client in the
+    // way. The PORTAL minted the signal and knows what it is, so the category rule can be real there
+    // rather than advisory here.
+    //
+    // Rides the EXISTING sealed submission queue — same path as an endorsement, same results
+    // channel. No new wire verb.
+    const submitted = await submitForAgent({
+      connectionId,
+      op: "revoke",
+      // The TARGET SIGNAL HASH, exactly as `refuse` and `withdraw` carry it — this acts on an
+      // existing signal rather than asserting a fact about a party.
+      subjectKind: row.subjectKind,
+      subject: signalHash,
+      body: "",
+      context: "The revocation was NOT queued:",
+    });
+    if (!submitted.queued) {
+      return { ok: false, reason: submitted.reason, guidance: submitted.guidance };
     }
 
-    // Always hard-delete locally regardless of directory result.
-    const removed = store.removeWalletSignal(signalHash);
-    logger.info("signal.wallet.revoked", { signalHash, directoryResults: results.map((r) => ({ url: r.url, ok: r.ok })) });
-    return { ok: true, signal_hash: signalHash, removed_locally: removed, directory_results: results };
+    // THE LOCAL COPY SURVIVES. It used to be deleted unconditionally, so a failed retraction also
+    // destroyed the ability to retry — and since the directory half never worked, that was every
+    // retraction. The signal stays until the portal confirms the revocation; the operator can see
+    // the outcome with cello_attestations_issued and the wallet reflects it on the next refresh.
+    return {
+      ok: true,
+      signal_hash: signalHash,
+      submission_id: submitted.submissionId,
+      revoked: false,
+      queued: true,
+      guidance:
+        `Revocation QUEUED for '${row.type}' — not yet revoked. The portal opens it, checks the ` +
+        `signal is one you may retract, and revokes it at the directory; the outcome comes back on ` +
+        `the results channel. Your local copy is kept until then, deliberately, so a failure leaves ` +
+        `you able to retry.`,
+    };
   });
 
   // ─── MCP-001: cello_status (per-connection perspective) ───

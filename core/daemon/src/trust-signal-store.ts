@@ -128,8 +128,13 @@ export interface ReceivedSignalInput extends Omit<WalletSignalInput, "status"> {
   verdict: SignalStatus;
 }
 
-/** The submission verbs. Mirrors protocol-types' `SubmissionOp` without importing it into storage. */
-export type SubmissionOpName = "submit" | "withdraw" | "refuse";
+/**
+ * The submission verbs. Mirrors protocol-types' `SubmissionOp` without importing it into storage.
+ *
+ * MIRRORED, SO IT DRIFTS. Widening `SubmissionOp` and not this one is a type error at the call
+ * site rather than a silent divergence — which is how `revoke` was caught. Keep them in step.
+ */
+export type SubmissionOpName = "submit" | "withdraw" | "refuse" | "revoke";
 
 export interface IssuedSubmissionInput {
   agentId: string;
