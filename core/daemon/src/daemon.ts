@@ -2815,10 +2815,29 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
     }
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-    const item = store.listPendingConsent(sel.pubkey).find((r) => r.signalHash.startsWith(prefix));
+    // REFUSAL IS REACHABLE AFTER ACCEPTANCE, not only while pending.
+    //
+    // "I accepted this endorsement and now I want it gone" had NO path: refusal was pending-only and
+    // revocation is the issuer's to perform, not the subject's. Refusing an accepted item is the
+    // answer, and it is the better one — the decision is RECORDED rather than erased, so the trail
+    // stays honest, and a refused signal is already inert everywhere it is checked.
+    //
+    // Peer-issued only (`issuer_kind <> 'portal'`, enforced in the store). Refusal makes a signal
+    // inert, so allowing it on portal-issued signals would be a back door to suppressing a MANDATORY
+    // track record — achieving by consent exactly what revocation is forbidden from doing.
+    const item = store.findDecidableConsent(sel.pubkey, prefix);
     if (!item) {
-      return { ok: false, reason: "not_pending_for_agent", guidance: `No pending consent item for '${sel.name}' with prefix '${prefix}'.` };
+      return {
+        ok: false,
+        reason: "not_decidable_for_agent",
+        guidance:
+          `No pending or accepted attestation for '${sel.name}' with prefix '${prefix}'. Refusal ` +
+          `applies to attestations another party issued ABOUT you — signals the portal issued (your ` +
+          `track record, verified email and phone, GitHub links, security factors) are not refused ` +
+          `here. Run cello_attestation_consent_list to see what is decidable.`,
+      };
     }
+    const wasAccepted = item.consentState === "accepted";
     // ORDER IS LOAD-BEARING: the refusal is recorded FIRST and is never conditional on the message
     // getting out. A refusal that only takes effect if the network cooperates would leave a signal
     // Alice believes she rejected sitting in an unrefused state — the exact failure INV-CONSENT
@@ -2831,7 +2850,27 @@ async function startDaemonHoldingLock(
       return { ok: false, reason: "consent_write_failed",
         guidance: `The refusal was NOT recorded — the signal row changed underneath this call. Run cello_attestation_consent_list and retry.` };
     }
-    const refused = { ok: true as const, signal_hash: item.signalHash, consent_state: "refused" as const };
+    const refused = {
+      ok: true as const,
+      signal_hash: item.signalHash,
+      consent_state: "refused" as const,
+      // WITHDRAWN vs REFUSED, told apart in the response, because they are different acts and the
+      // operator needs to know which one just happened. Also flags the supersession consequence:
+      // accepting a re-issue supersedes what it replaced, and refusing it afterwards does NOT bring
+      // the predecessor back. Withdrawing consent from a replacement can therefore leave you with
+      // neither — surfaced rather than discovered.
+      ...(wasAccepted
+        ? {
+            withdrawn_after_acceptance: true,
+            guidance:
+              `Consent WITHDRAWN — you had accepted this and it is now refused, so it stops being ` +
+              `presented anywhere. The record of the decision remains, which is what keeps the trail ` +
+              `honest. Note: if this attestation superseded an earlier one when you accepted it, the ` +
+              `earlier one stays superseded — withdrawing from a replacement does not restore what it ` +
+              `replaced.`,
+          }
+        : {}),
+    };
 
     // M10B-D4: the message back to the issuer is the subject's CHOICE. Silence is the default, and a
     // silent refusal tells Bob NOTHING — which is what keeps D-24 intact for anyone who wants it.

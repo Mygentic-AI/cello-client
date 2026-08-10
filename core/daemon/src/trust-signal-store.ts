@@ -905,6 +905,47 @@ export class TrustSignalStore {
    * not about authority. Recorded as an open question on `DOD-END-SURFACE-1` rather than settled by
    * whichever predicate got copied first.
    */
+  /**
+   * Find a consent item this agent may DECIDE ON — pending, or ALREADY ACCEPTED.
+   *
+   * Refusal used to be reachable only while an item was `pending`, so "I accepted this endorsement
+   * and now I want it gone" had no path at all. This widens it, and the widening is the whole point:
+   * a refused signal is inert everywhere it is checked, which is the mechanism for taking back
+   * something you previously agreed to show.
+   *
+   * ── `issuer_kind <> 'portal'` IS THE LOAD-BEARING CLAUSE, NOT A TIDY-UP ────────────────────────
+   * Refusal makes a signal inert. So widening refusal without this filter would hand every operator
+   * a back door to suppressing their own MANDATORY signals — refuse your `track_record` and it stops
+   * being presented, achieving by consent exactly what revocation is forbidden from doing. The
+   * behavioural record is portal-issued; peer-claimed attestations are not. That is the axis, and it
+   * is the same one the DIRECTORY uses (`issuer_kind`), rather than a list of type names the client
+   * would have to keep in step.
+   *
+   * Deliberately NOT filtered by type: a hostile peer can issue a signal it CALLS `track_record`, and
+   * refusing a stranger's claim about you is precisely what this is for. The mandatory rule protects
+   * the portal's behavioural record, never a third party's assertion.
+   *
+   * Same agent-scoping predicate as `listPendingConsent` — including its unresolved question about
+   * who may decide for an account-subject item. Copied rather than diverged: two different answers to
+   * "may this agent decide" would be worse than one unresolved answer.
+   */
+  findDecidableConsent(agentPubkeyHex: string, prefix: string): WalletSignalRow | null {
+    requireAgentPubkeyHex(agentPubkeyHex, "findDecidableConsent");
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM wallet_trust_signals
+          WHERE consent_state IN ('pending', 'accepted')
+            AND status = 'active'
+            AND issuer_kind <> 'portal'
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (subject_kind <> 'agent' OR lower(subject) = ?)
+            AND signal_hash LIKE ? || '%'
+          ORDER BY received_at ASC`,
+      )
+      .all(Math.floor(Date.now() / 1000), agentPubkeyHex, prefix) as unknown as EnvelopeDbRow[];
+    return rows.length > 0 ? toWalletRow(rows[0]!) : null;
+  }
+
   listPendingConsent(agentPubkeyHex: string): WalletSignalRow[] {
     requireAgentPubkeyHex(agentPubkeyHex, "listPendingConsent");
     const rows = this.#db
