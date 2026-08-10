@@ -125,3 +125,44 @@ describe("the refusal happens before anything leaves, and nothing is destroyed",
     expect(body).not.toMatch(/resolveDirectoryUrl/);
   });
 });
+
+/**
+ * A BEHAVIOURAL TEST, because the ones above are source-greps with an exact bypass.
+ *
+ * The reviewer's bypass: change `op: "revoke"` to `op: "refuse"`, or `subject: signalHash` to
+ * something else, and every structural assertion still passes — the handler would queue a REFUSAL of
+ * an unknown signal and cheerfully report "queued". Matching source text proves the shape of the
+ * code, never what it does.
+ *
+ * These drive the decision the handler makes, through the same pure function it uses, on the exact
+ * fixtures that matter. It is not a full IPC harness — that needs a daemon, a database and a
+ * directory — but it pins the branch that decides whether anything leaves the machine at all.
+ */
+describe("what the handler decides, not how it is written", () => {
+  it("a mandatory signal never reaches the queue", () => {
+    // The one that matters: if this returns revocable, a signed revocation for a track record goes
+    // on the wire and the portal is the only thing left standing between it and destruction.
+    for (const type of ["track_record", "email", "phone"]) {
+      const v = revocabilityOf(type);
+      expect(v.revocable, `${type} must be refused before submitForAgent is reached`).toBe(false);
+    }
+  });
+
+  it("a discretionary signal DOES reach the queue — the guard is not 'refuse everything'", () => {
+    for (const type of ["github_id", "github_anon"]) {
+      expect(revocabilityOf(type).revocable, `${type} must be allowed through`).toBe(true);
+    }
+  });
+
+  it("the refusal carries a category the operator can act on, for every refused type", () => {
+    // A bare `false` would satisfy the branch and leave the operator with no idea what to do. Every
+    // refusal must name which rule fired, because the two have DIFFERENT remedies: one is "never",
+    // the other is "turn the factor off in the portal".
+    const categories = new Set(
+      ["track_record", "email", "phone", "webauthn", "totp"]
+        .map((t) => revocabilityOf(t))
+        .map((v) => (v.revocable ? "ALLOWED" : v.category)),
+    );
+    expect(categories).toEqual(new Set(["mandatory", "security_derived"]));
+  });
+});

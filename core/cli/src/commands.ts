@@ -1061,17 +1061,29 @@ export async function trustSignals(
       const result = (await withIpc(lock.socketPath, (client) => client.send("wallet_revoke_signal", { hash_prefix: prefix }))) as {
         ok: boolean;
         signal_hash?: string;
-        removed_locally?: boolean;
-        directory_results?: Array<{ url: string; ok: boolean; detail?: string }>;
+        submission_id?: string;
+        queued?: boolean;
         reason?: string;
         guidance?: string;
       };
       if (!result.ok) {
         return { exitCode: 1, output: result.guidance ?? result.reason ?? "failed to revoke signal" };
       }
-      const dirOk = result.directory_results?.every((r) => r.ok) ?? false;
-      const dirNote = dirOk ? "directory tombstone set" : "directory unreachable — tombstone may be pending";
-      return { exitCode: 0, output: `Revoked signal ${result.signal_hash}. ${dirNote}.` };
+      // QUEUED, NOT REVOKED — and the daemon's own guidance says what happens next.
+      //
+      // This printed `Revoked signal <hash>. directory unreachable — tombstone may be pending.` on
+      // every success, at exit 0. Three untruths in one line: it was not revoked, no directory was
+      // contacted from here, and `directory_results` had stopped existing so `every()` on undefined
+      // fell to `false` and the failure branch ran unconditionally. It also DROPPED the daemon's
+      // guidance, which is the only place the operator learns that their local copy is kept and how
+      // to check the outcome.
+      return {
+        exitCode: 0,
+        output:
+          `Revocation queued for ${result.signal_hash}` +
+          (result.submission_id ? ` (submission ${result.submission_id.slice(0, 12)}…)` : "") +
+          (result.guidance ? `\n${result.guidance}` : ""),
+      };
     } catch (err: unknown) {
       return { exitCode: 1, output: `Failed to revoke signal: ${err instanceof Error ? err.message : String(err)}` };
     }
@@ -1085,7 +1097,7 @@ export async function trustSignals(
       "  cello trust-signals view <hash>       — decode and display a signal's full payload\n" +
       "  cello trust-signals enable <hash>     — include signal in the default presentation bundle\n" +
       "  cello trust-signals disable <hash>    — exclude signal from the default bundle\n" +
-      "  cello trust-signals revoke <hash>     — tombstone at directory AND delete locally\n" +
+      "  cello trust-signals revoke <hash>     — ask the portal to retract a signal (queued; your copy is kept)\n" +
       "\n" +
       "<hash> can be a prefix (min 8 chars). See 'cello trust-signals list' for hashes.",
   };

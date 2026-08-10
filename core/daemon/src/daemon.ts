@@ -2921,6 +2921,9 @@ async function startDaemonHoldingLock(
     if (!hashPrefix || hashPrefix.length < 8) {
       return { ok: false, reason: "invalid_prefix", guidance: "hash_prefix must be at least 8 hex characters." };
     }
+    const resolvedAgent = resolveSelectedAgent(connectionId);
+    if (!resolvedAgent.ok) return resolvedAgent;
+    const sel = resolvedAgent;
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
     let row;
     try {
@@ -2948,6 +2951,22 @@ async function startDaemonHoldingLock(
     // This is a courtesy, NOT the enforcement: an operator can edit this file. The portal refuses
     // mandatory revocations server-side, and the directory already makes a non-issuer's tombstone
     // inert for attestations. See signal-revocability.ts.
+    // M7: THE WALLET LOOKUP IS NOT AGENT-SCOPED, so refuse here rather than queue under the wrong
+    // key. `getWalletSignalByPrefix` matches on hash alone, and several agents share this daemon's
+    // database — so the SELECTED agent could sign a revocation for a signal that is another agent's.
+    // The portal blocks it across accounts, but within one account it would silently succeed under
+    // the wrong agent's key, and across accounts the operator waits for an async `not_authorized`
+    // instead of being told immediately.
+    if (row.subjectKind === "agent" && row.subject.toLowerCase() !== sel.pubkey.toLowerCase()) {
+      return {
+        ok: false,
+        reason: "not_your_signal",
+        guidance:
+          `That signal is about a different agent, not '${sel.name}'. Select the agent it belongs to ` +
+          `with cello_use_agent and retry.`,
+      };
+    }
+
     const revocability = revocabilityOf(row.type);
     if (!revocability.revocable) {
       return {
@@ -3001,11 +3020,19 @@ async function startDaemonHoldingLock(
       submission_id: submitted.submissionId,
       revoked: false,
       queued: true,
+      // M5: CARRIED, not dropped. `submitForAgent`'s own comment says the warning lives in the
+      // shared path "because the same omission would otherwise be available to every verb added
+      // after this one" — and this was the next verb added. `stored:false` means a node already held
+      // this id: usually a benign retry, but also what single-node censorship looks like, and
+      // without it that reads as unqualified success.
+      stored: submitted.stored,
+      ...(submitted.storedWarning ? { stored_warning: submitted.storedWarning } : {}),
       guidance:
         `Revocation QUEUED for '${row.type}' — not yet revoked. The portal opens it, checks the ` +
         `signal is one you may retract, and revokes it at the directory; the outcome comes back on ` +
-        `the results channel. Your local copy is kept until then, deliberately, so a failure leaves ` +
-        `you able to retry.`,
+        `the results channel. Your local copy is KEPT — deliberately, so a failure leaves you able to ` +
+        `retry. Nothing removes it automatically even on success: check the outcome with ` +
+        `cello_attestations_issued.`,
     };
   });
 
