@@ -29,7 +29,13 @@ import {
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
-const CREATE_SQL = `
+/**
+ * Shared with `DocumentStore`, which also execs this (the :353 shared-definition precedent there):
+ * every epoch producer already holds a DocumentStore, and `currentDocumentEpoch` reads this table
+ * through it — so the table must exist whichever module constructs first. Keep the two consumers
+ * on THIS one string.
+ */
+export const DOCUMENT_AMENDMENTS_CREATE_SQL = `
   CREATE TABLE IF NOT EXISTS document_amendments (
     owner_agent_id  TEXT    NOT NULL,
     document_id     TEXT    NOT NULL,
@@ -56,7 +62,7 @@ export class DocumentAmendmentStore {
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
-    this.#db.exec(CREATE_SQL);
+    this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
   }
 
   /**

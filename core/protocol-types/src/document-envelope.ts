@@ -197,14 +197,14 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
   }
 
   const epochId = requirePresent(map, "epoch_id");
-  if (typeof epochId !== "number" || !Number.isInteger(epochId)) {
-    throw new Error(`document_envelope_epoch: must be an integer, got ${String(epochId)}`);
-  }
-  if (epochId !== DOCUMENT_EPOCH_V1) {
-    // V2 introduces compaction and non-zero epochs. Accepting one now would mean applying an
-    // update whose base state this build cannot reconstruct.
+  // SHAPE ONLY (M14B / DOD-MP-AMEND-1 — relaxed from a hard `!== 0` refusal). Epoch CORRECTNESS
+  // is a per-document fact — the current epoch is derived from the amendment chain — and a
+  // decoder cannot know it. The inbound path rules on it, and may trust this decoded value
+  // because `epoch_id` sits inside the signed TBS: a lie about the epoch fails verification
+  // before any epoch comparison runs.
+  if (typeof epochId !== "number" || !Number.isInteger(epochId) || epochId < 0) {
     throw new Error(
-      `document_envelope_epoch: this build speaks epoch ${DOCUMENT_EPOCH_V1} only, got ${epochId}`,
+      `document_envelope_epoch: must be a non-negative integer, got ${String(epochId)}`,
     );
   }
 

@@ -16,6 +16,7 @@ import { Buffer } from "node:buffer";
 import * as Y from "yjs";
 import { generateKeypair, verify } from "@cello-protocol/crypto";
 import {
+  DOCUMENT_FEATURE_VERSION,
   decodeDocumentProposal,
   buildDocumentProposalTbs,
   encodeDocumentProposal,
@@ -100,7 +101,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   const incomingProposal = async (over: Partial<DocumentProposalEnvelope> = {}) => {
     const base: DocumentProposalEnvelope = {
       type: "document_proposal",
-      feature_version: 1,
+      feature_version: DOCUMENT_FEATURE_VERSION,
       proposer_agent_id: peer,
       peer_agent_id: owner,
       document_type: "markdown",

@@ -108,7 +108,7 @@ function newFixture(
     liveDocFor: () => live,
     sign: async () => new Uint8Array(64).fill(1),
   });
-  return { inbound, store, engine, live, events, logger };
+  return { inbound, store, engine, live, events, logger, db };
 }
 
 describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
@@ -129,6 +129,48 @@ describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
     // An ack that does not identify what it acknowledges cannot settle anything — the sender has
     // a backlog, not a single outstanding envelope.
     expect((res as { envelopeHash: string }).envelopeHash).toBe(documentEnvelopeHash(env));
+  });
+});
+
+describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
+  /** Raise the document's current epoch by planting an amendment-chain head row. */
+  function raiseEpoch(db: DatabaseSync, epoch: number) {
+    db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, epoch, "h".repeat(64), Buffer.from([1]), 1);
+  }
+
+  it("an envelope BEHIND the current epoch is TERMINAL — its TBS binds the old epoch forever", async () => {
+    const f = newFixture();
+    raiseEpoch(f.db, 1);
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    expect(res).toMatchObject({ ok: false, reason: "document_epoch_stale", terminal: true });
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
+
+  it("an envelope AHEAD of us refuses NON-terminally — the amendment is still in flight here", async () => {
+    const f = newFixture();
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 2 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_epoch_ahead" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
+
+  it("an envelope AT the current post-amendment epoch admits normally", async () => {
+    const f = newFixture();
+    raiseEpoch(f.db, 1);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 1 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: true, admitted: true });
   });
 });
 

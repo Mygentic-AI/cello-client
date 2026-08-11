@@ -34,6 +34,7 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
+import { DOCUMENT_AMENDMENTS_CREATE_SQL } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -345,6 +346,9 @@ export class DocumentStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_DOCUMENTS_SQL);
+    // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
+    // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
+    this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
@@ -550,6 +554,8 @@ export class DocumentStore {
       documentId: q.documentId,
       senderAgentId: q.rejectedSenderAgentId,
       docPrevHash: q.rejectedDocPrevHash,
+      // EXEMPT from current-epoch stamping (M14B Entry 5): a stub is a SYNTHETIC verification
+      // node — never on the wire, never replayed — and the chain walk checks hash linkage only.
       epochId: 0,
       signature: new Uint8Array(0),
       stateVector: new Uint8Array(0),
@@ -882,6 +888,21 @@ export class DocumentStore {
    * Scoped to `senderAgentId = ownerAgentId`: an envelope we RECEIVED is not ours to deliver, and
    * without the scope a receiver would helpfully re-send the sender's own updates back at it.
    */
+  /**
+   * The document's CURRENT epoch: the head of its recorded amendment chain, 0 at genesis.
+   * Trustworthy for stamping because every append site validates (deriveArrangement) before
+   * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
+   */
+  currentDocumentEpoch(ownerAgentId: string, documentId: string): number {
+    const r = this.#db
+      .prepare(
+        `SELECT MAX(epoch_id) AS max_epoch FROM document_amendments
+          WHERE owner_agent_id = ? AND document_id = ?`,
+      )
+      .get(ownerAgentId, documentId) as { max_epoch?: number | null } | undefined;
+    return r?.max_epoch ?? 0;
+  }
+
   pendingDeliveries(
     ownerAgentId: string,
     nowMs: number,
