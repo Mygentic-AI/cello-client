@@ -338,10 +338,14 @@ export function deriveArrangement(
         at,
       );
     }
-    if (body.state_hash !== null && properties["assurance_tier"] === "authenticated") {
+    // WHITELIST, not an equality on the benign value: only a tier that DEFINES the slot may fill
+    // it. An equality check on "authenticated" silently accepted a Tier 2 field whenever the
+    // genesis lacked the tier property — a mis-built genesis running degraded instead of refusing.
+    if (body.state_hash !== null && properties["assurance_tier"] !== "attested") {
       return refuse(
         `amendment_state_hash_tier: epoch ${at} carries a canonical state hash but the document's ` +
-          `tier is authenticated — the slot is Tier 2's to fill`,
+          `tier is ${JSON.stringify(properties["assurance_tier"] ?? null)} — only "attested" ` +
+          `(Tier 2) defines that slot`,
         at,
       );
     }

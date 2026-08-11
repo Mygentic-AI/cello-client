@@ -96,6 +96,17 @@ describe("document proposal — CBOR round-trip", () => {
     expect(documentIdFromProposal(one)).not.toBe(documentIdFromProposal(none));
   });
 
+  it("refuses a NON-HEX admin — the joined-scalar TBS is collision-free only because the charset is enforced", () => {
+    // AMEND-1 review F1: "aa,bb" as one entry would fold to the same preimage as two entries
+    // ["aa","bb"] — one document_id, one signature, two admin sets. The 64-hex rule IS the boundary.
+    for (const bad of [["aa,bb"], ["AA".repeat(32)], ["not-a-key"], ["aa".repeat(31)]]) {
+      expect(seamViolation({ ...props(), admin_set: bad })).toMatch(/document_proposal_admin_set/);
+      expect(() =>
+        encodeDocumentProposal(proposal({ properties: { ...props(), admin_set: bad } })),
+      ).toThrow(/document_proposal_admin_set/);
+    }
+  });
+
   it("refuses a duplicate admin and an empty admin list with NAMED errors", () => {
     const dup = "aa".repeat(32);
     expect(() =>

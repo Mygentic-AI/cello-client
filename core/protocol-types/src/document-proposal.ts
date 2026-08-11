@@ -125,8 +125,15 @@ export interface DocumentProposalEnvelope {
 function canonicalAdminSet(adminSet: readonly string[]): string[] {
   const sorted = [...adminSet].sort();
   for (let i = 0; i < sorted.length; i++) {
-    if (typeof sorted[i] !== "string" || sorted[i]!.length === 0) {
-      throw new Error("document_proposal_admin_set: every admin must be a non-empty pubkey string");
+    // 64-hex ENFORCED, not assumed. The TBS folds the set to a ","-joined scalar, and the join is
+    // collision-free only because a pubkey cannot contain the separator — an unvalidated entry
+    // like "aa,bb" would let two different admin sets share one preimage, one document_id, and
+    // one valid signature. The charset IS the boundary.
+    if (typeof sorted[i] !== "string" || !/^[0-9a-f]{64}$/.test(sorted[i]!)) {
+      throw new Error(
+        "document_proposal_admin_set: every admin must be a 64-hex Ed25519 pubkey — got " +
+          JSON.stringify(sorted[i]),
+      );
     }
     if (i > 0 && sorted[i] === sorted[i - 1]) {
       throw new Error(`document_proposal_admin_set: ${sorted[i]} appears more than once`);

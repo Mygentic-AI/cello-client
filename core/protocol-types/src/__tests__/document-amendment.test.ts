@@ -284,6 +284,20 @@ describe("deriveArrangement — the chain", () => {
     expect(r.reason).toMatch(/amendment_chain_gap/);
   });
 
+  it("a skipped epoch WITH an unknown predecessor is a GAP, never a fork — the order is the diagnosis", () => {
+    // AMEND-1 review T2: a lag arrival (epoch skipped, predecessor we do not hold) must be named
+    // resolvable (gap), not a governance failure (fork). Swapping the two checks mislabels it.
+    const { c, g, verify } = threeParty();
+    const skipped = signedAmendment(
+      body({ epoch_id: 2, prev_amendment_hash: "ab".repeat(32), subject_agent_id: c.agentId }),
+      [makeSigner()],
+    );
+    const r = deriveArrangement(g, [skipped], allAdminsPolicy, verify);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/amendment_chain_gap/);
+  });
+
   it("REFUSES a wrong predecessor hash — a fork is named, not absorbed", () => {
     const { a, c, g, first, verify } = threeParty();
     const second = signedAmendment(
@@ -387,6 +401,19 @@ describe("deriveArrangement — subject rules", () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toMatch(/amendment_property_not_amendable/);
+  });
+
+  it("a genesis MISSING the tier property fails LOUD on a state hash — never degraded-accept", () => {
+    // AMEND-1 review F2: the gate is a whitelist ("attested" defines the slot), not an equality
+    // on the benign value — a mis-built genesis must refuse, not run degraded.
+    const a = makeSigner();
+    const b = makeSigner();
+    const g = { ...genesis(a, b), properties: { schema_enforcement: false } };
+    const withHash = signedAmendment(body({ state_hash: new Uint8Array(32).fill(9) }), [a]);
+    const r = deriveArrangement(g, [withHash], allAdminsPolicy, makeVerify([a, b]));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/amendment_state_hash_tier/);
   });
 
   it("refuses a non-null state_hash while the tier is authenticated — the slot is Tier 2's", () => {
