@@ -264,6 +264,14 @@ export {
   validateDocumentJoinOffer,
 } from "./document-join.js";
 export type { DocumentJoinOffer, JoinOfferValidation } from "./document-join.js";
+export {
+  DOCUMENT_JOIN_ANSWER_DOMAIN,
+  MAX_JOIN_REFUSAL_REASON_LENGTH,
+  buildDocumentJoinAnswerTbs,
+  encodeDocumentJoinAnswer,
+  decodeDocumentJoinAnswer,
+} from "./document-join-answer.js";
+export type { DocumentJoinAnswer } from "./document-join-answer.js";
 export { documentGovernancePolicy } from "./document-governance.js";
 export type { GovernanceVerdict } from "./document-governance.js";
 export {
