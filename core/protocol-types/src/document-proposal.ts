@@ -340,6 +340,9 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
   // OPTIONAL, unlike the seam fields above — documents agreed before profiles existed carry none,
   // and `present` would refuse every one of them. When declared it must be a name; membership in
   // the closed set is the gate's question (`seamViolation` checks shape, the daemon checks names).
+  // CANONICAL FORM: absent is the only encoding of "no profile". The TBS folds absent and null to
+  // the same signed slot, but an explicit `content_profile: null` on the wire is REFUSED here —
+  // one preimage, one decodable byte encoding. A second implementation must emit absent, not null.
   const contentProfile = "content_profile" in p ? p["content_profile"] : undefined;
   if (contentProfile !== undefined && (typeof contentProfile !== "string" || contentProfile.length === 0)) {
     throw new Error(

@@ -77,6 +77,17 @@ describe("document proposal — CBOR round-trip", () => {
     expect("content_profile" in decoded.properties).toBe(false);
   });
 
+  it("refuses a malformed content_profile with a NAMED error, never a silent default", () => {
+    const raw = decodeCbor(encodeDocumentProposal(proposal())) as Record<string, unknown>;
+    const props = raw["properties"] as Record<string, unknown>;
+    for (const bad of [42, "", null]) {
+      props["content_profile"] = bad;
+      expect(() => decodeDocumentProposal(encodeCbor(raw))).toThrow(
+        /document_proposal_field_type: properties\.content_profile/,
+      );
+    }
+  });
+
   it("copies byte fields out of the wire rather than aliasing it", () => {
     const wire = encodeDocumentProposal(proposal());
     const decoded = decodeDocumentProposal(wire);
