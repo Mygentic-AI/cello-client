@@ -249,6 +249,41 @@ export class DocumentHandshake {
    * Ours is addressed to the peer by definition, so reusing that path would require weakening the
    * check that stops a proposal being recorded under an agent it never named.
    */
+  /**
+   * M14B / DOD-MP-JOIN-1 — record the genesis of a document this agent JOINED.
+   *
+   * The joiner is neither the proposer nor the named peer, so both existing paths refuse this
+   * envelope by design (`recordProposal` demands we are the addressee; `recordOutgoing` claims
+   * authorship). Stored `accepted` because the joiner's consent is their signed join answer —
+   * and stored at all because `LiveDocuments` reads `starting_content` from this table: without
+   * the row, a joined document rebuilds from an empty epoch zero and silently diverges from
+   * every other holder.
+   *
+   * The caller passes the RECEIVED genesis bytes; they are stored verbatim, not re-encoded.
+   */
+  recordJoined(ownerAgentId: string, receivedGenesis: Uint8Array, nowMs: number): string {
+    const envelope = decodeDocumentProposal(receivedGenesis);
+    const documentId = documentIdFromProposal(envelope);
+    this.#db
+      .prepare(
+        `INSERT INTO document_proposals
+           (owner_agent_id, document_id, proposer_agent_id, peer_agent_id, envelope,
+            consent_state, refusal_reason, created_at, decided_at)
+         VALUES (?, ?, ?, ?, ?, 'accepted', NULL, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id) DO NOTHING`,
+      )
+      .run(
+        ownerAgentId,
+        documentId,
+        envelope.proposer_agent_id,
+        envelope.peer_agent_id,
+        Buffer.from(receivedGenesis),
+        nowMs,
+        nowMs,
+      );
+    return documentId;
+  }
+
   recordOutgoing(ownerAgentId: string, envelope: DocumentProposalEnvelope, nowMs: number): string {
     const documentId = documentIdFromProposal(envelope);
     this.#db
