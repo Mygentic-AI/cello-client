@@ -257,6 +257,27 @@ export type {
   DocumentConsentState,
 } from "./document-proposal.js";
 export {
+  DOCUMENT_AMENDMENT_DOMAIN,
+  AMENDMENT_SUBJECT_KIND,
+  AMENDMENT_KINDS,
+  AMENDABLE_PROPERTIES,
+  MAX_DOCUMENT_HOLDERS,
+  buildDocumentAmendmentTbs,
+  documentAmendmentHash,
+  encodeDocumentAmendment,
+  decodeDocumentAmendment,
+  deriveArrangement,
+} from "./document-amendment.js";
+export type {
+  AmendmentKind,
+  DocumentAmendmentBody,
+  DocumentAmendmentEnvelope,
+  ArrangementGenesis,
+  Arrangement,
+  SignerPolicy,
+  DeriveResult,
+} from "./document-amendment.js";
+export {
   DOCUMENT_MULTISIG_DOMAIN,
   buildDocumentMultisigTbs,
   collectionStatus,
