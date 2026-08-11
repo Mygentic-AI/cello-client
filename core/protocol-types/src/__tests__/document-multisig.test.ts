@@ -123,6 +123,21 @@ describe("collection status — complete means EVERY required signature verifies
     expect(status.missing).toEqual([]);
     expect(status.unknown).toEqual([]);
     expect(status.invalidSigners).toEqual([]);
+    expect(status.duplicates).toEqual([]);
+  });
+
+  it("an INVALID signature is not compensated by a second, VALID one — the compensation attack", () => {
+    // A wrong "signer satisfied if ANY row verifies" implementation must fail here directly,
+    // not only via the duplicates flag as a side effect.
+    const signers = [makeSigner()];
+    const collection = signedCollection(signers);
+    const goodSig = collection.signatures[0]!.signature;
+    collection.signatures[0]!.signature = new Uint8Array(64).fill(1);
+    collection.signatures.push({ signer_agent_id: signers[0]!.agentId, signature: goodSig });
+    const status = collectionStatus(collection, makeVerify(signers));
+    expect(status.complete).toBe(false);
+    expect(status.invalidSigners).toEqual([signers[0]!.agentId]);
+    expect(status.duplicates).toEqual([signers[0]!.agentId]);
   });
 
   it("one missing signature → NOT complete, and the missing signer is NAMED", () => {
@@ -211,6 +226,35 @@ describe("collection wire — strict round-trip", () => {
     wire.fill(0);
     expect(decoded.subject_hash).toEqual(collection.subject_hash);
     expect(decoded.signatures[0]!.signature).toEqual(collection.signatures[0]!.signature);
+  });
+
+  it.each([
+    ["document_id", undefined, /multisig_missing_field: document_id/],
+    ["document_id", 42, /multisig_field_type: document_id/],
+    ["subject_kind", undefined, /multisig_missing_field: subject_kind/],
+    ["subject_kind", "", /multisig_field_type: subject_kind/],
+    ["subject_hash", undefined, /multisig_missing_field: subject_hash/],
+    ["subject_hash", "not-bytes", /multisig_field_type: subject_hash/],
+    ["required_signers", [1, 2], /multisig_field_type: required_signers/],
+    ["required_signers", [""], /multisig_signer_type/],
+    ["signatures", undefined, /multisig_missing_field: signatures/],
+    ["signatures", "nope", /multisig_field_type: signatures/],
+    ["signatures", ["not-a-map"], /multisig_field_type: signatures\[0\]/],
+  ] as const)(
+    "decode refuses %s = %j with the NAMED code — never a coerced default",
+    (field, value, expected) => {
+      const wire = decodeCbor(encodeMultisigCollection(signedCollection([makeSigner()]))) as Record<
+        string,
+        unknown
+      >;
+      if (value === undefined) delete wire[field];
+      else wire[field] = value;
+      expect(() => decodeMultisigCollection(encodeCbor(wire))).toThrow(expected);
+    },
+  );
+
+  it("decode refuses a non-map root as malformed", () => {
+    expect(() => decodeMultisigCollection(encodeCbor([1, 2, 3]))).toThrow(/multisig_malformed/);
   });
 });
 

@@ -153,20 +153,17 @@ export function collectionStatus(
     }
   }
 
-  const missing = [...required].filter(
-    (id) => !seen.has(id) || invalidSigners.includes(id),
-  );
   // A signer whose signature failed is INVALID, not missing — the two send the operator to
-  // different fixes — so the missing list excludes them again after the filter above.
-  const trulyMissing = missing.filter((id) => !invalidSigners.includes(id));
+  // different fixes — so missing is strictly "no row present at all".
+  const missing = [...required].filter((id) => !seen.has(id));
 
   return {
     complete:
-      trulyMissing.length === 0 &&
+      missing.length === 0 &&
       invalidSigners.length === 0 &&
       unknown.length === 0 &&
       duplicates.length === 0,
-    missing: trulyMissing,
+    missing,
     invalidSigners,
     unknown,
     duplicates,
