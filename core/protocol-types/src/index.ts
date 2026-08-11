@@ -262,6 +262,7 @@ export {
   encodeDocumentJoinOffer,
   decodeDocumentJoinOffer,
   validateDocumentJoinOffer,
+  arrangementGenesisFromProposal,
 } from "./document-join.js";
 export type { DocumentJoinOffer, JoinOfferValidation } from "./document-join.js";
 export {

@@ -30,6 +30,8 @@ import { screeningRule, SCREEN_RULE_ID } from "./document-screen.js";
 import { DocumentRejections } from "./document-rejection.js";
 import { DocumentInbound } from "./document-inbound.js";
 import { DocumentAckInbound } from "./document-ack-inbound.js";
+import { DocumentAmendmentStore } from "./document-amendment-store.js";
+import { DocumentJoinStore } from "./document-join-store.js";
 import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
@@ -48,6 +50,13 @@ import {
   decodeDocumentControl,
   buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
+  decodeDocumentJoinOffer,
+  decodeDocumentAmendment,
+  documentAmendmentHash,
+  validateDocumentJoinOffer,
+  documentGovernancePolicy,
+  arrangementGenesisFromProposal,
+  deriveArrangement,
   encodeDocumentAck,
   buildDocumentAckTbs,
   type DocumentAck,
@@ -311,6 +320,11 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
   // arrival's bytes permanent for that id).
   const handshake = new DocumentHandshake(db, logger, verifySignature);
+  // M14B / DOD-MP-JOIN-1 — the amendment chain and the join-consent stores. The membership READ
+  // path (`currentDocumentEpoch`) has run through DocumentStore since AMEND-1; these are the
+  // WRITE path, and every append below validates first (the standing AMEND-1 condition).
+  const amendments = new DocumentAmendmentStore(db, logger);
+  const joins = new DocumentJoinStore(db, logger);
 
   const router = new DocumentFrameRouter({
     inbound,
@@ -321,6 +335,67 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // THROWS on a forged or misaddressed proposal, which the router contains and reports. That is
       // right: those are refusals, and nothing should be recorded for them.
       handshake.recordProposal(ownerAgentId, wire, nowMs);
+    },
+    recordJoinOffer: (ownerAgentId, wire, nowMs) => {
+      const offer = decodeDocumentJoinOffer(wire);
+      // ADDRESSED TO US — the same multi-agent-daemon rule recordProposal enforces: consent
+      // belongs to the agent the inviter named, and a throw here is contained by the router.
+      if (offer.invitee_agent_id !== ownerAgentId) {
+        throw new Error(
+          `document_join_wrong_invitee: this offer is addressed to ${offer.invitee_agent_id}, ` +
+            `not to ${ownerAgentId}`,
+        );
+      }
+      const validation = validateDocumentJoinOffer(offer, documentGovernancePolicy, verifySignature);
+      if (validation.ok) {
+        joins.recordIncoming(ownerAgentId, wire, validation.pendingAmendmentHash, { state: "pending" }, nowMs);
+        return;
+      }
+      // Refused-but-RECORDED when a settle key exists (the operator can see who tried and why);
+      // an offer whose amendments do not even decode has no key and throws — contained, logged,
+      // nothing recorded, exactly like a forged proposal.
+      const last = offer.amendments[offer.amendments.length - 1];
+      if (last === undefined) throw new Error(validation.reason);
+      let settleKey: string;
+      try {
+        settleKey = Buffer.from(documentAmendmentHash(decodeDocumentAmendment(last).body)).toString("hex");
+      } catch {
+        throw new Error(validation.reason);
+      }
+      joins.recordIncoming(
+        ownerAgentId, wire, settleKey, { state: "refused", reason: validation.reason }, nowMs,
+      );
+    },
+    recordJoinAnswer: (ownerAgentId, wire, nowMs) => {
+      const r = joins.recordAnswer(ownerAgentId, wire, verifySignature, nowMs);
+      // A refusal is a verdict the router contains and reports — never a silent drop.
+      if (!r.ok) throw new Error(r.reason);
+    },
+    recordAmendment: (ownerAgentId, wire, nowMs) => {
+      // An amendment reaching an EXISTING holder. VALIDATE-BEFORE-APPEND (the AMEND-1 standing
+      // condition): the whole chain, including this arrival, must replay through the real policy
+      // before one byte lands in the table — a row in document_amendments is post-validation by
+      // invariant, and epoch stamping rests on that.
+      const env = decodeDocumentAmendment(wire);
+      const documentId = env.body.document_id;
+      if (!store.getDocument(ownerAgentId, documentId)) {
+        throw new Error(`document_unknown: no document ${documentId.slice(0, 16)}… for this agent`);
+      }
+      const record = handshake.get(ownerAgentId, documentId);
+      if (!record) {
+        throw new Error(
+          `document_genesis_missing: ${documentId.slice(0, 16)}… has a row but no stored genesis ` +
+            `proposal to replay from`,
+        );
+      }
+      const derived = deriveArrangement(
+        arrangementGenesisFromProposal(record.envelope),
+        [...amendments.chain(ownerAgentId, documentId), env],
+        documentGovernancePolicy,
+        verifySignature,
+      );
+      if (!derived.ok) throw new Error(derived.reason);
+      amendments.append(ownerAgentId, documentId, wire, nowMs);
     },
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a

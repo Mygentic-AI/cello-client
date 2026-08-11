@@ -169,6 +169,34 @@ export function decodeDocumentJoinOffer(input: Uint8Array): DocumentJoinOffer {
   };
 }
 
+/**
+ * The replay's starting facts, computed from a decoded genesis proposal — ONE implementation for
+ * every consumer (join validation, the daemon's amendment receive and accept paths), because two
+ * copies of the everyone-admin default is how two holders derive different arrangements from one
+ * genesis. Absent `admin_set` means both genesis participants govern (the bilateral default);
+ * `admin_set` itself lives on the ARRANGEMENT, not in the scalar properties bag the replay
+ * derives `change_property` against.
+ */
+export function arrangementGenesisFromProposal(
+  genesis: DocumentProposalEnvelope,
+): ArrangementGenesis {
+  return {
+    documentId: documentIdFromProposal(genesis),
+    proposerAgentId: genesis.proposer_agent_id,
+    peerAgentId: genesis.peer_agent_id,
+    adminSet: genesis.properties.admin_set ?? [genesis.proposer_agent_id, genesis.peer_agent_id],
+    properties: {
+      assurance_tier: genesis.properties.assurance_tier,
+      schema_enforcement: genesis.properties.schema_enforcement,
+      topology: genesis.properties.topology,
+      append_only: genesis.properties.append_only,
+      ...(genesis.properties.content_profile !== undefined
+        ? { content_profile: genesis.properties.content_profile }
+        : {}),
+    },
+  };
+}
+
 export type JoinOfferValidation =
   | {
       ok: true;
@@ -249,26 +277,12 @@ export function validateDocumentJoinOffer(
     );
   }
 
-  const arrangementGenesis: ArrangementGenesis = {
-    documentId: offer.document_id,
-    proposerAgentId: genesis.proposer_agent_id,
-    peerAgentId: genesis.peer_agent_id,
-    // The everyone default, exactly as the accept path computes it — a proposal signed before
-    // the admin slot existed carries none, and both genesis participants govern.
-    adminSet: genesis.properties.admin_set ?? [genesis.proposer_agent_id, genesis.peer_agent_id],
-    // Built field-by-field: `admin_set` lives on the ARRANGEMENT (adminSet above), not in the
-    // scalar properties bag the replay derives change_property against.
-    properties: {
-      assurance_tier: genesis.properties.assurance_tier,
-      schema_enforcement: genesis.properties.schema_enforcement,
-      topology: genesis.properties.topology,
-      append_only: genesis.properties.append_only,
-      ...(genesis.properties.content_profile !== undefined
-        ? { content_profile: genesis.properties.content_profile }
-        : {}),
-    },
-  };
-  const derived = deriveArrangement(arrangementGenesis, amendments, policy, verify);
+  const derived = deriveArrangement(
+    arrangementGenesisFromProposal(genesis),
+    amendments,
+    policy,
+    verify,
+  );
   if (!derived.ok) {
     // The replay's reason IS the diagnosis — passed through, never substituted.
     return refuse(derived.reason);
