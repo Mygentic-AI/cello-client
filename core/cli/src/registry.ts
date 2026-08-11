@@ -1039,6 +1039,8 @@ export const COMMANDS: readonly CommandSpec[] = [
       { name: "--type", consumesValue: true },
       { name: "--content", consumesValue: true },
       { name: "--append-only", consumesValue: false },
+      // GOVERN-1: comma-separated pubkeys governing membership; omitted = both parties are admins.
+      { name: "--admins", consumesValue: true },
       // RE-SEND an offer the peer never received. Declared here or `checkArgs` rejects it, which is
       // the same four-place lockstep failure that left `--type` and `--content` advertised in the
       // help and refused by the parser.
@@ -1047,7 +1049,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "Share a living document with a counterparty — both sides edit, both sides converge.",
     help:
       "Usage:\n" +
-      "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--content <text>] [--retry <id>]\n" +
+      "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--admins <hex,hex>] [--content <text>] [--retry <id>]\n" +
       "                                                    — offer a shared document. They must accept.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
       "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
@@ -1092,12 +1094,16 @@ export const COMMANDS: readonly CommandSpec[] = [
         const { value: documentType } = takeValueFlag(rest, "--type");
         const { value: startingContent } = takeValueFlag(rest, "--content");
         const { value: documentId } = takeValueFlag(rest, "--retry");
+        const { value: adminsRaw } = takeValueFlag(rest, "--admins");
         const appendOnly = rest.includes("--append-only");
         return docPropose(ctx.celloDir, target, {
           ...o,
           ...(documentType !== undefined ? { documentType } : {}),
           ...(startingContent !== undefined ? { startingContent } : {}),
           ...(appendOnly ? { appendOnly } : {}),
+          ...(adminsRaw !== undefined
+            ? { admins: adminsRaw.split(",").map((s) => s.trim()).filter((s) => s.length > 0) }
+            : {}),
           ...(documentId !== undefined ? { documentId } : {}),
         });
       }

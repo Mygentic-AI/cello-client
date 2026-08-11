@@ -256,6 +256,8 @@ export type {
   DocumentProperties,
   DocumentConsentState,
 } from "./document-proposal.js";
+export { documentGovernancePolicy } from "./document-governance.js";
+export type { GovernanceVerdict } from "./document-governance.js";
 export {
   DOCUMENT_AMENDMENT_DOMAIN,
   AMENDMENT_SUBJECT_KIND,

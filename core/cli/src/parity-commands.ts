@@ -790,7 +790,7 @@ export function contactSetSignal(
 // ─── M14 / DOD-DOC-TOOLS-1 — federated documents ────────────────────────────────────────────────
 
 /**
- * `cello doc propose <peer-pubkey> [--type <t>] [--content <text>] [--append-only] [--retry <id>]`
+ * `cello doc propose <peer-pubkey> [--type <t>] [--content <text>] [--append-only] [--admins <hex,hex>] [--retry <id>]`
  * → cello_doc_propose.
  *
  * `--retry` re-sends an offer that was created locally but never reached the peer. The daemon has
@@ -809,6 +809,7 @@ export function docPropose(
     appendOnly?: boolean;
     startingContent?: string;
     documentId?: string;
+    admins?: string[];
   },
 ): Promise<CliOutput> {
   return ipcCommand(
@@ -818,6 +819,7 @@ export function docPropose(
       peer_pubkey: peerPubkey,
       document_type: opts.documentType,
       append_only: opts.appendOnly === true ? true : undefined,
+      admins: opts.admins,
       starting_content: opts.startingContent,
       document_id: opts.documentId,
     }),

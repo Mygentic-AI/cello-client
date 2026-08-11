@@ -152,6 +152,30 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     expect(envelope.peer_agent_id).toBe(f.peer);
   });
 
+  it("writes the admin choice into the SIGNED proposal — the everyone default EXPLICITLY, never absent", async () => {
+    // GOVERN-1: the invitee consents to a stated rule, not a convention. Omitted admins means
+    // both parties govern, and that default is recorded in the signed bytes.
+    const f = await newFixture();
+    await f.call("cello_doc_propose", { peer_pubkey: f.peer });
+    const everyone = decodeDocumentProposal(f.sent[0]!.bytes);
+    expect(everyone.properties.admin_set).toEqual([f.owner, f.peer].sort());
+
+    const f2 = await newFixture();
+    await f2.call("cello_doc_propose", { peer_pubkey: f2.peer, admins: [f2.owner] });
+    const solo = decodeDocumentProposal(f2.sent[0]!.bytes);
+    expect(solo.properties.admin_set).toEqual([f2.owner]);
+  });
+
+  it("refuses an admin who is not a party — admins are always holders, and nothing is created", async () => {
+    const f = await newFixture();
+    const res = await f.call("cello_doc_propose", {
+      peer_pubkey: f.peer,
+      admins: ["f".repeat(64)],
+    });
+    expect(res).toMatchObject({ ok: false, reason: "document_admins_invalid" });
+    expect(f.sent).toHaveLength(0);
+  });
+
   it("puts the STARTING CONTENT on the wire as bytes both sides apply", async () => {
     const f = await newFixture();
     const res = await f.call("cello_doc_propose", { peer_pubkey: f.peer, starting_content: "shared start" });

@@ -300,11 +300,40 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       startingContent = Y.encodeStateAsUpdate(seed);
     }
 
+    // THE ADMIN SET IS ALWAYS WRITTEN, NEVER SILENTLY ABSENT (GOVERN-1: the creation flow makes
+    // the choice legible). No `admins` param means EVERYONE — both genesis participants — and
+    // that default is recorded explicitly in the signed proposal rather than implied by an
+    // absent field, so the invitee consents to a stated rule, not a convention.
+    const rawAdmins = params?.admins;
+    if (rawAdmins !== undefined && (!Array.isArray(rawAdmins) || rawAdmins.length === 0)) {
+      return {
+        ok: false,
+        reason: "document_admins_invalid",
+        guidance:
+          "admins must be a non-empty list of 64-hex pubkeys, or omitted for everyone-is-admin. " +
+          "Nothing was created.",
+      };
+    }
+    const adminSet = rawAdmins === undefined
+      ? [who.ownerAgentId, peerAgentId]
+      : [...new Set(rawAdmins as string[])];
+    for (const admin of adminSet) {
+      if (admin !== who.ownerAgentId && admin !== peerAgentId) {
+        return {
+          ok: false,
+          reason: "document_admins_invalid",
+          guidance:
+            `${String(admin).slice(0, 16)}… is not a party to this document — a creation admin ` +
+            `must be you or the counterparty (admins are always holders). Nothing was created.`,
+        };
+      }
+    }
     const properties = {
       assurance_tier: ASSURANCE_TIER_V1,
       schema_enforcement: false,
       topology: TOPOLOGY_V1,
       append_only: params?.append_only === true,
+      admin_set: adminSet,
     };
     const violation = seamViolation(properties);
     if (violation) {
