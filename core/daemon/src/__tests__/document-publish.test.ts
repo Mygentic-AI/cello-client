@@ -45,10 +45,30 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
   });
   const doc = new Y.Doc();
   doc.clientID = 7777;
-  return { store, engine, publish, doc };
+  return { store, engine, publish, doc, db };
+}
+
+function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number) {
+  db.prepare(
+    `INSERT INTO document_amendments
+       (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(owner, doc, epoch, "h".repeat(64), Buffer.from([1]), 1);
 }
 
 describe("DocumentPublish — writes a signed, chained envelope and returns", () => {
+  it("stamps the CURRENT epoch from the recorded amendment chain — never a constant", async () => {
+    // REVERT-VISIBLE (AMEND-1 review T1): with the table non-empty, a producer reverted to the
+    // old constant 0 fails here and nowhere else.
+    const f = newFixture();
+    raiseEpoch(f.db, AGENT, DOC, 1);
+    f.doc.getText("content").insert(0, "post-amendment text. ");
+    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
+    expect(res.ok).toBe(true);
+    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.epochId).toBe(1);
+  });
+
+
   it("appends an update the peer can decode", async () => {
     const f = newFixture();
     f.doc.getText("content").insert(0, "first draft. ");

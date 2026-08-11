@@ -174,7 +174,7 @@ export class DocumentLifecycle {
       peerAgentId: d.peerAgentId,
       documentType: d.documentType,
       assuranceTier: "authenticated",
-      epochId: 0,
+      epochId: this.#store.currentDocumentEpoch(ownerAgentId, d.documentId),
       status: d.status,
       pendingDeliveries: pendingByDocument.get(d.documentId)?.total ?? 0,
       pendingSent: pendingByDocument.get(d.documentId)?.sent ?? 0,

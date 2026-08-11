@@ -237,6 +237,46 @@ export class DocumentInbound {
       };
     }
 
+    // 4b. THE EPOCH RULING (M14B / DOD-MP-AMEND-1) — moved here from the decoder, which cannot
+    // know a per-document fact. The decoded value is trustworthy at this point: `epoch_id` sits
+    // inside the signed TBS verified at step 2, so a lie about the epoch already failed there.
+    // The two directions are different facts and get different answers:
+    // - BEHIND us: the envelope was authored under an epoch that has been amended past. Its TBS
+    //   binds that epoch forever, so redelivery can never change the answer — TERMINAL; the
+    //   sender's daemon re-publishes its content under the current epoch.
+    // - AHEAD of us: the sender has applied an amendment we have not yet received. Once it
+    //   arrives, this envelope becomes admittable — so the refusal is NON-terminal and their
+    //   ordinary redelivery retry resolves it. (Richer lag handling is DOD-MP-INBOUND-N-1.)
+    const currentEpoch = this.#d.store.currentDocumentEpoch(ownerAgentId, env.document_id);
+    if (env.epoch_id !== currentEpoch) {
+      const behind = env.epoch_id < currentEpoch;
+      this.#d.logger.warn("document.inbound.epoch_mismatch", {
+        documentId: env.document_id,
+        envelopeEpoch: env.epoch_id,
+        currentEpoch,
+        behind,
+        correlationId,
+      });
+      if (behind) {
+        return {
+          ok: false,
+          reason: "document_epoch_stale",
+          terminal: true,
+          envelopeHash,
+          detail:
+            `this update was authored under epoch ${env.epoch_id} and the document is at epoch ` +
+            `${currentEpoch} — republish it under the current epoch`,
+        };
+      }
+      return {
+        ok: false,
+        reason: "document_epoch_ahead",
+        detail:
+          `this update names epoch ${env.epoch_id} and this holder is at epoch ${currentEpoch} — ` +
+          `an amendment is still in flight here; retry after it lands`,
+      };
+    }
+
     // 5. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
     // comment describing the bug it was written to fix — "after a restart the document row said
     // `stalled` while the daemon happily accepted updates on it". The only inbound path in the

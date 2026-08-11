@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi } from "vitest";
 import {
+  DOCUMENT_FEATURE_VERSION,
   encodeDocumentUpdateEnvelope,
   encodeDocumentAck,
   encodeDocumentProposal,
@@ -320,7 +321,7 @@ describe("DocumentFrameRouter — every document frame kind is classified", () =
     const r = newRouter();
     const proposal = encodeDocumentProposal({
       type: "document_proposal",
-      feature_version: 1,
+      feature_version: DOCUMENT_FEATURE_VERSION,
       proposer_agent_id: "peer-agent",
       peer_agent_id: AGENT,
       document_type: "markdown",

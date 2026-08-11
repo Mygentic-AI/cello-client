@@ -112,10 +112,17 @@ describe("document update envelope — the decoder refuses loudly, naming the ga
     );
   });
 
-  it("a V1 envelope declaring a non-zero epoch is refused", () => {
+  it("a non-zero epoch DECODES — correctness is the inbound path's ruling, not the decoder's", () => {
+    // AMENDED for M14B / DOD-MP-AMEND-1 (was: hard refusal of epoch !== 0). The decoder cannot
+    // know a document's current epoch; the inbound path derives it from the amendment chain and
+    // rules there. Shape is still enforced: negatives and non-integers refuse by name.
     const map = asMap(envelope());
-    map.epoch_id = 1;
-    expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(/document_envelope_epoch/);
+    map.epoch_id = 3;
+    expect(decodeDocumentUpdateEnvelope(raw(map)).epoch_id).toBe(3);
+    for (const bad of [-1, 1.5]) {
+      map.epoch_id = bad;
+      expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(/document_envelope_epoch/);
+    }
   });
 
   it("an unrecognized update encoding is refused rather than guessed at", () => {

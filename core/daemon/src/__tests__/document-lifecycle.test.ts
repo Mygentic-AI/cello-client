@@ -106,10 +106,21 @@ describe("DocumentLifecycle — list", () => {
       status: "active",
       pendingDeliveries: 1,
     });
-    // Tier and epoch are constants in V1 — shown anyway because they are seam surface, and an
-    // operator who cannot see a field cannot notice the day it starts varying.
+    // Tier is constant in V1; epoch is DERIVED since M14B / AMEND-1 — 0 here because this
+    // document has no amendments, not because anything is hardcoded.
     expect(row!.assuranceTier).toBe("authenticated");
     expect(row!.epochId).toBe(0);
+  });
+
+  it("reports the CURRENT epoch once the document has amendments — not a constant", () => {
+    const f = newFixture();
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, 2, "h".repeat(64), Buffer.from([1]), 1);
+    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
+    expect(row!.epochId).toBe(2);
   });
 
   it("counts only what is actually pending, not the whole log", () => {
