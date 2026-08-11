@@ -429,8 +429,8 @@ export function deriveArrangement(
       }
     }
 
-    // The collection: bound to THIS amendment, required set exactly the policy's answer for the
-    // state BEFORE it, and complete. Order matters — a mismatch in what the collection claims is
+    // The collection: bound to THIS amendment, its claimed required set ACCEPTABLE TO THE POLICY
+    // for the state BEFORE it, and complete. Order matters — a mismatch in what the collection claims is
     // reported before whether it gathered enough names for the wrong claim.
     const expectedHash = documentAmendmentHash(body);
     if (env.collection.document_id !== body.document_id) {

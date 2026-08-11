@@ -57,13 +57,26 @@ describe("governance policy — single-admin kinds", () => {
   const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
   const st = state([a, b, c], [a, b]);
 
-  it.each(["add_holder", "promote_admin", "change_property"] as const)(
+  it.each(["add_holder", "promote_admin"] as const)(
     "%s: any ONE current admin's claimed set is acceptable",
     (kind) => {
       expect(documentGovernancePolicy(kind, "f".repeat(64), st, [a.agentId])).toMatchObject(ok);
       expect(documentGovernancePolicy(kind, "f".repeat(64), st, [b.agentId])).toMatchObject(ok);
     },
   );
+
+  it("change_property: any ONE current admin — asserted on the shape a legal amendment carries (subject null)", () => {
+    expect(documentGovernancePolicy("change_property", null, st, [a.agentId])).toMatchObject(ok);
+    expect(documentGovernancePolicy("change_property", null, st, [b.agentId])).toMatchObject(ok);
+    expect(documentGovernancePolicy("change_property", null, st, [c.agentId]).ok).toBe(false);
+  });
+
+  it("a claim naming one signer TWICE is refused here, before the multisig layer can throw on it", () => {
+    const r = documentGovernancePolicy("add_holder", "f".repeat(64), st, [a.agentId, a.agentId]);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/governance_claim_shape/);
+  });
 
   it("a NON-admin's claimed set is refused, naming the rule", () => {
     const r = documentGovernancePolicy("add_holder", "f".repeat(64), st, [c.agentId]);
@@ -211,6 +224,38 @@ describe("governance policy — end to end through deriveArrangement", () => {
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toMatch(/governance_not_admin/);
+  });
+
+  it("THE DOD'S PROOF CLAUSE: two parties, one admin's signature flips a property — and the same amendment unsigned is rejected", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const change: Partial<DocumentAmendmentBody> = {
+      kind: "change_property",
+      subject_agent_id: null,
+      property_change: { key: "append_only", value: true },
+    };
+    const good = deriveArrangement(
+      genesis(a, b, [a, b]),
+      [signed(change, [a])],
+      documentGovernancePolicy,
+      makeVerify([a, b]),
+    );
+    expect(good.ok).toBe(true);
+    if (!good.ok) return;
+    expect(good.arrangement.properties["append_only"]).toBe(true);
+
+    // The SAME amendment with the claimed signature absent: storable, never valid.
+    const unsigned = signed(change, [a]);
+    unsigned.collection.signatures = [];
+    const bad = deriveArrangement(
+      genesis(a, b, [a, b]),
+      [unsigned],
+      documentGovernancePolicy,
+      makeVerify([a, b]),
+    );
+    expect(bad.ok).toBe(false);
+    if (bad.ok) return;
+    expect(bad.reason).toMatch(/amendment_collection_incomplete/);
+    expect(bad.reason).toContain(a.agentId);
   });
 
   it("the two-admin deadlock holds end to end, with the recourse in the refusal", () => {

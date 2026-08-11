@@ -35,6 +35,13 @@ function canonical(ids: readonly string[]): string[] {
   return [...new Set(ids)].sort();
 }
 
+/** A duplicated claim is a builder bug, refused — deduping here would hand the multisig layer a
+ * collection it THROWS on (`multisig_duplicate_signer`), escaping DeriveResult's never-throw
+ * contract. The two layers agree: duplicates refuse, loudly, at the first gate they reach. */
+function hasDuplicates(ids: readonly string[]): boolean {
+  return new Set(ids).size !== ids.length;
+}
+
 function sameSet(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((id, i) => id === b[i]);
 }
@@ -45,6 +52,12 @@ export function documentGovernancePolicy(
   state: { participants: ReadonlySet<string>; admins: ReadonlySet<string> },
   claimedRequiredSet: readonly string[],
 ): GovernanceVerdict {
+  if (hasDuplicates(claimedRequiredSet)) {
+    return {
+      ok: false,
+      reason: "governance_claim_shape: the claimed required set names a signer more than once",
+    };
+  }
   const claimed = canonical(claimedRequiredSet);
   if (claimed.length === 0) {
     return {
