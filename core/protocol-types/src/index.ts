@@ -257,6 +257,19 @@ export type {
   DocumentConsentState,
 } from "./document-proposal.js";
 export {
+  DOCUMENT_MULTISIG_DOMAIN,
+  buildDocumentMultisigTbs,
+  collectionStatus,
+  encodeMultisigCollection,
+  decodeMultisigCollection,
+} from "./document-multisig.js";
+export type {
+  MultisigSubject,
+  MultisigSignature,
+  MultisigCollection,
+  MultisigStatus,
+} from "./document-multisig.js";
+export {
   DOCUMENT_ACK_DOMAIN,
   buildDocumentAckTbs,
   encodeDocumentAck,
