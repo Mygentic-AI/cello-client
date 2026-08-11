@@ -42,7 +42,7 @@ export const DOCUMENT_PROPOSAL_DOMAIN = "CELLO-DOCUMENT-PROPOSAL-v1";
  * The document feature version this build speaks. Bumped when the document wire changes in a way
  * a peer must understand; see `documentFeatureIncompatibility` for what a mismatch produces.
  */
-export const DOCUMENT_FEATURE_VERSION = 1;
+export const DOCUMENT_FEATURE_VERSION = 2;
 
 /** §6 — Tier 1. Tier 2 (attested) is V2; the field exists so V2 is a validation change. */
 export const ASSURANCE_TIER_V1 = "authenticated";
@@ -79,6 +79,15 @@ export interface DocumentProperties {
    * 412" is not.
    */
   content_profile?: string;
+  /**
+   * M14B / DOD-MP-AMEND-1 — the admin set fixed at creation (ruling D2, 2026-08-11): the
+   * pubkey-hex identities holding admin power over this document's arrangement. Signed into the
+   * preimage — and therefore into `document_id` — because WHO governs the document is part of
+   * what the invitee consents to. Absent means EVERY genesis participant is an admin (the
+   * bilateral default: either party can invite). The set is canonicalized sorted; membership
+   * must be ⊆ the genesis participants, enforced at accept and again at every replay.
+   */
+  admin_set?: string[];
 }
 
 export interface DocumentProposalEnvelope {
@@ -112,6 +121,20 @@ export interface DocumentProposalEnvelope {
  * builds of the same proposal would produce different `document_id`s. For this envelope that is
  * worse than a bad signature: the id IS the hash, so the two parties would be on two documents.
  */
+/** Sorted, duplicate-refusing canonical form — the SET is what is signed, not the typing order. */
+function canonicalAdminSet(adminSet: readonly string[]): string[] {
+  const sorted = [...adminSet].sort();
+  for (let i = 0; i < sorted.length; i++) {
+    if (typeof sorted[i] !== "string" || sorted[i]!.length === 0) {
+      throw new Error("document_proposal_admin_set: every admin must be a non-empty pubkey string");
+    }
+    if (i > 0 && sorted[i] === sorted[i - 1]) {
+      throw new Error(`document_proposal_admin_set: ${sorted[i]} appears more than once`);
+    }
+  }
+  return sorted;
+}
+
 export function buildDocumentProposalTbs(
   env: DocumentProposalEnvelope,
   opts: { preHash?: boolean } = {},
@@ -139,6 +162,11 @@ export function buildDocumentProposalTbs(
     // `null` when the proposer named none, so the slot is always occupied and no field's meaning
     // depends on whether the one before it was present.
     env.properties.content_profile ?? null,
+    // DOD-MP-AMEND-1's slot, feature_version 2. A SCALAR — sorted-unique pubkeys joined with
+    // "," (hex carries no comma) — because this preimage's flatness invariant (no nested
+    // containers, pinned by test) is what keeps the id independent of any container encoding.
+    // `null` when the proposer named none, so the slot is always occupied.
+    env.properties.admin_set === undefined ? null : canonicalAdminSet(env.properties.admin_set).join(","),
     env.starting_content,
     env.nonce,
     // BIGINT past 0xffffffff — the same coercion three sibling builders carry and which
@@ -208,6 +236,19 @@ export function seamViolation(props: DocumentProperties): string | null {
       `document whose character space is declared as something else`
     );
   }
+  if (props.admin_set !== undefined) {
+    if (!Array.isArray(props.admin_set) || props.admin_set.length === 0) {
+      return (
+        "document_proposal_admin_set: when declared, the admin set must be a non-empty list of " +
+        "pubkeys — an empty list is a document nobody can ever amend"
+      );
+    }
+    try {
+      canonicalAdminSet(props.admin_set);
+    } catch (err: unknown) {
+      return err instanceof Error ? err.message : String(err);
+    }
+  }
   if (props.topology !== TOPOLOGY_V1) {
     return (
       `document_seam_topology: this version supports "${TOPOLOGY_V1}" only, and the proposal asks ` +
@@ -263,6 +304,9 @@ export function encodeDocumentProposal(env: DocumentProposalEnvelope): Uint8Arra
       // byte encoding.
       ...(env.properties.content_profile !== undefined
         ? { content_profile: env.properties.content_profile }
+        : {}),
+      ...(env.properties.admin_set !== undefined
+        ? { admin_set: canonicalAdminSet(env.properties.admin_set) }
         : {}),
     },
     starting_content: env.starting_content,
@@ -343,6 +387,14 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
   // CANONICAL FORM: absent is the only encoding of "no profile". The TBS folds absent and null to
   // the same signed slot, but an explicit `content_profile: null` on the wire is REFUSED here —
   // one preimage, one decodable byte encoding. A second implementation must emit absent, not null.
+  const adminSet = "admin_set" in p ? p["admin_set"] : undefined;
+  if (adminSet !== undefined) {
+    if (!Array.isArray(adminSet) || adminSet.length === 0 || adminSet.some((s) => typeof s !== "string")) {
+      throw new Error(
+        "document_proposal_field_type: properties.admin_set must be a non-empty array of strings when present",
+      );
+    }
+  }
   const contentProfile = "content_profile" in p ? p["content_profile"] : undefined;
   if (contentProfile !== undefined && (typeof contentProfile !== "string" || contentProfile.length === 0)) {
     throw new Error(
@@ -374,6 +426,7 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
       topology: str(p, "topology"),
       append_only: appendOnly,
       ...(contentProfile !== undefined ? { content_profile: contentProfile } : {}),
+      ...(adminSet !== undefined ? { admin_set: canonicalAdminSet(adminSet as string[]) } : {}),
     },
     starting_content: startingContent === null ? null : new Uint8Array(startingContent),
     nonce: bytes(map, "nonce"),

@@ -77,6 +77,35 @@ describe("document proposal — CBOR round-trip", () => {
     expect("content_profile" in decoded.properties).toBe(false);
   });
 
+  it("carries admin_set on the wire, canonicalized sorted — the SET is signed, not the typing order", () => {
+    const admins = ["bb".repeat(32), "aa".repeat(32)];
+    const original = proposal({ properties: { ...props(), admin_set: admins } });
+    const decoded = decodeDocumentProposal(encodeDocumentProposal(original));
+    expect(decoded.properties.admin_set).toEqual([...admins].sort());
+    expect(buildDocumentProposalTbs(decoded)).toEqual(buildDocumentProposalTbs(original));
+    expect(
+      documentIdFromProposal(proposal({ properties: { ...props(), admin_set: [...admins].reverse() } })),
+    ).toBe(documentIdFromProposal(original));
+  });
+
+  it("a DIFFERENT admin set is a DIFFERENT document — the slot is in the id", () => {
+    const one = proposal({ properties: { ...props(), admin_set: ["aa".repeat(32)] } });
+    const two = proposal({ properties: { ...props(), admin_set: ["bb".repeat(32)] } });
+    const none = proposal();
+    expect(documentIdFromProposal(one)).not.toBe(documentIdFromProposal(two));
+    expect(documentIdFromProposal(one)).not.toBe(documentIdFromProposal(none));
+  });
+
+  it("refuses a duplicate admin and an empty admin list with NAMED errors", () => {
+    const dup = "aa".repeat(32);
+    expect(() =>
+      encodeDocumentProposal(proposal({ properties: { ...props(), admin_set: [dup, dup] } })),
+    ).toThrow(/document_proposal_admin_set/);
+    expect(seamViolation({ ...props(), admin_set: [] })).toMatch(/document_proposal_admin_set/);
+    expect(seamViolation({ ...props(), admin_set: [dup, dup] })).toMatch(/document_proposal_admin_set/);
+    expect(seamViolation({ ...props(), admin_set: [dup] })).toBeNull();
+  });
+
   it("refuses a malformed content_profile with a NAMED error, never a silent default", () => {
     const raw = decodeCbor(encodeDocumentProposal(proposal())) as Record<string, unknown>;
     const props = raw["properties"] as Record<string, unknown>;
@@ -208,7 +237,7 @@ describe("document proposal — document_id is the hash, so canonicalization is 
     expect(documentIdFromProposal(proposal({ nonce: new Uint8Array([9, 8]) }))).not.toBe(id);
     expect(documentIdFromProposal(proposal({ proposed_at_ms: 1 }))).not.toBe(id);
     expect(documentIdFromProposal(proposal({ starting_content: null }))).not.toBe(id);
-    expect(documentIdFromProposal(proposal({ feature_version: 2 }))).not.toBe(id);
+    expect(documentIdFromProposal(proposal({ feature_version: DOCUMENT_FEATURE_VERSION + 1 }))).not.toBe(id);
     for (const p of [
       props({ assurance_tier: "attested" }),
       props({ schema_enforcement: true }),
@@ -312,6 +341,10 @@ describe("document proposal TBS — the FROZEN vector", () => {
     // This test firing was the correct outcome, not an obstacle. A frozen vector that could be
     // edited without noticing is not a guard — if this ever fails again after real documents exist,
     // the change is a migration, not a reissue.
-    expect(documentIdFromProposal(FROZEN)).toBe("7e53ceb4df8d5d9640ed1453c052359d195531ff480292f109f69e05b44c15e5");
+    // REISSUED 2026-08-11 (M14B / DOD-MP-AMEND-1): the admin_set slot entered the preimage and
+    // feature_version moved to 2 — one batched change, journaled (M14B Entry 5). Documents still
+    // do not exist, so rebinding is still free; the NEXT reissue after real documents exist is a
+    // MIGRATION, not a reissue.
+    expect(documentIdFromProposal(FROZEN)).toBe("92d03c21f3c4827271022376349b32bacd295b1d6a31d025f4f37a88e0180c41");
   });
 });
