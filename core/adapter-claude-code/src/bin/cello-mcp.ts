@@ -590,14 +590,16 @@ server.tool("cello_doc_propose", "Offer a shared living document to a counterpar
   document_type: z.string().optional().describe("What kind of document: 'markdown' (default), 'text', 'plaintext' (same as text), 'html' or 'json'. Anything else is refused — a type only some verbs can serve would read as empty and lose your content silently. A 'json' document merges PER KEY, so you and your peer can edit different fields at the same time and both survive — send the complete object, not a fragment. An 'html' document is an executable file: opening it in a browser runs whatever your peer wrote into it, so read it with cello_doc_read or an editor instead."),
   starting_content: z.string().optional().describe("Initial text. Both sides start from these exact bytes."),
   append_only: z.boolean().optional().describe("If true, neither side can delete existing content — only add"),
+  admins: z.array(z.string()).optional().describe("Who governs this document's membership and settings (64-hex pubkeys, from you and the counterparty). Omit for the default: BOTH of you are admins and either can invite others later. The choice is written into the signed proposal — the peer consents to it."),
   document_id: z.string().optional().describe("RE-SEND an offer that was created but never reached the peer (the daemon's guidance names the id). Sends the SAME offer again — proposing afresh instead would create a second document."),
   agent: z.string().optional().describe("Agent to propose as (defaults to the current agent)"),
-}, async ({ peer_pubkey, document_type, starting_content, append_only, document_id, agent }) => {
+}, async ({ peer_pubkey, document_type, starting_content, append_only, admins, document_id, agent }) => {
   const result = await proxy.call("cello_doc_propose", {
     peer_pubkey,
     ...(document_type !== undefined ? { document_type } : {}),
     ...(starting_content !== undefined ? { starting_content } : {}),
     ...(append_only !== undefined ? { append_only } : {}),
+    ...(admins !== undefined ? { admins } : {}),
     // THE RETRY. The daemon has had this branch since the surface shipped, and its own failure
     // guidance tells the operator to use it — but no surface forwarded the parameter, so the
     // instruction could not be followed. An agent obeying it as closely as it could re-proposed

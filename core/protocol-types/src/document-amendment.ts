@@ -264,14 +264,17 @@ export interface Arrangement {
 }
 
 /**
- * GOVERN-1's seam: which signatures does THIS amendment require, given the arrangement as it
- * stands BEFORE the amendment applies.
+ * GOVERN-1's seam: is the collection's CLAIMED required-signer set acceptable for this amendment,
+ * given the arrangement as it stands BEFORE the amendment applies. A verdict rather than a
+ * minted set, because "any single admin" has no single answer — {a} and {b} are both acceptable
+ * claims — and the multisig layer then demands every claimed signature verify.
  */
 export type SignerPolicy = (
   kind: AmendmentKind,
   subjectAgentId: string | null,
   state: { participants: ReadonlySet<string>; admins: ReadonlySet<string> },
-) => string[];
+  claimedRequiredSet: readonly string[],
+) => { ok: true } | { ok: false; reason: string };
 
 export type DeriveResult =
   | { ok: true; arrangement: Arrangement }
@@ -426,8 +429,8 @@ export function deriveArrangement(
       }
     }
 
-    // The collection: bound to THIS amendment, required set exactly the policy's answer for the
-    // state BEFORE it, and complete. Order matters — a mismatch in what the collection claims is
+    // The collection: bound to THIS amendment, its claimed required set ACCEPTABLE TO THE POLICY
+    // for the state BEFORE it, and complete. Order matters — a mismatch in what the collection claims is
     // reported before whether it gathered enough names for the wrong claim.
     const expectedHash = documentAmendmentHash(body);
     if (env.collection.document_id !== body.document_id) {
@@ -446,18 +449,10 @@ export function deriveArrangement(
         at,
       );
     }
-    const requiredByPolicy = [...new Set(policy(body.kind, subject, { participants, admins }))].sort();
-    const claimed = [...env.collection.required_signers].sort();
-    if (
-      requiredByPolicy.length !== claimed.length ||
-      requiredByPolicy.some((id, i) => id !== claimed[i])
-    ) {
-      return refuse(
-        `amendment_required_set_mismatch: epoch ${at} requires the signatures of ` +
-          `[${requiredByPolicy.join(", ")}] and the collection claims [${claimed.join(", ")}] — ` +
-          `a collection may not choose its own signer set`,
-        at,
-      );
+    const verdict = policy(body.kind, subject, { participants, admins }, env.collection.required_signers);
+    if (!verdict.ok) {
+      // The policy's reason IS the diagnosis — epoch context prepended, nothing substituted.
+      return refuse(`epoch ${at}: ${verdict.reason}`, at);
     }
     const status = collectionStatus(env.collection, verify);
     if (!status.complete) {

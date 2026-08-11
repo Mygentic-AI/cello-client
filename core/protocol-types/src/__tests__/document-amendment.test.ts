@@ -51,8 +51,18 @@ function makeVerify(signers: Signer[]) {
   };
 }
 
-/** GOVERN-1's stand-in: every CURRENT admin must sign every amendment. */
-const allAdminsPolicy: SignerPolicy = (_kind, _subject, state) => [...state.admins].sort();
+/** GOVERN-1's stand-in: every CURRENT admin must sign every amendment, claimed exactly. */
+const allAdminsPolicy: SignerPolicy = (_kind, _subject, state, claimed) => {
+  const required = [...state.admins].sort();
+  const c = [...new Set(claimed)].sort();
+  if (required.length === c.length && required.every((id, i) => id === c[i])) return { ok: true };
+  return {
+    ok: false,
+    reason:
+      `amendment_required_set_mismatch: requires [${required.join(", ")}] and the collection ` +
+      `claims [${c.join(", ")}] — a collection may not choose its own signer set`,
+  };
+};
 
 const DOC_ID = "d".repeat(64);
 
