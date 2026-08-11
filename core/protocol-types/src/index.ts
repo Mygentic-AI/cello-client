@@ -256,6 +256,14 @@ export type {
   DocumentProperties,
   DocumentConsentState,
 } from "./document-proposal.js";
+export {
+  DOCUMENT_JOIN_OFFER_DOMAIN,
+  buildDocumentJoinOfferTbs,
+  encodeDocumentJoinOffer,
+  decodeDocumentJoinOffer,
+  validateDocumentJoinOffer,
+} from "./document-join.js";
+export type { DocumentJoinOffer, JoinOfferValidation } from "./document-join.js";
 export { documentGovernancePolicy } from "./document-governance.js";
 export type { GovernanceVerdict } from "./document-governance.js";
 export {
