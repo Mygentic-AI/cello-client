@@ -512,8 +512,49 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         hasStartingContent: p.envelope.starting_content !== null,
         proposedAtMs: p.envelope.proposed_at_ms,
       })),
+      // M14B / DOD-MP-JOIN-1 — offers to join an EXISTING document, decided with the same
+      // accept/refuse verbs (route by document_id). What the invitee consents to is the DERIVED
+      // arrangement; cello_doc_accept re-derives it at the moment of consequence.
+      joins: layer.joins.pendingFor(who.ownerAgentId).map((j) => ({
+        documentId: j.documentId,
+        inviterAgentId: j.inviterAgentId,
+        amendmentHash: j.amendmentHash,
+        offeredAtMs: j.offer.offered_at_ms,
+        carriedEnvelopes: j.offer.envelope_log.length,
+      })),
     };
   });
+
+  /**
+   * Tell the INVITER what was decided — the join twin of `tellProposer`, and the same doctrine:
+   * best-effort, because consent is local and final the moment the operator makes it, and an
+   * unreachable inviter must not get a veto over the invitee's choice.
+   */
+  async function tellInviter(
+    who: Resolved,
+    documentId: string,
+    inviterAgentId: string,
+    answerBytes: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      const sent = await deps.transportFor(who.agentName).sendBytes({
+        peerAgentId: inviterAgentId,
+        documentId,
+        bytes: answerBytes,
+        correlationId: randomUUID(),
+      });
+      if (!sent.ok) {
+        logger.warn("document.join.answer_unsent", { documentId, reason: sent.reason });
+      }
+      return sent.ok;
+    } catch (err: unknown) {
+      logger.warn("document.join.answer_send_threw", {
+        documentId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return false;
+    }
+  }
 
   handlers.set("cello_doc_accept", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -521,6 +562,31 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const documentId = typeof params?.document_id === "string" ? params.document_id : "";
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
+    }
+
+    // A join offer decided with the SAME verb the inbox advertises. Routed first by exact
+    // pending match, so a proposal and a join for different documents can never shadow each
+    // other; an id that matches neither falls through to the proposal path's own refusal.
+    const pendingJoin = layer.joins
+      .pendingFor(who.ownerAgentId)
+      .find((j) => j.documentId === documentId);
+    if (pendingJoin) {
+      const joined = await layer.acceptJoin(who.ownerAgentId, pendingJoin.amendmentHash, deps.now());
+      if (!joined.ok) return { ok: false, reason: joined.reason, guidance: joined.detail };
+      const joinFile = await materialize(who.ownerAgentId, documentId, joined.documentType);
+      const told = await tellInviter(who, documentId, joined.inviterAgentId, joined.answerBytes);
+      return {
+        ok: true,
+        documentId,
+        joined: true,
+        peerAgentId: joined.inviterAgentId,
+        inviterNotified: told,
+        appliedEnvelopes: joined.applied,
+        filePath: joinFile.path,
+        ...(joinFile.path !== null && openingNoticeFor(joined.documentType) !== undefined
+          ? { fileNotice: openingNoticeFor(joined.documentType) }
+          : {}),
+      };
     }
 
     const outcome = layer.handshake.accept(who.ownerAgentId, documentId, deps.now());
@@ -596,6 +662,18 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
+    const pendingJoinRefusal = layer.joins
+      .pendingFor(who.ownerAgentId)
+      .find((j) => j.documentId === documentId);
+    if (pendingJoinRefusal) {
+      const refused = await layer.refuseJoin(
+        who.ownerAgentId, pendingJoinRefusal.amendmentHash, reason, deps.now(),
+      );
+      if (!refused.ok) return { ok: false, reason: refused.reason, guidance: refused.detail };
+      const told = await tellInviter(who, documentId, refused.inviterAgentId, refused.answerBytes);
+      return { ok: true, documentId, joined: false, inviterNotified: told };
+    }
+
     const proposal = layer.handshake.get(who.ownerAgentId, documentId);
     const outcome = layer.handshake.refuse(who.ownerAgentId, documentId, reason, deps.now());
     if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
