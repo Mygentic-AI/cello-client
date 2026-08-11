@@ -257,6 +257,13 @@ export function encodeDocumentProposal(env: DocumentProposalEnvelope): Uint8Arra
       schema_enforcement: env.properties.schema_enforcement,
       topology: env.properties.topology,
       append_only: env.properties.append_only,
+      // Present only when declared — the TBS signs this slot (`?? null`), so an encoding that
+      // drops it has the receiver rebuild a different preimage and refuse the signature of every
+      // profiled proposal. Absent stays absent so profile-less proposals keep their pre-profile
+      // byte encoding.
+      ...(env.properties.content_profile !== undefined
+        ? { content_profile: env.properties.content_profile }
+        : {}),
     },
     starting_content: env.starting_content,
     nonce: env.nonce,
@@ -330,6 +337,15 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
   if (typeof appendOnly !== "boolean") {
     throw new Error("document_proposal_field_type: properties.append_only must be a boolean");
   }
+  // OPTIONAL, unlike the seam fields above — documents agreed before profiles existed carry none,
+  // and `present` would refuse every one of them. When declared it must be a name; membership in
+  // the closed set is the gate's question (`seamViolation` checks shape, the daemon checks names).
+  const contentProfile = "content_profile" in p ? p["content_profile"] : undefined;
+  if (contentProfile !== undefined && (typeof contentProfile !== "string" || contentProfile.length === 0)) {
+    throw new Error(
+      "document_proposal_field_type: properties.content_profile must be a non-empty text string when present",
+    );
+  }
 
   const startingContent = present(map, "starting_content");
   if (startingContent !== null && !(startingContent instanceof Uint8Array)) {
@@ -354,6 +370,7 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
       schema_enforcement: schemaEnforcement,
       topology: str(p, "topology"),
       append_only: appendOnly,
+      ...(contentProfile !== undefined ? { content_profile: contentProfile } : {}),
     },
     starting_content: startingContent === null ? null : new Uint8Array(startingContent),
     nonce: bytes(map, "nonce"),

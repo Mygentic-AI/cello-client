@@ -62,6 +62,21 @@ describe("document proposal — CBOR round-trip", () => {
     expect(decoded.starting_content).toBeNull();
   });
 
+  it("carries content_profile on the wire — the preimage signs it, so the encoding must too", () => {
+    // The profile is in the SIGNED preimage (buildDocumentProposalTbs slot 9). An encoding that
+    // drops it makes the receiver rebuild a different preimage (null) and refuse the signature of
+    // every profiled proposal — the field would be agreed locally and unsendable.
+    const original = proposal({ properties: { ...props(), content_profile: "ascii-markdown" } });
+    const decoded = decodeDocumentProposal(encodeDocumentProposal(original));
+    expect(decoded.properties.content_profile).toBe("ascii-markdown");
+    expect(buildDocumentProposalTbs(decoded)).toEqual(buildDocumentProposalTbs(original));
+  });
+
+  it("a proposal with NO profile round-trips with the field absent, not null", () => {
+    const decoded = decodeDocumentProposal(encodeDocumentProposal(proposal()));
+    expect("content_profile" in decoded.properties).toBe(false);
+  });
+
   it("copies byte fields out of the wire rather than aliasing it", () => {
     const wire = encodeDocumentProposal(proposal());
     const decoded = decodeDocumentProposal(wire);
