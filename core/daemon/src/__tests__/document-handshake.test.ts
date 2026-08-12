@@ -11,7 +11,7 @@ import {
   documentIdFromProposal,
   DOCUMENT_FEATURE_VERSION,
   ASSURANCE_TIER_V1,
-  TOPOLOGY_V1,
+  TOPOLOGY_DEFAULT,
   type DocumentProposalEnvelope,
   type DocumentProperties,
 } from "@cello-protocol/protocol-types";
@@ -37,7 +37,7 @@ function props(over: Partial<DocumentProperties> = {}): DocumentProperties {
   return {
     assurance_tier: ASSURANCE_TIER_V1,
     schema_enforcement: false,
-    topology: TOPOLOGY_V1,
+    topology: TOPOLOGY_DEFAULT,
     append_only: false,
     ...over,
   };
@@ -117,7 +117,7 @@ describe("DocumentHandshake — the seam is refused at PROPOSAL and again at ACC
   for (const [label, p] of [
     ["an attested assurance tier", props({ assurance_tier: "attested" })],
     ["schema enforcement", props({ schema_enforcement: true })],
-    ["mesh topology", props({ topology: "mesh" })],
+    ["star topology", props({ topology: "star" })],
   ] as const) {
     it(`auto-refuses ${label} at proposal, with the reason recorded`, () => {
       const { handshake } = newFixture();
@@ -137,7 +137,7 @@ describe("DocumentHandshake — the seam is refused at PROPOSAL and again at ACC
 
   it("refuses at ACCEPT too, even if the row somehow reached pending", () => {
     const { handshake, db } = newFixture();
-    const env = proposal({ properties: props({ topology: "mesh" }) });
+    const env = proposal({ properties: props({ topology: "star" }) });
     const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(env), NOW);
     // Force the row to pending — this models the real case the second check exists for: the row
     // was recorded by an OLDER build whose seam rules were looser, and this build must not accept
@@ -380,7 +380,7 @@ describe("DocumentHandshake — a proposal must be ADDRESSED to the accepting ag
 describe("DocumentHandshake — a seam violation at ACCEPT is recorded, not just returned", () => {
   it("transitions the row to refused so the operator can clear it", () => {
     const { handshake, db } = newFixture();
-    const env = proposal({ properties: props({ topology: "mesh" }) });
+    const env = proposal({ properties: props({ topology: "star" }) });
     const { documentId } = handshake.recordProposal(OWNER, encodeDocumentProposal(env), NOW);
     db.prepare("UPDATE document_proposals SET consent_state = 'pending' WHERE document_id = ?").run(
       documentId,

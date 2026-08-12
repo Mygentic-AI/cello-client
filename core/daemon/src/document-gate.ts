@@ -456,7 +456,7 @@ export class DocumentGate {
         detail: `clientID(s) ${unbound.join(", ")} advanced but are not bound to sender ` +
           `${context.senderAgentId.slice(0, 16)}… — either an update authored under another ` +
           `party's identity, or relayed third-party operations, which V1 does not support ` +
-          `(hub-and-spoke is deferred, §11.1)`,
+          `(relayed third-party operations — pass-through, M14-P8 — are not supported)`,
       };
     }
     return null;

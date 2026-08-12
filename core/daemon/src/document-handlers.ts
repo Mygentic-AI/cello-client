@@ -46,7 +46,7 @@ import {
   documentIdFromProposal,
   seamViolation,
   ASSURANCE_TIER_V1,
-  TOPOLOGY_V1,
+  TOPOLOGY_DEFAULT,
   DOCUMENT_FEATURE_VERSION,
   encodeDocumentProposalAck,
   buildDocumentProposalAckTbs,
@@ -345,7 +345,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const properties = {
       assurance_tier: ASSURANCE_TIER_V1,
       schema_enforcement: false,
-      topology: TOPOLOGY_V1,
+      topology: TOPOLOGY_DEFAULT,
       append_only: params?.append_only === true,
       admin_set: adminSet,
     };
