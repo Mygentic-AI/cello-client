@@ -18,6 +18,7 @@ import { generateKeypair, verify } from "@cello-protocol/crypto";
 import {
   DOCUMENT_FEATURE_VERSION,
   decodeDocumentProposal,
+  decodeDocumentProposalAck,
   buildDocumentProposalTbs,
   encodeDocumentProposal,
   documentIdFromProposal,
@@ -52,12 +53,21 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   const logger = {
     debug: record, info: record, warn: record, error: record,
   } as unknown as Logger;
+
+  /** Every byte the surface handed to the transport OR the layer, so "sent" can be checked. */
+  const sent: Array<{ peerAgentId: string; bytes: Uint8Array }> = [];
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
 
   const layer = createDocumentLayer({
     db,
     logger,
+    // The layer's own send seam (auto-refusal acks, join answers) — captured in the SAME array
+    // the transport writes to, so a test can assert what actually left by either route.
+    sendFrame: async (_owner: string, peerAgentId: string, bytes: Uint8Array) => {
+      sent.push({ peerAgentId, bytes });
+      return { ok: true as const };
+    },
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: (agentName) => (agentName === AGENT ? owner : null),
     notifyPeer: async () => ({ ok: true }),
@@ -65,8 +75,6 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     sign: async (_owner, tbs) => keys.sign(tbs),
   });
 
-  /** Every byte the surface handed to the transport, so a "sent" claim can be checked. */
-  const sent: Array<{ peerAgentId: string; bytes: Uint8Array }> = [];
   const transport = {
     isPeerReachable: async () => ({ reachable: true, unknownAgent: false }),
     sendBytes: async (input: { peerAgentId: string; bytes: Uint8Array }) => {
@@ -132,6 +140,15 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   };
 }
 
+/** Drain the router's per-owner async queue by polling the observable outcome. */
+async function until(pred: () => boolean): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (pred()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  expect(pred()).toBe(true);
+}
+
 describe("cello_doc_propose — a document exists and the offer leaves", () => {
   it("creates the local document AND sends a proposal the peer can verify", async () => {
     const f = await newFixture();
@@ -154,6 +171,28 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     ).toBe(true);
     expect(documentIdFromProposal(envelope)).toBe(documentId);
     expect(envelope.peer_agent_id).toBe(f.peer);
+    // TOPOLOGY-1: the SENT proposal literally carries the mesh default.
+    expect(envelope.properties.topology).toBe("mesh");
+  });
+
+  it("an ARRIVAL AUTO-REFUSAL answers the proposer — the sentence reaches a human, not just our DB", async () => {
+    // TOPOLOGY-1 review F1: a seam/version refusal at arrival wrote its reason to OUR database
+    // and answered with silence; the proposer waited forever and read it as a network fault.
+    const f = await newFixture();
+    const env = await f.incomingProposal({
+      properties: {
+        assurance_tier: "authenticated",
+        schema_enforcement: false,
+        topology: "star",
+        append_only: false,
+      },
+    });
+    f.layer.onDocumentFrame(AGENT, "session-1", encodeDocumentProposal(env), f.peer);
+    await until(() => f.sent.some((s) => s.peerAgentId === f.peer));
+    const answer = decodeDocumentProposalAck(f.sent.find((s) => s.peerAgentId === f.peer)!.bytes);
+    expect(answer.accepted).toBe(false);
+    expect(answer.refusal_reason).toMatch(/document_seam_topology/);
+    expect(answer.refusal_reason).toContain("star");
   });
 
   it("writes the admin choice into the SIGNED proposal — the everyone default EXPLICITLY, never absent", async () => {
@@ -243,15 +282,6 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
 });
 
 describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
-  /** Drain the router's per-owner async queue by polling the observable outcome. */
-  async function until(pred: () => boolean): Promise<void> {
-    for (let i = 0; i < 100; i++) {
-      if (pred()) return;
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    expect(pred()).toBe(true);
-  }
-
   it("invite → offer → inbox → accept → materialized content → answer settled on the inviter", async () => {
     const fA = await newFixture(); // the inviter's daemon
     const fC = await newFixture(); // the invitee's daemon — its own DB, its own keys

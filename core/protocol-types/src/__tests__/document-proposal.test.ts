@@ -205,6 +205,9 @@ describe("document proposal — the seam is refused, and says which property", (
     expect(r).toMatch(/document_seam_topology/);
     expect(r).toContain('"star"');
     expect(SUPPORTED_TOPOLOGIES.has(TOPOLOGY_DEFAULT)).toBe(true);
+    // The VALUE, pinned: reverting the default to hub-and-spoke kept every symbolic assertion
+    // green — "mesh becomes the default" had zero revert-surviving coverage.
+    expect(TOPOLOGY_DEFAULT).toBe("mesh");
   });
 
   it("append_only is NOT a seam field — both values are legitimate", () => {

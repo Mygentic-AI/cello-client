@@ -58,6 +58,11 @@ import {
   buildDocumentJoinOfferTbs,
   decodeDocumentJoinOffer,
   decodeDocumentAmendment,
+  decodeDocumentProposal,
+  encodeDocumentProposalAck,
+  DOCUMENT_PROPOSAL_ACK_VERSION,
+  MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
+  type DocumentProposalAck,
   documentAmendmentHash,
   validateDocumentJoinOffer,
   documentGovernancePolicy,
@@ -465,7 +470,39 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     recordProposal: (ownerAgentId, wire, nowMs) => {
       // THROWS on a forged or misaddressed proposal, which the router contains and reports. That is
       // right: those are refusals, and nothing should be recorded for them.
-      handshake.recordProposal(ownerAgentId, wire, nowMs);
+      const recorded = handshake.recordProposal(ownerAgentId, wire, nowMs);
+      // BOTH ENDS GET THE SENTENCE (TOPOLOGY-1 review F1, the join path's rule applied here):
+      // an arrival auto-refusal — seam violation, version mismatch — used to write its sentence
+      // to OUR database and answer the proposer with silence, a hang they diagnose as a network
+      // fault. The signed refusal ack now travels best-effort; the proposal verified against its
+      // named proposer at record time, so the answer goes to an authenticated party.
+      const refusalReason = recorded.reason;
+      if (recorded.state === "refused" && refusalReason !== undefined) {
+        const proposal = decodeDocumentProposal(wire);
+        void (async () => {
+          try {
+            const ack: DocumentProposalAck = {
+              type: "document_proposal_ack",
+              ack_version: DOCUMENT_PROPOSAL_ACK_VERSION,
+              document_id: recorded.documentId,
+              acker_agent_id: ownerAgentId,
+              accepted: false,
+              refusal_reason: refusalReason.slice(0, MAX_PROPOSAL_REFUSAL_REASON_LENGTH),
+              decided_at_ms: Date.now(),
+              signature: new Uint8Array(0),
+            };
+            ack.signature = await deps.sign(ownerAgentId, buildDocumentProposalAckTbs(ack));
+            await deps.sendFrame(
+              ownerAgentId, proposal.proposer_agent_id, encodeDocumentProposalAck(ack),
+            );
+          } catch (err: unknown) {
+            logger.warn("document.proposal.auto_refusal_ack_failed", {
+              documentId: recorded.documentId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        })();
+      }
     },
     recordJoinOffer: (ownerAgentId, wire, nowMs) => {
       const offer = decodeDocumentJoinOffer(wire);

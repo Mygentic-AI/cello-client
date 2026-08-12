@@ -12,7 +12,7 @@
  *
  * ── THE SEAM (§3.4, §11.1) ────────────────────────────────────────────────────────────────────
  *
- * Three properties are DECLARED in V1 but support exactly one value each, and the pattern is
+ * Seam properties are DECLARED with a closed accepted-value set, and the pattern is
  * deliberate — §3.3 chose it for `schema_enforcement` and §16.1 generalized it. Declaring a field
  * that only accepts one value looks redundant until you need the second value: the field is
  * already on the wire and already signed, so V2 is a validation change rather than a wire break
@@ -71,7 +71,7 @@ export interface DocumentProperties {
   assurance_tier: string;
   /** Only `false` in V1 — the schema-as-first-update path (§3.3) is V2. */
   schema_enforcement: boolean;
-  /** Only `hub-and-spoke` in V1. */
+  /** `mesh` (the default) or `hub-and-spoke` — anything else refuses at both ends. */
   topology: string;
   /** Receiver-local append-only enforcement (§16.7-1). Freely settable — not a seam field. */
   append_only: boolean;
