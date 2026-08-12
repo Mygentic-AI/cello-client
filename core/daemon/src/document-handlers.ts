@@ -1158,21 +1158,58 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // "all holders derive the same arrangement" — the governance line's headline claim — was
     // unassertable from outside the process. DERIVED here, never stored: each daemon computes it
     // from its OWN chain, which is exactly the property worth comparing across machines.
-    const arrangementFor = (documentId: string): Record<string, unknown> => {
-      const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
-      if (!genesisRecord) return { arrangementUnavailable: "no_genesis_record" };
-      const derived = deriveArrangement(
-        arrangementGenesisFromProposal(genesisRecord.envelope),
-        layer.amendments.chain(who.ownerAgentId, documentId),
-        documentGovernancePolicy,
-        layer.verifySignature,
-      );
-      if (!derived.ok) return { arrangementUnavailable: derived.reason };
-      return {
-        participants: [...derived.arrangement.participants].sort(),
-        admins: [...derived.arrangement.admins].sort(),
-        properties: derived.arrangement.properties,
-      };
+    const unavailable = (reason: string): Record<string, unknown> => ({
+      // THE KEYS ARE ALWAYS PRESENT, null on failure. Dropping them made `row.participants`
+      // undefined, which a consumer coerces to [] and reads as "nobody holds this" — a
+      // materially wrong answer to the question this surface exists to answer. `null` cannot
+      // be mistaken for an empty membership; an absent key already was, in this unit's own
+      // enforcer helper.
+      participants: null,
+      admins: null,
+      properties: null,
+      arrangementUnavailable: reason,
+    });
+    const arrangementFor = (
+      documentId: string,
+      genesisRecord: ReturnType<typeof layer.handshake.get>,
+    ): Record<string, unknown> => {
+      // The SAME name the invite path uses for the same fault, carrying the same sentence —
+      // one condition should not have two names, and the one an operator reads should be the
+      // one that says whose fault it is.
+      if (!genesisRecord) {
+        return unavailable(
+          "document_genesis_missing: the document has a row but no stored genesis proposal to " +
+            "replay from — this is a local-state fault, not the peer's",
+        );
+      }
+      // CONTAINED. `chain()` decodes every stored amendment and `documentIdFromProposal` parses
+      // the genesis — both THROW on bytes this build cannot read (a client downgrade past an
+      // amendment kind is the reachable case). Uncontained, that throw escapes the row, escapes
+      // the map, and the operator asking "what documents do I have?" gets NOTHING because one
+      // chain would not decode.
+      try {
+        const derived = deriveArrangement(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          layer.amendments.chain(who.ownerAgentId, documentId),
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (!derived.ok) return unavailable(derived.reason);
+        return {
+          participants: [...derived.arrangement.participants].sort(),
+          admins: [...derived.arrangement.admins].sort(),
+          properties: derived.arrangement.properties,
+          // WAS THE ADMIN SET DECLARED, OR DEFAULTED? A genesis from before the admin slot
+          // existed carries none, and the replay hands both parties admin power. Rendering that
+          // identically to a declared set would have this surface state as agreed fact something
+          // the code decided — so it says which it is.
+          adminSetDefaulted: genesisRecord.envelope.properties.admin_set === undefined,
+        };
+      } catch (err: unknown) {
+        return unavailable(
+          `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     };
 
     const outgoingJoins = layer.joins.outgoingFor(who.ownerAgentId).map((j) => ({
@@ -1221,7 +1258,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
           consentState: proposal?.consentState ?? null,
           // WHO HOLDS IT AND WHO GOVERNS IT — derived from THIS daemon's own chain (G0).
-          ...arrangementFor(d.documentId),
+          // `proposal` is passed rather than re-fetched: it is the same SQL read and the same
+          // CBOR decode of the same bytes, already in hand.
+          ...arrangementFor(d.documentId, proposal),
           // DID OUR OFFER LEAVE? Only meaningful for a document WE proposed — for one we accepted
           // there is no offer of ours to have sent. Without this, `peerAccepted: null` meant both
           // "they are thinking" and "they were never asked", and the shipped guidance said WAIT,

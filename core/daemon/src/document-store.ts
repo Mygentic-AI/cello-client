@@ -34,7 +34,7 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import { DOCUMENT_AMENDMENTS_CREATE_SQL, walkMembership } from "./document-amendment-store.js";
+import { DOCUMENT_AMENDMENTS_CREATE_SQL, walkMembership, type MembershipVerdict } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -943,10 +943,25 @@ export class DocumentStore {
           ORDER BY epoch_id ASC`,
       )
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
-    const verdict = walkMembership(
-      rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes))),
-      agentId,
-    );
+    // CONTAINED, for the same reason the arrangement read is: `decodeDocumentAmendment` throws
+    // on bytes this build cannot read, and this runs once PER ROW inside `list` — so one
+    // undecodable chain took down the operator's whole document list. Reporting not-removed
+    // here is not a health claim: the same row carries `arrangementUnavailable` naming the
+    // undecodable chain, so the surface says it cannot answer rather than answering wrongly.
+    let verdict: MembershipVerdict;
+    try {
+      verdict = walkMembership(
+        rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes))),
+        agentId,
+      );
+    } catch (err: unknown) {
+      this.#logger.error("document.membership.undecodable", {
+        documentId,
+        agentId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return { removed: false, epochId: null };
+    }
     return { removed: verdict.state === "removed", epochId: verdict.epochId };
   }
 

@@ -133,7 +133,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   };
 
   return {
-    call, layer, sent, owner, peer, events, incomingProposal,
+    call, layer, sent, owner, peer, events, db, incomingProposal,
     peerComesOnline: () => {
       sendFails = undefined;
     },
@@ -223,6 +223,43 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     expect(row.arrangementUnavailable).toBeUndefined();
     expect(row.admins).toEqual([f.owner]);
     expect((row.participants as string[]).sort()).toEqual([f.owner, f.peer].sort());
+    // PROPERTIES is the third part of the arrangement G0 named — surfaced and asserted.
+    expect((row.properties as Record<string, unknown>).topology).toBe("mesh");
+    // And the admin set was DECLARED, not defaulted — the surface can tell them apart.
+    expect(row.adminSetDefaulted).toBe(false);
+  });
+
+  it("a document whose chain cannot be read degrades ONE row, naming the fault — the list survives", async () => {
+    // The blast-radius fix: chain() throws on bytes this build cannot read (a client downgrade
+    // past an amendment kind is the reachable case). Uncontained, that took the WHOLE list down
+    // and the operator asking "what documents do I have?" got nothing at all.
+    const f = await newFixture();
+    const healthy = await f.call("cello_doc_propose", { peer_pubkey: f.peer });
+    const broken = await f.call("cello_doc_propose", {
+      peer_pubkey: f.peer,
+      starting_content: "second doc",
+    });
+    const brokenId = broken.documentId as string;
+    f.db
+      .prepare(
+        `INSERT INTO document_amendments
+           (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(f.owner, brokenId, 1, "h".repeat(64), Buffer.from([0xff, 0xff, 0xff]), 1);
+
+    const list = await f.call("cello_doc_list", {});
+    const rows = list.documents as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2);
+    const ok = rows.find((r) => r.documentId === healthy.documentId)!;
+    expect(ok.arrangementUnavailable).toBeUndefined();
+    expect((ok.participants as string[]).length).toBe(2);
+    // The broken one says WHY, and its membership keys are null — never absent, which a caller
+    // coerces to [] and reads as "nobody holds this".
+    const bad = rows.find((r) => r.documentId === brokenId)!;
+    expect(String(bad.arrangementUnavailable)).toContain("document_chain_undecodable");
+    expect(bad.participants).toBeNull();
+    expect(bad.admins).toBeNull();
   });
 
   it("refuses an admin who is not a party — admins are always holders, and nothing is created", async () => {
