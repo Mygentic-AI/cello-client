@@ -40,6 +40,7 @@ import {
   contactSetSignal,
   docPropose,
   docInvite,
+  docRemove,
   docInbox,
   docAccept,
   docRefuse,
@@ -1052,6 +1053,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "Usage:\n" +
       "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--admins <hex,hex>] [--content <text>] [--retry <id>]\n" +
       "  cello doc invite <document-id> <invitee-pubkey>\n" +
+      "  cello doc remove <document-id> <holder-pubkey>\n" +
       "                                                    — offer a shared document. They must accept.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
       "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
@@ -1116,6 +1118,12 @@ export const COMMANDS: readonly CommandSpec[] = [
         positional[2] !== undefined && !positional[2].startsWith("--")
       ) {
         return docInvite(ctx.celloDir, target, positional[2], o);
+      }
+      if (
+        sub === "remove" && target &&
+        positional[2] !== undefined && !positional[2].startsWith("--")
+      ) {
+        return docRemove(ctx.celloDir, target, positional[2], o);
       }
       if (sub === "accept" && target) return docAccept(ctx.celloDir, target, o);
       if (sub === "refuse" && target) {

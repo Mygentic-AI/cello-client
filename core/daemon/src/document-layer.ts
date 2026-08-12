@@ -283,6 +283,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     logger,
     verifySignature,
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
+    membershipOf: (ownerAgentId, documentId, agentId) =>
+      amendments.membershipOf(ownerAgentId, documentId, agentId),
     sign: deps.sign,
   });
 
@@ -497,6 +499,20 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       );
       if (!derived.ok) throw new Error(derived.reason);
       amendments.append(ownerAgentId, documentId, wire, nowMs);
+      // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just stored:
+      // the row flips to `removed` (publishes refuse locally, naming the condition; the copy,
+      // the file, the history all remain — forward-only by doctrine), and the event is the
+      // operator's notice. Everyone else's arrangement changes are visible through list/inbox
+      // derivation; being written out of one is the change an operator must not miss.
+      if (env.body.kind === "remove_holder" && env.body.subject_agent_id === ownerAgentId) {
+        // Applied by DERIVATION — the recorded chain IS the removal; publish gates and the list
+        // overlay read it. This warn is the operator's notice.
+        logger.warn("document.removed_from", {
+          documentId,
+          epochId: env.body.epoch_id,
+          removedBy: env.collection.required_signers.join(","),
+        });
+      }
     },
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a

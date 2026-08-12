@@ -434,6 +434,89 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fB.layer.store.currentDocumentEpoch(fB.owner, documentId)).toBe(1);
   });
 
+  it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "content C keeps forever. ",
+    });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await fC.call("cello_doc_accept", { document_id: documentId });
+
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fC.owner,
+    });
+    expect(removed).toMatchObject({ ok: true, voluntary: false, epochId: 2 });
+    expect((removed.holdersNotified as Record<string, boolean>)[fC.owner]).toBe(true);
+
+    // C's daemon applies the removal: status flips, the event is the operator's notice —
+    // and the COPY REMAINS, content readable, history intact.
+    const removalSend = fA.sent.filter((s) => s.peerAgentId === fC.owner).at(-1)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", removalSend.bytes, fA.owner);
+    await until(
+      () => fC.layer.store.removedFromArrangement(fC.owner, documentId).removed,
+    );
+    expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
+      "content C keeps forever",
+    );
+    // Publishing refuses NAMING the condition — forward-only, not an error about transport.
+    // (Asserted at the gate: the fixture has no file workspace, so the publish VERB refuses on
+    // the missing file before it ever reaches this gate.)
+    const gate = fC.layer.lifecycle.canPublish(fC.owner, documentId);
+    expect(gate).toMatchObject({ ok: false, reason: "document_removed" });
+    expect((gate as { detail: string }).detail).toContain("epoch 2");
+    // And A's side refuses any post-removal envelope from C by membership (inbound-suite covers
+    // the refusal shape; here we pin the derived arrangement dropped C).
+    const chain = fA.layer.amendments.chain(fA.owner, documentId);
+    expect(chain.at(-1)!.body.kind).toBe("remove_holder");
+    expect(fA.layer.amendments.membershipOf(fA.owner, documentId, fC.owner).state).toBe("removed");
+  });
+
+  it("REMOVE-1: voluntary leave — a holder removes THEMSELVES on their own signature", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await fC.call("cello_doc_accept", { document_id: documentId });
+
+    // C is NOT an admin — leaving is still theirs (D3).
+    const left = await fC.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fC.owner,
+    });
+    expect(left).toMatchObject({ ok: true, voluntary: true });
+    expect(fC.layer.store.removedFromArrangement(fC.owner, documentId).removed).toBe(true);
+    expect(fC.layer.lifecycle.canPublish(fC.owner, documentId)).toMatchObject({
+      ok: false,
+      reason: "document_removed",
+    });
+    // The leave amendment reaches A and A's arrangement drops C.
+    const leaveSend = fC.sent.filter((s) => s.peerAgentId === fA.owner).at(-1)!;
+    fA.layer.onDocumentFrame(AGENT, "session-1", leaveSend.bytes, fC.owner);
+    await until(
+      () => fA.layer.amendments.membershipOf(fA.owner, documentId, fC.owner).state === "removed",
+    );
+  });
+
+  it("REMOVE-1: a fellow ADMIN cannot be expelled through the holder door — the policy's sentence surfaces", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    // Default admins = both parties; removing the peer (an admin) as a holder must refuse.
+    const documentId = proposed.documentId as string;
+    const res = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fA.peer,
+    });
+    expect(res).toMatchObject({ ok: false, reason: "document_amendment_invalid" });
+    expect(String(res.guidance)).toContain("governance_remove_admin_first");
+  });
+
   it("an under-signed offer admits nobody — recorded refused on the invitee, named", async () => {
     const fA = await newFixture();
     const fC = await newFixture();

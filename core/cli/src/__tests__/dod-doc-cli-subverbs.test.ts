@@ -42,7 +42,7 @@ function docRunBody(): string {
 
 /** Every sub-verb the help text advertises to an operator. */
 const ADVERTISED = [
-  "inbox", "list", "propose", "invite", "accept", "refuse",
+  "inbox", "list", "propose", "invite", "remove", "accept", "refuse",
   "read", "write", "diff", "watch", "publish", "close", "kill",
 ];
 

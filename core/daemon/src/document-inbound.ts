@@ -88,6 +88,12 @@ export interface DocumentInboundDeps {
   verifySignature(senderAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
+  /** DOD-MP-REMOVE-1 — the sender's last membership event in the recorded amendment chain. */
+  membershipOf(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): { state: "holder" | "removed" | "untouched"; epochId: number | null };
   /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
@@ -274,6 +280,30 @@ export class DocumentInbound {
         detail:
           `this update names epoch ${env.epoch_id} and this holder is at epoch ${currentEpoch} — ` +
           `an amendment is still in flight here; retry after it lands`,
+      };
+    }
+
+    // 4c. A REMOVED HOLDER'S envelope refuses NAMING THE REMOVAL (DOD-MP-REMOVE-1) — never a
+    // silent drop, and never a generic condition: "you were removed at epoch N" is a different
+    // fact to hand an operator than any transport or chain error, and it is TERMINAL — no
+    // redelivery changes a membership fact. The sender was authenticated at step 2, so answering
+    // discloses only what the removal amendment already told them.
+    const membership = this.#d.membershipOf(ownerAgentId, env.document_id, env.sender_agent_id);
+    if (membership.state === "removed") {
+      this.#d.logger.warn("document.inbound.sender_removed", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        removedAtEpoch: membership.epochId,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_sender_removed",
+        terminal: true,
+        envelopeHash,
+        detail:
+          `this holder was removed from the document at epoch ${membership.epochId} — the ` +
+          `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
       };
     }
 

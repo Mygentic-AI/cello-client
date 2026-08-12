@@ -90,6 +90,7 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   // dual-surface capability's CLI name is a real command", and the source audit.
   { mcp: "cello_doc_propose", cli: "cello doc propose" },
   { mcp: "cello_doc_invite", cli: "cello doc invite" },
+  { mcp: "cello_doc_remove", cli: "cello doc remove" },
   { mcp: "cello_doc_inbox", cli: "cello doc inbox" },
   { mcp: "cello_doc_accept", cli: "cello doc accept" },
   { mcp: "cello_doc_refuse", cli: "cello doc refuse" },

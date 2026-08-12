@@ -15,6 +15,8 @@ import * as Y from "yjs";
 import {
   encodeDocumentUpdateEnvelope,
   documentEnvelopeHash,
+  documentAmendmentHash,
+  encodeDocumentAmendment,
   DOCUMENT_UPDATE_ENCODING_V1,
   DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
@@ -24,6 +26,7 @@ import { DocumentEngine } from "../document-engine.js";
 import { DocumentGate } from "../document-gate.js";
 import { DocumentRejections } from "../document-rejection.js";
 import { DocumentInbound } from "../document-inbound.js";
+import { DocumentAmendmentStore } from "../document-amendment-store.js";
 import type { Logger } from "../types.js";
 
 const AGENT = "owner-agent";
@@ -99,6 +102,7 @@ function newFixture(
     },
   } as unknown as DocumentGate;
   const rejections = new DocumentRejections(store, logger);
+  const amendmentStore = new DocumentAmendmentStore(db, logger);
   const live = new Y.Doc();
   live.clientID = 9999;
 
@@ -106,6 +110,7 @@ function newFixture(
     store, engine, gate, rejections, logger,
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
+    membershipOf: (o, d, a) => amendmentStore.membershipOf(o, d, a),
     sign: async () => new Uint8Array(64).fill(1),
   });
   return { inbound, store, engine, live, events, logger, db };
@@ -133,14 +138,58 @@ describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
 });
 
 describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
-  /** Raise the document's current epoch by planting an amendment-chain head row. */
-  function raiseEpoch(db: DatabaseSync, epoch: number) {
+  /**
+   * Raise the document's current epoch by planting a DECODABLE amendment-chain row — the
+   * membership walk (DOD-MP-REMOVE-1) decodes every stored row, so a garbage blob here is a
+   * state no real daemon can hold (validate-before-append) and would only test the test.
+   */
+  function plantAmendment(
+    db: DatabaseSync,
+    epoch: number,
+    kind: "add_holder" | "remove_holder" = "add_holder",
+    subject: string = "f".repeat(64),
+  ) {
+    const body = {
+      document_id: DOC,
+      epoch_id: epoch,
+      prev_amendment_hash: null,
+      kind,
+      subject_agent_id: subject,
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC,
+        subject_kind: "document_amendment",
+        subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
     db.prepare(
       `INSERT INTO document_amendments
          (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, epoch, "h".repeat(64), Buffer.from([1]), 1);
+    ).run(AGENT, DOC, epoch, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
   }
+  const raiseEpoch = (db: DatabaseSync, epoch: number) => plantAmendment(db, epoch);
+
+  it("a REMOVED sender's envelope is TERMINAL, naming the removal epoch — never a silent drop", async () => {
+    const f = newFixture();
+    plantAmendment(f.db, 1, "remove_holder", PEER);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 1 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
+    expect((res as { detail: string }).detail).toContain("epoch 1");
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
 
   it("an envelope BEHIND the current epoch is TERMINAL — its TBS binds the old epoch forever", async () => {
     const f = newFixture();
