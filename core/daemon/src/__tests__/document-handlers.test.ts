@@ -238,6 +238,89 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
   });
 });
 
+describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
+  /** Drain the router's per-owner async queue by polling the observable outcome. */
+  async function until(pred: () => boolean): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (pred()) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(pred()).toBe(true);
+  }
+
+  it("invite → offer → inbox → accept → materialized content → answer settled on the inviter", async () => {
+    const fA = await newFixture(); // the inviter's daemon
+    const fC = await newFixture(); // the invitee's daemon — its own DB, its own keys
+
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      starting_content: "hello from A. ",
+    });
+    expect(proposed.ok).toBe(true);
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_write", {
+      document_id: documentId,
+      content: "hello from A. plus an edit worth carrying. ",
+    });
+
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    expect(invited).toMatchObject({ ok: true, offerSent: true, epochId: 1 });
+
+    // The offer crossed A's transport addressed to C; C receives it on the session channel and
+    // the router queues the validation.
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner);
+    expect(offerSend).toBeDefined();
+    const routed = fC.layer.onDocumentFrame(AGENT, "session-1", offerSend!.bytes, fA.owner);
+    expect(routed.consumed).toBe(true);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+
+    const inbox = await fC.call("cello_doc_inbox");
+    expect((inbox.joins as Array<{ documentId: string }>)[0]?.documentId).toBe(documentId);
+
+    // C consents BY DERIVING — the accept re-replays the carried bytes.
+    const accepted = await fC.call("cello_doc_accept", { document_id: documentId });
+    expect(accepted).toMatchObject({ ok: true, joined: true });
+    expect(accepted.appliedEnvelopes as number).toBeGreaterThanOrEqual(1);
+
+    // C's copy carries A's content, rebuilt from the snapshot, and both derive epoch 1.
+    expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
+      "hello from A",
+    );
+    expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(1);
+    expect(fA.layer.store.currentDocumentEpoch(fA.owner, documentId)).toBe(1);
+
+    // C's signed answer reaches A and settles the offer — consent recorded on both sides.
+    const answerSend = fC.sent.find((s) => s.peerAgentId === fA.owner);
+    expect(answerSend).toBeDefined();
+    const back = fA.layer.onDocumentFrame(AGENT, "session-1", answerSend!.bytes, fC.owner);
+    expect(back.consumed).toBe(true);
+    await until(
+      () => fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.state === "accepted",
+    );
+  });
+
+  it("an under-signed offer admits nobody — recorded refused on the invitee, named", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      // A is deliberately NOT an admin: only the (absent) peer governs.
+      admins: [fA.peer],
+    });
+    const documentId = proposed.documentId as string;
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    // The inviter's own daemon refuses at authoring — a non-admin cannot even mint the offer.
+    expect(invited).toMatchObject({ ok: false, reason: "document_not_admin" });
+    expect(fA.sent.find((s) => s.peerAgentId === fC.owner)).toBeUndefined();
+  });
+});
+
 describe("cello_doc_accept — consent and the document are ONE act", () => {
   it("creates the document, so the peer's first update is not refused as unknown", async () => {
     const f = await newFixture();
