@@ -31,7 +31,7 @@ cello_doc_diff({ document_id })              — what changed since you last rea
 cello_doc_watch({ document_id, paths })      — wake me when THESE fields change (local to you)
 cello_doc_write({ document_id, content })    — replace the text, publish the change
 cello_doc_publish({ document_id })           — publish what is in the document's FILE right now
-cello_doc_close({ document_id })             — you are done; settles when they say so too
+cello_doc_close({ document_id })             — you are done; completes when every holder says so
 cello_doc_kill({ document_id })              — end it now, one-sided
 ```
 
@@ -157,7 +157,7 @@ document worse in a way that is tedious to undo.
 ## Ending one
 
 `cello_doc_close` says you are finished. It does not stop anyone editing on its own — the document
-settles only once the other side has said it too. Every current holder is told you said it.
+is complete only once EVERY current holder has said it too. All of them are told you said it.
 
 `cello_doc_kill` is one-sided and immediate. Use it when something is wrong, not when you are simply
 finished. Afterwards neither side's updates are accepted. Both copies and both histories are kept:

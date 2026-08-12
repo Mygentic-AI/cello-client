@@ -718,7 +718,7 @@ server.tool("cello_doc_publish", "Publish whatever is in the document's FILE rig
   return jsonText(result);
 });
 
-server.tool("cello_doc_close", "Say you are done with a shared document. This does not end anyone's editing on its own — it is a statement that you are finished, and the document settles only once the other side has said it too. Every current holder is told: check `holdersNotified` in the result, which names each one and whether they took it, because a holder who was not told will keep editing a document you consider finished. Use cello_doc_kill if you need it over now.", {
+server.tool("cello_doc_close", "Say you are done with a shared document. This does not end anyone's editing on its own — it is a statement that you are finished, and the document is complete only once EVERY current holder has said it too. Every current holder is told: check `holdersNotified` in the result, which names each one and whether they took it, because a holder who was not told will keep editing a document you consider finished. Use cello_doc_kill if you need it over now.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   agent: z.string().optional().describe("Agent closing (defaults to the current agent)"),
 }, async ({ document_id, agent }) => {

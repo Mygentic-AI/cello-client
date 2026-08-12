@@ -286,7 +286,7 @@ cello_doc_diff({ document_id })              — what changed since YOU last rea
 cello_doc_watch({ document_id, paths })      — wake me when THESE fields change (local to you)
 cello_doc_write({ document_id, content })    — replace the text and publish the change
 cello_doc_publish({ document_id })           — publish what is in the document's FILE right now
-cello_doc_close({ document_id })             — you are done; settles when they say so too
+cello_doc_close({ document_id })             — you are done; completes when every holder says so
 cello_doc_kill({ document_id })              — end it now, one-sided
 ```
 
