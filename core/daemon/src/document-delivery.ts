@@ -225,9 +225,14 @@ export class DocumentDelivery {
    * unreachable peer must not stop delivery to every other peer, which is precisely the "works
    * only when all nodes are healthy" shape the project forbids.
    */
+  /**
+   * One pass over what is due, PER (document, holder). Returns counts rather than throwing on a
+   * per-target failure: one unreachable HOLDER must not stop delivery to any other — the same
+   * "works only when all nodes are healthy" shape the project forbids, now per holder.
+   */
   async tick(
     ownerAgentId: string,
-    peerFor: (documentId: string) => string | null,
+    holdersFor: (documentId: string) => string[] | null,
     nowMs: number,
     opts: {
       sessionHints?: ReadonlyMap<string, string>;
@@ -236,12 +241,8 @@ export class DocumentDelivery {
       senderAgentId?: string;
     } = {},
   ): Promise<DeliveryTickResult> {
-    // NO RE-ENTRY. Nothing marks a row in-flight until its outcome lands, so a `deliver` slower
-    // than the tick interval — a dial to a distant peer is exactly that — would have the next tick
-    // return the same rows and dial again: two autonomous sessions and two seals for one envelope,
-    // and the loser's markAcked returning false, which logs as if the PEER had redelivered an ack.
     if (this.#inFlight) return this.#inFlight;
-    const run = this.#run(ownerAgentId, peerFor, nowMs, opts);
+    const run = this.#run(ownerAgentId, holdersFor, nowMs, opts);
     this.#inFlight = run;
     try {
       return await run;
@@ -252,7 +253,7 @@ export class DocumentDelivery {
 
   async #run(
     ownerAgentId: string,
-    peerFor: (documentId: string) => string | null,
+    holdersFor: (documentId: string) => string[] | null,
     nowMs: number,
     opts: {
       sessionHints?: ReadonlyMap<string, string>;
@@ -260,288 +261,236 @@ export class DocumentDelivery {
       senderAgentId?: string;
     },
   ): Promise<DeliveryTickResult> {
-    // THE PASS BUDGET. Spent down by every envelope that opens its own session and waits for an
-    // ack; once it is gone the rest of the pass delivers without waiting rather than stalling
-    // behind whoever exhausted it. See DELIVERY_ACK_GRACE_BUDGET_MS.
     let graceBudgetRemainingMs = DELIVERY_ACK_GRACE_BUDGET_MS;
-    // Minted once per pass and threaded through every event, so an operator can tie a failure back
-    // to the lookup that preceded it and the session that carried it. Delivery is precisely the
-    // async multi-step flow the convention exists for: lookup, dial, deliver, ack — across ticks
-    // and across restarts.
     const correlationId = opts.correlationId ?? `dlv-${ownerAgentId.slice(0, 8)}-${nowMs}`;
-    // OUR sender id on the wire, which M14-D5 makes the pubkey hex rather than the owner key.
-    // Passing the owner key here returned nothing pending and every published update sat in the log
-    // undelivered, with no error on any path.
-    const pending = this.#store.pendingDeliveries(ownerAgentId, nowMs, opts.senderAgentId);
+    const senderAgentId = opts.senderAgentId ?? ownerAgentId;
+
+    // LEGACY bilateral rows gain their per-holder twin before anything is read — idempotent
+    // insurance, journaled (Entry 14): pre-fan-out backlogs are near-empty at alpha.
+    this.#store.backfillBilateralDeliveries(ownerAgentId, senderAgentId, nowMs);
+
+    const pending = this.#store.pendingHolderDeliveries(ownerAgentId, nowMs);
     const result: DeliveryTickResult = {
       attempted: 0, delivered: 0, sent: 0, rejected: 0, deferred: 0, failed: 0,
     };
 
-    // Group by document so one reachability lookup serves every pending envelope for that peer.
-    // Per-envelope lookups would multiply directory traffic by the size of the backlog, which is
-    // largest exactly when the peer has been away longest.
-    const byDocument = new Map<string, DocumentEnvelopeRow[]>();
-    for (const e of pending) {
-      const list = byDocument.get(e.documentId);
-      if (list) list.push(e);
-      else byDocument.set(e.documentId, [e]);
+    // Grouped (document, holder): one derivation and one reachability probe serve every pending
+    // envelope for that pair.
+    const byDocument = new Map<string, Map<string, Array<{ attempts: number; envelope: DocumentEnvelopeRow }>>>();
+    for (const p of pending) {
+      let holders = byDocument.get(p.documentId);
+      if (!holders) {
+        holders = new Map();
+        byDocument.set(p.documentId, holders);
+      }
+      const list = holders.get(p.holderAgentId);
+      if (list) list.push(p);
+      else holders.set(p.holderAgentId, [p]);
     }
 
-    for (const [documentId, envelopes] of byDocument) {
-      const peerAgentId = peerFor(documentId);
-      // DOD-MP-REMOVE-1 — "every remaining holder STOPS DELIVERING to the removed holder."
-      // Checked here, against the recorded chain, because the row's peer_agent_id is a genesis
-      // fact and outlives the arrangement. The envelopes are retired as ABANDONED — a settled
-      // decision of ours, not evidence about the peer — so they leave every pending counter
-      // rather than redialing a party the arrangement no longer includes.
-      if (peerAgentId !== null) {
-        const membership = this.#store.memberRemoved(ownerAgentId, documentId, peerAgentId);
-        if (membership.removed) {
-          this.#logger.info("document.delivery.peer_removed", {
-            documentId,
-            peerAgentId,
-            removedAtEpoch: membership.epochId,
-            retired: envelopes.length,
-            correlationId,
-          });
-          for (const e of envelopes) {
-            this.#store.markAbandoned(ownerAgentId, documentId, e.envelopeHash, nowMs);
+    for (const [documentId, holderGroups] of byDocument) {
+      const currentHolders = holdersFor(documentId);
+      if (currentHolders === null) {
+        // The document row is gone or its chain does not derive — NOT transient. Scheduled at
+        // the cap so the rows never starve anything, exactly the old no_peer discipline.
+        this.#logger.error("document.delivery.no_holders", {
+          documentId,
+          pending: [...holderGroups.values()].reduce((n, l) => n + l.length, 0),
+          correlationId,
+        });
+        for (const [holder, rows] of holderGroups) {
+          for (const r of rows) {
+            this.#store.scheduleHolderRetry(
+              ownerAgentId, documentId, r.envelope.envelopeHash, holder,
+              nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
+            );
           }
+          result.failed += rows.length;
+        }
+        continue;
+      }
+      const currentSet = new Set(currentHolders);
+
+      for (const [holderAgentId, rows] of holderGroups) {
+        // A holder the arrangement no longer includes — removed, or never derivable — is
+        // RETIRED, announced: our decision, not evidence about them (DOD-MP-REMOVE-1's
+        // delivery-stop clause, generalized per holder).
+        if (
+          !currentSet.has(holderAgentId) ||
+          this.#store.memberRemoved(ownerAgentId, documentId, holderAgentId).removed
+        ) {
+          const retiredHashes = this.#store.abandonHolderDeliveries(
+            ownerAgentId, documentId, holderAgentId, nowMs,
+          );
+          for (const hash of retiredHashes) {
+            this.#store.reconcileEnvelopeSettlement(ownerAgentId, documentId, hash, nowMs);
+          }
+          this.#logger.info("document.delivery.peer_removed", {
+            documentId, holderAgentId, retired: retiredHashes.length, correlationId,
+          });
           continue;
         }
-      }
-      if (peerAgentId === null) {
-        // No peer means the document row is gone or malformed, which is NOT transient — so it goes
-        // straight to the cap rather than climbing to it, and crucially it is SCHEDULED. Skipping
-        // the schedule made this the one exit that never self-corrects: the rows stayed due on
-        // every tick forever, emitting an error line each time, and — because the pending window
-        // is ordered and bounded — they filled it and starved every other document. The operator's
-        // work on an unrelated document would silently never leave the machine, with the only
-        // signal being an error naming a different one.
-        this.#logger.error("document.delivery.no_peer", {
-          documentId,
-          pending: envelopes.length,
-          correlationId,
-        });
-        for (const e of envelopes) {
-          this.#store.recordDeliveryAttempt(
-            ownerAgentId,
-            documentId,
-            e.envelopeHash,
-            nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
-          );
-        }
-        result.failed += envelopes.length;
-        continue;
-      }
 
-      let reach: { reachable: boolean; unknownAgent: boolean };
-      try {
-        reach = await this.#transport.isPeerReachable(peerAgentId, correlationId);
-      } catch (err: unknown) {
-        // A FAILED LOOKUP IS NOT AN OFFLINE PEER. Recording it as "away" would report a directory
-        // outage to the operator as their collaborator being absent — an error substituted for a
-        // different error, and one that sends them to ask the wrong person.
-        this.#logger.warn("document.delivery.lookup_failed", {
-          documentId,
-          peerAgentId,
-          correlationId,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-        this.#defer(ownerAgentId, documentId, envelopes, nowMs);
-        result.deferred += envelopes.length;
-        continue;
-      }
-
-      if (!reach.reachable) {
-        // The unknown-agent case is announced AGAINST THE DOCUMENT, not in a separate line that
-        // cannot be joined to it. "This address does not resolve" and "your collaborator stepped
-        // away" are different things to tell an operator, and the second is what they saw for both.
-        this.#logger.info(
-          reach.unknownAgent ? "document.delivery.peer_unknown" : "document.delivery.peer_unreachable",
-          { documentId, peerAgentId, pending: envelopes.length, correlationId },
-        );
-        this.#defer(ownerAgentId, documentId, envelopes, nowMs);
-        result.deferred += envelopes.length;
-        continue;
-      }
-
-      for (const envelope of envelopes) {
-        result.attempted += 1;
-        // CLAIM THE ROW BEFORE DIALING. Scheduling only on the outcome leaves the row due for the
-        // whole duration of the dial, and leaves it due FOREVER if the daemon dies mid-dial. The
-        // claim is corrected below when the outcome lands.
-        const attempts = this.#store.recordDeliveryAttempt(
-          ownerAgentId,
-          documentId,
-          envelope.envelopeHash,
-          nowMs + backoffFor(envelope.attempts ?? 0),
-        );
-        let outcome: Awaited<ReturnType<DocumentDeliveryTransport["deliver"]>>;
-        const graceStartedAt = Date.now();
+        let reach: { reachable: boolean; unknownAgent: boolean };
         try {
-          outcome = await this.#transport.deliver({
-            peerAgentId,
-            documentId,
-            envelope,
-            // WHAT IS LEFT OF THE PASS BUDGET, never a fresh allowance. One unresponsive peer can
-            // exhaust it, and then every later envelope in the sweep is delivered without a wait
-            // rather than the sweep stalling behind it.
-            ackGraceMs: Math.max(0, graceBudgetRemainingMs),
-            // Per DOCUMENT. One hint applied to every envelope in the pass refused every OTHER
-            // document's delivery — their peer's active sessions cannot contain this document's
-            // session — so an unrelated update failed and backed off, citing a session the
-            // operator never associated with it.
-            sessionHint: opts.sessionHints?.get(documentId),
-            correlationId,
-          });
+          reach = await this.#transport.isPeerReachable(holderAgentId, correlationId);
         } catch (err: unknown) {
-          // A THROW IS A FAILURE, never a success. Wrapped here rather than left to propagate so
-          // one envelope's transport fault does not abandon the rest of the backlog mid-pass.
-          outcome = {
-            ok: false,
-            reason: "document_delivery_threw",
-            detail: err instanceof Error ? err.message : String(err),
-          };
-        } finally {
-          // SPEND WHAT THE CALL ACTUALLY TOOK, not the allowance it was offered. The dial and the
-          // seal share the same await and cannot be timed apart from here, so the whole call is
-          // charged — the conservative direction, since it can only exhaust the budget sooner,
-          // never let one envelope overrun it.
-          graceBudgetRemainingMs -= Date.now() - graceStartedAt;
+          // A FAILED LOOKUP IS NOT AN OFFLINE HOLDER — deferred, per holder, without an attempt.
+          this.#logger.warn("document.delivery.lookup_failed", {
+            documentId, holderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          for (const r of rows) {
+            // Deferrals ESCALATE the schedule (an offline holder must not be redialed at full
+            // rate forever) without touching the SENDS ceiling — waiting is not sending.
+            this.#store.recordHolderAttempt(
+              ownerAgentId, documentId, r.envelope.envelopeHash, holderAgentId,
+              nowMs + backoffFor(r.attempts),
+            );
+          }
+          result.deferred += rows.length;
+          continue;
+        }
+        if (!reach.reachable) {
+          this.#logger.info(
+            reach.unknownAgent ? "document.delivery.peer_unknown" : "document.delivery.peer_unreachable",
+            { documentId, holderAgentId, pending: rows.length, correlationId },
+          );
+          for (const r of rows) {
+            this.#store.recordHolderAttempt(
+              ownerAgentId, documentId, r.envelope.envelopeHash, holderAgentId,
+              nowMs + backoffFor(r.attempts),
+            );
+          }
+          result.deferred += rows.length;
+          continue;
         }
 
-        if (outcome.ok && outcome.admitted === null) {
-          // IN FLIGHT. The content left and the peer has not answered.
-          this.#store.markDelivered(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-          // PARKED IS NOT DELIVERED, and scheduling them alike cost ten minutes per parked update.
-          //
-          // The ack timeout answers "how long do I wait for an ANSWER", and it is the right question
-          // for content that reached the peer. Parked content did not reach them — the relay took it
-          // because the session had no live counterparty — so the question is the one the ordinary
-          // backoff answers: how long before trying again. Ten minutes for a peer who is online and
-          // simply moved to another session is a stall the operator reads as a broken document.
-          //
-          // Caught by the no-chat enforcer flipping red when unrelated edits shifted timing by
-          // milliseconds: the update parked onto a session the peer had just left, and the next
-          // attempt was outside any window a person would wait.
-          const parked = outcome.parked;
-          this.#store.recordDeliveryAttempt(
-            ownerAgentId,
-            documentId,
-            envelope.envelopeHash,
-            nowMs + (parked ? backoffFor(envelope.attempts ?? 0) : DELIVERY_ACK_TIMEOUT_MS),
+        for (const row of rows) {
+          const envelope = row.envelope;
+          result.attempted += 1;
+          // CLAIM THE ROW BEFORE DIALING — due-forever-on-crash-mid-dial is the same hazard it
+          // always was, per holder now.
+          this.#store.recordHolderAttempt(
+            ownerAgentId, documentId, envelope.envelopeHash, holderAgentId,
+            nowMs + backoffFor(row.attempts),
           );
-          this.#logger.info("document.delivery.sent", {
-            documentId,
-            envelopeHash: envelope.envelopeHash,
-            sessionId: outcome.sessionId,
-            sessionOpened: outcome.sessionOpened,
-            unackedSends: attempts,
-            correlationId,
-          });
-          result.sent += 1;
+          let outcome: Awaited<ReturnType<DocumentDeliveryTransport["deliver"]>>;
+          const graceStartedAt = Date.now();
+          try {
+            outcome = await this.#transport.deliver({
+              peerAgentId: holderAgentId,
+              documentId,
+              envelope,
+              ackGraceMs: Math.max(0, graceBudgetRemainingMs),
+              sessionHint: opts.sessionHints?.get(documentId),
+              correlationId,
+            });
+          } catch (err: unknown) {
+            outcome = {
+              ok: false,
+              reason: "document_delivery_threw",
+              detail: err instanceof Error ? err.message : String(err),
+            };
+          } finally {
+            graceBudgetRemainingMs -= Date.now() - graceStartedAt;
+          }
 
-          if (attempts >= DELIVERY_MAX_UNACKED_SENDS) {
-            // A peer that will never answer must stop being a transient. Otherwise this envelope is
-            // re-sent forever and looks, in the log and in `list`, exactly like one about to land.
-            //
-            // AND IT DID, because setting the status was never what stopped it. The selection above
-            // is `pendingDeliveries`, which filters on `acked_at IS NULL` and reads no status at
-            // all — so `stalled` changed what the surface SAID and nothing about what the worker
-            // DID. Every subsequent tick re-entered this branch, re-set the same status, and sent
-            // again. Measured on the operator's daemon: `sends: 74` against a documented cap of 5,
-            // while both the log line and the comment above claimed publishing had stopped.
-            //
-            // Retiring the envelope is what actually stops it — and it is retired as ABANDONED,
-            // not as acked. `markAcked` was the first spelling and it was wrong: `acked_at` means
-            // "the peer's daemon answered", so reusing it made `withdraw` tell the operator "your
-            // peer holds it, so it cannot be withdrawn" about an envelope the peer may never have
-            // seen. Giving up is our decision; it is not evidence about them.
-            this.#store.setDocumentStatus(ownerAgentId, documentId, "stalled");
-            this.#store.markAbandoned(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-            this.#logger.error("document.delivery.unacked_limit", {
+          if (outcome.ok && outcome.admitted === null) {
+            // IN FLIGHT for THIS holder. Parked and live sends want DIFFERENT retry schedules,
+            // but both LEFT the machine — the sent-vs-never-left surface counts either (review
+            // M7: reporting relay-parked content as "never left" mislabels a delivery that the
+            // relay is holding for them).
+            this.#store.markHolderDelivered(
+              ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
+            );
+            const sends = this.#store.recordHolderSend(
+              ownerAgentId, documentId, envelope.envelopeHash, holderAgentId,
+            );
+            this.#store.scheduleHolderRetry(
+              ownerAgentId, documentId, envelope.envelopeHash, holderAgentId,
+              nowMs + (outcome.parked ? backoffFor(row.attempts) : DELIVERY_ACK_TIMEOUT_MS),
+            );
+            this.#logger.info("document.delivery.sent", {
               documentId,
               envelopeHash: envelope.envelopeHash,
-              sends: attempts,
-              correlationId,
-              // WHAT WAS OBSERVED, not a guess about whose fault it is. This said "Their client may
-              // not support shared documents yet" — an assertion about the PEER'S SOFTWARE for a
-              // failure whose measured cause was our own teardown deleting an ack that had already
-              // arrived and been verified. An exit-point label presented as a diagnosis, and it
-              // sent the one operator who hit it looking at the wrong machine.
-              //
-              // Both named events are ours and are upstream of this line, so the operator has
-              // somewhere to go before concluding anything about the counterparty.
-              detail:
-                `this update has been delivered ${attempts} times without the peer's daemon ever ` +
-                `confirming it — the document has stopped publishing and this update will not be ` +
-                `retried. The cause may be local: check document.delivery.ack_grace_expired and ` +
-                `session.content.held.discarded for this session before concluding the peer's ` +
-                `client is at fault.`,
-            });
-          }
-        } else if (outcome.ok) {
-          // ACK = the peer's daemon ANSWERED, admitted or not. A rejection is an ack for delivery
-          // purposes (§3.2's 0x05): the peer has decided, so there is nothing left to retry, and
-          // retrying would re-trigger their gate and their retry counter until the document stalls
-          // for reasons the operator cannot see. Supersession is REJECT-1's job, not the worker's.
-          const first = this.#store.markAcked(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-          this.#logger.info("document.delivery.session", {
-            documentId,
-            sessionId: outcome.sessionId,
-            opened: outcome.sessionOpened,
-            correlationId,
-          });
-          if (outcome.admitted) {
-            this.#logger.info("document.delivery.acked", {
-              documentId,
-              envelopeHash: envelope.envelopeHash,
+              holderAgentId,
               sessionId: outcome.sessionId,
-              firstAck: first,
+              sessionOpened: outcome.sessionOpened,
+              unackedSends: sends,
               correlationId,
             });
-            result.delivered += 1;
+            result.sent += 1;
+
+            if (sends >= DELIVERY_MAX_UNACKED_SENDS) {
+              // THIS HOLDER is exhausted — retired, announced, and only theirs. The document
+              // stalls ONLY when every current holder is exhausted: one silent peer stopping a
+              // living collaboration is the exact availability failure the milestone forbids.
+              this.#store.abandonSingleHolderDelivery(
+                ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
+              );
+              this.#store.reconcileEnvelopeSettlement(
+                ownerAgentId, documentId, envelope.envelopeHash, nowMs,
+              );
+              this.#logger.error("document.delivery.unacked_limit", {
+                documentId,
+                envelopeHash: envelope.envelopeHash,
+                holderAgentId,
+                sends,
+                correlationId,
+                detail:
+                  `this update has been delivered ${sends} times to this holder without their ` +
+                  `daemon ever confirming it — delivery TO THEM is retired; every other holder ` +
+                  `is unaffected. Check document.delivery.ack_grace_expired and ` +
+                  `session.content.held.discarded before concluding their client is at fault.`,
+              });
+              const allExhausted = currentHolders
+                .filter((h) => h !== senderAgentId)
+                .every((h) => !this.#store.holderHasPending(ownerAgentId, documentId, h));
+              if (allExhausted) {
+                this.#store.setDocumentStatus(ownerAgentId, documentId, "stalled");
+                this.#logger.error("document.delivery.stalled_all_holders", {
+                  documentId, correlationId,
+                });
+              }
+            }
+          } else if (outcome.ok) {
+            const first = this.#store.ackHolderDelivery(
+              ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
+            );
+            // The envelope-level record follows the ONE terminal rule (review M3).
+            this.#store.reconcileEnvelopeSettlement(
+              ownerAgentId, documentId, envelope.envelopeHash, nowMs,
+            );
+            this.#logger.info("document.delivery.session", {
+              documentId, holderAgentId, sessionId: outcome.sessionId,
+              opened: outcome.sessionOpened, correlationId,
+            });
+            if (outcome.admitted) {
+              this.#logger.info("document.delivery.acked", {
+                documentId, envelopeHash: envelope.envelopeHash, holderAgentId,
+                sessionId: outcome.sessionId, firstAck: first, correlationId,
+              });
+              result.delivered += 1;
+            } else {
+              this.#logger.warn("document.delivery.rejected", {
+                documentId, envelopeHash: envelope.envelopeHash, holderAgentId,
+                sessionId: outcome.sessionId, reason: outcome.rejectionReason, correlationId,
+              });
+              result.rejected += 1;
+            }
           } else {
-            this.#logger.warn("document.delivery.rejected", {
-              documentId,
-              envelopeHash: envelope.envelopeHash,
-              sessionId: outcome.sessionId,
-              reason: outcome.rejectionReason,
+            this.#logger.warn("document.delivery.failed", {
+              documentId, envelopeHash: envelope.envelopeHash, holderAgentId,
+              reason: outcome.reason, detail: outcome.detail, attempts: row.attempts + 1,
               correlationId,
             });
-            result.rejected += 1;
+            result.failed += 1;
           }
-        } else {
-          this.#logger.warn("document.delivery.failed", {
-            documentId,
-            envelopeHash: envelope.envelopeHash,
-            reason: outcome.reason,
-            detail: outcome.detail,
-            attempts,
-            correlationId,
-          });
-          result.failed += 1;
         }
       }
     }
 
     return result;
-  }
-
-  #defer(
-    ownerAgentId: string,
-    documentId: string,
-    envelopes: readonly DocumentEnvelopeRow[],
-    nowMs: number,
-  ): void {
-    for (const e of envelopes) {
-      this.#store.recordDeliveryAttempt(
-        ownerAgentId,
-        documentId,
-        e.envelopeHash,
-        nowMs + backoffFor(e.attempts ?? 0),
-      );
-    }
   }
 }

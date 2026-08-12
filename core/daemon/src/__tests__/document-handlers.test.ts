@@ -83,6 +83,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     logger,
     layer,
     publish: new DocumentPublish({
+      holdersFor: (o, d) => layer.holdersFor(o, d),
       store: layer.store,
       engine: layer.engine,
       logger,

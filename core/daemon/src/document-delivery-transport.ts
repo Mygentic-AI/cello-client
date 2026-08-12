@@ -99,7 +99,12 @@ export interface DocumentTransportDeps {
    * relay, a busy peer. The rule is simply that we do not tear down the channel an answer is due
    * on until it has arrived or we have given up on it.
    */
-  awaitAck(envelopeHash: string, timeoutMs: number): Promise<{ admitted: boolean } | null>;
+  /** Waits for THE DIALED HOLDER'S answer — any other holder's ack must not resolve it (H1). */
+  awaitAck(
+    envelopeHash: string,
+    expectedAckerAgentId: string,
+    timeoutMs: number,
+  ): Promise<{ admitted: boolean } | null>;
   /**
    * Try to fill this session's ordering gaps, so anything HELD can be released.
    *
@@ -310,7 +315,7 @@ export function createDocumentDeliveryTransport(
             reason: err instanceof Error ? err.message : String(err),
           });
         });
-        settlement = await deps.awaitAck(envelope.envelopeHash, graceMs);
+        settlement = await deps.awaitAck(envelope.envelopeHash, input.peerAgentId, graceMs);
         if (!settlement) {
           // NOT a failure of the send — the content left and the peer may still answer later. Said
           // out loud because a seal that discards a held ack is otherwise invisible, and this is

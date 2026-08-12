@@ -106,6 +106,10 @@ async function newFixture(opts: { publishBlocked?: string } = {}) {
   registerDocumentHandlers({
     handlers, logger, layer,
     publish: new DocumentPublish({
+      holdersFor: (o, d) => {
+        const doc = layer.store.getDocument(o, d);
+        return doc ? [doc.peerAgentId] : null;
+      },
       store: layer.store, engine: layer.engine, logger,
       sign: async (_o, tbs) => keys.sign(tbs),
       senderIdFor: (o) => o,

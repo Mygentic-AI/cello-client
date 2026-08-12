@@ -49,6 +49,13 @@ export interface DocumentPublishDeps {
   senderIdFor(ownerAgentId: string): string | null;
   /** May this agent publish into this document right now? LIFECYCLE-1 owns the answer. */
   canPublish(ownerAgentId: string, documentId: string): { ok: true } | { ok: false; reason: string; detail: string };
+  /**
+   * M14B / FANOUT-1 — the CURRENT derived holders. Null means the chain does not derive, and a
+   * publish that cannot name its targets REFUSES rather than appending an envelope nothing will
+   * ever deliver (an un-seeded envelope is invisible work — the exact silent failure the
+   * envelope-first rule exists to prevent, arriving through the other door).
+   */
+  holdersFor(ownerAgentId: string, documentId: string): string[] | null;
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -146,10 +153,25 @@ export class DocumentPublish {
       update,
       signature: new Uint8Array(0),
     };
+    // TARGETS BEFORE THE ENVELOPE: a publish that cannot name its holders refuses before it
+    // writes, because an appended-but-unseeded envelope is invisible work nothing will deliver.
+    const holders = this.#d.holdersFor(ownerAgentId, documentId);
+    if (holders === null) {
+      return {
+        ok: false,
+        reason: "document_chain_invalid",
+        detail:
+          "this document's arrangement does not derive from its recorded chain — nothing can be " +
+          "published until it does; see document.holders.underivable in the log",
+      };
+    }
     envelope.signature = await this.#d.sign(ownerAgentId, buildDocumentUpdateTbs(envelope));
     const envelopeHash = documentEnvelopeHash(envelope);
 
-    const appended = this.#d.store.appendEnvelope(ownerAgentId, {
+    // ONE TRANSACTION (review M5): a crash between the append and the seed left an envelope
+    // in the log with zero delivery rows, and the bilateral backfill would re-seed only the
+    // genesis peer — every other holder silently never receiving it, forever.
+    const appended = this.#d.store.appendEnvelopeWithDeliveries(ownerAgentId, {
       envelopeHash,
       documentId,
       senderAgentId: senderId,
@@ -164,7 +186,7 @@ export class DocumentPublish {
       // inbound path stores for their envelopes.
       senderClientId: doc.clientID,
       createdAtMs: nowMs,
-    });
+    }, holders.filter((h) => h !== senderId), nowMs);
     if (!appended) {
       // The same content published twice hashes the same, so this is a genuine no-op rather than a
       // fault — but it is reported, because a caller that believes it published something new and

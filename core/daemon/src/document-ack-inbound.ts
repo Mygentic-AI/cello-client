@@ -47,12 +47,19 @@ export interface DocumentAckInboundDeps {
    */
   verifySignature(ackerAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /**
+   * M14B / FANOUT-1 — the CURRENT derived holders, or null when the chain does not derive.
+   * Null is the bilateral-legacy answer: only then does the genesis-peer clause stand alone.
+   * When the chain DERIVES, membership is the whole gate — a removed genesis peer's ack must
+   * refuse (review H2: `doc.peerAgentId` is a genesis fact that outlives the arrangement).
+   */
+  currentHolders(ownerAgentId: string, documentId: string): string[] | null;
+  /**
    * Called once an envelope is SETTLED — admitted or rejected, both of which end the delivery.
    *
    * Exists so the sender can stop holding a session open waiting for an answer that has arrived.
    * Optional because settling is complete without it; nothing here depends on anyone listening.
    */
-  onSettled?(ownerAgentId: string, envelopeHash: string, admitted: boolean): void;
+  onSettled?(ownerAgentId: string, envelopeHash: string, ackerAgentId: string, admitted: boolean): void;
 }
 
 export class DocumentAckInbound {
@@ -91,8 +98,16 @@ export class DocumentAckInbound {
       };
     }
 
-    // 3. The acker must be THIS document's peer.
-    if (ack.acker_agent_id !== doc.peerAgentId) {
+    // 3. The acker must be a party. When the chain DERIVES, derived membership is the WHOLE
+    // gate — a removed genesis peer's ack refuses like any outsider's (review H2). Only when the
+    // chain cannot answer (bilateral legacy, no genesis record) does the genesis-peer column
+    // stand in.
+    const holders = this.#d.currentHolders(ownerAgentId, ack.document_id);
+    const isParty =
+      holders === null
+        ? ack.acker_agent_id === doc.peerAgentId
+        : holders.includes(ack.acker_agent_id);
+    if (!isParty) {
       this.#d.logger.warn("document.ack.not_peer", {
         documentId: ack.document_id,
         ackerAgentId: ack.acker_agent_id,
@@ -150,17 +165,23 @@ export class DocumentAckInbound {
     // envelope. Applying the later one would let a peer that admitted an envelope later claim it
     // refused it — and the sender would roll back work the peer already holds. A second,
     // CONTRADICTING ack is an error; a second identical one is an ordinary redelivery.
-    const alreadyAcked = row.ackedAtMs != null;
+    // SETTLE-ONCE, PER ACKER (review M4). The envelope-level column stays null until ALL
+    // holders answer, so an envelope-scoped check let a holder that ADMITTED later send a
+    // REJECTION mid-fan-out — processed, rounds advanced, work rolled back that they already
+    // hold. The acker's own per-holder row is the record; the envelope-level check remains only
+    // for the zero-row bilateral legacy.
+    const holderPrior = this.#d.store.holderSettlement(
+      ownerAgentId, ack.envelope_hash, ack.acker_agent_id,
+    );
+    const alreadyAcked = holderPrior !== null || row.ackedAtMs != null;
     if (alreadyAcked) {
       // ENVELOPE-scoped. The document-scoped reader answers a different question, and using it
       // here would make a rejection of any OTHER envelope in this document read as a rejection of
       // this one — so an honest redelivered admission would be refused as a contradiction the
       // moment anything else in the document had ever been refused.
-      const previouslyRejected = this.#d.store.rejectionReceivedFor(
-        ownerAgentId,
-        ack.document_id,
-        ack.envelope_hash,
-      );
+      const previouslyRejected = holderPrior !== null
+        ? !holderPrior.admitted
+        : this.#d.store.rejectionReceivedFor(ownerAgentId, ack.document_id, ack.envelope_hash);
       const contradicts = ack.admitted === previouslyRejected;
       if (contradicts) {
         this.#d.logger.error("document.ack.contradiction", {
@@ -183,12 +204,22 @@ export class DocumentAckInbound {
       return { ok: true, admitted: ack.admitted, envelopeHash: ack.envelope_hash };
     }
 
-    // `markAcked` is idempotent and returns whether this was the first — a redelivered ack must not
-    // move the recorded time, or the delivery record says the peer confirmed at a moment it did not.
-    const first = this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
+    // FANOUT-1: the ACKING HOLDER settles THEIR row; the envelope-level record follows the ONE
+    // deterministic terminal rule (`reconcileEnvelopeSettlement` — review M3), identical from
+    // every reconciliation site. Bilateral legacy (zero rows) stays byte-identical: the
+    // reconcile no-ops and markAcked below still runs through it.
+    this.#d.store.ackHolderDelivery(
+      ownerAgentId, ack.document_id, ack.envelope_hash, ack.acker_agent_id, nowMs,
+    );
+    const before = row.ackedAtMs != null;
+    this.#d.store.reconcileEnvelopeSettlement(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
+    const legacy = this.#d.store.holderSettlement(ownerAgentId, ack.envelope_hash, ack.acker_agent_id) === null;
+    const first = legacy
+      ? this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs)
+      : !before;
     // ANNOUNCE THE SETTLE, before the admitted/rejected split — both outcomes end the delivery, and
     // a waiter that only heard about admissions would keep a session open through every rejection.
-    this.#d.onSettled?.(ownerAgentId, ack.envelope_hash, ack.admitted);
+    this.#d.onSettled?.(ownerAgentId, ack.envelope_hash, ack.acker_agent_id, ack.admitted);
 
     if (!ack.admitted) {
       // Durable on the publishing side. A log line would not survive the restart after which the

@@ -112,6 +112,7 @@ async function makeParty(agentName: string) {
   } as unknown as DocumentDeliveryTransport;
 
   const publish = new DocumentPublish({
+    holdersFor: (o, d) => layer.holdersFor(o, d),
     store: layer.store,
     engine: layer.engine,
     logger,
@@ -156,7 +157,10 @@ async function makeParty(agentName: string) {
     sweep: () =>
       worker.tick(
         owner,
-        (documentId) => layer.store.getDocument(owner, documentId)?.peerAgentId ?? null,
+        (documentId) => {
+          const doc = layer.store.getDocument(owner, documentId);
+          return doc ? [doc.peerAgentId] : null;
+        },
         NOW,
         { senderAgentId: owner },
       ),
@@ -384,7 +388,10 @@ describe("two parties converge through the operator surface", () => {
     b.wire.online = true;
     await a.worker.tick(
       a.owner,
-      (documentId2) => a.layer.store.getDocument(a.owner, documentId2)?.peerAgentId ?? null,
+      (documentId2) => {
+        const doc = a.layer.store.getDocument(a.owner, documentId2);
+        return doc ? [doc.peerAgentId] : null;
+      },
       NOW + 3_600_000,
       { senderAgentId: a.owner },
     );

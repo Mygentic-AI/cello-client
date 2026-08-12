@@ -350,6 +350,29 @@ export class DocumentStore {
     // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
+    // M14B / DOD-MP-FANOUT-1 — per-(envelope, holder) delivery state. The envelope row's
+    // bilateral ack columns cannot carry N answers; this table can, and it is DERIVED
+    // bookkeeping over the log — the envelope is the truth, a row here is one holder's
+    // outstanding confirmation. Restart-survivable by construction.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS document_deliveries (
+        owner_agent_id  TEXT    NOT NULL,
+        document_id     TEXT    NOT NULL,
+        envelope_hash   TEXT    NOT NULL,
+        holder_agent_id TEXT    NOT NULL,
+        delivered_at    INTEGER,
+        acked_at        INTEGER,
+        abandoned_at    INTEGER,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        -- SENDS is the ceiling's counter; ATTEMPTS is the schedule's. Conflating them was the
+        -- old worker's defect: five quiet deferrals to an offline peer counted as five unacked
+        -- sends, and the first real send after they returned abandoned the envelope.
+        sends           INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        created_at      INTEGER NOT NULL,
+        PRIMARY KEY (owner_agent_id, document_id, envelope_hash, holder_agent_id)
+      );
+    `);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
@@ -937,6 +960,391 @@ export class DocumentStore {
     return r?.max_epoch ?? 0;
   }
 
+  /**
+   * Append an envelope AND seed its per-holder delivery rows in ONE transaction (review M5):
+   * a crash between the two left an envelope in the log with zero rows, and the bilateral
+   * backfill would re-seed only the genesis peer — the fan-out holders silently starved.
+   * Returns the append verdict unchanged.
+   */
+  appendEnvelopeWithDeliveries(
+    ownerAgentId: string,
+    envelope: DocumentEnvelopeRow,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const appended = this.appendEnvelope(ownerAgentId, envelope);
+      if (appended) {
+        this.seedDeliveries(
+          ownerAgentId, envelope.documentId, envelope.envelopeHash, holderAgentIds, nowMs,
+        );
+      }
+      this.#db.exec("COMMIT");
+      return appended;
+    } catch (err: unknown) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  /** DOD-MP-FANOUT-1 — one pending row per CURRENT holder for a freshly published envelope. */
+  seedDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): void {
+    const insert = this.#db.prepare(
+      `INSERT INTO document_deliveries
+         (owner_agent_id, document_id, envelope_hash, holder_agent_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (owner_agent_id, document_id, envelope_hash, holder_agent_id) DO NOTHING`,
+    );
+    for (const holder of holderAgentIds) {
+      insert.run(ownerAgentId, documentId, envelopeHash, holder, nowMs);
+    }
+  }
+
+  /**
+   * Everything due for delivery, PER HOLDER, joined to its envelope. The window is bounded PER
+   * HOLDER (`ROW_NUMBER` over holder partitions) — one holder's backlog must never evict
+   * another's rows from the pass, which is the no_peer starvation shape multiplied by N.
+   */
+  pendingHolderDeliveries(
+    ownerAgentId: string,
+    nowMs: number,
+    opts: { perHolderLimit?: number } = {},
+  ): Array<{ holderAgentId: string; documentId: string; attempts: number; envelope: DocumentEnvelopeRow }> {
+    const limit = opts.perHolderLimit ?? 50;
+    const rows = this.#db
+      .prepare(
+        // holder_attempts ALIASED: e.* carries the envelope row's LEGACY bilateral attempts
+        // column, which would silently shadow the per-holder count in the result map.
+        `SELECT d.holder_agent_id, d.attempts AS holder_attempts, d.document_id AS delivery_document_id, e.*
+           FROM (
+             SELECT *, ROW_NUMBER() OVER (
+               PARTITION BY holder_agent_id
+               ORDER BY created_at ASC, envelope_hash ASC
+             ) AS rn
+             FROM document_deliveries
+             WHERE owner_agent_id = ?
+               AND acked_at IS NULL AND abandoned_at IS NULL
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           ) d
+           JOIN document_envelopes e
+             ON e.owner_agent_id = d.owner_agent_id
+            AND e.document_id = d.document_id
+            AND e.envelope_hash = d.envelope_hash
+          WHERE d.rn <= ?
+          ORDER BY d.holder_agent_id ASC, d.created_at ASC`,
+      )
+      .all(ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      holderAgentId: r["holder_agent_id"] as string,
+      documentId: r["delivery_document_id"] as string,
+      attempts: (r["holder_attempts"] as number) ?? 0,
+      envelope: toEnvelopeRow(r),
+    }));
+  }
+
+  /** Record one holder's attempt; returns THEIR attempt count. */
+  recordHolderAttempt(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nextAttemptAtMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET attempts = attempts + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+    const r = this.#db
+      .prepare(
+        `SELECT attempts FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash, holderAgentId) as { attempts?: number } | undefined;
+    return r?.attempts ?? 0;
+  }
+
+  /** Settle one holder's confirmation. True exactly when THIS call settled it. */
+  ackHolderDelivery(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): boolean {
+    const r = this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+    return (r.changes ?? 0) > 0;
+  }
+
+  /**
+   * Retire EVERY outstanding row for one holder — our decision, announced by the caller.
+   * Returns the affected envelope hashes so the caller can reconcile the envelope-level record
+   * (an envelope whose every holder-row is settled-with-abandonment is itself abandoned).
+   */
+  abandonHolderDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): string[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT envelope_hash FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .all(ownerAgentId, documentId, holderAgentId) as Array<{ envelope_hash: string }>;
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET abandoned_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(nowMs, ownerAgentId, documentId, holderAgentId);
+    return rows.map((r) => r.envelope_hash);
+  }
+
+  /** Count one REAL send (content left us — live or parked) toward this holder's ceiling. */
+  recordHolderSend(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET sends = sends + 1
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(ownerAgentId, documentId, envelopeHash, holderAgentId);
+    const r = this.#db
+      .prepare(
+        `SELECT sends FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash, holderAgentId) as { sends?: number } | undefined;
+    return r?.sends ?? 0;
+  }
+
+  /** One holder's copy LEFT the machine — the sent-vs-never-left fact, per holder. */
+  markHolderDelivered(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET delivered_at = COALESCE(delivered_at, ?)
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nowMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+  }
+
+  /** Has ANY holder's copy of this envelope left the machine? */
+  envelopeEverSent(ownerAgentId: string, envelopeHash: string): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND delivered_at IS NOT NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, envelopeHash);
+    return r !== undefined;
+  }
+
+  /** Reschedule one holder's retry WITHOUT counting an attempt — waiting is not sending. */
+  scheduleHolderRetry(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nextAttemptAtMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+  }
+
+  /** Retire ONE (envelope, holder) row — the per-holder unacked ceiling's teeth. */
+  abandonSingleHolderDelivery(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET abandoned_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(nowMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+  }
+
+  /**
+   * No holder still owes a confirmation on this envelope. TRUE with zero rows — the bilateral
+   * legacy case, where the envelope-row columns remain the record and this table has nothing to
+   * say.
+   */
+  envelopeFullySettled(ownerAgentId: string, envelopeHash: string): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, envelopeHash);
+    return r === undefined;
+  }
+
+  /**
+   * Seed per-holder rows for LEGACY bilateral envelopes: anything this agent authored that is
+   * still unacknowledged on the envelope row and has no per-holder rows yet gets one for the
+   * genesis peer. Idempotent (the PK refuses duplicates); run per pass, cheap, and journaled —
+   * pre-fan-out backlogs are near-empty at alpha, this is insurance not migration.
+   */
+  backfillBilateralDeliveries(ownerAgentId: string, senderAgentId: string, nowMs: number): void {
+    this.#db
+      .prepare(
+        `INSERT INTO document_deliveries
+           (owner_agent_id, document_id, envelope_hash, holder_agent_id, attempts, created_at)
+         SELECT e.owner_agent_id, e.document_id, e.envelope_hash, d.peer_agent_id, e.attempts, ?
+           FROM document_envelopes e
+           JOIN documents d
+             ON d.owner_agent_id = e.owner_agent_id AND d.document_id = e.document_id
+          WHERE e.owner_agent_id = ? AND e.sender_agent_id = ?
+            AND e.acked_at IS NULL AND e.abandoned_at IS NULL AND e.kind = 'update'
+            AND NOT EXISTS (
+              SELECT 1 FROM document_deliveries dd
+               WHERE dd.owner_agent_id = e.owner_agent_id AND dd.envelope_hash = e.envelope_hash
+            )
+         ON CONFLICT (owner_agent_id, document_id, envelope_hash, holder_agent_id) DO NOTHING`,
+      )
+      .run(nowMs, ownerAgentId, senderAgentId);
+  }
+
+  /**
+   * THIS holder's settlement of THIS envelope — the per-acker twin of `envelopeSettlement`,
+   * with rejection attribution taken from the rejections-received rows' `from_agent_id`.
+   * Null when the holder has not answered (or has no row — the bilateral-legacy case, where the
+   * envelope-level read is the record).
+   */
+  holderSettlement(
+    ownerAgentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+  ): { admitted: boolean } | null {
+    const r = this.#db
+      .prepare(
+        `SELECT document_id, acked_at FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, envelopeHash, holderAgentId) as
+      | { document_id?: string; acked_at?: number | null }
+      | undefined;
+    if (!r || r.acked_at == null) return null;
+    return {
+      admitted: !this.rejectionReceivedFromFor(
+        ownerAgentId, r.document_id as string, envelopeHash, holderAgentId,
+      ),
+    };
+  }
+
+  /** Was a rejection of this envelope received FROM this specific holder? */
+  rejectionReceivedFromFor(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    fromAgentId: string,
+  ): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_envelope_hash = ?
+            AND from_agent_id = ?
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash, fromAgentId);
+    return r !== undefined;
+  }
+
+  /**
+   * ONE deterministic envelope-level terminal rule (FANOUT-1 review M3), applied by every
+   * reconciliation site: once no holder is outstanding, the envelope is ACKED if at least one
+   * holder acked, ABANDONED only when nobody ever answered. Without one rule, identical final
+   * holder states landed as opposite envelope-level facts depending on event order — and
+   * `withdraw`'s "your peer holds it" answered differently for the same reality.
+   */
+  reconcileEnvelopeSettlement(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nowMs: number,
+  ): void {
+    if (!this.envelopeFullySettled(ownerAgentId, envelopeHash)) return;
+    const anyAcked = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND acked_at IS NOT NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, envelopeHash);
+    if (anyAcked !== undefined) {
+      this.markAcked(ownerAgentId, documentId, envelopeHash, nowMs);
+    } else {
+      const anyRows = this.#db
+        .prepare(
+          `SELECT 1 FROM document_deliveries WHERE owner_agent_id = ? AND envelope_hash = ? LIMIT 1`,
+        )
+        .get(ownerAgentId, envelopeHash);
+      // Zero rows = bilateral legacy — the envelope-level columns are already the record.
+      if (anyRows !== undefined) {
+        this.markAbandoned(ownerAgentId, documentId, envelopeHash, nowMs);
+      }
+    }
+  }
+
+  /** Does this holder still owe any confirmation on this document? */
+  holderHasPending(ownerAgentId: string, documentId: string, holderAgentId: string): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, holderAgentId);
+    return r !== undefined;
+  }
+
   pendingDeliveries(
     ownerAgentId: string,
     nowMs: number,
@@ -1003,44 +1411,7 @@ export class DocumentStore {
     return rows.map(toEnvelopeRow);
   }
 
-  /** Mark an attempt: bumps the counter and schedules the next one. Returns the new count. */
-  recordDeliveryAttempt(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-    nextAttemptAtMs: number,
-  ): number {
-    this.#db
-      .prepare(
-        `UPDATE document_envelopes
-            SET attempts = attempts + 1, next_attempt_at = ?
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash);
-    const r = this.#db
-      .prepare(
-        `SELECT attempts FROM document_envelopes
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .get(ownerAgentId, documentId, envelopeHash) as { attempts?: number } | undefined;
-    return r?.attempts ?? 0;
-  }
 
-  /** Record that the envelope left. Not an ack — the peer has not answered yet. */
-  markDelivered(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-    nowMs: number,
-  ): boolean {
-    const info = this.#db
-      .prepare(
-        `UPDATE document_envelopes SET delivered_at = COALESCE(delivered_at, ?)
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .run(nowMs, ownerAgentId, documentId, envelopeHash);
-    return Number(info.changes) > 0;
-  }
 
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
   /**

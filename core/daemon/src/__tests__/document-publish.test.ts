@@ -35,7 +35,10 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
     properties: {}, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
+  const state = { publishHolders: [PEER] as string[] | null };
   const publish = new DocumentPublish({
+    // Bilateral default: the sole holder is the genesis peer; tests may widen or null it.
+    holdersFor: () => state.publishHolders,
     store,
     engine,
     logger,
@@ -45,7 +48,11 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
   });
   const doc = new Y.Doc();
   doc.clientID = 7777;
-  return { store, engine, publish, doc, db };
+  return {
+    store, engine, publish, doc, db,
+    get publishHolders() { return state.publishHolders; },
+    set publishHolders(v: string[] | null) { state.publishHolders = v; },
+  };
 }
 
 function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number) {
@@ -55,6 +62,31 @@ function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number)
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(owner, doc, epoch, "h".repeat(64), Buffer.from([1]), 1);
 }
+
+describe("FANOUT-1 — publish SEEDS per-holder delivery rows through the production path", () => {
+  it("one publish, two holders, two pending rows — no hand-seeding anywhere", async () => {
+    // The one write that makes fan-out HAPPEN. Revert the seed call in publish and this is the
+    // test that goes red — without it a 3-party document delivers to the genesis peer only,
+    // the literal §7-1 divergence the DoD line quotes.
+    const H2 = "ee".repeat(32);
+    const f = newFixture();
+    f.publishHolders = [PEER, H2];
+    f.doc.getText("content").insert(0, "reaches both holders. ");
+    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
+    expect(res.ok).toBe(true);
+    const pending = f.store.pendingHolderDeliveries(AGENT, NOW);
+    expect(new Set(pending.map((p) => p.holderAgentId))).toEqual(new Set([PEER, H2]));
+  });
+
+  it("refuses when the chain does not derive — nothing appended, nothing invisible", async () => {
+    const f = newFixture();
+    f.publishHolders = null;
+    f.doc.getText("content").insert(0, "never leaves. ");
+    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
+    expect(res).toMatchObject({ ok: false, reason: "document_chain_invalid" });
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+  });
+});
 
 describe("DocumentPublish — writes a signed, chained envelope and returns", () => {
   it("stamps the CURRENT epoch from the recorded amendment chain — never a constant", async () => {

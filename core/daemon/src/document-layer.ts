@@ -164,6 +164,9 @@ export interface DocumentLayer {
   joins: DocumentJoinStore;
   /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
+  /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
+  holdersFor(ownerAgentId: string, documentId: string): string[] | null;
+  isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
   /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
   acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
     | { ok: true; documentId: string; inviterAgentId: string; documentType: string; applied: number; answerBytes: Uint8Array }
@@ -201,6 +204,7 @@ export interface DocumentLayer {
   awaitAck(
     ownerAgentId: string,
     envelopeHash: string,
+    expectedAckerAgentId: string,
     timeoutMs: number,
   ): Promise<{ admitted: boolean } | null>;
 }
@@ -291,16 +295,23 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
   // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
   // session held open for the full grace period with the answer already in hand.
+  // KEYED BY ACKER TOO (FANOUT-1 review H1): an envelope-keyed waiter let ANY holder's ack —
+  // including a redelivered one from an already-settled holder — resolve the grace wait for
+  // whichever holder was being dialed, and the worker then settled the DIALED holder's row for
+  // content that never reached them. §7-1's silent divergence, through the sender's own
+  // bookkeeping.
   const ackWaiters = new Map<string, Set<(admitted: boolean) => void>>();
-  const waiterKey = (ownerAgentId: string, envelopeHash: string) => `${ownerAgentId}\u0000${envelopeHash}`;
+  const waiterKey = (ownerAgentId: string, envelopeHash: string, ackerAgentId: string) =>
+    `${ownerAgentId}\u0000${envelopeHash}\u0000${ackerAgentId}`;
 
   const ackInbound = new DocumentAckInbound({
     store,
     rejections,
     logger,
     verifySignature,
-    onSettled: (ownerAgentId, envelopeHash, admitted) => {
-      const key = waiterKey(ownerAgentId, envelopeHash);
+    currentHolders: (o: string, d: string) => holdersFor(o, d),
+    onSettled: (ownerAgentId, envelopeHash, ackerAgentId, admitted) => {
+      const key = waiterKey(ownerAgentId, envelopeHash, ackerAgentId);
       const waiting = ackWaiters.get(key);
       if (!waiting) return;
       ackWaiters.delete(key);
@@ -311,14 +322,20 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
   });
 
-  const awaitAck = async (ownerAgentId: string, envelopeHash: string, timeoutMs: number) => {
-    // ALREADY SETTLED WINS. The ack round trip was measured at 4ms on a local pair; the caller
-    // reaches this line after a network send. Checking the store first is not an optimisation —
-    // without it the common case waits out the entire grace period for an answer already recorded.
-    const already = store.envelopeSettlement(ownerAgentId, envelopeHash);
+  const awaitAck = async (
+    ownerAgentId: string,
+    envelopeHash: string,
+    expectedAckerAgentId: string,
+    timeoutMs: number,
+  ) => {
+    // ALREADY SETTLED WINS — by THE HOLDER BEING DIALED (H1): the per-acker read first, the
+    // envelope-level read only for the zero-row bilateral legacy.
+    const already =
+      store.holderSettlement(ownerAgentId, envelopeHash, expectedAckerAgentId) ??
+      store.envelopeSettlement(ownerAgentId, envelopeHash);
     if (already) return already;
 
-    const key = waiterKey(ownerAgentId, envelopeHash);
+    const key = waiterKey(ownerAgentId, envelopeHash, expectedAckerAgentId);
     return new Promise<{ admitted: boolean } | null>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       const wake = (admitted: boolean) => {
@@ -349,6 +366,45 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // WRITE path, and every append below validates first (the standing AMEND-1 condition).
   const amendments = new DocumentAmendmentStore(db, logger);
   const joins = new DocumentJoinStore(db, logger);
+
+  /**
+   * M14B / DOD-MP-FANOUT-1 — the CURRENT holders of a document, derived from genesis + the
+   * recorded chain. Null when the document is unknown or its chain does not derive — NOT an
+   * empty list, because "nobody holds this" and "this cannot be answered" are different facts
+   * and the worker schedules them differently.
+   */
+  const holdersFor = (ownerAgentId: string, documentId: string): string[] | null => {
+    const genesisRecord = handshake.get(ownerAgentId, documentId);
+    if (!genesisRecord) {
+      // The SAME event the publish refusal points at — an operator hunting
+      // document.holders.underivable must find it for BOTH null causes (review M6).
+      logger.error("document.holders.underivable", {
+        documentId,
+        reason: "no_genesis_record: the document has a row but no stored genesis proposal",
+      });
+      return null;
+    }
+    const derived = deriveArrangement(
+      arrangementGenesisFromProposal(genesisRecord.envelope),
+      amendments.chain(ownerAgentId, documentId),
+      documentGovernancePolicy,
+      verifySignature,
+    );
+    if (!derived.ok) {
+      logger.error("document.holders.underivable", {
+        documentId,
+        reason: derived.reason,
+      });
+      return null;
+    }
+    return [...derived.arrangement.participants];
+  };
+
+  /** Is this agent a CURRENT holder — the ack gate's membership question. */
+  const isCurrentHolder = (ownerAgentId: string, documentId: string, agentId: string): boolean => {
+    const holders = holdersFor(ownerAgentId, documentId);
+    return holders !== null && holders.includes(agentId);
+  };
 
   /** Sign and send a join answer — best-effort, never a veto over the local decision. */
   const sendJoinAnswer = async (
@@ -901,6 +957,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     amendments,
     joins,
     verifySignature,
+    holdersFor,
+    isCurrentHolder,
     acceptJoin,
     refuseJoin,
     store,
