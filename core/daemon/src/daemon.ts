@@ -2695,7 +2695,7 @@ async function startDaemonHoldingLock(
       // this as a completed endorsement would promise three steps that have not happened.
       guidance: res.storedWarning
         ? `Submitted for '${sel.name}'. ${res.storedWarning}`
-        : `Submitted for '${sel.name}'. The portal will scan and mint it, then the subject must ACCEPT it before it is visible to anyone — a signal they have not accepted is inert. Nothing here is final until they decide.`,
+        : `Submitted for '${sel.name}'. The portal will scan and mint it, and it stays invisible to everyone unless the subject ACCEPTS it — they are free to refuse, and a signal they have not accepted is inert. Nothing here is final until they decide.`,
     };
   });
 

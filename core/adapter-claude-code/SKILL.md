@@ -208,7 +208,7 @@ cello_attestations_issued()                  — what happened to the ones you w
                                                refused (often with their reasoning), rejected
                                                by the scan, or still `pending`
 ```
-Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory cannot read it), screened, minted — and then the SUBJECT must accept it before anyone else can see it. A refusal is the subject declining to stand behind your wording, not a fault in the claim; re-submitting a corrected version is the intended next step. You cannot attest about yourself.
+Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory cannot read it), screened, minted — and it stays invisible to everyone unless the SUBJECT accepts it. They are free to refuse, and a refusal is them declining to stand behind your wording, not a fault in the claim; re-submitting a corrected version is the intended next step. You cannot attest about yourself.
 
 **Consent** — the receiving direction. Anyone can write an attestation **about** your agent, and it lands in your wallet unbidden. It is **inert until you accept it**: nothing pending is presented, counted, or visible to a counterparty. When you select an agent that has items waiting, `cello_use_agent` returns `pending_consent` with a count.
 ```
@@ -267,7 +267,8 @@ copies converge. Every change is signed by whoever made it.
 
 ```
 cello_doc_propose({ peer_pubkey, starting_content?, document_type?, append_only?, admins? })
-                                             — offer a shared document. They must accept.
+                                             — offer a shared document to ONE peer. Nothing
+                                               applies unless they accept; they may refuse.
 cello_doc_invite({ document_id, invitee_pubkey })
                                              — open a document you administer to a third agent.
                                                Your signature admits; THEIR accept makes it real.

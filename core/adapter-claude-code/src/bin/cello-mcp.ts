@@ -585,7 +585,7 @@ server.tool("cello_dismiss", "Dismiss a sealed/terminal session from your inbox.
 // why propose and accept are separate tools: consent is given once, deliberately, and never inferred
 // from the first update arriving.
 
-server.tool("cello_doc_propose", "Offer a shared living document to a counterparty. Both of you edit it; both copies converge automatically. They must ACCEPT before anything applies — this only sends the offer. Use this instead of pasting a document back and forth: the peer's edits reach you without either of you re-sending it.", {
+server.tool("cello_doc_propose", "Offer a shared living document to a counterparty. Both of you edit it; both copies converge automatically. This only sends the offer: nothing applies unless they accept, and they are free to refuse. Use this instead of pasting a document back and forth: the peer's edits reach you without either of you re-sending it.", {
   peer_pubkey: z.string().describe("The counterparty's 64-char hex public key (their agent id) — see cello_contacts"),
   document_type: z.string().optional().describe("What kind of document: 'markdown' (default), 'text', 'plaintext' (same as text), 'html' or 'json'. Anything else is refused — a type only some verbs can serve would read as empty and lose your content silently. A 'json' document merges PER KEY, so you and your peer can edit different fields at the same time and both survive — send the complete object, not a fragment. An 'html' document is an executable file: opening it in a browser runs whatever your peer wrote into it, so read it with cello_doc_read or an editor instead."),
   starting_content: z.string().optional().describe("Initial text. Both sides start from these exact bytes."),

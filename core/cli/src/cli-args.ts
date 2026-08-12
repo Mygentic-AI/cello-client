@@ -69,7 +69,15 @@ export const USAGE =
   "dependency. Where a command has an MCP tool, it carries the SAME name: cello send ↔ cello_send.";
 
 /** Per-command help — the registry entry's own text, verbatim. */
-export function helpForCommand(command: string): string {
+export function helpForCommand(command: string, args: readonly string[] = []): string {
+  // SUB-VERB HELP WINS. `-h` is answered here, before dispatch, so a per-verb help block inside
+  // a command's own handler could never run — `cello doc propose -h` printed the whole doc list,
+  // which names propose's six flags and explains none of them.
+  const sub = args.find((a) => !a.startsWith("-"));
+  if (sub) {
+    const detail = findCommand(command)?.subHelp?.[sub];
+    if (detail) return detail;
+  }
   return findCommand(command)?.help ?? USAGE;
 }
 

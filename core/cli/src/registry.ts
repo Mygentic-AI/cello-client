@@ -168,6 +168,8 @@ export interface CommandSpec {
    */
   jsonOut?: boolean;
   run(ctx: CommandContext, args: string[]): Promise<CliOutput>;
+  /** Per-sub-verb help, keyed by the sub-verb — answered before dispatch. */
+  subHelp?: Record<string, string>;
 }
 
 /** Parse the parity commands' shared flags out of argv (`--agent`, `--pretty`, and value flags). */
@@ -246,6 +248,72 @@ const AGENT_AND_TIMEOUT: readonly FlagSpec[] = [
   { name: "--agent", consumesValue: false },
   { name: "--timeout-ms", consumesValue: true },
 ];
+
+/**
+ * Per-verb help for the `doc` verbs whose flags need explaining. A verb whose whole surface is
+ * `<document-id>` does not need an entry — the one-liner in the list says everything.
+ */
+const DOC_VERB_HELP: Record<string, string> = {
+  propose:
+    "cello doc propose <peer-pubkey> [flags]\n" +
+    "\n" +
+    "Offer ONE other agent a shared living document. Both of you edit your own copy and the\n" +
+    "copies converge — no pasting text back and forth. This only SENDS the offer: nothing\n" +
+    "applies unless they accept, and they are free to refuse.\n" +
+    "\n" +
+    "  <peer-pubkey>       Their 64-hex agent id — see 'cello contacts'.\n" +
+    "\n" +
+    "  --type <t>          What kind of document: markdown (default), text, plaintext, html,\n" +
+    "                      or json. A json document merges PER KEY, so you and they can edit\n" +
+    "                      different fields at once and both survive. An html document is an\n" +
+    "                      executable file — read it with 'cello doc read', not a browser.\n" +
+    "                      Any other value is refused rather than half-served.\n" +
+    "\n" +
+    "  --content <text>    The document's starting text. Both sides begin from these exact\n" +
+    "                      bytes, so neither has to retype it.\n" +
+    "\n" +
+    "  --append-only       Neither side may delete or edit existing content — only add. Useful\n" +
+    "                      for a running log; it does NOT make the document tamper-evident.\n" +
+    "\n" +
+    "  --admins <hex,hex>  Who may later invite others, remove holders, and change settings.\n" +
+    "                      Comma-separated agent ids, and each must be you or the peer.\n" +
+    "                      OMIT IT and you BOTH govern — either of you can invite a third\n" +
+    "                      agent later. Pass just your own id to keep that to yourself.\n" +
+    "                      The choice is written into the signed offer, so they consent to it.\n" +
+    "\n" +
+    "  --retry <id>        Re-send an offer that was created but never reached them (the\n" +
+    "                      failure message names the id). Sends the SAME offer — proposing\n" +
+    "                      again instead would create a second, separate document.\n" +
+    "\n" +
+    "Then: they run 'cello doc inbox' and 'cello doc accept <id>'. Afterwards, open the\n" +
+    "document up to a third agent with 'cello doc invite'.\n",
+  invite:
+    "cello doc invite <document-id> <invitee-pubkey>\n" +
+    "\n" +
+    "Open a document you administer to a THIRD agent. Your signature admits them; THEIR own\n" +
+    "accept makes the join real — neither alone adds anyone.\n" +
+    "\n" +
+    "They receive the document's full current content and its history, verify all of it on\n" +
+    "their own machine, and see who holds it and who governs it before deciding.\n" +
+    "\n" +
+    "Only an admin can invite. If the offer does not reach them (they are offline), run the\n" +
+    "same command again once they are back: it re-sends that same offer rather than inviting\n" +
+    "them twice.\n",
+  remove:
+    "cello doc remove <document-id> <holder-pubkey>\n" +
+    "\n" +
+    "Remove a holder from a document you administer — or leave one yourself, by passing your\n" +
+    "OWN agent id (leaving is always yours to do).\n" +
+    "\n" +
+    "FORWARD-ONLY, and the wording matters: their existing copy and its whole history remain\n" +
+    "theirs. Removal stops NEW edits flowing either way — they receive nothing further, and\n" +
+    "their next edit is refused with a reason naming the removal. Nothing reaches onto their\n" +
+    "disk, and no surface here will claim otherwise.\n" +
+    "\n" +
+    "You cannot remove a fellow admin this way: demote them first, which takes the agreement\n" +
+    "of every other admin.\n",
+};
+
 
 export const COMMANDS: readonly CommandSpec[] = [
   // ═══ Setup — get a working agent, in the order you actually do it ═══════════════════════════
@@ -929,8 +997,9 @@ export const COMMANDS: readonly CommandSpec[] = [
       "network's own claims about you (GitHub account age, phone, email) are 'cello trust-signals'.\n" +
       "\n" +
       "Nothing you write is final on your say-so. It is sealed to the CELLO portal (the directory\n" +
-      "cannot read it), screened, minted \u2014 and then the SUBJECT must accept it before anyone else can\n" +
-      "see it. They may refuse, and a refusal may carry their reasoning back to you.\n" +
+      "cannot read it), screened, minted \u2014 and it stays invisible to everyone unless the SUBJECT\n" +
+      "accepts it. They are free to refuse, and a refusal may carry their reasoning back to you \u2014\n" +
+      "it is them declining to stand behind your wording, not a fault in the claim.\n" +
       "\n" +
       "The receiving direction \u2014 attestations others wrote about YOU \u2014 is 'cello attestation-consent'.\n" +
       "You cannot attest about yourself.\n" +
@@ -1048,12 +1117,21 @@ export const COMMANDS: readonly CommandSpec[] = [
       // help and refused by the parser.
       { name: "--retry", consumesValue: true },
     ],
-    summary: "Share a living document with a counterparty — both sides edit, both sides converge.",
+    summary:
+      "Share a living document — both sides edit, both converge. 'cello doc -h' lists the verbs.",
+    subHelp: DOC_VERB_HELP,
     help:
       "Usage:\n" +
+      // EACH VERB'S ANNOTATION IMMEDIATELY FOLLOWS ITS OWN LINE. `propose` is too long to annotate
+      // inline so its description wraps to the next line — and anything inserted into that gap
+      // steals it. That is exactly what happened when `invite` landed here: it read as "offer a
+      // shared document..." and `propose` read as nothing.
       "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--admins <hex,hex>] [--content <text>] [--retry <id>]\n" +
+      "                                                    — offer a shared document to ONE peer. Nothing applies\n" +
+      "                                                      unless they accept; they are free to refuse.\n" +
       "  cello doc invite <document-id> <invitee-pubkey>\n" +
-      "                                                    — offer a shared document. They must accept.\n" +
+      "                                                    — open a document you administer to a THIRD agent;\n" +
+      "                                                      their own accept makes the join real.\n" +
       "  cello doc remove <document-id> <holder-pubkey>    — remove a holder (or leave, with your own key).\n" +
       "                                                    — forward-only: their copy stays theirs.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +

@@ -77,13 +77,13 @@ async function main(): Promise<void> {
   // never be coerced into a positional argument.
   const check = checkArgs(command, args);
   if (check.kind === "help") {
-    process.stdout.write(helpForCommand(command) + "\n");
+    process.stdout.write(helpForCommand(command, args) + "\n");
     process.exit(0);
     return;
   }
   if (check.kind === "unknown_flag") {
     process.stderr.write(`Unknown flag '${check.flag}' for 'cello ${command}'.\n`);
-    process.stdout.write(helpForCommand(command) + "\n");
+    process.stdout.write(helpForCommand(command, args) + "\n");
     process.exit(1);
     return;
   }
