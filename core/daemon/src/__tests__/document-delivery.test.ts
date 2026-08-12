@@ -119,6 +119,31 @@ describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", ()
   });
 });
 
+describe("DOD-MP-FANOUT-1 — one unreachable holder never blocks the others", () => {
+  it("delivers to the reachable holder in the SAME pass the unreachable one defers", async () => {
+    const H2 = "ee".repeat(32);
+    const f = newFixture({
+      isPeerReachable: async (peerAgentId) => ({
+        reachable: peerAgentId === H2,
+        unknownAgent: false,
+      }),
+    });
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER, H2], NOW);
+
+    const res = await f.delivery.tick(AGENT, () => [PEER, H2], NOW);
+    // The availability clause, directly: H2 got the envelope while PEER deferred — neither
+    // waited on the other, and the settled half stays settled.
+    expect(res).toMatchObject({ delivered: 1, deferred: 1 });
+    expect(f.calls).toHaveLength(1);
+    expect(f.store.holderHasPending(AGENT, DOC, H2)).toBe(false);
+    expect(f.store.holderHasPending(AGENT, DOC, PEER)).toBe(true);
+    // And the envelope-level record does NOT claim all-confirmed while one holder is owed.
+    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.ackedAtMs).toBeNull();
+  });
+});
+
 describe("DocumentDelivery — pending is DERIVED from the log", () => {
   it("delivers an unacknowledged envelope this agent authored, and marks it acked", async () => {
     const f = newFixture();
