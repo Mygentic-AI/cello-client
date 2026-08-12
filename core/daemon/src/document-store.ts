@@ -1075,7 +1075,7 @@ export class DocumentStore {
             AND acked_at IS NULL AND abandoned_at IS NULL`,
       )
       .run(nowMs, ownerAgentId, documentId, holderAgentId);
-    return r.changes ?? 0;
+    return Number(r.changes ?? 0);
   }
 
   /** Does this holder still owe any confirmation on this document? */
