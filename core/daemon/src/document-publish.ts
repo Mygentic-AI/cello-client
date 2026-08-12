@@ -168,7 +168,10 @@ export class DocumentPublish {
     envelope.signature = await this.#d.sign(ownerAgentId, buildDocumentUpdateTbs(envelope));
     const envelopeHash = documentEnvelopeHash(envelope);
 
-    const appended = this.#d.store.appendEnvelope(ownerAgentId, {
+    // ONE TRANSACTION (review M5): a crash between the append and the seed left an envelope
+    // in the log with zero delivery rows, and the bilateral backfill would re-seed only the
+    // genesis peer — every other holder silently never receiving it, forever.
+    const appended = this.#d.store.appendEnvelopeWithDeliveries(ownerAgentId, {
       envelopeHash,
       documentId,
       senderAgentId: senderId,
@@ -183,18 +186,7 @@ export class DocumentPublish {
       // inbound path stores for their envelopes.
       senderClientId: doc.clientID,
       createdAtMs: nowMs,
-    });
-    if (appended) {
-      // FANOUT-1: one pending row per CURRENT holder (minus ourselves), seeded in the same act
-      // as the append — the worker derives its work from these, restart-survivable.
-      this.#d.store.seedDeliveries(
-        ownerAgentId,
-        documentId,
-        envelopeHash,
-        holders.filter((h) => h !== senderId),
-        nowMs,
-      );
-    }
+    }, holders.filter((h) => h !== senderId), nowMs);
     if (!appended) {
       // The same content published twice hashes the same, so this is a genuine no-op rather than a
       // fault — but it is reported, because a caller that believes it published something new and

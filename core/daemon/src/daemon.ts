@@ -3814,7 +3814,7 @@ async function startDaemonHoldingLock(
         // The owner KEY, not the agent name — every document row is scoped by our own pubkey hex
         // (M14-D5), and the store query behind this reads that column. Passing the name here
         // returns no rows and the wait times out on every delivery.
-        awaitAck: async (envelopeHash, timeoutMs) => {
+        awaitAck: async (envelopeHash, expectedAckerAgentId, timeoutMs) => {
           const ownerKey = documentOwnerKeyFor(agentName);
           if (ownerKey === null) {
             // NOT "the peer stayed silent". `false` means the grace expired with no answer, and the
@@ -3826,7 +3826,7 @@ async function startDaemonHoldingLock(
             logger.error("document.delivery.ack_wait_unwired", { agentName, envelopeHash });
             return null;
           }
-          return documentLayer.awaitAck(ownerKey, envelopeHash, timeoutMs);
+          return documentLayer.awaitAck(ownerKey, envelopeHash, expectedAckerAgentId, timeoutMs);
         },
         drainHeld: async (sessionId, correlationId) => {
           // ONLY WHEN THERE IS A GAP. `sealReadiness` already answers exactly this question, and

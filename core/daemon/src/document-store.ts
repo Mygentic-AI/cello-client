@@ -960,6 +960,34 @@ export class DocumentStore {
     return r?.max_epoch ?? 0;
   }
 
+  /**
+   * Append an envelope AND seed its per-holder delivery rows in ONE transaction (review M5):
+   * a crash between the two left an envelope in the log with zero rows, and the bilateral
+   * backfill would re-seed only the genesis peer — the fan-out holders silently starved.
+   * Returns the append verdict unchanged.
+   */
+  appendEnvelopeWithDeliveries(
+    ownerAgentId: string,
+    envelope: DocumentEnvelopeRow,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): boolean {
+    this.#db.exec("BEGIN IMMEDIATE");
+    try {
+      const appended = this.appendEnvelope(ownerAgentId, envelope);
+      if (appended) {
+        this.seedDeliveries(
+          ownerAgentId, envelope.documentId, envelope.envelopeHash, holderAgentIds, nowMs,
+        );
+      }
+      this.#db.exec("COMMIT");
+      return appended;
+    } catch (err: unknown) {
+      this.#db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   /** DOD-MP-FANOUT-1 — one pending row per CURRENT holder for a freshly published envelope. */
   seedDeliveries(
     ownerAgentId: string,
@@ -1058,7 +1086,7 @@ export class DocumentStore {
         `UPDATE document_deliveries
             SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
           WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?
-            AND acked_at IS NULL`,
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
       )
       .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
     return (r.changes ?? 0) > 0;
@@ -1214,9 +1242,94 @@ export class DocumentStore {
              ON d.owner_agent_id = e.owner_agent_id AND d.document_id = e.document_id
           WHERE e.owner_agent_id = ? AND e.sender_agent_id = ?
             AND e.acked_at IS NULL AND e.abandoned_at IS NULL AND e.kind = 'update'
+            AND NOT EXISTS (
+              SELECT 1 FROM document_deliveries dd
+               WHERE dd.owner_agent_id = e.owner_agent_id AND dd.envelope_hash = e.envelope_hash
+            )
          ON CONFLICT (owner_agent_id, document_id, envelope_hash, holder_agent_id) DO NOTHING`,
       )
       .run(nowMs, ownerAgentId, senderAgentId);
+  }
+
+  /**
+   * THIS holder's settlement of THIS envelope — the per-acker twin of `envelopeSettlement`,
+   * with rejection attribution taken from the rejections-received rows' `from_agent_id`.
+   * Null when the holder has not answered (or has no row — the bilateral-legacy case, where the
+   * envelope-level read is the record).
+   */
+  holderSettlement(
+    ownerAgentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+  ): { admitted: boolean } | null {
+    const r = this.#db
+      .prepare(
+        `SELECT document_id, acked_at FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, envelopeHash, holderAgentId) as
+      | { document_id?: string; acked_at?: number | null }
+      | undefined;
+    if (!r || r.acked_at == null) return null;
+    return {
+      admitted: !this.rejectionReceivedFromFor(
+        ownerAgentId, r.document_id as string, envelopeHash, holderAgentId,
+      ),
+    };
+  }
+
+  /** Was a rejection of this envelope received FROM this specific holder? */
+  rejectionReceivedFromFor(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    fromAgentId: string,
+  ): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_rejections_received
+          WHERE owner_agent_id = ? AND document_id = ? AND rejected_envelope_hash = ?
+            AND from_agent_id = ?
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash, fromAgentId);
+    return r !== undefined;
+  }
+
+  /**
+   * ONE deterministic envelope-level terminal rule (FANOUT-1 review M3), applied by every
+   * reconciliation site: once no holder is outstanding, the envelope is ACKED if at least one
+   * holder acked, ABANDONED only when nobody ever answered. Without one rule, identical final
+   * holder states landed as opposite envelope-level facts depending on event order — and
+   * `withdraw`'s "your peer holds it" answered differently for the same reality.
+   */
+  reconcileEnvelopeSettlement(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    nowMs: number,
+  ): void {
+    if (!this.envelopeFullySettled(ownerAgentId, envelopeHash)) return;
+    const anyAcked = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND envelope_hash = ? AND acked_at IS NOT NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, envelopeHash);
+    if (anyAcked !== undefined) {
+      this.markAcked(ownerAgentId, documentId, envelopeHash, nowMs);
+    } else {
+      const anyRows = this.#db
+        .prepare(
+          `SELECT 1 FROM document_deliveries WHERE owner_agent_id = ? AND envelope_hash = ? LIMIT 1`,
+        )
+        .get(ownerAgentId, envelopeHash);
+      // Zero rows = bilateral legacy — the envelope-level columns are already the record.
+      if (anyRows !== undefined) {
+        this.markAbandoned(ownerAgentId, documentId, envelopeHash, nowMs);
+      }
+    }
   }
 
   /** Does this holder still owe any confirmation on this document? */
@@ -1298,44 +1411,7 @@ export class DocumentStore {
     return rows.map(toEnvelopeRow);
   }
 
-  /** Mark an attempt: bumps the counter and schedules the next one. Returns the new count. */
-  recordDeliveryAttempt(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-    nextAttemptAtMs: number,
-  ): number {
-    this.#db
-      .prepare(
-        `UPDATE document_envelopes
-            SET attempts = attempts + 1, next_attempt_at = ?
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash);
-    const r = this.#db
-      .prepare(
-        `SELECT attempts FROM document_envelopes
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .get(ownerAgentId, documentId, envelopeHash) as { attempts?: number } | undefined;
-    return r?.attempts ?? 0;
-  }
 
-  /** Record that the envelope left. Not an ack — the peer has not answered yet. */
-  markDelivered(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-    nowMs: number,
-  ): boolean {
-    const info = this.#db
-      .prepare(
-        `UPDATE document_envelopes SET delivered_at = COALESCE(delivered_at, ?)
-          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ?`,
-      )
-      .run(nowMs, ownerAgentId, documentId, envelopeHash);
-    return Number(info.changes) > 0;
-  }
 
   /** Record that the peer acknowledged. Idempotent — a redelivered ack must not move the clock. */
   /**

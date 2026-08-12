@@ -62,7 +62,12 @@ function ack(over: Partial<DocumentAck> = {}): DocumentAck {
   };
 }
 
-function newFixture(opts: { verify?: () => boolean; onSettled?: (owner: string, hash: string) => void } = {}) {
+function newFixture(opts: {
+  verify?: () => boolean;
+  onSettled?: (owner: string, hash: string) => void;
+  /** Derived holders; null = bilateral legacy (the genesis-peer gate stands alone). */
+  currentHolders?: () => string[] | null;
+} = {}) {
   const { logger, events } = recordingLogger();
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
@@ -74,12 +79,65 @@ function newFixture(opts: { verify?: () => boolean; onSettled?: (owner: string, 
   const rejections = new DocumentRejections(store, logger);
   const inbound = new DocumentAckInbound({
     store, rejections, logger,
-    isCurrentHolder: () => false,
+    // Null = the bilateral-legacy gate (genesis peer only) — the pre-fan-out semantics.
+    currentHolders: opts.currentHolders ?? (() => null),
     verifySignature: opts.verify ?? (() => true),
     ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
   });
   return { inbound, store, events, rejections };
 }
+
+describe("FANOUT-1 — the ack gate follows the DERIVED arrangement, not the genesis column", () => {
+  it("a JOINED non-genesis holder's ack passes the gate and settles THEIR row", async () => {
+    const JOINED = "ff".repeat(32);
+    const f = newFixture({ currentHolders: () => [PEER, JOINED] });
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER, JOINED], NOW);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentAck(ack({ envelope_hash: e.envelopeHash, acker_agent_id: JOINED })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: true, admitted: true });
+    expect(f.store.holderHasPending(AGENT, DOC, JOINED)).toBe(false);
+    expect(f.store.holderHasPending(AGENT, DOC, PEER)).toBe(true);
+    // Not all-confirmed while the genesis peer is owed.
+    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.ackedAtMs).toBeNull();
+  });
+
+  it("a REMOVED genesis peer's ack refuses when the chain derives — the genesis column is not a permanent credential", async () => {
+    // Review H2: doc.peerAgentId outlives the arrangement; a removed (hostile) genesis peer
+    // could otherwise keep settling rows forever.
+    const JOINED = "ff".repeat(32);
+    const f = newFixture({ currentHolders: () => [JOINED] });
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [JOINED], NOW);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentAck(ack({ envelope_hash: e.envelopeHash, acker_agent_id: PEER })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_ack_not_peer" });
+    expect(f.store.holderHasPending(AGENT, DOC, JOINED)).toBe(true);
+  });
+
+  it("H1: one holder's ack cannot settle another's row — each settles exactly their own", async () => {
+    const JOINED = "ff".repeat(32);
+    const f = newFixture({ currentHolders: () => [PEER, JOINED] });
+    const e = envelope();
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER, JOINED], NOW);
+    await f.inbound.receive(
+      AGENT,
+      encodeDocumentAck(ack({ envelope_hash: e.envelopeHash, acker_agent_id: PEER })),
+      NOW,
+    );
+    expect(f.store.holderHasPending(AGENT, DOC, PEER)).toBe(false);
+    expect(f.store.holderHasPending(AGENT, DOC, JOINED)).toBe(true);
+  });
+});
 
 describe("DocumentAckInbound — an admission settles the envelope", () => {
   it("marks it acked, so the worker stops redelivering", () => {

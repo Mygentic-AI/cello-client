@@ -323,9 +323,7 @@ export class DocumentDelivery {
             ownerAgentId, documentId, holderAgentId, nowMs,
           );
           for (const hash of retiredHashes) {
-            if (this.#store.envelopeFullySettled(ownerAgentId, hash)) {
-              this.#store.markAbandoned(ownerAgentId, documentId, hash, nowMs);
-            }
+            this.#store.reconcileEnvelopeSettlement(ownerAgentId, documentId, hash, nowMs);
           }
           this.#logger.info("document.delivery.peer_removed", {
             documentId, holderAgentId, retired: retiredHashes.length, correlationId,
@@ -399,13 +397,13 @@ export class DocumentDelivery {
           }
 
           if (outcome.ok && outcome.admitted === null) {
-            // IN FLIGHT for THIS holder. Parked is not delivered — different retry questions —
-            // and a non-parked send IS delivered-to-the-wire for the sent-vs-never-left surface.
-            if (!outcome.parked) {
-              this.#store.markHolderDelivered(
-                ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
-              );
-            }
+            // IN FLIGHT for THIS holder. Parked and live sends want DIFFERENT retry schedules,
+            // but both LEFT the machine — the sent-vs-never-left surface counts either (review
+            // M7: reporting relay-parked content as "never left" mislabels a delivery that the
+            // relay is holding for them).
+            this.#store.markHolderDelivered(
+              ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
+            );
             const sends = this.#store.recordHolderSend(
               ownerAgentId, documentId, envelope.envelopeHash, holderAgentId,
             );
@@ -431,9 +429,9 @@ export class DocumentDelivery {
               this.#store.abandonSingleHolderDelivery(
                 ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
               );
-              if (this.#store.envelopeFullySettled(ownerAgentId, envelope.envelopeHash)) {
-                this.#store.markAbandoned(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-              }
+              this.#store.reconcileEnvelopeSettlement(
+                ownerAgentId, documentId, envelope.envelopeHash, nowMs,
+              );
               this.#logger.error("document.delivery.unacked_limit", {
                 documentId,
                 envelopeHash: envelope.envelopeHash,
@@ -460,11 +458,10 @@ export class DocumentDelivery {
             const first = this.#store.ackHolderDelivery(
               ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
             );
-            if (this.#store.envelopeFullySettled(ownerAgentId, envelope.envelopeHash)) {
-              // EVERY holder has answered — the envelope-level record (list counts, withdraw's
-              // "your peer holds it") means all-confirmed from here on.
-              this.#store.markAcked(ownerAgentId, documentId, envelope.envelopeHash, nowMs);
-            }
+            // The envelope-level record follows the ONE terminal rule (review M3).
+            this.#store.reconcileEnvelopeSettlement(
+              ownerAgentId, documentId, envelope.envelopeHash, nowMs,
+            );
             this.#logger.info("document.delivery.session", {
               documentId, holderAgentId, sessionId: outcome.sessionId,
               opened: outcome.sessionOpened, correlationId,

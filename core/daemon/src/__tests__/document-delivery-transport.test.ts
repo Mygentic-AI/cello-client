@@ -282,8 +282,10 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
     // seam that asserts nothing about what flows through it cannot catch either.
     const calls: Array<[string, number]> = [];
     const t = newTransport({
-      awaitAck: async (hash, ms) => {
+      awaitAck: async (hash, acker, ms) => {
         calls.push([hash, ms]);
+        // H1: the waiter is scoped to the holder being DIALED — pinned here with the hash.
+        expect(acker).toBe("peer-b");
         return { admitted: true };
       },
     });
@@ -293,7 +295,7 @@ describe("the ack grace is a BUDGET the caller controls, not a fixed cost per en
 
   it("waits for the SMALLER of the standard grace and what the pass has left", async () => {
     const calls: number[] = [];
-    const t = newTransport({ awaitAck: async (_h, ms) => { calls.push(ms); return { admitted: true }; } });
+    const t = newTransport({ awaitAck: async (_h, _a, ms) => { calls.push(ms); return { admitted: true }; } });
     await t.transport.deliver(deliverInput({ ackGraceMs: 500_000 }));
     expect(calls).toEqual([DELIVERY_ACK_GRACE_MS]);
   });

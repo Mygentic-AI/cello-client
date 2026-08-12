@@ -204,6 +204,7 @@ export interface DocumentLayer {
   awaitAck(
     ownerAgentId: string,
     envelopeHash: string,
+    expectedAckerAgentId: string,
     timeoutMs: number,
   ): Promise<{ admitted: boolean } | null>;
 }
@@ -294,17 +295,23 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
   // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
   // session held open for the full grace period with the answer already in hand.
+  // KEYED BY ACKER TOO (FANOUT-1 review H1): an envelope-keyed waiter let ANY holder's ack —
+  // including a redelivered one from an already-settled holder — resolve the grace wait for
+  // whichever holder was being dialed, and the worker then settled the DIALED holder's row for
+  // content that never reached them. §7-1's silent divergence, through the sender's own
+  // bookkeeping.
   const ackWaiters = new Map<string, Set<(admitted: boolean) => void>>();
-  const waiterKey = (ownerAgentId: string, envelopeHash: string) => `${ownerAgentId}\u0000${envelopeHash}`;
+  const waiterKey = (ownerAgentId: string, envelopeHash: string, ackerAgentId: string) =>
+    `${ownerAgentId}\u0000${envelopeHash}\u0000${ackerAgentId}`;
 
   const ackInbound = new DocumentAckInbound({
     store,
     rejections,
     logger,
     verifySignature,
-    isCurrentHolder: (o, d, a) => isCurrentHolder(o, d, a),
-    onSettled: (ownerAgentId, envelopeHash, admitted) => {
-      const key = waiterKey(ownerAgentId, envelopeHash);
+    currentHolders: (o: string, d: string) => holdersFor(o, d),
+    onSettled: (ownerAgentId, envelopeHash, ackerAgentId, admitted) => {
+      const key = waiterKey(ownerAgentId, envelopeHash, ackerAgentId);
       const waiting = ackWaiters.get(key);
       if (!waiting) return;
       ackWaiters.delete(key);
@@ -315,14 +322,20 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
   });
 
-  const awaitAck = async (ownerAgentId: string, envelopeHash: string, timeoutMs: number) => {
-    // ALREADY SETTLED WINS. The ack round trip was measured at 4ms on a local pair; the caller
-    // reaches this line after a network send. Checking the store first is not an optimisation —
-    // without it the common case waits out the entire grace period for an answer already recorded.
-    const already = store.envelopeSettlement(ownerAgentId, envelopeHash);
+  const awaitAck = async (
+    ownerAgentId: string,
+    envelopeHash: string,
+    expectedAckerAgentId: string,
+    timeoutMs: number,
+  ) => {
+    // ALREADY SETTLED WINS — by THE HOLDER BEING DIALED (H1): the per-acker read first, the
+    // envelope-level read only for the zero-row bilateral legacy.
+    const already =
+      store.holderSettlement(ownerAgentId, envelopeHash, expectedAckerAgentId) ??
+      store.envelopeSettlement(ownerAgentId, envelopeHash);
     if (already) return already;
 
-    const key = waiterKey(ownerAgentId, envelopeHash);
+    const key = waiterKey(ownerAgentId, envelopeHash, expectedAckerAgentId);
     return new Promise<{ admitted: boolean } | null>((resolve) => {
       let timer: ReturnType<typeof setTimeout>;
       const wake = (admitted: boolean) => {
@@ -362,7 +375,15 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
    */
   const holdersFor = (ownerAgentId: string, documentId: string): string[] | null => {
     const genesisRecord = handshake.get(ownerAgentId, documentId);
-    if (!genesisRecord) return null;
+    if (!genesisRecord) {
+      // The SAME event the publish refusal points at — an operator hunting
+      // document.holders.underivable must find it for BOTH null causes (review M6).
+      logger.error("document.holders.underivable", {
+        documentId,
+        reason: "no_genesis_record: the document has a row but no stored genesis proposal",
+      });
+      return null;
+    }
     const derived = deriveArrangement(
       arrangementGenesisFromProposal(genesisRecord.envelope),
       amendments.chain(ownerAgentId, documentId),

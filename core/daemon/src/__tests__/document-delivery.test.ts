@@ -84,6 +84,32 @@ function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existing
   };
 }
 
+describe("FANOUT-1 — deferrals never spend the ceiling: attempts schedule, sends gate", () => {
+  it("an offline weekend does not abandon the first real send after the holder returns", async () => {
+    // The Entry-15 defect, pinned: re-conflate the counters (drive the ceiling from attempts)
+    // and this goes red — after 5+ quiet deferrals the first live send would abandon the row.
+    const wire = { online: false };
+    const f = newFixture({
+      isPeerReachable: async () => ({ reachable: wire.online, unknownAgent: false }),
+      deliver: async () => ({ ok: true as const, admitted: null, parked: false, sessionId: "s", sessionOpened: true }),
+    });
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    let at = NOW;
+    for (let i = 0; i < DELIVERY_MAX_UNACKED_SENDS + 2; i++) {
+      await f.delivery.tick(AGENT, f.holdersFor, at);
+      at += DELIVERY_BACKOFF_CAP_MS;
+    }
+    // Seven quiet deferrals; nothing dialed, nothing abandoned.
+    expect(f.calls).toHaveLength(0);
+    wire.online = true;
+    const res = await f.delivery.tick(AGENT, f.holdersFor, at);
+    expect(res).toMatchObject({ sent: 1 });
+    // The row SURVIVES — one real send against a ceiling of five.
+    expect(f.store.holderHasPending(AGENT, DOC, PEER)).toBe(true);
+    expect(f.events.some((e) => e.event === "document.delivery.unacked_limit")).toBe(false);
+  });
+});
+
 describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", () => {
   it("retires pending envelopes to a removed target without dialing — abandoned, not redialed forever", async () => {
     const f = newFixture();
