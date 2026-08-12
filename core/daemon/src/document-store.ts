@@ -350,6 +350,25 @@ export class DocumentStore {
     // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
+    // M14B / DOD-MP-FANOUT-1 — per-(envelope, holder) delivery state. The envelope row's
+    // bilateral ack columns cannot carry N answers; this table can, and it is DERIVED
+    // bookkeeping over the log — the envelope is the truth, a row here is one holder's
+    // outstanding confirmation. Restart-survivable by construction.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS document_deliveries (
+        owner_agent_id  TEXT    NOT NULL,
+        document_id     TEXT    NOT NULL,
+        envelope_hash   TEXT    NOT NULL,
+        holder_agent_id TEXT    NOT NULL,
+        delivered_at    INTEGER,
+        acked_at        INTEGER,
+        abandoned_at    INTEGER,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        created_at      INTEGER NOT NULL,
+        PRIMARY KEY (owner_agent_id, document_id, envelope_hash, holder_agent_id)
+      );
+    `);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
@@ -935,6 +954,141 @@ export class DocumentStore {
       )
       .get(ownerAgentId, documentId) as { max_epoch?: number | null } | undefined;
     return r?.max_epoch ?? 0;
+  }
+
+  /** DOD-MP-FANOUT-1 — one pending row per CURRENT holder for a freshly published envelope. */
+  seedDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): void {
+    const insert = this.#db.prepare(
+      `INSERT INTO document_deliveries
+         (owner_agent_id, document_id, envelope_hash, holder_agent_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (owner_agent_id, document_id, envelope_hash, holder_agent_id) DO NOTHING`,
+    );
+    for (const holder of holderAgentIds) {
+      insert.run(ownerAgentId, documentId, envelopeHash, holder, nowMs);
+    }
+  }
+
+  /**
+   * Everything due for delivery, PER HOLDER, joined to its envelope. The window is bounded PER
+   * HOLDER (`ROW_NUMBER` over holder partitions) — one holder's backlog must never evict
+   * another's rows from the pass, which is the no_peer starvation shape multiplied by N.
+   */
+  pendingHolderDeliveries(
+    ownerAgentId: string,
+    nowMs: number,
+    opts: { perHolderLimit?: number } = {},
+  ): Array<{ holderAgentId: string; documentId: string; attempts: number; envelope: DocumentEnvelopeRow }> {
+    const limit = opts.perHolderLimit ?? 50;
+    const rows = this.#db
+      .prepare(
+        // holder_attempts ALIASED: e.* carries the envelope row's LEGACY bilateral attempts
+        // column, which would silently shadow the per-holder count in the result map.
+        `SELECT d.holder_agent_id, d.attempts AS holder_attempts, d.document_id AS delivery_document_id, e.*
+           FROM (
+             SELECT *, ROW_NUMBER() OVER (
+               PARTITION BY holder_agent_id
+               ORDER BY created_at ASC, envelope_hash ASC
+             ) AS rn
+             FROM document_deliveries
+             WHERE owner_agent_id = ?
+               AND acked_at IS NULL AND abandoned_at IS NULL
+               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+           ) d
+           JOIN document_envelopes e
+             ON e.owner_agent_id = d.owner_agent_id
+            AND e.document_id = d.document_id
+            AND e.envelope_hash = d.envelope_hash
+          WHERE d.rn <= ?
+          ORDER BY d.holder_agent_id ASC, d.created_at ASC`,
+      )
+      .all(ownerAgentId, nowMs, limit) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      holderAgentId: r["holder_agent_id"] as string,
+      documentId: r["delivery_document_id"] as string,
+      attempts: (r["holder_attempts"] as number) ?? 0,
+      envelope: toEnvelopeRow(r),
+    }));
+  }
+
+  /** Record one holder's attempt; returns THEIR attempt count. */
+  recordHolderAttempt(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nextAttemptAtMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET attempts = attempts + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+    const r = this.#db
+      .prepare(
+        `SELECT attempts FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, envelopeHash, holderAgentId) as { attempts?: number } | undefined;
+    return r?.attempts ?? 0;
+  }
+
+  /** Settle one holder's confirmation. True exactly when THIS call settled it. */
+  ackHolderDelivery(
+    ownerAgentId: string,
+    documentId: string,
+    envelopeHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): boolean {
+    const r = this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET acked_at = ?, delivered_at = COALESCE(delivered_at, ?)
+          WHERE owner_agent_id = ? AND document_id = ? AND envelope_hash = ? AND holder_agent_id = ?
+            AND acked_at IS NULL`,
+      )
+      .run(nowMs, nowMs, ownerAgentId, documentId, envelopeHash, holderAgentId);
+    return (r.changes ?? 0) > 0;
+  }
+
+  /** Retire EVERY outstanding row for one holder — our decision, announced by the caller. */
+  abandonHolderDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): number {
+    const r = this.#db
+      .prepare(
+        `UPDATE document_deliveries
+            SET abandoned_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL`,
+      )
+      .run(nowMs, ownerAgentId, documentId, holderAgentId);
+    return r.changes ?? 0;
+  }
+
+  /** Does this holder still owe any confirmation on this document? */
+  holderHasPending(ownerAgentId: string, documentId: string, holderAgentId: string): boolean {
+    const r = this.#db
+      .prepare(
+        `SELECT 1 FROM document_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND holder_agent_id = ?
+            AND acked_at IS NULL AND abandoned_at IS NULL
+          LIMIT 1`,
+      )
+      .get(ownerAgentId, documentId, holderAgentId);
+    return r !== undefined;
   }
 
   pendingDeliveries(
