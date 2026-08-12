@@ -1153,6 +1153,28 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // who is still thinking, and the refusal prose when there is one. Without this the answer
     // arrived, flipped a row, and reached nobody; a refused-but-admitted holder additionally
     // needs removing (REMOVE-1) and nothing else prompts it.
+    // THE DERIVED ARRANGEMENT, per document (enforcer review G0). Until now nothing surfaced who
+    // holds a document or who governs it: an operator could not answer "who is in this?", and
+    // "all holders derive the same arrangement" — the governance line's headline claim — was
+    // unassertable from outside the process. DERIVED here, never stored: each daemon computes it
+    // from its OWN chain, which is exactly the property worth comparing across machines.
+    const arrangementFor = (documentId: string): Record<string, unknown> => {
+      const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+      if (!genesisRecord) return { arrangementUnavailable: "no_genesis_record" };
+      const derived = deriveArrangement(
+        arrangementGenesisFromProposal(genesisRecord.envelope),
+        layer.amendments.chain(who.ownerAgentId, documentId),
+        documentGovernancePolicy,
+        layer.verifySignature,
+      );
+      if (!derived.ok) return { arrangementUnavailable: derived.reason };
+      return {
+        participants: [...derived.arrangement.participants].sort(),
+        admins: [...derived.arrangement.admins].sort(),
+        properties: derived.arrangement.properties,
+      };
+    };
+
     const outgoingJoins = layer.joins.outgoingFor(who.ownerAgentId).map((j) => ({
       documentId: j.documentId,
       inviteeAgentId: j.inviteeAgentId,
@@ -1198,6 +1220,8 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           peerHasPublished:
             layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
           consentState: proposal?.consentState ?? null,
+          // WHO HOLDS IT AND WHO GOVERNS IT — derived from THIS daemon's own chain (G0).
+          ...arrangementFor(d.documentId),
           // DID OUR OFFER LEAVE? Only meaningful for a document WE proposed — for one we accepted
           // there is no offer of ours to have sent. Without this, `peerAccepted: null` meant both
           // "they are thinking" and "they were never asked", and the shipped guidance said WAIT,

@@ -209,6 +209,22 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     expect(solo.properties.admin_set).toEqual([f2.owner]);
   });
 
+  it("the DERIVED arrangement honours the declared admin set — not the everyone default", async () => {
+    const f = await newFixture();
+    const proposed = await f.call("cello_doc_propose", {
+      peer_pubkey: f.peer,
+      admins: [f.owner],
+    });
+    const documentId = proposed.documentId as string;
+    const list = await f.call("cello_doc_list", {});
+    const row = (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d.documentId === documentId,
+    )!;
+    expect(row.arrangementUnavailable).toBeUndefined();
+    expect(row.admins).toEqual([f.owner]);
+    expect((row.participants as string[]).sort()).toEqual([f.owner, f.peer].sort());
+  });
+
   it("refuses an admin who is not a party — admins are always holders, and nothing is created", async () => {
     const f = await newFixture();
     const res = await f.call("cello_doc_propose", {
