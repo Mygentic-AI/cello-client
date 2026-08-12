@@ -265,8 +265,15 @@ describe("DocumentHandshake — properties are IMMUTABLE after accept (§16.3)",
       // even rewrite its own. They exist because nothing durable recorded the send outcome, which
       // made `peerAccepted: null` mean both "they are thinking" and "they were never asked" — and
       // the shipped guidance told the operator to wait, which is wrong for the second.
+      //
+      // `recordJoined` (M14B / DOD-MP-JOIN-1) records the genesis of a document this agent JOINED —
+      // the joiner is neither addressee nor author, so both existing write paths refuse it by
+      // design. Its INSERT is ON CONFLICT DO NOTHING like `recordOutgoing`'s, so a stored row's
+      // `consent_state` and `envelope` are unreachable from it; the joiner's consent is their
+      // signed join answer, recorded in the join store, not here.
       ["accept", "constructor", "get", "pending", "recordProposal", "recordOutgoing", "refuse",
-       "recordPeerDecision", "peerDecision", "peerAnswer", "markProposalSent", "proposalSent"].sort(),
+       "recordPeerDecision", "peerDecision", "peerAnswer", "markProposalSent", "proposalSent",
+       "recordJoined"].sort(),
     );
     expect(handshake.get(OWNER, documentId)!.envelope.properties.append_only).toBe(true);
   });

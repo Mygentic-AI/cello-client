@@ -22,6 +22,7 @@
  * admit when it says no.
  */
 
+import { createHash } from "node:crypto";
 import { verify } from "@cello-protocol/crypto";
 import { DocumentStore } from "./document-store.js";
 import { DocumentEngine } from "./document-engine.js";
@@ -30,6 +31,8 @@ import { screeningRule, SCREEN_RULE_ID } from "./document-screen.js";
 import { DocumentRejections } from "./document-rejection.js";
 import { DocumentInbound } from "./document-inbound.js";
 import { DocumentAckInbound } from "./document-ack-inbound.js";
+import { DocumentAmendmentStore } from "./document-amendment-store.js";
+import { DocumentJoinStore } from "./document-join-store.js";
 import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
@@ -48,6 +51,19 @@ import {
   decodeDocumentControl,
   buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
+  buildDocumentUpdateTbs,
+  documentEnvelopeHash,
+  buildDocumentJoinAnswerTbs,
+  encodeDocumentJoinAnswer,
+  buildDocumentJoinOfferTbs,
+  decodeDocumentJoinOffer,
+  decodeDocumentAmendment,
+  documentAmendmentHash,
+  validateDocumentJoinOffer,
+  documentGovernancePolicy,
+  arrangementGenesisFromProposal,
+  deriveArrangement,
+  type DocumentJoinAnswer,
   encodeDocumentAck,
   buildDocumentAckTbs,
   type DocumentAck,
@@ -142,6 +158,21 @@ export interface DocumentLayer {
   lifecycle: DocumentLifecycle;
   notifications: DocumentNotifications;
   rejections: DocumentRejections;
+  /** M14B — the amendment chain (write path; reads go through `store.currentDocumentEpoch`). */
+  amendments: DocumentAmendmentStore;
+  /** M14B — join offers pending consent, both roles. */
+  joins: DocumentJoinStore;
+  /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
+  verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
+  /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
+  acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
+    | { ok: true; documentId: string; inviterAgentId: string; documentType: string; applied: number; answerBytes: Uint8Array }
+    | { ok: false; reason: string; detail: string }
+  >;
+  refuseJoin(ownerAgentId: string, amendmentHash: string, reason: string | null, nowMs: number): Promise<
+    | { ok: true; documentId: string; inviterAgentId: string; answerBytes: Uint8Array }
+    | { ok: false; reason: string; detail: string }
+  >;
   router: DocumentFrameRouter;
   /**
    * The hook `SessionNodeManager.setOnDocumentFrame` takes. Handed out ready-shaped so the
@@ -311,6 +342,60 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
   // arrival's bytes permanent for that id).
   const handshake = new DocumentHandshake(db, logger, verifySignature);
+  // M14B / DOD-MP-JOIN-1 — the amendment chain and the join-consent stores. The membership READ
+  // path (`currentDocumentEpoch`) has run through DocumentStore since AMEND-1; these are the
+  // WRITE path, and every append below validates first (the standing AMEND-1 condition).
+  const amendments = new DocumentAmendmentStore(db, logger);
+  const joins = new DocumentJoinStore(db, logger);
+
+  /** Sign and send a join answer — best-effort, never a veto over the local decision. */
+  const sendJoinAnswer = async (
+    ownerAgentId: string,
+    inviterAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    accepted: boolean,
+    reason: string | null,
+  ): Promise<void> => {
+    try {
+      const answer: DocumentJoinAnswer = {
+        type: "document_join_answer",
+        document_id: documentId,
+        amendment_hash: amendmentHash,
+        invitee_agent_id: ownerAgentId,
+        accepted,
+        refusal_reason: accepted ? null : reason,
+        answered_at_ms: Date.now(),
+        signature: new Uint8Array(0),
+      };
+      answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
+      await deps.sendFrame(ownerAgentId, inviterAgentId, encodeDocumentJoinAnswer(answer));
+    } catch (err: unknown) {
+      logger.warn("document.join.answer_send_failed", {
+        documentId,
+        amendmentHash,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  /** Re-send the STANDING decision for an already-decided offer a redelivery just matched. */
+  const resendJoinAnswer = async (
+    ownerAgentId: string,
+    amendmentHash: string,
+    inviterAgentId: string,
+  ): Promise<void> => {
+    const record = joins.get(ownerAgentId, amendmentHash);
+    if (!record || record.state === "pending") return;
+    await sendJoinAnswer(
+      ownerAgentId,
+      inviterAgentId,
+      record.documentId,
+      amendmentHash,
+      record.state === "accepted",
+      record.reason,
+    );
+  };
 
   const router = new DocumentFrameRouter({
     inbound,
@@ -321,6 +406,97 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // THROWS on a forged or misaddressed proposal, which the router contains and reports. That is
       // right: those are refusals, and nothing should be recorded for them.
       handshake.recordProposal(ownerAgentId, wire, nowMs);
+    },
+    recordJoinOffer: (ownerAgentId, wire, nowMs) => {
+      const offer = decodeDocumentJoinOffer(wire);
+      // ADDRESSED TO US — the same multi-agent-daemon rule recordProposal enforces: consent
+      // belongs to the agent the inviter named, and a throw here is contained by the router.
+      if (offer.invitee_agent_id !== ownerAgentId) {
+        throw new Error(
+          `document_join_wrong_invitee: this offer is addressed to ${offer.invitee_agent_id}, ` +
+            `not to ${ownerAgentId}`,
+        );
+      }
+      const validation = validateDocumentJoinOffer(offer, documentGovernancePolicy, verifySignature);
+      if (validation.ok) {
+        const stored = joins.recordIncoming(
+          ownerAgentId, wire, validation.pendingAmendmentHash, { state: "pending" }, nowMs,
+        );
+        // REDELIVERY OF A DECIDED OFFER RE-SENDS THE ANSWER. A lost answer was otherwise lost
+        // forever: the invitee's decision stood, the inviter's row sat pending, and the
+        // inviter's only lever — re-inviting, which redelivers this exact offer — reached a
+        // DO-NOTHING insert. Now that redelivery is the recovery: the standing decision is
+        // re-signed and travels again. Best-effort, like every answer.
+        if (stored.state !== "pending") {
+          void resendJoinAnswer(ownerAgentId, validation.pendingAmendmentHash, offer.inviter_agent_id);
+        }
+        return;
+      }
+      // A REFUSAL IS RECORDED — AND ANSWERED — ONLY WHEN IT IS AUTHENTICATED. The first cut
+      // recorded every refusal under the admitting amendment's hash, and that was a standing
+      // veto: any party holding the amendment bytes (every holder gets them in the fan-out)
+      // could deliver a garbage offer FIRST, occupy the real settle key with a refused row, and
+      // the genuine offer would arrive to a DO-NOTHING insert — the admin's admission silently
+      // suppressed, both operators seeing nothing. So: an offer whose signature does not verify
+      // against its named inviter THROWS (contained + logged, nothing recorded — the forged-
+      // proposal treatment), and an authenticated refusal is recorded under the hash of ITS OWN
+      // BYTES — visible to the operator, never able to occupy a real join's settle key.
+      if (!verifySignature(offer.inviter_agent_id, buildDocumentJoinOfferTbs(offer), offer.signature)) {
+        throw new Error(validation.reason);
+      }
+      const refusalKey = createHash("sha256").update(wire).digest("hex");
+      joins.recordIncoming(
+        ownerAgentId, wire, refusalKey, { state: "refused", reason: validation.reason }, nowMs,
+      );
+      // BOTH ENDS get the sentence: the refusal answer travels back to the authenticated
+      // inviter, settling their row with the reason — the version-mismatch sentence was written
+      // for a human and was reaching a database column. The settle key is the admitting
+      // amendment's hash when one is recoverable (the inviter's row lives under it).
+      const last = offer.amendments[offer.amendments.length - 1];
+      if (last !== undefined) {
+        try {
+          const settleKey = Buffer.from(
+            documentAmendmentHash(decodeDocumentAmendment(last).body),
+          ).toString("hex");
+          void sendJoinAnswer(
+            ownerAgentId, offer.inviter_agent_id, offer.document_id, settleKey, false, validation.reason,
+          );
+        } catch {
+          // No recoverable settle key — the refusal stays visible locally and the inviter's
+          // re-invite (which redelivers) will meet the same recorded refusal.
+        }
+      }
+    },
+    recordJoinAnswer: (ownerAgentId, wire, nowMs) => {
+      const r = joins.recordAnswer(ownerAgentId, wire, verifySignature, nowMs);
+      // A refusal is a verdict the router contains and reports — never a silent drop.
+      if (!r.ok) throw new Error(r.reason);
+    },
+    recordAmendment: (ownerAgentId, wire, nowMs) => {
+      // An amendment reaching an EXISTING holder. VALIDATE-BEFORE-APPEND (the AMEND-1 standing
+      // condition): the whole chain, including this arrival, must replay through the real policy
+      // before one byte lands in the table — a row in document_amendments is post-validation by
+      // invariant, and epoch stamping rests on that.
+      const env = decodeDocumentAmendment(wire);
+      const documentId = env.body.document_id;
+      if (!store.getDocument(ownerAgentId, documentId)) {
+        throw new Error(`document_unknown: no document ${documentId.slice(0, 16)}… for this agent`);
+      }
+      const record = handshake.get(ownerAgentId, documentId);
+      if (!record) {
+        throw new Error(
+          `document_genesis_missing: ${documentId.slice(0, 16)}… has a row but no stored genesis ` +
+            `proposal to replay from`,
+        );
+      }
+      const derived = deriveArrangement(
+        arrangementGenesisFromProposal(record.envelope),
+        [...amendments.chain(ownerAgentId, documentId), env],
+        documentGovernancePolicy,
+        verifySignature,
+      );
+      if (!derived.ok) throw new Error(derived.reason);
+      amendments.append(ownerAgentId, documentId, wire, nowMs);
     },
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
@@ -503,7 +679,214 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
   });
 
+  /**
+   * M14B / DOD-MP-JOIN-1 — the invitee's ACCEPT: consent becomes a held document.
+   *
+   * VALIDATE EVERYTHING, THEN MUTATE. The stored offer is re-validated at the moment of
+   * consequence (validate-before-append, on the bytes that will be appended), and the whole
+   * envelope-log snapshot is verified — every signature, every document binding — before one row
+   * lands. A snapshot with one bad envelope refuses the accept naming it, because skipping it
+   * silently would hand the joiner a document that reads complete and diverges from every other
+   * holder (NO-SILENT-DROP).
+   *
+   * Historical log envelopes are accepted at the epoch their SIGNED bytes claim — the inbound
+   * epoch gate is for live arrivals; a snapshot legitimately spans epochs 0..N.
+   */
+  const acceptJoin = async (ownerAgentId: string, amendmentHash: string, nowMs: number) => {
+    const record = joins.get(ownerAgentId, amendmentHash);
+    if (!record || record.role !== "invitee") {
+      return {
+        ok: false as const,
+        reason: "join_unknown_offer",
+        detail: `no join offer for this agent settles on ${amendmentHash.slice(0, 16)}…`,
+      };
+    }
+    if (record.state !== "pending") {
+      return {
+        ok: false as const,
+        reason: "join_already_decided",
+        detail: `this offer was already ${record.state} — a consent decision is made once`,
+      };
+    }
+    const validation = validateDocumentJoinOffer(record.offer, documentGovernancePolicy, verifySignature);
+    if (!validation.ok) {
+      // Recorded, not just returned: an offer that no longer validates is a settled fact.
+      joins.decide(ownerAgentId, amendmentHash, false, validation.reason, nowMs);
+      return { ok: false as const, reason: "join_offer_invalid", detail: validation.reason };
+    }
+    const documentId = record.documentId;
+
+    // WHO MAY APPEAR IN THE SNAPSHOT: anyone who held the document at ANY epoch of the carried
+    // chain — the genesis pair plus every add_holder subject (a removed holder's history stays
+    // legal). Without this, a malicious inviter plants envelopes signed by keys they control
+    // under identities that were never holders, and the joiner materializes content no
+    // legitimate holder ever saw — silent divergence the live path's sender-is-peer check
+    // would have refused.
+    const everHeld = new Set<string>([
+      validation.genesis.proposer_agent_id,
+      validation.genesis.peer_agent_id,
+    ]);
+    for (const amendment of validation.amendments) {
+      if (amendment.body.kind === "add_holder" && amendment.body.subject_agent_id !== null) {
+        everHeld.add(amendment.body.subject_agent_id);
+      }
+    }
+
+    // The WHOLE snapshot verified before any mutation.
+    const verified: Array<Parameters<typeof store.appendEnvelope>[1]> = [];
+    for (let i = 0; i < record.offer.envelope_log.length; i++) {
+      const bytes = record.offer.envelope_log[i]!;
+      let env;
+      try {
+        env = decodeDocumentUpdateEnvelope(bytes);
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          reason: "join_log_invalid",
+          detail: `snapshot envelope ${i} does not decode: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+      if (env.document_id !== documentId) {
+        return {
+          ok: false as const,
+          reason: "join_log_invalid",
+          detail: `snapshot envelope ${i} names document ${env.document_id.slice(0, 16)}…, not this one`,
+        };
+      }
+      if (!verifySignature(env.sender_agent_id, buildDocumentUpdateTbs(env), env.signature)) {
+        return {
+          ok: false as const,
+          reason: "join_log_invalid",
+          detail: `snapshot envelope ${i} does not verify against its sender ${env.sender_agent_id}`,
+        };
+      }
+      if (!everHeld.has(env.sender_agent_id)) {
+        return {
+          ok: false as const,
+          reason: "join_log_invalid",
+          detail:
+            `snapshot envelope ${i} is signed by ${env.sender_agent_id}, who never held this ` +
+            `document at any epoch of the carried chain — refused before anything materializes`,
+        };
+      }
+      verified.push({
+        envelopeHash: documentEnvelopeHash(env),
+        documentId,
+        senderAgentId: env.sender_agent_id,
+        docPrevHash: env.doc_prev_hash,
+        epochId: env.epoch_id,
+        signature: env.signature,
+        stateVector: env.state_vector,
+        payload: env.update,
+        kind: "update",
+        referencesEnvelopeHash: null,
+        createdAtMs: nowMs,
+      });
+    }
+
+    // Mutations, in dependency order: genesis (LiveDocuments reads starting_content from it),
+    // the chain (idempotent on redelivery), the row, the log, the live rebuild, the file.
+    handshake.recordJoined(ownerAgentId, record.offer.genesis, nowMs);
+    try {
+      for (const bytes of record.offer.amendments) {
+        amendments.append(ownerAgentId, documentId, bytes, nowMs);
+      }
+    } catch (err: unknown) {
+      // TWO ADMINS INVITED THE SAME AGENT INDEPENDENTLY: each offer's chain is self-consistent
+      // and both sat pending, but their admitting amendments rival at one epoch — the second
+      // accept hits the store's fork refusal mid-append. Settled as refused with the conflict's
+      // own reason rather than thrown: a raw exception left the row pending and every retry
+      // rethrowing, a wedge the operator could not see past.
+      const reason = err instanceof Error ? err.message : String(err);
+      joins.decide(ownerAgentId, amendmentHash, false, reason, nowMs);
+      return { ok: false as const, reason: "join_conflicting_admission", detail: reason };
+    }
+    if (!store.getDocument(ownerAgentId, documentId)) {
+      store.createDocument({
+        documentId,
+        ownerAgentId,
+        // The inviter is this holder's live counterpart until fan-out delivery (P2) — the
+        // participants that MATTER derive from the amendment chain (Entry 9's decision).
+        peerAgentId: record.inviterAgentId,
+        documentType: validation.genesis.document_type,
+        properties: validation.genesis.properties,
+        status: "active",
+        createdAtMs: nowMs,
+      });
+    }
+    for (const row of verified) store.appendEnvelope(ownerAgentId, row);
+    const doc = live.get(ownerAgentId, documentId);
+    if (writePath) {
+      await writePath.materialize(ownerAgentId, documentId, validation.genesis.document_type, doc);
+    }
+    joins.decide(ownerAgentId, amendmentHash, true, null, nowMs);
+
+    const answer: DocumentJoinAnswer = {
+      type: "document_join_answer",
+      document_id: documentId,
+      amendment_hash: amendmentHash,
+      invitee_agent_id: ownerAgentId,
+      accepted: true,
+      refusal_reason: null,
+      answered_at_ms: nowMs,
+      signature: new Uint8Array(0),
+    };
+    answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
+    logger.info("document.join.accepted", { documentId, amendmentHash, applied: verified.length });
+    return {
+      ok: true as const,
+      documentId,
+      inviterAgentId: record.inviterAgentId,
+      documentType: validation.genesis.document_type,
+      applied: verified.length,
+      answerBytes: encodeDocumentJoinAnswer(answer),
+    };
+  };
+
+  /** The invitee's REFUSE — local and final; the signed answer travels best-effort. */
+  const refuseJoin = async (ownerAgentId: string, amendmentHash: string, reason: string | null, nowMs: number) => {
+    const record = joins.get(ownerAgentId, amendmentHash);
+    if (!record || record.role !== "invitee") {
+      return {
+        ok: false as const,
+        reason: "join_unknown_offer",
+        detail: `no join offer for this agent settles on ${amendmentHash.slice(0, 16)}…`,
+      };
+    }
+    const decided = joins.decide(ownerAgentId, amendmentHash, false, reason, nowMs);
+    if (!decided.decided) {
+      return {
+        ok: false as const,
+        reason: "join_already_decided",
+        detail: `this offer was already ${decided.state} — a consent decision is made once`,
+      };
+    }
+    const answer: DocumentJoinAnswer = {
+      type: "document_join_answer",
+      document_id: record.documentId,
+      amendment_hash: amendmentHash,
+      invitee_agent_id: ownerAgentId,
+      accepted: false,
+      refusal_reason: reason,
+      answered_at_ms: nowMs,
+      signature: new Uint8Array(0),
+    };
+    answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
+    logger.info("document.join.refused", { documentId: record.documentId, amendmentHash });
+    return {
+      ok: true as const,
+      documentId: record.documentId,
+      inviterAgentId: record.inviterAgentId,
+      answerBytes: encodeDocumentJoinAnswer(answer),
+    };
+  };
+
   return {
+    amendments,
+    joins,
+    verifySignature,
+    acceptJoin,
+    refuseJoin,
     store,
     writePath,
     handshake,

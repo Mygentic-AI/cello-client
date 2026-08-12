@@ -21,6 +21,10 @@ import {
   buildDocumentProposalTbs,
   encodeDocumentProposal,
   documentIdFromProposal,
+  documentAmendmentHash,
+  buildDocumentMultisigTbs,
+  encodeDocumentAmendment,
+  type DocumentAmendmentBody,
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
@@ -235,6 +239,217 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     // would dial the daemon it is running in.
     expect(res).toMatchObject({ ok: false, reason: "document_peer_is_self" });
     expect(f.sent).toHaveLength(0);
+  });
+});
+
+describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
+  /** Drain the router's per-owner async queue by polling the observable outcome. */
+  async function until(pred: () => boolean): Promise<void> {
+    for (let i = 0; i < 100; i++) {
+      if (pred()) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(pred()).toBe(true);
+  }
+
+  it("invite → offer → inbox → accept → materialized content → answer settled on the inviter", async () => {
+    const fA = await newFixture(); // the inviter's daemon
+    const fC = await newFixture(); // the invitee's daemon — its own DB, its own keys
+
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      starting_content: "hello from A. ",
+    });
+    expect(proposed.ok).toBe(true);
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_write", {
+      document_id: documentId,
+      content: "hello from A. plus an edit worth carrying. ",
+    });
+
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    expect(invited).toMatchObject({ ok: true, offerSent: true, epochId: 1 });
+
+    // The offer crossed A's transport addressed to C; C receives it on the session channel and
+    // the router queues the validation.
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner);
+    expect(offerSend).toBeDefined();
+    const routed = fC.layer.onDocumentFrame(AGENT, "session-1", offerSend!.bytes, fA.owner);
+    expect(routed.consumed).toBe(true);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+
+    const inbox = await fC.call("cello_doc_inbox");
+    expect((inbox.joins as Array<{ documentId: string }>)[0]?.documentId).toBe(documentId);
+
+    // C consents BY DERIVING — the accept re-replays the carried bytes.
+    const accepted = await fC.call("cello_doc_accept", { document_id: documentId });
+    expect(accepted).toMatchObject({ ok: true, joined: true });
+    expect(accepted.appliedEnvelopes as number).toBeGreaterThanOrEqual(1);
+
+    // C's copy carries A's content, rebuilt from the snapshot, and both derive epoch 1.
+    expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
+      "hello from A",
+    );
+    expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(1);
+    expect(fA.layer.store.currentDocumentEpoch(fA.owner, documentId)).toBe(1);
+
+    // C's signed answer reaches A and settles the offer — consent recorded on both sides.
+    const answerSend = fC.sent.find((s) => s.peerAgentId === fA.owner);
+    expect(answerSend).toBeDefined();
+    const back = fA.layer.onDocumentFrame(AGENT, "session-1", answerSend!.bytes, fC.owner);
+    expect(back.consumed).toBe(true);
+    await until(
+      () => fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.state === "accepted",
+    );
+  });
+
+  it("an arrived-but-unaccepted offer leaves the invitee holding NOTHING — neither alone admits anyone", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "content C must not hold yet. ",
+    });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    // The AMENDMENT half is valid and delivered — and C holds NOTHING until C's own accept.
+    expect(fC.layer.store.getDocument(fC.owner, documentId)).toBeNull();
+    expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(0);
+  });
+
+  it("the inbox SHOWS THE RULES the invitee is consenting to — participants, admins, properties", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, admins: [fA.owner], append_only: true,
+    });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    const inbox = await fC.call("cello_doc_inbox");
+    const entry = (inbox.joins as Array<Record<string, unknown>>)[0]!;
+    expect(entry.documentId).toBe(documentId);
+    expect((entry.participants as string[]).sort()).toEqual([fA.owner, fA.peer, fC.owner].sort());
+    expect(entry.admins).toEqual([fA.owner]);
+    expect((entry.properties as Record<string, unknown>).append_only).toBe(true);
+    expect(entry.assuranceTier).toBe("authenticated");
+  });
+
+  it("a REFUSED join settles on the inviter with the operator's reason — and C still holds nothing", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const documentId = proposed.documentId as string;
+    const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    const refused = await fC.call("cello_doc_refuse", {
+      document_id: documentId, reason: "not this one thanks",
+    });
+    expect(refused).toMatchObject({ ok: true, joined: false });
+    expect(fC.layer.store.getDocument(fC.owner, documentId)).toBeNull();
+    const answerSend = fC.sent.find((s) => s.peerAgentId === fA.owner)!;
+    fA.layer.onDocumentFrame(AGENT, "session-1", answerSend.bytes, fC.owner);
+    await until(
+      () => fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.state === "refused",
+    );
+    expect(fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.reason).toBe(
+      "not this one thanks",
+    );
+    // And the inviter's list SURFACES the answer.
+    const list = await fA.call("cello_doc_list");
+    const offers = list.joinOffers as Array<Record<string, unknown>>;
+    expect(offers.find((o) => o.documentId === documentId)).toMatchObject({ state: "refused" });
+  });
+
+  it("an existing holder VALIDATES an arriving amendment before appending — a forged one is refused", async () => {
+    // The receive-side validate-before-append site, pinned revert-visibly (JOIN-1 review):
+    // delete the replay in recordAmendment and the forged half of this test goes green-to-red.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    // A proposes TO B's real daemon; B accepts, so B holds the document.
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    const routedProposal = fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    expect(routedProposal).toMatchObject({ consumed: true, kind: "proposal" });
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    const bAccept = await fB.call("cello_doc_accept", { document_id: documentId });
+    expect(bAccept.ok).toBe(true);
+
+    // A invites C; the amendment fans out to B.
+    const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    expect((invited.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
+    const amendSend = fA.sent.filter((s) => s.peerAgentId === fB.owner).at(-1)!;
+    const routedAmend = fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
+    expect(routedAmend).toMatchObject({ consumed: true, kind: "amendment" });
+    await until(() => fB.layer.store.currentDocumentEpoch(fB.owner, documentId) === 1);
+
+    // The forged twin: a rogue key authors epoch 2 claiming itself as the required signer.
+    const rogue = generateKeypair();
+    const rogueId = Buffer.from(await rogue.getPublicKey()).toString("hex");
+    const chain = fB.layer.amendments.chain(fB.owner, documentId);
+    const body: DocumentAmendmentBody = {
+      document_id: documentId,
+      epoch_id: 2,
+      prev_amendment_hash: Buffer.from(
+        documentAmendmentHash(chain[chain.length - 1]!.body),
+      ).toString("hex"),
+      kind: "add_holder",
+      subject_agent_id: "e".repeat(64),
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: NOW,
+    };
+    const hash = documentAmendmentHash(body);
+    const tbs = buildDocumentMultisigTbs({
+      document_id: documentId,
+      subject_kind: "document_amendment",
+      subject_hash: hash,
+      required_signers: [rogueId],
+    });
+    const forged = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: documentId,
+        subject_kind: "document_amendment",
+        subject_hash: hash,
+        required_signers: [rogueId],
+        signatures: [{ signer_agent_id: rogueId, signature: await rogue.sign(tbs) }],
+      },
+    });
+    const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(forged), rogueId);
+    expect(routed.consumed).toBe(true);
+    // The router contains the refusal; the epoch NEVER advances on a forged amendment.
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fB.layer.store.currentDocumentEpoch(fB.owner, documentId)).toBe(1);
+  });
+
+  it("an under-signed offer admits nobody — recorded refused on the invitee, named", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      // A is deliberately NOT an admin: only the (absent) peer governs.
+      admins: [fA.peer],
+    });
+    const documentId = proposed.documentId as string;
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    // The inviter's own daemon refuses at authoring — a non-admin cannot even mint the offer.
+    expect(invited).toMatchObject({ ok: false, reason: "document_not_admin" });
+    expect(fA.sent.find((s) => s.peerAgentId === fC.owner)).toBeUndefined();
   });
 });
 

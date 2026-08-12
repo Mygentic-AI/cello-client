@@ -611,6 +611,19 @@ server.tool("cello_doc_propose", "Offer a shared living document to a counterpar
   return jsonText(result);
 });
 
+server.tool("cello_doc_invite", "Invite a third agent into a shared document you administer. Your signature authors the admitting amendment; THEIR OWN ACCEPT makes the join real — neither alone admits anyone. They receive the document's full history and rules, verify everything independently, and consent to what they computed. Re-running with the same invitee re-sends the same offer rather than inviting twice.", {
+  document_id: z.string().describe("The document to open up — see cello_doc_list"),
+  invitee_pubkey: z.string().describe("The third agent's 64-char hex public key — see cello_contacts"),
+  agent: z.string().optional().describe("Agent to invite as (defaults to the current agent)"),
+}, async ({ document_id, invitee_pubkey, agent }) => {
+  const result = await proxy.call("cello_doc_invite", {
+    document_id,
+    invitee_pubkey,
+    ...(agent !== undefined ? { agent } : {}),
+  });
+  return jsonText(result);
+});
+
 server.tool("cello_doc_inbox", "Documents someone has offered YOU that are awaiting your decision. Read what was offered here BEFORE accepting — accepting is what lets their signed edits change your copy from then on.", {
   agent: z.string().optional().describe("Agent whose inbox to read (defaults to the current agent)"),
 }, async ({ agent }) => {

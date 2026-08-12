@@ -75,6 +75,9 @@ import {
   decodeDocumentRejection,
   decodeDocumentProposalAck,
   decodeDocumentControl,
+  decodeDocumentJoinOffer,
+  decodeDocumentJoinAnswer,
+  decodeDocumentAmendment,
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
 import type { DocumentAckInbound } from "./document-ack-inbound.js";
@@ -93,7 +96,10 @@ export type DocumentFrameKind =
   | "proposal"
   | "rejection"
   | "proposal_ack"
-  | "control";
+  | "control"
+  | "join_offer"
+  | "join_answer"
+  | "amendment";
 
 export type FrameRouting =
   | { consumed: false }
@@ -134,6 +140,20 @@ export interface DocumentFrameRouterDeps {
    * with nothing on their screen explaining why.
    */
   recordControl(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /**
+   * M14B / DOD-MP-JOIN-1 — an admin's offer to a third party. Validated (the invitee REPLAYS the
+   * carried bytes) and recorded — pending or refused-with-reason, never dropped.
+   */
+  recordJoinOffer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /** The invitee's signed answer to an offer we authored. Settle-once. */
+  recordJoinAnswer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /**
+   * An amendment reaching an EXISTING holder — validated against our own chain
+   * (validate-before-append) and appended, so our derived participant set does not silently
+   * diverge from the amender's (§7-1's hazard). Best-effort delivery at P1; the inbound epoch
+   * gate makes a missed one loud.
+   */
+  recordAmendment(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * Tell the sender what happened to their envelope — admitted or refused, both of which SETTLE it.
    *
@@ -444,6 +464,18 @@ export class DocumentFrameRouter {
         this.#d.recordControl(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
       }
+      if (kind === "join_offer") {
+        this.#d.recordJoinOffer(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
+      }
+      if (kind === "join_answer") {
+        this.#d.recordJoinAnswer(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
+      }
+      if (kind === "amendment") {
+        this.#d.recordAmendment(ownerAgentId, content, nowMs);
+        return { consumed: true, kind, ok: true };
+      }
       const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);
       return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
     } catch (err: unknown) {
@@ -580,6 +612,15 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_control":
         decodeDocumentControl(content);
         return "control";
+      case "document_join_offer":
+        decodeDocumentJoinOffer(content);
+        return "join_offer";
+      case "document_join_answer":
+        decodeDocumentJoinAnswer(content);
+        return "join_answer";
+      case "document_amendment":
+        decodeDocumentAmendment(content);
+        return "amendment";
       default:
         // A frame type this build does not know. Reported by the caller rather than silently
         // treated as conversation — see `routeSync`.

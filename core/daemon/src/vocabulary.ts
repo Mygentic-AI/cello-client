@@ -89,6 +89,7 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   // failed three guards at once: "every declared tool has a handler behind it", "every
   // dual-surface capability's CLI name is a real command", and the source audit.
   { mcp: "cello_doc_propose", cli: "cello doc propose" },
+  { mcp: "cello_doc_invite", cli: "cello doc invite" },
   { mcp: "cello_doc_inbox", cli: "cello doc inbox" },
   { mcp: "cello_doc_accept", cli: "cello doc accept" },
   { mcp: "cello_doc_refuse", cli: "cello doc refuse" },
