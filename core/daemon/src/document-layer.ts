@@ -462,6 +462,20 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     ownerAgentId: string,
     documentId: string,
   ): { ok: true; holders: readonly string[] } | { ok: false; reason: string } => {
+    // LEGACY FIRST, and for the same reason the settle path checks it first: a document with no
+    // stored genesis proposal has NO CHAIN, so the peer column is not a fallback — it IS the
+    // membership. Without this branch the send path refused the very condition the settle path
+    // calls legacy, so no close frame ever left, neither side recorded the other's close, and such
+    // a document could never be ended by agreement at all. Reachable two ways: documents proposed
+    // before `recordOutgoing` shipped, and a crash between `createDocument` and `recordOutgoing`,
+    // which run in that order.
+    //
+    // The two paths must agree about what "cannot answer" means. Their disagreeing is the whole
+    // shape of this milestone's defects.
+    const doc = store.getDocument(ownerAgentId, documentId);
+    if (doc && !handshake.get(ownerAgentId, documentId)) {
+      return { ok: true, holders: [doc.peerAgentId] };
+    }
     let derivedHolders: readonly string[] | null;
     try {
       derivedHolders = holdersFor(ownerAgentId, documentId);
@@ -474,6 +488,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
+    // A chain that EXISTS and will not replay keeps the refusal — it may name holders we cannot
+    // see, and addressing the genesis peer alone there is the original defect.
     if (derivedHolders === null) return { ok: false, reason: "document_holders_underivable" };
     return { ok: true, holders: derivedHolders.filter((p) => p !== ownerAgentId).sort() };
   };

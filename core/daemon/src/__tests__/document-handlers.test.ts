@@ -1092,6 +1092,32 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     expect(row.closePending).toBe(false);
   });
 
+  it("CLOSE-N-1 legacy: a document with NO chain still SENDS its close — through the real notifier", async () => {
+    // The unit that pinned the legacy clause injected the verdict and called `recordPeerClose`
+    // directly, so the NOTIFIER — the half that refuses — was never in the picture. Meanwhile
+    // `controlHolders` refused the very condition the settle path calls legacy, so no frame ever
+    // left and a pre-amendment document could not be ended by agreement at all. Two paths
+    // disagreeing about what "cannot answer" means is the shape of this whole milestone.
+    const f = await newFixture();
+    const proposed = await f.call("cello_doc_propose", {
+      peer_pubkey: f.peer, starting_content: "legacy. ",
+    });
+    const documentId = proposed.documentId as string;
+    // Drop the stored genesis proposal: this IS the legacy shape — a row with no chain to replay.
+    f.layer.store.rawDb
+      .prepare(`DELETE FROM document_proposals WHERE owner_agent_id = ? AND document_id = ?`)
+      .run(f.owner, documentId);
+    f.sent.length = 0;
+
+    const closed = await f.call("cello_doc_close", { document_id: documentId });
+    expect(closed.ok).toBe(true);
+    expect(
+      closed.holdersNotified,
+      "a legacy document sent its close to nobody — it can never settle",
+    ).toEqual({ [f.peer]: true });
+    expect(f.sent.map((x) => x.peerAgentId)).toEqual([f.peer]);
+  });
+
   it("CLOSE-N-1 F2: a chain that will not derive REFUSES to settle rather than falling back to the pair", async () => {
     const { fA, fC, documentId } = await threeHolders();
 
