@@ -441,8 +441,11 @@ export class DocumentDelivery {
                 detail:
                   `this update has been delivered ${sends} times to this holder without their ` +
                   `daemon ever confirming it — delivery TO THEM is retired; every other holder ` +
-                  `is unaffected. Check document.delivery.ack_grace_expired and ` +
-                  `session.content.held.discarded before concluding their client is at fault.`,
+                  `is unaffected. Check document.delivery.ack_grace_expired, ` +
+                  `session.content.held.discarded, and whether their daemon has yet received ` +
+                  `the amendment that added you (their log would show ` +
+                  `document.inbound.sender_unknown_epoch_ahead) before concluding their client ` +
+                  `is at fault.`,
               });
               const allExhausted = currentHolders
                 .filter((h) => h !== senderAgentId)

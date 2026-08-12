@@ -95,6 +95,13 @@ export interface DocumentInboundDeps {
     agentId: string,
   ): { state: "holder" | "removed" | "untouched"; epochId: number | null };
   /**
+   * DOD-MP-INBOUND-N-1 — the CURRENT derived holders, or null when the chain does not derive.
+   * When it derives, membership is the WHOLE sender gate — the genesis-peer column is a
+   * bilateral-legacy fallback, never a permanent credential (the same rule the ack gate
+   * learned in FANOUT-1's review).
+   */
+  currentHolders(ownerAgentId: string, documentId: string): string[] | null;
+  /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
    * Takes the agent so it cannot sign with the wrong key. ASYNC, and that is what makes `receive`
@@ -212,15 +219,19 @@ export class DocumentInbound {
       };
     }
 
-    // 4. The sender must be THIS document's peer — BEFORE any lifecycle answer.
-    //
-    // The order here is the disclosure boundary, and it was wrong. This check used to run AFTER the
-    // killed/closed branch, and once that branch became terminal it meant a non-party who signed an
-    // envelope naming an existing document received a SIGNED ACK confirming the document exists and
-    // what lifecycle state it is in — `sendAck` addresses `env.sender_agent_id` from the envelope,
-    // not `doc.peerAgentId`, so it really does go back to the stranger. That is exactly the
-    // disclosure the silent refusal below is written to withhold.
-    if (env.sender_agent_id !== doc.peerAgentId) {
+    // 4. THE SENDER GATE (DOD-MP-INBOUND-N-1), BEFORE any lifecycle answer — the order is the
+    // disclosure boundary: every later branch may answer with a SIGNED ACK, and an ack to a
+    // non-party confirms the document exists and what state it is in. When the chain DERIVES,
+    // derived membership is
+    // the whole gate — a joined third holder's envelope is as admissible as the genesis peer's,
+    // and a removed genesis peer's is not admissible at all. Only when the chain cannot answer
+    // (bilateral legacy, no genesis record) does the row's peer column stand in.
+    const senderHolders = this.#d.currentHolders(ownerAgentId, env.document_id);
+    const senderIsParty =
+      senderHolders === null
+        ? env.sender_agent_id === doc.peerAgentId
+        : senderHolders.includes(env.sender_agent_id);
+    if (!senderIsParty) {
       // A REMOVED former holder is upgraded from the silent stranger-refusal to the TERMINAL
       // named one (REMOVE-1 review F4): they hold the removal fact already — no new disclosure —
       // and the silent path left their delivery worker redelivering forever, which is the exact
@@ -243,12 +254,26 @@ export class DocumentInbound {
             `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
         };
       }
-      this.#d.logger.warn("document.inbound.not_peer", {
-        documentId: env.document_id,
-        senderAgentId: env.sender_agent_id,
-        peerAgentId: doc.peerAgentId,
-        correlationId,
-      });
+      // F1 (INBOUND-N-1 review): an UNKNOWN sender whose envelope claims an epoch ahead of
+      // ours is the amendment-in-flight signature — an honest new holder can ONLY arrive
+      // epoch-ahead, because a receiver holding their epoch would hold their amendment too.
+      // The wire stays silent (the disclosure decision stands); the LOG names the lag, so the
+      // operator debugging "the new collaborator's edits aren't landing" does not read that a
+      // stranger probed the document. Resolution is the sender's ordinary retry after the
+      // amendment lands — see Entry 18 for the settled shape and its retry-ceiling window.
+      const lagSignature =
+        formerHolder.state === "untouched" &&
+        env.epoch_id > this.#d.store.currentDocumentEpoch(ownerAgentId, env.document_id);
+      this.#d.logger.warn(
+        lagSignature ? "document.inbound.sender_unknown_epoch_ahead" : "document.inbound.not_peer",
+        {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          peerAgentId: doc.peerAgentId,
+          ...(lagSignature ? { envelopeEpoch: env.epoch_id } : {}),
+          correlationId,
+        },
+      );
       return {
         ok: false,
         reason: "document_sender_not_peer",

@@ -289,6 +289,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
     membershipOf: (ownerAgentId, documentId, agentId) =>
       amendments.membershipOf(ownerAgentId, documentId, agentId),
+    currentHolders: (ownerAgentId: string, documentId: string) =>
+      holdersFor(ownerAgentId, documentId),
     sign: deps.sign,
   });
 

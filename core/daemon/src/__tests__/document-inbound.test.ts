@@ -73,6 +73,7 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
 function newFixture(
   opts: {
     verify?: () => boolean;
+    currentHolders?: () => string[] | null;
     order?: string[];
     appendOnly?: boolean;
     /** Omit the document entirely — the peer-refused-the-proposal case, which holds no row. */
@@ -108,6 +109,9 @@ function newFixture(
 
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
+    // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
+    // every older test in this file was written against.
+    currentHolders: opts.currentHolders ?? (() => null),
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
     membershipOf: (o, d, a) => amendmentStore.membershipOf(o, d, a),
@@ -134,6 +138,113 @@ describe("DocumentInbound — an admitted envelope lands, and is acked", () => {
     // An ack that does not identify what it acknowledges cannot settle anything — the sender has
     // a backlog, not a single outstanding envelope.
     expect((res as { envelopeHash: string }).envelopeHash).toBe(documentEnvelopeHash(env));
+  });
+});
+
+/** Module-level twin of the epoch describe's planter — a DECODABLE amendment row. */
+function plantAmendment2(
+  db: DatabaseSync,
+  epoch: number,
+  kind: "add_holder" | "remove_holder",
+  subject: string,
+) {
+  const body = {
+    document_id: DOC,
+    epoch_id: epoch,
+    prev_amendment_hash: null,
+    kind,
+    subject_agent_id: subject,
+    property_change: null,
+    state_hash: null,
+    authored_at_ms: 1,
+  } as const;
+  const hash = documentAmendmentHash(body);
+  const bytes = encodeDocumentAmendment({
+    body,
+    collection: {
+      document_id: DOC,
+      subject_kind: "document_amendment",
+      subject_hash: hash,
+      required_signers: ["a".repeat(64)],
+      signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+    },
+  });
+  db.prepare(
+    `INSERT INTO document_amendments
+       (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(AGENT, DOC, epoch, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+}
+
+describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement", () => {
+  const JOINED = "0".repeat(63) + "2";
+
+  it("a JOINED non-genesis holder's envelope ADMITS — the row's peer column is not the gate", async () => {
+    const f = newFixture({ currentHolders: () => [PEER, JOINED] });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: JOINED, sender_client_id: 4242 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: true, admitted: true });
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("N senders chain INDEPENDENTLY — each first envelope anchors its own per-sender chain", async () => {
+    const f = newFixture({ currentHolders: () => [PEER, JOINED] });
+    const fromPeer = await f.inbound.receive(
+      AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW,
+    );
+    // JOINED's first envelope also carries prev null — a GLOBAL chain would refuse it as a fork
+    // of PEER's head; the per-sender chain admits it on its own anchor.
+    const fromJoined = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: JOINED, sender_client_id: 4242 })),
+      NOW,
+    );
+    expect(fromPeer).toMatchObject({ ok: true, admitted: true });
+    expect(fromJoined).toMatchObject({ ok: true, admitted: true });
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(2);
+  });
+
+  it("an UNKNOWN epoch-ahead sender is LOGGED as amendment lag, not as a stranger probe", async () => {
+    // F1: the honest new holder's first envelope — their add_holder amendment still in flight
+    // to us — is wire-silent (disclosure stands) but the LOG names the lag signature: unknown
+    // sender + epoch ahead of ours. Revert the discriminator and this reads as a stranger.
+    const f = newFixture({ currentHolders: () => [PEER] });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7, epoch_id: 1 }),
+      ),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
+    expect(f.events.some((e) => e.event === "document.inbound.sender_unknown_epoch_ahead")).toBe(true);
+    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(false);
+  });
+
+  it("a STRANGER stays silently refused even when the chain derives — membership discloses nothing to non-parties", async () => {
+    const f = newFixture({ currentHolders: () => [PEER, JOINED] });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: "0".repeat(63) + "3" })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
+    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+
+  it("a REMOVED genesis peer's envelope refuses BY NAME when the chain derives — not admitted via the row", async () => {
+    const f = newFixture({ currentHolders: () => [JOINED] });
+    plantAmendment2(f.db, 1, "add_holder", JOINED);
+    plantAmendment2(f.db, 2, "remove_holder", PEER);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 2 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
   });
 });
 
