@@ -984,6 +984,42 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return { ok: false, reason: "document_chain_invalid", guidance: derived.reason };
     }
     if (!derived.arrangement.participants.has(holder)) {
+      // ALREADY REMOVED is the HEALING path, not a refusal (REMOVE-1 review F3): a holder who
+      // was offline at removal time never learned, and no other verb can ever re-send the
+      // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
+      // the chain never touched still refuses.
+      const membership = layer.amendments.membershipOf(who.ownerAgentId, documentId, holder);
+      if (membership.state === "removed") {
+        const removal = chain.find(
+          (e) => e.body.kind === "remove_holder" &&
+            e.body.subject_agent_id === holder &&
+            e.body.epoch_id === membership.epochId,
+        );
+        const resendTold: Record<string, boolean> = {};
+        if (removal) {
+          const bytes = new Uint8Array(encodeDocumentAmendment(removal));
+          const targets = new Set([...derived.arrangement.participants, holder]);
+          targets.delete(who.ownerAgentId);
+          for (const member of targets) {
+            try {
+              const sent = await deps.transportFor(who.agentName).sendBytes({
+                peerAgentId: member, documentId, bytes, correlationId: randomUUID(),
+              });
+              resendTold[member] = sent.ok;
+            } catch {
+              resendTold[member] = false;
+            }
+          }
+        }
+        return {
+          ok: true,
+          documentId,
+          removedAgentId: holder,
+          resent: true,
+          epochId: membership.epochId,
+          holdersNotified: resendTold,
+        };
+      }
       return {
         ok: false,
         reason: "document_not_holder",

@@ -152,6 +152,23 @@ describe("DocumentAmendmentStore", () => {
     expect(store.currentEpoch("other-owner", DOC)).toBe(0);
   });
 
+  it("membership follows the LAST event — add, remove, RE-ADD yields holder again", () => {
+    // An implementation reading "any remove ever = removed forever" permanently refuses a
+    // re-admitted holder while every other test stays green.
+    const subject = "c".repeat(64);
+    const [one, two, three] = chainOf(
+      amendment({ subject_agent_id: subject }),
+      amendment({ kind: "remove_holder", subject_agent_id: subject }),
+      amendment({ subject_agent_id: subject }),
+    );
+    store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1);
+    expect(store.membershipOf(OWNER, DOC, subject).state).toBe("holder");
+    store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2);
+    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "removed", epochId: 2 });
+    store.append(OWNER, DOC, encodeDocumentAmendment(three!), 3);
+    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "holder", epochId: 3 });
+  });
+
   it("currentEpoch is 0 with no amendments and the max epoch afterwards", () => {
     expect(store.currentEpoch(OWNER, DOC)).toBe(0);
     const [one, two] = chainOf(amendment(), amendment({ kind: "promote_admin", subject_agent_id: "e".repeat(64) }));

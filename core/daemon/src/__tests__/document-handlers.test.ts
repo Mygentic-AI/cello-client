@@ -38,12 +38,6 @@ const AGENT = "owner-agent";
 const CONN = "conn-1";
 const NOW = 1_700_000_000_000;
 
-function silentLogger(): Logger {
-  const noop = () => {};
-  const logger = { debug: noop, info: noop, warn: noop, error: noop, child: () => logger } as unknown as Logger;
-  return logger;
-}
-
 async function newFixture(opts: { sendFails?: string } = {}) {
   /** Mutable so a test can fail the first send and succeed the retry — the real recovery sequence. */
   let sendFails = opts.sendFails;
@@ -52,7 +46,12 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   const peerKeys = generateKeypair();
   const peer = Buffer.from(await peerKeys.getPublicKey()).toString("hex");
 
-  const logger = silentLogger();
+  /** Event names captured, so operator-notice claims ("the warn IS the surface") are testable. */
+  const events: string[] = [];
+  const record = (event: string) => { events.push(event); };
+  const logger = {
+    debug: record, info: record, warn: record, error: record,
+  } as unknown as Logger;
   const db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
 
@@ -125,7 +124,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   };
 
   return {
-    call, layer, sent, owner, peer, incomingProposal,
+    call, layer, sent, owner, peer, events, incomingProposal,
     peerComesOnline: () => {
       sendFails = undefined;
     },
@@ -460,6 +459,8 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(
       () => fC.layer.store.removedFromArrangement(fC.owner, documentId).removed,
     );
+    // The warn IS the operator's notice — the surfacing clause, pinned.
+    expect(fC.events).toContain("document.removed_from");
     expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
       "content C keeps forever",
     );

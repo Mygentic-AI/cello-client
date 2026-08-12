@@ -178,6 +178,50 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
   }
   const raiseEpoch = (db: DatabaseSync, epoch: number) => plantAmendment(db, epoch);
 
+  it("the MISSED-AMENDMENT removed publisher gets the REMOVAL answer, not the epoch answer", async () => {
+    // REMOVE-1 review F2 — the honest case: a removed holder who never received the removal
+    // amendment publishes at the OLD epoch. "Republish under the current epoch" is an
+    // instruction they cannot follow; the membership fact is the diagnosis.
+    const f = newFixture();
+    plantAmendment(f.db, 1, "remove_holder", PEER);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 0 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
+    expect((res as { detail: string }).detail).toContain("epoch 1");
+  });
+
+  it("a daemon that knows ITSELF removed stops applying — terminal, so the sender settles", async () => {
+    const f = newFixture();
+    plantAmendment(f.db, 1, "remove_holder", AGENT);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 0 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_recipient_removed", terminal: true });
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    expect(f.events.some((e) => e.event === "document.inbound.recipient_removed")).toBe(true);
+  });
+
+  it("a removed FORMER holder who is not the genesis peer refuses NAMED and terminal — never the silent stranger path", async () => {
+    // REMOVE-1 review F4: the silent not_peer refusal left a removed joined holder redelivering
+    // forever. They hold the removal fact already — the named terminal answer discloses nothing.
+    const f = newFixture();
+    const other = "0".repeat(63) + "1";
+    plantAmendment(f.db, 1, "add_holder", other);
+    plantAmendment(f.db, 2, "remove_holder", other);
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ sender_agent_id: other, epoch_id: 2 })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
+    expect((res as { detail: string }).detail).toContain("epoch 2");
+  });
+
   it("a REMOVED sender's envelope is TERMINAL, naming the removal epoch — never a silent drop", async () => {
     const f = newFixture();
     plantAmendment(f.db, 1, "remove_holder", PEER);

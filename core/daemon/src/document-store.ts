@@ -904,6 +904,15 @@ export class DocumentStore {
     ownerAgentId: string,
     documentId: string,
   ): { removed: boolean; epochId: number | null } {
+    return this.memberRemoved(ownerAgentId, documentId, ownerAgentId);
+  }
+
+  /** The same walk for ANY agent — the delivery worker asks it about the TARGET (F1). */
+  memberRemoved(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): { removed: boolean; epochId: number | null } {
     const rows = this.#db
       .prepare(
         `SELECT received_bytes FROM document_amendments
@@ -913,7 +922,7 @@ export class DocumentStore {
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
     const verdict = walkMembership(
       rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes))),
-      ownerAgentId,
+      agentId,
     );
     return { removed: verdict.state === "removed", epochId: verdict.epochId };
   }

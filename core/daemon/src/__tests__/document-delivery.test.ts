@@ -6,6 +6,10 @@
 
 import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
+import {
+  documentAmendmentHash,
+  encodeDocumentAmendment,
+} from "@cello-protocol/protocol-types";
 import { createHash } from "node:crypto";
 import {
   DocumentDelivery,
@@ -79,6 +83,41 @@ function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existing
     peerFor: () => PEER,
   };
 }
+
+describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", () => {
+  it("retires pending envelopes to a removed target without dialing — abandoned, not redialed forever", async () => {
+    const f = newFixture();
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    // The peer is REMOVED per the recorded chain (a decodable amendment row — the walk decodes
+    // every stored row).
+    const body = {
+      document_id: DOC, epoch_id: 1, prev_amendment_hash: null,
+      kind: "remove_holder", subject_agent_id: PEER,
+      property_change: null, state_hash: null, authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC, subject_kind: "document_amendment", subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, 1, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+
+    const res = await f.delivery.tick(AGENT, f.peerFor, NOW);
+    // No dial, no retry: the envelope is RETIRED (our decision, announced), pending drains.
+    expect(f.calls).toHaveLength(0);
+    expect(res.attempted).toBe(0);
+    expect(f.store.pendingDeliveries(AGENT, NOW)).toHaveLength(0);
+    expect(f.events.some((e) => e.event === "document.delivery.peer_removed")).toBe(true);
+  });
+});
 
 describe("DocumentDelivery — pending is DERIVED from the log", () => {
   it("delivers an unacknowledged envelope this agent authored, and marks it acked", async () => {

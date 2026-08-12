@@ -150,6 +150,40 @@ describe("DocumentLifecycle — list", () => {
     expect(row!.epochId).toBe(2);
   });
 
+  it("a removed owner's row says so — the overlay is derived, the stored status stays active", () => {
+    const f = newFixture();
+    const body = {
+      document_id: DOC,
+      epoch_id: 1,
+      prev_amendment_hash: null,
+      kind: "remove_holder",
+      subject_agent_id: AGENT,
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC,
+        subject_kind: "document_amendment",
+        subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, 1, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
+    expect((row as unknown as { removed?: boolean }).removed).toBe(true);
+    expect(row!.status).toBe("active");
+    expect(f.lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
+  });
+
   it("counts only what is actually pending, not the whole log", () => {
     const f = newFixture();
     const a = envelope(AGENT, null);

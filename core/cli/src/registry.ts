@@ -1053,8 +1053,9 @@ export const COMMANDS: readonly CommandSpec[] = [
       "Usage:\n" +
       "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--admins <hex,hex>] [--content <text>] [--retry <id>]\n" +
       "  cello doc invite <document-id> <invitee-pubkey>\n" +
-      "  cello doc remove <document-id> <holder-pubkey>\n" +
       "                                                    — offer a shared document. They must accept.\n" +
+      "  cello doc remove <document-id> <holder-pubkey>    — remove a holder (or leave, with your own key).\n" +
+      "                                                    — forward-only: their copy stays theirs.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
       "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
       "  cello doc refuse <document-id> [why…]             — refuse one\n" +
