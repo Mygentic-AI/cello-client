@@ -160,6 +160,8 @@ export interface DocumentLayer {
   amendments: DocumentAmendmentStore;
   /** M14B — join offers pending consent, both roles. */
   joins: DocumentJoinStore;
+  /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
+  verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
   acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
     | { ok: true; documentId: string; inviterAgentId: string; documentType: string; applied: number; answerBytes: Uint8Array }
@@ -765,6 +767,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   return {
     amendments,
     joins,
+    verifySignature,
     acceptJoin,
     refuseJoin,
     store,

@@ -266,9 +266,13 @@ Instead of pasting a document back and forth, share it: both sides edit their ow
 copies converge. Every change is signed by whoever made it.
 
 ```
-cello_doc_propose({ peer_pubkey, starting_content?, document_type?, append_only? })
+cello_doc_propose({ peer_pubkey, starting_content?, document_type?, append_only?, admins? })
                                              — offer a shared document. They must accept.
+cello_doc_invite({ document_id, invitee_pubkey })
+                                             — open a document you administer to a third agent.
+                                               Your signature admits; THEIR accept makes it real.
 cello_doc_inbox()                            — documents offered to YOU, awaiting your decision
+                                               (proposals AND join offers — accept either by id)
 cello_doc_accept({ document_id })            — accept: their signed edits now apply to your copy
 cello_doc_refuse({ document_id, reason? })   — refuse
 cello_doc_list()                             — your documents and whether your changes reached them

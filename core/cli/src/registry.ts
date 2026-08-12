@@ -39,6 +39,7 @@ import {
   contactSetTier,
   contactSetSignal,
   docPropose,
+  docInvite,
   docInbox,
   docAccept,
   docRefuse,
@@ -1050,6 +1051,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     help:
       "Usage:\n" +
       "  cello doc propose <peer-pubkey> [--type <t>] [--append-only] [--admins <hex,hex>] [--content <text>] [--retry <id>]\n" +
+      "  cello doc invite <document-id> <invitee-pubkey>\n" +
       "                                                    — offer a shared document. They must accept.\n" +
       "  cello doc inbox                                   — documents others have offered YOU, awaiting your decision\n" +
       "  cello doc accept <document-id>                    — accept one: their signed edits now apply to your copy\n" +
@@ -1106,6 +1108,14 @@ export const COMMANDS: readonly CommandSpec[] = [
             : {}),
           ...(documentId !== undefined ? { documentId } : {}),
         });
+      }
+      // A missing invitee falls through to the help block below rather than inventing a
+      // positional out of a flag — the same treatment `--retry` gets above.
+      if (
+        sub === "invite" && target &&
+        positional[2] !== undefined && !positional[2].startsWith("--")
+      ) {
+        return docInvite(ctx.celloDir, target, positional[2], o);
       }
       if (sub === "accept" && target) return docAccept(ctx.celloDir, target, o);
       if (sub === "refuse" && target) {

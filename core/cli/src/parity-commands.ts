@@ -301,6 +301,7 @@ export const IPC_METHODS = {
   "settings-set": "cello_settings_set",
   "moniker-set": "cello_set_moniker",
   "doc-propose": "cello_doc_propose",
+  "doc-invite": "cello_doc_invite",
   "doc-inbox": "cello_doc_inbox",
   "doc-accept": "cello_doc_accept",
   "doc-refuse": "cello_doc_refuse",
@@ -823,6 +824,21 @@ export function docPropose(
       starting_content: opts.startingContent,
       document_id: opts.documentId,
     }),
+    opts,
+  );
+}
+
+/** `cello doc invite <document-id> <invitee-pubkey>` → cello_doc_invite. */
+export function docInvite(
+  celloDir: string,
+  documentId: string,
+  inviteePubkey: string,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["doc-invite"],
+    { document_id: documentId, invitee_pubkey: inviteePubkey },
     opts,
   );
 }
