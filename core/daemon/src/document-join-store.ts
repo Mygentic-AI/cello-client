@@ -242,6 +242,30 @@ export class DocumentJoinStore {
     return r ? rowToRecord(r) : null;
   }
 
+  /** Auto-refused arrivals — surfaced so the refusal sentence reaches an operator. */
+  refusedFor(ownerAgentId: string): JoinOfferRecord[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM document_join_offers
+          WHERE owner_agent_id = ? AND role = 'invitee' AND state = 'refused'
+          ORDER BY created_at ASC`,
+      )
+      .all(ownerAgentId) as Array<Record<string, unknown>>;
+    return rows.map(rowToRecord);
+  }
+
+  /** Offers THIS owner authored — the inviter's view of who has answered what. */
+  outgoingFor(ownerAgentId: string): JoinOfferRecord[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT * FROM document_join_offers
+          WHERE owner_agent_id = ? AND role = 'inviter'
+          ORDER BY created_at ASC`,
+      )
+      .all(ownerAgentId) as Array<Record<string, unknown>>;
+    return rows.map(rowToRecord);
+  }
+
   /** Offers awaiting THIS owner's consent — the inbox surface. */
   pendingFor(ownerAgentId: string): JoinOfferRecord[] {
     const rows = this.#db

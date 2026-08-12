@@ -22,6 +22,7 @@
  * admit when it says no.
  */
 
+import { createHash } from "node:crypto";
 import { verify } from "@cello-protocol/crypto";
 import { DocumentStore } from "./document-store.js";
 import { DocumentEngine } from "./document-engine.js";
@@ -54,6 +55,7 @@ import {
   documentEnvelopeHash,
   buildDocumentJoinAnswerTbs,
   encodeDocumentJoinAnswer,
+  buildDocumentJoinOfferTbs,
   decodeDocumentJoinOffer,
   decodeDocumentAmendment,
   documentAmendmentHash,
@@ -346,6 +348,55 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const amendments = new DocumentAmendmentStore(db, logger);
   const joins = new DocumentJoinStore(db, logger);
 
+  /** Sign and send a join answer — best-effort, never a veto over the local decision. */
+  const sendJoinAnswer = async (
+    ownerAgentId: string,
+    inviterAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    accepted: boolean,
+    reason: string | null,
+  ): Promise<void> => {
+    try {
+      const answer: DocumentJoinAnswer = {
+        type: "document_join_answer",
+        document_id: documentId,
+        amendment_hash: amendmentHash,
+        invitee_agent_id: ownerAgentId,
+        accepted,
+        refusal_reason: accepted ? null : reason,
+        answered_at_ms: Date.now(),
+        signature: new Uint8Array(0),
+      };
+      answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
+      await deps.sendFrame(ownerAgentId, inviterAgentId, encodeDocumentJoinAnswer(answer));
+    } catch (err: unknown) {
+      logger.warn("document.join.answer_send_failed", {
+        documentId,
+        amendmentHash,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  /** Re-send the STANDING decision for an already-decided offer a redelivery just matched. */
+  const resendJoinAnswer = async (
+    ownerAgentId: string,
+    amendmentHash: string,
+    inviterAgentId: string,
+  ): Promise<void> => {
+    const record = joins.get(ownerAgentId, amendmentHash);
+    if (!record || record.state === "pending") return;
+    await sendJoinAnswer(
+      ownerAgentId,
+      inviterAgentId,
+      record.documentId,
+      amendmentHash,
+      record.state === "accepted",
+      record.reason,
+    );
+  };
+
   const router = new DocumentFrameRouter({
     inbound,
     ackInbound,
@@ -368,23 +419,53 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       }
       const validation = validateDocumentJoinOffer(offer, documentGovernancePolicy, verifySignature);
       if (validation.ok) {
-        joins.recordIncoming(ownerAgentId, wire, validation.pendingAmendmentHash, { state: "pending" }, nowMs);
+        const stored = joins.recordIncoming(
+          ownerAgentId, wire, validation.pendingAmendmentHash, { state: "pending" }, nowMs,
+        );
+        // REDELIVERY OF A DECIDED OFFER RE-SENDS THE ANSWER. A lost answer was otherwise lost
+        // forever: the invitee's decision stood, the inviter's row sat pending, and the
+        // inviter's only lever — re-inviting, which redelivers this exact offer — reached a
+        // DO-NOTHING insert. Now that redelivery is the recovery: the standing decision is
+        // re-signed and travels again. Best-effort, like every answer.
+        if (stored.state !== "pending") {
+          void resendJoinAnswer(ownerAgentId, validation.pendingAmendmentHash, offer.inviter_agent_id);
+        }
         return;
       }
-      // Refused-but-RECORDED when a settle key exists (the operator can see who tried and why);
-      // an offer whose amendments do not even decode has no key and throws — contained, logged,
-      // nothing recorded, exactly like a forged proposal.
-      const last = offer.amendments[offer.amendments.length - 1];
-      if (last === undefined) throw new Error(validation.reason);
-      let settleKey: string;
-      try {
-        settleKey = Buffer.from(documentAmendmentHash(decodeDocumentAmendment(last).body)).toString("hex");
-      } catch {
+      // A REFUSAL IS RECORDED — AND ANSWERED — ONLY WHEN IT IS AUTHENTICATED. The first cut
+      // recorded every refusal under the admitting amendment's hash, and that was a standing
+      // veto: any party holding the amendment bytes (every holder gets them in the fan-out)
+      // could deliver a garbage offer FIRST, occupy the real settle key with a refused row, and
+      // the genuine offer would arrive to a DO-NOTHING insert — the admin's admission silently
+      // suppressed, both operators seeing nothing. So: an offer whose signature does not verify
+      // against its named inviter THROWS (contained + logged, nothing recorded — the forged-
+      // proposal treatment), and an authenticated refusal is recorded under the hash of ITS OWN
+      // BYTES — visible to the operator, never able to occupy a real join's settle key.
+      if (!verifySignature(offer.inviter_agent_id, buildDocumentJoinOfferTbs(offer), offer.signature)) {
         throw new Error(validation.reason);
       }
+      const refusalKey = createHash("sha256").update(wire).digest("hex");
       joins.recordIncoming(
-        ownerAgentId, wire, settleKey, { state: "refused", reason: validation.reason }, nowMs,
+        ownerAgentId, wire, refusalKey, { state: "refused", reason: validation.reason }, nowMs,
       );
+      // BOTH ENDS get the sentence: the refusal answer travels back to the authenticated
+      // inviter, settling their row with the reason — the version-mismatch sentence was written
+      // for a human and was reaching a database column. The settle key is the admitting
+      // amendment's hash when one is recoverable (the inviter's row lives under it).
+      const last = offer.amendments[offer.amendments.length - 1];
+      if (last !== undefined) {
+        try {
+          const settleKey = Buffer.from(
+            documentAmendmentHash(decodeDocumentAmendment(last).body),
+          ).toString("hex");
+          void sendJoinAnswer(
+            ownerAgentId, offer.inviter_agent_id, offer.document_id, settleKey, false, validation.reason,
+          );
+        } catch {
+          // No recoverable settle key — the refusal stays visible locally and the inviter's
+          // re-invite (which redelivers) will meet the same recorded refusal.
+        }
+      }
     },
     recordJoinAnswer: (ownerAgentId, wire, nowMs) => {
       const r = joins.recordAnswer(ownerAgentId, wire, verifySignature, nowMs);
@@ -635,6 +716,22 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     }
     const documentId = record.documentId;
 
+    // WHO MAY APPEAR IN THE SNAPSHOT: anyone who held the document at ANY epoch of the carried
+    // chain — the genesis pair plus every add_holder subject (a removed holder's history stays
+    // legal). Without this, a malicious inviter plants envelopes signed by keys they control
+    // under identities that were never holders, and the joiner materializes content no
+    // legitimate holder ever saw — silent divergence the live path's sender-is-peer check
+    // would have refused.
+    const everHeld = new Set<string>([
+      validation.genesis.proposer_agent_id,
+      validation.genesis.peer_agent_id,
+    ]);
+    for (const amendment of validation.amendments) {
+      if (amendment.body.kind === "add_holder" && amendment.body.subject_agent_id !== null) {
+        everHeld.add(amendment.body.subject_agent_id);
+      }
+    }
+
     // The WHOLE snapshot verified before any mutation.
     const verified: Array<Parameters<typeof store.appendEnvelope>[1]> = [];
     for (let i = 0; i < record.offer.envelope_log.length; i++) {
@@ -663,6 +760,15 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           detail: `snapshot envelope ${i} does not verify against its sender ${env.sender_agent_id}`,
         };
       }
+      if (!everHeld.has(env.sender_agent_id)) {
+        return {
+          ok: false as const,
+          reason: "join_log_invalid",
+          detail:
+            `snapshot envelope ${i} is signed by ${env.sender_agent_id}, who never held this ` +
+            `document at any epoch of the carried chain — refused before anything materializes`,
+        };
+      }
       verified.push({
         envelopeHash: documentEnvelopeHash(env),
         documentId,
@@ -681,8 +787,19 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // Mutations, in dependency order: genesis (LiveDocuments reads starting_content from it),
     // the chain (idempotent on redelivery), the row, the log, the live rebuild, the file.
     handshake.recordJoined(ownerAgentId, record.offer.genesis, nowMs);
-    for (const bytes of record.offer.amendments) {
-      amendments.append(ownerAgentId, documentId, bytes, nowMs);
+    try {
+      for (const bytes of record.offer.amendments) {
+        amendments.append(ownerAgentId, documentId, bytes, nowMs);
+      }
+    } catch (err: unknown) {
+      // TWO ADMINS INVITED THE SAME AGENT INDEPENDENTLY: each offer's chain is self-consistent
+      // and both sat pending, but their admitting amendments rival at one epoch — the second
+      // accept hits the store's fork refusal mid-append. Settled as refused with the conflict's
+      // own reason rather than thrown: a raw exception left the row pending and every retry
+      // rethrowing, a wedge the operator could not see past.
+      const reason = err instanceof Error ? err.message : String(err);
+      joins.decide(ownerAgentId, amendmentHash, false, reason, nowMs);
+      return { ok: false as const, reason: "join_conflicting_admission", detail: reason };
     }
     if (!store.getDocument(ownerAgentId, documentId)) {
       store.createDocument({

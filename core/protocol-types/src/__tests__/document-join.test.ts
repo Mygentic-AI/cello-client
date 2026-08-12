@@ -11,7 +11,7 @@
  * Real Ed25519 throughout — no mocks for crypto.
  */
 import { describe, it, expect } from "vitest";
-import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify } from "node:crypto";
+import { generateKeyPairSync, sign as edSign, verify as edVerify } from "node:crypto";
 import { decodeCbor, encodeCbor } from "../cbor.js";
 import {
   DOCUMENT_JOIN_OFFER_DOMAIN,
@@ -315,4 +315,3 @@ describe("the envelope-log snapshot is hash-bound, not free-riding", () => {
   });
 });
 
-void createHash;

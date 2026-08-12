@@ -123,6 +123,10 @@ export function documentAmendmentHash(body: DocumentAmendmentBody): Uint8Array {
 
 export function encodeDocumentAmendment(env: DocumentAmendmentEnvelope): Uint8Array {
   return encodeCbor({
+    // The FRAME discriminator — how the session router tells an amendment from conversation.
+    // Not part of the TBS (the hash and every signature are over the body's preimage), so its
+    // absence in early builds cost classification, never integrity.
+    type: "document_amendment",
     body: {
       document_id: env.body.document_id,
       epoch_id: env.body.epoch_id,
@@ -158,6 +162,12 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
     throw new Error("document_amendment_malformed: not a CBOR map");
   }
   const map = decoded as Record<string, unknown>;
+  const frameType = present(map, "type");
+  if (frameType !== "document_amendment") {
+    throw new Error(
+      `document_amendment_type: expected document_amendment, got ${String(frameType)}`,
+    );
+  }
 
   const rawBody = present(map, "body");
   if (typeof rawBody !== "object" || rawBody === null || Array.isArray(rawBody)) {

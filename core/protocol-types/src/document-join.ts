@@ -307,8 +307,9 @@ export function validateDocumentJoinOffer(
     arrangement: derived.arrangement,
     genesis,
     amendments,
-    pendingAmendmentHash: pending.collection.subject_hash.length
-      ? Buffer.from(pending.collection.subject_hash).toString("hex")
-      : "",
+    // Unconditional: after a successful replay the subject_hash provably equals the amendment
+    // hash, and a conditional empty-string key would collide every document on "" if the
+    // invariant ever broke — better to emit the hex of whatever verified.
+    pendingAmendmentHash: Buffer.from(pending.collection.subject_hash).toString("hex"),
   };
 }
