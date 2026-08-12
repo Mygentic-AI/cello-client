@@ -36,6 +36,8 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
   });
   const engine = new DocumentEngine(logger);
   const publish = new DocumentPublish({
+    // Bilateral fixture: the sole holder is the genesis peer.
+    holdersFor: () => [PEER],
     store,
     engine,
     logger,

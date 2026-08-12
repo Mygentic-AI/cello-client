@@ -93,7 +93,7 @@ describe("per-holder delivery state", () => {
     store.seedDeliveries(AGENT, DOC, e1.envelopeHash, [H1, H2], NOW);
     store.seedDeliveries(AGENT, DOC, e2.envelopeHash, [H1, H2], NOW);
     const retired = store.abandonHolderDeliveries(AGENT, DOC, H1, NOW);
-    expect(retired).toBe(2);
+    expect(retired).toHaveLength(2);
     const pending = store.pendingHolderDeliveries(AGENT, NOW);
     expect(pending.every((p) => p.holderAgentId === H2)).toBe(true);
     expect(pending).toHaveLength(2);

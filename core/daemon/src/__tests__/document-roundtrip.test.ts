@@ -69,6 +69,12 @@ async function makeParty(name: string, clientId: number) {
   });
 
   const publish = new DocumentPublish({
+    // This harness seeds document rows directly (no handshake record), so chain derivation has
+    // nothing to derive from — the bilateral row IS the fixture's arrangement.
+    holdersFor: (o, d) => {
+      const doc = layer.store.getDocument(o, d);
+      return doc ? [doc.peerAgentId] : null;
+    },
     store: layer.store,
     engine: layer.engine,
     logger,
@@ -185,7 +191,7 @@ function deliveryFor(
     tick: (nowMs: number) =>
       new DocumentDelivery(from.layer.store, acking, from.logger).tick(
         from.id,
-        () => to.id,
+        () => [to.id],
         nowMs,
         { senderAgentId: from.id },
       ),

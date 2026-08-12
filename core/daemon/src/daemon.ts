@@ -3870,6 +3870,7 @@ async function startDaemonHoldingLock(
   // to go: without the inbound path a peer's answer is unroutable, and without the delivery worker a
   // published update never leaves.
   const documentPublish = new DocumentPublish({
+    holdersFor: (ownerAgentId, documentId) => documentLayer.holdersFor(ownerAgentId, documentId),
     store: documentLayer.store,
     engine: documentLayer.engine,
     logger,
@@ -3958,9 +3959,13 @@ async function startDaemonHoldingLock(
           // and leaves a fully synced document invisible with no error on any path.
           if (ownerAgentId === null) continue;
           agentsSwept++;
-          const peerFor = (documentId: string): string | null =>
-            documentLayer.store.getDocument(ownerAgentId, documentId)?.peerAgentId ?? null;
-          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, peerFor, Date.now(), {
+          // FANOUT-1: targets are the DERIVED holders minus ourselves — never per-sender
+          // config, never the genesis peer column (§7-1's silent-divergence hazard).
+          const holdersFor = (documentId: string): string[] | null => {
+            const holders = documentLayer.holdersFor(ownerAgentId, documentId);
+            return holders === null ? null : holders.filter((h) => h !== ownerAgentId);
+          };
+          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
             senderAgentId: ownerAgentId,
           });
           attempted += result.attempted;

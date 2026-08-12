@@ -74,6 +74,7 @@ function newFixture(opts: { verify?: () => boolean; onSettled?: (owner: string, 
   const rejections = new DocumentRejections(store, logger);
   const inbound = new DocumentAckInbound({
     store, rejections, logger,
+    isCurrentHolder: () => false,
     verifySignature: opts.verify ?? (() => true),
     ...(opts.onSettled ? { onSettled: opts.onSettled } : {}),
   });

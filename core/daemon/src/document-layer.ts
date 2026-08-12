@@ -164,6 +164,9 @@ export interface DocumentLayer {
   joins: DocumentJoinStore;
   /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
+  /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
+  holdersFor(ownerAgentId: string, documentId: string): string[] | null;
+  isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
   /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
   acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
     | { ok: true; documentId: string; inviterAgentId: string; documentType: string; applied: number; answerBytes: Uint8Array }
@@ -299,6 +302,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     rejections,
     logger,
     verifySignature,
+    isCurrentHolder: (o, d, a) => isCurrentHolder(o, d, a),
     onSettled: (ownerAgentId, envelopeHash, admitted) => {
       const key = waiterKey(ownerAgentId, envelopeHash);
       const waiting = ackWaiters.get(key);
@@ -349,6 +353,37 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // WRITE path, and every append below validates first (the standing AMEND-1 condition).
   const amendments = new DocumentAmendmentStore(db, logger);
   const joins = new DocumentJoinStore(db, logger);
+
+  /**
+   * M14B / DOD-MP-FANOUT-1 — the CURRENT holders of a document, derived from genesis + the
+   * recorded chain. Null when the document is unknown or its chain does not derive — NOT an
+   * empty list, because "nobody holds this" and "this cannot be answered" are different facts
+   * and the worker schedules them differently.
+   */
+  const holdersFor = (ownerAgentId: string, documentId: string): string[] | null => {
+    const genesisRecord = handshake.get(ownerAgentId, documentId);
+    if (!genesisRecord) return null;
+    const derived = deriveArrangement(
+      arrangementGenesisFromProposal(genesisRecord.envelope),
+      amendments.chain(ownerAgentId, documentId),
+      documentGovernancePolicy,
+      verifySignature,
+    );
+    if (!derived.ok) {
+      logger.error("document.holders.underivable", {
+        documentId,
+        reason: derived.reason,
+      });
+      return null;
+    }
+    return [...derived.arrangement.participants];
+  };
+
+  /** Is this agent a CURRENT holder — the ack gate's membership question. */
+  const isCurrentHolder = (ownerAgentId: string, documentId: string, agentId: string): boolean => {
+    const holders = holdersFor(ownerAgentId, documentId);
+    return holders !== null && holders.includes(agentId);
+  };
 
   /** Sign and send a join answer — best-effort, never a veto over the local decision. */
   const sendJoinAnswer = async (
@@ -901,6 +936,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     amendments,
     joins,
     verifySignature,
+    holdersFor,
+    isCurrentHolder,
     acceptJoin,
     refuseJoin,
     store,

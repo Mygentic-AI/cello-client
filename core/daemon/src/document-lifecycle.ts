@@ -162,9 +162,9 @@ export class DocumentLifecycle {
       const c = pendingByDocument.get(e.documentId) ?? { total: 0, sent: 0 };
       c.total += 1;
       // SPLIT, because "sent, awaiting confirmation" and "never left this machine" are different
-      // things to tell an operator asking why their work has not landed — and the column that
-      // records the difference had a writer but no reader, which is how it got deleted once.
-      if (e.deliveredAtMs != null) c.sent += 1;
+      // things to tell an operator asking why their work has not landed. FANOUT-1: the fact
+      // moved to the per-holder rows — "sent" means it reached AT LEAST ONE holder's wire.
+      if (e.deliveredAtMs != null || this.#store.envelopeEverSent(ownerAgentId, e.envelopeHash)) c.sent += 1;
       pendingByDocument.set(e.documentId, c);
     }
     void nowMs;

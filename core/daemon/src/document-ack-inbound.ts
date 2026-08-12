@@ -46,6 +46,8 @@ export interface DocumentAckInboundDeps {
    * question that must never have one.
    */
   verifySignature(ackerAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
+  /** M14B / FANOUT-1 — is this acker a CURRENT derived holder of the document. */
+  isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
   /**
    * Called once an envelope is SETTLED — admitted or rejected, both of which end the delivery.
    *
@@ -91,8 +93,12 @@ export class DocumentAckInbound {
       };
     }
 
-    // 3. The acker must be THIS document's peer.
-    if (ack.acker_agent_id !== doc.peerAgentId) {
+    // 3. The acker must be a party — the genesis peer, or ANY current derived holder
+    // (M14B / FANOUT-1: a joined holder's confirmation is as settling as the genesis peer's).
+    if (
+      ack.acker_agent_id !== doc.peerAgentId &&
+      !this.#d.isCurrentHolder(ownerAgentId, ack.document_id, ack.acker_agent_id)
+    ) {
       this.#d.logger.warn("document.ack.not_peer", {
         documentId: ack.document_id,
         ackerAgentId: ack.acker_agent_id,
@@ -183,9 +189,15 @@ export class DocumentAckInbound {
       return { ok: true, admitted: ack.admitted, envelopeHash: ack.envelope_hash };
     }
 
-    // `markAcked` is idempotent and returns whether this was the first — a redelivered ack must not
-    // move the recorded time, or the delivery record says the peer confirmed at a moment it did not.
-    const first = this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs);
+    // FANOUT-1: the ACKING HOLDER settles THEIR row; the envelope-level record flips only when
+    // every holder has answered (or, bilateral-legacy, when no per-holder rows exist at all —
+    // `envelopeFullySettled` is true on zero rows, so the old path is byte-identical).
+    this.#d.store.ackHolderDelivery(
+      ownerAgentId, ack.document_id, ack.envelope_hash, ack.acker_agent_id, nowMs,
+    );
+    const first = this.#d.store.envelopeFullySettled(ownerAgentId, ack.envelope_hash)
+      ? this.#d.store.markAcked(ownerAgentId, ack.document_id, ack.envelope_hash, nowMs)
+      : false;
     // ANNOUNCE THE SETTLE, before the admitted/rejected split — both outcomes end the delivery, and
     // a waiter that only heard about admissions would keep a session open through every rejection.
     this.#d.onSettled?.(ownerAgentId, ack.envelope_hash, ack.admitted);
