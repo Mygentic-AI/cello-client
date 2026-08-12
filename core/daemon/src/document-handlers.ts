@@ -1860,11 +1860,12 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       status,
       peerNotified: outcome.peerNotified,
       holdersNotified: outcome.holdersNotified,
+      holderFailures: outcome.holderFailures,
       ...(outcome.peerNotified
         ? {}
         : {
             reason: outcome.notifyReason,
-            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified),
+            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
           }),
     };
   });
@@ -1883,6 +1884,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     reason?: string,
     detail?: string,
     holdersNotified?: Record<string, boolean>,
+    holderFailures?: Record<string, string>,
   ): string {
     const tail = verb === "close"
       ? `A close is not retried — run cello_doc_close again once this is cleared, or cello_doc_kill if you need it over now.`
@@ -1944,10 +1946,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // peer" and names nobody — unusable when there are several, and the per-holder transport
       // reasons live only in the log. It also arrives with no `reason` field at all, because the
       // notifier returned ok: signing and addressing both worked, the sends did not.
+      //
+      // AND IT SAID "most likely offline", WHICH WAS A GUESS. Caught on the live fleet: every
+      // holder failed with `session_sealed` — the relay refusing a leaf for a session it has
+      // closed — and the operator was told to wait for people who were sitting right there.
+      // Waiting cannot reopen a sealed session. The cause is known per holder; it travels.
+      const causes = [...new Set(Object.values(holderFailures ?? {}))].filter(Boolean);
+      const because = causes.length > 0 ? ` (${causes.join(", ")})` : "";
+      const sealed = causes.some((c) => c.includes("sealed"));
       return (
         `Your ${verb} was recorded but reached none of the ${missed.length} other ` +
-        `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")}), so the document cannot ` +
-        `settle until they hear it. They are most likely offline. ${tail}`
+        `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")})${because}, so the document ` +
+        `cannot settle until they hear it. ` +
+        (sealed
+          ? `The session carrying this document has been sealed, so waiting will not help — ` +
+            `the document needs a fresh session to the other holders. `
+          : ``) +
+        `${tail}`
       );
     }
     return (
@@ -1974,12 +1989,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       peerNotified: outcome.peerNotified,
       holdersNotified: outcome.holdersNotified,
+      holderFailures: outcome.holderFailures,
       note: outcome.note,
       ...(outcome.peerNotified
         ? {}
         : {
             reason: outcome.notifyReason,
-            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified),
+            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
           }),
     };
   });

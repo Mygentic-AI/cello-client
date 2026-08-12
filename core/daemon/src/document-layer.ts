@@ -116,7 +116,7 @@ export interface DocumentLayerDeps {
     documentId: string,
     verb: "kill" | "close",
   ): Promise<
-    | { ok: true; holdersNotified: Record<string, boolean> }
+    | { ok: true; holdersNotified: Record<string, boolean>; holderFailures: Record<string, string> }
     | { ok: false; reason: string }
   >;
   /** Undo one envelope's operations on the live document, for withdraw. */

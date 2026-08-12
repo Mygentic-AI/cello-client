@@ -112,6 +112,30 @@ describe("control frames fan out to the DERIVED holder set", () => {
     expect(f.sent.map((s) => s.peerAgentId)).toContain(GENESIS_PEER);
   });
 
+  it("carries WHY each holder missed it — the cause is known, so it must not be guessed", async () => {
+    const f = fixture({ sendFails: new Set([GENESIS_PEER, JOINER]) });
+    const res = await f.notify(DOC, "close") as {
+      ok: boolean; holderFailures: Record<string, string>;
+    };
+    // Caught on the live fleet: every holder failed with `session_sealed` — the relay refusing a
+    // leaf for a session it had closed — and the operator was told they were "most likely offline"
+    // and to wait. Waiting cannot reopen a sealed session. The boolean alone throws the cause away
+    // and forces the sentence above it to guess, which is the substitution notifyGuidance exists
+    // to prevent, reintroduced one layer up.
+    expect(res.ok).toBe(true);
+    expect(res.holderFailures).toEqual({
+      [GENESIS_PEER]: "transport_unavailable",
+      [JOINER]: "transport_unavailable",
+    });
+  });
+
+  it("records no failure reason for a holder that DID take it", async () => {
+    const f = fixture({ sendFails: new Set([JOINER]) });
+    const res = await f.notify(DOC, "close") as { holderFailures: Record<string, string> };
+    // A reason present for a successful holder would read as a failure that did not happen.
+    expect(Object.keys(res.holderFailures)).toEqual([JOINER]);
+  });
+
   it("signs ONCE and sends the identical frame to each holder", async () => {
     const f = fixture();
     await f.notify(DOC, "kill");

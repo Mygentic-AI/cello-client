@@ -87,7 +87,17 @@ export type NotifyPeer = (
   documentId: string,
   verb: DocumentControlVerb,
 ) => Promise<
-  | { ok: true; holdersNotified: Record<string, boolean> }
+  | {
+      ok: true;
+      holdersNotified: Record<string, boolean>;
+      /**
+       * WHY each holder did not get it, per holder. The boolean alone throws the cause away, and
+       * the operator's sentence then has to guess — it guessed "most likely offline" for a
+       * `session_sealed`, which waiting can never fix. That is the exact substitution
+       * `notifyGuidance` exists to prevent, reintroduced one layer up.
+       */
+      holderFailures: Record<string, string>;
+    }
   | { ok: false; reason: string; detail?: string }
 >;
 
@@ -143,6 +153,7 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
       const bytes = encodeDocumentControl(control);
 
       const holdersNotified: Record<string, boolean> = {};
+      const holderFailures: Record<string, string> = {};
       for (const holder of targets.holders) {
         // Sequential and independent: one unreachable holder must neither block nor abort the
         // others (availability is a first-class protocol concern), and a throw from the transport
@@ -156,12 +167,14 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
           });
           holdersNotified[holder] = sent.ok;
           if (!sent.ok) {
+            holderFailures[holder] = sent.reason;
             deps.logger?.warn("document.control.holder_not_notified", {
               documentId, verb, holderAgentId: holder, reason: sent.reason,
             });
           }
         } catch (err: unknown) {
           holdersNotified[holder] = false;
+          holderFailures[holder] = err instanceof Error ? err.message : String(err);
           deps.logger?.warn("document.control.holder_not_notified", {
             documentId, verb, holderAgentId: holder,
             reason: err instanceof Error ? err.message : String(err),
@@ -170,7 +183,7 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
       }
       // `ok` means SIGNED AND ATTEMPTED TO EVERY CURRENT HOLDER. Who actually took it is the map's
       // job — collapsing that into one boolean is how a partial fan-out reads as a clean one.
-      return { ok: true, holdersNotified };
+      return { ok: true, holdersNotified, holderFailures };
     }
     // No agent on this daemon holds it. Named as such rather than reported as a transport failure:
     // the two want different things from whoever reads the log.

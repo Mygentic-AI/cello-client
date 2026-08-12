@@ -89,7 +89,7 @@ export interface LifecycleNotifier {
     // (DOD-MP-CONTROL-N-1). With N holders a partial fan-out is the ordinary failure, and the one
     // boolean this used to return could not tell "all three heard you" from "one of three did".
   ): Promise<
-    | { ok: true; holdersNotified: Record<string, boolean> }
+    | { ok: true; holdersNotified: Record<string, boolean>; holderFailures: Record<string, string> }
     | { ok: false; reason: string; detail?: string }
   >;
 }
@@ -310,6 +310,7 @@ export class DocumentLifecycle {
         ok: true;
         peerNotified: boolean;
         holdersNotified: Record<string, boolean>;
+        holderFailures: Record<string, string>;
         notifyReason?: string;
         notifyDetail?: string;
       })
@@ -335,6 +336,7 @@ export class DocumentLifecycle {
     }
     this.#settleClose(ownerAgentId, documentId);
     const holdersNotified = notified.ok ? notified.holdersNotified : {};
+    const holderFailures = notified.ok ? notified.holderFailures : {};
     // EVERY current holder, not "the send returned ok" — with N holders a partial fan-out is the
     // normal failure and one boolean cannot describe it. The map is the precise answer; this stays
     // as the summary a caller can branch on.
@@ -347,6 +349,7 @@ export class DocumentLifecycle {
       ok: true,
       peerNotified: allNotified,
       holdersNotified,
+      holderFailures,
       ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
     };
   }
@@ -465,6 +468,7 @@ export class DocumentLifecycle {
         ok: true;
         peerNotified: boolean;
         holdersNotified: Record<string, boolean>;
+        holderFailures: Record<string, string>;
         note: string;
         notifyReason?: string;
         notifyDetail?: string;
@@ -490,6 +494,7 @@ export class DocumentLifecycle {
       });
     }
     const holdersNotified = notified.ok ? notified.holdersNotified : {};
+    const holderFailures = notified.ok ? notified.holderFailures : {};
     const allNotified = everyHolderNotified(notified.ok, holdersNotified);
     this.#logger.info("document.killed", { documentId, peerNotified: allNotified, holdersNotified });
 
@@ -497,6 +502,7 @@ export class DocumentLifecycle {
       ok: true,
       peerNotified: allNotified,
       holdersNotified,
+      holderFailures,
       note:
         "this document no longer accepts or publishes updates, and your local copy and log are " +
         "retained. Your peer keeps what it holds — a kill stops the collaboration, it does not " +
