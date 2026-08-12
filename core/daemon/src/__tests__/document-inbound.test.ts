@@ -207,6 +207,23 @@ describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(2);
   });
 
+  it("an UNKNOWN epoch-ahead sender is LOGGED as amendment lag, not as a stranger probe", async () => {
+    // F1: the honest new holder's first envelope — their add_holder amendment still in flight
+    // to us — is wire-silent (disclosure stands) but the LOG names the lag signature: unknown
+    // sender + epoch ahead of ours. Revert the discriminator and this reads as a stranger.
+    const f = newFixture({ currentHolders: () => [PEER] });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7, epoch_id: 1 }),
+      ),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
+    expect(f.events.some((e) => e.event === "document.inbound.sender_unknown_epoch_ahead")).toBe(true);
+    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(false);
+  });
+
   it("a STRANGER stays silently refused even when the chain derives — membership discloses nothing to non-parties", async () => {
     const f = newFixture({ currentHolders: () => [PEER, JOINED] });
     const res = await f.inbound.receive(
