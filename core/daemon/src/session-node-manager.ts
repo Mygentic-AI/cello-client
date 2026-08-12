@@ -3770,7 +3770,45 @@ export class SessionNodeManager {
           return terminalRelayRefusal(
             {
               logger: this.#logger,
-              retireSession: (id) => this.#updateSessionStatus(agentName, id, "sealed"),
+              // FULL TEARDOWN, not a status write. Every other terminal path goes through these,
+              // and the difference is not bookkeeping: `destroySessionNode` also records the
+              // terminal answer for a BLOCKED `cello_receive` (which otherwise hangs to timeout),
+              // detaches the relay stream, stops the libp2p node, evicts the plaintext caches, and
+              // re-arms the standing receiver — which on a fixed-port deployment is the moment the
+              // port is freed. A DB-only flip leaves the corpse in `#activeNodes` holding the very
+              // port the replacement session may need, which would defeat this fix's own purpose.
+              //
+              // THE TWO TERMINAL REASONS ARE NOT THE SAME FACT and must not share a status:
+              //   session_sealed    — the seal really completed; a FROST certificate exists at the
+              //                       directory and `cello_sealed_receipt` pulls it on a local miss.
+              //   session_not_found — the relay never held it or lost it. There may be no
+              //                       certificate anywhere, so writing "sealed" would be a
+              //                       FABRICATED NOTARIZATION CLAIM: `cello_close_session` would
+              //                       answer "already sealed, view its notarization" while the
+              //                       receipt read answers "not sealed yet" — the two-answers-
+              //                       pointing-at-each-other deadlock `seal-certificate-pull.ts`
+              //                       exists to kill. `abandoned` is the state invented for
+              //                       locally-terminal-with-nothing-to-notarize.
+              // ONLY `session_sealed` RETIRES ANYTHING. The other terminal reason,
+              // `session_not_found`, is documented THREE FUNCTIONS AWAY as **transient**
+              // (DOD-FIRSTMSG-WITNESS-1): the relay does not hold the session YET, and in all 23
+              // logged first-message failures the assignment landed 5ms–2.1s after the rejected
+              // submit. Retiring on it would destroy a live session seconds old — trading a stuck
+              // document for a killed conversation, which is a strictly worse bug than the one this
+              // unit fixes. It still refuses the send; it just does not reach for the shovel.
+              retireSession: (id) => {
+                if (witnessed.reason !== "session_sealed") return;
+                // STATUS FIRST AND SYNCHRONOUS, teardown second — the order `abandonSession` uses,
+                // and for a sharper reason here: `destroySessionNode` returns early at its
+                // `if (!entry) return` when the node is not in `#activeNodes`, and the status write
+                // lives AFTER that guard. There is an entry on this path today (we are mid-send on
+                // its relay client), but resting the whole fix on that is resting it on a
+                // coincidence — a concurrent teardown would leave the row `active` and the loop
+                // would resume. The flip is the load-bearing half; the teardown is what makes the
+                // memory agree with it.
+                this.#updateSessionStatus(agentName, id, "sealed");
+                void this.destroySessionNode(agentName, id, "sealed");
+              },
             },
             { sessionId, reason: witnessed.reason, correlationId },
           );

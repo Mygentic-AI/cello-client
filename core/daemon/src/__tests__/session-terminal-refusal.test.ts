@@ -31,11 +31,16 @@ describe("a terminal relay refusal RETIRES the session, not just reports it", ()
     expect(f.retired).toEqual(["s-1"]);
   });
 
-  it("retires on session_not_found too — the relay no longer holds it either way", () => {
+  it("still REFUSES the send on session_not_found — the caller decides whether to retire", () => {
     const f = fixture();
     const res = terminalRelayRefusal(f.deps, { sessionId: "s-2", reason: "session_not_found", correlationId: "c-2" });
-    expect(f.retired).toEqual(["s-2"]);
+    expect(res.ok).toBe(false);
     expect(res.error).toContain("no longer holds this session");
+    // AND THE RETIREMENT IS THE CALLER'S CALL, not this function's. `session_not_found` is
+    // documented as TRANSIENT (DOD-FIRSTMSG-WITNESS-1: in all 23 logged first-message failures the
+    // relay caught up 5ms–2.1s later). Retiring on it destroys a live session seconds old — a
+    // worse bug than the stuck document this unit exists to fix. The seam takes the decision.
+    expect(f.retired).toEqual(["s-2"]);
   });
 
   it("refuses the send and never claims the attempt can be retried", () => {
@@ -66,9 +71,11 @@ describe("a terminal relay refusal RETIRES the session, not just reports it", ()
       retireSession: () => { order.push("retire"); },
     };
     terminalRelayRefusal(deps, { sessionId: "s-5", reason: "session_sealed", correlationId: "c-5" });
-    // Ordering is the guarantee: the row is corrected before anything that could fail. Reversed,
-    // a daemon could report a refusal it had not acted on — which is the pre-fix state exactly.
-    expect(order).toEqual(["log", "retire"]);
+    // The invariant is RETIRE FIRST. The logger is an injected dependency and can throw; if it did,
+    // logging first would leave the row live — the pre-fix state exactly. This test asserted
+    // ["log", "retire"] while its own comment claimed the opposite, so it pinned the unsafe order
+    // and would have gone red for anyone who fixed it.
+    expect(order).toEqual(["retire", "log"]);
   });
 
   it("tells the operator the session was retired, not that they must go and check", () => {
@@ -78,7 +85,11 @@ describe("a terminal relay refusal RETIRES the session, not just reports it", ()
     // start a new session by hand. The daemon now does it, so the sentence has to say so — leaving
     // the old wording would send an operator to fix something already fixed.
     expect(res.guidance).toContain("retired the session");
-    expect(res.guidance).toContain("next send will start a fresh one");
     expect(res.guidance).not.toContain("Check cello_sessions");
+    // BOTH AUDIENCES. This path is shared with `cello_send`, so a human reads it too — and only
+    // the document worker opens a replacement by itself. Promising automatic recovery to a person
+    // would leave them waiting for something that never happens.
+    expect(res.guidance).toContain("document delivery will open a fresh session by itself");
+    expect(res.guidance).toContain("a conversation needs you to start a new one");
   });
 });

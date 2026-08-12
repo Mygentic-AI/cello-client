@@ -64,15 +64,16 @@ export function terminalRelayRefusal(
   deps: TerminalRefusalDeps,
   input: TerminalRefusalInput,
 ): TerminalRefusalResult {
+  // RETIRE FIRST, THEN REPORT — and the code now matches the comment, which it did not. The logger
+  // is an injected dependency and can throw; logging first meant a throw there left the row live,
+  // which is the pre-fix state exactly. The retirement is the load-bearing act, so it goes first.
+  deps.retireSession(input.sessionId);
   deps.logger.error("session.relay.hash.submit.terminal", {
     sessionId: input.sessionId,
     reason: input.reason,
     correlationId: input.correlationId,
     impact: "the relay has ended this session — nothing sent now can ever be part of its record",
   });
-  // RETIRE FIRST, then report. If the caller's report path ever throws, the row is already correct;
-  // the reverse ordering would leave the daemon reporting a refusal it had not acted on.
-  deps.retireSession(input.sessionId);
   return {
     ok: false,
     reason: input.reason,
@@ -81,9 +82,15 @@ export function terminalRelayRefusal(
         ? "the relay has already sealed this session, so nothing further can enter its record"
         : "the relay no longer holds this session, so nothing further can enter its record",
     durable: false,
+    // WORDED FOR BOTH CALLERS. `sendContent` is shared with `cello_send`, so a human reads this
+    // too — and "the next send will start a fresh one" is true only for the document worker, which
+    // opens sessions on its own. A person has to start one. Saying otherwise would leave them
+    // waiting for an automatic recovery that never comes, which is the same wrong-audience mistake
+    // as telling someone to wait out a fault on their own machine.
     guidance:
       `This session is over as far as the relay is concerned, and anything sent now would be ` +
-      `invisible to the receipt. Nothing was sent, and this daemon has now retired the session on ` +
-      `its side, so the next send will start a fresh one. The conversation so far is not lost.`,
+      `invisible to the receipt. Nothing was sent. This daemon has now retired the session on its ` +
+      `side, so nothing is stuck on it: document delivery will open a fresh session by itself, and ` +
+      `a conversation needs you to start a new one. The conversation so far is not lost.`,
   };
 }
