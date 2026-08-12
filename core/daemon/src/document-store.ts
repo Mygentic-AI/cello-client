@@ -34,7 +34,7 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import { DOCUMENT_AMENDMENTS_CREATE_SQL } from "./document-amendment-store.js";
+import { DOCUMENT_AMENDMENTS_CREATE_SQL, walkMembership } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -57,6 +57,7 @@ export type DocumentEnvelopeKind = "update" | "withdrawal" | "rejection";
  */
 export type { DocumentProperties } from "@cello-protocol/protocol-types";
 import type { DocumentProperties } from "@cello-protocol/protocol-types";
+import { decodeDocumentAmendment } from "@cello-protocol/protocol-types";
 
 export interface DocumentRow {
   documentId: string;
@@ -893,6 +894,39 @@ export class DocumentStore {
    * Trustworthy for stamping because every append site validates (deriveArrangement) before
    * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
    */
+  /**
+   * DOD-MP-REMOVE-1 — was THIS OWNER written out of the arrangement? DERIVED from the recorded
+   * chain, never stored: a status column would need a CHECK-constraint rebuild on every operator
+   * DB, and a stored flag can drift from the chain that actually governs. Forward-only by
+   * construction — nothing here touches content.
+   */
+  removedFromArrangement(
+    ownerAgentId: string,
+    documentId: string,
+  ): { removed: boolean; epochId: number | null } {
+    return this.memberRemoved(ownerAgentId, documentId, ownerAgentId);
+  }
+
+  /** The same walk for ANY agent — the delivery worker asks it about the TARGET (F1). */
+  memberRemoved(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): { removed: boolean; epochId: number | null } {
+    const rows = this.#db
+      .prepare(
+        `SELECT received_bytes FROM document_amendments
+          WHERE owner_agent_id = ? AND document_id = ?
+          ORDER BY epoch_id ASC`,
+      )
+      .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
+    const verdict = walkMembership(
+      rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes))),
+      agentId,
+    );
+    return { removed: verdict.state === "removed", epochId: verdict.epochId };
+  }
+
   currentDocumentEpoch(ownerAgentId: string, documentId: string): number {
     const r = this.#db
       .prepare(

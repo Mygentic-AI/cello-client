@@ -302,6 +302,7 @@ export const IPC_METHODS = {
   "moniker-set": "cello_set_moniker",
   "doc-propose": "cello_doc_propose",
   "doc-invite": "cello_doc_invite",
+  "doc-remove": "cello_doc_remove",
   "doc-inbox": "cello_doc_inbox",
   "doc-accept": "cello_doc_accept",
   "doc-refuse": "cello_doc_refuse",
@@ -839,6 +840,21 @@ export function docInvite(
     celloDir,
     IPC_METHODS["doc-invite"],
     { document_id: documentId, invitee_pubkey: inviteePubkey },
+    opts,
+  );
+}
+
+/** `cello doc remove <document-id> <holder-pubkey>` → cello_doc_remove. */
+export function docRemove(
+  celloDir: string,
+  documentId: string,
+  holderPubkey: string,
+  opts: ParityOptions,
+): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS["doc-remove"],
+    { document_id: documentId, holder_pubkey: holderPubkey },
     opts,
   );
 }

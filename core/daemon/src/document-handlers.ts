@@ -941,6 +941,174 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     };
   });
 
+  /**
+   * DOD-MP-REMOVE-1 — remove a holder, forward-only. Two shapes, one verb: an admin removing a
+   * non-admin holder, and a holder removing THEMSELVES (voluntary leave — always theirs, per
+   * D3). What removal means is exactly and only: delivery to them stops and their new edits
+   * refuse naming the removal. Their copy is theirs forever — no surface claims more. Removing
+   * a fellow ADMIN refuses here the way the policy refuses it everywhere (demote first, under
+   * remove_admin's all-others rule — whose cross-daemon signature gathering is a parked design
+   * note, Entry 10).
+   */
+  handlers.set("cello_doc_remove", async (params, connectionId) => {
+    const who = resolve(params, connectionId);
+    if (isRefusal(who)) return who;
+    const documentId = typeof params?.document_id === "string" ? params.document_id : "";
+    const holder = typeof params?.holder_pubkey === "string" ? params.holder_pubkey : "";
+    if (documentId.length === 0) {
+      return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
+    }
+    if (!/^[0-9a-f]{64}$/.test(holder)) {
+      return {
+        ok: false,
+        reason: "invalid_holder_pubkey",
+        guidance: "holder_pubkey must be the 64-hex agent id of a current holder.",
+      };
+    }
+    const doc = layer.store.getDocument(who.ownerAgentId, documentId);
+    if (!doc) {
+      return { ok: false, reason: "document_unknown", guidance: `No document ${documentId.slice(0, 16)}… for this agent.` };
+    }
+    const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+    if (!genesisRecord) {
+      return {
+        ok: false,
+        reason: "document_genesis_missing",
+        guidance: "The document has a row but no stored genesis proposal to replay from.",
+      };
+    }
+    const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
+    const chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    const derived = deriveArrangement(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
+    if (!derived.ok) {
+      return { ok: false, reason: "document_chain_invalid", guidance: derived.reason };
+    }
+    if (!derived.arrangement.participants.has(holder)) {
+      // ALREADY REMOVED is the HEALING path, not a refusal (REMOVE-1 review F3): a holder who
+      // was offline at removal time never learned, and no other verb can ever re-send the
+      // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
+      // the chain never touched still refuses.
+      const membership = layer.amendments.membershipOf(who.ownerAgentId, documentId, holder);
+      if (membership.state === "removed") {
+        const removal = chain.find(
+          (e) => e.body.kind === "remove_holder" &&
+            e.body.subject_agent_id === holder &&
+            e.body.epoch_id === membership.epochId,
+        );
+        const resendTold: Record<string, boolean> = {};
+        if (removal) {
+          const bytes = new Uint8Array(encodeDocumentAmendment(removal));
+          const targets = new Set([...derived.arrangement.participants, holder]);
+          targets.delete(who.ownerAgentId);
+          for (const member of targets) {
+            try {
+              const sent = await deps.transportFor(who.agentName).sendBytes({
+                peerAgentId: member, documentId, bytes, correlationId: randomUUID(),
+              });
+              resendTold[member] = sent.ok;
+            } catch {
+              resendTold[member] = false;
+            }
+          }
+        }
+        return {
+          ok: true,
+          documentId,
+          removedAgentId: holder,
+          resent: true,
+          epochId: membership.epochId,
+          holdersNotified: resendTold,
+        };
+      }
+      return {
+        ok: false,
+        reason: "document_not_holder",
+        guidance: "That agent does not hold this document — there is nobody to remove.",
+      };
+    }
+
+    const body: DocumentAmendmentBody = {
+      document_id: documentId,
+      epoch_id: derived.arrangement.epoch + 1,
+      prev_amendment_hash: derived.arrangement.lastAmendmentHash,
+      kind: "remove_holder",
+      subject_agent_id: holder,
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: deps.now(),
+    };
+    const amendHash = documentAmendmentHash(body);
+    const multisigTbs = buildDocumentMultisigTbs({
+      document_id: documentId,
+      subject_kind: "document_amendment",
+      subject_hash: amendHash,
+      required_signers: [who.ownerAgentId],
+    });
+    const amendment: DocumentAmendmentEnvelope = {
+      body,
+      collection: {
+        document_id: documentId,
+        subject_kind: "document_amendment",
+        subject_hash: amendHash,
+        required_signers: [who.ownerAgentId],
+        signatures: [
+          { signer_agent_id: who.ownerAgentId, signature: await deps.sign(who.agentName, multisigTbs) },
+        ],
+      },
+    };
+    // VALIDATE-BEFORE-APPEND — the policy rules here: a non-admin removing someone else, or any
+    // single admin trying to expel a fellow admin through the holder door, refuses with the
+    // policy's own sentence. Voluntary self-leave passes for anyone.
+    const withNew = deriveArrangement(
+      genesisArr, [...chain, amendment], documentGovernancePolicy, layer.verifySignature,
+    );
+    if (!withNew.ok) {
+      return { ok: false, reason: "document_amendment_invalid", guidance: withNew.reason };
+    }
+    const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
+    layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
+
+    // The amendment travels to EVERY current holder INCLUDING the removed one — being told is
+    // how their daemon surfaces the removal to their operator. Best-effort at P1, per holder,
+    // reported never assumed.
+    const holdersTold: Record<string, boolean> = {};
+    for (const member of withNew.arrangement.participants) {
+      if (member === who.ownerAgentId) continue;
+      try {
+        const sent = await deps.transportFor(who.agentName).sendBytes({
+          peerAgentId: member, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
+        });
+        holdersTold[member] = sent.ok;
+      } catch {
+        holdersTold[member] = false;
+      }
+    }
+    if (holder !== who.ownerAgentId) {
+      try {
+        const sent = await deps.transportFor(who.agentName).sendBytes({
+          peerAgentId: holder, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
+        });
+        holdersTold[holder] = sent.ok;
+      } catch {
+        holdersTold[holder] = false;
+      }
+    }
+    logger.info("document.holder_removed", {
+      documentId, holder, epochId: body.epoch_id, voluntary: holder === who.ownerAgentId,
+    });
+    return {
+      ok: true,
+      documentId,
+      removedAgentId: holder,
+      voluntary: holder === who.ownerAgentId,
+      epochId: body.epoch_id,
+      holdersNotified: holdersTold,
+      guidance:
+        "Removal is forward-only: their existing copy and its history remain theirs — new edits " +
+        "simply no longer flow either way.",
+    };
+  });
+
   handlers.set("cello_doc_refuse", async (params, connectionId) => {
     const who = resolve(params, connectionId);
     if (isRefusal(who)) return who;

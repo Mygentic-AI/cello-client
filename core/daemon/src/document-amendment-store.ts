@@ -47,6 +47,35 @@ export const DOCUMENT_AMENDMENTS_CREATE_SQL = `
   );
 `;
 
+export interface MembershipVerdict {
+  state: "holder" | "removed" | "untouched";
+  epochId: number | null;
+}
+
+/**
+ * The last membership event naming this agent in an ordered chain — ONE implementation, because
+ * two walks (the inbound refusal's and the publish gate's) disagreeing about whether someone was
+ * removed is two daemons disagreeing about the arrangement.
+ */
+export function walkMembership(
+  chain: readonly DocumentAmendmentEnvelope[],
+  agentId: string,
+): MembershipVerdict {
+  let state: MembershipVerdict["state"] = "untouched";
+  let epochId: number | null = null;
+  for (const env of chain) {
+    if (env.body.subject_agent_id !== agentId) continue;
+    if (env.body.kind === "add_holder") {
+      state = "holder";
+      epochId = env.body.epoch_id;
+    } else if (env.body.kind === "remove_holder") {
+      state = "removed";
+      epochId = env.body.epoch_id;
+    }
+  }
+  return { state, epochId };
+}
+
 export interface AmendmentAppendResult {
   /** False on an idempotent redelivery — the row already existed with the same hash. */
   recorded: boolean;
@@ -151,6 +180,22 @@ export class DocumentAmendmentStore {
       )
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
     return rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes)));
+  }
+
+  /**
+   * DOD-MP-REMOVE-1 — this agent's LAST membership event in the recorded chain.
+   * "holder" = admitted (or never touched by any membership amendment — genesis membership is
+   * the CALLER's fact, not this table's); "removed" = the last event naming them was
+   * remove_holder, with the epoch it happened at, so a refusal can name the removal rather than
+   * a generic condition. Reads the recorded chain only — validity was ruled before append
+   * (the standing invariant).
+   */
+  membershipOf(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): MembershipVerdict {
+    return walkMembership(this.chain(ownerAgentId, documentId), agentId);
   }
 
   /** The highest recorded epoch, or 0 — genesis — when no amendment exists. */

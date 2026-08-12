@@ -18,6 +18,10 @@ import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import * as Y from "yjs";
+import {
+  documentAmendmentHash,
+  encodeDocumentAmendment,
+} from "@cello-protocol/protocol-types";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
 import { DocumentEngine } from "../document-engine.js";
 import { DocumentLifecycle } from "../document-lifecycle.js";
@@ -113,14 +117,71 @@ describe("DocumentLifecycle — list", () => {
   });
 
   it("reports the CURRENT epoch once the document has amendments — not a constant", () => {
+    // A DECODABLE row — the list's removal overlay and the membership walk decode every stored
+    // amendment, and a garbage blob is a state no real daemon can hold (validate-before-append).
     const f = newFixture();
+    const body = {
+      document_id: DOC,
+      epoch_id: 2,
+      prev_amendment_hash: null,
+      kind: "add_holder",
+      subject_agent_id: "f".repeat(64),
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC,
+        subject_kind: "document_amendment",
+        subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
     f.db.prepare(
       `INSERT INTO document_amendments
          (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
        VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, 2, "h".repeat(64), Buffer.from([1]), 1);
+    ).run(AGENT, DOC, 2, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
     const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect(row!.epochId).toBe(2);
+  });
+
+  it("a removed owner's row says so — the overlay is derived, the stored status stays active", () => {
+    const f = newFixture();
+    const body = {
+      document_id: DOC,
+      epoch_id: 1,
+      prev_amendment_hash: null,
+      kind: "remove_holder",
+      subject_agent_id: AGENT,
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC,
+        subject_kind: "document_amendment",
+        subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, 1, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
+    expect((row as unknown as { removed?: boolean }).removed).toBe(true);
+    expect(row!.status).toBe("active");
+    expect(f.lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
   });
 
   it("counts only what is actually pending, not the whole log", () => {

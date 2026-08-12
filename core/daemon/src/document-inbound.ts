@@ -88,6 +88,12 @@ export interface DocumentInboundDeps {
   verifySignature(senderAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
+  /** DOD-MP-REMOVE-1 — the sender's last membership event in the recorded amendment chain. */
+  membershipOf(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): { state: "holder" | "removed" | "untouched"; epochId: number | null };
   /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
@@ -215,6 +221,28 @@ export class DocumentInbound {
     // not `doc.peerAgentId`, so it really does go back to the stranger. That is exactly the
     // disclosure the silent refusal below is written to withhold.
     if (env.sender_agent_id !== doc.peerAgentId) {
+      // A REMOVED former holder is upgraded from the silent stranger-refusal to the TERMINAL
+      // named one (REMOVE-1 review F4): they hold the removal fact already — no new disclosure —
+      // and the silent path left their delivery worker redelivering forever, which is the exact
+      // silent drop the DoD line forbids. A true stranger still gets silence.
+      const formerHolder = this.#d.membershipOf(ownerAgentId, env.document_id, env.sender_agent_id);
+      if (formerHolder.state === "removed") {
+        this.#d.logger.warn("document.inbound.sender_removed", {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          removedAtEpoch: formerHolder.epochId,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "document_sender_removed",
+          terminal: true,
+          envelopeHash,
+          detail:
+            `this holder was removed from the document at epoch ${formerHolder.epochId} — the ` +
+            `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
+        };
+      }
       this.#d.logger.warn("document.inbound.not_peer", {
         documentId: env.document_id,
         senderAgentId: env.sender_agent_id,
@@ -234,6 +262,28 @@ export class DocumentInbound {
         // which discloses strictly more. It is bounded by document_id being a 32-byte hash
         // (`documentIdFromProposal`), unguessable and never published.
         detail: "you are not a party to this document",
+      };
+    }
+
+    // 4a. A DAEMON THAT KNOWS ITSELF REMOVED STOPS APPLYING (DOD-MP-REMOVE-1's other half):
+    // "new edits stop flowing either way" is a lie if the removed party's own daemon keeps
+    // admitting what still arrives from holders whose worker has not yet gated. TERMINAL — the
+    // sender's delivery settles instead of retrying at a door that will never open.
+    const selfMembership = this.#d.store.removedFromArrangement(ownerAgentId, env.document_id);
+    if (selfMembership.removed) {
+      this.#d.logger.warn("document.inbound.recipient_removed", {
+        documentId: env.document_id,
+        removedAtEpoch: selfMembership.epochId,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_recipient_removed",
+        terminal: true,
+        envelopeHash,
+        detail:
+          `this daemon was removed from the document's arrangement at epoch ` +
+          `${selfMembership.epochId} — the local copy remains, but new edits are no longer applied`,
       };
     }
 
@@ -258,6 +308,27 @@ export class DocumentInbound {
         correlationId,
       });
       if (behind) {
+        // ERROR FIDELITY (REMOVE-1 review F2): a removed holder who MISSED the removal
+        // amendment publishes at the old epoch and lands here — and "republish under the
+        // current epoch" is an instruction they cannot follow, concealing a membership fact
+        // behind an epoch label. The behind branch is the one place this answer is definitive:
+        // our chain already contains their removal. (The AHEAD case must NOT do this — there
+        // OUR chain may be the stale one.)
+        const senderMembership = this.#d.membershipOf(
+          ownerAgentId, env.document_id, env.sender_agent_id,
+        );
+        if (senderMembership.state === "removed") {
+          return {
+            ok: false,
+            reason: "document_sender_removed",
+            terminal: true,
+            envelopeHash,
+            detail:
+              `this holder was removed from the document at epoch ${senderMembership.epochId} — ` +
+              `the removal is forward-only (your copy is yours), but new edits are no longer ` +
+              `accepted`,
+          };
+        }
         return {
           ok: false,
           reason: "document_epoch_stale",
@@ -274,6 +345,30 @@ export class DocumentInbound {
         detail:
           `this update names epoch ${env.epoch_id} and this holder is at epoch ${currentEpoch} — ` +
           `an amendment is still in flight here; retry after it lands`,
+      };
+    }
+
+    // 4c. A REMOVED HOLDER'S envelope refuses NAMING THE REMOVAL (DOD-MP-REMOVE-1) — never a
+    // silent drop, and never a generic condition: "you were removed at epoch N" is a different
+    // fact to hand an operator than any transport or chain error, and it is TERMINAL — no
+    // redelivery changes a membership fact. The sender was authenticated at step 2, so answering
+    // discloses only what the removal amendment already told them.
+    const membership = this.#d.membershipOf(ownerAgentId, env.document_id, env.sender_agent_id);
+    if (membership.state === "removed") {
+      this.#d.logger.warn("document.inbound.sender_removed", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        removedAtEpoch: membership.epochId,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "document_sender_removed",
+        terminal: true,
+        envelopeHash,
+        detail:
+          `this holder was removed from the document at epoch ${membership.epochId} — the ` +
+          `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
       };
     }
 

@@ -173,6 +173,12 @@ export class DocumentLifecycle {
       documentId: d.documentId,
       peerAgentId: d.peerAgentId,
       documentType: d.documentType,
+      // DOD-MP-REMOVE-1 — display overlay, derived: a removed holder's row still says active in
+      // the table (removal is a chain fact, not a stored flag), and a list that said "active"
+      // would be the surface claiming more than forward-only allows.
+      ...(this.#store.removedFromArrangement(ownerAgentId, d.documentId).removed
+        ? { removed: true }
+        : {}),
       assuranceTier: "authenticated",
       epochId: this.#store.currentDocumentEpoch(ownerAgentId, d.documentId),
       status: d.status,
@@ -495,6 +501,21 @@ export class DocumentLifecycle {
     }
     if (doc.status === "killed") {
       return { ok: false, reason: "document_killed", detail: "this document was ended locally" };
+    }
+    // DOD-MP-REMOVE-1, forward-only — DERIVED from the amendment chain, never a stored flag:
+    // the copy is theirs (reading, the file, the history all remain), but publishing into an
+    // arrangement that no longer includes them would only be refused by every holder, so it is
+    // refused here first, naming the actual condition and the epoch it happened at.
+    const membership = this.#store.removedFromArrangement(ownerAgentId, documentId);
+    if (membership.removed) {
+      return {
+        ok: false,
+        reason: "document_removed",
+        detail:
+          `you were removed from this document's arrangement at epoch ${membership.epochId} — ` +
+          `your copy and its history remain yours, but new edits no longer publish to the ` +
+          `other holders`,
+      };
     }
     if (doc.status === "stalled") {
       // REJECT-1 stalls a document after its retry rounds. A stalled document has stopped

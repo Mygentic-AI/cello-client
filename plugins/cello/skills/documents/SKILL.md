@@ -19,6 +19,9 @@ cello_doc_propose({ peer_pubkey, starting_content?, document_type?, append_only?
 cello_doc_invite({ document_id, invitee_pubkey })
                                              — open a document you administer to a third agent;
                                                their own accept makes the join real
+cello_doc_remove({ document_id, holder_pubkey })
+                                             — remove a holder, or leave with your own key;
+                                               forward-only — their copy stays theirs
 cello_doc_inbox()                            — documents offered to YOU (proposals AND join offers)
 cello_doc_accept({ document_id })            — their signed edits now apply to your copy
 cello_doc_refuse({ document_id, reason? })

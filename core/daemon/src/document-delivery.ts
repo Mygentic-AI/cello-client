@@ -289,6 +289,27 @@ export class DocumentDelivery {
 
     for (const [documentId, envelopes] of byDocument) {
       const peerAgentId = peerFor(documentId);
+      // DOD-MP-REMOVE-1 — "every remaining holder STOPS DELIVERING to the removed holder."
+      // Checked here, against the recorded chain, because the row's peer_agent_id is a genesis
+      // fact and outlives the arrangement. The envelopes are retired as ABANDONED — a settled
+      // decision of ours, not evidence about the peer — so they leave every pending counter
+      // rather than redialing a party the arrangement no longer includes.
+      if (peerAgentId !== null) {
+        const membership = this.#store.memberRemoved(ownerAgentId, documentId, peerAgentId);
+        if (membership.removed) {
+          this.#logger.info("document.delivery.peer_removed", {
+            documentId,
+            peerAgentId,
+            removedAtEpoch: membership.epochId,
+            retired: envelopes.length,
+            correlationId,
+          });
+          for (const e of envelopes) {
+            this.#store.markAbandoned(ownerAgentId, documentId, e.envelopeHash, nowMs);
+          }
+          continue;
+        }
+      }
       if (peerAgentId === null) {
         // No peer means the document row is gone or malformed, which is NOT transient — so it goes
         // straight to the cap rather than climbing to it, and crucially it is SCHEDULED. Skipping
