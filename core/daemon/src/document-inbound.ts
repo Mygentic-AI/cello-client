@@ -95,6 +95,13 @@ export interface DocumentInboundDeps {
     agentId: string,
   ): { state: "holder" | "removed" | "untouched"; epochId: number | null };
   /**
+   * DOD-MP-INBOUND-N-1 — the CURRENT derived holders, or null when the chain does not derive.
+   * When it derives, membership is the WHOLE sender gate — the genesis-peer column is a
+   * bilateral-legacy fallback, never a permanent credential (the same rule the ack gate
+   * learned in FANOUT-1's review).
+   */
+  currentHolders(ownerAgentId: string, documentId: string): string[] | null;
+  /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
    * Takes the agent so it cannot sign with the wrong key. ASYNC, and that is what makes `receive`
@@ -220,7 +227,16 @@ export class DocumentInbound {
     // what lifecycle state it is in — `sendAck` addresses `env.sender_agent_id` from the envelope,
     // not `doc.peerAgentId`, so it really does go back to the stranger. That is exactly the
     // disclosure the silent refusal below is written to withhold.
-    if (env.sender_agent_id !== doc.peerAgentId) {
+    // 4. THE SENDER GATE (DOD-MP-INBOUND-N-1): when the chain DERIVES, derived membership is
+    // the whole gate — a joined third holder's envelope is as admissible as the genesis peer's,
+    // and a removed genesis peer's is not admissible at all. Only when the chain cannot answer
+    // (bilateral legacy, no genesis record) does the row's peer column stand in.
+    const senderHolders = this.#d.currentHolders(ownerAgentId, env.document_id);
+    const senderIsParty =
+      senderHolders === null
+        ? env.sender_agent_id === doc.peerAgentId
+        : senderHolders.includes(env.sender_agent_id);
+    if (!senderIsParty) {
       // A REMOVED former holder is upgraded from the silent stranger-refusal to the TERMINAL
       // named one (REMOVE-1 review F4): they hold the removal fact already — no new disclosure —
       // and the silent path left their delivery worker redelivering forever, which is the exact
