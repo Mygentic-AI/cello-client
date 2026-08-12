@@ -46,8 +46,17 @@ export const DOCUMENT_FEATURE_VERSION = 2;
 
 /** §6 — Tier 1. Tier 2 (attested) is V2; the field exists so V2 is a validation change. */
 export const ASSURANCE_TIER_V1 = "authenticated";
-/** §11 — the pairwise two-document form. Mesh is deferred (§11.1). */
-export const TOPOLOGY_V1 = "hub-and-spoke";
+/**
+ * DOD-MP-TOPOLOGY-1 (ruling D4, 2026-08-13): `mesh` is the DEFAULT — one document, N holders,
+ * everyone delivers to everyone, which is what the M14B machinery does regardless of the label.
+ * `hub-and-spoke` survives as an accepted VALUE only (the wire field is signed into
+ * `document_id`, and a document so labeled behaves identically — the broker case is served by
+ * construction: two ordinary documents). Nothing else is accepted; the refusal names the
+ * mismatch at BOTH ends, because the proposer and accepter run different builds and one-sided
+ * validation lets whichever side is newer decide for both.
+ */
+export const TOPOLOGY_DEFAULT = "mesh";
+export const SUPPORTED_TOPOLOGIES: ReadonlySet<string> = new Set(["mesh", "hub-and-spoke"]);
 
 export type DocumentConsentState = "pending" | "accepted" | "refused";
 
@@ -256,10 +265,11 @@ export function seamViolation(props: DocumentProperties): string | null {
       return err instanceof Error ? err.message : String(err);
     }
   }
-  if (props.topology !== TOPOLOGY_V1) {
+  if (!SUPPORTED_TOPOLOGIES.has(props.topology)) {
     return (
-      `document_seam_topology: this version supports "${TOPOLOGY_V1}" only, and the proposal asks ` +
-      `for "${props.topology}" — mesh documents (§11.1) are not yet built`
+      `document_seam_topology: this version supports ${[...SUPPORTED_TOPOLOGIES]
+        .map((v) => `"${v}"`)
+        .join(" and ")}, and the proposal asks for "${props.topology}"`
     );
   }
   return null;

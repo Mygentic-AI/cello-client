@@ -24,7 +24,7 @@ import {
   documentIdFromProposal,
   DOCUMENT_FEATURE_VERSION,
   ASSURANCE_TIER_V1,
-  TOPOLOGY_V1,
+  TOPOLOGY_DEFAULT,
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
@@ -452,7 +452,7 @@ describe("M14 round trip — through the REAL handshake", () => {
       properties: {
         assurance_tier: ASSURANCE_TIER_V1,
         schema_enforcement: false,
-        topology: TOPOLOGY_V1,
+        topology: TOPOLOGY_DEFAULT,
         append_only: false,
       },
       starting_content: null,
@@ -508,7 +508,7 @@ describe("M14 round trip — through the REAL handshake", () => {
       properties: {
         assurance_tier: ASSURANCE_TIER_V1,
         schema_enforcement: false,
-        topology: TOPOLOGY_V1,
+        topology: TOPOLOGY_DEFAULT,
         append_only: false,
       },
       starting_content: null,

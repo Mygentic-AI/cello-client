@@ -12,7 +12,8 @@ import {
   DOCUMENT_PROPOSAL_DOMAIN,
   DOCUMENT_FEATURE_VERSION,
   ASSURANCE_TIER_V1,
-  TOPOLOGY_V1,
+  TOPOLOGY_DEFAULT,
+  SUPPORTED_TOPOLOGIES,
   buildDocumentProposalTbs,
   documentIdFromProposal,
   encodeDocumentProposal,
@@ -27,7 +28,7 @@ function props(over: Partial<DocumentProperties> = {}): DocumentProperties {
   return {
     assurance_tier: ASSURANCE_TIER_V1,
     schema_enforcement: false,
-    topology: TOPOLOGY_V1,
+    topology: TOPOLOGY_DEFAULT,
     append_only: false,
     ...over,
   };
@@ -173,9 +174,9 @@ describe("document proposal — the decoder refuses rather than defaulting", () 
     // decoder that refused it would leave the proposal unanswered, which is the silent hang the
     // feature version exists to replace.
     const decoded = decodeDocumentProposal(
-      encodeDocumentProposal(proposal({ properties: props({ topology: "mesh" }) })),
+      encodeDocumentProposal(proposal({ properties: props({ topology: "star" }) })),
     );
-    expect(decoded.properties.topology).toBe("mesh");
+    expect(decoded.properties.topology).toBe("star");
     expect(seamViolation(decoded.properties)).toMatch(/document_seam_topology/);
   });
 });
@@ -197,10 +198,13 @@ describe("document proposal — the seam is refused, and says which property", (
     );
   });
 
-  it("refuses mesh topology, naming it", () => {
-    const reason = seamViolation(props({ topology: "mesh" }));
-    expect(reason).toMatch(/document_seam_topology/);
-    expect(reason).toContain("mesh");
+  it("accepts BOTH surviving topologies and refuses anything else, naming the mismatch", () => {
+    expect(seamViolation(props({ topology: "mesh" }))).toBeNull();
+    expect(seamViolation(props({ topology: "hub-and-spoke" }))).toBeNull();
+    const r = seamViolation(props({ topology: "star" }));
+    expect(r).toMatch(/document_seam_topology/);
+    expect(r).toContain('"star"');
+    expect(SUPPORTED_TOPOLOGIES.has(TOPOLOGY_DEFAULT)).toBe(true);
   });
 
   it("append_only is NOT a seam field — both values are legitimate", () => {
@@ -252,7 +256,7 @@ describe("document proposal — document_id is the hash, so canonicalization is 
     for (const p of [
       props({ assurance_tier: "attested" }),
       props({ schema_enforcement: true }),
-      props({ topology: "mesh" }),
+      props({ topology: "hub-and-spoke" }),
       props({ append_only: true }),
     ]) {
       expect(documentIdFromProposal(proposal({ properties: p }))).not.toBe(id);
