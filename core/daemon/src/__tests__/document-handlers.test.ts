@@ -1048,6 +1048,28 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     expect(closedBy()).toContain(fC.owner);
   });
 
+  it("DOD-MP-CLOSE-N-1: TWO of three closing does NOT settle it — the third is still editing", async () => {
+    const { fA, fC, documentId } = await threeHolders();
+
+    // A closes. Then the GENESIS PEER's close arrives. Under the old rule that pair was the whole
+    // agreement and the document flipped to `closed` right here — while C, a full holder, had said
+    // nothing and was still writing into it. A close is a REQUEST; two of three is a conclusion
+    // drawn from one.
+    await fA.call("cello_doc_close", { document_id: documentId });
+    expect(fA.layer.lifecycle.recordPeerClose(fA.owner, documentId, fA.peer, NOW).ok).toBe(true);
+    expect(fA.layer.store.getDocument(fA.owner, documentId)?.status).toBe("active");
+
+    const row = () =>
+      (fA.layer.lifecycle.list(fA.owner) as Array<{ documentId: string; closePending: boolean }>)
+        .find((r) => r.documentId === documentId)!;
+    expect(row().closePending, "we have closed and someone has not — that is pending").toBe(true);
+
+    // And the joiner's close is the one that completes it.
+    expect(fA.layer.lifecycle.recordPeerClose(fA.owner, documentId, fC.owner, NOW).ok).toBe(true);
+    expect(fA.layer.store.getDocument(fA.owner, documentId)?.status).toBe("closed");
+    expect(row().closePending).toBe(false);
+  });
+
   it("a REMOVED holder cannot end the creator's document — the honest daemon refuses it", async () => {
     const { fA, fC, documentId } = await threeHolders({ soleAdmin: true });
     // C is removed. C's own daemon would now self-censor, so the frame is signed and delivered

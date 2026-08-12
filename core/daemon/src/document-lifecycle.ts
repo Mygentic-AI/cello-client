@@ -250,9 +250,10 @@ export class DocumentLifecycle {
         (pendingByDocument.get(d.documentId)?.total ?? 0) -
         (pendingByDocument.get(d.documentId)?.sent ?? 0),
       abandonedDeliveries: this.#store.abandonedCount(ownerAgentId, d.documentId),
-      closePending:
-        this.#hasClosed(ownerAgentId, d.documentId, ownerAgentId) &&
-        !this.#hasClosed(ownerAgentId, d.documentId, d.peerAgentId),
+      // "I have closed and we are still waiting on someone" — ALL of them, not just the genesis
+      // peer (DOD-MP-CLOSE-N-1). Against the peer alone this read "not pending" the moment the
+      // genesis pair agreed, while a joiner had not answered and the document was still open.
+      closePending: this.#closePendingFor(ownerAgentId, d.documentId, d.peerAgentId),
     }));
   }
 
@@ -691,17 +692,48 @@ export class DocumentLifecycle {
     return r?.present === 1;
   }
 
+  /**
+   * A document is complete BY AGREEMENT, so every current holder must have said it — DOD-MP-CLOSE-N-1.
+   *
+   * This settled on the owner plus `doc.peerAgentId`. With three holders that flipped the document
+   * to `closed` as soon as TWO of them had closed, while the third was still editing — which is
+   * exactly the failure this unit's own header forbids: "One side's close is a REQUEST — treating
+   * it as a conclusion would tell this operator the collaboration ended while the peer is still
+   * writing into it." Two of three is a conclusion drawn from a request.
+   *
+   * Ruled under M14B-PROCEDURE §3a as the least-reversal-risk reading. Requiring ALL is the
+   * conservative direction: it never claims an agreement that does not exist, and it is identical
+   * to the old behaviour for a two-party document. Loosening later (say, an admin closing for
+   * everyone) only widens what settles and strands nothing; shipping the loose rule first would
+   * leave documents already marked closed that never were, and no migration can un-say that.
+   *
+   * A chain that cannot derive falls back to the genesis pair — the bilateral-legacy path, the
+   * same standing-in rule the inbound gate uses, never a licence to settle on fewer holders than
+   * the chain actually knows about.
+   */
+  /** Have WE closed while at least one other current holder has not? The list row's question. */
+  #closePendingFor(ownerAgentId: string, documentId: string, peerAgentId: string): boolean {
+    if (!this.#hasClosed(ownerAgentId, documentId, ownerAgentId)) return false;
+    const holders = this.#currentHolders(ownerAgentId, documentId);
+    const mustAgree = holders === null ? [ownerAgentId, peerAgentId] : holders;
+    return mustAgree.some((h) => !this.#hasClosed(ownerAgentId, documentId, h));
+  }
+
   #settleClose(ownerAgentId: string, documentId: string, peerAgentId: string): void {
     // ONLY FROM ACTIVE. Unconditional, a peer close arriving after a unilateral kill overwrote
     // `killed` with `closed` — the operator's own decision replaced by "closed by agreement", which
     // is a different fact and the one they did not choose. Same for `stalled`.
     if (this.#store.getDocument(ownerAgentId, documentId)?.status !== "active") return;
-    if (
-      this.#hasClosed(ownerAgentId, documentId, ownerAgentId) &&
-      this.#hasClosed(ownerAgentId, documentId, peerAgentId)
-    ) {
+    const holders = this.#currentHolders(ownerAgentId, documentId);
+    const mustAgree = holders === null ? [ownerAgentId, peerAgentId] : holders;
+    // `[].every()` is TRUE — an empty set would settle the document instantly on nobody's
+    // agreement. A derived arrangement always contains at least its proposer, so this is the
+    // second line rather than the first; it is here because the vacuous reading of this exact
+    // idiom already had to be closed once in this file.
+    if (mustAgree.length === 0) return;
+    if (mustAgree.every((h) => this.#hasClosed(ownerAgentId, documentId, h))) {
       this.#store.setDocumentStatus(ownerAgentId, documentId, "closed");
-      this.#logger.info("document.closed", { documentId });
+      this.#logger.info("document.closed", { documentId, agreedBy: mustAgree.length });
     }
   }
 }
