@@ -928,12 +928,12 @@ export function docWrite(
   return ipcCommand(celloDir, IPC_METHODS["doc-write"], { document_id: documentId, content }, opts);
 }
 
-/** `cello doc close <document-id>` → cello_doc_close. Bilateral: settles when both sides have said it. */
+/** `cello doc close <document-id>` → cello_doc_close. Every current holder is told; `holdersNotified` says who took it. */
 export function docClose(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["doc-close"], { document_id: documentId }, opts);
 }
 
-/** `cello doc kill <document-id>` → cello_doc_kill. One-sided and immediate; the peer is told best-effort. */
+/** `cello doc kill <document-id>` → cello_doc_kill. One-sided and immediate; every holder is told best-effort. */
 export function docKill(celloDir: string, documentId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS["doc-kill"], { document_id: documentId }, opts);
 }

@@ -1854,11 +1854,12 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       status,
       peerNotified: outcome.peerNotified,
+      holdersNotified: outcome.holdersNotified,
       ...(outcome.peerNotified
         ? {}
         : {
             reason: outcome.notifyReason,
-            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail),
+            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified),
           }),
     };
   });
@@ -1872,7 +1873,12 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
    * DOD-DOC-TOOLS-1 review: an exit-point label standing in for a local fault, pointing at the
    * network.
    */
-  function notifyGuidance(verb: "close" | "kill", reason?: string, detail?: string): string {
+  function notifyGuidance(
+    verb: "close" | "kill",
+    reason?: string,
+    detail?: string,
+    holdersNotified?: Record<string, boolean>,
+  ): string {
     const tail = verb === "close"
       ? `A close is not retried — run cello_doc_close again once this is cleared, or cello_doc_kill if you need it over now.`
       : `The kill stands locally either way; run cello_doc_kill again once this is cleared so they stop editing.`;
@@ -1887,6 +1893,56 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return (
         `Your ${verb} was recorded, but this daemon does not hold the agent that owns the document, ` +
         `so it could not tell the peer. That is a local wiring fault, not the peer being away. ${tail}`
+      );
+    }
+    // THE FOUR DERIVATION FAULTS (DOD-MP-CONTROL-N-1). Every one of these is a fact about THIS
+    // machine's record of the document, and not one of them is fixed by the counterparty coming
+    // online — which is what the generic sentence below tells the operator to wait for. That is the
+    // exact defect this function's header says it was written to remove, reintroduced by four new
+    // reasons that were never added to it.
+    if (reason === "document_holders_underivable" || reason === "document_genesis_missing") {
+      return (
+        `Your ${verb} was recorded, but this daemon could not work out who currently holds the ` +
+        `document, so it sent nothing to anyone. Waiting will not help — the signed history on this ` +
+        `machine is the problem, not the network. Look for a "document.holders.underivable" line in ` +
+        `the daemon log, which names the specific cause. ${tail}`
+      );
+    }
+    if (reason?.startsWith("document_chain_undecodable")) {
+      return (
+        `Your ${verb} was recorded, but this build cannot read part of the document's signed ` +
+        `history${detail ? ` (${detail})` : ""}, so it could not work out who to tell. That is ` +
+        `usually a client older than the document — upgrading is the fix, not waiting. ${tail}`
+      );
+    }
+    if (reason === "document_no_holders") {
+      return (
+        `Your ${verb} was recorded, and there is nobody left to tell — the signed history shows no ` +
+        `other current holder of this document. Nothing is pending and nothing needs retrying.`
+      );
+    }
+    // PARTIAL FAN-OUT is its own case and reads nothing like "the peer is offline". With three
+    // holders, two hearing you and one not is the ordinary outcome, and the operator needs to know
+    // WHICH one is still editing a document they think is live — a message saying "the peer" names
+    // nobody when there are several.
+    const missed = Object.entries(holdersNotified ?? {}).filter(([, told]) => !told).map(([h]) => h);
+    const reached = Object.values(holdersNotified ?? {}).filter(Boolean).length;
+    if (missed.length > 0 && reached > 0) {
+      return (
+        `Your ${verb} was recorded and reached ${reached} of ${reached + missed.length} other ` +
+        `holders, but not ${missed.join(", ")} — they will keep editing a document the rest of you ` +
+        `have ended. ${tail}`
+      );
+    }
+    if (missed.length > 0) {
+      // EVERY holder failed. This used to fall through to the generic sentence, which says "the
+      // peer" and names nobody — unusable when there are several, and the per-holder transport
+      // reasons live only in the log. It also arrives with no `reason` field at all, because the
+      // notifier returned ok: signing and addressing both worked, the sends did not.
+      return (
+        `Your ${verb} was recorded but reached none of the ${missed.length} other ` +
+        `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")}), so the document cannot ` +
+        `settle until they hear it. They are most likely offline. ${tail}`
       );
     }
     return (
@@ -1912,12 +1968,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       ok: true,
       documentId,
       peerNotified: outcome.peerNotified,
+      holdersNotified: outcome.holdersNotified,
       note: outcome.note,
       ...(outcome.peerNotified
         ? {}
         : {
             reason: outcome.notifyReason,
-            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail),
+            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified),
           }),
     };
   });

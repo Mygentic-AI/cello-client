@@ -718,7 +718,7 @@ server.tool("cello_doc_publish", "Publish whatever is in the document's FILE rig
   return jsonText(result);
 });
 
-server.tool("cello_doc_close", "Say you are done with a shared document. BILATERAL — it settles only when the counterparty says so too, so this does not end their editing and does not end yours until they answer. Use cello_doc_kill if you need it over now.", {
+server.tool("cello_doc_close", "Say you are done with a shared document. This does not end anyone's editing on its own — it is a statement that you are finished, and the document settles only once the other side has said it too. Every current holder is told: check `holdersNotified` in the result, which names each one and whether they took it, because a holder who was not told will keep editing a document you consider finished. Use cello_doc_kill if you need it over now.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   agent: z.string().optional().describe("Agent closing (defaults to the current agent)"),
 }, async ({ document_id, agent }) => {
@@ -726,7 +726,7 @@ server.tool("cello_doc_close", "Say you are done with a shared document. BILATER
   return jsonText(result);
 });
 
-server.tool("cello_doc_kill", "End a shared document NOW, one-sided. Neither side's updates will be accepted afterwards. Your local copy and its history are kept, and so is theirs — a kill stops the collaboration, it does not retract content they already have. The peer is told best-effort; check `peerNotified` in the result, because if they were not told they may keep writing into it.", {
+server.tool("cello_doc_kill", "End a shared document NOW, one-sided. No further updates are accepted, in either direction. Your local copy and its history are kept, and so is every other holder's — a kill stops the collaboration, it does not retract content they already have. All current holders are told best-effort; check `holdersNotified` in the result, which names each one, because anybody who was not told may keep writing into it.", {
   document_id: z.string().describe("Document ID from cello_doc_list"),
   agent: z.string().optional().describe("Agent killing (defaults to the current agent)"),
 }, async ({ document_id, agent }) => {

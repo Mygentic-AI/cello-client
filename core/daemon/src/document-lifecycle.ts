@@ -28,6 +28,40 @@
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
+/**
+ * "Did every holder hear it?" — and NO on an empty map.
+ *
+ * `[].every(…)` is `true`, so folding an empty fan-out with `every` alone reports that everybody
+ * was notified precisely when nobody was. The notifier refuses a holder-less document by name, so
+ * this is the second line rather than the first, but the vacuous-truth reading is the one that
+ * would surface to an operator as a clean close that told no one.
+ */
+function everyHolderNotified(ok: boolean, holders: Record<string, boolean>): boolean {
+  const told = Object.values(holders ?? {});
+  return ok && told.length > 0 && told.every((v) => v);
+}
+
+/**
+ * Who currently holds this document, derived from the chain — the INBOUND authorization gate.
+ *
+ * DOD-MP-CONTROL-N-1 fixed the outbound half first and that was only half the defect: the
+ * receiving side still authorized a `close`/`kill` by `sender === doc.peerAgentId`, the same
+ * genesis column. Two ordinary-command consequences, no rewritten daemon required:
+ *
+ *  - **A REMOVED holder could still end the creator's document.** A created with B, invited C,
+ *    removed B. A's `peerAgentId` is still B, so B's kill was accepted by A and refused by C —
+ *    the two operators left in different states by a party who holds no rights at all.
+ *  - **A JOINER's end reached nobody.** With {A, B, C}, C's close is now correctly addressed to
+ *    both, and BOTH refused it, because C is neither one's `peerAgentId`. The sender was told
+ *    everyone heard them while nothing was recorded anywhere.
+ *
+ * Returns null when the chain cannot answer, which is NOT an empty list: "nobody holds this" and
+ * "this cannot be answered" are different facts. On null the row's peer column stands in, exactly
+ * as `document-inbound.ts` does for update envelopes — that is the bilateral-legacy path, not a
+ * fallback for convenience.
+ */
+export type CurrentHolders = (ownerAgentId: string, documentId: string) => readonly string[] | null;
+
 /** How the peer is told about a unilateral end. Injected — the transport is not this unit's. */
 export interface LifecycleNotifier {
   notifyPeer(
@@ -36,7 +70,13 @@ export interface LifecycleNotifier {
     // `detail` carries the underlying description when the failure is LOCAL — a key that could not
     // be loaded reads nothing like a peer who is offline, and one guidance string for both sent
     // operators to wait for someone who was already there.
-  ): Promise<{ ok: true } | { ok: false; reason: string; detail?: string }>;
+    // `holdersNotified` is per-holder because a control frame goes to EVERY current holder
+    // (DOD-MP-CONTROL-N-1). With N holders a partial fan-out is the ordinary failure, and the one
+    // boolean this used to return could not tell "all three heard you" from "one of three did".
+  ): Promise<
+    | { ok: true; holdersNotified: Record<string, boolean> }
+    | { ok: false; reason: string; detail?: string }
+  >;
 }
 
 const CREATE_LIFECYCLE_SQL = `
@@ -127,6 +167,19 @@ export class DocumentLifecycle {
     documentId: string,
     envelopeHash: string,
   ) => { ok: true } | { ok: false; reason: string };
+  readonly #currentHolders: CurrentHolders;
+
+  /**
+   * May this sender end this document? Derived membership is the WHOLE gate when the chain
+   * derives — a joined third holder's close is as admissible as the genesis peer's, and a removed
+   * holder's is not admissible at all. The peer column stands in only when the chain cannot
+   * answer. Mirrors `document-inbound.ts`'s sender gate deliberately; two different answers to
+   * "is this agent a party to this document" is how the two paths drift apart.
+   */
+  #senderMayEnd(ownerAgentId: string, documentId: string, senderAgentId: string, peerAgentId: string): boolean {
+    const holders = this.#currentHolders(ownerAgentId, documentId);
+    return holders === null ? senderAgentId === peerAgentId : holders.includes(senderAgentId);
+  }
 
   constructor(
     store: DocumentStore,
@@ -140,12 +193,21 @@ export class DocumentLifecycle {
     rollback: (ownerAgentId: string, documentId: string, envelopeHash: string) =>
       { ok: true } | { ok: false; reason: string },
     senderAgentId: (ownerAgentId: string) => string = (id) => id,
+    /**
+     * The inbound authorization gate (DOD-MP-CONTROL-N-1). Defaults to "cannot answer", which
+     * routes to the `peerAgentId` check — the pre-multiplayer behaviour — so a caller that has not
+     * been wired yet is bilateral-correct rather than open. It is NOT defaulted to a permissive
+     * answer: a membership gate whose default admits everyone is worse than no gate, because it
+     * reads as one.
+     */
+    currentHolders: CurrentHolders = () => null,
   ) {
     this.#store = store;
     this.#logger = logger;
     this.#notifier = notifier;
     this.#rollback = rollback;
     this.#senderAgentId = senderAgentId;
+    this.#currentHolders = currentHolders;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
@@ -200,7 +262,13 @@ export class DocumentLifecycle {
     documentId: string,
     nowMs: number,
   ): Promise<
-    | (Verdict & { ok: true; peerNotified: boolean; notifyReason?: string; notifyDetail?: string })
+    | (Verdict & {
+        ok: true;
+        peerNotified: boolean;
+        holdersNotified: Record<string, boolean>;
+        notifyReason?: string;
+        notifyDetail?: string;
+      })
     | (Verdict & { ok: false })
   > {
     const doc = this.#store.getDocument(ownerAgentId, documentId);
@@ -222,13 +290,19 @@ export class DocumentLifecycle {
       });
     }
     this.#settleClose(ownerAgentId, documentId, doc.peerAgentId);
-    this.#logger.info("document.close.requested", { documentId, peerNotified: notified.ok });
+    const holdersNotified = notified.ok ? notified.holdersNotified : {};
+    // EVERY current holder, not "the send returned ok" — with N holders a partial fan-out is the
+    // normal failure and one boolean cannot describe it. The map is the precise answer; this stays
+    // as the summary a caller can branch on.
+    const allNotified = everyHolderNotified(notified.ok, holdersNotified);
+    this.#logger.info("document.close.requested", { documentId, peerNotified: allNotified, holdersNotified });
     // THE REASON TRAVELS. It used to stop here, so one guidance string covered a transport failure,
     // a missing signing key and a wiring fault — and it told the operator to wait for their peer,
     // which only helps for the first of the three.
     return {
       ok: true,
-      peerNotified: notified.ok,
+      peerNotified: allNotified,
+      holdersNotified,
       ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
     };
   }
@@ -250,12 +324,15 @@ export class DocumentLifecycle {
         detail: `no document ${documentId.slice(0, 16)}… for this agent`,
       };
     }
-    if (peerAgentId !== doc.peerAgentId) {
-      // THE BILATERAL GUARANTEE. The closer id came from the caller and was written as `closed_by`
+    if (!this.#senderMayEnd(ownerAgentId, documentId, peerAgentId, doc.peerAgentId)) {
+      // THE PARTY GUARANTEE. The closer id came from the caller and was written as `closed_by`
       // and settled against ITSELF, so any second distinct string — a stale contact id, a
       // pubkey-vs-name mismatch, a hostile session — plus our own close flipped the document to
       // closed. The whole point of recording WHO closed is defeated if who is never checked.
-      this.#logger.warn("document.close.not_peer", {
+      //
+      // The check is now MEMBERSHIP, not identity-with-one-peer: a joiner is a party and their
+      // close must count, a removed holder is not and theirs must not.
+      this.#logger.warn("document.close.not_holder", {
         documentId,
         claimedBy: peerAgentId,
         peerAgentId: doc.peerAgentId,
@@ -264,13 +341,16 @@ export class DocumentLifecycle {
         ok: false,
         reason: "document_close_not_peer",
         detail:
-          `${peerAgentId} is not this document's peer (${doc.peerAgentId}), so their close is not ` +
-          `the other half of a bilateral close`,
+          `${peerAgentId} does not currently hold this document, so their close is not one of the ` +
+          `halves that can settle it`,
       };
     }
-    this.#recordClose(ownerAgentId, documentId, doc.peerAgentId, nowMs);
-    this.#settleClose(ownerAgentId, documentId, doc.peerAgentId);
-    this.#logger.info("document.close.peer_requested", { documentId, peerAgentId: doc.peerAgentId });
+    // RECORDED AGAINST THE SENDER, not against `doc.peerAgentId`. Writing the peer column here
+    // credited a joiner's close to the genesis peer — the wrong name on the record, and with two
+    // joiners closing it would settle twice against one identity.
+    this.#recordClose(ownerAgentId, documentId, peerAgentId, nowMs);
+    this.#settleClose(ownerAgentId, documentId, peerAgentId);
+    this.#logger.info("document.close.peer_requested", { documentId, peerAgentId });
     return { ok: true };
   }
 
@@ -299,8 +379,8 @@ export class DocumentLifecycle {
         detail: `no document ${documentId.slice(0, 16)}… for this agent`,
       };
     }
-    if (peerAgentId !== doc.peerAgentId) {
-      this.#logger.warn("document.kill.not_peer", {
+    if (!this.#senderMayEnd(ownerAgentId, documentId, peerAgentId, doc.peerAgentId)) {
+      this.#logger.warn("document.kill.not_holder", {
         documentId,
         claimedBy: peerAgentId,
         peerAgentId: doc.peerAgentId,
@@ -308,7 +388,7 @@ export class DocumentLifecycle {
       return {
         ok: false,
         reason: "document_kill_not_peer",
-        detail: `${peerAgentId} is not this document's peer (${doc.peerAgentId}), so their kill is not theirs to make`,
+        detail: `${peerAgentId} does not currently hold this document, so their kill is not theirs to make`,
       };
     }
     void nowMs;
@@ -337,7 +417,14 @@ export class DocumentLifecycle {
     documentId: string,
     nowMs: number,
   ): Promise<
-    | { ok: true; peerNotified: boolean; note: string; notifyReason?: string; notifyDetail?: string }
+    | {
+        ok: true;
+        peerNotified: boolean;
+        holdersNotified: Record<string, boolean>;
+        note: string;
+        notifyReason?: string;
+        notifyDetail?: string;
+      }
     | { ok: false; reason: string; detail: string }
   > {
     const doc = this.#store.getDocument(ownerAgentId, documentId);
@@ -358,11 +445,14 @@ export class DocumentLifecycle {
         detail: notified.detail ?? "",
       });
     }
-    this.#logger.info("document.killed", { documentId, peerNotified: notified.ok });
+    const holdersNotified = notified.ok ? notified.holdersNotified : {};
+    const allNotified = everyHolderNotified(notified.ok, holdersNotified);
+    this.#logger.info("document.killed", { documentId, peerNotified: allNotified, holdersNotified });
 
     return {
       ok: true,
-      peerNotified: notified.ok,
+      peerNotified: allNotified,
+      holdersNotified,
       note:
         "this document no longer accepts or publishes updates, and your local copy and log are " +
         "retained. Your peer keeps what it holds — a kill stops the collaboration, it does not " +

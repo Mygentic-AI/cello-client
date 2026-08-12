@@ -156,17 +156,22 @@ document worse in a way that is tedious to undo.
 
 ## Ending one
 
-`cello_doc_close` is bilateral — it settles only when both of you have said it. Saying it does not
-stop their editing, and does not stop yours until they answer.
+`cello_doc_close` says you are finished. It does not stop anyone editing on its own — the document
+settles only once the other side has said it too. Every current holder is told you said it.
 
 `cello_doc_kill` is one-sided and immediate. Use it when something is wrong, not when you are simply
 finished. Afterwards neither side's updates are accepted. Both copies and both histories are kept:
 **a kill stops the collaboration, it does not retract content they already have.** If you need
 something unsaid, there is no protocol move for that — say so to the person.
 
-Check `peerNotified` on the result. A kill succeeds locally whether or not the peer heard about it,
-because a decision to stop that depends on the other party being online is not a decision to stop —
-but if they were not told, they may keep writing into a document that will never answer them.
+Check `holdersNotified` on the result. It names every current holder and whether each one took the
+message. A kill succeeds locally whether or not anyone heard it, because a decision to stop that
+depends on the other party being online is not a decision to stop — but anyone who was not told may
+keep writing into a document that will never answer them.
+
+With more than two holders, a partial result is the ordinary one: some heard it, someone was
+offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
+there are several of them.
 
 ## When something is wrong
 

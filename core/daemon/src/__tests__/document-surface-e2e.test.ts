@@ -85,6 +85,11 @@ async function makeParty(agentName: string) {
         return layerRef.store;
       },
       owners: () => [{ agentName, ownerAgentId: owner }],
+      // THE PRODUCTION FUNCTION, not a copy of it. The holder set is the thing that was wrong
+      // (DOD-MP-CONTROL-N-1), and a fixture that re-implemented the derivation — or worse, handed
+      // back a hardcoded peer — would restore exactly the assumption under test while staying
+      // green. Same call the daemon makes.
+      holders: (ownerAgentId, documentId) => layerRef.controlHolders(ownerAgentId, documentId),
       sign: async (_n, tbs) => keys.sign(tbs),
       send: (_n, input) => transport.sendBytes(input),
       now: () => NOW,

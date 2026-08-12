@@ -108,11 +108,17 @@ export interface DocumentLayerDeps {
    * stands — this is the narrow exception an agent asked for by name.
    */
   nudge?(ownerAgentId: string, documentId: string, paths: readonly string[]): void;
-  /** Tell the peer about a unilateral end. Injected — the transport is not this layer's. */
+  /**
+   * Tell EVERY current holder about an end. Injected — the transport is not this layer's.
+   * Per-holder because a document has N holders (DOD-MP-CONTROL-N-1), not one counterparty.
+   */
   notifyPeer(
     documentId: string,
     verb: "kill" | "close",
-  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  ): Promise<
+    | { ok: true; holdersNotified: Record<string, boolean> }
+    | { ok: false; reason: string }
+  >;
   /** Undo one envelope's operations on the live document, for withdraw. */
   rollback(
     ownerAgentId: string,
@@ -171,6 +177,15 @@ export interface DocumentLayer {
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
+  /**
+   * Who a control frame must be addressed to — everyone but the owner, derived (DOD-MP-CONTROL-N-1).
+   * Refuses by name rather than falling back to the genesis peer, which after a removal is the one
+   * party the frame must not reach.
+   */
+  controlHolders(
+    ownerAgentId: string,
+    documentId: string,
+  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string };
   isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
   /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
   acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
@@ -256,7 +271,18 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     const record = handshake.get(ownerAgentId, documentId);
     return record?.envelope.starting_content ?? null;
   });
-  const lifecycle = new DocumentLifecycle(store, logger, { notifyPeer: deps.notifyPeer }, deps.rollback);
+  const lifecycle = new DocumentLifecycle(
+    store,
+    logger,
+    { notifyPeer: deps.notifyPeer },
+    deps.rollback,
+    undefined,
+    // DOD-MP-CONTROL-N-1 — the inbound gate. `holdersFor` is declared below and resolved lazily,
+    // the same shape `live` uses above; the gate is only ever called long after construction.
+    // Wired HERE rather than left to the daemon so every consumer of the layer — including the
+    // e2e fixture — gets the real derivation and cannot silently keep the bilateral gate.
+    (ownerAgentId, documentId) => holdersFor(ownerAgentId, documentId),
+  );
   const notifications = new DocumentNotifications(store, logger);
   // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool
   // surface had: a complete unit with no production caller reads exactly like a working feature.
@@ -405,6 +431,41 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       return null;
     }
     return [...derived.arrangement.participants];
+  };
+
+  /**
+   * Who a control frame (`close`, `kill`) must be addressed to — DOD-MP-CONTROL-N-1.
+   *
+   * THIS LIVES HERE, not as a closure in the composition root, for the reason
+   * `document-control-notifier.ts`'s own header records about itself: a closure in `daemon.ts` has
+   * no test, so every fixture hand-copies it, and a hand-copy cannot disagree with the original.
+   * The first draft of this WAS such a closure and had already drifted — it re-derived the
+   * arrangement itself and so never emitted `document.holders.underivable`, leaving the control
+   * path invisible to the exact log search meant to find it.
+   *
+   * Everyone EXCEPT the owner, because the owner is the one doing the ending. A chain that will
+   * not derive is refused by name rather than falling back to the genesis `peerAgentId` — that
+   * fallback is the original defect, and after a removal it aims the frame at precisely the
+   * removed holder.
+   */
+  const controlHolders = (
+    ownerAgentId: string,
+    documentId: string,
+  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string } => {
+    let derivedHolders: readonly string[] | null;
+    try {
+      derivedHolders = holdersFor(ownerAgentId, documentId);
+    } catch (err: unknown) {
+      // CONTAINED for the same reason `cello_doc_list` contains it: a chain this build cannot
+      // decode THROWS, and an uncontained throw would take down the close/kill verb entirely
+      // rather than reporting why the frame could not be addressed.
+      return {
+        ok: false,
+        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (derivedHolders === null) return { ok: false, reason: "document_holders_underivable" };
+    return { ok: true, holders: derivedHolders.filter((p) => p !== ownerAgentId).sort() };
   };
 
   /** Is this agent a CURRENT holder — the ack gate's membership question. */
@@ -997,6 +1058,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     joins,
     verifySignature,
     holdersFor,
+    controlHolders,
     isCurrentHolder,
     acceptJoin,
     refuseJoin,

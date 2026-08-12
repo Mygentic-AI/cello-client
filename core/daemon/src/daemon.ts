@@ -3650,6 +3650,10 @@ async function startDaemonHoldingLock(
         loadedAgents
           .filter((a) => a.pubkey)
           .map((a) => ({ agentName: a.name, ownerAgentId: a.pubkey!.toLowerCase() })),
+      // DOD-MP-CONTROL-N-1 — the ONE implementation, on the layer, shared with every test fixture.
+      // A closure here instead would be untested by construction and hand-copied into fixtures
+      // that cannot disagree with it, which is exactly how the original defect survived.
+      holders: (ownerAgentId, documentId) => documentLayer.controlHolders(ownerAgentId, documentId),
       sign: async (agentName, tbs) => {
         const provider = keyProviders.get(agentName);
         if (!provider) throw new Error(`document_control_unsigned: no key provider for ${agentName}`);

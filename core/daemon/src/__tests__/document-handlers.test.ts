@@ -25,11 +25,17 @@ import {
   documentAmendmentHash,
   buildDocumentMultisigTbs,
   encodeDocumentAmendment,
+  encodeDocumentControl,
+  buildDocumentControlTbs,
+  decodeDocumentControl,
+  DOCUMENT_CONTROL_VERSION,
+  type DocumentControl,
   type DocumentAmendmentBody,
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
+import { createDocumentControlNotifier } from "../document-control-notifier.js";
 import { DocumentPublish } from "../document-publish.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { DocumentDeliveryTransport } from "../document-delivery.js";
@@ -70,7 +76,22 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     },
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: (agentName) => (agentName === AGENT ? owner : null),
-    notifyPeer: async () => ({ ok: true }),
+    // THE REAL NOTIFIER over the REAL derivation (DOD-MP-CONTROL-N-1). This was
+    // `async () => ({ ok: true })`, which is why nothing here noticed that close/kill addressed the
+    // genesis peer alone: a stub reports success, sends nothing, and agrees with whatever the near
+    // side did. Only the SEND is captured, into the same array everything else uses.
+    notifyPeer: (documentId, verb) =>
+      createDocumentControlNotifier({
+        get store() { return layer.store; },
+        owners: () => [{ agentName: AGENT, ownerAgentId: owner }],
+        holders: (o, d) => layer.controlHolders(o, d),
+        sign: async (_n, tbs) => keys.sign(tbs),
+        send: async (_n, input) => {
+          sent.push({ peerAgentId: input.peerAgentId, bytes: input.bytes });
+          return { ok: true as const };
+        },
+        now: () => NOW,
+      })(documentId, verb),
     rollback: () => ({ ok: true }),
     sign: async (_owner, tbs) => keys.sign(tbs),
   });
@@ -133,7 +154,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   };
 
   return {
-    call, layer, sent, owner, peer, events, db, incomingProposal,
+    call, layer, sent, owner, peer, events, db, incomingProposal, keys,
     peerComesOnline: () => {
       sendFails = undefined;
     },
@@ -929,5 +950,131 @@ describe("DOD-DOC-SCREEN-1 §16.7-16 — the sender ADOPTS the receiver's rule",
       .toMatchObject({ ok: false, reason: "document_peer_rule_adopted" });
     expect(await f.call("cello_doc_write", { document_id: docB, content: "café" }))
       .toMatchObject({ ok: true, published: true });
+  });
+});
+
+describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain", () => {
+  /**
+   * The holder set here is built by real invite/accept, not stubbed. That distinction is the whole
+   * point: the fan-out unit tests hand the notifier a list and prove it fans out over whatever it
+   * is given, which stays green if the list is wrong. These prove the LIST.
+   */
+  async function threeHolders(opts: { soleAdmin?: boolean } = {}) {
+    const fA = await newFixture(); // creator
+    const fC = await newFixture(); // the joiner, its own DB and keys
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      starting_content: "shared base. ",
+      // Omitting `admins` makes BOTH genesis parties admins, and removing a fellow admin through
+      // the holder door is refused by design (the two-admin deadlock, §13-D3). The removal test
+      // therefore declares A the sole admin — which is also what the live fleet run did.
+      ...(opts.soleAdmin ? { admins: [fA.owner] } : {}),
+    });
+    const documentId = proposed.documentId as string;
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    expect(invited).toMatchObject({ ok: true, epochId: 1 });
+    const offer = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offer.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await fC.call("cello_doc_accept", { document_id: documentId });
+    fA.sent.length = 0; // only what the ENDING sends, from here on
+    return { fA, fC, documentId };
+  }
+
+  it("close reaches BOTH the genesis peer and the joiner", async () => {
+    const { fA, fC, documentId } = await threeHolders();
+
+    const closed = await fA.call("cello_doc_close", { document_id: documentId });
+    expect(closed.ok).toBe(true);
+
+    const told = fA.sent.map((s) => s.peerAgentId).sort();
+    // The defect, in one assertion: this was [fA.peer] — the joiner, converging and publishing for
+    // the life of the document, was never told it had ended.
+    expect(told).toEqual([fA.peer, fC.owner].sort());
+    expect(closed.holdersNotified).toEqual({ [fA.peer]: true, [fC.owner]: true });
+    expect(closed.peerNotified).toBe(true);
+    // Signed once: byte-identical to both, because the frame commits to the document and verb and
+    // never to a recipient.
+    expect(Buffer.from(fA.sent[0]!.bytes)).toEqual(Buffer.from(fA.sent[1]!.bytes));
+    expect(decodeDocumentControl(fA.sent[0]!.bytes)).toMatchObject({
+      verb: "close",
+      document_id: documentId,
+      sender_agent_id: fA.owner,
+    });
+  });
+
+  it("after a removal the frame goes to the joiner and NOT to the removed genesis peer", async () => {
+    const { fA, fC, documentId } = await threeHolders({ soleAdmin: true });
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId,
+      holder_pubkey: fA.peer,
+    });
+    expect(removed, JSON.stringify(removed)).toMatchObject({ ok: true, epochId: 2 });
+    fA.sent.length = 0;
+
+    const killed = await fA.call("cello_doc_kill", { document_id: documentId });
+    expect(killed.ok).toBe(true);
+    // THE LIVE FLEET CASE. `doc.peerAgentId` is still the removed holder, so the old code sent the
+    // ending to the one party with no rights left and told the actual remaining co-author nothing.
+    expect(fA.sent.map((s) => s.peerAgentId)).toEqual([fC.owner]);
+    expect(killed.holdersNotified).toEqual({ [fC.owner]: true });
+  });
+
+  it("the JOINER's close is accepted by the creator — a party is a party, not just the genesis peer", async () => {
+    const { fA, fC, documentId } = await threeHolders();
+    fC.sent.length = 0;
+
+    const closed = await fC.call("cello_doc_close", { document_id: documentId });
+    expect(closed.ok).toBe(true);
+    // C correctly addresses A and the other holder...
+    const control = fC.sent.find((s) => s.peerAgentId === fA.owner);
+    expect(control, "the joiner's close must be addressed to the creator").toBeDefined();
+
+    // ...and A must RECORD it. Before the inbound half was fixed, A refused this — C is not A's
+    // `peerAgentId` — so a joiner could never end a document they hold: the sender was told
+    // everyone had heard them while nothing was recorded anywhere.
+    const routed = fA.layer.onDocumentFrame(AGENT, "session-1", control!.bytes, fC.owner);
+    expect(routed.consumed).toBe(true);
+    const closedBy = (): string[] =>
+      (fA.layer.store.rawDb
+        .prepare(`SELECT closed_by FROM document_closes WHERE owner_agent_id = ? AND document_id = ?`)
+        .all(fA.owner, documentId) as Array<{ closed_by: string }>).map((r) => r.closed_by);
+    await until(() => closedBy().includes(fC.owner));
+    // Recorded against the JOINER, not credited to the genesis peer — writing the peer column here
+    // would put the wrong name on the record and let two joiners settle as one identity.
+    expect(closedBy()).toContain(fC.owner);
+  });
+
+  it("a REMOVED holder cannot end the creator's document — the honest daemon refuses it", async () => {
+    const { fA, fC, documentId } = await threeHolders({ soleAdmin: true });
+    // C is removed. C's own daemon would now self-censor, so the frame is signed and delivered
+    // DIRECTLY into A's inbound path — the rewritten-client case, which is the only one that
+    // matters here: a guard that lives solely in the sender's daemon guards nothing.
+    await fA.call("cello_doc_remove", { document_id: documentId, holder_pubkey: fC.owner });
+
+    const control: DocumentControl = {
+      type: "document_control",
+      control_version: DOCUMENT_CONTROL_VERSION,
+      document_id: documentId,
+      sender_agent_id: fC.owner,
+      verb: "kill",
+      sent_at_ms: NOW,
+      signature: new Uint8Array(0),
+    };
+    control.signature = await fC.keys.sign(buildDocumentControlTbs(control));
+    const routed = fA.layer.onDocumentFrame(
+      AGENT, "session-1", new Uint8Array(encodeDocumentControl(control)), fC.owner,
+    );
+    expect(routed.consumed).toBe(true);
+    await new Promise((r) => setTimeout(r, 100));
+
+    // A's document is UNTOUCHED. `doc.peerAgentId` never was C, so this particular direction was
+    // already safe — the mirror case (the removed GENESIS peer killing the creator's document)
+    // is the one the old gate admitted, and both now run through derived membership.
+    const status = fA.layer.store.getDocument(fA.owner, documentId)?.status;
+    expect(status, "a removed holder must not be able to end the document").toBe("active");
   });
 });

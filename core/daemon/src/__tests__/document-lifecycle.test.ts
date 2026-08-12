@@ -86,7 +86,11 @@ function newFixture() {
     {
       notifyPeer: async (documentId, verb) => {
         notified.push({ documentId, verb });
-        return { ok: true };
+        // The per-holder map is the notifier's answer now (DOD-MP-CONTROL-N-1). A bare `{ok: true}`
+        // stub is what this fixture used to return, and it is worth naming: `peerNotified` folds
+        // this map, so a stub with no entries would report "nobody was told" here and a stub that
+        // hardcodes success would hide a fan-out that reached nobody.
+        return { ok: true, holdersNotified: { [PEER]: true } };
       },
     },
     (_a, _d, envelopeHash) => {
@@ -339,7 +343,7 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
     });
     const lifecycle = new DocumentLifecycle(
       store, logger,
-      { notifyPeer: async () => ({ ok: true }) },
+      { notifyPeer: async () => ({ ok: true, holdersNotified: { [PEER]: true } }) },
       () => ({ ok: false, reason: "nothing_tracked" }),
     );
     const e = envelope(AGENT, null);

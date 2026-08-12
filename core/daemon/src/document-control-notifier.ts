@@ -26,6 +26,22 @@
  * none. So the owner is resolved here, by asking each agent this daemon holds whether the document
  * is theirs. A document id is a hash committing to both parties and a nonce, so at most one agent
  * can answer.
+ *
+ * ── DOD-MP-CONTROL-N-1 — WHY THE TARGET IS DERIVED, NOT `peerAgentId` ─────────────────────────
+ *
+ * This addressed `doc.peerAgentId` and returned after one send. That column is the GENESIS
+ * counterparty, frozen at creation, and multiplayer made it wrong in two ways at once: with three
+ * holders only one was told, and after a removal the genesis counterparty can BE the removed
+ * holder — so the frame went to the one party it must not reach while the remaining co-author was
+ * never told, under a reported `peerNotified: true`. Found by the M14B live fleet smoke.
+ *
+ * The target is now the DERIVED participant set, the same source FANOUT-1 established for update
+ * envelopes; control frames were simply never migrated to it. Deriving needs the genesis proposal,
+ * the amendment chain and signature verification — all of which live above this module, so it
+ * arrives as an injected `holders()` rather than by widening this unit into the replay engine.
+ *
+ * A derivation failure REFUSES. It must never fall back to `peerAgentId`: that is the old bug, and
+ * it aims the frame at exactly the wrong party in the case that motivated the change.
  */
 
 import { randomUUID } from "node:crypto";
@@ -42,6 +58,15 @@ export interface DocumentControlNotifierDeps {
   store: DocumentStore;
   /** The agents this daemon holds — name for signing and sending, owner key for scoping the store. */
   owners(): ReadonlyArray<{ agentName: string; ownerAgentId: string }>;
+  /**
+   * The CURRENT holders of this document OTHER than the owner, derived from the genesis proposal
+   * plus the amendment chain — the same set that governs update delivery. A failure to derive is
+   * returned, not swallowed: this unit refuses rather than guessing a recipient.
+   */
+  holders(
+    ownerAgentId: string,
+    documentId: string,
+  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string };
   /** Sign as the named agent. A miss must REFUSE, not substitute another agent's key. */
   sign(agentName: string, tbs: Uint8Array): Promise<Uint8Array>;
   send(
@@ -61,13 +86,29 @@ export interface DocumentControlNotifierDeps {
 export type NotifyPeer = (
   documentId: string,
   verb: DocumentControlVerb,
-) => Promise<{ ok: true } | { ok: false; reason: string; detail?: string }>;
+) => Promise<
+  | { ok: true; holdersNotified: Record<string, boolean> }
+  | { ok: false; reason: string; detail?: string }
+>;
 
 export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps): NotifyPeer {
   return async (documentId, verb) => {
     for (const { agentName, ownerAgentId } of deps.owners()) {
       const doc = deps.store.getDocument(ownerAgentId, documentId);
       if (!doc) continue;
+
+      const targets = deps.holders(ownerAgentId, documentId);
+      if (!targets.ok) {
+        deps.logger?.warn("document.control.holders_underivable", {
+          documentId, verb, agentName, reason: targets.reason,
+        });
+        return { ok: false, reason: targets.reason };
+      }
+      if (targets.holders.length === 0) {
+        // Distinct from a failed send, and reported rather than returned as a vacuous success: an
+        // empty map behind `ok: true` reads as "everyone was told" to a caller that checks only ok.
+        return { ok: false, reason: "document_no_holders" };
+      }
 
       const control: DocumentControl = {
         type: "document_control",
@@ -96,13 +137,40 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
         return { ok: false, reason: "document_control_unsigned", detail };
       }
       control.signature = signature;
+      // Signed ONCE. The TBS commits to the document, the sender and the verb — never to a
+      // recipient — so every holder receives byte-identical evidence and cannot be handed a
+      // frame that differs from their co-holders'.
+      const bytes = encodeDocumentControl(control);
 
-      return deps.send(agentName, {
-        peerAgentId: doc.peerAgentId,
-        documentId,
-        bytes: encodeDocumentControl(control),
-        correlationId: randomUUID(),
-      });
+      const holdersNotified: Record<string, boolean> = {};
+      for (const holder of targets.holders) {
+        // Sequential and independent: one unreachable holder must neither block nor abort the
+        // others (availability is a first-class protocol concern), and a throw from the transport
+        // is that holder's failure alone, not the fan-out's.
+        try {
+          const sent = await deps.send(agentName, {
+            peerAgentId: holder,
+            documentId,
+            bytes,
+            correlationId: randomUUID(),
+          });
+          holdersNotified[holder] = sent.ok;
+          if (!sent.ok) {
+            deps.logger?.warn("document.control.holder_not_notified", {
+              documentId, verb, holderAgentId: holder, reason: sent.reason,
+            });
+          }
+        } catch (err: unknown) {
+          holdersNotified[holder] = false;
+          deps.logger?.warn("document.control.holder_not_notified", {
+            documentId, verb, holderAgentId: holder,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      // `ok` means SIGNED AND ATTEMPTED TO EVERY CURRENT HOLDER. Who actually took it is the map's
+      // job — collapsing that into one boolean is how a partial fan-out reads as a clean one.
+      return { ok: true, holdersNotified };
     }
     // No agent on this daemon holds it. Named as such rather than reported as a transport failure:
     // the two want different things from whoever reads the log.
