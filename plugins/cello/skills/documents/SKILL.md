@@ -152,7 +152,7 @@ document worse in a way that is tedious to undo.
 | `pendingSent` | Left this machine; the peer has **not confirmed** them. Not the same as arrived. |
 | `pendingDeliveries` | The total still outstanding — `pendingUnsent` + `pendingSent`. |
 | `abandonedDeliveries` | Updates that were **given up on** and will never be retried. Not delivered. Republish them. |
-| `closePending` | You closed; waiting for them to close too. |
+| `closePending` | You closed; still waiting on at least one other current holder. It ends when everyone who holds it has said so. |
 
 ## Ending one
 

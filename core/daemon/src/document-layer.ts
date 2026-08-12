@@ -281,7 +281,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // the same shape `live` uses above; the gate is only ever called long after construction.
     // Wired HERE rather than left to the daemon so every consumer of the layer — including the
     // e2e fixture — gets the real derivation and cannot silently keep the bilateral gate.
-    (ownerAgentId, documentId) => holdersFor(ownerAgentId, documentId),
+    (ownerAgentId, documentId) => {
+      // LEGACY vs UNKNOWN, decided HERE because only this scope can tell them apart: no genesis
+      // record means no chain at all — a bilateral document predating amendments, for which the
+      // peer column IS the membership. A genesis record whose chain will not replay is a different
+      // fact, and one this daemon must not paper over by assuming two parties.
+      if (!handshake.get(ownerAgentId, documentId)) return { kind: "legacy" as const };
+      const holders = holdersFor(ownerAgentId, documentId);
+      return holders === null
+        ? { kind: "unknown" as const, reason: "document_chain_underivable" }
+        : { kind: "derived" as const, holders };
+    },
   );
   const notifications = new DocumentNotifications(store, logger);
   // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool
@@ -668,6 +678,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           epochId: env.body.epoch_id,
           removedBy: env.collection.required_signers.join(","),
         });
+      }
+      // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one holder
+      // who had not closed leaves everyone who remains in agreement, and without this the document
+      // stayed `active` forever reporting that it waited on nobody: control frames are fire-once
+      // and never swept, so no later event would have settled it.
+      if (env.body.kind === "remove_holder" || env.body.kind === "add_holder") {
+        lifecycle.onMembershipChanged(
+          ownerAgentId,
+          documentId,
+          env.body.kind === "remove_holder" ? (env.body.subject_agent_id ?? undefined) : undefined,
+        );
       }
     },
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the

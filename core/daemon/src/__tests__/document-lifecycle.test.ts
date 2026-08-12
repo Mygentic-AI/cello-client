@@ -513,3 +513,58 @@ describe("DocumentLifecycle — the pause records WHEN", () => {
     expect(row.updated_at).toBe(NOW);
   });
 });
+
+describe("DOD-MP-CLOSE-N-1 — 'cannot answer' is TWO facts, and they get different answers", () => {
+  /**
+   * The first cut folded both into one null. Refusing both broke every genuine pre-amendment
+   * document — it could then never be closed by anyone, which the bilateral suite above caught.
+   * Standing in for both restored the defect this unit exists to remove. Only one of them is legacy.
+   */
+  function withVerdict(verdict: import("../document-lifecycle.js").HolderVerdict) {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const events: string[] = [];
+    const rec = (e: string) => { events.push(e); };
+    const logger = { debug: rec, info: rec, warn: rec, error: rec } as unknown as Logger;
+    const store = new DocumentStore(db, logger);
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    const lifecycle = new DocumentLifecycle(
+      store, logger,
+      { notifyPeer: async () => ({ ok: true, holdersNotified: { [PEER]: true } }) },
+      () => ({ ok: true }),
+      undefined,
+      () => verdict,
+    );
+    return { store, lifecycle, events };
+  }
+
+  it("LEGACY (no chain at all) settles on the genesis pair — the pre-amendment document still works", async () => {
+    const f = withVerdict({ kind: "legacy" });
+    await f.lifecycle.close(AGENT, DOC, NOW);
+    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(true);
+    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("closed");
+  });
+
+  it("UNKNOWN (a chain that will not replay) refuses to settle, and says so", async () => {
+    const f = withVerdict({ kind: "unknown", reason: "document_chain_underivable" });
+    await f.lifecycle.close(AGENT, DOC, NOW);
+    // The peer's close is refused by the gate — a chain we cannot read may have removed them.
+    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(false);
+    // And even the local half does not settle it: standing in the pair here would complete a
+    // document that may have a third holder nobody can see.
+    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
+    expect(f.events).toContain("document.close.holders_underivable");
+  });
+
+  it("UNKNOWN reports closePending TRUE — 'still waiting' is the safe answer, 'nothing pending' is not", async () => {
+    const f = withVerdict({ kind: "unknown", reason: "document_chain_underivable" });
+    await f.lifecycle.close(AGENT, DOC, NOW);
+    const row = f.lifecycle.list(AGENT).find((r) => r.documentId === DOC)!;
+    // Reporting false would tell an operator this document needs nothing from anyone, when in
+    // fact nothing can settle it until the chain is readable again.
+    expect(row.closePending).toBe(true);
+  });
+});

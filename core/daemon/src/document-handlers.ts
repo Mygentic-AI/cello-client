@@ -1067,6 +1067,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
+    // DOD-MP-CLOSE-N-1 — removing the one holder who had not closed leaves everyone who remains in
+    // agreement, so the removal itself can complete it. Without this the document sat `active`
+    // forever, reporting that it waited on nobody. Also drops the removed holder's close row, so a
+    // later re-admission does not carry their old agreement into a new tenure.
+    layer.lifecycle.onMembershipChanged(who.ownerAgentId, documentId, holder);
 
     // The amendment travels to EVERY current holder INCLUDING the removed one — being told is
     // how their daemon surfaces the removal to their operator. Best-effort at P1, per holder,

@@ -1070,6 +1070,74 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     expect(row().closePending).toBe(false);
   });
 
+  it("CLOSE-N-1 F3: removing the holder who never closed COMPLETES the agreement", async () => {
+    const { fA, fC, documentId } = await threeHolders({ soleAdmin: true });
+
+    // A and the joiner close. The genesis peer never answers.
+    await fA.call("cello_doc_close", { document_id: documentId });
+    expect(fA.layer.lifecycle.recordPeerClose(fA.owner, documentId, fC.owner, NOW).ok).toBe(true);
+    expect(fA.layer.store.getDocument(fA.owner, documentId)?.status).toBe("active");
+
+    // A gives up and removes them. Everyone who REMAINS has now agreed — so it is done. Without
+    // re-evaluating on the membership change this stayed `active` forever while `closePending`
+    // read false: open, waiting on nobody, and unsettleable, because control frames are fire-once
+    // and never swept.
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fA.peer,
+    });
+    expect(removed, JSON.stringify(removed)).toMatchObject({ ok: true });
+    expect(fA.layer.store.getDocument(fA.owner, documentId)?.status).toBe("closed");
+    const row = (fA.layer.lifecycle.list(fA.owner) as Array<{ documentId: string; closePending: boolean }>)
+      .find((r) => r.documentId === documentId)!;
+    expect(row.closePending).toBe(false);
+  });
+
+  it("CLOSE-N-1 F2: a chain that will not derive REFUSES to settle rather than falling back to the pair", async () => {
+    const { fA, fC, documentId } = await threeHolders();
+
+    // Both other holders close while the chain is still readable.
+    expect(fA.layer.lifecycle.recordPeerClose(fA.owner, documentId, fA.peer, NOW).ok).toBe(true);
+    expect(fA.layer.lifecycle.recordPeerClose(fA.owner, documentId, fC.owner, NOW).ok).toBe(true);
+    // Undo the joiner's, so only the genesis PAIR would look agreed under the old fallback.
+    fA.layer.store.rawDb
+      .prepare(`DELETE FROM document_closes WHERE owner_agent_id = ? AND document_id = ? AND closed_by = ?`)
+      .run(fA.owner, documentId, fC.owner);
+
+    // Now the chain cannot be derived. The old null branch stood in `[owner, peerAgentId]`, which
+    // both HAVE closed — so it settled a three-holder document on two, silently, with the surface
+    // showing `closed` and nothing saying the derivation had failed. `close()` takes no sender
+    // gate, so this reaches the settle decision directly.
+    fA.layer.store.rawDb
+      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
+
+    await fA.call("cello_doc_close", { document_id: documentId });
+    expect(
+      fA.layer.store.getDocument(fA.owner, documentId)?.status,
+      "an underivable chain must never settle the document on the genesis pair",
+    ).toBe("active");
+  });
+
+  it("CLOSE-N-1 F1: one undecodable chain must not take down cello_doc_list", async () => {
+    const { fA, documentId } = await threeHolders();
+    await fA.call("cello_doc_close", { document_id: documentId });
+    fA.layer.store.rawDb
+      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
+
+    // `holdersFor` THROWS on bytes this build cannot read. Uncontained, that throw escaped the row,
+    // escaped the map, and the operator asking "what documents do I have" got a raw CBOR decoder
+    // string naming no document — the exact regression already fixed once in `arrangementFor`,
+    // re-opened here through a different call site.
+    const listed = await fA.call("cello_doc_list");
+    expect(listed.ok).toBe(true);
+    const rows = listed.documents as Array<{ documentId: string; closePending: boolean }>;
+    const row = rows.find((r) => r.documentId === documentId)!;
+    expect(row, "the degraded document must still appear").toBeDefined();
+    // We closed and CANNOT PROVE the others did — "still waiting" is the safe answer here.
+    expect(row.closePending).toBe(true);
+  });
+
   it("a REMOVED holder cannot end the creator's document — the honest daemon refuses it", async () => {
     const { fA, fC, documentId } = await threeHolders({ soleAdmin: true });
     // C is removed. C's own daemon would now self-censor, so the frame is signed and delivered
