@@ -176,6 +176,11 @@ With more than two holders, a partial result is the ordinary one: some heard it,
 offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
 there are several of them.
 
+A holder who was offline is not forgotten: the ending is owed to them and re-sent when they come
+back. If it still cannot be confirmed after several tries the daemon stops and says so, naming them
+— at that point they may genuinely still believe the document is open, and telling them is the only
+thing that will fix it.
+
 
 ## When YOU are the one who was removed
 

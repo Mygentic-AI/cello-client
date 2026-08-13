@@ -2048,9 +2048,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     holdersNotified?: Record<string, boolean>,
     holderFailures?: Record<string, string>,
   ): string {
+    // DOD-MP-CONTROL-DURABLE-1 — this said "A close is not retried", and that stopped being true
+    // when the ending became durable. A sentence telling the operator to do by hand what the daemon
+    // now does for them is not merely stale: it invites a second close for no reason, and it
+    // undersells the one case that still needs them — a holder we never manage to confirm.
     const tail = verb === "close"
-      ? `A close is not retried — run cello_doc_close again once this is cleared, or cello_doc_kill if you need it over now.`
-      : `The kill stands locally either way; run cello_doc_kill again once this is cleared so they stop editing.`;
+      ? `The ending is owed to anyone who did not take it and is re-sent when they return; you do ` +
+        `not need to run this again. If it still cannot be confirmed the daemon says so, naming ` +
+        `them — that one needs you.`
+      : `The kill stands locally either way, and is re-sent to anyone who did not take it until ` +
+        `they do or the daemon reports that it gave up on them.`;
     if (reason === "document_control_unsigned") {
       return (
         `Your ${verb} was recorded, but this agent's signing key could not be loaded, so nothing ` +
