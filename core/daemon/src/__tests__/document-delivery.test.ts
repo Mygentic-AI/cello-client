@@ -723,3 +723,49 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
     expect(f.store.pendingAmendmentDeliveries(AGENT, NOW)).toHaveLength(1);
   });
 });
+
+/**
+ * DOD-MP-INVITE-FANOUT-1, clause 6 — THE UPGRADE PATH, against a POPULATED database.
+ *
+ * §2e: the daemon's migration mechanism is client-side and its failures are unrecoverable on an
+ * operator's machine, so every schema change is tested against a database that already has rows —
+ * never a fresh one. A fresh-DB test cannot fail the way a real upgrade fails.
+ */
+describe("DOD-MP-INVITE-FANOUT-1 — upgrading a populated database keeps its content deliveries", () => {
+  it("a pending content delivery written BEFORE the amendment table existed still delivers after", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+
+    // A daemon on the OLD build: a document and a content envelope owed to the peer.
+    const before = newFixture({}, db);
+    before.store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    const old = envelope(AGENT, null);
+    before.store.appendEnvelope(AGENT, old);
+    before.store.seedDeliveries(AGENT, DOC, old.envelopeHash, [PEER], NOW);
+    const owedBefore = before.store.pendingHolderDeliveries(AGENT, NOW);
+    expect(owedBefore.length, "the pre-upgrade backlog must be non-empty or this proves nothing")
+      .toBeGreaterThan(0);
+
+    // The upgrade: a NEW store opens the SAME database, exactly as a restarted daemon does.
+    const after = newFixture({}, db);
+
+    // The old backlog is untouched — not dropped, not duplicated, still owed to the same holder.
+    const owedAfter = after.store.pendingHolderDeliveries(AGENT, NOW);
+    expect(owedAfter.map((p) => p.envelope.envelopeHash))
+      .toEqual(owedBefore.map((p) => p.envelope.envelopeHash));
+    expect(owedAfter.every((p) => p.holderAgentId === PEER)).toBe(true);
+
+    // And the new capability is available on the upgraded database, with no data migration step.
+    after.store.seedAmendmentDeliveries(AGENT, DOC, "ab".repeat(32), [PEER], NOW);
+    expect(after.store.pendingAmendmentDeliveries(AGENT, NOW)).toHaveLength(0); // no chain row yet
+    expect(() => after.store.pendingAmendmentDeliveries(AGENT, NOW)).not.toThrow();
+
+    // The content delivery still goes out on the upgraded store — the pass is not broken by the
+    // new queue sitting in front of it.
+    const res = await after.delivery.tick(AGENT, after.holdersFor, NOW);
+    expect(res.delivered + res.sent).toBeGreaterThan(0);
+  });
+});
