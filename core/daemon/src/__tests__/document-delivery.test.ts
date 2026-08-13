@@ -780,11 +780,26 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
         return { ok: true as const, sessionId: "s", sessionOpened: true };
       },
     });
-    oweAmendment(f);
+    const hex = oweAmendment(f);
+    // A SECOND holder who IS still in the chain, owed the same amendment. Without this the test
+    // passes against an implementation that acks every row and never sends anything at all —
+    // "nothing was dialed" is exactly what a do-nothing loop achieves.
+    const H2 = "ee".repeat(32);
+    f.store.seedAmendmentDeliveries(AGENT, DOC, hex, [H2], NOW);
+
     // PEER is gone from the derived set — governance must not be sprayed at whoever was last known.
-    await f.delivery.tick(AGENT, () => [], NOW);
-    expect(sends).toEqual([]);
-    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toEqual([]);
+    await f.delivery.tick(AGENT, () => [H2], NOW);
+    expect(sends, "the remaining holder is dialed; the departed one is not").toEqual([H2]);
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)
+      .map((p) => p.holderAgentId)).not.toContain(PEER);
+    // RETIRED, NOT ACKED — the durable record must not claim a delivery that never happened.
+    const row = f.db.prepare(
+      `SELECT acked_at, retired_at FROM document_amendment_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ?`,
+    ).get(AGENT, PEER) as { acked_at: number | null; retired_at: number | null };
+    expect(row.retired_at).not.toBeNull();
+    expect(row.acked_at).toBeNull();
+    expect(f.events.some((e) => e.event === "document.amendment.holder_retired")).toBe(true);
   });
 
   it("an underivable chain DEFERS the amendment rather than guessing a recipient", async () => {
@@ -824,12 +839,12 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
  * operator's machine, so every schema change is tested against a database that already has rows —
  * never a fresh one. A fresh-DB test cannot fail the way a real upgrade fails.
  */
-describe("DOD-MP-INVITE-FANOUT-1 — upgrading a populated database keeps its content deliveries", () => {
-  it("a pending content delivery written BEFORE the amendment table existed still delivers after", async () => {
+describe("DOD-MP-INVITE-FANOUT-1 — upgrading a genuinely PRE-MIGRATION populated database", () => {
+  it("a database with NO amendment-delivery table keeps its content backlog and gains the table", async () => {
     const db = new DatabaseSync(":memory:");
     db.exec("PRAGMA foreign_keys = ON");
 
-    // A daemon on the OLD build: a document and a content envelope owed to the peer.
+    // A daemon on the OLD build: real documents, a real content backlog.
     const before = newFixture({}, db);
     before.store.createDocument({
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
@@ -838,27 +853,82 @@ describe("DOD-MP-INVITE-FANOUT-1 — upgrading a populated database keeps its co
     const old = envelope(AGENT, null);
     before.store.appendEnvelope(AGENT, old);
     before.store.seedDeliveries(AGENT, DOC, old.envelopeHash, [PEER], NOW);
+
+    // NOW MAKE IT ACTUALLY PRE-MIGRATION. The first version of this test asserted nothing about
+    // migration: `DocumentStore`'s constructor creates `document_amendment_deliveries`
+    // unconditionally, so its "before" store already had the new schema and the test would have
+    // passed on a build with no migration at all. Dropping the table reproduces the real starting
+    // state — a populated database that has never seen this change.
+    db.exec("DROP TABLE document_amendment_deliveries");
+    const present = () =>
+      (db.prepare(
+        "SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='document_amendment_deliveries'",
+      ).get() as { n: number }).n;
+    expect(present(), "the premise: the table must be ABSENT before the upgrade").toBe(0);
+
     const owedBefore = before.store.pendingHolderDeliveries(AGENT, NOW);
     expect(owedBefore.length, "the pre-upgrade backlog must be non-empty or this proves nothing")
       .toBeGreaterThan(0);
 
-    // The upgrade: a NEW store opens the SAME database, exactly as a restarted daemon does.
+    // THE UPGRADE: a new store opens the same database, exactly as a restarted daemon does.
     const after = newFixture({}, db);
 
-    // The old backlog is untouched — not dropped, not duplicated, still owed to the same holder.
+    // The migration ran, on a populated database, with no data step.
+    expect(present()).toBe(1);
+    // And the old backlog is untouched — not dropped, not duplicated, same holder.
     const owedAfter = after.store.pendingHolderDeliveries(AGENT, NOW);
     expect(owedAfter.map((p) => p.envelope.envelopeHash))
       .toEqual(owedBefore.map((p) => p.envelope.envelopeHash));
     expect(owedAfter.every((p) => p.holderAgentId === PEER)).toBe(true);
 
-    // And the new capability is available on the upgraded database, with no data migration step.
-    after.store.seedAmendmentDeliveries(AGENT, DOC, "ab".repeat(32), [PEER], NOW);
-    expect(after.store.pendingAmendmentDeliveries(AGENT, NOW)).toHaveLength(0); // no chain row yet
-    expect(() => after.store.pendingAmendmentDeliveries(AGENT, NOW)).not.toThrow();
-
-    // The content delivery still goes out on the upgraded store — the pass is not broken by the
-    // new queue sitting in front of it.
+    // The content delivery still goes out on the upgraded store — the new queue sitting in front of
+    // it does not break the pass.
     const res = await after.delivery.tick(AGENT, after.holdersFor, NOW);
     expect(res.delivered + res.sent).toBeGreaterThan(0);
+  });
+
+  it("an owed amendment SURVIVES a restart — the debt is on disk, like the backlog it replaces", async () => {
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const first = newFixture({
+      sendBytes: async () => ({ ok: false as const, reason: "session_sealed", detail: "sealed" }),
+    }, db);
+    first.store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    const body = {
+      document_id: DOC, epoch_id: 1, prev_amendment_hash: null,
+      kind: "add_holder", subject_agent_id: "cc".repeat(32),
+      property_change: null, state_hash: null, authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const hex = Buffer.from(hash).toString("hex");
+    db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, 1, hex, Buffer.from(encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC, subject_kind: "document_amendment", subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    })), 1);
+    first.store.seedAmendmentDeliveries(AGENT, DOC, hex, [PEER], NOW);
+    await first.delivery.tick(AGENT, first.holdersFor, NOW);
+
+    // THE DAEMON RESTARTS. Clause 2 claims the holder still receives it "after a daemon restart,
+    // with no operator action", and nothing pinned that — an in-memory debt would evaporate here
+    // and the membership change would be lost exactly as it was before the fix.
+    const reopened = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+    }, db);
+    const owed = reopened.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2);
+    expect(owed.map((o) => o.amendmentHash)).toEqual([hex]);
+
+    const res = await reopened.delivery.tick(AGENT, reopened.holdersFor, NOW + DELIVERY_BACKOFF_CAP_MS * 2);
+    expect(res.sent).toBe(1);
   });
 });
