@@ -397,3 +397,69 @@ describe("an answer that arrives inside the grace is REPORTED, not discarded", (
     expect(await t.transport.deliver(deliverInput())).toMatchObject({ admitted: null });
   });
 });
+
+/**
+ * DOD-MP-SESSION-RETIRE-1, the remaining half — WIRED, not just implemented.
+ *
+ * The suspects unit beside this one proves the counting. It proves nothing about whether the
+ * transport consults it, and a fix that is correct in a module nobody calls is the exact shape of a
+ * green suite over a broken daemon. This drives the real transport.
+ */
+describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keeps refusing", () => {
+  it("opens a FRESH session after repeated relay_session_gone, and destroys nothing", async () => {
+    const t = newTransport({
+      activeSessionsWith: () => ["stuck-session"],
+      sendContent: async (_a, sessionId) => {
+        // The fully-sealed case: the relay has discarded its state and answers with the string that
+        // is deliberately NOT in TERMINAL_RELAY_REFUSALS, because it also fires for LIVE sessions
+        // whenever the relay restarts.
+        if (sessionId === "stuck-session") return { ok: false, reason: "relay_session_gone", error: "gone" };
+        return { ok: true, delivered: true };
+      },
+    });
+
+    // Two refusals — the DoD's "repeated", not the first blip.
+    await t.transport.deliver(deliverInput());
+    await t.transport.deliver(deliverInput());
+    expect(t.opened, "one bad answer must not churn a live session").toEqual([]);
+
+    // The third acquire routes around it.
+    const third = await t.transport.deliver(deliverInput());
+    expect(t.opened, "delivery must open a fresh session instead of resubmitting forever").toEqual([PEER]);
+    expect(third.ok).toBe(true);
+    // NOTHING WAS DESTROYED. The refused fix retired the session; this one leaves it listed and
+    // usable by the conversation path, which is what makes it safe when the string merely meant
+    // "the relay lost its memory".
+    expect(t.sealed).not.toContain("stuck-session");
+  });
+
+  it("a session that RECOVERS keeps being reused — the run must be consecutive", async () => {
+    let fail = true;
+    const t = newTransport({
+      activeSessionsWith: () => ["flaky"],
+      sendContent: async (_a, sessionId) => {
+        if (fail) return { ok: false as const, reason: "relay_session_gone", error: "gone" };
+        return { ok: true as const, delivered: true, sessionId };
+      },
+    });
+    await t.transport.deliver(deliverInput());
+    fail = false;
+    await t.transport.deliver(deliverInput()); // works — clears the run
+    fail = true;
+    await t.transport.deliver(deliverInput()); // one more failure, not two in a row
+    // A flaky link is not a dead session. Opening a fresh one here would churn a session that is
+    // demonstrably still carrying traffic.
+    expect(t.opened).toEqual([]);
+  });
+
+  it("an OFFLINE peer never condemns the session", async () => {
+    const t = newTransport({
+      activeSessionsWith: () => ["s"],
+      sendContent: async () => ({ ok: false as const, reason: "transport_unavailable", error: "away" }),
+    });
+    for (let i = 0; i < 4; i++) await t.transport.deliver(deliverInput());
+    // Otherwise every sweep against a sleeping counterparty opens a new session, each sealed moments
+    // later — churn dressed up as availability.
+    expect(t.opened).toEqual([]);
+  });
+});

@@ -41,6 +41,7 @@ import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { LEAF_KIND_DOC } from "./session-relay-client.js";
 import type { Logger } from "./types.js";
+import { createSessionSuspects, TERMINAL_ISH_REFUSALS } from "./delivery-session-suspects.js";
 
 export interface DocumentTransportDeps {
   /**
@@ -148,6 +149,11 @@ export const DOCUMENT_LEAF_KIND = LEAF_KIND_DOC;
 export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
 ): DocumentDeliveryTransport {
+  // DOD-MP-SESSION-RETIRE-1 (remaining half) — sessions this worker has stopped REUSING because
+  // they keep answering terminally. Per transport instance, in memory, destroying nothing: see
+  // delivery-session-suspects.ts for why `relay_session_gone` is handled here and not by retiring.
+  const suspects = createSessionSuspects();
+
   /**
    * Acquire a session with the peer — the hint, then the most recent active one, then a fresh dial.
    *
@@ -180,7 +186,25 @@ export function createDocumentDeliveryTransport(
       return { ok: true, sessionId: sessionHint, sessionOpened: false };
     }
     // Most recent LAST — activeSessionsWith is ordered oldest-first by the daemon's adapter.
-    if (active.length > 0) return { ok: true, sessionId: active[active.length - 1]!, sessionOpened: false };
+    //
+    // DOD-MP-SESSION-RETIRE-1 — a session that has answered terminally more than once is skipped
+    // rather than retired. If it really is finished, delivery routes around it instead of
+    // resubmitting into it forever; if the relay merely bounced and lost its memory, the cost is
+    // one extra session and the old one is untouched. Nothing is destroyed on an ambiguous signal.
+    const reusable = active.filter((id) => !suspects.isSuspect(id));
+    if (reusable.length > 0) {
+      return { ok: true, sessionId: reusable[reusable.length - 1]!, sessionOpened: false };
+    }
+    if (active.length > 0) {
+      deps.logger.warn("document.delivery.session.bypassed", {
+        peerAgentId,
+        skipped: active.length,
+        correlationId,
+        impact:
+          "every open session with this holder has refused terminally more than once — opening a " +
+          "fresh one; the old sessions are left intact",
+      });
+    }
     const opened = await deps.openSession(deps.agentName, peerAgentId, correlationId);
     if (!opened.ok) {
       // The upstream reason verbatim. `document_delivery_threw` is reserved for a genuine
@@ -216,6 +240,9 @@ export function createDocumentDeliveryTransport(
       // of those compute the hash with the same function.
       const hash = wireContentHash(bytes);
       const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND);
+      // DOD-MP-SESSION-RETIRE-1 — a working send breaks the run; a terminal-ish refusal extends it.
+      if (sent.ok) suspects.noteSuccess(session.sessionId);
+      else if (TERMINAL_ISH_REFUSALS.has(sent.reason)) suspects.noteFailure(session.sessionId, sent.reason);
       if (!sent.ok) {
         // Sealed even on a send failure, for the same reason as below: a session this daemon opened
         // and walked away from is a live node the operator never started. A failed send is exactly
@@ -257,6 +284,11 @@ export function createDocumentDeliveryTransport(
 
       const { bytes, hash } = deps.encodeEnvelope(envelope);
       const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId, DOCUMENT_LEAF_KIND);
+      // DOD-MP-SESSION-RETIRE-1 — same accounting on the envelope path. Both paths acquire through
+      // `acquireSession`, so a session judged on one is skipped by the other; splitting the record
+      // would let a session that keeps refusing envelopes still be picked for the next frame.
+      if (sent.ok) suspects.noteSuccess(sessionId);
+      else if (TERMINAL_ISH_REFUSALS.has(sent.reason)) suspects.noteFailure(sessionId, sent.reason);
       if (sent.ok) deps.appendLeaf(deps.agentName, sessionId, hash, correlationId);
       if (!sent.ok) {
         // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it
