@@ -245,7 +245,17 @@ export function createDocumentDeliveryTransport(
         correlationId,
       });
       if (session.sessionOpened) await deps.sealSession(deps.agentName, session.sessionId, correlationId);
-      return { ok: true, sessionId: session.sessionId, sessionOpened: session.sessionOpened };
+      // `parked` SURVIVES THE RETURN. It was computed one line above, logged, and discarded — and a
+      // caller that reads `ok` alone cannot tell "the holder has it" from "the relay is holding it
+      // because the holder had no live counterparty". For an amendment that difference is the whole
+      // fact: there is no ack frame, so a caller which clears its debt on `ok` loses the membership
+      // change the moment the relay parks it.
+      return {
+        ok: true,
+        sessionId: session.sessionId,
+        sessionOpened: session.sessionOpened,
+        parked: sent.delivered === false,
+      };
     },
 
     async deliver(input) {

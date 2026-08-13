@@ -85,7 +85,16 @@ export interface DocumentDeliveryTransport {
      */
     leafKind?: number;
   }): Promise<
-    | { ok: true; sessionId: string; sessionOpened: boolean }
+    | {
+        ok: true;
+        sessionId: string;
+        sessionOpened: boolean;
+        /**
+         * The relay took it because the holder had no live counterparty — it is NOT with them yet.
+         * Only a caller that has no ack frame needs this, and for those `ok` alone is a lie.
+         */
+        parked?: boolean;
+      }
     | { ok: false; reason: string; detail?: string }
   >;
   deliver(input: {
