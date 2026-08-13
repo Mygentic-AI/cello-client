@@ -72,7 +72,14 @@ export interface DocumentControlNotifierDeps {
   send(
     agentName: string,
     input: { peerAgentId: string; documentId: string; bytes: Uint8Array; correlationId: string },
-  ): Promise<{ ok: true } | { ok: false; reason: string }>;
+    /**
+     * `parked: true` means the RELAY took it because the holder had no live counterparty — the
+     * ending is not with them. Without this the fast path reported `holdersNotified: true` for a
+     * frame nobody had received, and spent one of five sends doing it, while the drain loop
+     * correctly treated the same outcome as not-sent. Two halves of one feature disagreeing about
+     * what "sent" means, in the direction that reports success.
+     */
+  ): Promise<{ ok: true; parked?: boolean } | { ok: false; reason: string }>;
   now(): number;
   /**
    * Optional, and only for reporting a LOCAL fault. This module used to swallow the signing error
@@ -111,6 +118,14 @@ export const CONTROL_RESEND_AFTER_MS = 600_000;
 
 /** How many SENDS a control frame gets before the daemon stops and reports it unconfirmed. */
 export const CONTROL_MAX_SENDS = 5;
+
+/**
+ * How many failed ATTEMPTS before an unreachable holder is reported — while delivery keeps trying.
+ *
+ * The send ceiling can never fire for a holder who is never reachable, because only a successful
+ * send spends it. Without this the loud report existed only for the case you can see.
+ */
+export const CONTROL_UNREACHABLE_REPORT_AFTER = 5;
 
 export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps): NotifyPeer {
   return async (documentId, verb) => {
@@ -187,8 +202,16 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
             bytes,
             correlationId: randomUUID(),
           });
-          holdersNotified[holder] = sent.ok;
-          if (sent.ok) {
+          const landed = sent.ok && sent.parked !== true;
+          holdersNotified[holder] = landed;
+          if (!landed && sent.ok) {
+            holderFailures[holder] = "relay_parked";
+            deps.logger?.warn("document.control.holder_not_notified", {
+              documentId, verb, holderAgentId: holder, reason: "relay_parked",
+              detail: "the relay is holding it — the holder had no live counterparty",
+            });
+          }
+          if (landed) {
             // SENT, never acked — a control frame has no answer, so the most this can honestly say
             // is that the bytes left. The row stays owed and the worker re-offers it until the
             // send ceiling is spent, then says so loudly rather than pretending.

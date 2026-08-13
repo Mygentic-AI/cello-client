@@ -1091,11 +1091,22 @@ export class DocumentStore {
     holderAgentIds: readonly string[],
     nowMs: number,
   ): void {
+    // A FRESH CLOSE IS A FRESH DEBT. `DO NOTHING` meant that once a row was retired, re-running
+    // the verb — the natural response to `document.control.unconfirmed`, and the thing the ERROR
+    // effectively asks for — seeded nothing, sent once best-effort, and owed nothing. The operator's
+    // only recourse restored the exact one-shot behaviour this unit removed, at the moment they
+    // were acting on our own warning.
     const insert = this.#db.prepare(
       `INSERT INTO document_control_deliveries
          (owner_agent_id, document_id, verb, holder_agent_id, frame, created_at)
        VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT (owner_agent_id, document_id, verb, holder_agent_id) DO NOTHING`,
+       ON CONFLICT (owner_agent_id, document_id, verb, holder_agent_id) DO UPDATE SET
+         frame = excluded.frame,
+         retired_at = NULL,
+         sends = 0,
+         attempts = 0,
+         next_attempt_at = NULL
+       WHERE document_control_deliveries.acked_at IS NULL`,
     );
     for (const holder of holderAgentIds) {
       insert.run(ownerAgentId, documentId, verb, holder, Buffer.from(frame), nowMs);

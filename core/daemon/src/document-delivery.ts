@@ -27,7 +27,11 @@
  */
 
 import type { DocumentStore, DocumentEnvelopeRow } from "./document-store.js";
-import { CONTROL_RESEND_AFTER_MS, CONTROL_MAX_SENDS } from "./document-control-notifier.js";
+import {
+  CONTROL_RESEND_AFTER_MS,
+  CONTROL_MAX_SENDS,
+  CONTROL_UNREACHABLE_REPORT_AFTER,
+} from "./document-control-notifier.js";
 import type { Logger } from "./types.js";
 
 /**
@@ -218,16 +222,40 @@ export interface DeliveryTickResult {
   failed: number;
 }
 
+/**
+ * DOD-MP-CONTROL-DURABLE-1 — how a CONTROL frame's recipients are derived.
+ *
+ * Deliberately NOT the sweep's `holdersFor`. That returns null for a document with no stored
+ * genesis proposal, while `controlHolders` — the function the notifier uses — has an explicit
+ * legacy branch for exactly that case. Deriving the two halves of one feature differently is how a
+ * seeded row becomes a permanent no-op, and it is the failure shape this milestone keeps producing.
+ */
+export type ControlHoldersFor = (
+  documentId: string,
+) => { ok: true; holders: readonly string[] } | { ok: false; reason: string };
+
 export class DocumentDelivery {
   readonly #store: DocumentStore;
   readonly #transport: DocumentDeliveryTransport;
   readonly #logger: Logger;
+  readonly #controlHolders: ControlHoldersFor;
   #inFlight: Promise<DeliveryTickResult> | null = null;
 
-  constructor(store: DocumentStore, transport: DocumentDeliveryTransport, logger: Logger) {
+  constructor(
+    store: DocumentStore,
+    transport: DocumentDeliveryTransport,
+    logger: Logger,
+    /**
+     * REQUIRED IN PRACTICE. The default refuses rather than falling back to the envelope
+     * derivation: a fallback would look correct for every ordinary document and silently drop
+     * every legacy one, which is precisely the bug this parameter exists to prevent.
+     */
+    controlHolders: ControlHoldersFor = () => ({ ok: false, reason: "control_holders_unavailable" }),
+  ) {
     this.#store = store;
     this.#transport = transport;
     this.#logger = logger;
+    this.#controlHolders = controlHolders;
   }
 
   /**
@@ -424,6 +452,19 @@ export class DocumentDelivery {
       const list = holders.get(p.holderAgentId);
       if (list) list.push(p);
       else holders.set(p.holderAgentId, [p]);
+    }
+
+    // DOD-MP-CONTROL-DURABLE-1 — endings for documents with NO pending content go FIRST.
+    //
+    // The ordering rule is per-document (D's ending after D's content), so draining every
+    // document's ending behind every OTHER document's content bought nothing while creating a real
+    // hazard: the pass is time-bounded and restarts from the top, so a large backlog or one slow
+    // dial meant the control queue was deterministically never reached. A document with nothing
+    // queued cannot violate the rule, so it is served before that risk applies.
+    const documentsWithContent = new Set(byDocument.keys());
+    for (const owed of this.#store.pendingControlDeliveries(ownerAgentId, nowMs)) {
+      if (documentsWithContent.has(owed.documentId)) continue;
+      await this.#deliverControl(ownerAgentId, owed, nowMs, correlationId, result);
     }
 
     for (const [documentId, holderGroups] of byDocument) {
@@ -654,96 +695,158 @@ export class DocumentDelivery {
     }
 
 
-    // DOD-MP-CONTROL-DURABLE-1 — control frames drain LAST, and that is the opposite of amendments
-    // on purpose. An amendment must reach a holder BEFORE the content that depends on it; a close
-    // must reach them AFTER the content it terminates, or they end the document holding less of it
-    // than the sender does.
+    // DOD-MP-CONTROL-DURABLE-1 — and then the rest. A document whose content has just gone out in
+    // this same pass gets its ending immediately after it, which is the order the receiver needs.
     for (const owed of this.#store.pendingControlDeliveries(ownerAgentId, nowMs)) {
-      const holders = holdersFor(owed.documentId);
-      if (holders === null) {
-        this.#store.recordControlAttempt(
-          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
-          nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
-        );
-        continue;
-      }
-      // A holder the chain no longer contains is not owed the ending — removal already stopped
-      // delivery to them, and chasing them with a close would contradict the act that removed them.
-      if (!holders.includes(owed.holderAgentId)) {
-        this.#store.settleControlDelivery(
-          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
-        );
-        continue;
-      }
-      if (owed.sends >= CONTROL_MAX_SENDS) {
-        // STOP, AND SAY SO. A control frame has no ack, so retrying forever would chatter at every
-        // holder for the life of the document. Retired rather than acked — the record must not
-        // claim they were told when nothing confirmed it — and at ERROR, because the consequence is
-        // that someone still believes this document is open.
-        this.#store.settleControlDelivery(
-          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
-        );
-        this.#logger.error("document.control.unconfirmed", {
-          documentId: owed.documentId,
-          holderAgentId: owed.holderAgentId,
-          verb: owed.verb,
-          sends: owed.sends,
-          correlationId,
-          impact:
-            "this holder was never confirmed to have received the ending — their copy may still " +
-            "be open, and their next edit will be refused rather than applied",
-        });
-        continue;
-      }
-      result.attempted += 1;
-      try {
-        const sent = await this.#transport.sendBytes({
-          peerAgentId: owed.holderAgentId,
-          documentId: owed.documentId,
-          bytes: owed.bytes,
-          correlationId,
-        });
-        if (sent.ok && sent.parked !== true) {
-          this.#store.markControlSent(
-            ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
-            nowMs, CONTROL_RESEND_AFTER_MS,
-          );
-          result.sent += 1;
-        } else {
-          // Parked is not delivered, here for the same reason as everywhere else: the relay holding
-          // it is not the holder having it.
+      await this.#deliverControl(ownerAgentId, owed, nowMs, correlationId, result);
+    }
+
+    return result;
+  }
+
+  /**
+   * One owed control frame — extracted so the drain can run in two phases without duplicating it.
+   *
+   * Control-first would not merely leave a holder with a lesser copy: the inbound path refuses
+   * envelopes on a closed or killed document TERMINALLY, and the worker treats a rejection as an
+   * ack — so every queued envelope would settle unsent and never be retried. Content-then-ending is
+   * what stops that content being silently lost.
+   */
+  async #deliverControl(
+    ownerAgentId: string,
+    owed: {
+      holderAgentId: string; documentId: string; verb: string;
+      sends: number; attempts: number; bytes: Uint8Array;
+    },
+    nowMs: number,
+    correlationId: string,
+    result: DeliveryTickResult,
+  ): Promise<void> {
+
+        // THE SAME DERIVATION THE NOTIFIER USED. Using the sweep's `holdersFor` here made a document
+        // with no stored genesis proposal a permanent no-op: seeded, sent once by the fast path, then
+        // rescheduled forever because the drain could not derive a recipient the notifier had already
+        // found. `controlHolders`'s own comment names this — the two paths must agree about what
+        // "cannot answer" means.
+        const derived = this.#controlHolders(owed.documentId);
+        if (!derived.ok) {
           this.#store.recordControlAttempt(
             ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
-            nowMs + backoffFor(owed.attempts),
+            nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
           );
+          // NOT SILENT. The sibling amendment branch logs for the reason its comment gives: the row
+          // would otherwise be re-scanned every tick forever with nothing said anywhere, and here the
+          // consequence is a holder who thinks the document is still open.
+          this.#logger.error("document.control.holders_underivable", {
+            documentId: owed.documentId,
+            holderAgentId: owed.holderAgentId,
+            verb: owed.verb,
+            reason: derived.reason,
+            correlationId,
+            impact:
+              "this ending cannot be addressed to anyone — the holder will go on believing the " +
+              "document is open",
+          });
+          return;
+        }
+        const holders = derived.holders;
+        // A holder the chain no longer contains is not owed the ending — removal already stopped
+        // delivery to them, and chasing them with a close would contradict the act that removed them.
+        // BOTH checks, matching the amendment loop: a disagreement between the derived set and the
+        // recorded removal would otherwise keep this loop dialing a locally-removed holder.
+        if (this.#store.memberRemoved(ownerAgentId, owed.documentId, owed.holderAgentId).removed
+            || !holders.includes(owed.holderAgentId)) {
+          this.#store.settleControlDelivery(
+            ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
+          );
+          return;
+        }
+        // REPORTED EVEN WHEN WE HAVE NOT GIVEN UP. A holder we can never reach never advances
+        // `sends` (only a successful send does), so the ceiling below never fires for them — the loud
+        // report existed for the holder you CAN reach and not for the one the DoD line is actually
+        // about. This says so once, and keeps trying, because stopping would be the Entry-15 defect:
+        // quiet deferrals to an absent peer are not evidence that further tries are pointless.
+        if (owed.attempts === CONTROL_UNREACHABLE_REPORT_AFTER) {
+          this.#logger.error("document.control.unconfirmed", {
+            documentId: owed.documentId,
+            holderAgentId: owed.holderAgentId,
+            verb: owed.verb,
+            attempts: owed.attempts,
+            stillTrying: true,
+            correlationId,
+            impact:
+              "this holder has not been reachable since the document ended — their copy may still " +
+              "be open, and delivery keeps trying",
+          });
+        }
+        if (owed.sends >= CONTROL_MAX_SENDS) {
+          // STOP, AND SAY SO. A control frame has no ack, so retrying forever would chatter at every
+          // holder for the life of the document. Retired rather than acked — the record must not
+          // claim they were told when nothing confirmed it — and at ERROR, because the consequence is
+          // that someone still believes this document is open.
+          this.#store.settleControlDelivery(
+            ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
+          );
+          this.#logger.error("document.control.unconfirmed", {
+            documentId: owed.documentId,
+            holderAgentId: owed.holderAgentId,
+            verb: owed.verb,
+            sends: owed.sends,
+            correlationId,
+            impact:
+              "this holder was never confirmed to have received the ending — their copy may still " +
+              "be open, and their next edit will be refused rather than applied",
+          });
+          return;
+        }
+        result.attempted += 1;
+        // CLAIM THE ROW BEFORE DIALING, the rule both sibling loops state. Without it a crash
+        // mid-dial leaves the row immediately due with the counters unchanged, so a crash-looping
+        // daemon dials at full rate forever and never backs off — and the 60s sweep firing inside the
+        // notifier's own await sends the same close twice, which was PROVEN in review: both holders
+        // received it twice and 40% of the send ceiling was spent before the first retry.
+        this.#store.recordControlAttempt(
+          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+          nowMs + backoffFor(owed.attempts),
+        );
+        try {
+          const sent = await this.#transport.sendBytes({
+            peerAgentId: owed.holderAgentId,
+            documentId: owed.documentId,
+            bytes: owed.bytes,
+            correlationId,
+          });
+          if (sent.ok && sent.parked !== true) {
+            this.#store.markControlSent(
+              ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+              nowMs, CONTROL_RESEND_AFTER_MS,
+            );
+            result.sent += 1;
+          } else {
+            // Parked is not delivered, here for the same reason as everywhere else: the relay holding
+            // it is not the holder having it. The attempt was already claimed above.
+            result.failed += 1;
+            this.#logger.warn("document.control.delivery_failed", {
+              documentId: owed.documentId,
+              holderAgentId: owed.holderAgentId,
+              verb: owed.verb,
+              reason: sent.ok ? "relay_parked" : sent.reason,
+              detail: sent.ok ? "the relay is holding it — the holder had no live counterparty" : sent.detail,
+              attempts: owed.attempts + 1,
+              correlationId,
+            });
+          }
+        } catch (err: unknown) {
           result.failed += 1;
           this.#logger.warn("document.control.delivery_failed", {
             documentId: owed.documentId,
             holderAgentId: owed.holderAgentId,
             verb: owed.verb,
-            reason: sent.ok ? "relay_parked" : sent.reason,
-            detail: sent.ok ? "the relay is holding it — the holder had no live counterparty" : sent.detail,
-            attempts: owed.attempts + 1,
+            reason: "control_send_threw",
+            detail: err instanceof Error ? err.message : String(err),
             correlationId,
           });
         }
-      } catch (err: unknown) {
-        this.#store.recordControlAttempt(
-          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
-          nowMs + backoffFor(owed.attempts),
-        );
-        result.failed += 1;
-        this.#logger.warn("document.control.delivery_failed", {
-          documentId: owed.documentId,
-          holderAgentId: owed.holderAgentId,
-          verb: owed.verb,
-          reason: "control_send_threw",
-          detail: err instanceof Error ? err.message : String(err),
-          correlationId,
-        });
-      }
-    }
-
-    return result;
   }
+
 }

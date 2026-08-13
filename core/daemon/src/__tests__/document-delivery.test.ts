@@ -54,7 +54,13 @@ function envelope(sender: string, prev: string | null): DocumentEnvelopeRow {
   };
 }
 
-function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existingDb?: DatabaseSync) {
+function newFixture(
+  transport: Partial<DocumentDeliveryTransport> = {},
+  existingDb?: DatabaseSync,
+  controlHolders: (documentId: string) =>
+    | { ok: true; holders: readonly string[] }
+    | { ok: false; reason: string } = () => ({ ok: true, holders: [PEER] }),
+) {
   const { logger, events } = recordingLogger();
   const db = existingDb ?? new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
@@ -79,7 +85,8 @@ function newFixture(transport: Partial<DocumentDeliveryTransport> = {}, existing
     events,
     calls,
     db,
-    delivery: new DocumentDelivery(store, t, logger),
+    // The control drain derives recipients the way the notifier does — see ControlHoldersFor.
+    delivery: new DocumentDelivery(store, t, logger, controlHolders),
     holdersFor: () => [PEER],
   };
 }
@@ -1000,9 +1007,36 @@ describe("DOD-MP-CONTROL-DURABLE-1 — an owed ending is retried, then reported 
     f.store.appendEnvelope(AGENT, envelope(AGENT, null));
 
     await f.delivery.tick(AGENT, f.holdersFor, NOW);
-    // The opposite of the amendment rule, deliberately: a holder who applies the close before the
-    // last edit ends the document holding less of it than the sender does.
+    // The opposite of the amendment rule, deliberately — and it is not merely about a lesser copy:
+    // the inbound path refuses envelopes on a closed document TERMINALLY, and the worker treats a
+    // rejection as an ack, so a close that arrived first would settle every queued envelope unsent
+    // and never retry it. Content-then-ending is what stops that content being lost.
     expect(order).toEqual(["envelope", "control"]);
+  });
+
+  it("one document's ending does not wait behind ANOTHER document's content", async () => {
+    // The scope of the rule, which the test above cannot see: it has one document, so it passes
+    // whether the ending follows THIS document's content or ALL content. Draining globally last is
+    // starvable — the pass is time-bounded and restarts from the top — and buys nothing, because
+    // the constraint is per document.
+    const order: string[] = [];
+    const OTHER = "ab".repeat(32);
+    const f = newFixture({
+      sendBytes: async () => { order.push("control:other"); return { ok: true as const, sessionId: "s", sessionOpened: true }; },
+      deliver: async () => { order.push("envelope:main"); return { ok: true as const, admitted: true, sessionId: "s", sessionOpened: true }; },
+    });
+    // A second document that owes only an ENDING, with no content of its own.
+    f.store.createDocument({
+      documentId: OTHER, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
+    });
+    f.store.seedControlDeliveries(AGENT, OTHER, "close", new Uint8Array([9, 9]), [PEER], NOW);
+    // …and the main document with a content backlog.
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    // The other document has nothing queued, so nothing it could arrive out of order with.
+    expect(order[0]).toBe("control:other");
   });
 
   it("gives up after the send ceiling and says so LOUDLY — retired, never acked", async () => {
@@ -1030,16 +1064,57 @@ describe("DOD-MP-CONTROL-DURABLE-1 — an owed ending is retried, then reported 
     expect(row.acked_at).toBeNull();
   });
 
-  it("a holder the chain no longer contains is not chased with the ending", async () => {
+  it("a holder the chain no longer contains is RETIRED, not merely absent", async () => {
     const sends: string[] = [];
-    const f = newFixture({
-      sendBytes: async (input) => { sends.push(input.peerAgentId); return { ok: true as const, sessionId: "s", sessionOpened: true }; },
-    });
+    const f = newFixture(
+      { sendBytes: async (input) => { sends.push(input.peerAgentId); return { ok: true as const, sessionId: "s", sessionOpened: true }; } },
+      undefined,
+      () => ({ ok: true, holders: [] }),
+    );
     oweControl(f);
-    await f.delivery.tick(AGENT, () => [], NOW);
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
     // Removal already stopped delivery to them; chasing them with a close would contradict the act
     // that removed them.
     expect(sends).toEqual([]);
     expect(f.store.pendingControlDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toEqual([]);
+    // THE ROW MUST EXIST AND SAY RETIRED. Asserting only absence passed against an implementation
+    // that never seeded anything at all — it could not tell "correctly retired" from "never
+    // existed", which is the whole claim.
+    const row = f.db.prepare(
+      `SELECT retired_at, acked_at, sends FROM document_control_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ?`,
+    ).get(AGENT, PEER) as { retired_at: number | null; acked_at: number | null; sends: number };
+    expect(row, "the debt must have been recorded before it was retired").toBeDefined();
+    expect(row.retired_at).not.toBeNull();
+    expect(row.acked_at, "retired is not told").toBeNull();
+    expect(row.sends, "nothing was ever sent to them").toBe(0);
+  });
+
+  it("quiet deferrals to an ABSENT holder never spend the send ceiling", async () => {
+    // The Entry-15 defect, in the new table. The ceiling test above drives only SUCCESSFUL sends,
+    // so an implementation that drove the ceiling from `attempts` would pass it verbatim — and
+    // would abandon the ending after five failed tries to a holder who was merely away.
+    const wire = { up: false };
+    const f = newFixture({
+      sendBytes: async () =>
+        wire.up
+          ? { ok: true as const, sessionId: "s", sessionOpened: true }
+          : { ok: false as const, reason: "transport_unavailable", detail: "away" },
+    });
+    oweControl(f);
+    let at = NOW;
+    for (let i = 0; i < 6; i++) {
+      await f.delivery.tick(AGENT, f.holdersFor, at);
+      at += DELIVERY_BACKOFF_CAP_MS + 1;
+    }
+    wire.up = true;
+    const res = await f.delivery.tick(AGENT, f.holdersFor, at);
+    // The first real send after they return must still happen.
+    expect(res.sent).toBe(1);
+    const row = f.db.prepare(
+      `SELECT retired_at FROM document_control_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ?`,
+    ).get(AGENT, PEER) as { retired_at: number | null };
+    expect(row.retired_at, "an away holder must not have been given up on").toBeNull();
   });
 });

@@ -3865,7 +3865,22 @@ async function startDaemonHoldingLock(
   const documentDeliveryFor = (agentName: string): DocumentDelivery => {
     const existing = documentDeliveryWorkers.get(agentName);
     if (existing) return existing;
-    const worker = new DocumentDelivery(documentLayer.store, documentTransportFor(agentName), logger);
+    const worker = new DocumentDelivery(
+      documentLayer.store,
+      documentTransportFor(agentName),
+      logger,
+      // DOD-MP-CONTROL-DURABLE-1 — control frames derive their recipients the way the NOTIFIER
+      // does, not the way envelopes do. `holdersFor` returns null for a document with no stored
+      // genesis proposal; `controlHolders` has an explicit legacy branch for it. Deriving the two
+      // halves differently turned a seeded row into a permanent no-op.
+      (documentId) => {
+        const ownerAgentId = documentOwnerKeyFor(agentName);
+        if (ownerAgentId === null) {
+          return { ok: false as const, reason: "document_owner_key_unavailable" };
+        }
+        return documentLayer.controlHolders(ownerAgentId, documentId);
+      },
+    );
     documentDeliveryWorkers.set(agentName, worker);
     return worker;
   };
