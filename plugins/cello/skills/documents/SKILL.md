@@ -173,6 +173,30 @@ With more than two holders, a partial result is the ordinary one: some heard it,
 offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
 there are several of them.
 
+A holder who was offline is not forgotten: the ending is owed to them and re-sent when they return.
+If it still cannot be confirmed after several attempts the daemon stops and says so, naming them —
+at that point they may genuinely believe the document is still open.
+
+## When YOU are the one who was removed
+
+This is the view nobody thinks to describe, because it is the one you cannot see from the other
+side. If an admin removes you — or you leave with your own key — `cello_doc_list` marks that
+document `yourAccess: "removed"` and tells you which epoch it happened at.
+
+What that means, exactly:
+
+- **Your copy is still yours.** The full text and its whole history stay on your machine. You can
+  read it, open the file, and keep it forever. Removal cannot reach a copy someone already has, and
+  nothing in CELLO pretends otherwise.
+- **What stops is the flow of edits, in both directions.** Your writes no longer publish to the
+  other holders, and their changes no longer reach you. So the copy you keep is frozen at the moment
+  you were removed — it is a real record, not a live one.
+- **Your write will refuse, and it will say why.** You will get `document_removed` naming the epoch,
+  not a vague failure. If you are seeing that reason, nothing is broken; the arrangement changed.
+
+If you want back in, there is no move you can make alone — an admin has to invite you again, and
+your own accept makes it real, exactly as it did the first time.
+
 ## When something is wrong
 
 **`document_unknown`** — no document by that id for this agent. Check `cello_doc_list`; if you are

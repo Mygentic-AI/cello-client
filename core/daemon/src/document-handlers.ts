@@ -1356,8 +1356,44 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // actions.
         const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
         const peerAnswer = layer.handshake.peerAnswer(who.ownerAgentId, d.documentId);
+        // DOD-MP-REMOVE-FEEDBACK-1 — THE OPERATOR'S OWN STANDING, on the surface they check.
+        //
+        // This row said nothing about it. A document the operator has been removed from simply
+        // stopped listing them among the participants, which renders identically to one they are
+        // still part of and have not looked at closely — so the single fact that changes what they
+        // can do here was the one fact missing.
+        //
+        // The wording is bound by FORWARD-ONLY-REMOVAL: their copy and its history are theirs and
+        // cannot be reached, so nothing may read as though anything was taken back.
+        //
+        // CONTAINED. `membershipOf` walks the chain and THROWS on one that will not decode, and
+        // this runs per row inside the list — so an unreadable chain on ONE document would take
+        // down the whole listing. That exact regression has been fixed here twice already, each
+        // time through a different call site; a new caller inherits the hazard, not the fix.
+        // A row whose standing cannot be computed simply says nothing about standing.
+        let ownStanding: { state: string; epochId: number | null } | null = null;
+        try {
+          ownStanding = layer.amendments.membershipOf(
+            who.ownerAgentId, d.documentId, who.ownerAgentId,
+          );
+        } catch {
+          ownStanding = null;
+        }
+        const outOfIt = ownStanding !== null && ownStanding.state === "removed";
         return {
           ...d,
+          ...(outOfIt
+            ? {
+                yourAccess: "removed" as const,
+                ...(ownStanding!.epochId === null ? {} : { removedAtEpoch: ownStanding!.epochId }),
+                accessGuidance:
+                  `You are no longer a holder of this document` +
+                  (ownStanding!.epochId === null ? `. ` : `, as of epoch ${ownStanding!.epochId}. `) +
+                  `Your copy and its full history remain yours, and you can still read it here or ` +
+                  `open the file. What changed is only the flow of edits: yours no longer publish ` +
+                  `to the other holders, and theirs no longer reach you.`,
+              }
+            : {}),
           proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
           // THE PEER'S OWN SIGNED ANSWER — true accepted, false refused, null not yet heard. This
           // replaced an inference ("they have published into it") that could not tell refused from

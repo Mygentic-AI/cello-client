@@ -1283,3 +1283,62 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
     expect(owedTo).toEqual([fA.peer]);
   });
 });
+
+/**
+ * DOD-MP-REMOVE-FEEDBACK-1 — the removed holder's OWN view.
+ *
+ * The write refusal already names the removal. `cello_doc_list` did not mention it at all: the
+ * document simply stopped listing them among the participants, which renders identically to a
+ * document they are still part of and haven't looked at closely. So the one surface an operator
+ * checks to answer "what is going on with my documents" was silent about the single fact that
+ * changes what they can do with this one.
+ *
+ * FORWARD-ONLY-REMOVAL is the constraint on the wording: nothing here may imply the copy was taken
+ * back, because it was not and cannot be.
+ */
+describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surface they check", () => {
+  it("the list row says they are no longer a holder, at which epoch, and that the copy is theirs", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "shared for a while. ",
+    });
+    const documentId = proposed.documentId as string;
+
+    // A leaves its own document — the same arrangement state an admin's removal produces, and the
+    // one a test can construct without a second daemon.
+    const left = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fA.owner,
+    });
+    expect(left).toMatchObject({ ok: true, voluntary: true });
+
+    const list = await fA.call("cello_doc_list");
+    const row = (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d["documentId"] === documentId,
+    )!;
+
+    // THE DEFECT: this row carried nothing at all about the removal.
+    expect(row["yourAccess"], "the row must say the operator is out").toBe("removed");
+    expect(typeof row["removedAtEpoch"]).toBe("number");
+    const sentence = String(row["accessGuidance"] ?? "");
+    expect(sentence.length, "a flag with no sentence is not feedback").toBeGreaterThan(40);
+    // The four things D9 says they must learn.
+    expect(sentence).toMatch(/no longer a holder|removed/i);
+    expect(sentence).toContain("remain yours");
+    expect(sentence).toMatch(/no longer publish|do not publish|stop publishing/i);
+    // FORWARD-ONLY-REMOVAL: nothing may imply the copy was taken back.
+    expect(sentence).not.toMatch(/revoked|deleted|taken|lost access to your copy/i);
+  });
+
+  it("a document the operator still holds says NOTHING about removal", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const list = await fA.call("cello_doc_list");
+    const row = (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d["documentId"] === (proposed.documentId as string),
+    )!;
+    // A removal notice on a healthy document would be worse than none — an operator who sees it
+    // where it does not belong stops believing it where it does.
+    expect(row["yourAccess"]).toBeUndefined();
+    expect(row["accessGuidance"]).toBeUndefined();
+  });
+});
