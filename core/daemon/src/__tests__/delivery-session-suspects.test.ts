@@ -90,4 +90,24 @@ describe("DOD-MP-SESSION-RETIRE-1 — a session that keeps refusing stops being 
     // And the most recent judgement is the one that survives eviction.
     expect(s.isSuspect("s-499")).toBe(true);
   });
+
+  it("a session STILL BEING ASKED ABOUT is not evicted out of its own verdict", () => {
+    const s = createSessionSuspects();
+    s.noteFailure("victim", "session_sealed");
+    s.noteFailure("victim", "session_sealed");
+    expect(s.isSuspect("victim")).toBe(true);
+
+    // 256 later sessions go bad. The old shape re-inserted only on FAILURE, and a session that has
+    // ALREADY crossed is filtered out of the candidate list — so it never fails again, ages to the
+    // front, and is evicted first. Measured in review: this returned false, silently putting a dead
+    // session back in rotation and costing two more failed deliveries to re-learn.
+    for (let i = 0; i < 256; i++) {
+      s.noteFailure(`later-${i}`, "session_sealed");
+      s.noteFailure(`later-${i}`, "session_sealed");
+      // The acquire path asks about every candidate on every delivery; that read is the signal the
+      // judgement is still live.
+      expect(s.isSuspect("victim")).toBe(true);
+    }
+    expect(s.isSuspect("victim"), "a verdict in active use must survive the bound").toBe(true);
+  });
 });

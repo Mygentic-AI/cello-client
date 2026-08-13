@@ -81,8 +81,8 @@ export interface DocumentTransportDeps {
     /** The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below. */
     leafKind?: number,
   ): Promise<
-    | { ok: true; delivered: true }
-    | { ok: true; delivered: false; parked: true }
+    | { ok: true; delivered: true; relayRefusal?: string }
+    | { ok: true; delivered: false; parked: true; relayRefusal?: string }
     | { ok: false; reason: string; error: string }
   >;
   /** Encode a document envelope row onto the wire, and its content hash. */
@@ -155,6 +155,31 @@ export function createDocumentDeliveryTransport(
   const suspects = createSessionSuspects();
 
   /**
+   * One place that decides what a send outcome says about the SESSION.
+   *
+   * A refusal is obvious. The subtle case is a send that SUCCEEDED while the relay refused the
+   * leaf: the content reached the peer directly and the session's record stopped growing. That is
+   * a fact about the session, not about the peer, and reading `ok` alone both hid it and cleared
+   * the evidence of every earlier occurrence.
+   */
+  function noteSendOutcome(
+    sessionId: string,
+    sent:
+      | { ok: true; delivered?: boolean; parked?: boolean; relayRefusal?: string }
+      | { ok: false; reason: string; error?: string },
+  ): void {
+    if (!sent.ok) {
+      if (TERMINAL_ISH_REFUSALS.has(sent.reason)) suspects.noteFailure(sessionId, sent.reason);
+      return;
+    }
+    if (sent.relayRefusal !== undefined && TERMINAL_ISH_REFUSALS.has(sent.relayRefusal)) {
+      suspects.noteFailure(sessionId, sent.relayRefusal);
+      return;
+    }
+    suspects.noteSuccess(sessionId);
+  }
+
+  /**
    * Acquire a session with the peer — the hint, then the most recent active one, then a fresh dial.
    *
    * ONE implementation for every document frame kind. A proposal that opened its own session by a
@@ -182,6 +207,19 @@ export function createDocumentDeliveryTransport(
             `session ${sessionHint.slice(0, 16)}… is not an active session with ${peerAgentId}, ` +
             `so the change cannot be placed in that record`,
         };
+      }
+      if (suspects.isSuspect(sessionHint)) {
+        // HONOURED, NOT SUBSTITUTED — the only reason to pass a hint is to control which sealed
+        // record the change lands in, and quietly picking another session would defeat exactly
+        // that. But a caller aiming at a session whose record is gone should be told.
+        deps.logger.warn("document.delivery.session.hint_suspect", {
+          peerAgentId,
+          sessionId: sessionHint,
+          correlationId,
+          impact:
+            "this session has answered terminally more than once — the change is being placed in " +
+            "it as asked, and its record may no longer be growing",
+        });
       }
       return { ok: true, sessionId: sessionHint, sessionOpened: false };
     }
@@ -240,9 +278,14 @@ export function createDocumentDeliveryTransport(
       // of those compute the hash with the same function.
       const hash = wireContentHash(bytes);
       const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND);
-      // DOD-MP-SESSION-RETIRE-1 — a working send breaks the run; a terminal-ish refusal extends it.
-      if (sent.ok) suspects.noteSuccess(session.sessionId);
-      else if (TERMINAL_ISH_REFUSALS.has(sent.reason)) suspects.noteFailure(session.sessionId, sent.reason);
+      // DOD-MP-SESSION-RETIRE-1 — a working send breaks the run; a terminal-ish answer extends it.
+      //
+      // `relayRefusal` IS CHECKED FIRST, and that is the whole unit. The fully-sealed case answers
+      // `relay_session_gone`, which is deliberately not terminal — so the send warns, delivers
+      // directly, and returns SUCCESS for a leaf the relay never witnessed. Reading `ok` alone made
+      // the counter unreachable AND made every such send clear it, so a session whose record was
+      // permanently gone stayed in rotation forever.
+      noteSendOutcome(session.sessionId, sent);
       if (!sent.ok) {
         // Sealed even on a send failure, for the same reason as below: a session this daemon opened
         // and walked away from is a live node the operator never started. A failed send is exactly
@@ -287,8 +330,7 @@ export function createDocumentDeliveryTransport(
       // DOD-MP-SESSION-RETIRE-1 — same accounting on the envelope path. Both paths acquire through
       // `acquireSession`, so a session judged on one is skipped by the other; splitting the record
       // would let a session that keeps refusing envelopes still be picked for the next frame.
-      if (sent.ok) suspects.noteSuccess(sessionId);
-      else if (TERMINAL_ISH_REFUSALS.has(sent.reason)) suspects.noteFailure(sessionId, sent.reason);
+      noteSendOutcome(sessionId, sent);
       if (sent.ok) deps.appendLeaf(deps.agentName, sessionId, hash, correlationId);
       if (!sent.ok) {
         // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it

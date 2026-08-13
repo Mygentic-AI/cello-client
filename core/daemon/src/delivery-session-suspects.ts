@@ -84,7 +84,18 @@ export function createSessionSuspects(
       runs.delete(sessionId);
     },
     isSuspect(sessionId: string): boolean {
-      return (runs.get(sessionId) ?? 0) >= threshold;
+      const run = runs.get(sessionId) ?? 0;
+      // TOUCH ON READ. Re-inserting only on FAILURE protects a session that keeps failing, and gets
+      // the crossed-threshold case exactly backwards: once a session is suspect it is filtered out
+      // of the candidate list, so it never fails again, ages to the front of the insertion order,
+      // and is evicted FIRST — silently un-suspecting itself. Measured in review: a suspect session
+      // followed by 256 others came back not-suspect. Every acquire asks about each candidate, so
+      // reading is the signal that this judgement is still in use.
+      if (run > 0) {
+        runs.delete(sessionId);
+        runs.set(sessionId, run);
+      }
+      return run >= threshold;
     },
     size(): number {
       return runs.size;
