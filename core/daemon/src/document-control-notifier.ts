@@ -101,6 +101,17 @@ export type NotifyPeer = (
   | { ok: false; reason: string; detail?: string }
 >;
 
+/**
+ * How long before an unconfirmed control frame is offered again.
+ *
+ * A control frame has no ack, so this is insurance rather than a schedule: re-send a few times over
+ * a long window in case the holder was merely away, then stop and say so.
+ */
+export const CONTROL_RESEND_AFTER_MS = 600_000;
+
+/** How many SENDS a control frame gets before the daemon stops and reports it unconfirmed. */
+export const CONTROL_MAX_SENDS = 5;
+
 export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps): NotifyPeer {
   return async (documentId, verb) => {
     for (const { agentName, ownerAgentId } of deps.owners()) {
@@ -152,6 +163,17 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
       // frame that differs from their co-holders'.
       const bytes = encodeDocumentControl(control);
 
+      // DOD-MP-CONTROL-DURABLE-1 — RECORD THE DEBT BEFORE TRYING TO PAY IT.
+      //
+      // The loop below is a fast path, not the guarantee. It used to be both: one failed send and
+      // the frame was gone, so a holder who happened to be offline never learned the document had
+      // ended and their copy stayed open forever — with this call reporting the close as done.
+      //
+      // Seeding first also covers the crash window: a daemon that dies between here and the send
+      // still owes the ending on restart.
+      deps.store.seedControlDeliveries(
+        ownerAgentId, documentId, verb, bytes, targets.holders, deps.now(),
+      );
       const holdersNotified: Record<string, boolean> = {};
       const holderFailures: Record<string, string> = {};
       for (const holder of targets.holders) {
@@ -166,6 +188,14 @@ export function createDocumentControlNotifier(deps: DocumentControlNotifierDeps)
             correlationId: randomUUID(),
           });
           holdersNotified[holder] = sent.ok;
+          if (sent.ok) {
+            // SENT, never acked — a control frame has no answer, so the most this can honestly say
+            // is that the bytes left. The row stays owed and the worker re-offers it until the
+            // send ceiling is spent, then says so loudly rather than pretending.
+            deps.store.markControlSent(
+              ownerAgentId, documentId, verb, holder, deps.now(), CONTROL_RESEND_AFTER_MS,
+            );
+          }
           if (!sent.ok) {
             holderFailures[holder] = sent.reason;
             deps.logger?.warn("document.control.holder_not_notified", {

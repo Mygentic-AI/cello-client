@@ -960,3 +960,86 @@ describe("DOD-MP-INVITE-FANOUT-1 — upgrading a genuinely PRE-MIGRATION populat
     expect(res.sent).toBe(1);
   });
 });
+
+/**
+ * DOD-MP-CONTROL-DURABLE-1 — the worker drains owed control frames, and drains them LAST.
+ */
+describe("DOD-MP-CONTROL-DURABLE-1 — an owed ending is retried, then reported rather than forgotten", () => {
+  function oweControl(f: ReturnType<typeof newFixture>, verb = "close"): void {
+    f.store.seedControlDeliveries(AGENT, DOC, verb, new Uint8Array([7, 7, 7]), [PEER], NOW);
+  }
+
+  it("a holder who could not be told is retried on a later pass", async () => {
+    const wire = { up: false };
+    const f = newFixture({
+      sendBytes: async () =>
+        wire.up
+          ? { ok: true as const, sessionId: "s", sessionOpened: true }
+          : { ok: false as const, reason: "transport_unavailable", detail: "away" },
+    });
+    oweControl(f);
+
+    const first = await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    expect(first.failed).toBe(1);
+    // STILL OWED — before this, one failed send lost the ending and that holder's copy stayed open
+    // for good while the operator's surface reported the close as done.
+    expect(f.store.pendingControlDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toHaveLength(1);
+
+    wire.up = true;
+    const second = await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_BACKOFF_CAP_MS * 2);
+    expect(second.sent).toBe(1);
+  });
+
+  it("the ending goes out AFTER the content it terminates", async () => {
+    const order: string[] = [];
+    const f = newFixture({
+      sendBytes: async () => { order.push("control"); return { ok: true as const, sessionId: "s", sessionOpened: true }; },
+      deliver: async () => { order.push("envelope"); return { ok: true as const, admitted: true, sessionId: "s", sessionOpened: true }; },
+    });
+    oweControl(f);
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    // The opposite of the amendment rule, deliberately: a holder who applies the close before the
+    // last edit ends the document holding less of it than the sender does.
+    expect(order).toEqual(["envelope", "control"]);
+  });
+
+  it("gives up after the send ceiling and says so LOUDLY — retired, never acked", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+    });
+    oweControl(f);
+    let at = NOW;
+    for (let i = 0; i < 8; i++) {
+      await f.delivery.tick(AGENT, f.holdersFor, at);
+      at += 600_000 + 1;
+    }
+    // A control frame has no ack, so retrying forever would chatter at every holder for the life of
+    // the document. It stops — and an operator is told, because the consequence is that somebody
+    // still believes this document is open.
+    const ev = f.events.find((e) => e.event === "document.control.unconfirmed");
+    expect(ev, "an ending nobody confirmed must not be silent").toBeDefined();
+    expect(ev!.fields["holderAgentId"]).toBe(PEER);
+    const row = f.db.prepare(
+      `SELECT acked_at, retired_at FROM document_control_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ?`,
+    ).get(AGENT, PEER) as { acked_at: number | null; retired_at: number | null };
+    // The record must not claim they were told when nothing confirmed it.
+    expect(row.retired_at).not.toBeNull();
+    expect(row.acked_at).toBeNull();
+  });
+
+  it("a holder the chain no longer contains is not chased with the ending", async () => {
+    const sends: string[] = [];
+    const f = newFixture({
+      sendBytes: async (input) => { sends.push(input.peerAgentId); return { ok: true as const, sessionId: "s", sessionOpened: true }; },
+    });
+    oweControl(f);
+    await f.delivery.tick(AGENT, () => [], NOW);
+    // Removal already stopped delivery to them; chasing them with a close would contradict the act
+    // that removed them.
+    expect(sends).toEqual([]);
+    expect(f.store.pendingControlDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toEqual([]);
+  });
+});

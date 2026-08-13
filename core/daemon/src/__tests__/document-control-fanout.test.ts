@@ -68,7 +68,7 @@ function fixture(opts: {
     logger: { warn: (event, ctx) => warnings.push({ event, ctx }) },
   });
 
-  return { notify, sent, warnings };
+  return { notify, sent, warnings, store };
 }
 
 describe("control frames fan out to the DERIVED holder set", () => {
@@ -188,5 +188,41 @@ describe("control frames fan out to the DERIVED holder set", () => {
     const res = await f.notify("e".repeat(64), "close");
     expect(res.ok).toBe(false);
     expect((res as { reason: string }).reason).toBe("document_unknown");
+  });
+});
+
+/**
+ * DOD-MP-CONTROL-DURABLE-1 — close and kill must survive an unreachable holder.
+ *
+ * Found by audit while fixing the amendment fan-out (Entry 40), same family: the notifier signs
+ * once, sends to each derived holder, and persists NOTHING. No pending row, no retry, no restart
+ * survival — so a holder who is offline at that moment never learns the document ended, and their
+ * copy stays open forever.
+ *
+ * Ranked below the membership work on purpose: this diverges VISIBLY (the stale holder keeps
+ * editing and their edits start refusing), where a lost membership change diverges in silence. It
+ * still loses a governance frame on one failed send, which is the thing this milestone keeps
+ * finding.
+ */
+describe("DOD-MP-CONTROL-DURABLE-1 — an unreachable holder is still owed the ending", () => {
+  it("a holder who could not be told STAYS OWED the control frame", async () => {
+    const f = fixture({ sendFails: new Set([JOINER]) });
+    const res = await f.notify(DOC, "close") as { ok: boolean; holdersNotified: Record<string, boolean> };
+
+    expect(res.ok).toBe(true);
+    expect(res.holdersNotified[JOINER]).toBe(false);
+
+    // THE DEFECT IN ONE ASSERTION. Today this is zero: the send was best-effort, so when it failed
+    // nothing was left owing anywhere and that holder's copy stays open for good — with the
+    // operator's own surface reporting the close as done.
+    const owed = f.store
+      .pendingControlDeliveries(OWNER, 1_700_000_000_000 + 3_600_000)
+      .filter((p) => p.holderAgentId === JOINER);
+    expect(
+      owed.length,
+      "the ending must remain OWED to a holder who could not be reached",
+    ).toBeGreaterThan(0);
+    expect(owed[0]!.verb).toBe("close");
+    expect(owed[0]!.bytes.byteLength).toBeGreaterThan(0);
   });
 });

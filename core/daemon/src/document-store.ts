@@ -408,6 +408,31 @@ export class DocumentStore {
         PRIMARY KEY (owner_agent_id, document_id, amendment_hash, holder_agent_id)
       );
     `);
+    // DOD-MP-CONTROL-DURABLE-1 — close and kill get the same durability the amendment fan-out
+    // gained. The notifier signed once, sent to each derived holder and persisted nothing, so a
+    // holder offline at that instant never learned the document had ended and their copy stayed
+    // open for good — while the operator's own surface reported the close as done.
+    //
+    // The BYTES are stored here, unlike the amendment queue which joins the recorded chain. A
+    // control frame is not a chain event, so there is nothing to join; storing the signed frame is
+    // the only way a redelivery sends exactly what was signed rather than re-minting it.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS document_control_deliveries (
+        owner_agent_id  TEXT    NOT NULL,
+        document_id     TEXT    NOT NULL,
+        verb            TEXT    NOT NULL,
+        holder_agent_id TEXT    NOT NULL,
+        frame           BLOB    NOT NULL,
+        sent_at         INTEGER,
+        acked_at        INTEGER,
+        retired_at      INTEGER,
+        sends           INTEGER NOT NULL DEFAULT 0,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        created_at      INTEGER NOT NULL,
+        PRIMARY KEY (owner_agent_id, document_id, verb, holder_agent_id)
+      );
+    `);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
@@ -1055,6 +1080,124 @@ export class DocumentStore {
     for (const holder of holderAgentIds) {
       insert.run(ownerAgentId, documentId, envelopeHash, holder, nowMs);
     }
+  }
+
+  /** DOD-MP-CONTROL-DURABLE-1 — one owed row per holder who must learn this document ended. */
+  seedControlDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    verb: string,
+    frame: Uint8Array,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): void {
+    const insert = this.#db.prepare(
+      `INSERT INTO document_control_deliveries
+         (owner_agent_id, document_id, verb, holder_agent_id, frame, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT (owner_agent_id, document_id, verb, holder_agent_id) DO NOTHING`,
+    );
+    for (const holder of holderAgentIds) {
+      insert.run(ownerAgentId, documentId, verb, holder, Buffer.from(frame), nowMs);
+    }
+  }
+
+  /** Control frames still owed, with the exact signed bytes to re-send. */
+  pendingControlDeliveries(
+    ownerAgentId: string,
+    nowMs: number,
+  ): Array<{
+    holderAgentId: string;
+    documentId: string;
+    verb: string;
+    sends: number;
+    attempts: number;
+    bytes: Uint8Array;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT holder_agent_id, document_id, verb, sends, attempts, frame
+           FROM document_control_deliveries
+          WHERE owner_agent_id = ?
+            AND acked_at IS NULL AND retired_at IS NULL
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY created_at ASC`,
+      )
+      .all(ownerAgentId, nowMs) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      holderAgentId: r["holder_agent_id"] as string,
+      documentId: r["document_id"] as string,
+      verb: r["verb"] as string,
+      sends: (r["sends"] as number) ?? 0,
+      attempts: (r["attempts"] as number) ?? 0,
+      bytes: new Uint8Array(r["frame"] as Uint8Array),
+    }));
+  }
+
+  /** The frame left this daemon. Spends a SEND against the ceiling and schedules a re-offer. */
+  markControlSent(
+    ownerAgentId: string, documentId: string, verb: string, holderAgentId: string,
+    nowMs: number, retryAfterMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_control_deliveries
+            SET sent_at = ?, sends = sends + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`,
+      )
+      .run(nowMs, nowMs + retryAfterMs, ownerAgentId, documentId, verb, holderAgentId);
+    const row = this.#db
+      .prepare(
+        `SELECT sends FROM document_control_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, verb, holderAgentId) as { sends?: number } | undefined;
+    return row?.sends ?? 0;
+  }
+
+  /**
+   * A failed attempt: schedules the next try WITHOUT spending the send ceiling.
+   *
+   * The counters are separate for the reason the envelope path already learned the hard way —
+   * conflating them meant quiet deferrals to an offline peer counted as sends, and the first real
+   * send after they returned hit the ceiling and gave up.
+   */
+  recordControlAttempt(
+    ownerAgentId: string, documentId: string, verb: string, holderAgentId: string,
+    nextAttemptAtMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_control_deliveries
+            SET attempts = attempts + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, verb, holderAgentId);
+    const row = this.#db
+      .prepare(
+        `SELECT attempts FROM document_control_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, verb, holderAgentId) as { attempts?: number } | undefined;
+    return row?.attempts ?? 0;
+  }
+
+  /**
+   * Stop owing this frame. The reason is recorded in a DIFFERENT column on purpose: `acked` means
+   * the holder is known to have it, `retired` means we stopped trying. A row that says acked when
+   * nothing confirmed anything is the lie this milestone keeps having to remove.
+   */
+  settleControlDelivery(
+    ownerAgentId: string, documentId: string, verb: string, holderAgentId: string,
+    nowMs: number, reason: "acked" | "retired",
+  ): void {
+    const sql =
+      reason === "acked"
+        ? `UPDATE document_control_deliveries SET acked_at = ?
+            WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`
+        : `UPDATE document_control_deliveries SET retired_at = ?
+            WHERE owner_agent_id = ? AND document_id = ? AND verb = ? AND holder_agent_id = ?`;
+    this.#db.prepare(sql).run(nowMs, ownerAgentId, documentId, verb, holderAgentId);
   }
 
   /**

@@ -27,6 +27,7 @@
  */
 
 import type { DocumentStore, DocumentEnvelopeRow } from "./document-store.js";
+import { CONTROL_RESEND_AFTER_MS, CONTROL_MAX_SENDS } from "./document-control-notifier.js";
 import type { Logger } from "./types.js";
 
 /**
@@ -649,6 +650,97 @@ export class DocumentDelivery {
             result.failed += 1;
           }
         }
+      }
+    }
+
+
+    // DOD-MP-CONTROL-DURABLE-1 — control frames drain LAST, and that is the opposite of amendments
+    // on purpose. An amendment must reach a holder BEFORE the content that depends on it; a close
+    // must reach them AFTER the content it terminates, or they end the document holding less of it
+    // than the sender does.
+    for (const owed of this.#store.pendingControlDeliveries(ownerAgentId, nowMs)) {
+      const holders = holdersFor(owed.documentId);
+      if (holders === null) {
+        this.#store.recordControlAttempt(
+          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+          nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
+        );
+        continue;
+      }
+      // A holder the chain no longer contains is not owed the ending — removal already stopped
+      // delivery to them, and chasing them with a close would contradict the act that removed them.
+      if (!holders.includes(owed.holderAgentId)) {
+        this.#store.settleControlDelivery(
+          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
+        );
+        continue;
+      }
+      if (owed.sends >= CONTROL_MAX_SENDS) {
+        // STOP, AND SAY SO. A control frame has no ack, so retrying forever would chatter at every
+        // holder for the life of the document. Retired rather than acked — the record must not
+        // claim they were told when nothing confirmed it — and at ERROR, because the consequence is
+        // that someone still believes this document is open.
+        this.#store.settleControlDelivery(
+          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId, nowMs, "retired",
+        );
+        this.#logger.error("document.control.unconfirmed", {
+          documentId: owed.documentId,
+          holderAgentId: owed.holderAgentId,
+          verb: owed.verb,
+          sends: owed.sends,
+          correlationId,
+          impact:
+            "this holder was never confirmed to have received the ending — their copy may still " +
+            "be open, and their next edit will be refused rather than applied",
+        });
+        continue;
+      }
+      result.attempted += 1;
+      try {
+        const sent = await this.#transport.sendBytes({
+          peerAgentId: owed.holderAgentId,
+          documentId: owed.documentId,
+          bytes: owed.bytes,
+          correlationId,
+        });
+        if (sent.ok && sent.parked !== true) {
+          this.#store.markControlSent(
+            ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+            nowMs, CONTROL_RESEND_AFTER_MS,
+          );
+          result.sent += 1;
+        } else {
+          // Parked is not delivered, here for the same reason as everywhere else: the relay holding
+          // it is not the holder having it.
+          this.#store.recordControlAttempt(
+            ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+            nowMs + backoffFor(owed.attempts),
+          );
+          result.failed += 1;
+          this.#logger.warn("document.control.delivery_failed", {
+            documentId: owed.documentId,
+            holderAgentId: owed.holderAgentId,
+            verb: owed.verb,
+            reason: sent.ok ? "relay_parked" : sent.reason,
+            detail: sent.ok ? "the relay is holding it — the holder had no live counterparty" : sent.detail,
+            attempts: owed.attempts + 1,
+            correlationId,
+          });
+        }
+      } catch (err: unknown) {
+        this.#store.recordControlAttempt(
+          ownerAgentId, owed.documentId, owed.verb, owed.holderAgentId,
+          nowMs + backoffFor(owed.attempts),
+        );
+        result.failed += 1;
+        this.#logger.warn("document.control.delivery_failed", {
+          documentId: owed.documentId,
+          holderAgentId: owed.holderAgentId,
+          verb: owed.verb,
+          reason: "control_send_threw",
+          detail: err instanceof Error ? err.message : String(err),
+          correlationId,
+        });
       }
     }
 
