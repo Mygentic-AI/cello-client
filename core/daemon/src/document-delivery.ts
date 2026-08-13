@@ -676,6 +676,20 @@ export class DocumentDelivery {
               });
               result.delivered += 1;
             } else {
+              // PROOF THAT OUR CLOSE LANDED (DOD-MP-CONTROL-DURABLE-1). A control frame has no ack,
+              // and the tempting inference — "they closed, so they heard us" — is FALSE: a holder
+              // closes on their own initiative in the ordinary flow, having received nothing.
+              //
+              // This one is sound. A holder answers `document_closed` only once their status is
+              // closed, and that is set only when the settle finds a recorded close from OUR agent
+              // id — which is written only on receipt of our signed close frame. So this rejection
+              // is evidence, not inference. It does NOT generalise to `kill`: `document_killed` is
+              // equally produced by their own kill.
+              if (outcome.rejectionReason === "document_closed") {
+                this.#store.settleControlDelivery(
+                  ownerAgentId, documentId, "close", holderAgentId, nowMs, "acked",
+                );
+              }
               this.#logger.warn("document.delivery.rejected", {
                 documentId, envelopeHash: envelope.envelopeHash, holderAgentId,
                 sessionId: outcome.sessionId, reason: outcome.rejectionReason, correlationId,

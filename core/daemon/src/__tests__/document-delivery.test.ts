@@ -1118,3 +1118,49 @@ describe("DOD-MP-CONTROL-DURABLE-1 — an owed ending is retried, then reported 
     expect(row.retired_at, "an away holder must not have been given up on").toBeNull();
   });
 });
+
+describe("DOD-MP-CONTROL-DURABLE-1 — a close is settled by EVIDENCE when evidence exists", () => {
+  it("a holder refusing with document_closed proves they received OUR close", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+      deliver: async () => ({
+        ok: true as const, admitted: false, rejectionReason: "document_closed",
+        sessionId: "s", sessionOpened: true,
+      }),
+    });
+    f.store.seedControlDeliveries(AGENT, DOC, "close", new Uint8Array([7, 7]), [PEER], NOW);
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+
+    const row = f.db.prepare(
+      `SELECT acked_at, retired_at FROM document_control_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ? AND verb = 'close'`,
+    ).get(AGENT, PEER) as { acked_at: number | null; retired_at: number | null };
+    // ACKED, not retired — the difference is the whole point of keeping two columns. Their status
+    // flips to closed only on recording a close from OUR agent id, so this refusal is evidence
+    // rather than the false inference "they closed, therefore they heard us".
+    expect(row.acked_at).not.toBeNull();
+    expect(row.retired_at).toBeNull();
+  });
+
+  it("a kill is NOT settled the same way — their own kill produces the same refusal", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+      deliver: async () => ({
+        ok: true as const, admitted: false, rejectionReason: "document_killed",
+        sessionId: "s", sessionOpened: true,
+      }),
+    });
+    f.store.seedControlDeliveries(AGENT, DOC, "kill", new Uint8Array([7, 7]), [PEER], NOW);
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    const row = f.db.prepare(
+      `SELECT acked_at FROM document_control_deliveries
+        WHERE owner_agent_id = ? AND holder_agent_id = ? AND verb = 'kill'`,
+    ).get(AGENT, PEER) as { acked_at: number | null };
+    // Recording this as acked would write "they were told" on the strength of something they could
+    // have done entirely on their own.
+    expect(row.acked_at).toBeNull();
+  });
+});
