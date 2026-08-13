@@ -93,6 +93,11 @@ interface Resolved {
   ownerAgentId: string;
 }
 
+/** Ends a fragment with a full stop unless it already ends in one — see the refusal below. */
+function withStop(text: string): string {
+  return /[.!?]$/.test(text.trimEnd()) ? text : `${text.trimEnd()}.`;
+}
+
 export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   const { handlers, logger, layer, publish } = deps;
 
@@ -1356,42 +1361,48 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // actions.
         const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
         const peerAnswer = layer.handshake.peerAnswer(who.ownerAgentId, d.documentId);
-        // DOD-MP-REMOVE-FEEDBACK-1 — THE OPERATOR'S OWN STANDING, on the surface they check.
+        const arrangement = arrangementFor(d.documentId, proposal);
+        // DOD-MP-REMOVE-FEEDBACK-1 — the SENTENCE for a fact the row already carried.
         //
-        // This row said nothing about it. A document the operator has been removed from simply
-        // stopped listing them among the participants, which renders identically to one they are
-        // still part of and have not looked at closely — so the single fact that changes what they
-        // can do here was the one fact missing.
+        // The row has shipped `removed: true` since REMOVE-1. What was missing is that a bare flag
+        // is not feedback: it does not say when, it does not say the copy is still yours, and it
+        // does not say what actually stopped. So this completes the existing signal rather than
+        // adding a second name for it computed by a second walk of the same chain.
         //
-        // The wording is bound by FORWARD-ONLY-REMOVAL: their copy and its history are theirs and
-        // cannot be reached, so nothing may read as though anything was taken back.
+        // NAMED `yourStanding`, NOT `yourAccess`: your access to the copy did not change — reading
+        // it still works and the file is still on disk, which the sentence itself says. A surface
+        // that renders a badge from the key alone would show "access: removed", which is the
+        // confiscation reading FORWARD-ONLY-REMOVAL exists to forbid.
         //
-        // CONTAINED. `membershipOf` walks the chain and THROWS on one that will not decode, and
-        // this runs per row inside the list — so an unreadable chain on ONE document would take
-        // down the whole listing. That exact regression has been fixed here twice already, each
-        // time through a different call site; a new caller inherits the hazard, not the fix.
-        // A row whose standing cannot be computed simply says nothing about standing.
-        let ownStanding: { state: string; epochId: number | null } | null = null;
-        try {
-          ownStanding = layer.amendments.membershipOf(
-            who.ownerAgentId, d.documentId, who.ownerAgentId,
-          );
-        } catch {
-          ownStanding = null;
-        }
-        const outOfIt = ownStanding !== null && ownStanding.state === "removed";
+        // ALWAYS PRESENT, exactly as `participants` is: an absent key is read as "fine", so on a
+        // chain this build cannot decode — where `removedFromArrangement` honestly cannot tell —
+        // it says `unknown` rather than going quiet and rendering a removed holder as a holder.
+        const standing: "removed" | "holder" | "unknown" =
+          arrangement["arrangementUnavailable"] !== undefined
+            ? "unknown"
+            : (d as { removed?: boolean }).removed === true
+              ? "removed"
+              : "holder";
+        const removedAtEpoch = (d as { removedAtEpoch?: number }).removedAtEpoch;
         return {
           ...d,
-          ...(outOfIt
+          yourStanding: standing,
+          ...(standing === "removed"
             ? {
-                yourAccess: "removed" as const,
-                ...(ownStanding!.epochId === null ? {} : { removedAtEpoch: ownStanding!.epochId }),
-                accessGuidance:
+                standingGuidance:
                   `You are no longer a holder of this document` +
-                  (ownStanding!.epochId === null ? `. ` : `, as of epoch ${ownStanding!.epochId}. `) +
+                  (removedAtEpoch === undefined ? `. ` : `, as of epoch ${removedAtEpoch}. `) +
                   `Your copy and its full history remain yours, and you can still read it here or ` +
                   `open the file. What changed is only the flow of edits: yours no longer publish ` +
                   `to the other holders, and theirs no longer reach you.`,
+              }
+            : {}),
+          ...(standing === "unknown"
+            ? {
+                standingGuidance:
+                  `This daemon cannot read this document's amendment chain, so it cannot tell ` +
+                  `whether you are still a holder. Nothing here should be taken as confirmation ` +
+                  `that you are.`,
               }
             : {}),
           proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
@@ -1413,7 +1424,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           // WHO HOLDS IT AND WHO GOVERNS IT — derived from THIS daemon's own chain (G0).
           // `proposal` is passed rather than re-fetched: it is the same SQL read and the same
           // CBOR decode of the same bytes, already in hand.
-          ...arrangementFor(d.documentId, proposal),
+          ...arrangement,
           // DID OUR OFFER LEAVE? Only meaningful for a document WE proposed — for one we accepted
           // there is no offer of ours to have sent. Without this, `peerAccepted: null` meant both
           // "they are thinking" and "they were never asked", and the shipped guidance said WAIT,
@@ -1886,7 +1897,10 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         ok: false,
         reason: publishable.reason,
         guidance:
-          `${publishable.detail ?? "This document can no longer accept writes."} Nothing was ` +
+          // PUNCTUATED. `detail` comes from several producers and not all of them end in a stop,
+          // so the two sentences ran together — "…no longer publish to the other holders Nothing
+          // was changed locally…" — on the one line this DoD calls actionable.
+          `${withStop(publishable.detail ?? "This document can no longer accept writes.")} Nothing was ` +
           `changed locally — an edit applied here could never be published or recovered, and would ` +
           `disappear the next time the daemon restarted.`,
       };

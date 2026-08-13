@@ -281,9 +281,16 @@ export class DocumentLifecycle {
       // DOD-MP-REMOVE-1 — display overlay, derived: a removed holder's row still says active in
       // the table (removal is a chain fact, not a stored flag), and a list that said "active"
       // would be the surface claiming more than forward-only allows.
-      ...(this.#store.removedFromArrangement(ownerAgentId, d.documentId).removed
-        ? { removed: true }
-        : {}),
+      // DOD-MP-REMOVE-FEEDBACK-1 — the epoch travels with the flag, from the SAME walk. Deriving
+      // it separately in the surface layer would be a second walk of one chain, which
+      // `walkMembership`'s own header forbids: two walks disagreeing about whether someone was
+      // removed is two daemons disagreeing about the arrangement.
+      ...(() => {
+        const standing = this.#store.removedFromArrangement(ownerAgentId, d.documentId);
+        return standing.removed
+          ? { removed: true, ...(standing.epochId === null ? {} : { removedAtEpoch: standing.epochId }) }
+          : {};
+      })(),
       assuranceTier: "authenticated",
       epochId: this.#store.currentDocumentEpoch(ownerAgentId, d.documentId),
       status: d.status,

@@ -153,6 +153,9 @@ document worse in a way that is tedious to undo.
 | `pendingDeliveries` | The total still outstanding — `pendingUnsent` + `pendingSent`. |
 | `abandonedDeliveries` | Updates that were **given up on** and will never be retried. Not delivered. Republish them. |
 | `closePending` | You closed; still waiting on at least one other current holder. It ends when everyone who holds it has said so. |
+| `yourStanding` | Where YOU stand: `holder`, `removed`, or `unknown`. Always present — an absent answer would read as "you are fine". |
+| `removed` / `removedAtEpoch` | You are out of this document's arrangement, and the epoch it happened at. |
+| `standingGuidance` | The sentence version of the above, including what remains yours. Read this one to the operator. |
 
 ## Ending one
 
@@ -173,15 +176,13 @@ With more than two holders, a partial result is the ordinary one: some heard it,
 offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
 there are several of them.
 
-A holder who was offline is not forgotten: the ending is owed to them and re-sent when they return.
-If it still cannot be confirmed after several attempts the daemon stops and says so, naming them —
-at that point they may genuinely believe the document is still open.
 
 ## When YOU are the one who was removed
 
 This is the view nobody thinks to describe, because it is the one you cannot see from the other
 side. If an admin removes you — or you leave with your own key — `cello_doc_list` marks that
-document `yourAccess: "removed"` and tells you which epoch it happened at.
+document `yourStanding: "removed"`, carries `removedAtEpoch`, and puts the whole of it in
+`standingGuidance` as a sentence.
 
 What that means, exactly:
 
