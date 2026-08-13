@@ -15,8 +15,8 @@
  * fix that closes only the suspected one would be a guess wearing a fix's clothes.
  */
 
-import { describe, it, expect } from "vitest";
-import { runAgentPassBounded } from "../delivery-sweep-bound.js";
+import { describe, it, expect, vi } from "vitest";
+import { runAgentPassBounded, sweepAgentEvicting } from "../delivery-sweep-bound.js";
 
 function recorder() {
   const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
@@ -66,6 +66,25 @@ describe("DOD-MP-SWEEP-ALIVE-1 — one hung pass cannot wedge the sweep", () => 
     expect(second).toEqual({ completed: true, value: 7 });
   });
 
+  it("clears its timer when the pass wins — asserted on the TIMER, not on elapsed time", async () => {
+    vi.useFakeTimers();
+    try {
+      const r = recorder();
+      const res = await runAgentPassBounded(
+        { logger: r.logger, timeoutMs: 5_000, agentName: "alice" },
+        async () => "done",
+      );
+      expect(res).toEqual({ completed: true, value: "done" });
+      // The previous version of this test measured elapsed wall-clock, which stays small whether or
+      // not the timer is cleared — it went green with `clearTimeout` removed AND with `unref`
+      // removed on top of that, so it could not detect the leak it was named after. A pass per agent
+      // per minute, each pinning a 5s timer, is a leak that only shows up on a long-lived daemon.
+      expect(vi.getTimerCount(), "the bound's timer must not outlive the pass").toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a pass that finishes in time is untouched — no bound, no warning, its value returned", async () => {
     const r = recorder();
     const res = await runAgentPassBounded(
@@ -89,16 +108,90 @@ describe("DOD-MP-SWEEP-ALIVE-1 — one hung pass cannot wedge the sweep", () => 
     expect(r.events).toEqual([]);
   });
 
-  it("does not hold the process open waiting for its own timer", async () => {
+});
+
+/**
+ * The CALL SITE, which is where the defect actually lives.
+ *
+ * Every test above exercises the helper. Revert only the daemon wiring — go back to a bare
+ * `await tick(...)` — and they all stay green, because none of them can see the guard release. These
+ * drive the eviction step against a runner carrying the SAME cached-promise re-entry guard that
+ * `DocumentDelivery.tick` has, which is the structure that makes a hang permanent.
+ */
+describe("DOD-MP-SWEEP-ALIVE-1 — the wedged agent's worker is EVICTED, so it delivers again", () => {
+  /** A worker with `DocumentDelivery.tick`'s exact shape: the pass is cached until it settles. */
+  function reentrantWorker(run: () => Promise<string>) {
+    let inFlight: Promise<string> | null = null;
+    let entries = 0;
+    return {
+      entries: () => entries,
+      tick: () => {
+        if (inFlight) return inFlight;
+        entries += 1;
+        const p = run();
+        inFlight = p;
+        return p.finally(() => { inFlight = null; });
+      },
+    };
+  }
+
+  it("without eviction the agent would never deliver again — with it, the next pass re-enters", async () => {
     const r = recorder();
-    const started = Date.now();
-    await runAgentPassBounded(
-      { logger: r.logger, timeoutMs: 5_000, agentName: "alice" },
-      async () => "done",
-    );
-    // The timer must be cleared when the pass wins the race. Left armed, every sweep would pin a
-    // 5s timer per agent per minute forever — and on a daemon whose whole point is to keep running,
-    // that is a leak that only shows up in production.
-    expect(Date.now() - started).toBeLessThan(1_000);
+    const workers = new Map<string, ReturnType<typeof reentrantWorker>>();
+    const hang = { on: true };
+    const build = () => reentrantWorker(() => (hang.on ? new Promise<string>(() => {}) : Promise.resolve("swept")));
+    const workerFor = (name: string) => {
+      let w = workers.get(name);
+      if (!w) { w = build(); workers.set(name, w); }
+      return w;
+    };
+
+    const first = await sweepAgentEvicting({
+      logger: r.logger, timeoutMs: 20, agentName: "alice",
+      workers, run: () => workerFor("alice").tick(),
+    });
+    expect(first.completed).toBe(false);
+    // THE FIX, IN ONE ASSERTION: the wedged worker is gone, so the next tick cannot be handed the
+    // same hung promise. Leave it in place and `tick()` returns the cached hang forever — the agent
+    // is finished for the life of the process and every later pass burns the full bound on it.
+    expect(workers.has("alice"), "the wedged worker must be dropped").toBe(false);
+
+    hang.on = false;
+    const second = await sweepAgentEvicting({
+      logger: r.logger, timeoutMs: 20, agentName: "alice",
+      workers, run: () => workerFor("alice").tick(),
+    });
+    expect(second).toEqual({ completed: true, value: "swept" });
+  });
+
+  it("a healthy pass keeps its worker — eviction is for the wedge, not for everyone", async () => {
+    const r = recorder();
+    const workers = new Map<string, unknown>();
+    workers.set("alice", { kept: true });
+    const res = await sweepAgentEvicting({
+      logger: r.logger, timeoutMs: 1_000, agentName: "alice",
+      workers, run: async () => "fine",
+    });
+    expect(res).toEqual({ completed: true, value: "fine" });
+    // Dropping a healthy worker every pass would discard its in-memory state for no reason.
+    expect(workers.has("alice")).toBe(true);
+    expect(r.events).toEqual([]);
+  });
+
+  it("a pass that fails LATE is still reported — the evidence is not swallowed by the race", async () => {
+    const r = recorder();
+    const workers = new Map<string, unknown>();
+    let boom: (e: Error) => void = () => {};
+    const late = new Promise<string>((_res, rej) => { boom = rej; });
+    await sweepAgentEvicting({
+      logger: r.logger, timeoutMs: 20, agentName: "alice", workers, run: () => late,
+    });
+    boom(new Error("dial never completed"));
+    await new Promise((res) => setTimeout(res, 10));
+    // The race has already settled, so this rejection would otherwise vanish — discarding the one
+    // piece of evidence that names WHICH await hung, on a defect whose root cause is still open.
+    const ev = r.events.find((e) => e.event === "document.delivery.pass.late_failure");
+    expect(ev, "a late failure from an abandoned pass must still be logged").toBeDefined();
+    expect(String(ev!.ctx["reason"])).toContain("dial never completed");
   });
 });
