@@ -1953,7 +1953,17 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // Waiting cannot reopen a sealed session. The cause is known per holder; it travels.
       const causes = [...new Set(Object.values(holderFailures ?? {}))].filter(Boolean);
       const because = causes.length > 0 ? ` (${causes.join(", ")})` : "";
-      const sealed = causes.some((c) => c.includes("sealed"));
+      // THE WHOLE FAMILY, not one substring. This tested `includes("sealed")`, so `session_sealed`
+      // got the useful sentence and every other way a session's record can be over —
+      // `relay_session_gone` (the relay restarted or swept it) and `session_not_found` — fell to
+      // generic wait-for-them advice, which is the one thing that cannot work when there is nothing
+      // left to wait for.
+      const sealed = causes.some(
+        (c) =>
+          c.includes("sealed") ||
+          c.includes("relay_session_gone") ||
+          c.includes("session_not_found"),
+      );
       return (
         `Your ${verb} was recorded but reached none of the ${missed.length} other ` +
         `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")})${because}, so the document ` +
