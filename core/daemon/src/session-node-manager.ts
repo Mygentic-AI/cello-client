@@ -3737,6 +3737,17 @@ export class SessionNodeManager {
     // the leaf_deliver witness stream / arrival order.
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
+    // DOD-MP-SESSION-RETIRE-1 — the relay's answer SURVIVES to the caller even when the direct send
+    // then succeeds. `relay_session_gone` is deliberately not terminal (it also fires for perfectly
+    // live sessions whenever the relay restarts, because the relay stores sessions in memory), so
+    // this path warns and carries on — and the send returns `ok: true, delivered: true` for a leaf
+    // that was never witnessed. The content arrives; the RECORD stops growing, silently.
+    //
+    // Reporting it does not change success or failure for any existing caller. It lets the document
+    // worker, which has no human in the loop, notice that a session's record is dead and route
+    // around it. Without this the suspicion counter could never see the one reason it exists for,
+    // and the successful direct send actively CLEARED it.
+    let relayRefusal: string | undefined;
     if (entry.relayClient && entry.relaySessionIdBytes) {
       try {
         const witnessed = await entry.relayClient.submitMessageHash(entry.node, entry.relaySessionIdBytes, contentHash, leafKind);
@@ -3818,6 +3829,7 @@ export class SessionNodeManager {
             reason: witnessed.reason,
             correlationId,
           });
+          relayRefusal = witnessed.reason;
         }
       } catch (relayErr: unknown) {
         this.#logger.warn("session.relay.hash.submit.failed", {
@@ -3878,7 +3890,7 @@ export class SessionNodeManager {
       // A close that failed for a benign reason costs a redundant park, which the receiver dedups
       // on the content hash. A false delivered costs the message.
       await stream.close();
-      return { ok: true, delivered: true };
+      return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
@@ -3892,7 +3904,7 @@ export class SessionNodeManager {
       const hashHex = Buffer.from(contentHash).toString("hex");
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (attempt.outcome === "parked") {
-        return { ok: true, delivered: false, parked: true };
+        return { ok: true, delivered: false, parked: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
       // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would

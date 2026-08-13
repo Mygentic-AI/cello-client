@@ -397,3 +397,93 @@ describe("an answer that arrives inside the grace is REPORTED, not discarded", (
     expect(await t.transport.deliver(deliverInput())).toMatchObject({ admitted: null });
   });
 });
+
+/**
+ * DOD-MP-SESSION-RETIRE-1, the remaining half — WIRED, not just implemented.
+ *
+ * The suspects unit beside this one proves the counting. It proves nothing about whether the
+ * transport consults it, and a fix that is correct in a module nobody calls is the exact shape of a
+ * green suite over a broken daemon. This drives the real transport.
+ */
+describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keeps refusing", () => {
+  /**
+   * THE SHAPE PRODUCTION ACTUALLY PRODUCES.
+   *
+   * The first version of these tests stubbed `sendContent` to return
+   * `{ ok: false, reason: "relay_session_gone" }`, and the real dependency CANNOT return that.
+   * `relay_session_gone` is not in `TERMINAL_RELAY_REFUSALS`, so `sendContent` warns, falls through
+   * to the direct peer-to-peer send, and on success returns `ok: true, delivered: true` — for a leaf
+   * the relay never witnessed. The tests defined a contract the producer does not honour, which is
+   * how a green suite sat on top of a fix that could never fire.
+   */
+  const relayGoneButDelivered = { ok: true as const, delivered: true as const, relayRefusal: "relay_session_gone" };
+
+  it("opens a FRESH session after repeated relay_session_gone, and destroys nothing", async () => {
+    const t = newTransport({
+      activeSessionsWith: () => ["stuck-session"],
+      sendContent: async (_a, sessionId) =>
+        sessionId === "stuck-session" ? relayGoneButDelivered : { ok: true as const, delivered: true as const },
+    });
+
+    // Two passes. Each one "succeeds" — the content reaches the peer directly — while the session's
+    // record is permanently gone. Reading `ok` alone not only missed this, it called noteSuccess and
+    // cleared the count, so the session stayed in rotation forever.
+    await t.transport.deliver(deliverInput());
+    await t.transport.deliver(deliverInput());
+    expect(t.opened, "one bad answer must not churn a live session").toEqual([]);
+
+    const third = await t.transport.deliver(deliverInput());
+    expect(t.opened, "delivery must open a fresh session instead of reusing a dead record").toEqual([PEER]);
+    expect(third.ok).toBe(true);
+    // NOTHING WAS DESTROYED. The refused fix retired the session; this leaves it listed and usable
+    // by the conversation path, which is what makes it safe when the string merely meant "the relay
+    // lost its memory" — it stores sessions in memory and says this after every restart.
+    expect(t.sealed).not.toContain("stuck-session");
+    // AND IT SAYS SO. A new log event with no assertion is an event nobody can rely on.
+    expect(t.events.some((e) => e.event === "document.delivery.session.bypassed")).toBe(true);
+  });
+
+  it("a session that RECOVERS keeps being reused — the run must be consecutive", async () => {
+    let gone = true;
+    const t = newTransport({
+      activeSessionsWith: () => ["flaky"],
+      sendContent: async () =>
+        gone ? relayGoneButDelivered : { ok: true as const, delivered: true as const },
+    });
+    await t.transport.deliver(deliverInput());
+    gone = false;
+    await t.transport.deliver(deliverInput()); // a witnessed leaf — clears the run
+    gone = true;
+    await t.transport.deliver(deliverInput()); // one more, not two in a row
+    // A flaky relay is not a dead session. Opening a fresh one here would churn a session that is
+    // demonstrably still recording.
+    expect(t.opened).toEqual([]);
+    expect(t.events.some((e) => e.event === "document.delivery.session.bypassed")).toBe(false);
+  });
+
+  it("an OFFLINE peer never condemns the session", async () => {
+    const t = newTransport({
+      activeSessionsWith: () => ["s"],
+      sendContent: async () => ({ ok: false as const, reason: "transport_unavailable", error: "away" }),
+    });
+    for (let i = 0; i < 4; i++) await t.transport.deliver(deliverInput());
+    // Otherwise every sweep against a sleeping counterparty opens a new session, each sealed moments
+    // later — churn dressed up as availability.
+    expect(t.opened).toEqual([]);
+  });
+
+  it("a hint naming a suspect session is HONOURED, and the caller is told", async () => {
+    const t = newTransport({
+      activeSessionsWith: () => ["hinted"],
+      sendContent: async () => relayGoneButDelivered,
+    });
+    await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
+    await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
+    const third = await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
+    expect(third).toMatchObject({ ok: true, sessionId: "hinted" });
+    // Substituting another session would defeat the only reason to pass a hint — controlling which
+    // sealed record the change lands in. Silence would leave the caller aiming at a dead record.
+    expect(t.opened).toEqual([]);
+    expect(t.events.some((e) => e.event === "document.delivery.session.hint_suspect")).toBe(true);
+  });
+});
