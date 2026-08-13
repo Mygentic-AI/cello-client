@@ -1243,7 +1243,7 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
     expect(owed[0]!.bytes.byteLength).toBeGreaterThan(0);
   });
 
-  it("a holder who DID take it is owed nothing — the fast path clears the debt", async () => {
+  it("a holder who took it is marked SENT, not acked — bytes arriving is not governance applied", async () => {
     const fA = await newFixture();
     const fC = await newFixture();
     const proposed = await fA.call("cello_doc_propose", {
@@ -1254,9 +1254,17 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
       document_id: documentId, invitee_pubkey: fC.owner,
     });
     expect((invited.holdersNotified as Record<string, boolean>)[fA.peer]).toBe(true);
-    // A row left pending after a successful send would make the worker send it a second time,
-    // which is how a durability fix turns into a duplicate-delivery bug.
-    expect(fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)).toEqual([]);
+
+    // NOT DUE AGAIN IMMEDIATELY — otherwise the worker sends a second copy straight away and the
+    // durability fix becomes a duplicate-delivery bug.
+    expect(fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 1_000)).toEqual([]);
+
+    // BUT STILL OWED. `sendBytes` ok means their daemon received the frame; whether it RECORDED it
+    // is a separate fact it can refuse — recordAmendment throws on a chain gap or a failed
+    // derivation, the router logs it, and answers nothing. Acking here would recreate the original
+    // defect inside the new machinery: debt cleared, holder stuck at the old epoch, nothing owed.
+    const later = fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000);
+    expect(later.map((p) => p.holderAgentId)).toEqual([fA.peer]);
   });
 
   it("the INVITER and the INVITEE are never owed the amendment — only the existing holders", async () => {

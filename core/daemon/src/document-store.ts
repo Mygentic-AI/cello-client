@@ -391,7 +391,17 @@ export class DocumentStore {
         document_id     TEXT    NOT NULL,
         amendment_hash  TEXT    NOT NULL,
         holder_agent_id TEXT    NOT NULL,
+        -- SENT is 'the bytes left this daemon'. ACKED is 'the holder demonstrably applied it'.
+        -- Conflating them was the review's HIGH-2: a successful send means the frame reached their
+        -- daemon, and the receiver can still REFUSE to record it (recordAmendment throws on a chain
+        -- gap or a failed derivation, and the router logs it and answers nothing). Acking on that
+        -- reproduced the original defect through the new machinery.
+        sent_at         INTEGER,
         acked_at        INTEGER,
+        -- RETIRED is not delivered. A holder the chain no longer contains is owed nothing, and
+        -- recording that as an ack would make the durable record claim a delivery that never
+        -- happened.
+        retired_at      INTEGER,
         attempts        INTEGER NOT NULL DEFAULT 0,
         next_attempt_at INTEGER,
         created_at      INTEGER NOT NULL,
@@ -1079,37 +1089,121 @@ export class DocumentStore {
   pendingAmendmentDeliveries(
     ownerAgentId: string,
     nowMs: number,
+    opts: { limit?: number } = {},
   ): Array<{
     holderAgentId: string;
     documentId: string;
     amendmentHash: string;
+    epochId: number;
     attempts: number;
     bytes: Uint8Array;
   }> {
+    // HEAD-OF-LINE, PER (DOCUMENT, HOLDER) — and this is a correctness rule, not a nicety.
+    //
+    // Ordering by `created_at` among only the rows that are DUE inverts the chain: epoch N fails
+    // once and takes a backoff, epoch N+1 is seeded due immediately, so the next pass sends N+1
+    // alone. The receiver then refuses it with `document_amendment_chain_gap` — "an out-of-order
+    // arrival is retried by its sender, never buffered silently" — and under the old ack-on-send
+    // there was no retry, so N+1 was lost permanently and the one message that would have explained
+    // it said the opposite. Proven by the unit review.
+    //
+    // So: order by the CHAIN's epoch, and never offer an amendment while an earlier one is still
+    // outstanding for that same holder. Per (document, holder), never globally — one holder's stuck
+    // chain must not hold up another's.
     const rows = this.#db
       .prepare(
-        `SELECT d.holder_agent_id, d.document_id, d.amendment_hash, d.attempts, a.received_bytes
-           FROM document_amendment_deliveries d
-           JOIN document_amendments a
-             ON a.owner_agent_id = d.owner_agent_id
-            AND a.document_id = d.document_id
-            AND a.amendment_hash = d.amendment_hash
-          WHERE d.owner_agent_id = ?
-            AND d.acked_at IS NULL
-            AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
-          ORDER BY d.created_at ASC, d.amendment_hash ASC`,
+        `SELECT holder_agent_id, document_id, amendment_hash, epoch_id, attempts, received_bytes
+           FROM (
+             SELECT d.holder_agent_id, d.document_id, d.amendment_hash, d.attempts,
+                    a.epoch_id, a.received_bytes,
+                    d.next_attempt_at,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY d.document_id, d.holder_agent_id
+                      ORDER BY a.epoch_id ASC
+                    ) AS rn
+               FROM document_amendment_deliveries d
+               JOIN document_amendments a
+                 ON a.owner_agent_id = d.owner_agent_id
+                AND a.document_id = d.document_id
+                AND a.amendment_hash = d.amendment_hash
+              WHERE d.owner_agent_id = ?
+                AND d.acked_at IS NULL
+                AND d.retired_at IS NULL
+           )
+          WHERE rn = 1
+            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+          ORDER BY document_id ASC, holder_agent_id ASC
+          LIMIT ?`,
       )
-      .all(ownerAgentId, nowMs) as Array<Record<string, unknown>>;
+      .all(ownerAgentId, nowMs, opts.limit ?? 50) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
       holderAgentId: r["holder_agent_id"] as string,
       documentId: r["document_id"] as string,
       amendmentHash: r["amendment_hash"] as string,
+      epochId: (r["epoch_id"] as number) ?? 0,
       attempts: (r["attempts"] as number) ?? 0,
       bytes: new Uint8Array(r["received_bytes"] as Uint8Array),
     }));
   }
 
-  /** The holder has it. Nothing further is owed for this (amendment, holder). */
+  /**
+   * Owed amendment rows with NO matching row in the recorded chain.
+   *
+   * The pending query INNER JOINs the chain, which is right — a redelivery must never send bytes
+   * this daemon's own chain does not contain — but an inner join also makes such a row invisible
+   * AND owed forever. Surfaced so the worker can say so instead of scanning past it every tick.
+   */
+  amendmentDeliveriesWithoutChainRow(ownerAgentId: string): Array<{
+    documentId: string;
+    amendmentHash: string;
+    holderAgentId: string;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT d.document_id, d.amendment_hash, d.holder_agent_id
+           FROM document_amendment_deliveries d
+           LEFT JOIN document_amendments a
+             ON a.owner_agent_id = d.owner_agent_id
+            AND a.document_id = d.document_id
+            AND a.amendment_hash = d.amendment_hash
+          WHERE d.owner_agent_id = ?
+            AND d.acked_at IS NULL
+            AND d.retired_at IS NULL
+            AND a.amendment_hash IS NULL`,
+      )
+      .all(ownerAgentId) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      documentId: r["document_id"] as string,
+      amendmentHash: r["amendment_hash"] as string,
+      holderAgentId: r["holder_agent_id"] as string,
+    }));
+  }
+
+  /**
+   * The bytes left this daemon. NOT a confirmation — see the `sent_at` note on the table.
+   *
+   * The row stays owed and is re-offered after `retryAfterMs`, because the only thing that has
+   * happened is that their daemon received a frame. Whether it RECORDED it is a separate fact, and
+   * the receiver can refuse.
+   */
+  markAmendmentSent(
+    ownerAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    holderAgentId: string,
+    nowMs: number,
+    retryAfterMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_amendment_deliveries
+            SET sent_at = ?, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nowMs, nowMs + retryAfterMs, ownerAgentId, documentId, amendmentHash, holderAgentId);
+  }
+
+  /** The holder demonstrably HAS it. Nothing further is owed for this (amendment, holder). */
   ackAmendmentDelivery(
     ownerAgentId: string,
     documentId: string,
@@ -1121,6 +1215,63 @@ export class DocumentStore {
       .prepare(
         `UPDATE document_amendment_deliveries
             SET acked_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nowMs, ownerAgentId, documentId, amendmentHash, holderAgentId);
+  }
+
+  /**
+   * PROOF BY EPOCH — settle every amendment a holder has demonstrably applied.
+   *
+   * There is no amendment ack frame, and inventing one is wire work. But there is already a fact on
+   * the wire that PROVES receipt: a holder that acks an envelope authored at epoch E must hold every
+   * amendment up to E, because the inbound epoch gate refuses anything whose epoch does not match
+   * its own derived arrangement. So their ack of the content IS their ack of the governance that
+   * made the content admissible.
+   *
+   * Returns how many rows it settled, so the caller can say so.
+   */
+  ackAmendmentsThroughEpoch(
+    ownerAgentId: string,
+    documentId: string,
+    holderAgentId: string,
+    epochId: number,
+    nowMs: number,
+  ): number {
+    const owed = this.#db
+      .prepare(
+        `SELECT d.amendment_hash
+           FROM document_amendment_deliveries d
+           JOIN document_amendments a
+             ON a.owner_agent_id = d.owner_agent_id
+            AND a.document_id = d.document_id
+            AND a.amendment_hash = d.amendment_hash
+          WHERE d.owner_agent_id = ? AND d.document_id = ? AND d.holder_agent_id = ?
+            AND d.acked_at IS NULL AND d.retired_at IS NULL
+            AND a.epoch_id <= ?`,
+      )
+      .all(ownerAgentId, documentId, holderAgentId, epochId) as Array<{ amendment_hash: string }>;
+    for (const row of owed) {
+      this.ackAmendmentDelivery(ownerAgentId, documentId, row.amendment_hash, holderAgentId, nowMs);
+    }
+    return owed.length;
+  }
+
+  /**
+   * The holder is no longer in the chain. Distinct from acked ON PURPOSE: an ack here would make
+   * the durable record claim a delivery that never happened.
+   */
+  retireAmendmentDelivery(
+    ownerAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_amendment_deliveries
+            SET retired_at = ?
           WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
       )
       .run(nowMs, ownerAgentId, documentId, amendmentHash, holderAgentId);

@@ -287,63 +287,125 @@ export class DocumentDelivery {
     //
     // A holder must apply the admitting amendment BEFORE any edit authored at the new epoch,
     // otherwise they refuse that edit as coming from a non-participant — the exact symptom seen
-    // live, where a joiner's edits were silently dropped by a holder still at the old epoch. Draining
-    // this queue ahead of the envelope queue in every pass is what makes that ordering a guarantee
-    // rather than a coincidence of timing.
+    // live, where a joiner's edits were silently dropped by a holder still at the old epoch.
+    // Draining this queue ahead of the envelope queue in every pass makes that ordering a
+    // guarantee rather than a coincidence of timing; the store's head-of-line rule makes it hold
+    // ACROSS passes too.
+    //
+    // An owed row whose amendment is not in the recorded chain can never be sent (the pending query
+    // inner-joins the chain, deliberately: a redelivery must never send bytes this daemon's own
+    // chain does not contain). Such a row is invisible AND owed forever, so it is named rather than
+    // scanned past in silence.
+    for (const orphan of this.#store.amendmentDeliveriesWithoutChainRow(ownerAgentId)) {
+      this.#logger.error("document.amendment.chain_row_missing", {
+        documentId: orphan.documentId,
+        amendmentHash: orphan.amendmentHash,
+        holderAgentId: orphan.holderAgentId,
+        correlationId,
+        impact:
+          "this membership change is owed to a holder and its bytes are not in the local chain, " +
+          "so it can never be delivered — the holder will stay at the old epoch",
+      });
+    }
     for (const owed of this.#store.pendingAmendmentDeliveries(ownerAgentId, nowMs)) {
       const holders = holdersFor(owed.documentId);
-      // A holder the chain no longer contains is owed nothing — and an underivable chain is not a
-      // reason to spray governance at whoever was last known. Silence here is deliberate; the
-      // envelope pass below logs `document.delivery.no_holders` for the same document.
-      if (holders === null) continue;
-      if (!holders.includes(owed.holderAgentId)) {
-        this.#store.ackAmendmentDelivery(
-          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId, nowMs,
+      if (holders === null) {
+        // NOT transient, and NOT silent. The envelope pass logs `no_holders` only for documents
+        // that also have pending ENVELOPES — a document whose content is fully acked has none, so
+        // this row would otherwise be re-scanned every tick forever with nothing said anywhere.
+        // Scheduled at the cap so it stops spinning, and logged so it stops being invisible.
+        this.#store.recordAmendmentAttempt(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId,
+          nowMs + DELIVERY_UNRESOLVABLE_RETRY_MS,
         );
+        this.#logger.error("document.amendment.holders_underivable", {
+          documentId: owed.documentId,
+          amendmentHash: owed.amendmentHash,
+          holderAgentId: owed.holderAgentId,
+          correlationId,
+          impact:
+            "the document row is gone or its chain does not derive, so this membership change " +
+            "cannot be addressed to anyone — it stays owed",
+        });
         continue;
       }
+      // A holder the chain no longer contains, or one it records as removed, is owed nothing.
+      // RETIRED, never acked: an ack here would make the durable record claim a delivery that
+      // never happened. Both checks, because the envelope path uses both and a disagreement
+      // between them would otherwise keep this loop dialing a locally-removed holder.
+      const removed = this.#store.memberRemoved(ownerAgentId, owed.documentId, owed.holderAgentId);
+      if (!holders.includes(owed.holderAgentId) || removed.removed) {
+        this.#store.retireAmendmentDelivery(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId, nowMs,
+        );
+        this.#logger.info("document.amendment.holder_retired", {
+          documentId: owed.documentId,
+          amendmentHash: owed.amendmentHash,
+          holderAgentId: owed.holderAgentId,
+          correlationId,
+        });
+        continue;
+      }
+      // CLAIM THE ROW BEFORE DIALING — the same rule the envelope path states and for the same
+      // reason: a crash mid-dial would otherwise leave the row immediately due with `attempts`
+      // unchanged, so a crash-looping daemon dials at full rate forever and never escalates. It
+      // also closes the window where the 60s sweep fires inside the invite handler's own await and
+      // sends the same amendment twice.
+      const attemptsNow = this.#store.recordAmendmentAttempt(
+        ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId,
+        nowMs + backoffFor(owed.attempts),
+      );
       result.attempted += 1;
-      let ok = false;
-      let reason = "send_threw";
+      let sent: { ok: true; parked?: boolean } | { ok: false; reason: string; detail?: string };
       try {
-        const sent = await this.#transport.sendBytes({
+        const out = await this.#transport.sendBytes({
           peerAgentId: owed.holderAgentId,
           documentId: owed.documentId,
           bytes: owed.bytes,
           correlationId,
         });
-        ok = sent.ok;
-        if (!sent.ok) reason = sent.reason;
+        sent = out.ok ? { ok: true, parked: out.parked === true } : out;
       } catch (err: unknown) {
-        reason = err instanceof Error ? err.message : String(err);
+        sent = { ok: false, reason: "amendment_send_threw", detail: err instanceof Error ? err.message : String(err) };
       }
-      if (ok) {
-        this.#store.ackAmendmentDelivery(
-          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId, nowMs,
+      if (sent.ok && sent.parked !== true) {
+        // SENT, NOT ACKED. Their daemon received the frame; whether it RECORDED it is a separate
+        // fact and it can refuse (a chain gap or a failed derivation throws on the receiver and
+        // answers nothing). The row stays owed and is re-offered, and it settles for real when the
+        // holder acks any envelope at this epoch or later — which proves they applied it, because
+        // the inbound epoch gate would have refused that envelope otherwise.
+        this.#store.markAmendmentSent(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId,
+          nowMs, DELIVERY_ACK_TIMEOUT_MS,
         );
-        result.delivered += 1;
-        this.#logger.info("document.amendment.delivered", {
+        result.sent += 1;
+        this.#logger.info("document.amendment.sent", {
           documentId: owed.documentId,
           holderAgentId: owed.holderAgentId,
           amendmentHash: owed.amendmentHash,
-          attempts: owed.attempts,
+          epochId: owed.epochId,
+          attempts: attemptsNow,
           correlationId,
         });
       } else {
-        const attempts = this.#store.recordAmendmentAttempt(
-          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId,
-          nowMs + backoffFor(owed.attempts),
-        );
+        // PARKED IS NOT DELIVERED. The relay took it because the holder had no live counterparty;
+        // if that holder never drains it and the debt has been cleared, the membership change is
+        // gone with both surfaces reporting success. It is a retry, exactly like a refusal.
+        const reason = sent.ok ? "relay_parked" : sent.reason;
         result.failed += 1;
         // WARN, NEVER ERROR, and NEVER ABANDONED: a membership change that cannot be delivered yet
         // is a retry, not a loss. There is no attempt ceiling here on purpose — abandoning would
-        // put the two holders permanently out of step over exactly the fact they must agree on.
+        // put two holders permanently out of step over exactly the fact they must agree on.
         this.#logger.warn("document.amendment.delivery_failed", {
           documentId: owed.documentId,
           holderAgentId: owed.holderAgentId,
           amendmentHash: owed.amendmentHash,
+          epochId: owed.epochId,
           reason,
-          attempts,
+          // The CAUSE, not just the exit-point label. `session_sealed` says where it surfaced;
+          // detail says why.
+          detail: sent.ok ? "the relay is holding it — the holder had no live counterparty" : sent.detail,
+          attempts: attemptsNow,
           correlationId,
         });
       }
@@ -536,6 +598,20 @@ export class DocumentDelivery {
             const first = this.#store.ackHolderDelivery(
               ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
             );
+            // PROOF BY EPOCH (DOD-MP-INVITE-FANOUT-1). There is no amendment ack frame, but this
+            // ack is one: the inbound epoch gate refuses any envelope whose epoch does not match
+            // the receiver's own derived arrangement, so a holder that answered about an envelope
+            // at epoch E demonstrably holds every amendment up to E. Their ack of the content is
+            // their ack of the governance that made the content admissible — which is what lets an
+            // amendment row settle for real instead of being re-offered forever.
+            const settled = this.#store.ackAmendmentsThroughEpoch(
+              ownerAgentId, documentId, holderAgentId, envelope.epochId, nowMs,
+            );
+            if (settled > 0) {
+              this.#logger.info("document.amendment.confirmed_by_epoch", {
+                documentId, holderAgentId, epochId: envelope.epochId, settled, correlationId,
+              });
+            }
             // The envelope-level record follows the ONE terminal rule (review M3).
             this.#store.reconcileEnvelopeSettlement(
               ownerAgentId, documentId, envelope.envelopeHash, nowMs,

@@ -60,6 +60,7 @@ import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
 import type { DocumentDeliveryTransport } from "./document-delivery.js";
+import { DELIVERY_ACK_TIMEOUT_MS } from "./document-delivery.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
 import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./document-json.js";
@@ -689,6 +690,79 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   });
 
   /**
+   * DOD-MP-INVITE-FANOUT-1 — fan a governance amendment to the CURRENT holders, durably.
+   *
+   * ONE implementation for every site that fans one. There were four — invite, re-invite, remove,
+   * and remove's re-send — each with its own copy of the same best-effort loop, and the review found
+   * that wiring durability into one of them left the other three losing membership changes exactly
+   * as before. The re-invite is the verb the tool's own guidance tells an operator to run when a
+   * holder is out of step, so it carrying the defect meant the documented cure did nothing.
+   *
+   * RECORD THE DEBT FIRST. The send below is a fast path, never the guarantee: a daemon that dies
+   * between here and the send still owes the amendment on restart.
+   *
+   * A successful send is recorded as SENT, not acked — their daemon received the frame, and whether
+   * it RECORDED it is a separate fact it can refuse. The row settles for real when that holder acks
+   * any envelope at this epoch or later, which proves they applied it.
+   */
+  const fanOutAmendment = async (args: {
+    agentName: string;
+    ownerAgentId: string;
+    documentId: string;
+    amendmentHashHex: string;
+    amendmentBytes: Uint8Array;
+    holders: readonly string[];
+    verb: string;
+  }): Promise<Record<string, boolean>> => {
+    layer.store.seedAmendmentDeliveries(
+      args.ownerAgentId, args.documentId, args.amendmentHashHex, args.holders, deps.now(),
+    );
+    const told: Record<string, boolean> = {};
+    for (const holder of args.holders) {
+      try {
+        const sent = await deps.transportFor(args.agentName).sendBytes({
+          peerAgentId: holder,
+          documentId: args.documentId,
+          bytes: args.amendmentBytes,
+          correlationId: randomUUID(),
+        });
+        // PARKED IS NOT NOTIFIED. The relay took it because the holder had no live counterparty.
+        const landed = sent.ok && sent.parked !== true;
+        told[holder] = landed;
+        if (landed) {
+          layer.store.markAmendmentSent(
+            args.ownerAgentId, args.documentId, args.amendmentHashHex, holder,
+            deps.now(), DELIVERY_ACK_TIMEOUT_MS,
+          );
+        } else {
+          // NAMED, NOT JUST COUNTED. This used to record `false` with no log line anywhere, so the
+          // only trace of a lost membership change was a boolean inside an `ok: true` response.
+          logger.warn("document.amendment.holder_unnotified", {
+            documentId: args.documentId,
+            holderAgentId: holder,
+            verb: args.verb,
+            reason: sent.ok ? "relay_parked" : sent.reason,
+            detail: sent.ok
+              ? "the relay is holding it — the holder had no live counterparty"
+              : sent.detail,
+          });
+        }
+      } catch (err: unknown) {
+        told[holder] = false;
+        // A throw used to be swallowed whole.
+        logger.warn("document.amendment.holder_unnotified", {
+          documentId: args.documentId,
+          holderAgentId: holder,
+          verb: args.verb,
+          reason: "amendment_send_threw",
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return told;
+  };
+
+  /**
    * M14B / DOD-MP-JOIN-1 — invite a third party into an existing document.
    *
    * One admin's signature authors the admitting amendment (D2); the invitee's own consent makes
@@ -780,22 +854,22 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // re-sent the amendment. The re-invite is the healing verb: it re-fans the admitting
         // amendment to every other current holder, best-effort, reported per holder.
         const admittingBytes = outgoing.offer.amendments[outgoing.offer.amendments.length - 1];
-        const holdersNotified: Record<string, boolean> = {};
-        if (admittingBytes !== undefined) {
-          for (const holder of derived.arrangement.participants) {
-            if (holder === who.ownerAgentId || holder === invitee) continue;
-            try {
-              const sentAmend = await deps.transportFor(who.agentName).sendBytes({
-                peerAgentId: holder,
-                documentId,
-                bytes: new Uint8Array(admittingBytes),
-                correlationId: randomUUID(),
-              });
-              holdersNotified[holder] = sentAmend.ok;
-            } catch {
-              holdersNotified[holder] = false;
-            }
-          }
+        let holdersNotified: Record<string, boolean> = {};
+        // `priorHash` is non-null whenever `outgoing` is — the lookup is keyed by it — but the
+        // narrowing does not survive the branch, and an amendment seeded under a null key would be
+        // owed to a row nothing can ever join.
+        if (admittingBytes !== undefined && priorHash !== null) {
+          holdersNotified = await fanOutAmendment({
+            agentName: who.agentName,
+            ownerAgentId: who.ownerAgentId,
+            documentId,
+            amendmentHashHex: priorHash,
+            amendmentBytes: new Uint8Array(admittingBytes),
+            holders: [...derived.arrangement.participants].filter(
+              (holder) => holder !== who.ownerAgentId && holder !== invitee,
+            ),
+            verb: "re-invite",
+          });
         }
         return {
           ok: true,
@@ -920,27 +994,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const owedHolders = [...derived.arrangement.participants].filter(
       (holder) => holder !== who.ownerAgentId && holder !== invitee,
     );
-    layer.store.seedAmendmentDeliveries(
-      who.ownerAgentId, documentId, amendHashHex, owedHolders, deps.now(),
-    );
-    const holdersTold: Record<string, boolean> = {};
-    for (const holder of owedHolders) {
-      try {
-        const sent = await deps.transportFor(who.agentName).sendBytes({
-          peerAgentId: holder, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
-        });
-        holdersTold[holder] = sent.ok;
-        // Only a send that ANSWERED clears the debt. A failure leaves the row pending and the
-        // delivery worker owns it from here.
-        if (sent.ok) {
-          layer.store.ackAmendmentDelivery(
-            who.ownerAgentId, documentId, amendHashHex, holder, deps.now(),
-          );
-        }
-      } catch {
-        holdersTold[holder] = false;
-      }
-    }
+    const holdersTold = await fanOutAmendment({
+      agentName: who.agentName,
+      ownerAgentId: who.ownerAgentId,
+      documentId,
+      amendmentHashHex: amendHashHex,
+      amendmentBytes,
+      holders: owedHolders,
+      verb: "invite",
+    });
     logger.info("document.join.invited", { documentId, invitee, epochId: body.epoch_id, offerSent });
     return {
       ok: true,
@@ -1016,19 +1078,32 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             e.body.subject_agent_id === holder &&
             e.body.epoch_id === membership.epochId,
         );
-        const resendTold: Record<string, boolean> = {};
+        let resendTold: Record<string, boolean> = {};
         if (removal) {
           const bytes = new Uint8Array(encodeDocumentAmendment(removal));
-          const targets = new Set([...derived.arrangement.participants, holder]);
-          targets.delete(who.ownerAgentId);
-          for (const member of targets) {
+          const remaining = [...derived.arrangement.participants].filter(
+            (m) => m !== who.ownerAgentId && m !== holder,
+          );
+          // The healing re-send is durable for the holders who REMAIN, for the same reason the
+          // re-invite is: it is the verb an operator runs precisely because someone is out of step,
+          // so it must not be the one that gives up quietest.
+          resendTold = await fanOutAmendment({
+            agentName: who.agentName,
+            ownerAgentId: who.ownerAgentId,
+            documentId,
+            amendmentHashHex: Buffer.from(documentAmendmentHash(removal.body)).toString("hex"),
+            amendmentBytes: bytes,
+            holders: remaining,
+            verb: "remove-resend",
+          });
+          if (holder !== who.ownerAgentId) {
             try {
               const sent = await deps.transportFor(who.agentName).sendBytes({
-                peerAgentId: member, documentId, bytes, correlationId: randomUUID(),
+                peerAgentId: holder, documentId, bytes, correlationId: randomUUID(),
               });
-              resendTold[member] = sent.ok;
+              resendTold[holder] = sent.ok && sent.parked !== true;
             } catch {
-              resendTold[member] = false;
+              resendTold[holder] = false;
             }
           }
         }
@@ -1097,26 +1172,42 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // The amendment travels to EVERY current holder INCLUDING the removed one — being told is
     // how their daemon surfaces the removal to their operator. Best-effort at P1, per holder,
     // reported never assumed.
-    const holdersTold: Record<string, boolean> = {};
-    for (const member of withNew.arrangement.participants) {
-      if (member === who.ownerAgentId) continue;
-      try {
-        const sent = await deps.transportFor(who.agentName).sendBytes({
-          peerAgentId: member, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
-        });
-        holdersTold[member] = sent.ok;
-      } catch {
-        holdersTold[member] = false;
-      }
-    }
+    // DOD-MP-INVITE-FANOUT-1 — the REMAINING holders get the durable fan-out. A holder who misses
+    // a removal keeps delivering to, and accepting edits from, someone the chain has removed —
+    // silently and permanently, which is the same defect the invite had and is worse, because here
+    // the stale holder keeps honouring a membership that has been revoked.
+    const holdersTold = await fanOutAmendment({
+      agentName: who.agentName,
+      ownerAgentId: who.ownerAgentId,
+      documentId,
+      amendmentHashHex: Buffer.from(amendHash).toString("hex"),
+      amendmentBytes,
+      holders: [...withNew.arrangement.participants].filter((m) => m !== who.ownerAgentId),
+      verb: "remove",
+    });
+    // THE REMOVED HOLDER IS TOLD ONCE, and is deliberately NOT owed a durable retry: delivery to
+    // them stopping is what removal MEANS, so a queue that kept redialling them would contradict
+    // the act it is announcing. Forward-only cuts both ways — we tell them, we do not pursue them.
     if (holder !== who.ownerAgentId) {
       try {
         const sent = await deps.transportFor(who.agentName).sendBytes({
           peerAgentId: holder, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
         });
-        holdersTold[holder] = sent.ok;
-      } catch {
+        holdersTold[holder] = sent.ok && sent.parked !== true;
+        if (!holdersTold[holder]) {
+          logger.warn("document.amendment.holder_unnotified", {
+            documentId, holderAgentId: holder, verb: "remove-subject",
+            reason: sent.ok ? "relay_parked" : sent.reason,
+            detail: sent.ok ? "the relay is holding it" : sent.detail,
+          });
+        }
+      } catch (err: unknown) {
         holdersTold[holder] = false;
+        logger.warn("document.amendment.holder_unnotified", {
+          documentId, holderAgentId: holder, verb: "remove-subject",
+          reason: "amendment_send_threw",
+          detail: err instanceof Error ? err.message : String(err),
+        });
       }
     }
     logger.info("document.holder_removed", {

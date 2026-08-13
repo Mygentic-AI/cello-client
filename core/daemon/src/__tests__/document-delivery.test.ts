@@ -661,12 +661,93 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
     // The holder comes back. No operator action anywhere.
     wire.up = true;
     const second = await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_BACKOFF_CAP_MS);
-    expect(second.delivered).toBe(1);
-    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toEqual([]);
-    expect(
-      f.events.some((e) => e.event === "document.amendment.delivered"),
-    ).toBe(true);
+    // SENT, not delivered. The bytes reached their daemon; whether it RECORDED them is a separate
+    // fact and the receiver can refuse (a chain gap throws there and answers nothing). Counting
+    // this as delivered is what let the original defect through the new machinery.
+    expect(second.sent).toBe(1);
+    expect(f.events.some((e) => e.event === "document.amendment.sent")).toBe(true);
+
+    // STILL OWED, deliberately — re-offered after the ack timeout until something PROVES receipt.
+    const stillOwed = f.store.pendingAmendmentDeliveries(
+      AGENT, NOW + DELIVERY_BACKOFF_CAP_MS + DELIVERY_ACK_TIMEOUT_MS + 1,
+    );
+    expect(stillOwed).toHaveLength(1);
     expect(hex).toHaveLength(64);
+  });
+
+  it("PROOF BY EPOCH settles it — a holder that acks content at that epoch demonstrably has it", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+      deliver: async () => ({ ok: true as const, admitted: true, sessionId: "s", sessionOpened: true }),
+    });
+    oweAmendment(f);
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_ACK_TIMEOUT_MS + 1)).toHaveLength(1);
+
+    // An envelope authored at the amendment's epoch, which this holder ACKS. The inbound epoch gate
+    // refuses anything whose epoch does not match the receiver's own derived arrangement, so their
+    // answer about this envelope is proof they applied the amendment that created the epoch.
+    const e = { ...envelope(AGENT, null), epochId: AMEND_EPOCH };
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER], NOW);
+    await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_ACK_TIMEOUT_MS + 2);
+
+    // Settled for real — without an amendment ack frame, and without ever claiming that bytes
+    // arriving meant governance applied.
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_ACK_TIMEOUT_MS * 4)).toEqual([]);
+    expect(f.events.some((e2) => e2.event === "document.amendment.confirmed_by_epoch")).toBe(true);
+  });
+
+  it("a RELAY-PARKED send is not treated as delivered", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true, parked: true }),
+    });
+    oweAmendment(f);
+    const res = await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    // The relay took it because the holder had no live counterparty. If they never drain it and the
+    // debt has been cleared, the membership change is gone with both surfaces reporting success.
+    expect(res.failed).toBe(1);
+    expect(res.sent).toBe(0);
+    const ev = f.events.find((e) => e.event === "document.amendment.delivery_failed");
+    expect(ev!.fields["reason"]).toBe("relay_parked");
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toHaveLength(1);
+  });
+
+  it("an EARLIER unacked amendment blocks a later one — no chain gap at the receiver", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: false as const, reason: "session_sealed", detail: "sealed" }),
+    });
+    const first = oweAmendment(f, "cc".repeat(32));
+    // A second amendment, seeded later and therefore due immediately while the first is backed off.
+    const body2 = {
+      document_id: DOC, epoch_id: AMEND_EPOCH + 1, prev_amendment_hash: first,
+      kind: "add_holder", subject_agent_id: "dd".repeat(32),
+      property_change: null, state_hash: null, authored_at_ms: 2,
+    } as const;
+    const h2 = documentAmendmentHash(body2);
+    const hex2 = Buffer.from(h2).toString("hex");
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, AMEND_EPOCH + 1, hex2, Buffer.from(encodeDocumentAmendment({
+      body: body2,
+      collection: {
+        document_id: DOC, subject_kind: "document_amendment", subject_hash: h2,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    })), 2);
+    f.store.seedAmendmentDeliveries(AGENT, DOC, hex2, [PEER], NOW + 1);
+
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    // Epoch 2 must NOT go out first. It would be refused with `document_amendment_chain_gap` —
+    // "an out-of-order arrival is retried by its sender, never buffered silently" — and the
+    // ordering that guarantees it is head-of-line per (document, holder), not creation order among
+    // whichever rows happen to be due.
+    const due = f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2);
+    expect(due).toHaveLength(1);
+    expect(due[0]!.epochId).toBe(AMEND_EPOCH);
   });
 
   it("the amendment goes out BEFORE the envelope in the same pass", async () => {
@@ -720,7 +801,19 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
     // dropping the row would lose the membership change. It stays owed.
     await f.delivery.tick(AGENT, () => null, NOW);
     expect(sends).toEqual([]);
-    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW)).toHaveLength(1);
+    // STILL OWED — dropping the row would lose the membership change.
+    expect(
+      f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2),
+    ).toHaveLength(1);
+    // AND IT SAYS SO. Without this assertion the test passes against a drain loop that does
+    // nothing at all — it was asserting the behaviour of a no-op. The envelope pass logs
+    // `no_holders` only for documents that also have pending envelopes, so a document whose content
+    // is fully acked would sit here re-scanned every tick with nothing said anywhere.
+    const ev = f.events.find((e) => e.event === "document.amendment.holders_underivable");
+    expect(ev, "a permanently stuck membership change must not be silent").toBeDefined();
+    expect(ev!.fields["holderAgentId"]).toBe(PEER);
+    // And it is not re-scanned every tick — it is scheduled at the cap.
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + 1)).toEqual([]);
   });
 });
 
