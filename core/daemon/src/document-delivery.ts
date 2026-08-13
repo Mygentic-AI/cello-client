@@ -274,6 +274,72 @@ export class DocumentDelivery {
       attempted: 0, delivered: 0, sent: 0, rejected: 0, deferred: 0, failed: 0,
     };
 
+    // DOD-MP-INVITE-FANOUT-1 — AMENDMENTS DRAIN FIRST, and the order is the point.
+    //
+    // A holder must apply the admitting amendment BEFORE any edit authored at the new epoch,
+    // otherwise they refuse that edit as coming from a non-participant — the exact symptom seen
+    // live, where a joiner's edits were silently dropped by a holder still at the old epoch. Draining
+    // this queue ahead of the envelope queue in every pass is what makes that ordering a guarantee
+    // rather than a coincidence of timing.
+    for (const owed of this.#store.pendingAmendmentDeliveries(ownerAgentId, nowMs)) {
+      const holders = holdersFor(owed.documentId);
+      // A holder the chain no longer contains is owed nothing — and an underivable chain is not a
+      // reason to spray governance at whoever was last known. Silence here is deliberate; the
+      // envelope pass below logs `document.delivery.no_holders` for the same document.
+      if (holders === null) continue;
+      if (!holders.includes(owed.holderAgentId)) {
+        this.#store.ackAmendmentDelivery(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId, nowMs,
+        );
+        continue;
+      }
+      result.attempted += 1;
+      let ok = false;
+      let reason = "send_threw";
+      try {
+        const sent = await this.#transport.sendBytes({
+          peerAgentId: owed.holderAgentId,
+          documentId: owed.documentId,
+          bytes: owed.bytes,
+          correlationId,
+        });
+        ok = sent.ok;
+        if (!sent.ok) reason = sent.reason;
+      } catch (err: unknown) {
+        reason = err instanceof Error ? err.message : String(err);
+      }
+      if (ok) {
+        this.#store.ackAmendmentDelivery(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId, nowMs,
+        );
+        result.delivered += 1;
+        this.#logger.info("document.amendment.delivered", {
+          documentId: owed.documentId,
+          holderAgentId: owed.holderAgentId,
+          amendmentHash: owed.amendmentHash,
+          attempts: owed.attempts,
+          correlationId,
+        });
+      } else {
+        const attempts = this.#store.recordAmendmentAttempt(
+          ownerAgentId, owed.documentId, owed.amendmentHash, owed.holderAgentId,
+          nowMs + backoffFor(owed.attempts),
+        );
+        result.failed += 1;
+        // WARN, NEVER ERROR, and NEVER ABANDONED: a membership change that cannot be delivered yet
+        // is a retry, not a loss. There is no attempt ceiling here on purpose — abandoning would
+        // put the two holders permanently out of step over exactly the fact they must agree on.
+        this.#logger.warn("document.amendment.delivery_failed", {
+          documentId: owed.documentId,
+          holderAgentId: owed.holderAgentId,
+          amendmentHash: owed.amendmentHash,
+          reason,
+          attempts,
+          correlationId,
+        });
+      }
+    }
+
     // Grouped (document, holder): one derivation and one reachability probe serve every pending
     // envelope for that pair.
     const byDocument = new Map<string, Map<string, Array<{ attempts: number; envelope: DocumentEnvelopeRow }>>>();

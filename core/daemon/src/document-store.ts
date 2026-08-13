@@ -373,6 +373,31 @@ export class DocumentStore {
         PRIMARY KEY (owner_agent_id, document_id, envelope_hash, holder_agent_id)
       );
     `);
+    // DOD-MP-INVITE-FANOUT-1 — the admitting amendment gets the SAME durability a content edit
+    // has. It used to be sent best-effort over direct transport: one shot, no row, no retry, no
+    // restart survival, so a single failed send lost a membership change permanently while every
+    // surface reported success. The governance act that decides who is a party to the document is
+    // the last thing that should be less durable than a typo fix.
+    //
+    // A SEPARATE table rather than a `payload_kind` column on `document_deliveries`: that query is
+    // the hot path every content edit rides, and ordering — the only reason to share a queue — is
+    // preserved explicitly instead, by draining amendments FIRST in every pass (see
+    // DocumentDelivery#run). A holder must apply the amendment before any edit authored at the new
+    // epoch, or they refuse that edit as coming from a non-participant, which is the observed
+    // symptom.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS document_amendment_deliveries (
+        owner_agent_id  TEXT    NOT NULL,
+        document_id     TEXT    NOT NULL,
+        amendment_hash  TEXT    NOT NULL,
+        holder_agent_id TEXT    NOT NULL,
+        acked_at        INTEGER,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at INTEGER,
+        created_at      INTEGER NOT NULL,
+        PRIMARY KEY (owner_agent_id, document_id, amendment_hash, holder_agent_id)
+      );
+    `);
     this.#db.exec(CREATE_ENVELOPES_SQL);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
@@ -1020,6 +1045,111 @@ export class DocumentStore {
     for (const holder of holderAgentIds) {
       insert.run(ownerAgentId, documentId, envelopeHash, holder, nowMs);
     }
+  }
+
+  /**
+   * DOD-MP-INVITE-FANOUT-1 — one owed row per holder who must learn about this amendment.
+   *
+   * The inviter and the subject are excluded by the CALLER, not here: this records what is owed,
+   * and who is owed it is a governance question the handler has already derived.
+   */
+  seedAmendmentDeliveries(
+    ownerAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    holderAgentIds: readonly string[],
+    nowMs: number,
+  ): void {
+    const insert = this.#db.prepare(
+      `INSERT INTO document_amendment_deliveries
+         (owner_agent_id, document_id, amendment_hash, holder_agent_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (owner_agent_id, document_id, amendment_hash, holder_agent_id) DO NOTHING`,
+    );
+    for (const holder of holderAgentIds) {
+      insert.run(ownerAgentId, documentId, amendmentHash, holder, nowMs);
+    }
+  }
+
+  /**
+   * Amendments still owed to a holder, with the exact bytes to send. Joined to
+   * `document_amendments` — the recorded chain IS the payload, so a redelivery can never send
+   * something the local chain does not contain.
+   */
+  pendingAmendmentDeliveries(
+    ownerAgentId: string,
+    nowMs: number,
+  ): Array<{
+    holderAgentId: string;
+    documentId: string;
+    amendmentHash: string;
+    attempts: number;
+    bytes: Uint8Array;
+  }> {
+    const rows = this.#db
+      .prepare(
+        `SELECT d.holder_agent_id, d.document_id, d.amendment_hash, d.attempts, a.received_bytes
+           FROM document_amendment_deliveries d
+           JOIN document_amendments a
+             ON a.owner_agent_id = d.owner_agent_id
+            AND a.document_id = d.document_id
+            AND a.amendment_hash = d.amendment_hash
+          WHERE d.owner_agent_id = ?
+            AND d.acked_at IS NULL
+            AND (d.next_attempt_at IS NULL OR d.next_attempt_at <= ?)
+          ORDER BY d.created_at ASC, d.amendment_hash ASC`,
+      )
+      .all(ownerAgentId, nowMs) as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      holderAgentId: r["holder_agent_id"] as string,
+      documentId: r["document_id"] as string,
+      amendmentHash: r["amendment_hash"] as string,
+      attempts: (r["attempts"] as number) ?? 0,
+      bytes: new Uint8Array(r["received_bytes"] as Uint8Array),
+    }));
+  }
+
+  /** The holder has it. Nothing further is owed for this (amendment, holder). */
+  ackAmendmentDelivery(
+    ownerAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    holderAgentId: string,
+    nowMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `UPDATE document_amendment_deliveries
+            SET acked_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nowMs, ownerAgentId, documentId, amendmentHash, holderAgentId);
+  }
+
+  /** Record one failed attempt and when to try again; returns THEIR attempt count. */
+  recordAmendmentAttempt(
+    ownerAgentId: string,
+    documentId: string,
+    amendmentHash: string,
+    holderAgentId: string,
+    nextAttemptAtMs: number,
+  ): number {
+    this.#db
+      .prepare(
+        `UPDATE document_amendment_deliveries
+            SET attempts = attempts + 1, next_attempt_at = ?
+          WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
+      )
+      .run(nextAttemptAtMs, ownerAgentId, documentId, amendmentHash, holderAgentId);
+    const row = this.#db
+      .prepare(
+        `SELECT attempts FROM document_amendment_deliveries
+          WHERE owner_agent_id = ? AND document_id = ? AND amendment_hash = ? AND holder_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, amendmentHash, holderAgentId) as
+      | { attempts?: number }
+      | undefined;
+    return row?.attempts ?? 0;
   }
 
   /**

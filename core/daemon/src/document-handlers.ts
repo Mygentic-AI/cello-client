@@ -908,14 +908,35 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         documentId, error: err instanceof Error ? err.message : String(err),
       });
     }
+    // DOD-MP-INVITE-FANOUT-1 — RECORD WHAT IS OWED BEFORE TRYING TO SEND IT.
+    //
+    // The loop below is a fast path, not the guarantee. It used to be both, and that is the whole
+    // defect: one failed send lost a membership change permanently, because nothing remained owing
+    // anywhere. A content edit has always had a pending row, a retry schedule and restart survival;
+    // the governance act that decides who is a party to the document had none of them.
+    //
+    // Seeding first also makes the crash window safe: a daemon that dies between here and the send
+    // still owes the amendment on restart.
+    const owedHolders = [...derived.arrangement.participants].filter(
+      (holder) => holder !== who.ownerAgentId && holder !== invitee,
+    );
+    layer.store.seedAmendmentDeliveries(
+      who.ownerAgentId, documentId, amendHashHex, owedHolders, deps.now(),
+    );
     const holdersTold: Record<string, boolean> = {};
-    for (const holder of derived.arrangement.participants) {
-      if (holder === who.ownerAgentId || holder === invitee) continue;
+    for (const holder of owedHolders) {
       try {
         const sent = await deps.transportFor(who.agentName).sendBytes({
           peerAgentId: holder, documentId, bytes: amendmentBytes, correlationId: randomUUID(),
         });
         holdersTold[holder] = sent.ok;
+        // Only a send that ANSWERED clears the debt. A failure leaves the row pending and the
+        // delivery worker owns it from here.
+        if (sent.ok) {
+          layer.store.ackAmendmentDelivery(
+            who.ownerAgentId, documentId, amendHashHex, holder, deps.now(),
+          );
+        }
       } catch {
         holdersTold[holder] = false;
       }

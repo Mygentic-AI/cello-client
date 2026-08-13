@@ -1194,3 +1194,84 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     expect(status, "a removed holder must not be able to end the document").toBe("active");
   });
 });
+
+/**
+ * DOD-MP-INVITE-FANOUT-1 — the admitting amendment must be DURABLE, not best-effort.
+ *
+ * Found live 2026-08-13 across two machines (Entry 37/38). `cello_doc_invite` DOES fan the
+ * amendment out to every existing holder — over DIRECT TRANSPORT, one shot. No pending row, no
+ * ack, no backoff, no restart survival. A content edit gets all five of those; the governance act
+ * that decides WHO IS A PARTY TO THE DOCUMENT gets none, so a single failed send loses a
+ * membership change permanently while every surface reports success.
+ *
+ * On the night the send failed because the session to that holder was stuck sealed — and the
+ * session-retirement fix cannot rescue this path, because a retry-based cure needs a retry.
+ */
+describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreachable holder", () => {
+  it("a holder unreachable AT INVITE TIME still has the amendment owed to them afterwards", async () => {
+    const fA = await newFixture({ sendFails: "session_sealed" });
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer,
+      starting_content: "a document with a second holder who is about to go dark. ",
+    });
+    const documentId = proposed.documentId as string;
+
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId,
+      invitee_pubkey: fC.owner,
+    });
+    expect(invited.ok).toBe(true);
+
+    // The fan-out DID run and DID report the truth per holder — that half was never broken.
+    expect((invited.holdersNotified as Record<string, boolean>)[fA.peer]).toBe(false);
+
+    // THE DEFECT, IN ONE ASSERTION. Today this is zero: the send was best-effort, so when it
+    // failed nothing was left owing anywhere. The holder stays at the old epoch forever, silently
+    // discards the new holder's edits as coming from a stranger, and NO surface on either side
+    // shows an error or anything pending.
+    const owed = fA.layer.store
+      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
+      .filter((p) => p.holderAgentId === fA.peer);
+    expect(
+      owed.length,
+      "the amendment must remain OWED to a holder who could not be reached",
+    ).toBeGreaterThan(0);
+    // The bytes owed are the RECORDED chain's, not a copy held in memory by the handler — a
+    // redelivery can therefore never send something this daemon's own chain does not contain.
+    expect(owed[0]!.amendmentHash).toBe(invited.amendmentHash as string);
+    expect(owed[0]!.bytes.byteLength).toBeGreaterThan(0);
+  });
+
+  it("a holder who DID take it is owed nothing — the fast path clears the debt", async () => {
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "everyone reachable throughout. ",
+    });
+    const documentId = proposed.documentId as string;
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId, invitee_pubkey: fC.owner,
+    });
+    expect((invited.holdersNotified as Record<string, boolean>)[fA.peer]).toBe(true);
+    // A row left pending after a successful send would make the worker send it a second time,
+    // which is how a durability fix turns into a duplicate-delivery bug.
+    expect(fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)).toEqual([]);
+  });
+
+  it("the INVITER and the INVITEE are never owed the amendment — only the existing holders", async () => {
+    const fA = await newFixture({ sendFails: "session_sealed" });
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "who is owed what. ",
+    });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const owedTo = fA.layer.store
+      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
+      .map((p) => p.holderAgentId);
+    // The invitee gets the whole chain inside their join OFFER, so owing them the amendment too
+    // would deliver it twice; owing it to ourselves would be a daemon sending itself governance.
+    expect(owedTo).toEqual([fA.peer]);
+  });
+});

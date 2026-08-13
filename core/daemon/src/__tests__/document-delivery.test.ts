@@ -600,3 +600,126 @@ describe("DocumentDelivery — SENT is neither done nor failed", () => {
     expect(f.store.pendingHolderDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(0);
   });
 });
+
+/**
+ * DOD-MP-INVITE-FANOUT-1 — the worker DRAINS owed amendments, and drains them FIRST.
+ *
+ * The handler now records what is owed; that is worthless unless something delivers it. And the
+ * order is not cosmetic: a holder who applies an edit authored at the new epoch BEFORE the
+ * amendment that created that epoch refuses the edit as coming from a non-participant — the exact
+ * symptom observed live, where a joiner's edits were silently dropped by a holder still at epoch 0.
+ */
+describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before envelopes", () => {
+  const AMEND_EPOCH = 1;
+
+  /** Record an amendment in the chain and owe it to PEER, the way an invite now does. */
+  function oweAmendment(f: ReturnType<typeof newFixture>, subject = "cc".repeat(32)): string {
+    const body = {
+      document_id: DOC, epoch_id: AMEND_EPOCH, prev_amendment_hash: null,
+      kind: "add_holder", subject_agent_id: subject,
+      property_change: null, state_hash: null, authored_at_ms: 1,
+    } as const;
+    const hash = documentAmendmentHash(body);
+    const hex = Buffer.from(hash).toString("hex");
+    const bytes = encodeDocumentAmendment({
+      body,
+      collection: {
+        document_id: DOC, subject_kind: "document_amendment", subject_hash: hash,
+        required_signers: ["a".repeat(64)],
+        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
+      },
+    });
+    f.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, AMEND_EPOCH, hex, Buffer.from(bytes), 1);
+    f.store.seedAmendmentDeliveries(AGENT, DOC, hex, [PEER], NOW);
+    return hex;
+  }
+
+  it("an amendment the holder could not take STAYS OWED and is retried — never abandoned", async () => {
+    const wire = { up: false };
+    const f = newFixture({
+      sendBytes: async () =>
+        wire.up
+          ? { ok: true as const, sessionId: "s", sessionOpened: true }
+          : { ok: false as const, reason: "session_sealed" },
+    });
+    const hex = oweAmendment(f);
+
+    const first = await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    expect(first.failed).toBe(1);
+    // STILL OWED. This is the whole fix: before it, a failed send left nothing owing anywhere and
+    // the holder stayed at the old epoch forever with no error on either side.
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toHaveLength(1);
+    expect(
+      f.events.some((e) => e.event === "document.amendment.delivery_failed"),
+      "a membership change that cannot be delivered yet is a retry, and must say so",
+    ).toBe(true);
+
+    // The holder comes back. No operator action anywhere.
+    wire.up = true;
+    const second = await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_BACKOFF_CAP_MS);
+    expect(second.delivered).toBe(1);
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS * 2)).toEqual([]);
+    expect(
+      f.events.some((e) => e.event === "document.amendment.delivered"),
+    ).toBe(true);
+    expect(hex).toHaveLength(64);
+  });
+
+  it("the amendment goes out BEFORE the envelope in the same pass", async () => {
+    const order: string[] = [];
+    const f = newFixture({
+      sendBytes: async () => {
+        order.push("amendment");
+        return { ok: true as const, sessionId: "s", sessionOpened: true };
+      },
+      deliver: async () => {
+        order.push("envelope");
+        return { ok: true as const, admitted: true, sessionId: "s", sessionOpened: true };
+      },
+    });
+    oweAmendment(f);
+    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
+
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+    // Reverse this and the holder receives an edit authored at an epoch they have never heard of,
+    // and refuses it. Ordering is the guarantee, not a coincidence of which queue happened to be
+    // read first.
+    expect(order).toEqual(["amendment", "envelope"]);
+  });
+
+  it("a holder the chain no longer contains is owed nothing — and is not dialed", async () => {
+    const sends: string[] = [];
+    const f = newFixture({
+      sendBytes: async (input) => {
+        sends.push(input.peerAgentId);
+        return { ok: true as const, sessionId: "s", sessionOpened: true };
+      },
+    });
+    oweAmendment(f);
+    // PEER is gone from the derived set — governance must not be sprayed at whoever was last known.
+    await f.delivery.tick(AGENT, () => [], NOW);
+    expect(sends).toEqual([]);
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_BACKOFF_CAP_MS)).toEqual([]);
+  });
+
+  it("an underivable chain DEFERS the amendment rather than guessing a recipient", async () => {
+    const sends: string[] = [];
+    const f = newFixture({
+      sendBytes: async (input) => {
+        sends.push(input.peerAgentId);
+        return { ok: true as const, sessionId: "s", sessionOpened: true };
+      },
+    });
+    oweAmendment(f);
+    // holdersFor === null means "the document row is gone or the chain does not derive". Sending
+    // to the last-known holder there would be the silent-fallback shape this project forbids;
+    // dropping the row would lose the membership change. It stays owed.
+    await f.delivery.tick(AGENT, () => null, NOW);
+    expect(sends).toEqual([]);
+    expect(f.store.pendingAmendmentDeliveries(AGENT, NOW)).toHaveLength(1);
+  });
+});
