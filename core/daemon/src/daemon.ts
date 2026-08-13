@@ -94,6 +94,7 @@ import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { DocumentDelivery } from "./document-delivery.js";
+import { runAgentPassBounded } from "./delivery-sweep-bound.js";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
@@ -3937,6 +3938,10 @@ async function startDaemonHoldingLock(
   const tickOverride = Number(process.env["CELLO_DOCUMENT_DELIVERY_TICK_MS"]);
   const DOCUMENT_DELIVERY_TICK_MS =
     Number.isFinite(tickOverride) && tickOverride >= 250 ? tickOverride : 60_000;
+  // DOD-MP-SWEEP-ALIVE-1 — how long ONE agent's pass may run before the sweep stops waiting for
+  // it. Generous relative to real work (the ack-grace budget for a whole pass is 30s) and finite,
+  // which is the only property that matters: the defect is an unbounded wait, not a slow one.
+  const DOCUMENT_DELIVERY_PASS_TIMEOUT_MS = Math.max(120_000, DOCUMENT_DELIVERY_TICK_MS * 2);
   let documentDeliveryRunning = false;
   let documentDeliveryStopping = false;
   let documentDeliveryInFlight: Promise<void> | null = null;
@@ -3969,9 +3974,20 @@ async function startDaemonHoldingLock(
             const holders = documentLayer.holdersFor(ownerAgentId, documentId);
             return holders === null ? null : holders.filter((h) => h !== ownerAgentId);
           };
-          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
-            senderAgentId: ownerAgentId,
-          });
+          // DOD-MP-SWEEP-ALIVE-1 — BOUNDED. The `finally` below releases the overlap guard only
+          // when this body settles, so an await that never settles ends document delivery for the
+          // life of the process, silently: the interval keeps firing, returns at the guard, and
+          // logs nothing. Observed live 2026-08-13. One wedged agent now degrades alone and loudly
+          // instead of taking every other agent's documents down with it.
+          const bounded = await runAgentPassBounded(
+            { logger, timeoutMs: DOCUMENT_DELIVERY_PASS_TIMEOUT_MS, agentName },
+            () =>
+              documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
+                senderAgentId: ownerAgentId,
+              }),
+          );
+          if (!bounded.completed) continue;
+          const result = bounded.value;
           attempted += result.attempted;
           delivered += result.delivered;
           failed += result.failed;
