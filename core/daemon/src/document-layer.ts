@@ -427,12 +427,26 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       });
       return null;
     }
-    const derived = deriveArrangement(
-      arrangementGenesisFromProposal(genesisRecord.envelope),
-      amendments.chain(ownerAgentId, documentId),
-      documentGovernancePolicy,
-      verifySignature,
-    );
+    // CONTAINED. `chain()` decodes every stored amendment and THROWS on bytes this build cannot
+    // read, and this function's own contract is to return null when it cannot derive — so the throw
+    // escaped past every caller written against that contract. It reached the operator on
+    // `cello_doc_write` as a raw `Data read, but end of buffer not reached`: a CBOR library naming
+    // where it surfaced, in place of the refusal the publish path was already holding ready.
+    let derived: ReturnType<typeof deriveArrangement>;
+    try {
+      derived = deriveArrangement(
+        arrangementGenesisFromProposal(genesisRecord.envelope),
+        amendments.chain(ownerAgentId, documentId),
+        documentGovernancePolicy,
+        verifySignature,
+      );
+    } catch (err: unknown) {
+      logger.error("document.holders.undecodable", {
+        documentId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
     if (!derived.ok) {
       logger.error("document.holders.underivable", {
         documentId,

@@ -1283,3 +1283,133 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
     expect(owedTo).toEqual([fA.peer]);
   });
 });
+
+/**
+ * DOD-MP-REMOVE-FEEDBACK-1 — the removed holder's OWN view.
+ *
+ * The write refusal already names the removal. `cello_doc_list` did not mention it at all: the
+ * document simply stopped listing them among the participants, which renders identically to a
+ * document they are still part of and haven't looked at closely. So the one surface an operator
+ * checks to answer "what is going on with my documents" was silent about the single fact that
+ * changes what they can do with this one.
+ *
+ * FORWARD-ONLY-REMOVAL is the constraint on the wording: nothing here may imply the copy was taken
+ * back, because it was not and cannot be.
+ */
+describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surface they check", () => {
+  const rowFor = async (f: Awaited<ReturnType<typeof newFixture>>, documentId: string) => {
+    const list = await f.call("cello_doc_list");
+    return (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d["documentId"] === documentId,
+    )!;
+  };
+
+  it("the row says they are out, at which epoch, and that the copy is theirs", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "shared for a while. ",
+    });
+    const documentId = proposed.documentId as string;
+    const left = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fA.owner,
+    });
+    expect(left).toMatchObject({ ok: true, voluntary: true });
+
+    const row = await rowFor(fA, documentId);
+    // The row has carried `removed: true` since REMOVE-1. What was missing is that a bare flag is
+    // not feedback — it says nothing about when, about the copy, or about what actually stopped.
+    expect(row["removed"]).toBe(true);
+    expect(row["yourStanding"]).toBe("removed");
+    expect(typeof row["removedAtEpoch"]).toBe("number");
+    const sentence = String(row["standingGuidance"] ?? "");
+    expect(sentence.length, "a flag with no sentence is not feedback").toBeGreaterThan(40);
+    expect(sentence).toMatch(/no longer a holder|removed/i);
+    expect(sentence).toContain("remain yours");
+    expect(sentence).toMatch(/no longer publish|do not publish|stop publishing/i);
+    // FORWARD-ONLY-REMOVAL: nothing may read as though the copy was taken.
+    expect(sentence).not.toMatch(/revoked|deleted|taken|lost access to your copy/i);
+  });
+
+  it("REMOVING SOMEONE ELSE leaves your OWN row saying holder", async () => {
+    // The bypass the review proved: an implementation that reports removal whenever the chain
+    // contains ANY remove_holder — subject filter ignored — passed the whole suite, because the
+    // only negative case was a document with an EMPTY chain. That cannot tell "I am still a
+    // holder" from "nothing has happened here yet". This one has a real removal in the chain.
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fC.owner,
+    });
+    expect(removed).toMatchObject({ ok: true });
+
+    const row = await rowFor(fA, documentId);
+    // The ADMIN who removed somebody else must not be told they are out of their own document.
+    expect(row["yourStanding"], "the subject of the removal was someone else").toBe("holder");
+    expect(row["removed"]).toBeUndefined();
+    expect(row["standingGuidance"]).toBeUndefined();
+  });
+
+  it("INVITING someone leaves your own row saying holder", async () => {
+    // The sibling bypass: an implementation keyed on `state !== "untouched"` would mislabel every
+    // party to a chain that has any amendment at all, including the inviter.
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const documentId = proposed.documentId as string;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const row = await rowFor(fA, documentId);
+    expect(row["yourStanding"]).toBe("holder");
+  });
+
+  it("a chain this build cannot read says UNKNOWN, never 'holder'", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const documentId = proposed.documentId as string;
+    // A chain that will not decode. The membership walk honestly cannot answer here, and it
+    // reports not-removed — so a key that is merely ABSENT renders a removed holder as fine.
+    fA.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+
+    const row = await rowFor(fA, documentId);
+    expect(row["arrangementUnavailable"]).toBeDefined();
+    // ALWAYS PRESENT, exactly as `participants` is null rather than absent on the same failure.
+    expect(row["yourStanding"], "silence here reads as 'you are fine'").toBe("unknown");
+    expect(String(row["standingGuidance"])).toContain("cannot tell");
+  });
+});
+
+describe("DOD-MP-REMOVE-FEEDBACK-1 — a write REFUSES on an unreadable chain, never throws", () => {
+  it("the operator gets a named reason, not a CBOR library message", async () => {
+    const fA = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fA.peer, starting_content: "before the chain went bad. ",
+    });
+    const documentId = proposed.documentId as string;
+    fA.db.prepare(
+      `INSERT INTO document_amendments
+         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+
+    // `holdersFor` is contracted to return null when it cannot derive, and the publish path is
+    // already holding a named refusal for that. The chain decode threw straight past both, so the
+    // operator got `Data read, but end of buffer not reached` — where it surfaced, not what is
+    // wrong — on one of the three surfaces this DoD line names.
+    const res = await fA.call("cello_doc_write", { document_id: documentId, content: "an edit. " });
+
+    // It does not THROW, which is the whole finding. The shape it returns is the documented one for
+    // this case — the edit is applied to the local copy and NOT published — and the reason names
+    // the chain rather than the CBOR reader.
+    expect(res.published).toBe(false);
+    expect(String(res.reason)).toBe("document_chain_invalid");
+    const said = `${String(res.guidance ?? "")} ${String(res.detail ?? "")}`;
+    expect(said).not.toMatch(/end of buffer/i);
+    expect(said).toMatch(/does not derive from its recorded chain/i);
+  });
+});

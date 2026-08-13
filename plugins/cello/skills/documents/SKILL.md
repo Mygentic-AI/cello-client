@@ -153,6 +153,9 @@ document worse in a way that is tedious to undo.
 | `pendingDeliveries` | The total still outstanding — `pendingUnsent` + `pendingSent`. |
 | `abandonedDeliveries` | Updates that were **given up on** and will never be retried. Not delivered. Republish them. |
 | `closePending` | You closed; still waiting on at least one other current holder. It ends when everyone who holds it has said so. |
+| `yourStanding` | Where YOU stand: `holder`, `removed`, or `unknown`. Always present — an absent answer would read as "you are fine". |
+| `removed` / `removedAtEpoch` | You are out of this document's arrangement, and the epoch it happened at. |
+| `standingGuidance` | The sentence version of the above, including what remains yours. Read this one to the operator. |
 
 ## Ending one
 
@@ -172,6 +175,28 @@ keep writing into a document that will never answer them.
 With more than two holders, a partial result is the ordinary one: some heard it, someone was
 offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
 there are several of them.
+
+
+## When YOU are the one who was removed
+
+This is the view nobody thinks to describe, because it is the one you cannot see from the other
+side. If an admin removes you — or you leave with your own key — `cello_doc_list` marks that
+document `yourStanding: "removed"`, carries `removedAtEpoch`, and puts the whole of it in
+`standingGuidance` as a sentence.
+
+What that means, exactly:
+
+- **Your copy is still yours.** The full text and its whole history stay on your machine. You can
+  read it, open the file, and keep it forever. Removal cannot reach a copy someone already has, and
+  nothing in CELLO pretends otherwise.
+- **What stops is the flow of edits, in both directions.** Your writes no longer publish to the
+  other holders, and their changes no longer reach you. So the copy you keep is frozen at the moment
+  you were removed — it is a real record, not a live one.
+- **Your write will refuse, and it will say why.** You will get `document_removed` naming the epoch,
+  not a vague failure. If you are seeing that reason, nothing is broken; the arrangement changed.
+
+If you want back in, there is no move you can make alone — an admin has to invite you again, and
+your own accept makes it real, exactly as it did the first time.
 
 ## When something is wrong
 
