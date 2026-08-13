@@ -94,6 +94,7 @@ import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { DocumentDelivery } from "./document-delivery.js";
+import { sweepAgentEvicting } from "./delivery-sweep-bound.js";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
@@ -3937,6 +3938,15 @@ async function startDaemonHoldingLock(
   const tickOverride = Number(process.env["CELLO_DOCUMENT_DELIVERY_TICK_MS"]);
   const DOCUMENT_DELIVERY_TICK_MS =
     Number.isFinite(tickOverride) && tickOverride >= 250 ? tickOverride : 60_000;
+  // DOD-MP-SWEEP-ALIVE-1 — how long ONE agent's pass may run before the sweep stops waiting for
+  // it. Generous relative to real work (the ack-grace budget for a whole pass is 30s) and finite,
+  // which is the only property that matters: the defect is an unbounded wait, not a slow one.
+  // Generous relative to what a HEALTHY pass can legitimately spend: the discovery lookup is
+  // bounded at 10s per (document, holder), the whole-pass ack grace is 30s, and only the dial is
+  // unbounded. Six pairs against a slow directory is already ~90s, so a 120s bound would warn on
+  // the normal case — and a signal that fires when nothing is wrong teaches an operator to ignore
+  // the one that matters. Scales with the tick so the fast-tick test path does not sit out minutes.
+  const DOCUMENT_DELIVERY_PASS_TIMEOUT_MS = Math.max(180_000, DOCUMENT_DELIVERY_TICK_MS * 3);
   let documentDeliveryRunning = false;
   let documentDeliveryStopping = false;
   let documentDeliveryInFlight: Promise<void> | null = null;
@@ -3949,6 +3959,7 @@ async function startDaemonHoldingLock(
     documentDeliveryInFlight = (async () => {
       try {
         let agentsSwept = 0;
+        let stuck = 0;
         let attempted = 0;
         let delivered = 0;
         let failed = 0;
@@ -3962,23 +3973,49 @@ async function startDaemonHoldingLock(
           // Scoping the two halves differently returns nothing pending, reports nothing attempted,
           // and leaves a fully synced document invisible with no error on any path.
           if (ownerAgentId === null) continue;
-          agentsSwept++;
+          // COUNTED AFTER THE PASS, not before — an agent whose pass never finished was not swept,
+          // and saying it was is what made the stall indistinguishable from an idle daemon.
           // FANOUT-1: targets are the DERIVED holders minus ourselves — never per-sender
           // config, never the genesis peer column (§7-1's silent-divergence hazard).
           const holdersFor = (documentId: string): string[] | null => {
             const holders = documentLayer.holdersFor(ownerAgentId, documentId);
             return holders === null ? null : holders.filter((h) => h !== ownerAgentId);
           };
-          const result = await documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
-            senderAgentId: ownerAgentId,
+          // DOD-MP-SWEEP-ALIVE-1 — BOUNDED. The `finally` below releases the overlap guard only
+          // when this body settles, so an await that never settles ends document delivery for the
+          // life of the process, silently: the interval keeps firing, returns at the guard, and
+          // logs nothing. Observed live 2026-08-13. One wedged agent now degrades alone and loudly
+          // instead of taking every other agent's documents down with it.
+          const bounded = await sweepAgentEvicting({
+            logger,
+            timeoutMs: DOCUMENT_DELIVERY_PASS_TIMEOUT_MS,
+            agentName,
+            // Evicting the wedged worker is what makes the recovery real: `DocumentDelivery.tick`
+            // caches its pass and would otherwise hand back the same hung promise forever, so the
+            // agent would never deliver again AND every later pass would pay the full bound
+            // waiting for it — a 2x sweep-interval regression for every healthy agent.
+            workers: documentDeliveryWorkers,
+            run: () =>
+              documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
+                senderAgentId: ownerAgentId,
+              }),
           });
+          if (!bounded.completed) {
+            stuck += 1;
+            continue;
+          }
+          agentsSwept++;
+          const result = bounded.value;
           attempted += result.attempted;
           delivered += result.delivered;
           failed += result.failed;
         }
         // H3: a sweep that delivers nothing was byte-for-byte identical to a healthy idle one, which
         // is what made every scoping bug above invisible. One line per tick, always.
-        logger.debug("document.delivery.sweep", { agents: agentsSwept, attempted, delivered, failed });
+        // `stuck` IS PART OF THE LINE. Counting a wedged agent as swept reported `agents: 3,
+        // attempted: 0` — byte-for-byte a healthy idle sweep, which is the exact shape the comment
+        // below exists to prevent, on the one occasion it matters most.
+        logger.debug("document.delivery.sweep", { agents: agentsSwept, stuck, attempted, delivered, failed });
         if (agentsSwept === 0 && documentLayer.store.anyDocumentExists()) {
           logger.warn("document.delivery.sweep_empty", {
             reason: "documents exist but no agent was swept — nothing will ever be delivered",
