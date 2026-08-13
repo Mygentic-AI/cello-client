@@ -698,6 +698,34 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
     expect(f.events.some((e2) => e2.event === "document.amendment.confirmed_by_epoch")).toBe(true);
   });
 
+  it("a REJECTED envelope proves nothing — only an ADMISSION settles the amendment", async () => {
+    const f = newFixture({
+      sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true }),
+      // The holder ANSWERED and refused. A rejection is an ack for delivery purposes, so this
+      // envelope settles — but it must not settle the GOVERNANCE.
+      deliver: async () => ({
+        ok: true as const, admitted: false, rejectionReason: "document_unknown",
+        sessionId: "s", sessionOpened: true,
+      }),
+    });
+    oweAmendment(f);
+    await f.delivery.tick(AGENT, f.holdersFor, NOW);
+
+    const e = { ...envelope(AGENT, null), epochId: AMEND_EPOCH };
+    f.store.appendEnvelope(AGENT, e);
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER], NOW);
+    await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_ACK_TIMEOUT_MS + 2);
+
+    // The checks that run BEFORE the epoch gate — an unknown document, a failed signature — refuse
+    // terminally while the holder may be at ANY epoch. Settling on those would ack an amendment
+    // they do not have: the exact defect this queue exists to prevent, one layer up.
+    expect(
+      f.store.pendingAmendmentDeliveries(AGENT, NOW + DELIVERY_ACK_TIMEOUT_MS * 4),
+      "a refusal must not be read as proof of the receiver's epoch",
+    ).toHaveLength(1);
+    expect(f.events.some((e2) => e2.event === "document.amendment.confirmed_by_epoch")).toBe(false);
+  });
+
   it("a RELAY-PARKED send is not treated as delivered", async () => {
     const f = newFixture({
       sendBytes: async () => ({ ok: true as const, sessionId: "s", sessionOpened: true, parked: true }),

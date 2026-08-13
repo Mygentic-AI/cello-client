@@ -598,20 +598,7 @@ export class DocumentDelivery {
             const first = this.#store.ackHolderDelivery(
               ownerAgentId, documentId, envelope.envelopeHash, holderAgentId, nowMs,
             );
-            // PROOF BY EPOCH (DOD-MP-INVITE-FANOUT-1). There is no amendment ack frame, but this
-            // ack is one: the inbound epoch gate refuses any envelope whose epoch does not match
-            // the receiver's own derived arrangement, so a holder that answered about an envelope
-            // at epoch E demonstrably holds every amendment up to E. Their ack of the content is
-            // their ack of the governance that made the content admissible — which is what lets an
-            // amendment row settle for real instead of being re-offered forever.
-            const settled = this.#store.ackAmendmentsThroughEpoch(
-              ownerAgentId, documentId, holderAgentId, envelope.epochId, nowMs,
-            );
-            if (settled > 0) {
-              this.#logger.info("document.amendment.confirmed_by_epoch", {
-                documentId, holderAgentId, epochId: envelope.epochId, settled, correlationId,
-              });
-            }
+
             // The envelope-level record follows the ONE terminal rule (review M3).
             this.#store.reconcileEnvelopeSettlement(
               ownerAgentId, documentId, envelope.envelopeHash, nowMs,
@@ -621,6 +608,26 @@ export class DocumentDelivery {
               opened: outcome.sessionOpened, correlationId,
             });
             if (outcome.admitted) {
+              // PROOF BY EPOCH (DOD-MP-INVITE-FANOUT-1). There is no amendment ack frame, but an
+              // ADMISSION is one: the inbound epoch gate requires the envelope's epoch to EQUAL the
+              // receiver's own derived epoch, so a holder that admitted an envelope at epoch E
+              // demonstrably holds every amendment up to E. Their acceptance of the content is an
+              // acceptance of the governance that made the content admissible — which settles the
+              // amendment row on evidence rather than on inference.
+              //
+              // ADMITTED ONLY, NEVER MERELY ANSWERED. A rejection is also an ack for delivery
+              // purposes, and it proves nothing here: the checks that run BEFORE the epoch gate —
+              // an unknown document, a failed signature — refuse terminally while the holder may be
+              // at any epoch at all. Settling on those would ack an amendment they do not have,
+              // which is the exact defect this queue exists to prevent, reintroduced one layer up.
+              const settled = this.#store.ackAmendmentsThroughEpoch(
+                ownerAgentId, documentId, holderAgentId, envelope.epochId, nowMs,
+              );
+              if (settled > 0) {
+                this.#logger.info("document.amendment.confirmed_by_epoch", {
+                  documentId, holderAgentId, epochId: envelope.epochId, settled, correlationId,
+                });
+              }
               this.#logger.info("document.delivery.acked", {
                 documentId, envelopeHash: envelope.envelopeHash, holderAgentId,
                 sessionId: outcome.sessionId, firstAck: first, correlationId,
