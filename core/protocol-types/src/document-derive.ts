@@ -56,6 +56,61 @@ export type DeriveDocumentStateResult =
 
 type VerifyFn = (agentId: string, tbs: Uint8Array, signature: Uint8Array) => boolean;
 
+/**
+ * The STATE-INDEPENDENT admission check — what an inbound path may refuse outright, because no
+ * future entry can ever make it good: the collection must bind to this entry, the claimed author
+ * must be in the required set, and every claimed signature must verify. Everything else — subject
+ * semantics, policy, concurrency — is the fold's ruling, and a fold-void entry is still HISTORY
+ * (F4): it must be stored and shared, never bounced at the door, or two holders end up holding
+ * different sets.
+ */
+export function checkEntryAdmissible(
+  env: DocumentAmendmentEnvelope,
+  verify: VerifyFn,
+): { ok: true } | { ok: false; reason: string } {
+  const body = env.body;
+  if (!env.collection.required_signers.includes(body.author_agent_id)) {
+    return {
+      ok: false,
+      reason:
+        `entry_author_not_required: the claimed author ${body.author_agent_id} is not in the ` +
+        `collection's required set — accountability is signed, not asserted`,
+    };
+  }
+  if (env.collection.document_id !== body.document_id) {
+    return {
+      ok: false,
+      reason: `amendment_collection_document_mismatch: collection names ${env.collection.document_id}`,
+    };
+  }
+  if (env.collection.subject_kind !== AMENDMENT_SUBJECT_KIND) {
+    return {
+      ok: false,
+      reason: `amendment_collection_kind: collection signs "${env.collection.subject_kind}", not an amendment`,
+    };
+  }
+  const expected = documentAmendmentHash(body);
+  if (Buffer.compare(env.collection.subject_hash, expected) !== 0) {
+    return {
+      ok: false,
+      reason:
+        "amendment_collection_subject_mismatch: the collection signs a different entry than the " +
+        "one it rides with",
+    };
+  }
+  const status = collectionStatus(env.collection, verify);
+  if (!status.complete) {
+    return {
+      ok: false,
+      reason:
+        `amendment_collection_incomplete: missing [${status.missing.join(", ")}], invalid ` +
+        `[${status.invalidSigners.join(", ")}], unknown [${status.unknown.join(", ")}], ` +
+        `duplicate [${status.duplicates.join(", ")}]`,
+    };
+  }
+  return { ok: true };
+}
+
 interface FoldState {
   participants: Set<string>;
   admins: Set<string>;

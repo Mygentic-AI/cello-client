@@ -28,7 +28,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import * as Y from "yjs";
 import {
   encodeDocumentProposal,
-  deriveArrangement,
+  deriveDocumentState,
   documentGovernancePolicy,
   arrangementGenesisFromProposal,
   documentAmendmentHash,
@@ -815,20 +815,20 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
     const chain = layer.amendments.chain(who.ownerAgentId, documentId);
-    const derived = deriveArrangement(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
+    const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
     if (!derived.ok) {
       return { ok: false, reason: "document_chain_invalid", guidance: derived.reason };
     }
-    if (!derived.arrangement.admins.has(who.ownerAgentId)) {
+    if (!derived.state.admins.has(who.ownerAgentId)) {
       return {
         ok: false,
         reason: "document_not_admin",
         guidance:
           `Inviting takes an admin's signature and this agent holds no admin power here. ` +
-          `Current admins: ${[...derived.arrangement.admins].join(", ")}.`,
+          `Current admins: ${[...derived.state.admins].join(", ")}.`,
       };
     }
-    if (derived.arrangement.participants.has(invitee)) {
+    if (derived.state.participants.has(invitee)) {
       // A RE-RUN after the amendment landed but the offer did not reach them: re-send the STORED
       // offer bytes (the proposal --retry precedent) rather than refusing — authoring afresh
       // would try to admit a holder the chain already admitted, which the replay refuses.
@@ -870,7 +870,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             documentId,
             amendmentHashHex: priorHash,
             amendmentBytes: new Uint8Array(admittingBytes),
-            holders: [...derived.arrangement.participants].filter(
+            holders: [...derived.state.participants].filter(
               (holder) => holder !== who.ownerAgentId && holder !== invitee,
             ),
             verb: "re-invite",
@@ -895,23 +895,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.arrangement.epoch + 1,
-      prev_amendment_hash: derived.arrangement.lastAmendmentHash,
+      epoch_id: derived.state.interimMaxEpoch + 1,
+      prev_amendment_hash: derived.state.interimLastHash,
       kind: "add_holder",
       subject_agent_id: invitee,
       property_change: null,
       state_hash: null,
       authored_at_ms: deps.now(),
-      // SYNC-P1 — the causal fields. Parents are the linear head while authoring is still
-      // epoch-chained; P3's exchange moves this to the fold's frontier.
+      // SYNC-P1 — the causal fields: authored on the fold's frontier.
       author_agent_id: who.ownerAgentId,
       author_seq:
         (layer.amendments.watermarks(who.ownerAgentId, documentId).get(who.ownerAgentId)?.seq ??
           0) + 1,
-      parents:
-        derived.arrangement.lastAmendmentHash === null
-          ? []
-          : [derived.arrangement.lastAmendmentHash],
+      parents: [...derived.state.frontier],
     };
     const amendHash = documentAmendmentHash(body);
     const multisigTbs = buildDocumentMultisigTbs({
@@ -933,11 +929,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       },
     };
     // VALIDATE-BEFORE-APPEND, on the exact bytes about to land.
-    const withNew = deriveArrangement(
+    const withNew = deriveDocumentState(
       genesisArr, [...chain, amendment], documentGovernancePolicy, layer.verifySignature,
     );
     if (!withNew.ok) {
       return { ok: false, reason: "document_amendment_invalid", guidance: withNew.reason };
+    }
+    // A locally-authored entry must TAKE EFFECT — a fold-void entry is admissible history when a
+    // peer sends it, but authoring one ourselves would be publishing an act we already know is
+    // inert, and the void's reason is the refusal the operator needs.
+    {
+      const candidateHex = Buffer.from(amendHash).toString("hex");
+      const inert =
+        withNew.state.voids.find((v) => v.hash === candidateHex) ??
+        withNew.state.excluded.find((e) => e.hash === candidateHex);
+      if (inert) {
+        return { ok: false, reason: "document_amendment_invalid", guidance: inert.reason };
+      }
     }
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
@@ -1006,7 +1014,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     //
     // Seeding first also makes the crash window safe: a daemon that dies between here and the send
     // still owes the amendment on restart.
-    const owedHolders = [...derived.arrangement.participants].filter(
+    const owedHolders = [...derived.state.participants].filter(
       (holder) => holder !== who.ownerAgentId && holder !== invitee,
     );
     const holdersTold = await fanOutAmendment({
@@ -1077,11 +1085,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
     const chain = layer.amendments.chain(who.ownerAgentId, documentId);
-    const derived = deriveArrangement(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
+    const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
     if (!derived.ok) {
       return { ok: false, reason: "document_chain_invalid", guidance: derived.reason };
     }
-    if (!derived.arrangement.participants.has(holder)) {
+    if (!derived.state.participants.has(holder)) {
       // ALREADY REMOVED is the HEALING path, not a refusal (REMOVE-1 review F3): a holder who
       // was offline at removal time never learned, and no other verb can ever re-send the
       // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
@@ -1096,7 +1104,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         let resendTold: Record<string, boolean> = {};
         if (removal) {
           const bytes = new Uint8Array(encodeDocumentAmendment(removal));
-          const remaining = [...derived.arrangement.participants].filter(
+          const remaining = [...derived.state.participants].filter(
             (m) => m !== who.ownerAgentId && m !== holder,
           );
           // The healing re-send is durable for the holders who REMAIN, for the same reason the
@@ -1140,23 +1148,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.arrangement.epoch + 1,
-      prev_amendment_hash: derived.arrangement.lastAmendmentHash,
+      epoch_id: derived.state.interimMaxEpoch + 1,
+      prev_amendment_hash: derived.state.interimLastHash,
       kind: "remove_holder",
       subject_agent_id: holder,
       property_change: null,
       state_hash: null,
       authored_at_ms: deps.now(),
-      // SYNC-P1 — the causal fields. Parents are the linear head while authoring is still
-      // epoch-chained; P3's exchange moves this to the fold's frontier.
+      // SYNC-P1 — the causal fields: authored on the fold's frontier.
       author_agent_id: who.ownerAgentId,
       author_seq:
         (layer.amendments.watermarks(who.ownerAgentId, documentId).get(who.ownerAgentId)?.seq ??
           0) + 1,
-      parents:
-        derived.arrangement.lastAmendmentHash === null
-          ? []
-          : [derived.arrangement.lastAmendmentHash],
+      parents: [...derived.state.frontier],
     };
     const amendHash = documentAmendmentHash(body);
     const multisigTbs = buildDocumentMultisigTbs({
@@ -1180,11 +1184,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     // VALIDATE-BEFORE-APPEND — the policy rules here: a non-admin removing someone else, or any
     // single admin trying to expel a fellow admin through the holder door, refuses with the
     // policy's own sentence. Voluntary self-leave passes for anyone.
-    const withNew = deriveArrangement(
+    const withNew = deriveDocumentState(
       genesisArr, [...chain, amendment], documentGovernancePolicy, layer.verifySignature,
     );
     if (!withNew.ok) {
       return { ok: false, reason: "document_amendment_invalid", guidance: withNew.reason };
+    }
+    // A locally-authored entry must TAKE EFFECT — a fold-void entry is admissible history when a
+    // peer sends it, but authoring one ourselves would be publishing an act we already know is
+    // inert, and the void's reason is the refusal the operator needs.
+    {
+      const candidateHex = Buffer.from(amendHash).toString("hex");
+      const inert =
+        withNew.state.voids.find((v) => v.hash === candidateHex) ??
+        withNew.state.excluded.find((e) => e.hash === candidateHex);
+      if (inert) {
+        return { ok: false, reason: "document_amendment_invalid", guidance: inert.reason };
+      }
     }
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
@@ -1207,7 +1223,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       amendmentHashHex: Buffer.from(amendHash).toString("hex"),
       amendmentBytes,
-      holders: [...withNew.arrangement.participants].filter((m) => m !== who.ownerAgentId),
+      holders: [...withNew.state.participants].filter((m) => m !== who.ownerAgentId),
       verb: "remove",
     });
     // THE REMOVED HOLDER IS TOLD ONCE, and is deliberately NOT owed a durable retry: delivery to
@@ -1330,7 +1346,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // the map, and the operator asking "what documents do I have?" gets NOTHING because one
       // chain would not decode.
       try {
-        const derived = deriveArrangement(
+        const derived = deriveDocumentState(
           arrangementGenesisFromProposal(genesisRecord.envelope),
           layer.amendments.chain(who.ownerAgentId, documentId),
           documentGovernancePolicy,
@@ -1338,9 +1354,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         );
         if (!derived.ok) return unavailable(derived.reason);
         return {
-          participants: [...derived.arrangement.participants].sort(),
-          admins: [...derived.arrangement.admins].sort(),
-          properties: derived.arrangement.properties,
+          participants: [...derived.state.participants].sort(),
+          admins: [...derived.state.admins].sort(),
+          properties: derived.state.properties,
           // WAS THE ADMIN SET DECLARED, OR DEFAULTED? A genesis from before the admin slot
           // existed carries none, and the replay hands both parties admin power. Rendering that
           // identically to a declared set would have this surface state as agreed fact something

@@ -980,7 +980,7 @@ export class DocumentStore {
    */
   /**
    * The document's CURRENT epoch: the head of its recorded amendment chain, 0 at genesis.
-   * Trustworthy for stamping because every append site validates (deriveArrangement) before
+   * Trustworthy for stamping because every append site rules on admissibility before
    * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
    */
   /**

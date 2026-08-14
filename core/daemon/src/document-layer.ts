@@ -67,7 +67,8 @@ import {
   validateDocumentJoinOffer,
   documentGovernancePolicy,
   arrangementGenesisFromProposal,
-  deriveArrangement,
+  deriveDocumentState,
+  checkEntryAdmissible,
   type DocumentJoinAnswer,
   encodeDocumentAck,
   buildDocumentAckTbs,
@@ -432,9 +433,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // escaped past every caller written against that contract. It reached the operator on
     // `cello_doc_write` as a raw `Data read, but end of buffer not reached`: a CBOR library naming
     // where it surfaced, in place of the refusal the publish path was already holding ready.
-    let derived: ReturnType<typeof deriveArrangement>;
+    let derived: ReturnType<typeof deriveDocumentState>;
     try {
-      derived = deriveArrangement(
+      derived = deriveDocumentState(
         arrangementGenesisFromProposal(genesisRecord.envelope),
         amendments.chain(ownerAgentId, documentId),
         documentGovernancePolicy,
@@ -454,7 +455,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       });
       return null;
     }
-    return [...derived.arrangement.participants];
+    return [...derived.state.participants];
   };
 
   /**
@@ -671,10 +672,11 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       if (!r.ok) throw new Error(r.reason);
     },
     recordAmendment: (ownerAgentId, wire, nowMs) => {
-      // An amendment reaching an EXISTING holder. VALIDATE-BEFORE-APPEND (the AMEND-1 standing
-      // condition): the whole chain, including this arrival, must replay through the real policy
-      // before one byte lands in the table — a row in document_amendments is post-validation by
-      // invariant, and epoch stamping rests on that.
+      // An entry reaching an EXISTING holder. The door refuses only what no future entry can
+      // ever make good — a broken collection binding, an unproven author, a failed signature
+      // (checkEntryAdmissible). Everything semantic is the FOLD's ruling at consumption, and a
+      // fold-void entry is still history (F4): bouncing it here would leave two holders holding
+      // different sets.
       const env = decodeDocumentAmendment(wire);
       const documentId = env.body.document_id;
       if (!store.getDocument(ownerAgentId, documentId)) {
@@ -687,14 +689,31 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
             `proposal to replay from`,
         );
       }
-      const derived = deriveArrangement(
-        arrangementGenesisFromProposal(record.envelope),
-        [...amendments.chain(ownerAgentId, documentId), env],
-        documentGovernancePolicy,
-        verifySignature,
-      );
-      if (!derived.ok) throw new Error(derived.reason);
-      amendments.append(ownerAgentId, documentId, wire, nowMs);
+      const admissible = checkEntryAdmissible(env, verifySignature);
+      if (!admissible.ok) throw new Error(admissible.reason);
+      // THE STRANGER DOOR (SYNC-R18, interim until P3's full entitlement classes): a fold-void
+      // entry is history only when its author is KNOWN to this document — a genesis party or
+      // someone a held admission names (which covers invited and removed authors, whose earlier
+      // work must still converge, R20). A complete stranger's governance is refused by name,
+      // never stored — otherwise any key on the internet can grow every holder's entry set.
+      const author = env.body.author_agent_id;
+      const genesisArr = arrangementGenesisFromProposal(record.envelope);
+      const authorKnown =
+        genesisArr.proposerAgentId === author ||
+        genesisArr.peerAgentId === author ||
+        amendments
+          .chain(ownerAgentId, documentId)
+          .some((e) => e.body.kind === "add_holder" && e.body.subject_agent_id === author);
+      if (!authorKnown) {
+        throw new Error(
+          `document_author_stranger: ${author} is neither a genesis party nor named by any held ` +
+            `admission — a stranger's governance is refused, not stored`,
+        );
+      }
+      const appended = amendments.append(ownerAgentId, documentId, wire, nowMs);
+      // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
+      // with it. The store's `document.entry.held` event is the trace.
+      if (appended.held) return;
       // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just stored:
       // the row flips to `removed` (publishes refuse locally, naming the condition; the copy,
       // the file, the history all remain — forward-only by doctrine), and the event is the

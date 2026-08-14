@@ -20,7 +20,7 @@ import {
 } from "../document-amendment.js";
 import { documentGovernancePolicy } from "../document-governance.js";
 import { buildDocumentMultisigTbs } from "../document-multisig.js";
-import { deriveDocumentState } from "../document-derive.js";
+import { deriveDocumentState, checkEntryAdmissible } from "../document-derive.js";
 
 function makeSigner() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -513,13 +513,16 @@ describe("deriveDocumentState — fold-voids stay on the record (F4)", () => {
   });
 
   it("an incomplete signature collection is void, not document-fatal", () => {
-    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const [a, b, c, d] = [makeSigner(), makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
+    // Distinct subjects — were both to admit the same holder, whichever folds first would flip
+    // the OTHER's void reason to already_holder and the assertion would ride the hash coin.
     const unsigned = entry({ subject_agent_id: c.agentId }, [a]);
     unsigned.collection.signatures = [];
-    const good = entry({ subject_agent_id: c.agentId, authored_at_ms: T0 + 9 }, [a]);
-    const s = deriveOk(g, [unsigned, good], [a, b, c]);
-    expect(s.participants.has(c.agentId)).toBe(true);
+    const good = entry({ subject_agent_id: d.agentId, authored_at_ms: T0 + 9 }, [a]);
+    const s = deriveOk(g, [unsigned, good], [a, b, c, d]);
+    expect(s.participants.has(d.agentId)).toBe(true);
+    expect(s.participants.has(c.agentId)).toBe(false);
     expect(s.voids.find((v) => v.hash === hashHex(unsigned))!.reason).toMatch(/incomplete/);
   });
 });
@@ -558,6 +561,105 @@ describe("deriveDocumentState — the holder cap under concurrency", () => {
     expect(s.participants.size).toBe(20);
     const capVoids = s.voids.filter((v) => /holder_cap/.test(v.reason));
     expect(capVoids.length).toBe(1);
+  });
+});
+
+describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
+  it("genesis alone derives the bilateral arrangement with the genesis admin set", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const s = deriveOk(genesis(a, b), [], [a, b]);
+    expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
+    expect([...s.admins]).toEqual([a.agentId]);
+    expect(s.properties["topology"]).toBe("mesh");
+    expect(s.interimMaxEpoch).toBe(0);
+    expect(s.interimLastHash).toBeNull();
+  });
+
+  it("refuses a genesis whose admin set contains a non-participant", () => {
+    const [a, b, outsider] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = { ...genesis(a, b), adminSet: [outsider.agentId] };
+    const r = deriveDocumentState(g, [], documentGovernancePolicy, makeVerify([a, b]));
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/arrangement_admin_not_participant/);
+  });
+
+  it("a claim the policy refuses is void with the policy's own sentence — a rogue signer set admits nobody", () => {
+    const [a, b, c, rogue] = [makeSigner(), makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    // Signed and complete — but the claimed required set is the rogue, not a current admin.
+    const env = entry({ subject_agent_id: c.agentId, author_agent_id: rogue.agentId }, [rogue]);
+    const s = deriveOk(g, [env], [a, b, c, rogue]);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids[0]!.reason).toMatch(/governance_not_admin/);
+  });
+
+  it("removing a non-holder is void by name", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const env = entry({ kind: "remove_holder", subject_agent_id: "9".repeat(64) }, [a]);
+    const s = deriveOk(genesis(a, b), [env], [a, b]);
+    expect(s.voids[0]!.reason).toMatch(/amendment_subject_not_holder/);
+  });
+
+  it("a property outside the amendable set is void by name", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const env = entry(
+      {
+        kind: "change_property",
+        subject_agent_id: null,
+        property_change: { key: "assurance_tier", value: "attested" },
+      },
+      [a],
+    );
+    const s = deriveOk(genesis(a, b), [env], [a, b]);
+    expect(s.voids[0]!.reason).toMatch(/amendment_property_not_amendable/);
+    expect(s.properties["assurance_tier"]).toBe("authenticated");
+  });
+
+  it("a canonical state hash on an authenticated-tier document is void — only Tier 2 defines the slot", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const env = entry(
+      { subject_agent_id: c.agentId, state_hash: new Uint8Array(32) },
+      [a],
+    );
+    const s = deriveOk(genesis(a, b), [env], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids[0]!.reason).toMatch(/amendment_state_hash_tier/);
+  });
+});
+
+describe("checkEntryAdmissible — the state-independent door", () => {
+  it("admits a properly-bound, fully-signed entry", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    void b;
+    const env = entry({ subject_agent_id: "c".repeat(64) }, [a]);
+    expect(checkEntryAdmissible(env, makeVerify([a]))).toEqual({ ok: true });
+  });
+
+  it("refuses an author outside the required set, an unbound collection, and a failed signature — each by name", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const impostor = entry({ subject_agent_id: "c".repeat(64), author_agent_id: b.agentId }, [a]);
+    const r1 = checkEntryAdmissible(impostor, makeVerify([a, b]));
+    expect(r1.ok).toBe(false);
+    if (!r1.ok) expect(r1.reason).toMatch(/entry_author_not_required/);
+
+    const unsigned = entry({ subject_agent_id: "c".repeat(64) }, [a]);
+    unsigned.collection.signatures = [];
+    const r2 = checkEntryAdmissible(unsigned, makeVerify([a]));
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toMatch(/amendment_collection_incomplete/);
+
+    const rebound = entry({ subject_agent_id: "c".repeat(64) }, [a]);
+    rebound.collection.subject_hash = new Uint8Array(32);
+    const r3 = checkEntryAdmissible(rebound, makeVerify([a]));
+    expect(r3.ok).toBe(false);
+    if (!r3.ok) expect(r3.reason).toMatch(/amendment_collection_subject_mismatch/);
+  });
+
+  it("does NOT rule on semantics — an add of an existing holder passes the door (the fold voids it)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const dup = entry({ subject_agent_id: b.agentId }, [a]);
+    expect(checkEntryAdmissible(dup, makeVerify([a]))).toEqual({ ok: true });
   });
 });
 
