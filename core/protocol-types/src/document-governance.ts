@@ -23,7 +23,7 @@
  *   deadlock in one move. Demote first, under remove_admin's rule.
  *
  * Kind/subject semantics (does the subject hold? is it already an admin? last-admin protection)
- * are `deriveArrangement`'s job and run BEFORE this policy is consulted — it may assume a
+ * are the causal fold's job (`deriveDocumentState`) and run BEFORE this policy is consulted — it may assume a
  * semantically coherent amendment.
  */
 
@@ -36,7 +36,7 @@ function canonical(ids: readonly string[]): string[] {
 }
 
 /** A duplicated claim is a builder bug, refused — deduping here would hand the multisig layer a
- * collection it THROWS on (`multisig_duplicate_signer`), escaping DeriveResult's never-throw
+ * collection it THROWS on (`multisig_duplicate_signer`), escaping the derivation's never-throw
  * contract. The two layers agree: duplicates refuse, loudly, at the first gate they reach. */
 function hasDuplicates(ids: readonly string[]): boolean {
   return new Set(ids).size !== ids.length;
@@ -67,7 +67,7 @@ export function documentGovernancePolicy(
   }
 
   if (kind === "remove_admin") {
-    // deriveArrangement already refused a non-admin subject and the last-admin case.
+    // The fold already refused a non-admin subject and the last-admin case.
     if (state.admins.size === 2) {
       return {
         ok: false,

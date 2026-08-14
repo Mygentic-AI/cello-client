@@ -286,7 +286,6 @@ export {
   documentAmendmentHash,
   encodeDocumentAmendment,
   decodeDocumentAmendment,
-  deriveArrangement,
 } from "./document-amendment.js";
 export type {
   AmendmentKind,
@@ -295,8 +294,10 @@ export type {
   ArrangementGenesis,
   Arrangement,
   SignerPolicy,
-  DeriveResult,
 } from "./document-amendment.js";
+export { MAX_ENTRY_PARENTS } from "./document-amendment.js";
+export { deriveDocumentState, checkEntryAdmissible } from "./document-derive.js";
+export type { DocumentStateView, DeriveDocumentStateResult } from "./document-derive.js";
 export {
   DOCUMENT_MULTISIG_DOMAIN,
   buildDocumentMultisigTbs,

@@ -28,14 +28,24 @@
 import { createHash } from "node:crypto";
 import { encodeCbor, decodeCbor } from "./cbor.js";
 import {
-  collectionStatus,
   encodeMultisigCollection,
   decodeMultisigCollection,
   type MultisigCollection,
 } from "./document-multisig.js";
 
-/** Domain tag in slot 0 of the to-be-signed array. Sibling of the other CELLO-DOCUMENT-* tags. */
-export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v1";
+/**
+ * Domain tag in slot 0 of the to-be-signed array. Sibling of the other CELLO-DOCUMENT-* tags.
+ * v2 (SYNC-P1): the preimage gained the causal fields — author, sequence, parents. A v1 frame is
+ * refused by the mandatory-field discipline below; no compatibility is owed (all holders upgrade
+ * together).
+ */
+export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v2";
+
+/**
+ * Ceiling on an entry's parent list. The honest frontier is bounded by the holder cap (D5: 20);
+ * the ceiling exists so a hostile daemon cannot make every ancestry walk unbounded.
+ */
+export const MAX_ENTRY_PARENTS = 64;
 
 /** The `subject_kind` an amendment's multisig collection must carry. */
 export const AMENDMENT_SUBJECT_KIND = "document_amendment";
@@ -78,6 +88,17 @@ export interface DocumentAmendmentBody {
    */
   state_hash: Uint8Array | null;
   authored_at_ms: number;
+  /**
+   * SYNC-P1 — the causal fields. The accountable initiator (MUST appear in the collection's
+   * required set), their own-chain counter, and the frontier heads applied when authoring. For
+   * `author_seq > 1` the author's previous entry MUST be among the ancestors the parents reach —
+   * a direct parent is the common case, not the requirement. Signed: a forwarder cannot
+   * re-attribute, re-sequence, or re-parent without every signature failing (SYNC-R2).
+   */
+  author_agent_id: string;
+  author_seq: number;
+  /** Entry hashes (64-hex), CANONICAL: strictly ascending, no duplicates. Empty anchors to genesis. */
+  parents: readonly string[];
 }
 
 export interface DocumentAmendmentEnvelope {
@@ -109,6 +130,9 @@ export function buildDocumentAmendmentTbs(
     typeof body.authored_at_ms === "number" && body.authored_at_ms > 0xffffffff
       ? BigInt(body.authored_at_ms)
       : body.authored_at_ms,
+    body.author_agent_id,
+    body.author_seq,
+    [...body.parents],
   ]);
   if (opts.preHash === false) return preimage;
   return new Uint8Array(createHash("sha256").update(preimage).digest());
@@ -136,6 +160,9 @@ export function encodeDocumentAmendment(env: DocumentAmendmentEnvelope): Uint8Ar
       property_change: env.body.property_change,
       state_hash: env.body.state_hash,
       authored_at_ms: env.body.authored_at_ms,
+      author_agent_id: env.body.author_agent_id,
+      author_seq: env.body.author_seq,
+      parents: [...env.body.parents],
     },
     collection: encodeMultisigCollection(env.collection),
   });
@@ -234,6 +261,46 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
     throw new Error("document_amendment_field_type: authored_at_ms must be an integer");
   }
 
+  const author = present(b, "author_agent_id");
+  if (typeof author !== "string" || !/^[0-9a-f]{64}$/.test(author)) {
+    throw new Error(
+      "document_amendment_field_type: author_agent_id must be a 64-hex agent pubkey",
+    );
+  }
+
+  const authorSeq = present(b, "author_seq");
+  if (typeof authorSeq !== "number" || !Number.isInteger(authorSeq) || authorSeq < 1) {
+    throw new Error(
+      `document_amendment_author_seq: must be a positive integer (an author's own chain starts ` +
+        `at 1), got ${String(authorSeq)}`,
+    );
+  }
+
+  const rawParents = present(b, "parents");
+  if (!Array.isArray(rawParents)) {
+    throw new Error("document_amendment_field_type: parents must be an array of entry hashes");
+  }
+  if (rawParents.length > MAX_ENTRY_PARENTS) {
+    throw new Error(
+      `document_amendment_parents_cap: ${rawParents.length} parents exceeds the ceiling of ` +
+        `${MAX_ENTRY_PARENTS} — an honest frontier is bounded by the holder cap`,
+    );
+  }
+  for (const p of rawParents) {
+    if (typeof p !== "string" || !/^[0-9a-f]{64}$/.test(p)) {
+      throw new Error("document_amendment_field_type: parents must be 64-hex entry hashes");
+    }
+  }
+  const parents = rawParents as string[];
+  for (let i = 1; i < parents.length; i++) {
+    if (parents[i]! <= parents[i - 1]!) {
+      throw new Error(
+        "document_amendment_parents_canonical: parents must be strictly ascending with no " +
+          "duplicates — one entry, one identity",
+      );
+    }
+  }
+
   const rawCollection = present(map, "collection");
   if (!(rawCollection instanceof Uint8Array)) {
     throw new Error("document_amendment_field_type: collection must be a CBOR byte string");
@@ -249,6 +316,9 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
       property_change: propertyChange,
       state_hash: stateHash === null ? null : new Uint8Array(stateHash),
       authored_at_ms: authoredAt,
+      author_agent_id: author,
+      author_seq: authorSeq,
+      parents,
     },
     collection: decodeMultisigCollection(new Uint8Array(rawCollection)),
   };
@@ -285,217 +355,3 @@ export type SignerPolicy = (
   state: { participants: ReadonlySet<string>; admins: ReadonlySet<string> },
   claimedRequiredSet: readonly string[],
 ) => { ok: true } | { ok: false; reason: string };
-
-export type DeriveResult =
-  | { ok: true; arrangement: Arrangement }
-  | { ok: false; reason: string; epoch: number };
-
-function refuse(reason: string, epoch: number): DeriveResult {
-  return { ok: false, reason, epoch };
-}
-
-/**
- * Replay: genesis + the ordered amendment chain → the current arrangement, or a loud refusal
- * naming the epoch and the cause. NEVER a partial arrangement — a holder that cannot derive the
- * whole chain has no arrangement, which is what makes "invalid everywhere" computable.
- */
-export function deriveArrangement(
-  genesis: ArrangementGenesis,
-  amendments: readonly DocumentAmendmentEnvelope[],
-  policy: SignerPolicy,
-  verify: (agentId: string, tbs: Uint8Array, signature: Uint8Array) => boolean,
-): DeriveResult {
-  const participants = new Set([genesis.proposerAgentId, genesis.peerAgentId]);
-  const admins = new Set(genesis.adminSet);
-  if (admins.size === 0) {
-    return refuse(
-      "arrangement_admin_set_empty: a document with no admins can never be amended — the " +
-        "creation flow must name at least one",
-      0,
-    );
-  }
-  for (const admin of admins) {
-    if (!participants.has(admin)) {
-      return refuse(
-        `arrangement_admin_not_participant: ${admin} holds admin power but is not a holder — ` +
-          `admins are always holders`,
-        0,
-      );
-    }
-  }
-  const properties: Arrangement["properties"] = { ...genesis.properties };
-  let epoch = 0;
-  let lastHash: string | null = null;
-
-  for (const env of amendments) {
-    const body = env.body;
-    const at = body.epoch_id;
-
-    if (body.document_id !== genesis.documentId) {
-      return refuse(
-        `amendment_wrong_document: names ${body.document_id}, replaying ${genesis.documentId}`,
-        at,
-      );
-    }
-    if (body.epoch_id !== epoch + 1) {
-      return refuse(
-        `amendment_chain_gap: expected epoch ${epoch + 1} next, got ${body.epoch_id} — a missing ` +
-          `amendment is a gap to resolve, never to skip`,
-        at,
-      );
-    }
-    if (body.prev_amendment_hash !== lastHash) {
-      return refuse(
-        `amendment_chain_broken: epoch ${at} chains to ${body.prev_amendment_hash ?? "genesis"} ` +
-          `but the replayed predecessor is ${lastHash ?? "genesis"} — a fork, not a gap`,
-        at,
-      );
-    }
-    // WHITELIST, not an equality on the benign value: only a tier that DEFINES the slot may fill
-    // it. An equality check on "authenticated" silently accepted a Tier 2 field whenever the
-    // genesis lacked the tier property — a mis-built genesis running degraded instead of refusing.
-    if (body.state_hash !== null && properties["assurance_tier"] !== "attested") {
-      return refuse(
-        `amendment_state_hash_tier: epoch ${at} carries a canonical state hash but the document's ` +
-          `tier is ${JSON.stringify(properties["assurance_tier"] ?? null)} — only "attested" ` +
-          `(Tier 2) defines that slot`,
-        at,
-      );
-    }
-
-    // Subject semantics against the CURRENT state — a no-op amendment is refused, not absorbed:
-    // silently absorbing "add someone who already holds" would let two amendments with one
-    // meaning carry different signatures.
-    const subject = body.subject_agent_id;
-    switch (body.kind) {
-      case "add_holder": {
-        if (subject === null) return refuse(`amendment_subject_required: add_holder names nobody`, at);
-        if (participants.has(subject)) {
-          return refuse(`amendment_subject_already_holder: ${subject} already holds this document`, at);
-        }
-        if (participants.size + 1 > MAX_DOCUMENT_HOLDERS) {
-          return refuse(
-            `amendment_holder_cap: admitting ${subject} would make ${participants.size + 1} holders ` +
-              `and the cap is ${MAX_DOCUMENT_HOLDERS} (D5)`,
-            at,
-          );
-        }
-        break;
-      }
-      case "remove_holder": {
-        if (subject === null) return refuse(`amendment_subject_required: remove_holder names nobody`, at);
-        if (!participants.has(subject)) {
-          return refuse(`amendment_subject_not_holder: ${subject} does not hold this document`, at);
-        }
-        if (admins.has(subject) && admins.size === 1) {
-          return refuse(
-            `amendment_last_admin: removing ${subject} would leave the document with no admins — ` +
-              `it could never be amended again`,
-            at,
-          );
-        }
-        break;
-      }
-      case "promote_admin": {
-        if (subject === null) return refuse(`amendment_subject_required: promote_admin names nobody`, at);
-        if (!participants.has(subject)) {
-          return refuse(`amendment_subject_not_holder: ${subject} does not hold this document`, at);
-        }
-        if (admins.has(subject)) {
-          return refuse(`amendment_subject_already_admin: ${subject} is already an admin`, at);
-        }
-        break;
-      }
-      case "remove_admin": {
-        if (subject === null) return refuse(`amendment_subject_required: remove_admin names nobody`, at);
-        if (!admins.has(subject)) {
-          return refuse(`amendment_subject_not_admin: ${subject} holds no admin power to remove`, at);
-        }
-        if (admins.size === 1) {
-          return refuse(
-            `amendment_last_admin: demoting ${subject} would leave the document with no admins — ` +
-              `it could never be amended again`,
-            at,
-          );
-        }
-        break;
-      }
-      case "change_property": {
-        if (subject !== null) {
-          return refuse(`amendment_subject_forbidden: change_property is about the document, not a holder`, at);
-        }
-        if (body.property_change === null) {
-          return refuse(`amendment_property_missing: change_property carries no change`, at);
-        }
-        if (!AMENDABLE_PROPERTIES.has(body.property_change.key)) {
-          return refuse(
-            `amendment_property_not_amendable: "${body.property_change.key}" is not amendable — ` +
-              `the amendable set is {${[...AMENDABLE_PROPERTIES].join(", ")}}; tier and schema ` +
-              `changes are Tier 2 epoch events, topology and profile are a new agreement`,
-            at,
-          );
-        }
-        break;
-      }
-    }
-
-    // The collection: bound to THIS amendment, its claimed required set ACCEPTABLE TO THE POLICY
-    // for the state BEFORE it, and complete. Order matters — a mismatch in what the collection claims is
-    // reported before whether it gathered enough names for the wrong claim.
-    const expectedHash = documentAmendmentHash(body);
-    if (env.collection.document_id !== body.document_id) {
-      return refuse(`amendment_collection_document_mismatch: collection names ${env.collection.document_id}`, at);
-    }
-    if (env.collection.subject_kind !== AMENDMENT_SUBJECT_KIND) {
-      return refuse(
-        `amendment_collection_kind: collection signs "${env.collection.subject_kind}", not an amendment`,
-        at,
-      );
-    }
-    if (Buffer.compare(env.collection.subject_hash, expectedHash) !== 0) {
-      return refuse(
-        `amendment_collection_subject_mismatch: the collection signs a different amendment than ` +
-          `the one it rides with`,
-        at,
-      );
-    }
-    const verdict = policy(body.kind, subject, { participants, admins }, env.collection.required_signers);
-    if (!verdict.ok) {
-      // The policy's reason IS the diagnosis — epoch context prepended, nothing substituted.
-      return refuse(`epoch ${at}: ${verdict.reason}`, at);
-    }
-    const status = collectionStatus(env.collection, verify);
-    if (!status.complete) {
-      return refuse(
-        `amendment_collection_incomplete: epoch ${at} — missing [${status.missing.join(", ")}], ` +
-          `invalid [${status.invalidSigners.join(", ")}], unknown [${status.unknown.join(", ")}], ` +
-          `duplicate [${status.duplicates.join(", ")}]`,
-        at,
-      );
-    }
-
-    // Apply.
-    switch (body.kind) {
-      case "add_holder":
-        participants.add(subject!);
-        break;
-      case "remove_holder":
-        participants.delete(subject!);
-        admins.delete(subject!);
-        break;
-      case "promote_admin":
-        admins.add(subject!);
-        break;
-      case "remove_admin":
-        admins.delete(subject!);
-        break;
-      case "change_property":
-        properties[body.property_change!.key] = body.property_change!.value;
-        break;
-    }
-    epoch = body.epoch_id;
-    lastHash = Buffer.from(expectedHash).toString("hex");
-  }
-
-  return { ok: true, arrangement: { epoch, participants, admins, properties, lastAmendmentHash: lastHash } };
-}

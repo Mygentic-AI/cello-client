@@ -263,11 +263,12 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     const brokenId = broken.documentId as string;
     f.db
       .prepare(
-        `INSERT INTO document_amendments
-           (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO document_entries
+           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+            received_bytes, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(f.owner, brokenId, 1, "h".repeat(64), Buffer.from([0xff, 0xff, 0xff]), 1);
+      .run(f.owner, brokenId, "h".repeat(64), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const list = await f.call("cello_doc_list", {});
     const rows = list.documents as Array<Record<string, unknown>>;
@@ -513,6 +514,9 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: NOW,
+      author_agent_id: rogueId,
+      author_seq: 1,
+      parents: [],
     };
     const hash = documentAmendmentHash(body);
     const tbs = buildDocumentMultisigTbs({
@@ -533,9 +537,114 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     });
     const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(forged), rogueId);
     expect(routed.consumed).toBe(true);
-    // The router contains the refusal; the epoch NEVER advances on a forged amendment.
+    // The router contains the refusal; the epoch NEVER advances on a forged amendment — and the
+    // stranger's entry is NOT STORED, not even as history (SYNC-R18: refused, never absorbed).
     await new Promise((r) => setTimeout(r, 100));
     expect(fB.layer.store.currentDocumentEpoch(fB.owner, documentId)).toBe(1);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(1);
+  });
+
+  it("a KNOWN author's semantically-void entry IS stored — history, not refusal (F4 of the fold)", async () => {
+    // The other half of the stranger door: bouncing a known party's fold-void entry would leave
+    // two holders holding different sets. B stores it; the fold rules it contributes nothing.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const amendSend = fA.sent.filter((s) => s.peerAgentId === fB.owner).at(-1)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
+    await until(() => fB.layer.store.currentDocumentEpoch(fB.owner, documentId) === 1);
+
+    // A — a genesis party, fully signed — authors an admission for someone who ALREADY holds.
+    const chain = fB.layer.amendments.chain(fB.owner, documentId);
+    const inviteHash = Buffer.from(documentAmendmentHash(chain[0]!.body)).toString("hex");
+    const voidBody: DocumentAmendmentBody = {
+      document_id: documentId,
+      epoch_id: 2,
+      prev_amendment_hash: inviteHash,
+      kind: "add_holder",
+      subject_agent_id: fB.owner, // already a holder — the fold voids this
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: NOW + 1,
+      author_agent_id: fA.owner,
+      author_seq: 2,
+      parents: [inviteHash],
+    };
+    const voidHash = documentAmendmentHash(voidBody);
+    const voidTbs = buildDocumentMultisigTbs({
+      document_id: documentId,
+      subject_kind: "document_amendment",
+      subject_hash: voidHash,
+      required_signers: [fA.owner],
+    });
+    const voidWire = encodeDocumentAmendment({
+      body: voidBody,
+      collection: {
+        document_id: documentId,
+        subject_kind: "document_amendment",
+        subject_hash: voidHash,
+        required_signers: [fA.owner],
+        signatures: [{ signer_agent_id: fA.owner, signature: await fA.keys.sign(voidTbs) }],
+      },
+    });
+    const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(voidWire), fA.owner);
+    expect(routed.consumed).toBe(true);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
+    // Stored as history; the derived holders are unchanged.
+    const holders = fB.layer.holdersFor(fB.owner, documentId);
+    expect(holders).not.toBeNull();
+    expect([...holders!].sort()).toEqual([fA.owner, fB.owner, fC.owner].sort());
+  });
+
+  it("HELD-THEN-PROMOTED entries surface their notices — an out-of-order removal still tells its subject (review F2)", async () => {
+    // The arrival order the pending table exists for: the removal lands BEFORE the amendment it
+    // chains onto. On promotion, document.removed_from must fire and the lifecycle must run —
+    // the early-return version dropped both, silently, forever.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fB.owner,
+      admins: [fA.owner], // B must be a plain holder, or the holder door blocks the removal
+    });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+
+    // A authors amendment 1 (invite C) and amendment 2 (remove B) — B receives NEITHER yet.
+    const sentToB = fA.sent.filter((s) => s.peerAgentId === fB.owner).length;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId,
+      holder_pubkey: fB.owner,
+    });
+    expect(removed).toMatchObject({ ok: true, epochId: 2 });
+    const [inviteToB, removalToB] = fA.sent
+      .filter((s) => s.peerAgentId === fB.owner)
+      .slice(sentToB);
+
+    // The REMOVAL arrives first: held (its parent is missing), nothing applied, no notice.
+    fB.layer.onDocumentFrame(AGENT, "session-1", removalToB!.bytes, fA.owner);
+    await until(() => fB.layer.amendments.pending(fB.owner, documentId).length === 1);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(0);
+    expect(fB.events).not.toContain("document.removed_from");
+    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(false);
+
+    // The parent arrives: the removal PROMOTES — and its notice fires with it.
+    fB.layer.onDocumentFrame(AGENT, "session-1", inviteToB!.bytes, fA.owner);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
+    expect(fB.layer.amendments.pending(fB.owner, documentId)).toHaveLength(0);
+    expect(fB.events).toContain("document.removed_from");
+    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(true);
   });
 
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
@@ -1134,7 +1243,7 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     // showing `closed` and nothing saying the derivation had failed. `close()` takes no sender
     // gate, so this reaches the settle decision directly.
     fA.layer.store.rawDb
-      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .prepare(`UPDATE document_entries SET received_bytes = ? WHERE document_id = ?`)
       .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
 
     await fA.call("cello_doc_close", { document_id: documentId });
@@ -1148,7 +1257,7 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     const { fA, documentId } = await threeHolders();
     await fA.call("cello_doc_close", { document_id: documentId });
     fA.layer.store.rawDb
-      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .prepare(`UPDATE document_entries SET received_bytes = ? WHERE document_id = ?`)
       .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
 
     // `holdersFor` THROWS on bytes this build cannot read. Uncontained, that throw escaped the row,
@@ -1371,10 +1480,11 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     // A chain that will not decode. The membership walk honestly cannot answer here, and it
     // reports not-removed — so a key that is merely ABSENT renders a removed holder as fine.
     fA.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const row = await rowFor(fA, documentId);
     expect(row["arrangementUnavailable"]).toBeDefined();
@@ -1392,10 +1502,11 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a write REFUSES on an unreadable chain, n
     });
     const documentId = proposed.documentId as string;
     fA.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     // `holdersFor` is contracted to return null when it cannot derive, and the publish path is
     // already holding a named refusal for that. The chain decode threw straight past both, so the

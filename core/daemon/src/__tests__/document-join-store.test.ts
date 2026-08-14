@@ -73,6 +73,7 @@ function bundle() {
     document_id: documentId, epoch_id: 1, prev_amendment_hash: null,
     kind: "add_holder", subject_agent_id: c.agentId,
     property_change: null, state_hash: null, authored_at_ms: 1,
+    author_agent_id: a.agentId, author_seq: 1, parents: [],
   };
   const hash = documentAmendmentHash(body);
   const tbs = buildDocumentMultisigTbs({

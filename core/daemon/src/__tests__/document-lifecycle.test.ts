@@ -133,6 +133,9 @@ describe("DocumentLifecycle — list", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1,
+      author_agent_id: "a".repeat(64),
+      author_seq: 1,
+      parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const bytes = encodeDocumentAmendment({
@@ -146,10 +149,11 @@ describe("DocumentLifecycle — list", () => {
       },
     });
     f.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, 2, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 2, Buffer.from(bytes), 1);
     const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect(row!.epochId).toBe(2);
   });
@@ -165,6 +169,9 @@ describe("DocumentLifecycle — list", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1,
+      author_agent_id: "a".repeat(64),
+      author_seq: 1,
+      parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const bytes = encodeDocumentAmendment({
@@ -178,10 +185,11 @@ describe("DocumentLifecycle — list", () => {
       },
     });
     f.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, 1, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 1, Buffer.from(bytes), 1);
     const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect((row as unknown as { removed?: boolean }).removed).toBe(true);
     expect(row!.status).toBe("active");

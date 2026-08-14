@@ -7,14 +7,14 @@
  * voluntary leave is always acceptable, admin or not. The policy VALIDATES the collection's
  * claimed required set — it does not mint one, because "any one admin" has no single answer.
  *
- * Proven entirely bilateral where possible, and against deriveArrangement end-to-end with real
+ * Proven entirely bilateral where possible, and against the causal fold end-to-end with real
  * Ed25519 — no mocks for crypto.
  */
 import { describe, it, expect } from "vitest";
 import { generateKeyPairSync, sign as edSign, verify as edVerify } from "node:crypto";
 import {
   documentGovernancePolicy,
-  deriveArrangement,
+  deriveDocumentState,
   documentAmendmentHash,
   buildDocumentMultisigTbs,
   type DocumentAmendmentBody,
@@ -155,7 +155,7 @@ describe("governance policy — remove_admin, all the OTHERS", () => {
   });
 });
 
-describe("governance policy — end to end through deriveArrangement", () => {
+describe("governance policy — end to end through the causal fold", () => {
   const DOCID = DOC;
 
   function genesis(a: Signer, b: Signer, admins: Signer[]): ArrangementGenesis {
@@ -178,6 +178,10 @@ describe("governance policy — end to end through deriveArrangement", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1_700_000_000_000,
+      // SYNC-P1 causal fields: the accountable initiator is the first signer.
+      author_agent_id: signers[0]!.agentId,
+      author_seq: 1,
+      parents: [],
       ...bodyIn,
     };
     const hash = documentAmendmentHash(body);
@@ -202,7 +206,7 @@ describe("governance policy — end to end through deriveArrangement", () => {
 
   it("one admin invites; the other admin's signature is NOT needed (D2: single-admin power)", () => {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
-    const r = deriveArrangement(
+    const r = deriveDocumentState(
       genesis(a, b, [a, b]),
       [signed({ subject_agent_id: c.agentId }, [b])],
       documentGovernancePolicy,
@@ -210,20 +214,22 @@ describe("governance policy — end to end through deriveArrangement", () => {
     );
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.arrangement.participants.has(c.agentId)).toBe(true);
+    expect(r.state.participants.has(c.agentId)).toBe(true);
+    expect(r.state.voids).toEqual([]);
   });
 
-  it("a non-admin's invite is refused end to end", () => {
+  it("a non-admin's invite is VOID end to end — on the record, admitting nobody", () => {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
-    const r = deriveArrangement(
+    const r = deriveDocumentState(
       genesis(a, b, [a]),
       [signed({ subject_agent_id: c.agentId }, [b])],
       documentGovernancePolicy,
       makeVerify([a, b, c]),
     );
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.reason).toMatch(/governance_not_admin/);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.state.participants.has(c.agentId)).toBe(false);
+    expect(r.state.voids[0]!.reason).toMatch(/governance_not_admin/);
   });
 
   it("THE DOD'S PROOF CLAUSE: two parties, one admin's signature flips a property — and the same amendment unsigned is rejected", () => {
@@ -233,7 +239,7 @@ describe("governance policy — end to end through deriveArrangement", () => {
       subject_agent_id: null,
       property_change: { key: "append_only", value: true },
     };
-    const good = deriveArrangement(
+    const good = deriveDocumentState(
       genesis(a, b, [a, b]),
       [signed(change, [a])],
       documentGovernancePolicy,
@@ -241,33 +247,35 @@ describe("governance policy — end to end through deriveArrangement", () => {
     );
     expect(good.ok).toBe(true);
     if (!good.ok) return;
-    expect(good.arrangement.properties["append_only"]).toBe(true);
+    expect(good.state.properties["append_only"]).toBe(true);
 
-    // The SAME amendment with the claimed signature absent: storable, never valid.
+    // The SAME amendment with the claimed signature absent: storable, never EFFECTIVE.
     const unsigned = signed(change, [a]);
     unsigned.collection.signatures = [];
-    const bad = deriveArrangement(
+    const bad = deriveDocumentState(
       genesis(a, b, [a, b]),
       [unsigned],
       documentGovernancePolicy,
       makeVerify([a, b]),
     );
-    expect(bad.ok).toBe(false);
-    if (bad.ok) return;
-    expect(bad.reason).toMatch(/amendment_collection_incomplete/);
-    expect(bad.reason).toContain(a.agentId);
+    expect(bad.ok).toBe(true);
+    if (!bad.ok) return;
+    expect(bad.state.properties["append_only"]).toBe(false);
+    expect(bad.state.voids[0]!.reason).toMatch(/amendment_collection_incomplete/);
+    expect(bad.state.voids[0]!.reason).toContain(a.agentId);
   });
 
-  it("the two-admin deadlock holds end to end, with the recourse in the refusal", () => {
+  it("the two-admin deadlock holds end to end, with the recourse in the void", () => {
     const [a, b] = [makeSigner(), makeSigner()];
-    const r = deriveArrangement(
+    const r = deriveDocumentState(
       genesis(a, b, [a, b]),
       [signed({ kind: "remove_admin", subject_agent_id: b.agentId }, [a])],
       documentGovernancePolicy,
       makeVerify([a, b]),
     );
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.reason).toMatch(/governance_two_admin_deadlock/);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.state.admins.has(b.agentId)).toBe(true);
+    expect(r.state.voids[0]!.reason).toMatch(/governance_two_admin_deadlock/);
   });
 });

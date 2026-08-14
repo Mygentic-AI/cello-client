@@ -157,6 +157,9 @@ function plantAmendment2(
     property_change: null,
     state_hash: null,
     authored_at_ms: 1,
+    author_agent_id: "a".repeat(64),
+    author_seq: epoch,
+    parents: [],
   } as const;
   const hash = documentAmendmentHash(body);
   const bytes = encodeDocumentAmendment({
@@ -170,10 +173,11 @@ function plantAmendment2(
     },
   });
   db.prepare(
-    `INSERT INTO document_amendments
-       (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(AGENT, DOC, epoch, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+    `INSERT INTO document_entries
+       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+        received_bytes, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
 }
 
 describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement", () => {
@@ -269,6 +273,9 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1,
+      author_agent_id: "a".repeat(64),
+      author_seq: epoch,
+      parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const bytes = encodeDocumentAmendment({
@@ -282,10 +289,11 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       },
     });
     db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, epoch, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
   }
   const raiseEpoch = (db: DatabaseSync, epoch: number) => plantAmendment(db, epoch);
 

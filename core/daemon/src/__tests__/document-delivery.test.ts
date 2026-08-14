@@ -127,6 +127,7 @@ describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", ()
       document_id: DOC, epoch_id: 1, prev_amendment_hash: null,
       kind: "remove_holder", subject_agent_id: PEER,
       property_change: null, state_hash: null, authored_at_ms: 1,
+      author_agent_id: "a".repeat(64), author_seq: 1, parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const bytes = encodeDocumentAmendment({
@@ -138,10 +139,11 @@ describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", ()
       },
     });
     f.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, 1, Buffer.from(hash).toString("hex"), Buffer.from(bytes), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 1, Buffer.from(bytes), 1);
 
     const res = await f.delivery.tick(AGENT, f.holdersFor, NOW);
     // No dial, no retry: the envelope is RETIRED (our decision, announced), pending drains.
@@ -625,6 +627,7 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
       document_id: DOC, epoch_id: AMEND_EPOCH, prev_amendment_hash: null,
       kind: "add_holder", subject_agent_id: subject,
       property_change: null, state_hash: null, authored_at_ms: 1,
+      author_agent_id: "a".repeat(64), author_seq: AMEND_EPOCH, parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const hex = Buffer.from(hash).toString("hex");
@@ -637,10 +640,11 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
       },
     });
     f.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, AMEND_EPOCH, hex, Buffer.from(bytes), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, hex, "a".repeat(64), AMEND_EPOCH, AMEND_EPOCH, Buffer.from(bytes), 1);
     f.store.seedAmendmentDeliveries(AGENT, DOC, hex, [PEER], NOW);
     return hex;
   }
@@ -758,14 +762,16 @@ describe("DOD-MP-INVITE-FANOUT-1 — owed amendments drain, and drain before env
       document_id: DOC, epoch_id: AMEND_EPOCH + 1, prev_amendment_hash: first,
       kind: "add_holder", subject_agent_id: "dd".repeat(32),
       property_change: null, state_hash: null, authored_at_ms: 2,
+      author_agent_id: "a".repeat(64), author_seq: AMEND_EPOCH + 1, parents: [first],
     } as const;
     const h2 = documentAmendmentHash(body2);
     const hex2 = Buffer.from(h2).toString("hex");
     f.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, AMEND_EPOCH + 1, hex2, Buffer.from(encodeDocumentAmendment({
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, hex2, "a".repeat(64), AMEND_EPOCH + 1, AMEND_EPOCH + 1, Buffer.from(encodeDocumentAmendment({
       body: body2,
       collection: {
         document_id: DOC, subject_kind: "document_amendment", subject_hash: h2,
@@ -936,14 +942,16 @@ describe("DOD-MP-INVITE-FANOUT-1 — upgrading a genuinely PRE-MIGRATION populat
       document_id: DOC, epoch_id: 1, prev_amendment_hash: null,
       kind: "add_holder", subject_agent_id: "cc".repeat(32),
       property_change: null, state_hash: null, authored_at_ms: 1,
+      author_agent_id: "a".repeat(64), author_seq: 1, parents: [],
     } as const;
     const hash = documentAmendmentHash(body);
     const hex = Buffer.from(hash).toString("hex");
     db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, 1, hex, Buffer.from(encodeDocumentAmendment({
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, hex, "a".repeat(64), 1, 1, Buffer.from(encodeDocumentAmendment({
       body,
       collection: {
         document_id: DOC, subject_kind: "document_amendment", subject_hash: hash,

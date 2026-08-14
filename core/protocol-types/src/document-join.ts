@@ -33,12 +33,13 @@ import {
 } from "./document-proposal.js";
 import {
   decodeDocumentAmendment,
-  deriveArrangement,
+  documentAmendmentHash,
   type Arrangement,
   type ArrangementGenesis,
   type DocumentAmendmentEnvelope,
   type SignerPolicy,
 } from "./document-amendment.js";
+import { deriveDocumentState } from "./document-derive.js";
 
 /** Domain tag in slot 0 of the to-be-signed array. Sibling of the other CELLO-DOCUMENT-* tags. */
 export const DOCUMENT_JOIN_OFFER_DOMAIN = "CELLO-DOCUMENT-JOIN-OFFER-v1";
@@ -277,18 +278,28 @@ export function validateDocumentJoinOffer(
     );
   }
 
-  const derived = deriveArrangement(
+  const derived = deriveDocumentState(
     arrangementGenesisFromProposal(genesis),
     amendments,
     policy,
     verify,
   );
   if (!derived.ok) {
-    // The replay's reason IS the diagnosis — passed through, never substituted.
+    // The derivation's reason IS the diagnosis — passed through, never substituted.
     return refuse(derived.reason);
   }
 
   const pending = amendments[amendments.length - 1]!;
+  // The admitting entry must have TAKEN EFFECT — a fold-void admission (under-signed, refused by
+  // policy, concurrent with its author's removal) admits nobody, and the void's own reason is
+  // the diagnosis.
+  const pendingHash = Buffer.from(documentAmendmentHash(pending.body)).toString("hex");
+  const inert =
+    derived.state.voids.find((v) => v.hash === pendingHash) ??
+    derived.state.excluded.find((e) => e.hash === pendingHash);
+  if (inert) {
+    return refuse(inert.reason);
+  }
   if (pending.body.kind !== "add_holder" || pending.body.subject_agent_id !== offer.invitee_agent_id) {
     return refuse(
       `join_not_for_invitee: the chain's last amendment does not admit ${offer.invitee_agent_id} — ` +
@@ -304,7 +315,13 @@ export function validateDocumentJoinOffer(
 
   return {
     ok: true,
-    arrangement: derived.arrangement,
+    arrangement: {
+      epoch: derived.state.interimMaxEpoch,
+      participants: derived.state.participants,
+      admins: derived.state.admins,
+      properties: derived.state.properties,
+      lastAmendmentHash: derived.state.interimLastHash,
+    },
     genesis,
     amendments,
     // Unconditional: after a successful replay the subject_hash provably equals the amendment
