@@ -138,4 +138,27 @@ describe("document_reconcile — one shape, three steps", () => {
   it("the version is a number the far end can refuse BY NAME (R11) — pinned so a bump is a decision", () => {
     expect(DOCUMENT_RECONCILE_EXCHANGE_VERSION).toBe(1);
   });
+
+  it("a refusal rides the SAME frame — no second carrier for 'no'", () => {
+    const f = frame({
+      documents: [],
+      refusal: { reason: "document_reconcile_version: you speak 2, this holder speaks 1", terminal: false },
+    });
+    const decoded = decodeDocumentReconcile(encodeDocumentReconcile(f));
+    expect(decoded.refusal).toEqual({
+      reason: "document_reconcile_version: you speak 2, this holder speaks 1",
+      terminal: false,
+    });
+    expect(decoded.documents).toEqual([]);
+  });
+
+  it("a malformed refusal is refused by name", () => {
+    const wire = decodeCbor(
+      encodeDocumentReconcile(frame({ documents: [], refusal: { reason: "x", terminal: true } })),
+    ) as Record<string, unknown>;
+    (wire["refusal"] as Record<string, unknown>)["terminal"] = "yes";
+    expect(() => decodeDocumentReconcile(encodeCbor(wire))).toThrow(
+      /document_reconcile_field_type: refusal/,
+    );
+  });
 });

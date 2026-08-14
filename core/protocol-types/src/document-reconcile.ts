@@ -67,12 +67,22 @@ export interface DocumentReconcileFrame {
   type: "document_reconcile";
   exchange_version: number;
   documents: DocumentReconcileBlock[];
+  /**
+   * R11: a refusal rides the SAME frame — a version mismatch (or an entitlement refusal) is
+   * answered by name with a sentence, never by silence, and inventing a second frame kind for
+   * "no" would be the second carrier this design exists to avoid. A refusal reply carries no
+   * documents.
+   */
+  refusal?: { reason: string; terminal: boolean };
 }
 
 export function encodeDocumentReconcile(frame: DocumentReconcileFrame): Uint8Array {
   return encodeCbor({
     type: "document_reconcile",
     exchange_version: frame.exchange_version,
+    ...(frame.refusal
+      ? { refusal: { reason: frame.refusal.reason, terminal: frame.refusal.terminal } }
+      : {}),
     documents: frame.documents.map((d) => ({
       document_id: d.document_id,
       governance: d.governance.map((g) => ({
@@ -196,5 +206,22 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
       envelopes: byteList(d, "envelopes"),
     };
   });
-  return { type: "document_reconcile", exchange_version: version, documents };
+  let refusal: { reason: string; terminal: boolean } | undefined;
+  if ("refusal" in map) {
+    const r = asMap(map["refusal"], "refusal");
+    const reason = present(r, "reason");
+    const terminal = present(r, "terminal");
+    if (typeof reason !== "string" || reason.length === 0 || typeof terminal !== "boolean") {
+      throw new Error(
+        "document_reconcile_field_type: refusal must carry a non-empty reason and a terminal flag",
+      );
+    }
+    refusal = { reason, terminal };
+  }
+  return {
+    type: "document_reconcile",
+    exchange_version: version,
+    documents,
+    ...(refusal ? { refusal } : {}),
+  };
 }
