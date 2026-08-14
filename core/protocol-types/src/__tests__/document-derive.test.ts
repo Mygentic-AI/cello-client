@@ -316,17 +316,11 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
     return { a, b, c, d, g, admitC, promoteC };
   }
 
-  it("a grant NOT ancestral to the removal is void — its subject never becomes a participant", () => {
+  function concurrentGrantRace(grantLower: boolean) {
     const { a, b, c, d, g, admitC, promoteC } = setup();
-    // C (admin) invites D concurrently with C's removal by {A, B}.
-    const grant = entry(
-      {
-        subject_agent_id: d.agentId,
-        epoch_id: 3,
-        parents: [hashHex(promoteC)],
-      },
-      [c],
-    );
+    // C (admin) invites D concurrently with C's removal by {A, B} — GROUND both hash orders,
+    // because with the removal folding first the policy alone would void the grant and a broken
+    // concurrency rule would hide behind it on the hash coin (review F1's hollow-test finding).
     const removeC = entry(
       {
         kind: "remove_admin",
@@ -337,16 +331,95 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
       },
       [a, b],
     );
+    const { b: grant } = grindOrder(
+      () => removeC,
+      (ts) =>
+        entry(
+          { subject_agent_id: d.agentId, epoch_id: 3, parents: [hashHex(promoteC)], authored_at_ms: ts },
+          [c],
+        ),
+      grantLower,
+    );
     const s = deriveOk(g, [admitC, promoteC, grant, removeC], [a, b, c, d]);
+    return { s, grant, c, d };
+  }
+
+  it("a grant NOT ancestral to the removal is void — even when the GRANT folds first", () => {
+    const { s, grant, c, d } = concurrentGrantRace(true);
     expect(s.participants.has(d.agentId)).toBe(false);
     expect(s.admins.has(c.agentId)).toBe(false);
     // remove_admin DEMOTES — C stays a holder (the holder door is a separate, guarded act).
     expect(s.participants.has(c.agentId)).toBe(true);
-    const voidHashes = s.voids.map((v) => v.hash);
-    expect(voidHashes).toContain(hashHex(grant));
     expect(s.voids.find((v) => v.hash === hashHex(grant))!.reason).toMatch(
       /concurrent.*removal|removal.*concurrent/i,
     );
+  });
+
+  it("…and in the other hash order too", () => {
+    const { s, grant, d } = concurrentGrantRace(false);
+    expect(s.participants.has(d.agentId)).toBe(false);
+    expect(s.voids.map((v) => v.hash)).toContain(hashHex(grant));
+  });
+
+  it("RE-ADMISSION works — a removal among an entry's ANCESTORS is not concurrent with it (review F1)", () => {
+    // The Entry 48 promise, pinned: remove C, re-admit C, re-promote C — C's next act TAKES
+    // EFFECT. The broken rule ("non-ancestral" instead of "concurrent") voided a re-admitted
+    // admin forever, with a reason naming a race that never happened.
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [a],
+    );
+    const readmitC = entry(
+      { subject_agent_id: c.agentId, author_seq: 3, epoch_id: 3, parents: [hashHex(removeC)] },
+      [a],
+    );
+    const repromoteC = entry(
+      { kind: "promote_admin", subject_agent_id: c.agentId, author_seq: 4, epoch_id: 4, parents: [hashHex(readmitC)] },
+      [a],
+    );
+    const act = entry(
+      {
+        kind: "change_property",
+        subject_agent_id: null,
+        property_change: { key: "append_only", value: true },
+        epoch_id: 5,
+        parents: [hashHex(repromoteC)],
+      },
+      [c],
+    );
+    const s = deriveOk(g, [admitC, removeC, readmitC, repromoteC, act], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(true);
+    expect(s.admins.has(c.agentId)).toBe(true);
+    expect(s.properties["append_only"]).toBe(true);
+    expect(s.voids).toEqual([]);
+  });
+
+  it("WITHOUT re-admission, a removed party's post-removal act still voids — on its own merits, not on concurrency", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [a],
+    );
+    const lateAct = entry(
+      {
+        kind: "change_property",
+        subject_agent_id: null,
+        property_change: { key: "append_only", value: true },
+        epoch_id: 3,
+        parents: [hashHex(removeC)],
+      },
+      [c],
+    );
+    const s = deriveOk(g, [admitC, removeC, lateAct], [a, b, c]);
+    expect(s.properties["append_only"]).toBe(false);
+    const reason = s.voids.find((v) => v.hash === hashHex(lateAct))!.reason;
+    expect(reason).toMatch(/governance_not_admin/);
+    expect(reason).not.toMatch(/concurrent/);
   });
 
   it("a grant the removers had SEEN (ancestral to the removal) stands", () => {

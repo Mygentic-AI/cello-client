@@ -391,7 +391,20 @@ export function deriveDocumentState(
     return verdict;
   }
 
-  /** F1's concurrency void: an ancestor-valid removal of this author, this entry not ancestral to it. */
+  /**
+   * F1's concurrency void: an ancestor-valid removal of this author, CONCURRENT with this entry —
+   * neither is an ancestor of the other. An entry the removers had seen stands; an entry authored
+   * AFTER the removal (removal among its ancestors) is not concurrent either — it is the
+   * fold-position state's question, which fails safe: without a re-admission the author is no
+   * longer a participant there and the act voids on its own merits, while after a legitimate
+   * re-admission it must take effect (the Entry 48 re-admission promise).
+   *
+   * RULED (M14B Entry 51, review F3): this check consults ancestor-validity, NOT the admin
+   * floor — so in the all-admins-remove-each-other race, the floor-voided removal still voids
+   * its victim's concurrent non-removal acts. Deterministic on every holder, err-on-the-safe
+   * side (the removal was pairwise legitimate), and the alternative needs a second fold pass
+   * for a case that takes every admin co-signing against every other to construct.
+   */
   function concurrentRemovalOf(
     subset: ReadonlySet<string>,
     entryHash: string,
@@ -404,8 +417,8 @@ export function deriveDocumentState(
       if (env.body.subject_agent_id !== author) continue;
       if (!structuralOk(other)) continue;
       if (!removalValidAtAncestors(other).ok) continue;
-      const removalAncestors = closure(other);
-      if (removalAncestors.has(entryHash)) continue; // the removers had seen it — it stands
+      if (closure(other).has(entryHash)) continue; // the removers had seen it — it stands
+      if (closure(entryHash).has(other)) continue; // authored after the removal — not concurrent
       return other;
     }
     return null;

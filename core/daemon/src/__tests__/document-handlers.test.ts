@@ -537,9 +537,114 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     });
     const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(forged), rogueId);
     expect(routed.consumed).toBe(true);
-    // The router contains the refusal; the epoch NEVER advances on a forged amendment.
+    // The router contains the refusal; the epoch NEVER advances on a forged amendment — and the
+    // stranger's entry is NOT STORED, not even as history (SYNC-R18: refused, never absorbed).
     await new Promise((r) => setTimeout(r, 100));
     expect(fB.layer.store.currentDocumentEpoch(fB.owner, documentId)).toBe(1);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(1);
+  });
+
+  it("a KNOWN author's semantically-void entry IS stored — history, not refusal (F4 of the fold)", async () => {
+    // The other half of the stranger door: bouncing a known party's fold-void entry would leave
+    // two holders holding different sets. B stores it; the fold rules it contributes nothing.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const amendSend = fA.sent.filter((s) => s.peerAgentId === fB.owner).at(-1)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
+    await until(() => fB.layer.store.currentDocumentEpoch(fB.owner, documentId) === 1);
+
+    // A — a genesis party, fully signed — authors an admission for someone who ALREADY holds.
+    const chain = fB.layer.amendments.chain(fB.owner, documentId);
+    const inviteHash = Buffer.from(documentAmendmentHash(chain[0]!.body)).toString("hex");
+    const voidBody: DocumentAmendmentBody = {
+      document_id: documentId,
+      epoch_id: 2,
+      prev_amendment_hash: inviteHash,
+      kind: "add_holder",
+      subject_agent_id: fB.owner, // already a holder — the fold voids this
+      property_change: null,
+      state_hash: null,
+      authored_at_ms: NOW + 1,
+      author_agent_id: fA.owner,
+      author_seq: 2,
+      parents: [inviteHash],
+    };
+    const voidHash = documentAmendmentHash(voidBody);
+    const voidTbs = buildDocumentMultisigTbs({
+      document_id: documentId,
+      subject_kind: "document_amendment",
+      subject_hash: voidHash,
+      required_signers: [fA.owner],
+    });
+    const voidWire = encodeDocumentAmendment({
+      body: voidBody,
+      collection: {
+        document_id: documentId,
+        subject_kind: "document_amendment",
+        subject_hash: voidHash,
+        required_signers: [fA.owner],
+        signatures: [{ signer_agent_id: fA.owner, signature: await fA.keys.sign(voidTbs) }],
+      },
+    });
+    const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(voidWire), fA.owner);
+    expect(routed.consumed).toBe(true);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
+    // Stored as history; the derived holders are unchanged.
+    const holders = fB.layer.holdersFor(fB.owner, documentId);
+    expect(holders).not.toBeNull();
+    expect([...holders!].sort()).toEqual([fA.owner, fB.owner, fC.owner].sort());
+  });
+
+  it("HELD-THEN-PROMOTED entries surface their notices — an out-of-order removal still tells its subject (review F2)", async () => {
+    // The arrival order the pending table exists for: the removal lands BEFORE the amendment it
+    // chains onto. On promotion, document.removed_from must fire and the lifecycle must run —
+    // the early-return version dropped both, silently, forever.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", {
+      peer_pubkey: fB.owner,
+      admins: [fA.owner], // B must be a plain holder, or the holder door blocks the removal
+    });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+
+    // A authors amendment 1 (invite C) and amendment 2 (remove B) — B receives NEITHER yet.
+    const sentToB = fA.sent.filter((s) => s.peerAgentId === fB.owner).length;
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId,
+      holder_pubkey: fB.owner,
+    });
+    expect(removed).toMatchObject({ ok: true, epochId: 2 });
+    const [inviteToB, removalToB] = fA.sent
+      .filter((s) => s.peerAgentId === fB.owner)
+      .slice(sentToB);
+
+    // The REMOVAL arrives first: held (its parent is missing), nothing applied, no notice.
+    fB.layer.onDocumentFrame(AGENT, "session-1", removalToB!.bytes, fA.owner);
+    await until(() => fB.layer.amendments.pending(fB.owner, documentId).length === 1);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(0);
+    expect(fB.events).not.toContain("document.removed_from");
+    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(false);
+
+    // The parent arrives: the removal PROMOTES — and its notice fires with it.
+    fB.layer.onDocumentFrame(AGENT, "session-1", inviteToB!.bytes, fA.owner);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
+    expect(fB.layer.amendments.pending(fB.owner, documentId)).toHaveLength(0);
+    expect(fB.events).toContain("document.removed_from");
+    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(true);
   });
 
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {

@@ -69,6 +69,7 @@ import {
   arrangementGenesisFromProposal,
   deriveDocumentState,
   checkEntryAdmissible,
+  type DocumentAmendmentEnvelope,
   type DocumentJoinAnswer,
   encodeDocumentAck,
   buildDocumentAckTbs,
@@ -693,52 +694,80 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       if (!admissible.ok) throw new Error(admissible.reason);
       // THE STRANGER DOOR (SYNC-R18, interim until P3's full entitlement classes): a fold-void
       // entry is history only when its author is KNOWN to this document — a genesis party or
-      // someone a held admission names (which covers invited and removed authors, whose earlier
-      // work must still converge, R20). A complete stranger's governance is refused by name,
-      // never stored — otherwise any key on the internet can grow every holder's entry set.
+      // someone an EFFECTIVE admission names (which covers invited and removed authors, whose
+      // earlier work must still converge, R20). Effective, not merely held: a hostile holder can
+      // mint a self-signed, fold-void admission naming any key, and counting it would hand that
+      // key an unbounded license to grow every holder's entry set (review F4). A stranger's
+      // governance is refused by name, never stored.
       const author = env.body.author_agent_id;
       const genesisArr = arrangementGenesisFromProposal(record.envelope);
-      const authorKnown =
-        genesisArr.proposerAgentId === author ||
-        genesisArr.peerAgentId === author ||
-        amendments
-          .chain(ownerAgentId, documentId)
-          .some((e) => e.body.kind === "add_holder" && e.body.subject_agent_id === author);
+      let authorKnown =
+        genesisArr.proposerAgentId === author || genesisArr.peerAgentId === author;
+      if (!authorKnown) {
+        const held = amendments.chain(ownerAgentId, documentId);
+        const doorDerived = deriveDocumentState(
+          genesisArr,
+          held,
+          documentGovernancePolicy,
+          verifySignature,
+        );
+        if (!doorDerived.ok) throw new Error(doorDerived.reason);
+        const inert = new Set([
+          ...doorDerived.state.voids.map((v) => v.hash),
+          ...doorDerived.state.excluded.map((e) => e.hash),
+        ]);
+        authorKnown = held.some(
+          (e) =>
+            e.body.kind === "add_holder" &&
+            e.body.subject_agent_id === author &&
+            !inert.has(Buffer.from(documentAmendmentHash(e.body)).toString("hex")),
+        );
+      }
       if (!authorKnown) {
         throw new Error(
-          `document_author_stranger: ${author} is neither a genesis party nor named by any held ` +
-            `admission — a stranger's governance is refused, not stored`,
+          `document_author_stranger: ${author} is neither a genesis party nor named by any ` +
+            `effective admission — a stranger's governance is refused, not stored`,
         );
       }
       const appended = amendments.append(ownerAgentId, documentId, wire, nowMs);
+      // Post-apply surfacing runs for EVERYTHING that just applied: the direct arrival, and
+      // every held entry this arrival promoted (review F2 — the held path silently dropped the
+      // removal notice and the lifecycle completion, reintroducing the stuck-`active` defect
+      // CLOSE-N-1 fixed, on exactly the out-of-order path the pending table exists for).
+      const surfaceApplied = (applied: DocumentAmendmentEnvelope) => {
+        // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just
+        // stored: the row flips to `removed` (publishes refuse locally, naming the condition;
+        // the copy, the file, the history all remain — forward-only by doctrine), and the event
+        // is the operator's notice. Everyone else's arrangement changes are visible through
+        // list/inbox derivation; being written out of one is the change an operator must not
+        // miss.
+        if (
+          applied.body.kind === "remove_holder" &&
+          applied.body.subject_agent_id === ownerAgentId
+        ) {
+          logger.warn("document.removed_from", {
+            documentId,
+            epochId: applied.body.epoch_id,
+            removedBy: applied.collection.required_signers.join(","),
+          });
+        }
+        // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
+        // holder who had not closed leaves everyone who remains in agreement; without this the
+        // document stayed `active` forever reporting that it waited on nobody.
+        if (applied.body.kind === "remove_holder" || applied.body.kind === "add_holder") {
+          lifecycle.onMembershipChanged(
+            ownerAgentId,
+            documentId,
+            applied.body.kind === "remove_holder"
+              ? (applied.body.subject_agent_id ?? undefined)
+              : undefined,
+          );
+        }
+      };
       // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
-      // with it. The store's `document.entry.held` event is the trace.
-      if (appended.held) return;
-      // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just stored:
-      // the row flips to `removed` (publishes refuse locally, naming the condition; the copy,
-      // the file, the history all remain — forward-only by doctrine), and the event is the
-      // operator's notice. Everyone else's arrangement changes are visible through list/inbox
-      // derivation; being written out of one is the change an operator must not miss.
-      if (env.body.kind === "remove_holder" && env.body.subject_agent_id === ownerAgentId) {
-        // Applied by DERIVATION — the recorded chain IS the removal; publish gates and the list
-        // overlay read it. This warn is the operator's notice.
-        logger.warn("document.removed_from", {
-          documentId,
-          epochId: env.body.epoch_id,
-          removedBy: env.collection.required_signers.join(","),
-        });
-      }
-      // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one holder
-      // who had not closed leaves everyone who remains in agreement, and without this the document
-      // stayed `active` forever reporting that it waited on nobody: control frames are fire-once
-      // and never swept, so no later event would have settled it.
-      if (env.body.kind === "remove_holder" || env.body.kind === "add_holder") {
-        lifecycle.onMembershipChanged(
-          ownerAgentId,
-          documentId,
-          env.body.kind === "remove_holder" ? (env.body.subject_agent_id ?? undefined) : undefined,
-        );
-      }
+      // with it and fire on promotion. The store's `document.entry.held` event is the trace.
+      if (!appended.held) surfaceApplied(env);
+      for (const promoted of appended.promoted) surfaceApplied(promoted.envelope);
     },
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a

@@ -73,6 +73,7 @@ export const DOCUMENT_ENTRIES_CREATE_SQL = `
     owner_agent_id  TEXT    NOT NULL,
     document_id     TEXT    NOT NULL,
     entry_hash      TEXT    NOT NULL,
+    author_agent_id TEXT    NOT NULL,
     received_bytes  BLOB    NOT NULL,
     recorded_at     INTEGER NOT NULL,
     PRIMARY KEY (owner_agent_id, document_id, entry_hash)
@@ -118,8 +119,15 @@ export interface AmendmentAppendResult {
   entryHash: string;
   /** The interim epoch stamp the entry carries (D7 deletes the spine at P4). */
   epochId: number;
-  /** Previously-held entries this arrival completed, now applied. */
-  promoted: string[];
+  /** Previously-held entries this arrival completed, now applied — envelopes included, so the
+   *  caller can run the same post-apply surfacing it runs for a direct arrival (review F2: the
+   *  held path silently dropped removal notices and lifecycle completion). */
+  promoted: PromotedEntry[];
+}
+
+export interface PromotedEntry {
+  entryHash: string;
+  envelope: DocumentAmendmentEnvelope;
 }
 
 export interface PendingEntry {
@@ -128,6 +136,13 @@ export interface PendingEntry {
   missingParents: string[];
   recordedAtMs: number;
 }
+
+/**
+ * Ceiling on HELD entries per (document, author). An honest author's pending set is a short gap
+ * awaiting one delivery; a hostile known author fabricating parents could otherwise grow the
+ * pending table without bound (review F4).
+ */
+export const MAX_PENDING_PER_AUTHOR = 64;
 
 export interface AuthorWatermark {
   /** Highest CONTIGUOUS seq held from this author. */
@@ -179,13 +194,27 @@ export class DocumentAmendmentStore {
       (p) => !this.#hasEntry(ownerAgentId, documentId, p),
     );
     if (missing.length > 0) {
+      const author = env.body.author_agent_id;
+      const backlog = this.#db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM document_entries_pending
+            WHERE owner_agent_id = ? AND document_id = ? AND author_agent_id = ?`,
+        )
+        .get(ownerAgentId, documentId, author) as { n: number };
+      if (backlog.n >= MAX_PENDING_PER_AUTHOR) {
+        throw new Error(
+          `document_pending_cap: ${author} already has ${backlog.n} entries held awaiting ` +
+            `parents — the ceiling is ${MAX_PENDING_PER_AUTHOR}, and an honest gap is never ` +
+            `this deep; deliver the missing ancestry first`,
+        );
+      }
       this.#db
         .prepare(
           `INSERT INTO document_entries_pending
-             (owner_agent_id, document_id, entry_hash, received_bytes, recorded_at)
-           VALUES (?, ?, ?, ?, ?)`,
+             (owner_agent_id, document_id, entry_hash, author_agent_id, received_bytes, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
         )
-        .run(ownerAgentId, documentId, hash, Buffer.from(receivedBytes), nowMs);
+        .run(ownerAgentId, documentId, hash, author, Buffer.from(receivedBytes), nowMs);
       this.#logger.info("document.entry.held", {
         documentId,
         entryHash: hash,
@@ -358,8 +387,8 @@ export class DocumentAmendmentStore {
   }
 
   /** Move every pending entry whose ancestry is now complete — repeated until a pass moves none. */
-  #promoteReady(ownerAgentId: string, documentId: string, nowMs: number): string[] {
-    const promoted: string[] = [];
+  #promoteReady(ownerAgentId: string, documentId: string, nowMs: number): PromotedEntry[] {
+    const promoted: PromotedEntry[] = [];
     for (;;) {
       const rows = this.#db
         .prepare(
@@ -395,7 +424,7 @@ export class DocumentAmendmentStore {
           documentId,
           entryHash: row.entry_hash,
         });
-        promoted.push(row.entry_hash);
+        promoted.push({ entryHash: row.entry_hash, envelope: env });
         movedThisPass = true;
       }
       if (!movedThisPass) return promoted;

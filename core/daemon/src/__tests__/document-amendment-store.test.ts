@@ -191,7 +191,13 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     expect(store.chain(OWNER, DOC)).toHaveLength(0);
     const r = store.append(OWNER, DOC, encodeDocumentAmendment(one!), 3);
     expect(r.held).toBe(false);
-    expect(r.promoted.sort()).toEqual([hashHex(two!), hashHex(three!)].sort());
+    expect(r.promoted.map((e) => e.entryHash).sort()).toEqual(
+      [hashHex(two!), hashHex(three!)].sort(),
+    );
+    // The envelopes ride along, so the layer can surface what a promotion applied.
+    expect(r.promoted.map((e) => e.envelope.body.kind).sort()).toEqual(
+      ["change_property", "promote_admin"].sort(),
+    );
     expect(store.chain(OWNER, DOC)).toHaveLength(3);
     expect(store.pending(OWNER, DOC)).toHaveLength(0);
   });
