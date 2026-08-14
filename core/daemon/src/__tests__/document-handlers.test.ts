@@ -768,6 +768,71 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fA.layer.store.getDocument(fA.owner, documentId)!.status).not.toBe("closed");
   });
 
+  it("RECONCILE (P3): two diverged holders converge through ONE exchange, and a repeat exchange moves nothing", async () => {
+    // The pivot's core claim, in process: no delivery ledger ran here — both sides simply
+    // compare positions and close the gap. A and B each write while the other never receives
+    // it; one initiate → step-1 position → step-2 reply with B's missing content → step-3
+    // catch-up with A's — then a second exchange finds no difference and sends NOTHING, which
+    // is the termination rule (idempotence is the absence of a difference).
+    // Governance divergence during content divergence still trips the interim per-envelope
+    // epoch stamp — the exact coupling the P4 gate (SYNC-G1) exists to delete — so this pins
+    // the content half; the governance half is pinned in the engine suite.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // Diverge: each writes; NOTHING is routed.
+    await fA.call("cello_doc_write", { document_id: documentId, content: "alpha from A. " });
+    await fB.call("cello_doc_write", { document_id: documentId, content: "beta from B. " });
+    expect(fA.layer.store.getEnvelopeLog(fA.owner, documentId)).toHaveLength(1);
+    expect(fB.layer.store.getEnvelopeLog(fB.owner, documentId)).toHaveLength(1);
+
+    // Step 1: A sends its position.
+    const beforeInitiate = fA.sent.length;
+    const initiated = await fA.layer.initiateReconcile(fA.owner, fB.owner, [documentId]);
+    expect(initiated.ok).toBe(true);
+    const step1 = fA.sent.slice(beforeInitiate).find((send) => send.peerAgentId === fB.owner)!;
+
+    // Step 2: B answers with what A lacks + B's own position.
+    const bBefore = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fB.sent.length > bBefore);
+    const step2 = fB.sent.slice(bBefore).find((send) => send.peerAgentId === fA.owner)!;
+
+    // Step 3: A applies B's content and, seeing B behind, sends the catch-up.
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", step2.bytes, fB.owner);
+    await until(() => fA.sent.length > aBefore);
+    const step3 = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fB.owner)!;
+    const b2Before = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step3.bytes, fA.owner);
+
+    // CONVERGED: both hold both writes, unaided by any queue.
+    await until(
+      () =>
+        String((fA.layer.live.get(fA.owner, documentId).getText("content") ?? "")).includes("beta from B") &&
+        String((fB.layer.live.get(fB.owner, documentId).getText("content") ?? "")).includes("alpha from A"),
+    );
+
+    // IDEMPOTENCE: a fresh exchange over converged state moves nothing at all.
+    await new Promise((r) => setTimeout(r, 50));
+    const quietA = fA.sent.length;
+    const quietB = Math.max(fB.sent.length, b2Before);
+    await fA.layer.initiateReconcile(fA.owner, fB.owner, [documentId]);
+    const secondStep1 = fA.sent.slice(quietA).find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", secondStep1.bytes, fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    // B answered the converged position with SILENCE — no reply frame at all.
+    expect(fB.sent.length).toBe(quietB);
+  });
+
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
     const fA = await newFixture();
     const fC = await newFixture();
