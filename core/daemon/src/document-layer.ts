@@ -332,8 +332,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
     membershipOf: (ownerAgentId, documentId, agentId) =>
       amendments.membershipOf(ownerAgentId, documentId, agentId),
+    // The CONTENT door: strictly participants (R17 — invited seats receive, never author).
     currentHolders: (ownerAgentId: string, documentId: string) =>
-      holdersFor(ownerAgentId, documentId),
+      participantsFor(ownerAgentId, documentId),
     sign: deps.sign,
   });
 
@@ -456,6 +457,35 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       });
       return null;
     }
+    // PARTICIPANTS ∪ INVITED (P2 review F4/F5): this is the "who is seated" set — delivery
+    // targets, control-frame addressing, and the close agreement all reach every seat, because a
+    // peer whose consent entry is still in flight must neither be starved of the entries they
+    // will need nor ended around. An invited seat still cannot AUTHOR anything but its own
+    // consent/refusal — the CONTENT door checks `participantsFor`, and the fold enforces it for
+    // governance regardless of who we send to.
+    return [...derived.state.participants, ...derived.state.invited];
+  };
+
+  /**
+   * Strictly-consented participants — the CONTENT-AUTHORSHIP set (R17: an invited seat may
+   * receive, never author). The inbound sender gate checks this; everything delivery-facing uses
+   * `holdersFor`, which also counts invited seats.
+   */
+  const participantsFor = (ownerAgentId: string, documentId: string): string[] | null => {
+    const genesisRecord = handshake.get(ownerAgentId, documentId);
+    if (!genesisRecord) return null;
+    let derived: ReturnType<typeof deriveDocumentState>;
+    try {
+      derived = deriveDocumentState(
+        arrangementGenesisFromProposal(genesisRecord.envelope),
+        amendments.chain(ownerAgentId, documentId),
+        documentGovernancePolicy,
+        verifySignature,
+      );
+    } catch {
+      return null;
+    }
+    if (!derived.ok) return null;
     return [...derived.state.participants];
   };
 

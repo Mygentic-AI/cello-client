@@ -488,16 +488,14 @@ export class DocumentDelivery {
         }
         continue;
       }
-      const currentSet = new Set(currentHolders);
-
       for (const [holderAgentId, rows] of holderGroups) {
-        // A holder the arrangement no longer includes — removed, or never derivable — is
-        // RETIRED, announced: our decision, not evidence about them (DOD-MP-REMOVE-1's
-        // delivery-stop clause, generalized per holder).
-        if (
-          !currentSet.has(holderAgentId) ||
-          this.#store.memberRemoved(ownerAgentId, documentId, holderAgentId).removed
-        ) {
+        // RETIRE ONLY ON A PROVEN REMOVAL (P2 review F1). "Not in the current set" is no longer
+        // evidence of removal: an accepted-but-in-flight peer derives as INVITED, and retiring
+        // their owed content here destroyed the debt, marked it settled, and logged a removal
+        // that never happened — the peer's copy then missed those ops forever. A seat the
+        // derivation does not show at all simply defers; the debt survives until the consent
+        // lands or a removal proves otherwise.
+        if (this.#store.memberRemoved(ownerAgentId, documentId, holderAgentId).removed) {
           const retiredHashes = this.#store.abandonHolderDeliveries(
             ownerAgentId, documentId, holderAgentId, nowMs,
           );

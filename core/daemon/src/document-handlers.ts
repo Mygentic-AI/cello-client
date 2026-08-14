@@ -609,6 +609,45 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
 
+    // THE CURE FOR A HALF-CONSENTED DOCUMENT (P2 review F2): if this agent already holds the
+    // document but its own derivation says it is still an INVITED seat, the earlier accept
+    // recorded the decision and then failed to record the consent entry — and both decision rows
+    // are settled, so neither branch below can run again. Re-running accept authors the missing
+    // consent, which is exactly what the failure guidance promises.
+    if (layer.store.getDocument(who.ownerAgentId, documentId)) {
+      const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+      if (genesisRecord) {
+        const standing = deriveDocumentState(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          layer.amendments.chain(who.ownerAgentId, documentId),
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (standing.ok && standing.state.invited.has(who.ownerAgentId)) {
+          const consent = await authorConsent(who, documentId);
+          if (!consent.ok) {
+            return {
+              ok: false,
+              reason: "document_consent_unrecorded",
+              guidance:
+                `You hold this document but your consent entry is still unrecorded ` +
+                `(${consent.reason}) — run cello_doc_accept again once the named condition ` +
+                `clears.`,
+            };
+          }
+          return {
+            ok: true,
+            documentId,
+            consentEntry: consent.entryHash,
+            consentDelivered: consent.holdersNotified,
+            guidance:
+              "Your earlier accept had recorded the decision but not your consent entry — it is " +
+              "now recorded and on its way to the other holders.",
+          };
+        }
+      }
+    }
+
     // A join offer decided with the SAME verb the inbox advertises. Routed first by exact
     // pending match, so a proposal and a join for different documents can never shadow each
     // other; an id that matches neither falls through to the proposal path's own refusal.
@@ -868,7 +907,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       amendmentHashHex: entryHex,
       amendmentBytes: bytes,
-      holders: [...withNew.state.participants].filter((p) => p !== who.ownerAgentId),
+      holders: [...withNew.state.participants, ...withNew.state.invited].filter(
+        (p) => p !== who.ownerAgentId,
+      ),
       verb: "consent",
     });
     return { ok: true, entryHash: entryHex, holdersNotified };
@@ -935,7 +976,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `Current admins: ${[...derived.state.admins].join(", ")}.`,
       };
     }
-    if (derived.state.participants.has(invitee)) {
+    if (derived.state.participants.has(invitee) || derived.state.invited.has(invitee)) {
       // A RE-RUN after the amendment landed but the offer did not reach them: re-send the STORED
       // offer bytes (the proposal --retry precedent) rather than refusing — authoring afresh
       // would try to admit a holder the chain already admitted, which the replay refuses.
@@ -977,7 +1018,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             documentId,
             amendmentHashHex: priorHash,
             amendmentBytes: new Uint8Array(admittingBytes),
-            holders: [...derived.state.participants].filter(
+            holders: [...derived.state.participants, ...derived.state.invited].filter(
               (holder) => holder !== who.ownerAgentId && holder !== invitee,
             ),
             verb: "re-invite",
@@ -1121,7 +1162,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     //
     // Seeding first also makes the crash window safe: a daemon that dies between here and the send
     // still owes the amendment on restart.
-    const owedHolders = [...derived.state.participants].filter(
+    const owedHolders = [...derived.state.participants, ...derived.state.invited].filter(
       (holder) => holder !== who.ownerAgentId && holder !== invitee,
     );
     const holdersTold = await fanOutAmendment({
@@ -1211,7 +1252,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         let resendTold: Record<string, boolean> = {};
         if (removal) {
           const bytes = new Uint8Array(encodeDocumentAmendment(removal));
-          const remaining = [...derived.state.participants].filter(
+          const remaining = [...derived.state.participants, ...derived.state.invited].filter(
             (m) => m !== who.ownerAgentId && m !== holder,
           );
           // The healing re-send is durable for the holders who REMAIN, for the same reason the
@@ -1330,7 +1371,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       amendmentHashHex: Buffer.from(amendHash).toString("hex"),
       amendmentBytes,
-      holders: [...withNew.state.participants].filter((m) => m !== who.ownerAgentId),
+      holders: [...withNew.state.participants, ...withNew.state.invited].filter(
+        (m) => m !== who.ownerAgentId,
+      ),
       verb: "remove",
     });
     // THE REMOVED HOLDER IS TOLD ONCE, and is deliberately NOT owed a durable retry: delivery to

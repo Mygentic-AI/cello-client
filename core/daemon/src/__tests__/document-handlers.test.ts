@@ -626,10 +626,11 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const routed = fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(voidWire), fA.owner);
     expect(routed.consumed).toBe(true);
     await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 3);
-    // Stored as history; the derived participants are unchanged (C is invited, not yet consented).
+    // Stored as history; the derived seats are unchanged (C is invited, not yet consented —
+    // and an invited seat counts in the who-is-seated set).
     const holders = fB.layer.holdersFor(fB.owner, documentId);
     expect(holders).not.toBeNull();
-    expect([...holders!].sort()).toEqual([fA.owner, fB.owner].sort());
+    expect([...holders!].sort()).toEqual([fA.owner, fB.owner, fC.owner].sort());
   });
 
   it("HELD-THEN-PROMOTED entries surface their notices — an out-of-order removal still tells its subject (review F2)", async () => {
@@ -678,6 +679,93 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fB.layer.amendments.pending(fB.owner, documentId)).toHaveLength(0);
     expect(fB.events).toContain("document.removed_from");
     expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(true);
+  });
+
+  it("INVITED WINDOW: an invite while the peer's consent is in flight still reaches every seat (P2 review F4)", async () => {
+    // A proposes to B; B accepts; A invites C BEFORE B's consent entry arrives. The admission
+    // must be owed to B anyway — an invited seat is a seat — or B never learns C exists and
+    // every later entry sits held on B behind a parent nobody ever sent.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    // DELIBERATELY NOT ROUTED — the window is the point.
+
+    const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    expect(invited.ok).toBe(true);
+    expect((invited.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
+    const owedTo = fA.layer.store
+      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
+      .map((pending) => pending.holderAgentId);
+    expect(owedTo).toContain(fB.owner);
+
+    // B receives the admission, then B's consent finally lands at A — both sides converge on
+    // the same two-entry set (the entries are CONCURRENT: each was authored blind to the other,
+    // so both carry the same interim epoch stamp — the set, not the stamp, is the truth).
+    const amendSend = fA.sent.filter((send) => send.peerAgentId === fB.owner).at(-1)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
+    routeAll(fB, fA);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 2);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
+    expect(fA.layer.holdersFor(fA.owner, documentId)!.sort()).toEqual(
+      [fA.owner, fB.owner, fC.owner].sort(),
+    );
+  });
+
+  it("HALF-CONSENTED CURE: re-running accept authors the missing consent entry (P2 review F2)", async () => {
+    // The failure state: the earlier accept recorded the decision (both decision rows settle
+    // once) but the consent entry never landed — the agent holds the document yet derives as
+    // invited everywhere, and every other verb refuses. The guidance says "run accept again";
+    // this pins that the retry actually cures instead of dead-ending in document_proposal_unknown.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    const accepted = await fB.call("cello_doc_accept", { document_id: documentId });
+    expect(accepted.ok).toBe(true);
+    // Manufacture the half-state: strip B's own consent entry, as if authoring had failed after
+    // the decision settled.
+    fB.db
+      .prepare(`DELETE FROM document_entries WHERE owner_agent_id = ? AND document_id = ?`)
+      .run(fB.owner, documentId);
+    expect(fB.layer.store.getDocument(fB.owner, documentId)).not.toBeNull();
+
+    const retry = await fB.call("cello_doc_accept", { document_id: documentId });
+    expect(retry.ok, JSON.stringify(retry)).toBe(true);
+    expect(typeof retry.consentEntry).toBe("string");
+    // And the cure took: B's own derivation shows B participating again.
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) >= 1);
+  });
+
+  it("CLOSE WAITS ON AN INVITED SEAT — one party alone is never the whole agreement (P2 review F5)", async () => {
+    // During the consent-in-flight window the proposer must not be able to settle "closed by
+    // agreement" alone while the accepted peer is editing, and the close frame must REACH the
+    // invited seat.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    // B's consent is NOT routed — A still sees an invited seat.
+
+    const closed = await fA.call("cello_doc_close", { document_id: documentId });
+    expect(closed.ok).toBe(true);
+    // Addressed to the invited seat…
+    expect((closed.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
+    // …and NOT settled: the agreement waits on the seat that has not spoken.
+    expect(fA.layer.store.getDocument(fA.owner, documentId)!.status).not.toBe("closed");
   });
 
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {

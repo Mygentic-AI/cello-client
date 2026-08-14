@@ -855,6 +855,54 @@ describe("deriveDocumentState — consent (R21/R22): participant = admitted AND 
   });
 });
 
+describe("deriveDocumentState — a removal SPENDS the declared-genesis-admin grant (P2 review F6)", () => {
+  it("a demoted-then-removed-then-re-admitted genesis admin arrives as a PLAIN holder", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a, b]); // both DECLARED admins at creation
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const promoteC = entry(
+      { kind: "promote_admin", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    // admins {a,b,c} — now expel B the D3 way: demote (all others sign), then remove as holder.
+    const demoteB = entry(
+      { kind: "remove_admin", subject_agent_id: b.agentId, author_seq: 3, epoch_id: 4, parents: [hashHex(promoteC)] },
+      [a, c],
+    );
+    const removeB = entry(
+      { kind: "remove_holder", subject_agent_id: b.agentId, author_seq: 4, epoch_id: 5, parents: [hashHex(demoteB)] },
+      [a],
+    );
+    const readmitB = entry(
+      { subject_agent_id: b.agentId, author_seq: 5, epoch_id: 6, parents: [hashHex(removeB)] },
+      [a],
+    );
+    const bc2 = consentEntry(b, { author_seq: 2, epoch_id: 7, parents: [hashHex(readmitB)] });
+    const s = deriveOk(g, [bc, admitC, cc, promoteC, demoteB, removeB, readmitB, bc2], [a, b, c]);
+    expect(s.participants.has(b.agentId)).toBe(true);
+    // The declared grant was SPENT by the demotion — B returns as a plain holder, and only an
+    // explicit promote_admin (with its signature requirements) can re-arm them.
+    expect(s.admins.has(b.agentId)).toBe(false);
+    expect([...s.admins].sort()).toEqual([a.agentId, c.agentId].sort());
+    expect(s.voids).toEqual([]);
+  });
+
+  it("a refusal does NOT spend the grant — a re-invited declared admin who never held power gains it on consent", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a, b]);
+    const refuse = entry({ kind: "refuse_join", subject_agent_id: b.agentId }, [b]);
+    const reinvite = entry(
+      { subject_agent_id: b.agentId, epoch_id: 2, parents: [hashHex(refuse)] },
+      [a],
+    );
+    const bc = consentEntry(b, { author_seq: 2, epoch_id: 3, parents: [hashHex(reinvite)] });
+    const s = deriveOk(g, [refuse, reinvite, bc], [a, b]);
+    expect(s.admins.has(b.agentId)).toBe(true);
+  });
+});
+
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
   it("genesis alone: the proposer participates (their signature IS consent); the peer is invited", () => {
     const [a, b] = [makeSigner(), makeSigner()];

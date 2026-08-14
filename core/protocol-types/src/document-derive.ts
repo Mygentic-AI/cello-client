@@ -118,6 +118,12 @@ interface FoldState {
   participants: Set<string>;
   invited: Set<string>;
   admins: Set<string>;
+  /**
+   * Declared genesis admins whose grant a removal has SPENT (P2 review F6): once demoted or
+   * removed, a declared admin re-admitted later arrives as a plain holder — only an explicit
+   * promote_admin, with its signature requirements, re-arms them. A refusal spends nothing.
+   */
+  spentDeclaredAdmins: Set<string>;
   properties: Record<string, string | number | boolean | undefined>;
 }
 
@@ -425,8 +431,12 @@ export function deriveDocumentState(
       case "consent":
         state.invited.delete(body.subject_agent_id!);
         state.participants.add(body.subject_agent_id!);
-        // A declared genesis admin's power arrives WITH their participation (R21).
-        if (declaredGenesisAdmins.has(body.subject_agent_id!)) {
+        // A declared genesis admin's power arrives WITH their participation (R21) — unless a
+        // removal already spent the grant (F6): the re-admitted return as plain holders.
+        if (
+          declaredGenesisAdmins.has(body.subject_agent_id!) &&
+          !state.spentDeclaredAdmins.has(body.subject_agent_id!)
+        ) {
           state.admins.add(body.subject_agent_id!);
         }
         break;
@@ -435,12 +445,16 @@ export function deriveDocumentState(
         break;
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
+        if (state.admins.has(body.subject_agent_id!)) {
+          state.spentDeclaredAdmins.add(body.subject_agent_id!);
+        }
         state.admins.delete(body.subject_agent_id!);
         break;
       case "promote_admin":
         state.admins.add(body.subject_agent_id!);
         break;
       case "remove_admin":
+        state.spentDeclaredAdmins.add(body.subject_agent_id!);
         state.admins.delete(body.subject_agent_id!);
         break;
       case "change_property":
@@ -515,6 +529,7 @@ export function deriveDocumentState(
       participants: new Set(genesisParticipants),
       invited: new Set(genesisInvited),
       admins: new Set(genesisAdmins),
+      spentDeclaredAdmins: new Set(),
       properties: { ...genesis.properties },
     };
     const order = linearize(subset);
