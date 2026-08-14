@@ -86,6 +86,9 @@ function body(over: Partial<DocumentAmendmentBody> = {}): DocumentAmendmentBody 
     property_change: null,
     state_hash: null,
     authored_at_ms: 1_700_000_000_000,
+    author_agent_id: "a".repeat(64),
+    author_seq: 1,
+    parents: [],
     ...over,
   };
 }
@@ -143,9 +146,28 @@ describe("amendment TBS — the epoch event's final frame shape", () => {
     expect(
       documentAmendmentHash(body({ kind: "change_property", subject_agent_id: null, property_change: { key: "append_only", value: true } })),
     ).not.toEqual(base);
+    // SYNC-P1: the causal fields are agreed too — a forwarder must not be able to re-attribute,
+    // re-sequence, or re-parent an entry without every signature failing.
+    expect(documentAmendmentHash(body({ author_agent_id: "b".repeat(64) }))).not.toEqual(base);
+    expect(documentAmendmentHash(body({ author_seq: 2 }))).not.toEqual(base);
+    expect(documentAmendmentHash(body({ parents: ["ab".repeat(32)] }))).not.toEqual(base);
+  });
+
+  it("carries the causal fields in the signed slots after the linear carrier fields", () => {
+    const arr = decodeCbor(
+      buildDocumentAmendmentTbs(
+        body({ author_agent_id: "f".repeat(64), author_seq: 3, parents: ["ab".repeat(32), "cd".repeat(32)] }),
+        { preHash: false },
+      ),
+    ) as unknown[];
+    expect(arr[10]).toBe("f".repeat(64));
+    expect(arr[11]).toBe(3);
+    expect(arr[12]).toEqual(["ab".repeat(32), "cd".repeat(32)]);
   });
 
   it("FROZEN VECTOR — field order is wire law; regenerate only on a journaled preimage change", () => {
+    // SYNC-P1 (journaled: M14B Entry 49) — the preimage gained author_agent_id, author_seq,
+    // parents, and the domain moved to v2. The prior v1 vector is retired with the domain.
     const tbs = buildDocumentAmendmentTbs({
       document_id: "ab".repeat(32),
       epoch_id: 1,
@@ -155,9 +177,12 @@ describe("amendment TBS — the epoch event's final frame shape", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1_700_000_000_000,
+      author_agent_id: "ef".repeat(32),
+      author_seq: 1,
+      parents: [],
     });
     expect(Buffer.from(tbs).toString("hex")).toBe(
-      "53cbe466aab49c6c1db5bce80fea33f0c803eefa9af53d2a51db3a9a3a60379c",
+      "bb3053db48b53847bd5fd12879e6353f9fd7d5f6e0762fb6040f2a2b3d3f0528",
     );
   });
 });
@@ -177,6 +202,16 @@ describe("amendment wire — strict round-trip", () => {
     ["prev_amendment_hash", undefined, /document_amendment_missing_field: prev_amendment_hash/],
     ["state_hash", undefined, /document_amendment_missing_field: state_hash/],
     ["subject_agent_id", undefined, /document_amendment_missing_field: subject_agent_id/],
+    ["author_agent_id", undefined, /document_amendment_missing_field: author_agent_id/],
+    ["author_agent_id", "not-hex", /document_amendment_field_type: author_agent_id/],
+    ["author_seq", undefined, /document_amendment_missing_field: author_seq/],
+    ["author_seq", 0, /document_amendment_author_seq: must be a positive integer/],
+    ["parents", undefined, /document_amendment_missing_field: parents/],
+    ["parents", ["zz"], /document_amendment_field_type: parents/],
+    // Canonical order is wire law: a forwarder shuffling parents must not mint a second identity
+    // for the same entry — and since parents are in the TBS, a shuffle also breaks every signature.
+    ["parents", ["cd".repeat(32), "ab".repeat(32)], /document_amendment_parents_canonical/],
+    ["parents", ["ab".repeat(32), "ab".repeat(32)], /document_amendment_parents_canonical/],
   ] as const)(
     "decode refuses body.%s = %j with the NAMED code",
     (field, value, expected) => {
@@ -188,6 +223,18 @@ describe("amendment wire — strict round-trip", () => {
       expect(() => decodeDocumentAmendment(encodeCbor(wire))).toThrow(expected);
     },
   );
+
+  it("decode refuses a parent list wider than the cap — an adversary must not be able to make ancestry walks unbounded", () => {
+    const wide = Array.from({ length: 65 }, (_, i) =>
+      createHash("sha256").update(`parent-${i}`).digest("hex"),
+    ).sort();
+    const env = signedAmendment(body(), [makeSigner()]);
+    const wire = decodeCbor(encodeDocumentAmendment(env)) as Record<string, unknown>;
+    (wire["body"] as Record<string, unknown>)["parents"] = wide;
+    expect(() => decodeDocumentAmendment(encodeCbor(wire))).toThrow(
+      /document_amendment_parents_cap/,
+    );
+  });
 
   it("decode refuses a missing collection — an unsigned amendment is not an amendment", () => {
     const env = signedAmendment(body(), [makeSigner()]);

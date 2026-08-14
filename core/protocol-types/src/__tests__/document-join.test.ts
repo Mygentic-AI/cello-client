@@ -95,6 +95,10 @@ function makeAddHolder(
     property_change: null,
     state_hash: null,
     authored_at_ms: 1_700_000_000_001,
+    // SYNC-P1 causal fields: the inviting admin authors the admission.
+    author_agent_id: admin.agentId,
+    author_seq: 1,
+    parents: [],
     ...over,
   };
   const hash = documentAmendmentHash(body);

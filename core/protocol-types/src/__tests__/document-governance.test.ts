@@ -178,6 +178,10 @@ describe("governance policy — end to end through deriveArrangement", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: 1_700_000_000_000,
+      // SYNC-P1 causal fields: the accountable initiator is the first signer.
+      author_agent_id: signers[0]!.agentId,
+      author_seq: 1,
+      parents: [],
       ...bodyIn,
     };
     const hash = documentAmendmentHash(body);

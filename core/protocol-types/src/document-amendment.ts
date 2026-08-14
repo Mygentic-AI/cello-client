@@ -34,8 +34,19 @@ import {
   type MultisigCollection,
 } from "./document-multisig.js";
 
-/** Domain tag in slot 0 of the to-be-signed array. Sibling of the other CELLO-DOCUMENT-* tags. */
-export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v1";
+/**
+ * Domain tag in slot 0 of the to-be-signed array. Sibling of the other CELLO-DOCUMENT-* tags.
+ * v2 (SYNC-P1): the preimage gained the causal fields — author, sequence, parents. A v1 frame is
+ * refused by the mandatory-field discipline below; no compatibility is owed (all holders upgrade
+ * together).
+ */
+export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v2";
+
+/**
+ * Ceiling on an entry's parent list. The honest frontier is bounded by the holder cap (D5: 20);
+ * the ceiling exists so a hostile daemon cannot make every ancestry walk unbounded.
+ */
+export const MAX_ENTRY_PARENTS = 64;
 
 /** The `subject_kind` an amendment's multisig collection must carry. */
 export const AMENDMENT_SUBJECT_KIND = "document_amendment";
@@ -78,6 +89,16 @@ export interface DocumentAmendmentBody {
    */
   state_hash: Uint8Array | null;
   authored_at_ms: number;
+  /**
+   * SYNC-P1 — the causal fields. The accountable initiator (MUST appear in the collection's
+   * required set), their own-chain counter, and the entry hashes applied when authoring. For
+   * `author_seq > 1` the parents MUST include the author's previous entry. Signed: a forwarder
+   * cannot re-attribute, re-sequence, or re-parent without every signature failing (SYNC-R2).
+   */
+  author_agent_id: string;
+  author_seq: number;
+  /** Entry hashes (64-hex), CANONICAL: strictly ascending, no duplicates. Empty anchors to genesis. */
+  parents: readonly string[];
 }
 
 export interface DocumentAmendmentEnvelope {
@@ -109,6 +130,9 @@ export function buildDocumentAmendmentTbs(
     typeof body.authored_at_ms === "number" && body.authored_at_ms > 0xffffffff
       ? BigInt(body.authored_at_ms)
       : body.authored_at_ms,
+    body.author_agent_id,
+    body.author_seq,
+    [...body.parents],
   ]);
   if (opts.preHash === false) return preimage;
   return new Uint8Array(createHash("sha256").update(preimage).digest());
@@ -136,6 +160,9 @@ export function encodeDocumentAmendment(env: DocumentAmendmentEnvelope): Uint8Ar
       property_change: env.body.property_change,
       state_hash: env.body.state_hash,
       authored_at_ms: env.body.authored_at_ms,
+      author_agent_id: env.body.author_agent_id,
+      author_seq: env.body.author_seq,
+      parents: [...env.body.parents],
     },
     collection: encodeMultisigCollection(env.collection),
   });
@@ -234,6 +261,46 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
     throw new Error("document_amendment_field_type: authored_at_ms must be an integer");
   }
 
+  const author = present(b, "author_agent_id");
+  if (typeof author !== "string" || !/^[0-9a-f]{64}$/.test(author)) {
+    throw new Error(
+      "document_amendment_field_type: author_agent_id must be a 64-hex agent pubkey",
+    );
+  }
+
+  const authorSeq = present(b, "author_seq");
+  if (typeof authorSeq !== "number" || !Number.isInteger(authorSeq) || authorSeq < 1) {
+    throw new Error(
+      `document_amendment_author_seq: must be a positive integer (an author's own chain starts ` +
+        `at 1), got ${String(authorSeq)}`,
+    );
+  }
+
+  const rawParents = present(b, "parents");
+  if (!Array.isArray(rawParents)) {
+    throw new Error("document_amendment_field_type: parents must be an array of entry hashes");
+  }
+  if (rawParents.length > MAX_ENTRY_PARENTS) {
+    throw new Error(
+      `document_amendment_parents_cap: ${rawParents.length} parents exceeds the ceiling of ` +
+        `${MAX_ENTRY_PARENTS} — an honest frontier is bounded by the holder cap`,
+    );
+  }
+  for (const p of rawParents) {
+    if (typeof p !== "string" || !/^[0-9a-f]{64}$/.test(p)) {
+      throw new Error("document_amendment_field_type: parents must be 64-hex entry hashes");
+    }
+  }
+  const parents = rawParents as string[];
+  for (let i = 1; i < parents.length; i++) {
+    if (parents[i]! <= parents[i - 1]!) {
+      throw new Error(
+        "document_amendment_parents_canonical: parents must be strictly ascending with no " +
+          "duplicates — one entry, one identity",
+      );
+    }
+  }
+
   const rawCollection = present(map, "collection");
   if (!(rawCollection instanceof Uint8Array)) {
     throw new Error("document_amendment_field_type: collection must be a CBOR byte string");
@@ -249,6 +316,9 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
       property_change: propertyChange,
       state_hash: stateHash === null ? null : new Uint8Array(stateHash),
       authored_at_ms: authoredAt,
+      author_agent_id: author,
+      author_seq: authorSeq,
+      parents,
     },
     collection: decodeMultisigCollection(new Uint8Array(rawCollection)),
   };
