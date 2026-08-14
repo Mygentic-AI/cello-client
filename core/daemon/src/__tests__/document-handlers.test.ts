@@ -833,6 +833,75 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fB.sent.length).toBe(quietB);
   });
 
+  it("FORWARDING is load-bearing (AC2 shape): the author is GONE, and their signed work reaches a third holder through someone else's exchange", async () => {
+    // The standing ruling that unlocked the pivot: holders forward each other's signed entries,
+    // and forwarding confers no trust — the receiver verifies the author's signature itself.
+    // Here A authors content, A is never heard from again, and C ends up holding A's write
+    // because B's exchange carried it. Without forwarding, three holders cannot converge when
+    // an author goes offline; this is that claim, in process.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // C joins FIRST (offer routed), so the offer's snapshot predates what A writes next.
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.filter((send) => send.peerAgentId === fC.owner).at(-1)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await fC.call("cello_doc_accept", { document_id: documentId });
+    // B must know C is seated before it will answer C's exchange: route C's consent AND the
+    // admitting entry to B (in production the amendment carrier owes B both; here we route).
+    const inviteToB = fA.sent.filter((send) => send.peerAgentId === fB.owner).at(-1)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", inviteToB.bytes, fA.owner);
+    routeAll(fC, fB);
+    routeAll(fC, fA);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 3);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
+
+    // NOW A writes — after the offer, so C does not hold it — and B fetches it through the
+    // exchange: the last answer A ever gives. (Everyone is at the same interim epoch stamp;
+    // the stamp's coupling to content is the P4 gate's deletion target.)
+    await fA.call("cello_doc_write", { document_id: documentId, content: "A's last words. " });
+    const bInit = fB.sent.length;
+    await fB.layer.initiateReconcile(fB.owner, fA.owner, [documentId]);
+    const bStep1 = fB.sent.slice(bInit).find((send) => send.peerAgentId === fA.owner)!;
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", bStep1.bytes, fB.owner);
+    await until(() => fA.sent.length > aBefore);
+    const aStep2 = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", aStep2.bytes, fA.owner);
+    await until(() =>
+      String(fB.layer.live.get(fB.owner, documentId).getText("content")).includes("A's last words"),
+    );
+
+    // C reconciles with B — NOT with A, who no longer exists. The offer carried the governance
+    // history; A's CONTENT arrives only here, forwarded by B, and C verifies A's signature
+    // itself on apply.
+    const cBefore = fC.sent.length;
+    await fC.layer.initiateReconcile(fC.owner, fB.owner, [documentId]);
+    const step1 = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fB.owner)!;
+    const bBefore = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fC.owner);
+    await until(() => fB.sent.length > bBefore);
+    const step2 = fB.sent.slice(bBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step2.bytes, fB.owner);
+
+    await until(() =>
+      String(fC.layer.live.get(fC.owner, documentId).getText("content")).includes("A's last words"),
+    );
+    // And the envelope C holds is A's — the author's signed identity, not the forwarder's.
+    const cLog = fC.layer.store.getEnvelopeLog(fC.owner, documentId);
+    expect(cLog.some((row) => row.senderAgentId === fA.owner)).toBe(true);
+  });
+
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
     const fA = await newFixture();
     const fC = await newFixture();
