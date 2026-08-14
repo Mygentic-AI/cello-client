@@ -902,6 +902,70 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(cLog.some((row) => row.senderAgentId === fA.owner)).toBe(true);
   });
 
+  it("JOIN VIA THE EXCHANGE: no offer frame anywhere — the invite's own step-1 is the notice, and the reply carries the world", async () => {
+    // The D5 replacement, end to end: A invites C and simply initiates a reconcile toward
+    // them. C, holding nothing, answers with an empty hand; A's reply carries the genesis,
+    // every entry, and the content; C bootstraps, derives its OWN standing as invited, and
+    // accepting is the ordinary consent-authoring accept — the same verb, the same cure
+    // branch, no bespoke history-carrying offer and no answer frame in the flow at all.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // A invites C (the entry lands in A's chain; the legacy offer send is IGNORED — nothing
+    // from it is routed) and writes content afterwards, so the exchange must carry both.
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    await fA.call("cello_doc_write", { document_id: documentId, content: "history before C. " });
+
+    // The notice IS a step-1 position frame.
+    const aInit = fA.sent.length;
+    await fA.layer.initiateReconcile(fA.owner, fC.owner, [documentId]);
+    const step1 = fA.sent.slice(aInit).find((send) => send.peerAgentId === fC.owner)!;
+
+    // C answers with an empty hand…
+    const cBefore = fC.sent.length;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fC.sent.length > cBefore);
+    const emptyHand = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fA.owner)!;
+
+    // …and A's reply carries the genesis, the entries, and the content.
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", emptyHand.bytes, fC.owner);
+    await until(() => fA.sent.length > aBefore);
+    const world = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", world.bytes, fA.owner);
+
+    // C bootstrapped: the document exists, the content is there, and C's OWN derivation says
+    // invited — the surface shows an invitation without any join-store row behind it.
+    await until(() => fC.layer.store.getDocument(fC.owner, documentId) !== null);
+    await until(() =>
+      String(fC.layer.live.get(fC.owner, documentId).getText("content")).includes("history before C"),
+    );
+
+    // Accepting is the ORDINARY accept — the consent-authoring cure branch, same verb.
+    const accepted = await fC.call("cello_doc_accept", { document_id: documentId });
+    expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
+    expect(typeof accepted.consentEntry).toBe("string");
+
+    // C's consent reaches A, and A's own derivation seats C as a participant.
+    routeAll(fC, fA);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
+    await until(() => fA.layer.holdersFor(fA.owner, documentId)!.includes(fC.owner));
+    const list = await fA.call("cello_doc_list", {});
+    const row = (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d.documentId === documentId,
+    )!;
+    expect(row.participants).toContain(fC.owner);
+  });
+
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
     const fA = await newFixture();
     const fC = await newFixture();

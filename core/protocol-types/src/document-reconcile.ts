@@ -61,6 +61,13 @@ export interface DocumentReconcileBlock {
   entries: Uint8Array[];
   /** Content envelope wires the peer lacks. Empty on step 1. */
   envelopes: Uint8Array[];
+  /**
+   * The signed genesis proposal, included when the peer's position shows them holding NOTHING —
+   * a joiner is simply very far behind (spec §4), and the anchor everything derives from is the
+   * one record that is not an entry. Harmless when they already hold it: the bootstrap is
+   * idempotent, like everything else in the exchange.
+   */
+  genesis?: Uint8Array;
 }
 
 export interface DocumentReconcileFrame {
@@ -98,6 +105,7 @@ export function encodeDocumentReconcile(frame: DocumentReconcileFrame): Uint8Arr
       refused: [...d.refused],
       entries: d.entries.map((e) => new Uint8Array(e)),
       envelopes: d.envelopes.map((e) => new Uint8Array(e)),
+      ...(d.genesis ? { genesis: new Uint8Array(d.genesis) } : {}),
     })),
   });
 }
@@ -197,6 +205,14 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
         head_hash: hex64(c, "head_hash"),
       };
     });
+    let genesis: Uint8Array | undefined;
+    if ("genesis" in d) {
+      const g = d["genesis"];
+      if (!(g instanceof Uint8Array)) {
+        throw new Error("document_reconcile_field_type: genesis must be a byte string");
+      }
+      genesis = new Uint8Array(g);
+    }
     return {
       document_id: hex64(d, "document_id"),
       governance,
@@ -204,6 +220,7 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
       refused: hexList(d, "refused"),
       entries: byteList(d, "entries"),
       envelopes: byteList(d, "envelopes"),
+      ...(genesis ? { genesis } : {}),
     };
   });
   let refusal: { reason: string; terminal: boolean } | undefined;

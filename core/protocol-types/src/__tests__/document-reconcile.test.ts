@@ -139,6 +139,24 @@ describe("document_reconcile — one shape, three steps", () => {
     expect(DOCUMENT_RECONCILE_EXCHANGE_VERSION).toBe(1);
   });
 
+  it("the genesis rides the frame for a peer who holds nothing — a joiner is just very far behind", () => {
+    const f = frame({
+      documents: [
+        {
+          document_id: DOC,
+          governance: [],
+          content: [],
+          refused: [],
+          entries: [],
+          envelopes: [],
+          genesis: new Uint8Array([7, 8, 9]),
+        },
+      ],
+    });
+    const decoded = decodeDocumentReconcile(encodeDocumentReconcile(f));
+    expect(decoded.documents[0]!.genesis).toEqual(new Uint8Array([7, 8, 9]));
+  });
+
   it("a refusal rides the SAME frame — no second carrier for 'no'", () => {
     const f = frame({
       documents: [],

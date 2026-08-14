@@ -35,6 +35,8 @@ export interface ReconcileReads {
   refusedHashes(documentId: string): string[];
   /** The interim membership walk — "removed" is the one verdict consulted here. */
   membershipState(documentId: string, agentId: string): "holder" | "removed" | "untouched";
+  /** The signed genesis proposal bytes — the anchor a joiner-with-nothing must be handed. */
+  genesisBytes(documentId: string): Uint8Array | null;
 }
 
 export type ReconcileRefusal = {
@@ -225,9 +227,16 @@ export function respondToReconcile(
       return mine ? c.count > mine.count : c.count > 0;
     });
 
+  // A peer whose position is EMPTY holds nothing — a joiner (spec §4: "simply very far
+  // behind"). Hand them the anchor everything derives from; it is the one record that is not an
+  // entry, and the bootstrap on their side is idempotent.
+  const peerHoldsNothing =
+    peerBlock.governance.length === 0 && peerBlock.content.length === 0;
+  const genesis = peerHoldsNothing ? reads.genesisBytes(documentId) : null;
+
   return {
     kind: "reply",
-    block: { ...block, entries, envelopes },
+    block: { ...block, entries, envelopes, ...(genesis ? { genesis } : {}) },
     peerAhead,
   };
 }

@@ -59,6 +59,8 @@ import {
   decodeDocumentJoinOffer,
   decodeDocumentAmendment,
   decodeDocumentProposal,
+  encodeDocumentProposal,
+  documentIdFromProposal,
   encodeDocumentProposalAck,
   DOCUMENT_PROPOSAL_ACK_VERSION,
   MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
@@ -805,6 +807,10 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       rejections.quarantined(ownerAgentId, documentId).map((q) => q.rejectedEnvelopeHash),
     membershipState: (documentId, agentId) =>
       amendments.membershipOf(ownerAgentId, documentId, agentId).state,
+    genesisBytes: (documentId) => {
+      const record = handshake.get(ownerAgentId, documentId);
+      return record ? new Uint8Array(encodeDocumentProposal(record.envelope)) : null;
+    },
   });
 
   /**
@@ -851,6 +857,62 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     const replyBlocks = [];
     let refusal: { reason: string; terminal: boolean } | null = null;
     for (const block of frame.documents) {
+      // THE NOTICE, RECEIVED (R25): a position for a document this holder does not hold, with
+      // no genesis attached, IS the invitation pointer — the frame already names the document
+      // and the session names the inviter. The answer is our EMPTY position ("I hold nothing;
+      // send everything"), and the peer's reply carries the genesis and the lot. Two empty
+      // hands stay silent, so nothing ping-pongs.
+      if (!block.genesis && !store.getDocument(ownerAgentId, block.document_id)) {
+        const peerClaimsAnything =
+          block.governance.length > 0 || block.content.length > 0 ||
+          block.entries.length > 0 || block.envelopes.length > 0;
+        if (peerClaimsAnything) {
+          replyBlocks.push({
+            document_id: block.document_id,
+            governance: [], content: [], refused: [], entries: [], envelopes: [],
+          });
+          logger.info("document.reconcile.notice_received", {
+            documentId: block.document_id, viaAgentId: senderAgentId, correlationId,
+          });
+        }
+        continue;
+      }
+      // THE JOINER BOOTSTRAP (spec §4 — a joiner is simply very far behind): a block carrying
+      // the genesis for a document this holder does not have is the invitation arriving. The
+      // anchor is validated the way every genesis is — its hash IS the document id, its
+      // signature is the proposer's — and recording it is idempotent. The invitee then derives
+      // their own standing (invited) from the entries that follow; their ACCEPT is the ordinary
+      // consent-authoring accept.
+      if (block.genesis && !store.getDocument(ownerAgentId, block.document_id)) {
+        try {
+          const genesisEnv = decodeDocumentProposal(block.genesis);
+          if (documentIdFromProposal(genesisEnv) !== block.document_id) {
+            throw new Error(
+              "document_reconcile_genesis_mismatch: the carried genesis does not hash to the " +
+                "block's document id — the anchor cannot be swapped",
+            );
+          }
+          handshake.recordJoined(ownerAgentId, block.genesis, nowMs);
+          store.createDocument({
+            documentId: block.document_id,
+            ownerAgentId,
+            peerAgentId: senderAgentId,
+            documentType: genesisEnv.document_type,
+            properties: genesisEnv.properties,
+            status: "active",
+            createdAtMs: nowMs,
+          });
+          logger.info("document.reconcile.joined", {
+            documentId: block.document_id, viaAgentId: senderAgentId, correlationId,
+          });
+        } catch (err: unknown) {
+          logger.warn("document.reconcile.genesis_refused", {
+            documentId: block.document_id, senderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+      }
       // APPLY FIRST (R12 order: governance, then content). Both doors are the ordinary ones —
       // idempotent, held-until-whole, refusal-recording — so a redelivered exchange changes
       // nothing.

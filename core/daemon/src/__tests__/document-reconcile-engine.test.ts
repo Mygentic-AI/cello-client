@@ -119,6 +119,7 @@ function reads(over: Partial<ReconcileReads> = {}): ReconcileReads {
     envelopeLog: () => [],
     refusedHashes: () => [],
     membershipState: () => "untouched",
+    genesisBytes: () => null,
     ...over,
   };
 }
@@ -270,6 +271,32 @@ describe("respondToReconcile — the content difference", () => {
     );
     if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.peerAhead).toBe(true);
+  });
+});
+
+describe("respondToReconcile — the joiner bootstrap", () => {
+  it("a peer with an EMPTY position is handed the genesis alongside everything else", () => {
+    const g = new Uint8Array([9, 9, 9]);
+    const r = respondToReconcile(
+      reads({
+        deriveState: () => ({ ok: true, state: stateView({ invited: ["9".repeat(64)] }) }),
+        genesisBytes: () => g,
+      }),
+      "9".repeat(64),
+      block(),
+    );
+    if (r.kind !== "reply") throw new Error("expected reply");
+    expect(r.block.genesis).toEqual(g);
+  });
+
+  it("a peer with ANY position gets no genesis — they already hold the anchor", () => {
+    const r = respondToReconcile(
+      reads({ genesisBytes: () => new Uint8Array([9]) }),
+      peer,
+      block({ content: [{ author: peer, count: 1, head_hash: "aa".repeat(32) }] }),
+    );
+    if (r.kind !== "reply") throw new Error("expected reply");
+    expect(r.block.genesis).toBeUndefined();
   });
 });
 
