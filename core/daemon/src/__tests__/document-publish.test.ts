@@ -57,10 +57,11 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
 
 function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number) {
   db.prepare(
-    `INSERT INTO document_amendments
-       (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(owner, doc, epoch, "h".repeat(64), Buffer.from([1]), 1);
+    `INSERT INTO document_entries
+       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+        received_bytes, recorded_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(owner, doc, "h".repeat(64), "a".repeat(64), epoch, epoch, Buffer.from([1]), 1);
 }
 
 describe("FANOUT-1 — publish SEEDS per-holder delivery rows through the production path", () => {

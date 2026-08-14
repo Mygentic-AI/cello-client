@@ -902,6 +902,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       property_change: null,
       state_hash: null,
       authored_at_ms: deps.now(),
+      // SYNC-P1 — the causal fields. Parents are the linear head while authoring is still
+      // epoch-chained; P3's exchange moves this to the fold's frontier.
+      author_agent_id: who.ownerAgentId,
+      author_seq:
+        (layer.amendments.watermarks(who.ownerAgentId, documentId).get(who.ownerAgentId)?.seq ??
+          0) + 1,
+      parents:
+        derived.arrangement.lastAmendmentHash === null
+          ? []
+          : [derived.arrangement.lastAmendmentHash],
     };
     const amendHash = documentAmendmentHash(body);
     const multisigTbs = buildDocumentMultisigTbs({
@@ -1137,6 +1147,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       property_change: null,
       state_hash: null,
       authored_at_ms: deps.now(),
+      // SYNC-P1 — the causal fields. Parents are the linear head while authoring is still
+      // epoch-chained; P3's exchange moves this to the fold's frontier.
+      author_agent_id: who.ownerAgentId,
+      author_seq:
+        (layer.amendments.watermarks(who.ownerAgentId, documentId).get(who.ownerAgentId)?.seq ??
+          0) + 1,
+      parents:
+        derived.arrangement.lastAmendmentHash === null
+          ? []
+          : [derived.arrangement.lastAmendmentHash],
     };
     const amendHash = documentAmendmentHash(body);
     const multisigTbs = buildDocumentMultisigTbs({

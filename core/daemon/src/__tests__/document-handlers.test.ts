@@ -263,11 +263,12 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     const brokenId = broken.documentId as string;
     f.db
       .prepare(
-        `INSERT INTO document_amendments
-           (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO document_entries
+           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+            received_bytes, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(f.owner, brokenId, 1, "h".repeat(64), Buffer.from([0xff, 0xff, 0xff]), 1);
+      .run(f.owner, brokenId, "h".repeat(64), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const list = await f.call("cello_doc_list", {});
     const rows = list.documents as Array<Record<string, unknown>>;
@@ -513,6 +514,9 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       property_change: null,
       state_hash: null,
       authored_at_ms: NOW,
+      author_agent_id: rogueId,
+      author_seq: 1,
+      parents: [],
     };
     const hash = documentAmendmentHash(body);
     const tbs = buildDocumentMultisigTbs({
@@ -1134,7 +1138,7 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     // showing `closed` and nothing saying the derivation had failed. `close()` takes no sender
     // gate, so this reaches the settle decision directly.
     fA.layer.store.rawDb
-      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .prepare(`UPDATE document_entries SET received_bytes = ? WHERE document_id = ?`)
       .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
 
     await fA.call("cello_doc_close", { document_id: documentId });
@@ -1148,7 +1152,7 @@ describe("DOD-MP-CONTROL-N-1 — ending a document, against a REAL derived chain
     const { fA, documentId } = await threeHolders();
     await fA.call("cello_doc_close", { document_id: documentId });
     fA.layer.store.rawDb
-      .prepare(`UPDATE document_amendments SET received_bytes = ? WHERE document_id = ?`)
+      .prepare(`UPDATE document_entries SET received_bytes = ? WHERE document_id = ?`)
       .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
 
     // `holdersFor` THROWS on bytes this build cannot read. Uncontained, that throw escaped the row,
@@ -1371,10 +1375,11 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     // A chain that will not decode. The membership walk honestly cannot answer here, and it
     // reports not-removed — so a key that is merely ABSENT renders a removed holder as fine.
     fA.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const row = await rowFor(fA, documentId);
     expect(row["arrangementUnavailable"]).toBeDefined();
@@ -1392,10 +1397,11 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a write REFUSES on an unreadable chain, n
     });
     const documentId = proposed.documentId as string;
     fA.db.prepare(
-      `INSERT INTO document_amendments
-         (owner_agent_id, document_id, epoch_id, amendment_hash, received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, 1, "ff".repeat(32), Buffer.from([0xff, 0xff, 0xff]), 1);
+      `INSERT INTO document_entries
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+          received_bytes, recorded_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     // `holdersFor` is contracted to return null when it cannot derive, and the publish path is
     // already holding a named refusal for that. The chain decode threw straight past both, so the

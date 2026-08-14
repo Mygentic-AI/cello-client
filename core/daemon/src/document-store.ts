@@ -34,7 +34,12 @@
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import { DOCUMENT_AMENDMENTS_CREATE_SQL, walkMembership, type MembershipVerdict } from "./document-amendment-store.js";
+import {
+  DOCUMENT_AMENDMENTS_CREATE_SQL,
+  DOCUMENT_ENTRIES_CREATE_SQL,
+  walkMembership,
+  type MembershipVerdict,
+} from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
 export type DocumentStatus = "active" | "closed" | "killed" | "stalled";
@@ -350,6 +355,7 @@ export class DocumentStore {
     // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
+    this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
     // M14B / DOD-MP-FANOUT-1 — per-(envelope, holder) delivery state. The envelope row's
     // bilateral ack columns cannot carry N answers; this table can, and it is DERIVED
     // bookkeeping over the log — the envelope is the truth, a row here is one holder's
@@ -998,9 +1004,9 @@ export class DocumentStore {
   ): { removed: boolean; epochId: number | null } {
     const rows = this.#db
       .prepare(
-        `SELECT received_bytes FROM document_amendments
+        `SELECT received_bytes FROM document_entries
           WHERE owner_agent_id = ? AND document_id = ?
-          ORDER BY epoch_id ASC`,
+          ORDER BY epoch_id ASC, author_seq ASC, entry_hash ASC`,
       )
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
     // CONTAINED, for the same reason the arrangement read is: `decodeDocumentAmendment` throws
@@ -1028,7 +1034,7 @@ export class DocumentStore {
   currentDocumentEpoch(ownerAgentId: string, documentId: string): number {
     const r = this.#db
       .prepare(
-        `SELECT MAX(epoch_id) AS max_epoch FROM document_amendments
+        `SELECT MAX(epoch_id) AS max_epoch FROM document_entries
           WHERE owner_agent_id = ? AND document_id = ?`,
       )
       .get(ownerAgentId, documentId) as { max_epoch?: number | null } | undefined;
@@ -1276,10 +1282,10 @@ export class DocumentStore {
                       ORDER BY a.epoch_id ASC
                     ) AS rn
                FROM document_amendment_deliveries d
-               JOIN document_amendments a
+               JOIN document_entries a
                  ON a.owner_agent_id = d.owner_agent_id
                 AND a.document_id = d.document_id
-                AND a.amendment_hash = d.amendment_hash
+                AND a.entry_hash = d.amendment_hash
               WHERE d.owner_agent_id = ?
                 AND d.acked_at IS NULL
                 AND d.retired_at IS NULL
@@ -1316,14 +1322,14 @@ export class DocumentStore {
       .prepare(
         `SELECT d.document_id, d.amendment_hash, d.holder_agent_id
            FROM document_amendment_deliveries d
-           LEFT JOIN document_amendments a
+           LEFT JOIN document_entries a
              ON a.owner_agent_id = d.owner_agent_id
             AND a.document_id = d.document_id
-            AND a.amendment_hash = d.amendment_hash
+            AND a.entry_hash = d.amendment_hash
           WHERE d.owner_agent_id = ?
             AND d.acked_at IS NULL
             AND d.retired_at IS NULL
-            AND a.amendment_hash IS NULL`,
+            AND a.entry_hash IS NULL`,
       )
       .all(ownerAgentId) as Array<Record<string, unknown>>;
     return rows.map((r) => ({
@@ -1396,10 +1402,10 @@ export class DocumentStore {
       .prepare(
         `SELECT d.amendment_hash
            FROM document_amendment_deliveries d
-           JOIN document_amendments a
+           JOIN document_entries a
              ON a.owner_agent_id = d.owner_agent_id
             AND a.document_id = d.document_id
-            AND a.amendment_hash = d.amendment_hash
+            AND a.entry_hash = d.amendment_hash
           WHERE d.owner_agent_id = ? AND d.document_id = ? AND d.holder_agent_id = ?
             AND d.acked_at IS NULL AND d.retired_at IS NULL
             AND a.epoch_id <= ?`,
