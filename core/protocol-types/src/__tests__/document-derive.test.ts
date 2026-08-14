@@ -903,6 +903,27 @@ describe("deriveDocumentState — a removal SPENDS the declared-genesis-admin gr
   });
 });
 
+describe("deriveDocumentState — invitation retraction (P3: the missing verb)", () => {
+  it("remove_holder of an INVITED seat clears the invitation — the admin can take back an unanswered offer", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const retract = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, admitC, retract], [a, b, c]);
+    expect(s.invited.has(c.agentId)).toBe(false);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids).toEqual([]);
+    // A consent racing the retraction (concurrent) is void — removal dominates, as everywhere.
+    const lateConsent = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const s2 = deriveOk(g, [bc, admitC, retract, lateConsent], [a, b, c]);
+    expect(s2.participants.has(c.agentId)).toBe(false);
+  });
+});
+
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
   it("genesis alone: the proposer participates (their signature IS consent); the peer is invited", () => {
     const [a, b] = [makeSigner(), makeSigner()];

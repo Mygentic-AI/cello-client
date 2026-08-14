@@ -693,6 +693,34 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           removedBy: applied.collection.required_signers.join(","),
         });
       }
+      // THE ARRIVING CONSENT IS THE JOIN ANSWER (SYNC-P3, the D5 replacement): an inviter's
+      // pending row settles from the entry itself — the subject's own signed yes or no — so
+      // the legacy answer frame carries nothing the record does not. Settle-once semantics
+      // live in the store; a redelivered entry decides nothing twice.
+      if (
+        (applied.body.kind === "consent" || applied.body.kind === "refuse_join") &&
+        applied.body.subject_agent_id !== null &&
+        applied.body.subject_agent_id !== ownerAgentId
+      ) {
+        const subject = applied.body.subject_agent_id;
+        const pendingRow = joins
+          .outgoingFor(ownerAgentId)
+          .find(
+            (row) =>
+              row.documentId === documentId &&
+              row.inviteeAgentId === subject &&
+              row.state === "pending",
+          );
+        if (pendingRow) {
+          joins.settleFromEntry(
+            ownerAgentId,
+            pendingRow.amendmentHash,
+            applied.body.kind === "consent",
+            applied.body.kind === "refuse_join" ? "refused via the exchange" : null,
+            nowMs,
+          );
+        }
+      }
       // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
       // holder who had not closed leaves everyone who remains in agreement; without this the
       // document stayed `active` forever reporting that it waited on nobody.

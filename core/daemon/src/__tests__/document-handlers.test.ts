@@ -959,11 +959,72 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     routeAll(fC, fA);
     await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
     await until(() => fA.layer.holdersFor(fA.owner, documentId)!.includes(fC.owner));
+    // The inviter's join surface settled FROM THE ENTRY — no answer frame was ever routed.
+    expect(
+      fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state,
+    ).toBe("accepted");
     const list = await fA.call("cello_doc_list", {});
     const row = (list.documents as Array<Record<string, unknown>>).find(
       (d) => d.documentId === documentId,
     )!;
     expect(row.participants).toContain(fC.owner);
+  });
+
+  it("REFUSAL VIA THE EXCHANGE: the invitee's signed no settles the inviter's surface, and an unanswered invitation can be RETRACTED", async () => {
+    // Both halves of ending an invitation under the new model: the invitee declines by
+    // authoring their own refuse_join entry (no answer frame anywhere), and separately, an
+    // admin takes back an offer nobody answered with the same removal verb every seat answers
+    // to — a consent racing the retraction loses under removal dominance.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+
+    // Bootstrap C through the exchange (the join test's flow, condensed).
+    const aInit = fA.sent.length;
+    await fA.layer.initiateReconcile(fA.owner, fC.owner, [documentId]);
+    const step1 = fA.sent.slice(aInit).find((send) => send.peerAgentId === fC.owner)!;
+    const cBefore = fC.sent.length;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fC.sent.length > cBefore);
+    const emptyHand = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fA.owner)!;
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", emptyHand.bytes, fC.owner);
+    await until(() => fA.sent.length > aBefore);
+    const world = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", world.bytes, fA.owner);
+    await until(() => fC.layer.store.getDocument(fC.owner, documentId) !== null);
+
+    // C DECLINES — their own signed entry, authored and fanned like everything else.
+    const refused = await fC.call("cello_doc_refuse", { document_id: documentId });
+    expect(refused.ok, JSON.stringify(refused)).toBe(true);
+    expect(typeof refused.refusalEntry).toBe("string");
+    routeAll(fC, fA);
+    await until(
+      () =>
+        fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state ===
+        "refused",
+    );
+    // C is no longer a seat anywhere.
+    expect(fA.layer.holdersFor(fA.owner, documentId)).not.toContain(fC.owner);
+
+    // RETRACTION: invite a fourth key that never answers, then take the offer back.
+    const ghost = "9".repeat(64);
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: ghost });
+    expect(fA.layer.holdersFor(fA.owner, documentId)).toContain(ghost);
+    const retracted = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: ghost,
+    });
+    expect(retracted.ok, JSON.stringify(retracted)).toBe(true);
+    expect(fA.layer.holdersFor(fA.owner, documentId)).not.toContain(ghost);
   });
 
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {
