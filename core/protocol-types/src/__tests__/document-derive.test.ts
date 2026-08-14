@@ -131,9 +131,11 @@ describe("deriveDocumentState — determinism", () => {
   it("is a pure function of the entry SET — any array order gives the identical state", () => {
     const [a, b, c, d] = [makeSigner(), makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
-    const e1 = entry({ subject_agent_id: c.agentId, author_seq: 1 }, [a]);
+    const bc = consentEntry(b);
+    const e1 = entry({ subject_agent_id: c.agentId, author_seq: 1, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(e1)] });
     const e2 = entry(
-      { subject_agent_id: d.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(e1)] },
+      { subject_agent_id: d.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
       [a],
     );
     const e3 = entry(
@@ -141,36 +143,39 @@ describe("deriveDocumentState — determinism", () => {
         kind: "promote_admin",
         subject_agent_id: c.agentId,
         author_seq: 3,
-        epoch_id: 3,
+        epoch_id: 4,
         parents: [hashHex(e2)],
       },
       [a],
     );
     const signers = [a, b, c, d];
-    const forward = deriveOk(g, [e1, e2, e3], signers);
-    const shuffled = deriveOk(g, [e3, e1, e2], signers);
+    const forward = deriveOk(g, [bc, e1, cc, e2, e3], signers);
+    const shuffled = deriveOk(g, [e3, cc, e1, bc, e2], signers);
     expect([...shuffled.participants].sort()).toEqual([...forward.participants].sort());
     expect([...shuffled.admins].sort()).toEqual([...forward.admins].sort());
     expect(shuffled.order).toEqual(forward.order);
     expect(shuffled.frontier).toEqual(forward.frontier);
     expect([...forward.participants].sort()).toEqual(
-      [a.agentId, b.agentId, c.agentId, d.agentId].sort(),
+      [a.agentId, b.agentId, c.agentId].sort(),
     );
+    expect([...forward.invited]).toEqual([d.agentId]);
     expect([...forward.admins].sort()).toEqual([a.agentId, c.agentId].sort());
   });
 
   it("derives a sequential chain exactly as the linear replay did", () => {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
-    const add = entry({ subject_agent_id: c.agentId }, [a]);
+    const bc = consentEntry(b);
+    const add = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(add)] });
     const flip = entry(
       {
         kind: "change_property",
         subject_agent_id: null,
         property_change: { key: "append_only", value: true },
         author_seq: 2,
-        epoch_id: 2,
-        parents: [hashHex(add)],
+        epoch_id: 3,
+        parents: [hashHex(cc)],
       },
       [a],
     );
@@ -179,16 +184,16 @@ describe("deriveDocumentState — determinism", () => {
         kind: "remove_holder",
         subject_agent_id: c.agentId,
         author_seq: 3,
-        epoch_id: 3,
+        epoch_id: 4,
         parents: [hashHex(flip)],
       },
       [a],
     );
-    const s = deriveOk(g, [add, flip, remove], [a, b, c]);
+    const s = deriveOk(g, [bc, add, cc, flip, remove], [a, b, c]);
     expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
     expect(s.properties["append_only"]).toBe(true);
     expect(s.voids).toEqual([]);
-    expect(s.interimMaxEpoch).toBe(3);
+    expect(s.interimMaxEpoch).toBe(4);
     expect(s.interimLastHash).toBe(hashHex(remove));
   });
 
@@ -206,6 +211,7 @@ describe("deriveDocumentState — concurrent property changes (LWW by the total 
   function propertyRace(bLower: boolean) {
     const [a, b] = [makeSigner(), makeSigner()];
     const g = genesis(a, b, [a, b]);
+    const bc = consentEntry(b);
     const { a: ea, b: eb } = grindOrder(
       () =>
         entry(
@@ -213,6 +219,7 @@ describe("deriveDocumentState — concurrent property changes (LWW by the total 
             kind: "change_property",
             subject_agent_id: null,
             property_change: { key: "append_only", value: true },
+            parents: [hashHex(bc)],
           },
           [a],
         ),
@@ -223,26 +230,28 @@ describe("deriveDocumentState — concurrent property changes (LWW by the total 
             subject_agent_id: null,
             property_change: { key: "append_only", value: false },
             authored_at_ms: ts,
+            author_seq: 2,
+            parents: [hashHex(bc)],
           },
           [b],
         ),
       bLower,
     );
-    const s = deriveOk(g, [ea, eb], [a, b]);
-    return { s, ea, eb };
+    const s = deriveOk(g, [bc, ea, eb], [a, b]);
+    return { s, ea, eb, bc };
   }
 
   it("the entry later in the total order wins; both stand on the record", () => {
-    const { s, ea, eb } = propertyRace(true); // b's hash lower → a folds later → a's value wins
+    const { s, ea, eb, bc } = propertyRace(true); // b's hash lower → a folds later → a's value wins
     expect(s.properties["append_only"]).toBe(true);
-    expect(s.order).toEqual([hashHex(eb), hashHex(ea)]);
+    expect(s.order).toEqual([hashHex(bc), hashHex(eb), hashHex(ea)]);
     expect(s.voids).toEqual([]);
   });
 
   it("…and symmetrically in the other hash order", () => {
-    const { s, ea, eb } = propertyRace(false); // b's hash higher → b folds later → b's value wins
+    const { s, ea, eb, bc } = propertyRace(false); // b's hash higher → b folds later → b's value wins
     expect(s.properties["append_only"]).toBe(false);
-    expect(s.order).toEqual([hashHex(ea), hashHex(eb)]);
+    expect(s.order).toEqual([hashHex(bc), hashHex(ea), hashHex(eb)]);
     expect(s.voids).toEqual([]);
   });
 });
@@ -251,8 +260,10 @@ describe("deriveDocumentState — removal dominates a concurrent promotion (both
   function race(bLower: boolean) {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a, b]);
-    const admit = entry({ subject_agent_id: c.agentId }, [a]);
-    const admitHash = hashHex(admit);
+    const bc = consentEntry(b);
+    const admit = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admit)] });
+    const ccHash = hashHex(cc);
     // A removes C (single-admin: C is a plain participant at the removal's ancestors)…
     const { a: removal, b: promotion } = grindOrder(
       () =>
@@ -261,8 +272,8 @@ describe("deriveDocumentState — removal dominates a concurrent promotion (both
             kind: "remove_holder",
             subject_agent_id: c.agentId,
             author_seq: 2,
-            epoch_id: 2,
-            parents: [admitHash],
+            epoch_id: 3,
+            parents: [ccHash],
           },
           [a],
         ),
@@ -272,15 +283,16 @@ describe("deriveDocumentState — removal dominates a concurrent promotion (both
           {
             kind: "promote_admin",
             subject_agent_id: c.agentId,
-            epoch_id: 2,
-            parents: [admitHash],
+            author_seq: 2,
+            epoch_id: 3,
+            parents: [ccHash],
             authored_at_ms: ts,
           },
           [b],
         ),
       bLower,
     );
-    return { g, entries: [admit, removal, promotion], signers: [a, b, c], c };
+    return { g, entries: [bc, admit, cc, removal, promotion], signers: [a, b, c], c };
   }
 
   it("C is removed when the removal folds first", () => {
@@ -302,22 +314,24 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
   function setup() {
     const [a, b, c, d] = [makeSigner(), makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a, b]);
-    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
     const promoteC = entry(
       {
         kind: "promote_admin",
         subject_agent_id: c.agentId,
         author_seq: 2,
-        epoch_id: 2,
-        parents: [hashHex(admitC)],
+        epoch_id: 3,
+        parents: [hashHex(cc)],
       },
       [a],
     );
-    return { a, b, c, d, g, admitC, promoteC };
+    return { a, b, c, d, g, prelude: [bc, admitC, cc], promoteC };
   }
 
   function concurrentGrantRace(grantLower: boolean) {
-    const { a, b, c, d, g, admitC, promoteC } = setup();
+    const { a, b, c, d, g, prelude, promoteC } = setup();
     // C (admin) invites D concurrently with C's removal by {A, B} — GROUND both hash orders,
     // because with the removal folding first the policy alone would void the grant and a broken
     // concurrency rule would hide behind it on the hash coin (review F1's hollow-test finding).
@@ -326,7 +340,7 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
         kind: "remove_admin",
         subject_agent_id: c.agentId,
         author_seq: 3,
-        epoch_id: 3,
+        epoch_id: 4,
         parents: [hashHex(promoteC)],
       },
       [a, b],
@@ -335,12 +349,18 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
       () => removeC,
       (ts) =>
         entry(
-          { subject_agent_id: d.agentId, epoch_id: 3, parents: [hashHex(promoteC)], authored_at_ms: ts },
+          {
+            subject_agent_id: d.agentId,
+            author_seq: 2,
+            epoch_id: 4,
+            parents: [hashHex(promoteC)],
+            authored_at_ms: ts,
+          },
           [c],
         ),
       grantLower,
     );
-    const s = deriveOk(g, [admitC, promoteC, grant, removeC], [a, b, c, d]);
+    const s = deriveOk(g, [...prelude, promoteC, grant, removeC], [a, b, c, d]);
     return { s, grant, c, d };
   }
 
@@ -368,16 +388,18 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
     const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const cc1 = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
     const removeC = entry(
-      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc1)] },
       [a],
     );
     const readmitC = entry(
-      { subject_agent_id: c.agentId, author_seq: 3, epoch_id: 3, parents: [hashHex(removeC)] },
+      { subject_agent_id: c.agentId, author_seq: 3, epoch_id: 4, parents: [hashHex(removeC)] },
       [a],
     );
+    const cc2 = consentEntry(c, { author_seq: 2, epoch_id: 5, parents: [hashHex(readmitC)] });
     const repromoteC = entry(
-      { kind: "promote_admin", subject_agent_id: c.agentId, author_seq: 4, epoch_id: 4, parents: [hashHex(readmitC)] },
+      { kind: "promote_admin", subject_agent_id: c.agentId, author_seq: 4, epoch_id: 6, parents: [hashHex(cc2)] },
       [a],
     );
     const act = entry(
@@ -385,12 +407,13 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
         kind: "change_property",
         subject_agent_id: null,
         property_change: { key: "append_only", value: true },
-        epoch_id: 5,
+        author_seq: 3,
+        epoch_id: 7,
         parents: [hashHex(repromoteC)],
       },
       [c],
     );
-    const s = deriveOk(g, [admitC, removeC, readmitC, repromoteC, act], [a, b, c]);
+    const s = deriveOk(g, [admitC, cc1, removeC, readmitC, cc2, repromoteC, act], [a, b, c]);
     expect(s.participants.has(c.agentId)).toBe(true);
     expect(s.admins.has(c.agentId)).toBe(true);
     expect(s.properties["append_only"]).toBe(true);
@@ -401,8 +424,9 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
     const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const cc1 = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
     const removeC = entry(
-      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc1)] },
       [a],
     );
     const lateAct = entry(
@@ -410,12 +434,13 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
         kind: "change_property",
         subject_agent_id: null,
         property_change: { key: "append_only", value: true },
-        epoch_id: 3,
+        author_seq: 2,
+        epoch_id: 4,
         parents: [hashHex(removeC)],
       },
       [c],
     );
-    const s = deriveOk(g, [admitC, removeC, lateAct], [a, b, c]);
+    const s = deriveOk(g, [admitC, cc1, removeC, lateAct], [a, b, c]);
     expect(s.properties["append_only"]).toBe(false);
     const reason = s.voids.find((v) => v.hash === hashHex(lateAct))!.reason;
     expect(reason).toMatch(/governance_not_admin/);
@@ -423,9 +448,9 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
   });
 
   it("a grant the removers had SEEN (ancestral to the removal) stands", () => {
-    const { a, b, c, d, g, admitC, promoteC } = setup();
+    const { a, b, c, d, g, prelude, promoteC } = setup();
     const grant = entry(
-      { subject_agent_id: d.agentId, epoch_id: 3, parents: [hashHex(promoteC)] },
+      { subject_agent_id: d.agentId, author_seq: 2, epoch_id: 4, parents: [hashHex(promoteC)] },
       [c],
     );
     // The removal names the grant among its parents — the removers acted knowing of it.
@@ -434,13 +459,14 @@ describe("deriveDocumentState — a removed admin's concurrent authority is void
         kind: "remove_admin",
         subject_agent_id: c.agentId,
         author_seq: 3,
-        epoch_id: 4,
+        epoch_id: 5,
         parents: [hashHex(grant)],
       },
       [a, b],
     );
-    const s = deriveOk(g, [admitC, promoteC, grant, removeC], [a, b, c, d]);
-    expect(s.participants.has(d.agentId)).toBe(true);
+    const s = deriveOk(g, [...prelude, promoteC, grant, removeC], [a, b, c, d]);
+    // The invitation stands (R22: participation additionally needs D's own consent).
+    expect(s.invited.has(d.agentId)).toBe(true);
     expect(s.admins.has(c.agentId)).toBe(false);
   });
 });
@@ -449,30 +475,39 @@ describe("deriveDocumentState — the admin floor (Entry 49 addendum)", () => {
   function threeAdmins() {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a, b]);
-    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
     const promoteC = entry(
       {
         kind: "promote_admin",
         subject_agent_id: c.agentId,
         author_seq: 2,
-        epoch_id: 2,
-        parents: [hashHex(admitC)],
+        epoch_id: 3,
+        parents: [hashHex(cc)],
       },
       [a],
     );
     const base = [hashHex(promoteC)];
-    return { a, b, c, g, prelude: [admitC, promoteC], base };
+    return { a, b, c, g, prelude: [bc, admitC, cc, promoteC], base };
   }
 
   it("two mutual removals among three admins leave the co-signer standing", () => {
     const { a, b, c, g, prelude, base } = threeAdmins();
     // remove(A) by {B,C} ∥ remove(B) by {A,C} — C co-signs both.
     const removeA = entry(
-      { kind: "remove_admin", subject_agent_id: a.agentId, epoch_id: 3, parents: base, author_agent_id: b.agentId },
+      {
+        kind: "remove_admin",
+        subject_agent_id: a.agentId,
+        author_seq: 2,
+        epoch_id: 4,
+        parents: base,
+        author_agent_id: b.agentId,
+      },
       [b, c],
     );
     const removeB = entry(
-      { kind: "remove_admin", subject_agent_id: b.agentId, epoch_id: 3, parents: base },
+      { kind: "remove_admin", subject_agent_id: b.agentId, author_seq: 3, epoch_id: 4, parents: base },
       [a, c],
     );
     const s = deriveOk(g, [...prelude, removeA, removeB], [a, b, c]);
@@ -485,15 +520,24 @@ describe("deriveDocumentState — the admin floor (Entry 49 addendum)", () => {
   it("a three-way removal race leaves exactly ONE admin — never zero", () => {
     const { a, b, c, g, prelude, base } = threeAdmins();
     const removeA = entry(
-      { kind: "remove_admin", subject_agent_id: a.agentId, epoch_id: 3, parents: base, author_agent_id: b.agentId },
+      {
+        kind: "remove_admin",
+        subject_agent_id: a.agentId,
+        author_seq: 2,
+        epoch_id: 4,
+        parents: base,
+        author_agent_id: b.agentId,
+      },
       [b, c],
     );
     const removeB = entry(
-      { kind: "remove_admin", subject_agent_id: b.agentId, epoch_id: 3, parents: base },
+      { kind: "remove_admin", subject_agent_id: b.agentId, author_seq: 3, epoch_id: 4, parents: base },
       [a, c],
     );
+    // Also by A, CONCURRENT with removeB — a same-author fork at seq 3, which is exactly what
+    // concurrent authorship by one key looks like and the derivation tolerates.
     const removeC = entry(
-      { kind: "remove_admin", subject_agent_id: c.agentId, epoch_id: 3, parents: base },
+      { kind: "remove_admin", subject_agent_id: c.agentId, author_seq: 3, epoch_id: 4, parents: base },
       [a, b],
     );
     const s = deriveOk(g, [...prelude, removeA, removeB, removeC], [a, b, c]);
@@ -514,9 +558,8 @@ describe("deriveDocumentState — equivocation folds as concurrency", () => {
     const one = deriveOk(g, [forkOne, forkTwo], signers);
     const two = deriveOk(g, [forkTwo, forkOne], signers);
     expect(one.order).toEqual(two.order);
-    expect([...one.participants].sort()).toEqual(
-      [a.agentId, b.agentId, c.agentId, d.agentId].sort(),
-    );
+    // Both forked admissions apply — the invitations coexist.
+    expect([...one.invited].sort()).toEqual([b.agentId, c.agentId, d.agentId].sort());
     // The fork is visible: two applied entries by A at seq 1.
     expect(one.authorSeqs.get(a.agentId)).toBe(1);
   });
@@ -553,23 +596,32 @@ describe("deriveDocumentState — incomplete ancestry excludes, never guesses", 
       [a],
     );
     const s = deriveOk(g, [first, broken], [a, b, c, d]);
-    expect(s.participants.has(c.agentId)).toBe(true);
-    expect(s.participants.has(d.agentId)).toBe(false);
+    expect(s.invited.has(c.agentId)).toBe(true);
+    expect(s.invited.has(d.agentId)).toBe(false);
     expect(s.voids.find((v) => v.hash === hashHex(broken))!.reason).toMatch(/own.chain|own_chain/i);
   });
 });
 
 describe("deriveDocumentState — fold-voids stay on the record (F4)", () => {
-  it("adding an existing holder is void with the named reason; the state is untouched", () => {
+  it("re-admitting someone already seated is void with the named reason; the state is untouched", () => {
     const [a, b] = [makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
-    const dup = entry({ subject_agent_id: b.agentId }, [a]);
-    const s = deriveOk(g, [dup], [a, b]);
+    const bc = consentEntry(b);
+    const dup = entry({ subject_agent_id: b.agentId, parents: [hashHex(bc)] }, [a]);
+    const s = deriveOk(g, [bc, dup], [a, b]);
     expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
     expect(s.voids.length).toBe(1);
     expect(s.voids[0]!.reason).toMatch(/already_holder/);
     // Void entries are still IN the linearization — history, not refusal.
-    expect(s.order).toEqual([hashHex(dup)]);
+    expect(s.order).toEqual([hashHex(bc), hashHex(dup)]);
+  });
+
+  it("inviting someone with an OPEN invitation is void by name", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const dup = entry({ subject_agent_id: b.agentId }, [a]); // b is invited at genesis
+    const s = deriveOk(g, [dup], [a, b]);
+    expect(s.voids[0]!.reason).toMatch(/already_invited/);
   });
 
   it("an author outside the collection's required set is void — accountability is signed", () => {
@@ -594,8 +646,8 @@ describe("deriveDocumentState — fold-voids stay on the record (F4)", () => {
     unsigned.collection.signatures = [];
     const good = entry({ subject_agent_id: d.agentId, authored_at_ms: T0 + 9 }, [a]);
     const s = deriveOk(g, [unsigned, good], [a, b, c, d]);
-    expect(s.participants.has(d.agentId)).toBe(true);
-    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.invited.has(d.agentId)).toBe(true);
+    expect(s.invited.has(c.agentId)).toBe(false);
     expect(s.voids.find((v) => v.hash === hashHex(unsigned))!.reason).toMatch(/incomplete/);
   });
 });
@@ -604,7 +656,7 @@ describe("deriveDocumentState — the holder cap under concurrency", () => {
   it("two concurrent admissions at cap-1 admit exactly one, deterministically", () => {
     const [a, b] = [makeSigner(), makeSigner()];
     const g = genesis(a, b, [a]);
-    // Fill to cap-1 sequentially (17 admissions on top of the 2 genesis holders → 19).
+    // Fill to cap-1 sequentially: proposer + invited peer = 2 admitted seats; 17 more → 19.
     const fillers: DocumentAmendmentEnvelope[] = [];
     let prev: string[] = [];
     for (let i = 0; i < 17; i++) {
@@ -631,17 +683,232 @@ describe("deriveDocumentState — the holder cap under concurrency", () => {
       [a],
     );
     const s = deriveOk(g, [...fillers, race1, race2], [a, b]);
-    expect(s.participants.size).toBe(20);
+    expect(s.participants.size + s.invited.size).toBe(20);
     const capVoids = s.voids.filter((v) => /holder_cap/.test(v.reason));
     expect(capVoids.length).toBe(1);
   });
 });
 
+/** The subject's own signed consent (R21/R22): author = subject = sole signer, naming what they
+ *  agree to in the SIGNED property slots. */
+function consentEntry(
+  subject: Signer,
+  over: Partial<DocumentAmendmentBody> = {},
+): DocumentAmendmentEnvelope {
+  return entry(
+    {
+      kind: "consent",
+      subject_agent_id: subject.agentId,
+      property_change: { key: "consents_to", value: "authenticated/2" },
+      ...over,
+    },
+    [subject],
+  );
+}
+
+describe("deriveDocumentState — consent (R21/R22): participant = admitted AND consented", () => {
+  it("the genesis peer is INVITED until their consent entry applies — then participant, and their declared admin power activates", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a, b]); // both declared admins at creation
+    const before = deriveOk(g, [], [a, b]);
+    expect(before.participants.has(b.agentId)).toBe(false);
+    expect(before.invited.has(b.agentId)).toBe(true);
+    expect([...before.admins]).toEqual([a.agentId]); // declared ∩ participants
+
+    const after = deriveOk(g, [consentEntry(b)], [a, b]);
+    expect(after.participants.has(b.agentId)).toBe(true);
+    expect(after.invited.has(b.agentId)).toBe(false);
+    expect([...after.admins].sort()).toEqual([a.agentId, b.agentId].sort());
+    expect(after.voids).toEqual([]);
+  });
+
+  it("an admission alone admits NOBODY — invited, not participant (R22)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admit = entry(
+      { subject_agent_id: c.agentId, author_seq: 1, epoch_id: 1, parents: [hashHex(bc)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, admit], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.invited.has(c.agentId)).toBe(true);
+  });
+
+  it("admission + the subject's own consent = participant", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admit = entry(
+      { subject_agent_id: c.agentId, epoch_id: 1, parents: [hashHex(bc)] },
+      [a],
+    );
+    const cConsent = consentEntry(c, { epoch_id: 2, parents: [hashHex(admit)] });
+    const s = deriveOk(g, [bc, admit, cConsent], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(true);
+    expect(s.invited.has(c.agentId)).toBe(false);
+    expect(s.voids).toEqual([]);
+  });
+
+  it("a consent NOT signed by its subject is void — nobody consents for you (adversary lens)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admit = entry({ subject_agent_id: c.agentId, epoch_id: 1, parents: [hashHex(bc)] }, [a]);
+    // The ADMIN authors and signs a "consent" naming C.
+    const forged = entry(
+      {
+        kind: "consent",
+        subject_agent_id: c.agentId,
+        property_change: { key: "consents_to", value: "authenticated/2" },
+        author_seq: 2,
+        epoch_id: 2,
+        parents: [hashHex(admit)],
+      },
+      [a],
+    );
+    const s = deriveOk(g, [bc, admit, forged], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids.find((v) => v.hash === hashHex(forged))!.reason).toMatch(
+      /consent.*subject|subject.*consent/i,
+    );
+  });
+
+  it("a consent with NO admission to answer is void by name", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const stray = consentEntry(c);
+    const s = deriveOk(g, [consentEntry(b), stray], [a, b, c]);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids.find((v) => v.hash === hashHex(stray))!.reason).toMatch(/not_invited/);
+  });
+
+  it("a consent whose consents_to claim mismatches the document is void, naming both sides", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const wrong = consentEntry(b, {
+      property_change: { key: "consents_to", value: "attested/2" },
+    });
+    const s = deriveOk(g, [wrong], [a, b]);
+    expect(s.participants.has(b.agentId)).toBe(false);
+    const reason = s.voids[0]!.reason;
+    expect(reason).toMatch(/consents_to/);
+    expect(reason).toContain("attested/2");
+    expect(reason).toContain("authenticated/2");
+  });
+
+  it("refuse_join ends the invitation; a fresh admission can re-invite", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admit = entry({ subject_agent_id: c.agentId, epoch_id: 1, parents: [hashHex(bc)] }, [a]);
+    const refuse = entry(
+      {
+        kind: "refuse_join",
+        subject_agent_id: c.agentId,
+        author_seq: 1,
+        epoch_id: 2,
+        parents: [hashHex(admit)],
+      },
+      [c],
+    );
+    const s = deriveOk(g, [bc, admit, refuse], [a, b, c]);
+    expect(s.invited.has(c.agentId)).toBe(false);
+    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.voids).toEqual([]);
+    // A fresh admission after the refusal re-invites.
+    const again = entry(
+      { subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(refuse)] },
+      [a],
+    );
+    const s2 = deriveOk(g, [bc, admit, refuse, again], [a, b, c]);
+    expect(s2.invited.has(c.agentId)).toBe(true);
+  });
+
+  it("the holder cap counts the ADMITTED — invited seats are seats (over-inviting refused at the same door)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const fill: DocumentAmendmentEnvelope[] = [bc];
+    let prev = [hashHex(bc)];
+    // 18 invitations on top of proposer + consented peer → 20 admitted seats.
+    for (let i = 0; i < 18; i++) {
+      const e = entry(
+        {
+          subject_agent_id: makeSigner().agentId,
+          author_seq: i + 1,
+          epoch_id: i + 1,
+          parents: prev,
+          authored_at_ms: T0 + i,
+        },
+        [a],
+      );
+      fill.push(e);
+      prev = [hashHex(e)];
+    }
+    const over = entry(
+      { subject_agent_id: makeSigner().agentId, author_seq: 19, epoch_id: 19, parents: prev },
+      [a],
+    );
+    const s = deriveOk(g, [...fill, over], [a, b]);
+    expect(s.voids.find((v) => v.hash === hashHex(over))!.reason).toMatch(/holder_cap/);
+  });
+});
+
+describe("deriveDocumentState — a removal SPENDS the declared-genesis-admin grant (P2 review F6)", () => {
+  it("a demoted-then-removed-then-re-admitted genesis admin arrives as a PLAIN holder", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a, b]); // both DECLARED admins at creation
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const promoteC = entry(
+      { kind: "promote_admin", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    // admins {a,b,c} — now expel B the D3 way: demote (all others sign), then remove as holder.
+    const demoteB = entry(
+      { kind: "remove_admin", subject_agent_id: b.agentId, author_seq: 3, epoch_id: 4, parents: [hashHex(promoteC)] },
+      [a, c],
+    );
+    const removeB = entry(
+      { kind: "remove_holder", subject_agent_id: b.agentId, author_seq: 4, epoch_id: 5, parents: [hashHex(demoteB)] },
+      [a],
+    );
+    const readmitB = entry(
+      { subject_agent_id: b.agentId, author_seq: 5, epoch_id: 6, parents: [hashHex(removeB)] },
+      [a],
+    );
+    const bc2 = consentEntry(b, { author_seq: 2, epoch_id: 7, parents: [hashHex(readmitB)] });
+    const s = deriveOk(g, [bc, admitC, cc, promoteC, demoteB, removeB, readmitB, bc2], [a, b, c]);
+    expect(s.participants.has(b.agentId)).toBe(true);
+    // The declared grant was SPENT by the demotion — B returns as a plain holder, and only an
+    // explicit promote_admin (with its signature requirements) can re-arm them.
+    expect(s.admins.has(b.agentId)).toBe(false);
+    expect([...s.admins].sort()).toEqual([a.agentId, c.agentId].sort());
+    expect(s.voids).toEqual([]);
+  });
+
+  it("a refusal does NOT spend the grant — a re-invited declared admin who never held power gains it on consent", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a, b]);
+    const refuse = entry({ kind: "refuse_join", subject_agent_id: b.agentId }, [b]);
+    const reinvite = entry(
+      { subject_agent_id: b.agentId, epoch_id: 2, parents: [hashHex(refuse)] },
+      [a],
+    );
+    const bc = consentEntry(b, { author_seq: 2, epoch_id: 3, parents: [hashHex(reinvite)] });
+    const s = deriveOk(g, [refuse, reinvite, bc], [a, b]);
+    expect(s.admins.has(b.agentId)).toBe(true);
+  });
+});
+
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
-  it("genesis alone derives the bilateral arrangement with the genesis admin set", () => {
+  it("genesis alone: the proposer participates (their signature IS consent); the peer is invited", () => {
     const [a, b] = [makeSigner(), makeSigner()];
     const s = deriveOk(genesis(a, b), [], [a, b]);
-    expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
+    expect([...s.participants]).toEqual([a.agentId]);
+    expect([...s.invited]).toEqual([b.agentId]);
     expect([...s.admins]).toEqual([a.agentId]);
     expect(s.properties["topology"]).toBe("mesh");
     expect(s.interimMaxEpoch).toBe(0);
@@ -664,6 +931,7 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
     const env = entry({ subject_agent_id: c.agentId, author_agent_id: rogue.agentId }, [rogue]);
     const s = deriveOk(g, [env], [a, b, c, rogue]);
     expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.invited.has(c.agentId)).toBe(false);
     expect(s.voids[0]!.reason).toMatch(/governance_not_admin/);
   });
 
@@ -696,7 +964,7 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
       [a],
     );
     const s = deriveOk(genesis(a, b), [env], [a, b, c]);
-    expect(s.participants.has(c.agentId)).toBe(false);
+    expect(s.invited.has(c.agentId)).toBe(false);
     expect(s.voids[0]!.reason).toMatch(/amendment_state_hash_tier/);
   });
 });
@@ -740,21 +1008,23 @@ describe("deriveDocumentState — authoring seeds", () => {
   it("exposes frontier, per-author seqs, and the interim carrier fields", () => {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
     const g = genesis(a, b, [a, b]);
-    const e1 = entry({ subject_agent_id: c.agentId }, [a]);
+    const bc = consentEntry(b);
+    const e1 = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
     const e2 = entry(
       {
         kind: "change_property",
         subject_agent_id: null,
         property_change: { key: "append_only", value: true },
+        author_seq: 2,
         epoch_id: 2,
         parents: [hashHex(e1)],
       },
       [b],
     );
-    const s = deriveOk(g, [e1, e2], [a, b, c]);
+    const s = deriveOk(g, [bc, e1, e2], [a, b, c]);
     expect(s.frontier).toEqual([hashHex(e2)]);
     expect(s.authorSeqs.get(a.agentId)).toBe(1);
-    expect(s.authorSeqs.get(b.agentId)).toBe(1);
+    expect(s.authorSeqs.get(b.agentId)).toBe(2);
     expect(s.interimMaxEpoch).toBe(2);
   });
 });

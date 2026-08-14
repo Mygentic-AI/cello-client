@@ -59,6 +59,12 @@ export const AMENDMENT_KINDS = [
   "promote_admin",
   "remove_admin",
   "change_property",
+  // SYNC-P2 (R21/R24): the subject's own acts. A `consent` answers an admission and names what
+  // it agrees to in the signed property slots ({ key: "consents_to", value: "<tier>/<version>" });
+  // a `refuse_join` ends the invitation. Both are authored, subject-ed, and signed by the same
+  // party — nobody consents for you.
+  "consent",
+  "refuse_join",
 ] as const;
 export type AmendmentKind = (typeof AMENDMENT_KINDS)[number];
 
@@ -337,6 +343,8 @@ export interface ArrangementGenesis {
 export interface Arrangement {
   epoch: number;
   participants: ReadonlySet<string>;
+  /** SYNC-P2: admitted-not-yet-answered (R22). Optional while the interim join surface lives. */
+  invited?: ReadonlySet<string>;
   admins: ReadonlySet<string>;
   /** The DERIVED view — genesis properties + applied change_property amendments. */
   properties: Record<string, string | number | boolean | undefined>;

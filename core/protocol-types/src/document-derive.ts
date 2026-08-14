@@ -30,9 +30,12 @@ import {
   type SignerPolicy,
 } from "./document-amendment.js";
 import { collectionStatus } from "./document-multisig.js";
+import { DOCUMENT_FEATURE_VERSION } from "./document-proposal.js";
 
 export interface DocumentStateView {
   participants: ReadonlySet<string>;
+  /** Admitted, not yet answered (R22) — a seat at the table, not a voice. Counts toward the cap. */
+  invited: ReadonlySet<string>;
   admins: ReadonlySet<string>;
   properties: Record<string, string | number | boolean | undefined>;
   /** The total order actually folded (applied AND void entries — F4 keeps voids in history). */
@@ -113,7 +116,14 @@ export function checkEntryAdmissible(
 
 interface FoldState {
   participants: Set<string>;
+  invited: Set<string>;
   admins: Set<string>;
+  /**
+   * Declared genesis admins whose grant a removal has SPENT (P2 review F6): once demoted or
+   * removed, a declared admin re-admitted later arrives as a plain holder — only an explicit
+   * promote_admin, with its signature requirements, re-arms them. A refusal spends nothing.
+   */
+  spentDeclaredAdmins: Set<string>;
   properties: Record<string, string | number | boolean | undefined>;
 }
 
@@ -127,10 +137,16 @@ export function deriveDocumentState(
   policy: SignerPolicy,
   verify: VerifyFn,
 ): DeriveDocumentStateResult {
-  // ── Genesis — document-level refusals, exactly the linear replay's ─────────────────────────
-  const genesisParticipants = new Set([genesis.proposerAgentId, genesis.peerAgentId]);
-  const genesisAdmins = new Set(genesis.adminSet);
-  if (genesisAdmins.size === 0) {
+  // ── Genesis — document-level refusals ───────────────────────────────────────────────────────
+  // R21/R22: the proposer's signature on the proposal IS their consent; the peer is INVITED
+  // until their own consent entry applies. Declared admin power activates with participation —
+  // a declared-admin peer is briefly powerless, which self-resolves at their consent.
+  const genesisParticipants = new Set([genesis.proposerAgentId]);
+  const genesisInvited = new Set(
+    genesis.peerAgentId === genesis.proposerAgentId ? [] : [genesis.peerAgentId],
+  );
+  const declaredGenesisAdmins = new Set(genesis.adminSet);
+  if (declaredGenesisAdmins.size === 0) {
     return {
       ok: false,
       reason:
@@ -138,16 +154,19 @@ export function deriveDocumentState(
         "creation flow must name at least one",
     };
   }
-  for (const admin of genesisAdmins) {
-    if (!genesisParticipants.has(admin)) {
+  for (const admin of declaredGenesisAdmins) {
+    if (admin !== genesis.proposerAgentId && admin !== genesis.peerAgentId) {
       return {
         ok: false,
         reason:
-          `arrangement_admin_not_participant: ${admin} holds admin power but is not a holder — ` +
-          `admins are always holders`,
+          `arrangement_admin_not_participant: ${admin} holds admin power but is not a genesis ` +
+          `party — admins are always holders`,
       };
     }
   }
+  const genesisAdmins = new Set(
+    [...declaredGenesisAdmins].filter((id) => genesisParticipants.has(id)),
+  );
 
   // ── Index by hash (exact duplicates collapse — idempotence is free) ─────────────────────────
   const byHash = new Map<string, DocumentAmendmentEnvelope>();
@@ -295,10 +314,57 @@ export function deriveDocumentState(
         if (state.participants.has(subject)) {
           return `amendment_subject_already_holder: ${subject} already holds this document`;
         }
-        if (state.participants.size + 1 > MAX_DOCUMENT_HOLDERS) {
+        if (state.invited.has(subject)) {
+          return `amendment_subject_already_invited: ${subject} already holds an open invitation`;
+        }
+        // Invited seats ARE seats — counting only consented holders would let over-inviting
+        // smuggle a 21st past the door.
+        const admitted = state.participants.size + state.invited.size;
+        if (admitted + 1 > MAX_DOCUMENT_HOLDERS) {
           return (
-            `amendment_holder_cap: admitting ${subject} would make ` +
-            `${state.participants.size + 1} holders and the cap is ${MAX_DOCUMENT_HOLDERS} (D5)`
+            `amendment_holder_cap: admitting ${subject} would make ${admitted + 1} admitted ` +
+            `seats and the cap is ${MAX_DOCUMENT_HOLDERS} (D5)`
+          );
+        }
+        break;
+      }
+      case "consent": {
+        if (subject === null) return `amendment_subject_required: consent names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a consent is the subject's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        if (!state.invited.has(subject)) {
+          return (
+            `amendment_subject_not_invited: ${subject} has no open invitation to answer at this ` +
+            `position`
+          );
+        }
+        const expected = `${String(state.properties["assurance_tier"])}/${DOCUMENT_FEATURE_VERSION}`;
+        const claimed_to =
+          body.property_change?.key === "consents_to" ? String(body.property_change.value) : null;
+        if (claimed_to !== expected) {
+          return (
+            `entry_consents_to_mismatch: the consent claims "${claimed_to ?? "nothing"}" and ` +
+            `this document is "${expected}" — what was agreed to must be what stands (R22)`
+          );
+        }
+        break;
+      }
+      case "refuse_join": {
+        if (subject === null) return `amendment_subject_required: refuse_join names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a refusal is the subject's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        if (!state.invited.has(subject)) {
+          return (
+            `amendment_subject_not_invited: ${subject} has no open invitation to refuse at this ` +
+            `position`
           );
         }
         break;
@@ -360,16 +426,35 @@ export function deriveDocumentState(
     const body = env.body;
     switch (body.kind) {
       case "add_holder":
+        state.invited.add(body.subject_agent_id!);
+        break;
+      case "consent":
+        state.invited.delete(body.subject_agent_id!);
         state.participants.add(body.subject_agent_id!);
+        // A declared genesis admin's power arrives WITH their participation (R21) — unless a
+        // removal already spent the grant (F6): the re-admitted return as plain holders.
+        if (
+          declaredGenesisAdmins.has(body.subject_agent_id!) &&
+          !state.spentDeclaredAdmins.has(body.subject_agent_id!)
+        ) {
+          state.admins.add(body.subject_agent_id!);
+        }
+        break;
+      case "refuse_join":
+        state.invited.delete(body.subject_agent_id!);
         break;
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
+        if (state.admins.has(body.subject_agent_id!)) {
+          state.spentDeclaredAdmins.add(body.subject_agent_id!);
+        }
         state.admins.delete(body.subject_agent_id!);
         break;
       case "promote_admin":
         state.admins.add(body.subject_agent_id!);
         break;
       case "remove_admin":
+        state.spentDeclaredAdmins.add(body.subject_agent_id!);
         state.admins.delete(body.subject_agent_id!);
         break;
       case "change_property":
@@ -442,7 +527,9 @@ export function deriveDocumentState(
   } {
     const state: FoldState = {
       participants: new Set(genesisParticipants),
+      invited: new Set(genesisInvited),
       admins: new Set(genesisAdmins),
+      spentDeclaredAdmins: new Set(),
       properties: { ...genesis.properties },
     };
     const order = linearize(subset);
@@ -524,6 +611,7 @@ export function deriveDocumentState(
     ok: true,
     state: {
       participants: state.participants,
+      invited: state.invited,
       admins: state.admins,
       properties: state.properties,
       order,

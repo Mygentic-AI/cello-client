@@ -66,6 +66,20 @@ export function documentGovernancePolicy(
     };
   }
 
+  // SYNC-P2 — the subject's own acts: consent answers an admission, refuse_join declines one.
+  // The claim is EXACTLY the subject; no admin can consent on anyone's behalf (R22).
+  if (kind === "consent" || kind === "refuse_join") {
+    if (subjectAgentId !== null && claimed.length === 1 && claimed[0] === subjectAgentId) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      reason:
+        `governance_consent_self: ${kind} is the subject's own act — the claim must be exactly ` +
+        `[${subjectAgentId ?? "the subject"}] and the collection claims [${claimed.join(", ")}]`,
+    };
+  }
+
   if (kind === "remove_admin") {
     // The fold already refused a non-admin subject and the last-admin case.
     if (state.admins.size === 2) {

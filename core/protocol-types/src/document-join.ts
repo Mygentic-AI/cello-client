@@ -318,6 +318,7 @@ export function validateDocumentJoinOffer(
     arrangement: {
       epoch: derived.state.interimMaxEpoch,
       participants: derived.state.participants,
+      invited: derived.state.invited,
       admins: derived.state.admins,
       properties: derived.state.properties,
       lastAmendmentHash: derived.state.interimLastHash,

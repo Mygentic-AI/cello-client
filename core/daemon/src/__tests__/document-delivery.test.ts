@@ -154,6 +154,34 @@ describe("DOD-MP-REMOVE-1 — the worker STOPS DELIVERING to a removed peer", ()
   });
 });
 
+describe("P2 review F1 — the sweep never destroys an INVITED seat's owed content", () => {
+  it("a peer absent from the holder set but NOT removed keeps its debt — no retire, no peer_removed lie", async () => {
+    // The invited window: the peer accepted, their consent entry is in flight, and a sweep tick
+    // fires. The old rule retired every owed row for any holder outside the current set and
+    // logged document.delivery.peer_removed for a peer who was never removed — silent data loss
+    // on sweep timing, in the DEFAULT bilateral flow.
+    const wire = { online: false };
+    const f = newFixture({
+      isPeerReachable: async () => ({ reachable: wire.online, unknownAgent: false }),
+    });
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+    // The debt was SEEDED while the peer counted; then the derivation stops showing them —
+    // consent in flight, or a transient derivation gap. Nothing was removed: the chain is empty.
+    f.store.seedDeliveries(AGENT, DOC, e.envelopeHash, [PEER], NOW);
+    await f.delivery.tick(AGENT, () => [AGENT], NOW);
+    // NO RETIRE, NO REMOVAL LIE: absence from the set defers; only a removal in the recorded
+    // chain retires.
+    expect(f.events.some((ev) => ev.event === "document.delivery.peer_removed")).toBe(false);
+    expect(f.store.holderHasPending(AGENT, DOC, PEER)).toBe(true);
+    // Once the seat is back in the set and reachable, the debt is live again — nothing was
+    // destroyed.
+    wire.online = true;
+    const after = await f.delivery.tick(AGENT, f.holdersFor, NOW + DELIVERY_BACKOFF_CAP_MS + 1);
+    expect(after.delivered + after.sent).toBeGreaterThan(0);
+  });
+});
+
 describe("DOD-MP-FANOUT-1 — one unreachable holder never blocks the others", () => {
   it("delivers to the reachable holder in the SAME pass the unreachable one defers", async () => {
     const H2 = "ee".repeat(32);

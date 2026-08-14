@@ -550,6 +550,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           ...(derived.ok
             ? {
                 participants: [...derived.arrangement.participants].sort(),
+                invited: [...(derived.arrangement.invited ?? [])].sort(),
                 admins: [...derived.arrangement.admins].sort(),
                 properties: derived.arrangement.properties,
                 assuranceTier: derived.genesis.properties.assurance_tier,
@@ -608,6 +609,45 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
 
+    // THE CURE FOR A HALF-CONSENTED DOCUMENT (P2 review F2): if this agent already holds the
+    // document but its own derivation says it is still an INVITED seat, the earlier accept
+    // recorded the decision and then failed to record the consent entry — and both decision rows
+    // are settled, so neither branch below can run again. Re-running accept authors the missing
+    // consent, which is exactly what the failure guidance promises.
+    if (layer.store.getDocument(who.ownerAgentId, documentId)) {
+      const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+      if (genesisRecord) {
+        const standing = deriveDocumentState(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          layer.amendments.chain(who.ownerAgentId, documentId),
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (standing.ok && standing.state.invited.has(who.ownerAgentId)) {
+          const consent = await authorConsent(who, documentId);
+          if (!consent.ok) {
+            return {
+              ok: false,
+              reason: "document_consent_unrecorded",
+              guidance:
+                `You hold this document but your consent entry is still unrecorded ` +
+                `(${consent.reason}) — run cello_doc_accept again once the named condition ` +
+                `clears.`,
+            };
+          }
+          return {
+            ok: true,
+            documentId,
+            consentEntry: consent.entryHash,
+            consentDelivered: consent.holdersNotified,
+            guidance:
+              "Your earlier accept had recorded the decision but not your consent entry — it is " +
+              "now recorded and on its way to the other holders.",
+          };
+        }
+      }
+    }
+
     // A join offer decided with the SAME verb the inbox advertises. Routed first by exact
     // pending match, so a proposal and a join for different documents can never shadow each
     // other; an id that matches neither falls through to the proposal path's own refusal.
@@ -617,6 +657,18 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (pendingJoin) {
       const joined = await layer.acceptJoin(who.ownerAgentId, pendingJoin.amendmentHash, deps.now());
       if (!joined.ok) return { ok: false, reason: joined.reason, guidance: joined.detail };
+      // R21: accepting IS authoring your consent entry — until it reaches the other holders,
+      // their fold shows this agent invited, not participating.
+      const consent = await authorConsent(who, documentId);
+      if (!consent.ok) {
+        return {
+          ok: false,
+          reason: "document_consent_unrecorded",
+          guidance:
+            `The join was applied but your consent entry could not be recorded ` +
+            `(${consent.reason}) — run cello_doc_accept again; the offer is idempotent.`,
+        };
+      }
       const joinFile = await materialize(who.ownerAgentId, documentId, joined.documentType);
       const told = await tellInviter(who, documentId, joined.inviterAgentId, joined.answerBytes);
       return {
@@ -625,6 +677,8 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         joined: true,
         peerAgentId: joined.inviterAgentId,
         inviterNotified: told,
+        consentEntry: consent.entryHash,
+        consentDelivered: consent.holdersNotified,
         appliedEnvelopes: joined.applied,
         filePath: joinFile.path,
         ...(joinFile.path !== null && openingNoticeFor(joined.documentType) !== undefined
@@ -667,6 +721,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), outcome.envelope.starting_content);
     }
     const acceptFile = await materialize(who.ownerAgentId, documentId, outcome.envelope.document_type);
+    // R21: the accept IS this agent's consent entry — the proposer's fold shows this agent
+    // invited until the entry reaches them over the amendment carrier.
+    const consent = await authorConsent(who, documentId);
+    if (!consent.ok) {
+      logger.warn("document.consent.unrecorded", {
+        documentId,
+        reason: consent.reason,
+      });
+    }
     // NOT re-logged here. `DocumentHandshake` already emits `document.proposal.accepted` for this
     // exact fact, and two events for one act make every count of "how many were accepted" wrong
     // depending on which name the query used.
@@ -676,6 +739,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       peerAgentId: outcome.envelope.proposer_agent_id,
       proposerNotified: told,
+      ...(consent.ok
+        ? { consentEntry: consent.entryHash, consentDelivered: consent.holdersNotified }
+        : { consentUnrecorded: consent.reason }),
       filePath: acceptFile.path,
       // Matters MORE here than on propose: the type came from the PROPOSER's envelope, so the
       // accepter is being handed an executable file they did not choose the format of.
@@ -768,6 +834,88 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   };
 
   /**
+   * SYNC-P2 (R21/R22) — author THIS agent's consent entry for a document they were named into,
+   * append it locally, and fan it to the derived participants over the amendment carrier. Both
+   * accept branches (a bilateral proposal, a join offer) call this: consenting IS authoring your
+   * first entry, and until it reaches the others their fold shows you invited, not participating.
+   */
+  const authorConsent = async (who: {
+    agentName: string;
+    ownerAgentId: string;
+  }, documentId: string): Promise<
+    | { ok: true; entryHash: string; holdersNotified: Record<string, boolean> }
+    | { ok: false; reason: string }
+  > => {
+    const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+    if (!genesisRecord) return { ok: false, reason: "document_genesis_missing" };
+    const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
+    const chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
+    if (!derived.ok) return { ok: false, reason: derived.reason };
+    const body: DocumentAmendmentBody = {
+      document_id: documentId,
+      epoch_id: derived.state.interimMaxEpoch + 1,
+      prev_amendment_hash: derived.state.interimLastHash,
+      kind: "consent",
+      subject_agent_id: who.ownerAgentId,
+      property_change: {
+        key: "consents_to",
+        value: `${String(derived.state.properties["assurance_tier"])}/${DOCUMENT_FEATURE_VERSION}`,
+      },
+      state_hash: null,
+      authored_at_ms: deps.now(),
+      author_agent_id: who.ownerAgentId,
+      author_seq:
+        (layer.amendments.watermarks(who.ownerAgentId, documentId).get(who.ownerAgentId)?.seq ??
+          0) + 1,
+      parents: [...derived.state.frontier],
+    };
+    const entryHash = documentAmendmentHash(body);
+    const multisigTbs = buildDocumentMultisigTbs({
+      document_id: documentId,
+      subject_kind: "document_amendment",
+      subject_hash: entryHash,
+      required_signers: [who.ownerAgentId],
+    });
+    const consent: DocumentAmendmentEnvelope = {
+      body,
+      collection: {
+        document_id: documentId,
+        subject_kind: "document_amendment",
+        subject_hash: entryHash,
+        required_signers: [who.ownerAgentId],
+        signatures: [
+          { signer_agent_id: who.ownerAgentId, signature: await deps.sign(who.agentName, multisigTbs) },
+        ],
+      },
+    };
+    // The same author-your-own-void guard every local authoring site carries.
+    const withNew = deriveDocumentState(
+      genesisArr, [...chain, consent], documentGovernancePolicy, layer.verifySignature,
+    );
+    if (!withNew.ok) return { ok: false, reason: withNew.reason };
+    const entryHex = Buffer.from(entryHash).toString("hex");
+    const inert =
+      withNew.state.voids.find((v) => v.hash === entryHex) ??
+      withNew.state.excluded.find((e) => e.hash === entryHex);
+    if (inert) return { ok: false, reason: inert.reason };
+    const bytes = new Uint8Array(encodeDocumentAmendment(consent));
+    layer.amendments.append(who.ownerAgentId, documentId, bytes, deps.now());
+    const holdersNotified = await fanOutAmendment({
+      agentName: who.agentName,
+      ownerAgentId: who.ownerAgentId,
+      documentId,
+      amendmentHashHex: entryHex,
+      amendmentBytes: bytes,
+      holders: [...withNew.state.participants, ...withNew.state.invited].filter(
+        (p) => p !== who.ownerAgentId,
+      ),
+      verb: "consent",
+    });
+    return { ok: true, entryHash: entryHex, holdersNotified };
+  };
+
+  /**
    * M14B / DOD-MP-JOIN-1 — invite a third party into an existing document.
    *
    * One admin's signature authors the admitting amendment (D2); the invitee's own consent makes
@@ -828,7 +976,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `Current admins: ${[...derived.state.admins].join(", ")}.`,
       };
     }
-    if (derived.state.participants.has(invitee)) {
+    if (derived.state.participants.has(invitee) || derived.state.invited.has(invitee)) {
       // A RE-RUN after the amendment landed but the offer did not reach them: re-send the STORED
       // offer bytes (the proposal --retry precedent) rather than refusing — authoring afresh
       // would try to admit a holder the chain already admitted, which the replay refuses.
@@ -870,7 +1018,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             documentId,
             amendmentHashHex: priorHash,
             amendmentBytes: new Uint8Array(admittingBytes),
-            holders: [...derived.state.participants].filter(
+            holders: [...derived.state.participants, ...derived.state.invited].filter(
               (holder) => holder !== who.ownerAgentId && holder !== invitee,
             ),
             verb: "re-invite",
@@ -1014,7 +1162,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     //
     // Seeding first also makes the crash window safe: a daemon that dies between here and the send
     // still owes the amendment on restart.
-    const owedHolders = [...derived.state.participants].filter(
+    const owedHolders = [...derived.state.participants, ...derived.state.invited].filter(
       (holder) => holder !== who.ownerAgentId && holder !== invitee,
     );
     const holdersTold = await fanOutAmendment({
@@ -1104,7 +1252,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         let resendTold: Record<string, boolean> = {};
         if (removal) {
           const bytes = new Uint8Array(encodeDocumentAmendment(removal));
-          const remaining = [...derived.state.participants].filter(
+          const remaining = [...derived.state.participants, ...derived.state.invited].filter(
             (m) => m !== who.ownerAgentId && m !== holder,
           );
           // The healing re-send is durable for the holders who REMAIN, for the same reason the
@@ -1223,7 +1371,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       documentId,
       amendmentHashHex: Buffer.from(amendHash).toString("hex"),
       amendmentBytes,
-      holders: [...withNew.state.participants].filter((m) => m !== who.ownerAgentId),
+      holders: [...withNew.state.participants, ...withNew.state.invited].filter(
+        (m) => m !== who.ownerAgentId,
+      ),
       verb: "remove",
     });
     // THE REMOVED HOLDER IS TOLD ONCE, and is deliberately NOT owed a durable retry: delivery to
@@ -1355,6 +1505,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         if (!derived.ok) return unavailable(derived.reason);
         return {
           participants: [...derived.state.participants].sort(),
+          invited: [...derived.state.invited].sort(),
           admins: [...derived.state.admins].sort(),
           properties: derived.state.properties,
           // WAS THE ADMIN SET DECLARED, OR DEFAULTED? A genesis from before the admin slot
