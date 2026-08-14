@@ -206,15 +206,30 @@ describe("governance policy — end to end through the causal fold", () => {
 
   it("one admin invites; the other admin's signature is NOT needed (D2: single-admin power)", () => {
     const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    // B consents first (R21) — their declared admin power arrives with their participation.
+    const bConsent = signed(
+      {
+        kind: "consent",
+        subject_agent_id: b.agentId,
+        property_change: { key: "consents_to", value: "authenticated/2" },
+      },
+      [b],
+    );
+    const bHash = Buffer.from(documentAmendmentHash(bConsent.body)).toString("hex");
+    const invite = signed(
+      { subject_agent_id: c.agentId, epoch_id: 2, parents: [bHash], author_seq: 2 },
+      [b],
+    );
     const r = deriveDocumentState(
       genesis(a, b, [a, b]),
-      [signed({ subject_agent_id: c.agentId }, [b])],
+      [bConsent, invite],
       documentGovernancePolicy,
       makeVerify([a, b, c]),
     );
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.state.participants.has(c.agentId)).toBe(true);
+    // An admission INVITES (R22) — participation additionally takes C's own consent.
+    expect(r.state.invited.has(c.agentId)).toBe(true);
     expect(r.state.voids).toEqual([]);
   });
 
@@ -267,9 +282,24 @@ describe("governance policy — end to end through the causal fold", () => {
 
   it("the two-admin deadlock holds end to end, with the recourse in the void", () => {
     const [a, b] = [makeSigner(), makeSigner()];
+    const bConsent = signed(
+      {
+        kind: "consent",
+        subject_agent_id: b.agentId,
+        property_change: { key: "consents_to", value: "authenticated/2" },
+      },
+      [b],
+    );
+    const bHash = Buffer.from(documentAmendmentHash(bConsent.body)).toString("hex");
     const r = deriveDocumentState(
       genesis(a, b, [a, b]),
-      [signed({ kind: "remove_admin", subject_agent_id: b.agentId }, [a])],
+      [
+        bConsent,
+        signed(
+          { kind: "remove_admin", subject_agent_id: b.agentId, epoch_id: 2, parents: [bHash] },
+          [a],
+        ),
+      ],
       documentGovernancePolicy,
       makeVerify([a, b]),
     );

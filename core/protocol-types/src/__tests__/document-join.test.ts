@@ -132,7 +132,17 @@ function makeOffer(over: Partial<DocumentJoinOffer> = {}): {
   const b = makeSigner();
   const c = makeSigner();
   const g = makeGenesis(a, b, [a, b]);
-  const pending = makeAddHolder(g.documentId, c, a);
+  // B's own consent (R21) — without it the genesis peer is invited-only and never derives as a
+  // participant on the joiner's side.
+  const bConsent = makeAddHolder(g.documentId, b, b, {
+    kind: "consent",
+    property_change: { key: "consents_to", value: "authenticated/2" },
+  });
+  const bConsentHash = Buffer.from(documentAmendmentHash(bConsent.body)).toString("hex");
+  const pending = makeAddHolder(g.documentId, c, a, {
+    epoch_id: 2,
+    parents: [bConsentHash],
+  });
   const offer: DocumentJoinOffer = {
     type: "document_join_offer",
     feature_version: DOCUMENT_FEATURE_VERSION,
@@ -140,7 +150,10 @@ function makeOffer(over: Partial<DocumentJoinOffer> = {}): {
     invitee_agent_id: c.agentId,
     document_id: g.documentId,
     genesis: g.bytes,
-    amendments: [new Uint8Array(encodeDocumentAmendment(pending))],
+    amendments: [
+      new Uint8Array(encodeDocumentAmendment(bConsent)),
+      new Uint8Array(encodeDocumentAmendment(pending)),
+    ],
     envelope_log: [],
     offered_at_ms: 1_700_000_000_002,
     signature: new Uint8Array(0),
@@ -208,8 +221,10 @@ describe("validateDocumentJoinOffer — the invitee derives, never trusts", () =
     const r = validateDocumentJoinOffer(offer, documentGovernancePolicy, makeVerify([a, b, c]));
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    expect(r.arrangement.participants.has(c.agentId)).toBe(true);
-    expect(r.arrangement.epoch).toBe(1);
+    // The admission INVITES C (R22) — participation additionally takes C's own consent.
+    expect(r.arrangement.invited?.has(c.agentId)).toBe(true);
+    expect([...r.arrangement.participants].sort()).toEqual([a.agentId, b.agentId].sort());
+    expect(r.arrangement.epoch).toBe(2);
     expect([...r.arrangement.admins].sort()).toEqual([a.agentId, b.agentId].sort());
   });
 
