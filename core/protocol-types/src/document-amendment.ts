@@ -91,9 +91,10 @@ export interface DocumentAmendmentBody {
   authored_at_ms: number;
   /**
    * SYNC-P1 — the causal fields. The accountable initiator (MUST appear in the collection's
-   * required set), their own-chain counter, and the entry hashes applied when authoring. For
-   * `author_seq > 1` the parents MUST include the author's previous entry. Signed: a forwarder
-   * cannot re-attribute, re-sequence, or re-parent without every signature failing (SYNC-R2).
+   * required set), their own-chain counter, and the frontier heads applied when authoring. For
+   * `author_seq > 1` the author's previous entry MUST be among the ancestors the parents reach —
+   * a direct parent is the common case, not the requirement. Signed: a forwarder cannot
+   * re-attribute, re-sequence, or re-parent without every signature failing (SYNC-R2).
    */
   author_agent_id: string;
   author_seq: number;

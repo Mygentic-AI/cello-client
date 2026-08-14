@@ -297,6 +297,9 @@ export type {
   SignerPolicy,
   DeriveResult,
 } from "./document-amendment.js";
+export { MAX_ENTRY_PARENTS } from "./document-amendment.js";
+export { deriveDocumentState } from "./document-derive.js";
+export type { DocumentStateView, DeriveDocumentStateResult } from "./document-derive.js";
 export {
   DOCUMENT_MULTISIG_DOMAIN,
   buildDocumentMultisigTbs,
