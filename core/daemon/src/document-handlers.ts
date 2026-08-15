@@ -1476,8 +1476,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // WHOSE OFFER WAS IT, and has the other side actually shown up?
         //
         // Without these three fields, `cello_doc_list` renders identically for a document the peer
-        // refused, one whose offer never reached them, and one being actively co-edited — the only
-        // moving part is `pendingUnsent`, which also moves for a peer who is merely offline. An
+        // refused, one whose offer never reached them, and one being actively co-edited. An
         // operator cannot tell "they said no" from "they are asleep", and those want opposite
         // actions.
         const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
@@ -1504,15 +1503,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             : (d as { removed?: boolean }).removed === true
               ? "removed"
               : "holder";
-        const removedAtEpoch = (d as { removedAtEpoch?: number }).removedAtEpoch;
         return {
           ...d,
           yourStanding: standing,
           ...(standing === "removed"
             ? {
                 standingGuidance:
-                  `You are no longer a holder of this document` +
-                  (removedAtEpoch === undefined ? `. ` : `, as of epoch ${removedAtEpoch}. `) +
+                  `You are no longer a holder of this document. ` +
                   `Your copy and its full history remain yours, and you can still read it here or ` +
                   `open the file. What changed is only the flow of edits: yours no longer publish ` +
                   `to the other holders, and theirs no longer reach you.`,
