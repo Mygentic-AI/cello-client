@@ -29,7 +29,6 @@ import { DocumentGate } from "./document-gate.js";
 import { screeningRule, SCREEN_RULE_ID } from "./document-screen.js";
 import { DocumentRejections } from "./document-rejection.js";
 import { DocumentInbound } from "./document-inbound.js";
-import { DocumentAckInbound } from "./document-ack-inbound.js";
 import { DocumentAmendmentStore } from "./document-amendment-store.js";
 import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
@@ -67,9 +66,6 @@ import {
   encodeDocumentReconcile,
   DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   type DocumentAmendmentEnvelope,
-  encodeDocumentAck,
-  buildDocumentAckTbs,
-  type DocumentAck,
 } from "@cello-protocol/protocol-types";
 import { LEAF_KIND_REJECT } from "./session-relay-client.js";
 import {
@@ -203,24 +199,6 @@ export interface DocumentLayer {
     senderPubkey: string,
     correlationId?: string,
   ): { consumed: boolean; kind?: string; ok?: boolean; reason?: string };
-  /**
-   * Resolve when this envelope is SETTLED by the peer, or false when `timeoutMs` elapses first.
-   *
-   * The delivery transport holds a session it opened open until this resolves. See the comment on
-   * `DocumentTransportDeps.awaitAck`: the seal tears the session down and the teardown drops
-   * content still held for ordering, so sealing before the answer arrives can delete an ack that
-   * was correctly sent and correctly received.
-   *
-   * Resolves IMMEDIATELY if the envelope is already settled — the ack can win the race with the
-   * caller, and a waiter that only listened for future events would then wait out the full grace
-   * period on every fast peer.
-   */
-  awaitAck(
-    ownerAgentId: string,
-    envelopeHash: string,
-    expectedAckerAgentId: string,
-    timeoutMs: number,
-  ): Promise<{ admitted: boolean } | null>;
 }
 
 /**
@@ -347,71 +325,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
     sign: deps.sign,
   });
-
-  // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
-  // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
-  // session held open for the full grace period with the answer already in hand.
-  // KEYED BY ACKER TOO (FANOUT-1 review H1): an envelope-keyed waiter let ANY holder's ack —
-  // including a redelivered one from an already-settled holder — resolve the grace wait for
-  // whichever holder was being dialed, and the worker then settled the DIALED holder's row for
-  // content that never reached them. §7-1's silent divergence, through the sender's own
-  // bookkeeping.
-  const ackWaiters = new Map<string, Set<(admitted: boolean) => void>>();
-  const waiterKey = (ownerAgentId: string, envelopeHash: string, ackerAgentId: string) =>
-    `${ownerAgentId}\u0000${envelopeHash}\u0000${ackerAgentId}`;
-
-  const ackInbound = new DocumentAckInbound({
-    store,
-    rejections,
-    logger,
-    verifySignature,
-    currentHolders: (o: string, d: string) => holdersFor(o, d),
-    onSettled: (ownerAgentId, envelopeHash, ackerAgentId, admitted) => {
-      const key = waiterKey(ownerAgentId, envelopeHash, ackerAgentId);
-      const waiting = ackWaiters.get(key);
-      if (!waiting) return;
-      ackWaiters.delete(key);
-      // The OUTCOME, not just the fact of one. A caller told only "answered" has to report the
-      // envelope as still in flight, which is how `document.delivery.sweep { delivered: N }` came
-      // to be permanently 0 — a sweep that delivered nothing looked identical to a healthy one.
-      for (const wake of waiting) wake(admitted);
-    },
-  });
-
-  const awaitAck = async (
-    ownerAgentId: string,
-    envelopeHash: string,
-    expectedAckerAgentId: string,
-    timeoutMs: number,
-  ) => {
-    // ALREADY SETTLED WINS — by THE HOLDER BEING DIALED (H1): the per-acker read first, the
-    // envelope-level read only for the zero-row bilateral legacy.
-    const already =
-      store.holderSettlement(ownerAgentId, envelopeHash, expectedAckerAgentId) ??
-      store.envelopeSettlement(ownerAgentId, envelopeHash);
-    if (already) return already;
-
-    const key = waiterKey(ownerAgentId, envelopeHash, expectedAckerAgentId);
-    return new Promise<{ admitted: boolean } | null>((resolve) => {
-      let timer: ReturnType<typeof setTimeout>;
-      const wake = (admitted: boolean) => {
-        clearTimeout(timer);
-        resolve({ admitted });
-      };
-      const set = ackWaiters.get(key) ?? new Set<(admitted: boolean) => void>();
-      set.add(wake);
-      ackWaiters.set(key, set);
-      timer = setTimeout(() => {
-        // DEREGISTER on the way out. A waiter left in the map for an envelope that is never acked
-        // is a leak the length of the daemon's life, and `unref` is deliberately NOT used: the
-        // grace period must be able to hold the process just as the seal it precedes does.
-        const current = ackWaiters.get(key);
-        current?.delete(wake);
-        if (current && current.size === 0) ackWaiters.delete(key);
-        resolve(null);
-      }, timeoutMs);
-    });
-  };
 
   // The handshake verifies a proposal against its NAMED proposer — the same resolver, so a forged
   // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
@@ -985,7 +898,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
 
   const router = new DocumentFrameRouter({
     inbound,
-    ackInbound,
     handleReconcile,
     logger,
     ownerKeyFor: deps.ownerKeyFor,
@@ -1044,35 +956,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           documentId: env.document_id,
           peerAgentId: env.sender_agent_id,
           reason: sent.reason,
-        });
-      }
-    },
-    sendAck: async (ownerAgentId, wire, outcome) => {
-      const env = decodeDocumentUpdateEnvelope(wire);
-      const ack: DocumentAck = {
-        type: "document_ack",
-        // The wire version this build speaks. Inlined rather than imported because protocol-types
-        // exports the domain and the codec but not the constant; the decoder pins it by value.
-        ack_version: 1,
-        document_id: env.document_id,
-        envelope_hash: outcome.envelopeHash,
-        acker_agent_id: ownerAgentId,
-        admitted: outcome.admitted,
-        ...(outcome.admitted ? {} : { rejection_reason: outcome.rejectionReason ?? "refused" }),
-        acked_at_ms: Date.now(),
-        signature: new Uint8Array(0),
-      };
-      ack.signature = await deps.sign(ownerAgentId, buildDocumentAckTbs(ack));
-      // BEST-EFFORT, and it must be: an ack that could not be sent is not a reason to refuse
-      // content we have already admitted. The sender redelivers on its own timer, and the
-      // redelivery is acked too — which is the case this whole path exists to terminate.
-      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, encodeDocumentAck(ack));
-      if (!sent.ok) {
-        logger.warn("document.ack.unsent", {
-          documentId: env.document_id,
-          envelopeHash: outcome.envelopeHash,
-          reason: sent.reason,
-          correlationId: outcome.correlationId,
         });
       }
     },
@@ -1157,7 +1040,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     notifications,
     rejections,
     router,
-    awaitAck,
     onDocumentFrame: (agentName, _sessionId, content, senderPubkey, correlationId) =>
       // `agentName` names the owning agent for the session; the router maps it to the owner KEY
       // that scopes the store. The session id and the sender's transport pubkey are unused: a

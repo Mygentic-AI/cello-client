@@ -63,6 +63,12 @@ export interface DocumentPublishDeps {
    * envelope-first rule exists to prevent, arriving through the other door).
    */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
+  /**
+   * SYNC-P4 (R39's first trigger): a publish NUDGES every other seat by initiating a reconcile
+   * exchange with them — fire-and-forget, no ledger, no schedule. A nudge that does not land
+   * strands nothing: the difference it would have closed is recomputed at any later exchange.
+   */
+  nudgeSeats(ownerAgentId: string, documentId: string, seats: readonly string[]): void;
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -188,10 +194,7 @@ export class DocumentPublish {
     envelope.signature = await this.#d.sign(ownerAgentId, buildDocumentUpdateTbs(envelope));
     const envelopeHash = documentEnvelopeHash(envelope);
 
-    // ONE TRANSACTION (review M5): a crash between the append and the seed left an envelope
-    // in the log with zero delivery rows, and the bilateral backfill would re-seed only the
-    // genesis peer — every other holder silently never receiving it, forever.
-    const appended = this.#d.store.appendEnvelopeWithDeliveries(ownerAgentId, {
+    const appended = this.#d.store.appendEnvelope(ownerAgentId, {
       envelopeHash,
       documentId,
       senderAgentId: senderId,
@@ -207,7 +210,7 @@ export class DocumentPublish {
       // inbound path stores for their envelopes.
       senderClientId: doc.clientID,
       createdAtMs: nowMs,
-    }, holders.filter((h) => h !== senderId), nowMs);
+    });
     if (!appended) {
       // The same content published twice hashes the same, so this is a genuine no-op rather than a
       // fault — but it is reported, because a caller that believes it published something new and
@@ -225,8 +228,10 @@ export class DocumentPublish {
       bytes: update.length,
       senderClientId: doc.clientID,
     });
-    // Fire and forget: the delivery worker derives pending FROM THE LOG, so writing the envelope is
-    // the whole of publishing. Nothing here waits for a peer.
+    // Fire and forget: the NUDGE (an initiated reconcile per seat) is how the envelope travels
+    // now — there is no delivery ledger and no worker. Nothing here waits for a peer, and a nudge
+    // that does not land is repaired by any later exchange.
+    this.#d.nudgeSeats(ownerAgentId, documentId, holders.filter((h) => h !== senderId));
     return { ok: true, envelopeHash, bytes: update.length };
   }
 }

@@ -28,8 +28,7 @@ import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cell
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import { DocumentPublish } from "../document-publish.js";
-import { DocumentDelivery } from "../document-delivery.js";
-import type { DocumentDeliveryTransport } from "../document-delivery.js";
+import type { DocumentDeliveryTransport } from "../document-delivery-transport.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
 
@@ -85,14 +84,6 @@ async function makeParty(agentName: string) {
       wire.deliverToPeer(input.bytes);
       return { ok: true as const, sessionId: "session-1", sessionOpened: true };
     },
-    deliver: async (input: { envelope: { payload: Uint8Array | null } }) => {
-      if (!wire.online || !wire.deliverToPeer) return { ok: false as const, reason: "peer_offline" };
-      // The worker hands the transport a LOG ROW; production re-encodes it into the wire envelope.
-      // Reproduced here rather than shortcut, because encoding is where the two halves can disagree
-      // about a field and the peer refuses something we believe we sent correctly.
-      wire.deliverToPeer(encodeFromRow(input.envelope));
-      return { ok: true as const, sessionId: "session-1", sessionOpened: false, admitted: null };
-    },
   } as unknown as DocumentDeliveryTransport;
 
   const publish = new DocumentPublish({
@@ -104,6 +95,7 @@ async function makeParty(agentName: string) {
     sign: async (_o, tbs) => keys.sign(tbs),
     senderIdFor: (o) => o,
     canPublish: (o, d) => layer.lifecycle.canPublish(o, d),
+    nudgeSeats: () => {},
   });
 
   const handlers = new Map<string, IpcHandler>();
@@ -119,14 +111,11 @@ async function makeParty(agentName: string) {
     now: () => NOW,
   });
 
-  const worker = new DocumentDelivery(layer.store, transport, logger);
-
   return {
     agentName,
     owner,
     layer,
     wire,
-    worker,
     /** DOD-DOC-WATCH-1 — the doorbells this party was rung with, in order. */
     nudges,
     // Exposed so a test can author an update the way a HOSTILE PEER would — below the operator
@@ -138,17 +127,23 @@ async function makeParty(agentName: string) {
       handlers.get(verb)!(params, "conn") as Promise<Record<string, unknown>>,
     /** The production entry point: whatever arrives on the session content path. */
     receive: (bytes: Uint8Array) => layer.onDocumentFrame(agentName, "session-1", bytes, "pk", "wire"),
-    /** Run one delivery pass, the way the daemon's sweep does. */
-    sweep: () =>
-      worker.tick(
-        owner,
-        (documentId) => {
-          const doc = layer.store.getDocument(owner, documentId);
-          return doc ? [doc.peerAgentId] : null;
-        },
-        NOW,
-        { senderAgentId: owner },
-      ),
+    /**
+     * Carry this party's own envelopes to the peer, the way the exchange does (SYNC-P4: the
+     * delivery worker is deleted; production nudges an initiated reconcile — here the fixture
+     * re-encodes the log rows and puts them on the same one-hop wire).
+     */
+    sweep: async () => {
+      let carried = 0;
+      for (const doc of layer.store.listDocuments(owner)) {
+        for (const row of layer.store.getEnvelopeLog(owner, doc.documentId)) {
+          if (row.senderAgentId !== owner || row.kind !== "update" || row.payload === null) continue;
+          if (!wire.online || !wire.deliverToPeer) continue;
+          wire.deliverToPeer(encodeFromRow(row));
+          carried += 1;
+        }
+      }
+      return { carried };
+    },
     text: (documentId: string) => layer.live.get(owner, documentId).getText("content").toString(),
     /** The map root as JSON — a `text` read is empty for a JSON document, whose content is the map. */
     json: (documentId: string) => layer.live.get(owner, documentId).getMap("data").toJSON() as Record<string, unknown>,
@@ -220,7 +215,7 @@ describe("two parties converge through the operator surface", () => {
     // `sent`, not `delivered`: the envelope LEFT and no ack has come back yet. `delivered` would be
     // the peer's daemon confirming admission, which is a separate frame — counting a send as an ack
     // is exactly the lie the transport's `admitted: null` exists to refuse.
-    expect(swept).toMatchObject({ attempted: 1, sent: 1, failed: 0 });
+    expect(swept).toMatchObject({ carried: 1 });
     await vi.waitFor(() => expect(b.text(documentId)).toBe("# Plan\n- ship it\n"));
 
     // 5. And it goes the other way, which is the property that makes it a shared document rather
@@ -364,26 +359,15 @@ describe("two parties converge through the operator surface", () => {
     a.wire.online = false;
     expect(await a.call("cello_doc_write", { document_id: documentId, content: "written while away" }))
       .toMatchObject({ ok: true, published: true });
-    // The sweep tries and gets nowhere. The change is NOT lost — pending is derived from the log,
-    // which is what makes it survivable.
+    // The carry gets nowhere while the wire is down. The change is NOT lost — the LOG is what
+    // survives (D1: no ledger, no schedule; any later exchange recomputes the difference).
     await a.sweep();
     expect(b.text(documentId)).toBe("");
-    // Still pending, and deliberately checked PAST the backoff window: a failed attempt schedules
-    // the next one, so asking at the same instant would report nothing pending for a reason that has
-    // nothing to do with whether the change survived.
-    expect(a.layer.store.pendingDeliveries(a.owner, NOW + 3_600_000, a.owner)).toHaveLength(1);
+    expect(a.layer.store.getEnvelopeLog(a.owner, documentId)).toHaveLength(1);
 
     a.wire.online = true;
     b.wire.online = true;
-    await a.worker.tick(
-      a.owner,
-      (documentId2) => {
-        const doc = a.layer.store.getDocument(a.owner, documentId2);
-        return doc ? [doc.peerAgentId] : null;
-      },
-      NOW + 3_600_000,
-      { senderAgentId: a.owner },
-    );
+    await a.sweep();
     await vi.waitFor(() => expect(b.text(documentId)).toBe("written while away"));
   });
 

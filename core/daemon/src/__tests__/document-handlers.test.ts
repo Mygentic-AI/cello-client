@@ -84,6 +84,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
 
   /** Event names captured, so operator-notice claims ("the warn IS the surface") are testable. */
   const events: string[] = [];
+  const nudged: Array<{ documentId: string; seat: string }> = [];
   const record = (event: string) => { events.push(event); };
   const logger = {
     debug: record, info: record, warn: record, error: record,
@@ -133,6 +134,10 @@ async function newFixture(opts: { sendFails?: string } = {}) {
       sign: async (_o, tbs) => keys.sign(tbs),
       senderIdFor: (o) => o,
       canPublish: (o, d) => layer.lifecycle.canPublish(o, d),
+      // Captured, not dropped: the publish-time nudge is a fact tests may assert on.
+      nudgeSeats: (_o, documentId, seats) => {
+        for (const seat of seats) nudged.push({ documentId, seat });
+      },
     }),
     transportFor: () => transport,
     resolveAgent: (_c, explicit) => explicit ?? AGENT,
@@ -168,7 +173,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
   };
 
   return {
-    call, layer, sent, owner, peer, events, db, incomingProposal, keys,
+    call, layer, sent, nudged, owner, peer, events, db, incomingProposal, keys,
     goOffline: () => {
       sendFails = "peer_offline";
     },
@@ -672,10 +677,6 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     expect(invited.ok).toBe(true);
     expect((invited.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
-    const owedTo = fA.layer.store
-      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
-      .map((pending) => pending.holderAgentId);
-    expect(owedTo).toContain(fB.owner);
 
     // B receives the admission, then B's consent finally lands at A — both sides converge on
     // the same two-entry set (the entries are CONCURRENT: each was authored blind to the other,
@@ -1262,8 +1263,8 @@ describe("cello_doc_write — the edit is applied and published", () => {
     expect(await f.call("cello_doc_read", { document_id: documentId })).toMatchObject({
       content: "the whole document",
     });
-    // Pending delivery is derived FROM THE LOG, so this is the whole of publishing.
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(1);
+    // The LOG is the whole record now (D1): one envelope authored, carried by the exchange.
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(1);
   });
 
   it("an unchanged write publishes NOTHING", async () => {
@@ -1273,7 +1274,7 @@ describe("cello_doc_write — the edit is applied and published", () => {
     const res = await f.call("cello_doc_write", { document_id: documentId, content: "same" });
     // Publishing anyway would append a leaf, cost a delivery, and converge nothing.
     expect(res).toMatchObject({ ok: true, changed: false, published: false });
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(0);
   });
 
   it("REFUSES a patch-shaped call rather than treating a fragment as the document", async () => {
@@ -1309,7 +1310,7 @@ describe("cello_doc_write — the edit is applied and published", () => {
     const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
     f.layer.lifecycle.setPlatformPaused(f.owner, true, NOW);
     await f.call("cello_doc_write", { document_id: documentId, content: "written while paused" });
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(0);
 
     f.layer.lifecycle.setPlatformPaused(f.owner, false, NOW);
     const retry = await f.call("cello_doc_write", { document_id: documentId, content: "written while paused" });
@@ -1318,7 +1319,7 @@ describe("cello_doc_write — the edit is applied and published", () => {
     // THE ASSERTION THAT MATTERS: it is now deliverable. Reporting `published: true` while the log
     // stayed empty would be the same lie one layer up.
     expect(
-      f.layer.store.pendingDeliveries(f.owner, NOW, f.owner),
+      f.layer.store.getEnvelopeLog(f.owner, documentId),
       "the stuck edit was reported as published but never entered the log",
     ).toHaveLength(1);
   });
@@ -1403,7 +1404,7 @@ describe("a document the peer REFUSED does not keep publishing", () => {
     // And the refusal names the peer's own words, so the operator knows what happened rather than
     // being told a generic no.
     expect(String(res.guidance)).toContain("not this one");
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(0);
   });
 
   it("still allows a write while the peer has NOT yet answered", async () => {
@@ -1429,7 +1430,7 @@ describe("DOD-DOC-SCREEN-1 — the sender is told BEFORE the peer refuses", () =
     expect(String(res.guidance)).toContain("U+202E");
     // Nothing was applied and nothing published — a refusal that half-applied would be worse than
     // the rejection round it saves.
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(0);
     expect(await f.call("cello_doc_read", { document_id: documentId })).not.toMatchObject({
       content: expect.stringContaining("‮"),
     });
@@ -1476,7 +1477,7 @@ describe("DOD-DOC-SCREEN-1 §16.7-16 — the sender ADOPTS the receiver's rule",
     expect(res).toMatchObject({ ok: false, reason: "document_peer_rule_adopted" });
     expect(String(res.guidance)).toContain("U+00E9");
     // Nothing applied, nothing published — a refusal that half-applied is worse than the round it saves.
-    expect(f.layer.store.pendingDeliveries(f.owner, NOW, f.owner)).toHaveLength(0);
+    expect(f.layer.store.getEnvelopeLog(f.owner, documentId)).toHaveLength(0);
   });
 
   it("admits text that does not contain what they refused", async () => {
@@ -1610,10 +1611,13 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     const killed = await fA.call("cello_doc_kill", { document_id: documentId });
     expect(killed.ok, JSON.stringify(killed)).toBe(true);
     expect(fA.layer.store.getDocument(fA.owner, documentId)!.status).toBe("killed");
-    // The debt is durable — the seats are still owed the entry.
+    // The ENTRY is the durable debt (D2: no ledger): it is in the chain, every delivery honestly
+    // reported failed, and any later exchange with any seat carries it.
+    expect((killed.killDelivered as Record<string, boolean>)).not.toEqual({});
+    expect(Object.values(killed.killDelivered as Record<string, boolean>).every((v) => v === false)).toBe(true);
     expect(
-      fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000).length,
-    ).toBeGreaterThan(0);
+      fA.layer.amendments.chain(fA.owner, documentId).some((e) => e.body.kind === "kill"),
+    ).toBe(true);
   });
 
   it("a chain that will not derive REFUSES to close rather than guessing", async () => {
@@ -1638,8 +1642,9 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
   });
 });
 
-describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreachable holder", () => {
-  it("a holder unreachable AT INVITE TIME still has the amendment owed to them afterwards", async () => {
+
+describe("the admission SURVIVES an unreachable holder — through the exchange, not a ledger (SYNC-P4)", () => {
+  it("a holder unreachable at invite time learns of the admission at the next exchange", async () => {
     const fA = await newFixture({ sendFails: "session_sealed" });
     const fB = await newFixture();
     const fC = await newFixture();
@@ -1661,33 +1666,35 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
       invitee_pubkey: fC.owner,
     });
     expect(invited.ok).toBe(true);
-
-    // The fan-out DID run and DID report the truth per holder — that half was never broken.
+    // The fan-out ran and reported the truth per holder — B was NOT told.
     expect((invited.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(false);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(1);
 
-    // THE DEFECT, IN ONE ASSERTION. Today this is zero: the send was best-effort, so when it
-    // failed nothing was left owing anywhere. The holder stays at the old epoch forever, silently
-    // discards the new holder's edits as coming from a stranger, and NO surface on either side
-    // shows an error or anything pending.
-    const owed = fA.layer.store
-      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
-      .filter((p) => p.holderAgentId === fB.owner);
-    expect(
-      owed.length,
-      "the amendment must remain OWED to a holder who could not be reached",
-    ).toBeGreaterThan(0);
-    // The bytes owed are the RECORDED chain's, not a copy held in memory by the handler — a
-    // redelivery can therefore never send something this daemon's own chain does not contain.
-    expect(owed[0]!.amendmentHash).toBe(invited.amendmentHash as string);
-    expect(owed[0]!.bytes.byteLength).toBeGreaterThan(0);
+    // No ledger anywhere (D2) — the admission's durability IS the chain. When A's transport
+    // comes back, ONE exchange closes the difference: B's position lacks the admit entry, so
+    // A's answer carries it.
+    fA.peerComesOnline();
+    const before = fA.sent.length;
+    await fA.layer.initiateReconcile(fA.owner, fB.owner, [documentId]);
+    const step1 = fA.sent.slice(before).find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fB.sent.length > 0);
+    routeAll(fB, fA);
+    await new Promise((r) => setTimeout(r, 50));
+    routeAll(fA, fB);
+    await until(() =>
+      fB.layer.amendments
+        .chain(fB.owner, documentId)
+        .some((e) => e.body.kind === "add_holder" && e.body.subject_agent_id === fC.owner),
+    );
   });
 
-  it("a holder who took it is marked SENT, not acked — bytes arriving is not governance applied", async () => {
+  it("the INVITER and the INVITEE are not in the fan-out — only the existing holders", async () => {
     const fA = await newFixture();
     const fB = await newFixture();
     const fC = await newFixture();
     const proposed = await fA.call("cello_doc_propose", {
-      peer_pubkey: fB.owner, starting_content: "everyone reachable throughout. ",
+      peer_pubkey: fB.owner, starting_content: "who is told what. ",
     });
     const documentId = proposed.documentId as string;
     const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
@@ -1696,44 +1703,10 @@ describe("DOD-MP-INVITE-FANOUT-1 — the admitting amendment survives an unreach
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
-    const invited = await fA.call("cello_doc_invite", {
-      document_id: documentId, invitee_pubkey: fC.owner,
-    });
-    expect((invited.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
-
-    // NOT DUE AGAIN IMMEDIATELY — otherwise the worker sends a second copy straight away and the
-    // durability fix becomes a duplicate-delivery bug.
-    expect(fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 1_000)).toEqual([]);
-
-    // BUT STILL OWED. `sendBytes` ok means their daemon received the frame; whether it RECORDED it
-    // is a separate fact it can refuse — recordAmendment throws on a chain gap or a failed
-    // derivation, the router logs it, and answers nothing. Acking here would recreate the original
-    // defect inside the new machinery: debt cleared, holder stuck at the old epoch, nothing owed.
-    const later = fA.layer.store.pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000);
-    expect(later.map((p) => p.holderAgentId)).toEqual([fB.owner]);
-  });
-
-  it("the INVITER and the INVITEE are never owed the amendment — only the existing holders", async () => {
-    const fA = await newFixture({ sendFails: "session_sealed" });
-    const fB = await newFixture();
-    const fC = await newFixture();
-    const proposed = await fA.call("cello_doc_propose", {
-      peer_pubkey: fB.owner, starting_content: "who is owed what. ",
-    });
-    const documentId = proposed.documentId as string;
-    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
-    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
-    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
-    await fB.call("cello_doc_accept", { document_id: documentId });
-    routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
-    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const owedTo = fA.layer.store
-      .pendingAmendmentDeliveries(fA.owner, NOW + 3_600_000)
-      .map((p) => p.holderAgentId);
-    // The invitee gets the whole chain inside their join OFFER, so owing them the amendment too
-    // would deliver it twice; owing it to ourselves would be a daemon sending itself governance.
-    expect(owedTo).toEqual([fB.owner]);
+    const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    // The invitee gets the NOTICE (their bootstrap carries the chain), and a daemon does not fan
+    // governance to itself — the per-holder report names exactly the existing other holders.
+    expect(Object.keys(invited.holdersNotified as Record<string, boolean>)).toEqual([fB.owner]);
   });
 });
 

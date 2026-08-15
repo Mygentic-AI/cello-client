@@ -104,7 +104,6 @@ describe("DocumentLifecycle — list", () => {
       peerAgentId: PEER,
       documentType: "markdown",
       status: "active",
-      pendingDeliveries: 1,
     });
     // Tier is constant in V1; epoch is DERIVED since M14B / AMEND-1 — 0 here because this
     // document has no amendments, not because anything is hardcoded.
@@ -188,17 +187,6 @@ describe("DocumentLifecycle — list", () => {
     expect(f.lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
   });
 
-  it("counts only what is actually pending, not the whole log", () => {
-    const f = newFixture();
-    const a = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, a);
-    f.store.appendEnvelope(AGENT, envelope(PEER, null));
-    f.store.markAcked(AGENT, DOC, a.envelopeHash, NOW);
-
-    // The peer's envelope is not ours to deliver, and ours was acked. "1 update pending" when
-    // nothing is pending is the kind of number an operator stops trusting.
-    expect(f.lifecycle.list(AGENT, NOW)[0]!.pendingDeliveries).toBe(0);
-  });
 });
 
 describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => {
@@ -270,7 +258,11 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
     const f = newFixture();
     const e = envelope(AGENT, null);
     f.store.appendEnvelope(AGENT, e);
-    f.store.markAcked(AGENT, DOC, e.envelopeHash, NOW);
+    // The peer has it: acked_at set directly — the ack machinery is deleted (D4); the column
+    // survives on the row and withdrawal (itself dying in D9) still reads it.
+    f.db.prepare(
+      `UPDATE document_envelopes SET acked_at = ? WHERE owner_agent_id = ? AND envelope_hash = ?`,
+    ).run(NOW, AGENT, e.envelopeHash);
 
     const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
     // Withdrawing a delivered update would tell the operator their content was retracted when the
@@ -295,14 +287,6 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
     expect((res as { reason: string }).reason).toBe("document_envelope_unknown");
   });
 
-  it("the withdrawn update no longer counts as pending delivery", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    // Otherwise the delivery worker ships the very update that was just withdrawn.
-    expect(f.store.pendingDeliveries(AGENT, NOW + 1_000_000)).toHaveLength(0);
-  });
 });
 
 describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {

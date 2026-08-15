@@ -53,8 +53,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
-import type { DocumentDeliveryTransport } from "./document-delivery.js";
-import { DELIVERY_ACK_TIMEOUT_MS } from "./document-delivery.js";
+import type { DocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
 import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./document-json.js";
@@ -722,9 +721,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     holders: readonly string[];
     verb: string;
   }): Promise<Record<string, boolean>> => {
-    layer.store.seedAmendmentDeliveries(
-      args.ownerAgentId, args.documentId, args.amendmentHashHex, args.holders, deps.now(),
-    );
     const told: Record<string, boolean> = {};
     for (const holder of args.holders) {
       try {
@@ -737,12 +733,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // PARKED IS NOT NOTIFIED. The relay took it because the holder had no live counterparty.
         const landed = sent.ok && sent.parked !== true;
         told[holder] = landed;
-        if (landed) {
-          layer.store.markAmendmentSent(
-            args.ownerAgentId, args.documentId, args.amendmentHashHex, holder,
-            deps.now(), DELIVERY_ACK_TIMEOUT_MS,
-          );
-        } else {
+        if (!landed) {
           // NAMED, NOT JUST COUNTED. This used to record `false` with no log line anywhere, so the
           // only trace of a lost membership change was a boolean inside an `ok: true` response.
           logger.warn("document.amendment.holder_unnotified", {

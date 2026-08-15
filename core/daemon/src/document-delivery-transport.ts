@@ -34,9 +34,7 @@
  * as delivered, leaves it unacked, and asks again on the capped backoff.
  */
 
-import type { DocumentDeliveryTransport } from "./document-delivery.js";
 import { wireContentHash } from "./wire-content-hash.js";
-import type { DocumentEnvelopeRow } from "./document-store.js";
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { LEAF_KIND_DOC } from "./session-relay-client.js";
@@ -85,52 +83,8 @@ export interface DocumentTransportDeps {
     | { ok: true; delivered: false; parked: true; relayRefusal?: string }
     | { ok: false; reason: string; error: string }
   >;
-  /** Encode a document envelope row onto the wire, and its content hash. */
-  encodeEnvelope(envelope: DocumentEnvelopeRow): { bytes: Uint8Array; hash: Uint8Array };
-  /**
-   * Wait for the peer to ANSWER this envelope, bounded. Resolves true if the ack landed.
-   *
-   * The seal below tears the session down, and the teardown drops any content still held for
-   * ordering — so an ack that arrives correctly and is held for a gap is DELETED rather than
-   * applied. Measured on a live daemon: the ack was sent, logged `session.content.held`, and the
-   * session was destroyed three seconds later with it still buffered. The sender then re-sent the
-   * envelope every tick until the unacked ceiling retired it.
-   *
-   * Waiting here is deliberately indifferent to WHY the answer is slow — held for ordering, a slow
-   * relay, a busy peer. The rule is simply that we do not tear down the channel an answer is due
-   * on until it has arrived or we have given up on it.
-   */
-  /** Waits for THE DIALED HOLDER'S answer — any other holder's ack must not resolve it (H1). */
-  awaitAck(
-    envelopeHash: string,
-    expectedAckerAgentId: string,
-    timeoutMs: number,
-  ): Promise<{ admitted: boolean } | null>;
-  /**
-   * Try to fill this session's ordering gaps, so anything HELD can be released.
-   *
-   * Without it the grace above cannot help in the very case it was written for. An ack whose
-   * canonical sequence lands ahead of our tree is HELD, and held content is not routed to the
-   * document layer at all — it waits for `#releaseHeld`, which only runs when the missing
-   * in-between sequence arrives. So the ack sits in a buffer, nothing settles, the grace expires in
-   * full, and the seal then discards it. The wait alone converted a fast silent failure into a slow
-   * one.
-   *
-   * A no-op when the session has no gap, so the ordinary delivery pays nothing.
-   */
-  drainHeld(sessionId: string, correlationId: string): Promise<void>;
   logger: Logger;
 }
-
-/**
- * How long a session WE opened stays up waiting for the peer's answer.
- *
- * Sized against the observed round trip, not guessed: on a live cross-region session the ack was
- * on the wire ~375ms after the frame landed, and the seal ceremony itself takes ~3s. Ten seconds
- * covers a slow relay and a park-and-recover round without keeping an autonomous session alive
- * long enough to be mistaken for a conversation.
- */
-export const DELIVERY_ACK_GRACE_MS = 10_000;
 
 /**
  * Everything this transport sends is document-domain traffic, so 0x04 is the default rather than
@@ -145,6 +99,41 @@ export const DELIVERY_ACK_GRACE_MS = 10_000;
  * this path submitted every document leaf as a MESSAGE.
  */
 export const DOCUMENT_LEAF_KIND = LEAF_KIND_DOC;
+
+/**
+ * The document frame carrier (SYNC-P4: D1/D2/D4 deleted — this used to live in the delivery
+ * worker's module). Two capabilities survive: a reachability probe, and putting already-encoded
+ * bytes on a session the transport opens or reuses then seals. There is no `deliver` and no ack
+ * wait — content confirmation is the peer's position at the next reconcile exchange.
+ */
+export interface DocumentDeliveryTransport {
+  /**
+   * Is the peer reachable right now? `discovery_lookup` today. Returns false rather than throwing
+   * for an ordinary "not online"; a throw means the LOOKUP failed, which is a different fact and
+   * must not be recorded as the peer being away.
+   */
+  isPeerReachable(
+    peerAgentId: string,
+    correlationId: string,
+  ): Promise<{ reachable: boolean; unknownAgent: boolean }>;
+  /**
+   * Send already-encoded bytes to a peer over the open-or-reuse-then-seal path. `documentId` is
+   * for the log line only. `parked: true` means the relay took it because the peer had no live
+   * counterparty — it is NOT with them yet, and only the next exchange proves anything landed.
+   */
+  sendBytes(input: {
+    peerAgentId: string;
+    documentId: string;
+    bytes: Uint8Array;
+    sessionHint?: string;
+    correlationId: string;
+    /** The witnessed leaf DOMAIN. Defaults to the document kind (0x04); a refusal passes 0x05. */
+    leafKind?: number;
+  }): Promise<
+    | { ok: true; sessionId: string; sessionOpened: boolean; parked?: boolean }
+    | { ok: false; reason: string; detail?: string }
+  >;
+}
 
 export function createDocumentDeliveryTransport(
   deps: DocumentTransportDeps,
@@ -328,119 +317,6 @@ export function createDocumentDeliveryTransport(
       };
     },
 
-    async deliver(input) {
-      const { peerAgentId, documentId, envelope, sessionHint, correlationId } = input;
-
-      const session = await acquireSession(peerAgentId, sessionHint, correlationId);
-      if (!session.ok) return session;
-      const { sessionId, sessionOpened } = session;
-
-      const { bytes, hash } = deps.encodeEnvelope(envelope);
-      const sent = await deps.sendContent(deps.agentName, sessionId, bytes, hash, correlationId, DOCUMENT_LEAF_KIND);
-      // DOD-MP-SESSION-RETIRE-1 — same accounting on the envelope path. Both paths acquire through
-      // `acquireSession`, so a session judged on one is skipped by the other; splitting the record
-      // would let a session that keeps refusing envelopes still be picked for the next frame.
-      noteSendOutcome(sessionId, sent);
-      if (sent.ok) deps.appendLeaf(deps.agentName, sessionId, hash, correlationId);
-      if (!sent.ok) {
-        // SEAL WHAT WE OPENED, on the failure path too. This branch walked away from a session it
-        // had just dialled — a live node the operator never started, with no sealed record, which
-        // is precisely what the rule twenty lines below says the seal exists to prevent. A failed
-        // send is when it is most likely to happen, not least.
-        if (sessionOpened) await deps.sealSession(deps.agentName, sessionId, correlationId);
-        return { ok: false, reason: sent.reason, detail: sent.error };
-      }
-
-      deps.logger.info("document.delivery.sent", {
-        documentId,
-        sessionId,
-        sessionOpened,
-        parked: sent.delivered === false,
-        correlationId,
-      });
-
-      // SEAL what we opened. §16.4: the autonomous session still happens because it carries
-      // signing, encryption and the seal — the ceremony goes to zero, the seal does not. A session
-      // this adapter opened and walked away from is a live node the operator never started, and
-      // the sealed record the design exists to produce is never produced. A session we REUSED is
-      // not ours to close: its owner decides when that conversation ends.
-      // PARKED CONTENT CANNOT BE ACKED, so waiting for one is spending the pass budget on a
-      // certainty. `delivered: false` means the peer was offline and the relay took the frame; the
-      // ack comes whenever they next come online, which is not within any grace. Waiting here also
-      // fired `ack_grace_expired` on a designed, benign state — a warning on the normal case.
-      const answerPossible = sent.delivered !== false;
-      // The peer's ANSWER, when one arrives inside the grace. Reported back as `admitted` so the
-      // worker records a settled delivery instead of an in-flight one.
-      let settlement: { admitted: boolean } | null = null;
-      if (sessionOpened && answerPossible && input.ackGraceMs > 0) {
-        // WAIT FOR THE ANSWER BEFORE TEARING DOWN THE CHANNEL IT COMES BACK ON.
-        //
-        // The seal destroys the session, and the teardown drops content still held for ordering.
-        // Sealing straight after the send therefore raced the peer's ack and, on a real network,
-        // lost: 90 re-sends of one envelope against a ceiling of 5.
-        //
-        // A REUSED session is untouched by this — it is not ours to close, so its owner keeps it
-        // alive and the ack has all the time it needs. That asymmetry is exactly why every spine
-        // enforcer passed: they open a conversation first, so the worker always reused one.
-        // The SMALLER of this envelope's share and the standard grace. The caller spends a budget
-        // across the whole sweep pass; see DELIVERY_ACK_GRACE_BUDGET_MS.
-        const graceMs = Math.min(DELIVERY_ACK_GRACE_MS, input.ackGraceMs);
-        // UNSTICK BEFORE WAITING. If the ack is already sitting in the hold buffer, no amount of
-        // waiting produces it — the release is driven by the missing sequence arriving, not by
-        // time. Ordering-complete sessions return immediately.
-        // CONTAINED. A drain failure must not fail a delivery whose content has already left — the
-        // same contract the ack itself has. Uncontained, a relay hiccup during the drain would
-        // surface as `document_delivery_threw` and re-send content the peer already holds.
-        await deps.drainHeld(sessionId, correlationId).catch((err: unknown) => {
-          deps.logger.warn("document.delivery.drain_threw", {
-            documentId,
-            sessionId,
-            correlationId,
-            reason: err instanceof Error ? err.message : String(err),
-          });
-        });
-        settlement = await deps.awaitAck(envelope.envelopeHash, input.peerAgentId, graceMs);
-        if (!settlement) {
-          // NOT a failure of the send — the content left and the peer may still answer later. Said
-          // out loud because a seal that discards a held ack is otherwise invisible, and this is
-          // the only moment anything knows it is about to happen.
-          deps.logger.warn("document.delivery.ack_grace_expired", {
-            documentId,
-            envelopeHash: envelope.envelopeHash,
-            sessionId,
-            graceMs,
-            correlationId,
-          });
-        }
-      }
-      // SEAL WHAT WE OPENED — unconditionally, whether or not we waited. The wait is about giving
-      // an answer time to arrive; the seal is about never leaving an autonomous session running.
-      // Making the seal conditional on the wait would trade one defect for a worse one.
-      if (sessionOpened) {
-        await deps.sealSession(deps.agentName, sessionId, correlationId);
-      }
-
-      // SENT, NOT ACKED — `admitted: null`. The content left (or was parked for an offline peer),
-      // which is a transport fact; the DoD's ack is the peer's daemon confirming admission, and
-      // that answer comes from the inbound document handler, which is its own line.
-      //
-      // Neither of the two-valued answers is available honestly. `true` would mark the envelope
-      // acknowledged in the log while the peer may never have applied it — and the log being right
-      // about what the peer holds is the entire reason pending is derived from it. `false` would
-      // count a send that WORKED as a failure and re-send content already in flight, which is the
-      // permanent-redelivery shape this milestone already fixed once.
-      // THE ANSWER IF WE HAVE IT. `null` still means "left, unanswered" — the honest third state —
-      // but an ack that landed inside the grace is no longer thrown away as if it had not.
-      return {
-        ok: true,
-        sessionId,
-        sessionOpened,
-        admitted: settlement ? settlement.admitted : null,
-        // PARKED, reported rather than inferred. The worker cannot tell it from an ordinary
-        // awaiting-answer send otherwise, and the two need different retry schedules.
-        parked: sent.delivered === false,
-      };
-    },
   };
 }
 

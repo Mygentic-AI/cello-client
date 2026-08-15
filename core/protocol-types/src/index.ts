@@ -312,13 +312,6 @@ export type {
   MultisigStatus,
 } from "./document-multisig.js";
 export {
-  DOCUMENT_ACK_DOMAIN,
-  buildDocumentAckTbs,
-  encodeDocumentAck,
-  decodeDocumentAck,
-} from "./document-ack.js";
-export type { DocumentAck } from "./document-ack.js";
-export {
   encodeDocumentProposalAck,
   decodeDocumentProposalAck,
   buildDocumentProposalAckTbs,

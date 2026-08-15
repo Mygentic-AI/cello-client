@@ -35,6 +35,7 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
     properties: {}, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
+  const nudged: string[][] = [];
   const state = { publishHolders: [PEER] as string[] | null };
   const publish = new DocumentPublish({
     governanceFrontierFor: () => [],
@@ -46,11 +47,12 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
     sign: async () => new Uint8Array(64).fill(5),
     senderIdFor: () => SENDER,
     canPublish: () => opts.canPublish ?? { ok: true },
+    nudgeSeats: (_o, _d, seats) => { nudged.push([...seats]); },
   });
   const doc = new Y.Doc();
   doc.clientID = 7777;
   return {
-    store, engine, publish, doc, db,
+    store, engine, publish, doc, db, nudged,
     get publishHolders() { return state.publishHolders; },
     set publishHolders(v: string[] | null) { state.publishHolders = v; },
   };
@@ -66,18 +68,17 @@ function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number)
 }
 
 describe("FANOUT-1 — publish SEEDS per-holder delivery rows through the production path", () => {
-  it("one publish, two holders, two pending rows — no hand-seeding anywhere", async () => {
-    // The one write that makes fan-out HAPPEN. Revert the seed call in publish and this is the
-    // test that goes red — without it a 3-party document delivers to the genesis peer only,
-    // the literal §7-1 divergence the DoD line quotes.
+  it("one publish, two holders, two nudges — no genesis-peer-only fan-out anywhere", async () => {
+    // The write that makes fan-out HAPPEN is now the nudge set. Nudge only the genesis peer and
+    // a 3-party document converges with one holder only — the literal §7-1 divergence the DoD
+    // line quotes, through the new machinery.
     const H2 = "ee".repeat(32);
     const f = newFixture();
     f.publishHolders = [PEER, H2];
     f.doc.getText("content").insert(0, "reaches both holders. ");
     const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
     expect(res.ok).toBe(true);
-    const pending = f.store.pendingHolderDeliveries(AGENT, NOW);
-    expect(new Set(pending.map((p) => p.holderAgentId))).toEqual(new Set([PEER, H2]));
+    expect(new Set(f.nudged.flat())).toEqual(new Set([PEER, H2]));
   });
 
   it("refuses when the chain does not derive — nothing appended, nothing invisible", async () => {
@@ -191,16 +192,24 @@ describe("DocumentPublish — refuses rather than writing something useless", ()
   });
 });
 
-describe("DocumentPublish — the published envelope is what DELIVERY picks up", () => {
-  it("becomes pending delivery immediately", async () => {
+describe("DocumentPublish — the publish NUDGES every other seat (SYNC-P4, R39's first trigger)", () => {
+  it("nudges each holder except the sender, once, after the append", async () => {
     const f = newFixture();
+    f.publishHolders = [SENDER, PEER, "cc".repeat(32)];
     f.doc.getText("content").insert(0, "deliver me. ");
     await f.publish.publish(AGENT, DOC, f.doc, NOW);
-    // Fire and forget: the worker derives pending FROM THE LOG, so writing the envelope is the
-    // whole of publishing.
-    // Scoped by OUR WIRE SENDER ID, not the owner key. M14-D5 makes them different, and passing
-    // the owner key here returned nothing pending — every published update sitting in the log
-    // undelivered with no error on any path.
-    expect(f.store.pendingDeliveries(AGENT, NOW, SENDER)).toHaveLength(1);
+    // No ledger and no worker: the nudge — an initiated reconcile per seat — is how the envelope
+    // travels, and the envelope itself is in the log for any later exchange to carry.
+    expect(f.nudged).toEqual([[PEER, "cc".repeat(32)]]);
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("a refused publish nudges nobody", async () => {
+    const f = newFixture();
+    f.publishHolders = null;
+    f.doc.getText("content").insert(0, "never leaves. ");
+    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
+    expect(res.ok).toBe(false);
+    expect(f.nudged).toEqual([]);
   });
 });

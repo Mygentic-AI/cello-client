@@ -116,6 +116,7 @@ async function newFixture(opts: { publishBlocked?: string } = {}) {
       senderIdFor: (o) => o,
       canPublish: (o, d) =>
         publishBlocked ? { ok: false as const, reason: publishBlocked, detail: "blocked for this test" } : layer.lifecycle.canPublish(o, d),
+      nudgeSeats: () => {},
     }),
     transportFor: () => transport,
     resolveAgent: (_c, explicit) => explicit ?? AGENT,

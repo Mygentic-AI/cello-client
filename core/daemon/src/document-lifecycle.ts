@@ -70,21 +70,6 @@ export interface DocumentListRow {
   assuranceTier: string;
   epochId: number;
   status: string;
-  pendingDeliveries: number;
-  /** Of those, how many have LEFT and are awaiting the peer's confirmation. */
-  pendingSent: number;
-  /** Of those, how many have not left this machine at all. */
-  pendingUnsent: number;
-  /**
-   * Updates WE GAVE UP ON — the unacked ceiling fired and they will never be retried.
-   *
-   * Without this the surface lies by omission. An abandoned envelope drops out of all three pending
-   * counters, so the operator's view goes from `pendingUnsent: 1` to `pendingDeliveries: 0`, which
-   * reads as delivered. The only other signal was `status: "stalled"`, and nothing said an update
-   * had been permanently dropped. The database keeps the distinction (`abandoned_at` is our
-   * decision, not evidence about the peer) and the surface threw it away.
-   */
-  abandonedDeliveries: number;
   /** We have closed and at least one current holder has not. */
   closePending: boolean;
 }
@@ -95,12 +80,6 @@ export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
   readonly #closePendingFor: (ownerAgentId: string, documentId: string) => boolean;
-  /**
-   * Our own wire sender id for an agent. M14-D5 makes it the pubkey hex, which is NOT the local
-   * owner key this store is otherwise keyed by — and passing the wrong one here reports every
-   * pending update as delivered.
-   */
-  readonly #senderAgentId: (ownerAgentId: string) => string;
   readonly #rollback: (
     ownerAgentId: string,
     documentId: string,
@@ -123,34 +102,17 @@ export class DocumentLifecycle {
      */
     rollback: (ownerAgentId: string, documentId: string, envelopeHash: string) =>
       { ok: true } | { ok: false; reason: string },
-    senderAgentId: (ownerAgentId: string) => string = (id) => id,
   ) {
     this.#store = store;
     this.#logger = logger;
     this.#closePendingFor = closePendingFor;
     this.#rollback = rollback;
-    this.#senderAgentId = senderAgentId;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
   list(ownerAgentId: string, nowMs: number): DocumentListRow[] {
-    // Every pending envelope regardless of schedule: the operator is asking "what has not reached
-    // my peer", not "what is due for a retry in the next few seconds".
-    const pending = this.#store.pendingDeliveries(
-      ownerAgentId,
-      Number.MAX_SAFE_INTEGER,
-      this.#senderAgentId(ownerAgentId),
-    );
-    const pendingByDocument = new Map<string, { total: number; sent: number }>();
-    for (const e of pending) {
-      const c = pendingByDocument.get(e.documentId) ?? { total: 0, sent: 0 };
-      c.total += 1;
-      // SPLIT, because "sent, awaiting confirmation" and "never left this machine" are different
-      // things to tell an operator asking why their work has not landed. FANOUT-1: the fact
-      // moved to the per-holder rows — "sent" means it reached AT LEAST ONE holder's wire.
-      if (e.deliveredAtMs != null || this.#store.envelopeEverSent(ownerAgentId, e.envelopeHash)) c.sent += 1;
-      pendingByDocument.set(e.documentId, c);
-    }
+    // SYNC-P4 (D1/D2/D4): there is no delivery ledger to count "pending" from anymore — what a
+    // peer holds is computed at each exchange from positions, not tracked per envelope (R8/R9).
     void nowMs;
 
     return this.#store.listDocuments(ownerAgentId).map((d) => ({
@@ -173,12 +135,6 @@ export class DocumentLifecycle {
       assuranceTier: "authenticated",
       epochId: this.#store.currentDocumentEpoch(ownerAgentId, d.documentId),
       status: d.status,
-      pendingDeliveries: pendingByDocument.get(d.documentId)?.total ?? 0,
-      pendingSent: pendingByDocument.get(d.documentId)?.sent ?? 0,
-      pendingUnsent:
-        (pendingByDocument.get(d.documentId)?.total ?? 0) -
-        (pendingByDocument.get(d.documentId)?.sent ?? 0),
-      abandonedDeliveries: this.#store.abandonedCount(ownerAgentId, d.documentId),
       // "I have closed and the derivation is still waiting on someone" — derived from the entry
       // set, ALL current seats (SYNC-P4; the DOD-MP-CLOSE-N-1 rule, now the fold's).
       closePending: this.#closePendingFor(ownerAgentId, d.documentId),
