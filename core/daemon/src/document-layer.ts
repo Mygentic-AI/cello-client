@@ -51,6 +51,7 @@ import {
   decodeDocumentControl,
   buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
+  encodeDocumentAmendment,
   buildDocumentUpdateTbs,
   documentEnvelopeHash,
   buildDocumentJoinAnswerTbs,
@@ -61,6 +62,7 @@ import {
   decodeDocumentProposal,
   encodeDocumentProposal,
   documentIdFromProposal,
+  buildDocumentProposalTbs,
   encodeDocumentProposalAck,
   DOCUMENT_PROPOSAL_ACK_VERSION,
   MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
@@ -839,6 +841,41 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       const record = handshake.get(ownerAgentId, documentId);
       return record ? new Uint8Array(encodeDocumentProposal(record.envelope)) : null;
     },
+    removalClosure: (documentId, agentId) => {
+      // The LAST removal naming them, plus every ancestor — walked over the held entry set.
+      const chain = amendments.chain(ownerAgentId, documentId);
+      const byHash = new Map(
+        chain.map((env) => [
+          Buffer.from(documentAmendmentHash(env.body)).toString("hex"),
+          env,
+        ]),
+      );
+      let removalHash: string | null = null;
+      for (const [hash, env] of byHash) {
+        if (env.body.kind === "remove_holder" && env.body.subject_agent_id === agentId) {
+          removalHash = hash;
+        }
+      }
+      if (!removalHash) return null;
+      const wanted = new Set<string>([removalHash]);
+      const queue = [removalHash];
+      while (queue.length > 0) {
+        const env = byHash.get(queue.pop()!);
+        if (!env) continue;
+        for (const parent of env.body.parents) {
+          if (!wanted.has(parent)) {
+            wanted.add(parent);
+            queue.push(parent);
+          }
+        }
+      }
+      // Foldable order: parents before children — the chain read is already epoch/seq ordered.
+      return chain
+        .filter((env) =>
+          wanted.has(Buffer.from(documentAmendmentHash(env.body)).toString("hex")),
+        )
+        .map((env) => new Uint8Array(encodeDocumentAmendment(env)));
+    },
   });
 
   /**
@@ -864,6 +901,14 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       });
       return { ok: true };
     }
+    for (const block of frame.documents) {
+      if (block.refusal) {
+        logger.warn("document.reconcile.refused_by_peer", {
+          documentId: block.document_id, senderAgentId,
+          reason: block.refusal.reason, terminal: block.refusal.terminal, correlationId,
+        });
+      }
+    }
     if (frame.exchange_version !== DOCUMENT_RECONCILE_EXCHANGE_VERSION) {
       const reason =
         `document_reconcile_version: you speak exchange version ${frame.exchange_version} and ` +
@@ -883,7 +928,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     }
     const reads = reconcileReads(ownerAgentId);
     const replyBlocks = [];
-    let refusal: { reason: string; terminal: boolean } | null = null;
+    // One reply frame's payload allowance, shared across its blocks (review F3): headroom under
+    // the router's 2 MiB frame ceiling so positions, hashes, and CBOR overhead always fit.
+    const replyBudget = { remainingBytes: 1_500_000 };
     for (const block of frame.documents) {
       // THE NOTICE, RECEIVED (R25): a position for a document this holder does not hold, with
       // no genesis attached, IS the invitation pointer — the frame already names the document
@@ -920,11 +967,49 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
                 "block's document id — the anchor cannot be swapped",
             );
           }
+          // THE ANCHOR IS VERIFIED, NOT TAKEN (P3 review F2): a proposal is only a proposal
+          // under its proposer's own signature — an unsigned or forged genesis stored here
+          // would attribute a document to someone who never made it, and hand any session
+          // peer an unlimited license to grow this store with fabricated documents.
+          if (
+            !verifySignature(
+              genesisEnv.proposer_agent_id,
+              buildDocumentProposalTbs(genesisEnv),
+              genesisEnv.signature,
+            )
+          ) {
+            throw new Error(
+              `document_reconcile_genesis_unsigned: the carried genesis does not verify ` +
+                `against its named proposer ${genesisEnv.proposer_agent_id}`,
+            );
+          }
+          // AND IT MUST NAME US (F2's entitlement half): this holder bootstraps only a
+          // document it is a party to — the genesis peer, or the subject of an admission
+          // carried in the same block. Anything else is a stranger's document and is refused,
+          // not stored.
+          const namedAsGenesisPeer = genesisEnv.peer_agent_id === ownerAgentId;
+          const namedByAdmission = block.entries.some((entryWire) => {
+            try {
+              const env = decodeDocumentAmendment(entryWire);
+              return env.body.kind === "add_holder" && env.body.subject_agent_id === ownerAgentId;
+            } catch {
+              return false;
+            }
+          });
+          if (!namedAsGenesisPeer && !namedByAdmission) {
+            throw new Error(
+              "document_reconcile_not_invited: the carried world names this holder nowhere — " +
+                "neither the genesis peer nor the subject of any carried admission; a document " +
+                "we are no party to is refused, not stored",
+            );
+          }
           handshake.recordJoined(ownerAgentId, block.genesis, nowMs);
           store.createDocument({
             documentId: block.document_id,
             ownerAgentId,
-            peerAgentId: senderAgentId,
+            // The GENESIS FACT, not the messenger (F6): the peer column is the proposer's —
+            // whoever's session happened to carry the frame may be any holder (forwarding).
+            peerAgentId: genesisEnv.proposer_agent_id,
             documentType: genesisEnv.document_type,
             properties: genesisEnv.properties,
             status: "active",
@@ -960,31 +1045,45 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           try {
             noticeInboundUpdateImpl(ownerAgentId, envWire);
           } catch { /* the notice is a row; the content is already the truth */ }
-          void rewriteFileImpl(ownerAgentId, envWire);
+          void rewriteFileImpl(ownerAgentId, envWire).catch((err: unknown) => {
+            logger.warn("document.reconcile.rewrite_failed", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
         }
       }
-      const answer = respondToReconcile(reads, senderAgentId, block);
-      if (answer.kind === "refusal") {
-        refusal = { reason: answer.reason, terminal: answer.terminal };
+      const answer = respondToReconcile(reads, senderAgentId, block, replyBudget);
+      if (answer.block.refusal) {
+        // Per-document, on the block (review F4) — a batch never silences one document's no.
         logger.warn("document.reconcile.refused", {
           documentId: block.document_id, senderAgentId,
-          reason: answer.reason, terminal: answer.terminal, correlationId,
+          reason: answer.block.refusal.reason, terminal: answer.block.refusal.terminal,
+          correlationId,
         });
+        replyBlocks.push(answer.block);
         continue;
+      }
+      if (answer.truncated) {
+        // The byte budget cut the payload (review F3) — LOUD, never a silently-oversized frame
+        // the router would drop as unshaped. The exchange is idempotent: the peer's next
+        // initiate picks up from its advanced position.
+        logger.warn("document.reconcile.truncated", {
+          documentId: block.document_id, senderAgentId, correlationId,
+        });
       }
       const hasDifference = answer.block.entries.length > 0 || answer.block.envelopes.length > 0;
       if (hasDifference || answer.peerAhead) {
         replyBlocks.push(answer.block);
       }
     }
-    if (replyBlocks.length > 0 || refusal) {
+    if (replyBlocks.length > 0) {
       await deps.sendFrame(
         ownerAgentId, senderAgentId,
         encodeDocumentReconcile({
           type: "document_reconcile",
           exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
           documents: replyBlocks,
-          ...(refusal && replyBlocks.length === 0 ? { refusal } : {}),
         }),
       );
     }

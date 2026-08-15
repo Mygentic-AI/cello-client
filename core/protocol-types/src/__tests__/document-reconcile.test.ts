@@ -157,6 +157,29 @@ describe("document_reconcile — one shape, three steps", () => {
     expect(decoded.documents[0]!.genesis).toEqual(new Uint8Array([7, 8, 9]));
   });
 
+  it("a PER-DOCUMENT refusal rides its block — batching never silences one document's 'no' (review F4)", () => {
+    const f = frame({
+      documents: [
+        {
+          document_id: DOC,
+          governance: [],
+          content: [],
+          refused: [],
+          entries: [new Uint8Array([1])],
+          envelopes: [],
+          refusal: { reason: "document_reconcile_removed: gone", terminal: true },
+        },
+      ],
+    });
+    const decoded = decodeDocumentReconcile(encodeDocumentReconcile(f));
+    expect(decoded.documents[0]!.refusal).toEqual({
+      reason: "document_reconcile_removed: gone",
+      terminal: true,
+    });
+    // And it coexists with entries — a removed holder's closure travels WITH the ruling.
+    expect(decoded.documents[0]!.entries).toHaveLength(1);
+  });
+
   it("a refusal rides the SAME frame — no second carrier for 'no'", () => {
     const f = frame({
       documents: [],

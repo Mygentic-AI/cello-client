@@ -32,6 +32,10 @@ import {
   type DocumentControl,
   type DocumentAmendmentBody,
   type DocumentProposalEnvelope,
+  encodeDocumentReconcile,
+  DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+  encodeDocumentUpdateEnvelope,
+  DOCUMENT_UPDATE_ENCODING_V1,
 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
@@ -968,6 +972,99 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       (d) => d.documentId === documentId,
     )!;
     expect(row.participants).toContain(fC.owner);
+  });
+
+  it("A FORGED OR STRANGER-ADDRESSED GENESIS IS REFUSED, NOT STORED (review F2) — no session peer can spawn documents on this daemon", async () => {
+    // Two adversarial bootstraps, both through the real router: (a) a genesis whose signature
+    // does not verify against its named proposer; (b) a perfectly signed genesis for a document
+    // that names this holder NOWHERE. Both must leave the store untouched — the old code
+    // recorded both, handing any session peer an unlimited license to grow the store with
+    // fabricated documents attributed to proposers who never signed them.
+    const fA = await newFixture();
+    const fC = await newFixture();
+
+    // (a) Forged: a real proposal from A to C, signature stripped.
+    const honest = await fA.call("cello_doc_propose", { peer_pubkey: fC.owner });
+    const honestId = honest.documentId as string;
+    const proposalToC = fA.sent.find((send) => send.peerAgentId === fC.owner)!;
+    const forgedGenesis = decodeDocumentProposal(proposalToC.bytes);
+    forgedGenesis.signature = new Uint8Array(64);
+    const forgedWire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: honestId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [],
+        genesis: new Uint8Array(encodeDocumentProposal(forgedGenesis)),
+      }],
+    });
+    fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(forgedWire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fC.layer.store.getDocument(fC.owner, honestId)).toBeNull();
+    expect(fC.events).toContain("document.reconcile.genesis_refused");
+
+    // (b) Signed but a stranger's: A proposes to A's own bare-key peer — C is named nowhere.
+    const strangerDoc = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const strangerId = strangerDoc.documentId as string;
+    const strangerGenesis = fA.layer.handshake.get(fA.owner, strangerId)!.envelope;
+    const strangerWire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: strangerId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [],
+        genesis: new Uint8Array(encodeDocumentProposal(strangerGenesis)),
+      }],
+    });
+    fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(strangerWire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fC.layer.store.getDocument(fC.owner, strangerId)).toBeNull();
+  });
+
+  it("A FORWARDED ENVELOPE WITH A CORRUPTED SIGNATURE IS REFUSED — forwarding confers no trust, verified not asserted (R2)", async () => {
+    // The AC2 test proves delivery; this proves VERIFICATION: B forwards A's envelope with the
+    // signature corrupted, and C's gate refuses it — the forwarder cannot vouch for content.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await fA.call("cello_doc_write", { document_id: documentId, content: "signed by A. " });
+
+    // A "forwards" its own envelope to B with the signature corrupted — as a hostile forwarder
+    // would after tampering.
+    const row = fA.layer.store.getEnvelopeLog(fA.owner, documentId)[0]!;
+    const tampered = encodeDocumentUpdateEnvelope({
+      type: "document_update",
+      document_id: row.documentId,
+      epoch_id: row.epochId,
+      doc_prev_hash: row.docPrevHash,
+      sender_agent_id: row.senderAgentId,
+      sender_client_id: 0,
+      update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+      state_vector: row.stateVector,
+      update: row.payload!,
+      signature: new Uint8Array(64),
+    });
+    const wire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: documentId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [new Uint8Array(tampered)],
+      }],
+    });
+    fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(wire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    // The tampered envelope was NOT applied.
+    expect(
+      String(fB.layer.live.get(fB.owner, documentId).getText("content")),
+    ).not.toContain("signed by A");
   });
 
   it("REFUSAL VIA THE EXCHANGE: the invitee's signed no settles the inviter's surface, and an unanswered invitation can be RETRACTED", async () => {

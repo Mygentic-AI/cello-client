@@ -37,21 +37,26 @@ export interface ReconcileReads {
   membershipState(documentId: string, agentId: string): "holder" | "removed" | "untouched";
   /** The signed genesis proposal bytes — the anchor a joiner-with-nothing must be handed. */
   genesisBytes(documentId: string): Uint8Array | null;
+  /**
+   * R32 — the LAST removal entry naming this agent plus its full ancestor closure, as wire
+   * bytes in a foldable order, or null when no removal names them. This is what a removed
+   * holder is owed: enough to derive their own removal and nothing authored after it.
+   */
+  removalClosure(documentId: string, agentId: string): Uint8Array[] | null;
 }
 
-export type ReconcileRefusal = {
-  kind: "refusal";
-  reason: string;
-  /** R19: a stranger's refusal is NON-terminal — the admission may simply not have reached us. */
-  terminal: boolean;
-};
-
-export type ReconcileReply = {
-  kind: "reply";
+export type ReconcileAnswer = {
   block: DocumentReconcileBlock;
   /** True when the peer's position shows them holding something we lack — step 3 is wanted. */
   peerAhead: boolean;
+  /** True when the byte budget cut the payload short — the peer's next exchange gets the rest. */
+  truncated: boolean;
 };
+
+/** A mutable byte allowance shared across the blocks of one reply frame (P3 review F3). */
+export interface ReplyBudget {
+  remainingBytes: number;
+}
 
 /** Our own position for one document — step 1's payload, and the position half of every reply. */
 export function buildReconcileBlock(
@@ -95,22 +100,37 @@ function contentPositions(log: DocumentEnvelopeRow[]): ContentPosition[] {
 }
 
 /**
- * Answer a peer's position. The entitlement ruling comes FIRST and from our own state alone
- * (R18) — a frame from a stranger computes no difference and learns nothing but the refusal.
+ * Answer a peer's position for one document. The entitlement ruling comes FIRST and from our
+ * own state alone (R18); a refusal rides the BLOCK (never silenced by a batch, review F4), and
+ * a refusal-bearing block carries EMPTY positions — a stranger learns nothing about where this
+ * holder stands. The removed holder is the one refusal that also DELIVERS: their own removal
+ * and its ancestors travel with the terminal ruling (R32), so a holder who was offline at
+ * removal time can derive why the document went quiet.
  */
 export function respondToReconcile(
   reads: ReconcileReads,
   peerAgentId: string,
   peerBlock: DocumentReconcileBlock,
-): ReconcileRefusal | ReconcileReply {
+  budget?: ReplyBudget,
+): ReconcileAnswer {
   const documentId = peerBlock.document_id;
+  const refusalBlock = (reason: string, terminal: boolean, entries: Uint8Array[] = []): ReconcileAnswer => ({
+    block: {
+      document_id: documentId,
+      governance: [],
+      content: [],
+      refused: [],
+      entries,
+      envelopes: [],
+      refusal: { reason, terminal },
+    },
+    peerAhead: false,
+    truncated: false,
+  });
+
   const derived = reads.deriveState(documentId);
   if (!derived.ok) {
-    return {
-      kind: "refusal",
-      reason: `document_reconcile_underivable: ${derived.reason}`,
-      terminal: false,
-    };
+    return refusalBlock(`document_reconcile_underivable: ${derived.reason}`, false);
   }
   const state = derived.state;
 
@@ -119,31 +139,41 @@ export function respondToReconcile(
   const isInvited = state.invited.has(peerAgentId);
   if (!isParticipant && !isInvited) {
     if (reads.membershipState(documentId, peerAgentId) === "removed") {
-      // R32's "their own removal and its ancestors" delivery rides the ordinary difference the
-      // moment their position shows them behind the removal; past that, nothing.
-      return {
-        kind: "refusal",
-        reason:
-          `document_reconcile_removed: this holder was removed — the removal is forward-only ` +
-          `(the copy is theirs), and there is nothing further to reconcile`,
-        terminal: true,
-      };
+      // R32: the ruling is terminal, but it DELIVERS — the removal entry and its ancestors,
+      // so the removed holder can derive their own removal, surface it with its reason, and
+      // stop asking. Idempotent like everything here: asking again gets the same closure.
+      const closure = reads.removalClosure(documentId, peerAgentId) ?? [];
+      return refusalBlock(
+        `document_reconcile_removed: this holder was removed — the removal is forward-only ` +
+          `(the copy is theirs); the removal entry and its ancestors are attached so their own ` +
+          `derivation can say so, and there is nothing further to reconcile`,
+        true,
+        closure,
+      );
     }
     // R18 + R19: refused by name, NON-terminal, and the sentence says why it is not final — a
     // legitimate joiner is exactly this refusal whenever their inviter's admission has not yet
     // reached us, and a terminal answer here would strand them (the failure R19 names).
-    return {
-      kind: "refusal",
-      reason:
-        `document_reconcile_stranger: ${peerAgentId} is not a party to this document AS THIS ` +
+    return refusalBlock(
+      `document_reconcile_stranger: ${peerAgentId} is not a party to this document AS THIS ` +
         `HOLDER CURRENTLY DERIVES IT — non-terminal: if you were admitted, the admission may ` +
         `not have reached us yet; reconcile again after your inviter's entries spread`,
-      terminal: false,
-    };
+      false,
+    );
   }
 
   const peerRefused = new Set(peerBlock.refused);
   const block = buildReconcileBlock(reads, documentId);
+  let truncated = false;
+  const spend = (wire: Uint8Array): boolean => {
+    if (!budget) return true;
+    if (budget.remainingBytes < wire.length) {
+      truncated = true;
+      return false;
+    }
+    budget.remainingBytes -= wire.length;
+    return true;
+  };
 
   // Governance difference — R12 says these apply first, so they are FIRST in the frame.
   const peerGov = new Map(peerBlock.governance.map((g) => [g.author, g]));
@@ -168,8 +198,10 @@ export function respondToReconcile(
         "hex",
       );
       if (peerRefused.has(hash)) continue; // R36: nothing refused is ever re-offered
+      if (!spend(wire)) break;
       entries.push(wire);
     }
+    if (truncated) break;
   }
 
   // Content difference — the sender-chain suffix past the peer's count, re-encoded losslessly
@@ -185,27 +217,28 @@ export function respondToReconcile(
   }
   const envelopes: Uint8Array[] = [];
   for (const [author, rows] of [...bySender].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+    if (truncated) break;
     const theirs = peerContent.get(author);
     const from = theirs ? theirs.count : 0;
     for (const row of rows.slice(from)) {
       if (row.kind !== "update" || row.payload === null) continue;
       if (peerRefused.has(row.envelopeHash)) continue;
-      envelopes.push(
-        new Uint8Array(
-          encodeDocumentUpdateEnvelope({
-            type: "document_update",
-            document_id: row.documentId,
-            epoch_id: row.epochId,
-            doc_prev_hash: row.docPrevHash,
-            sender_agent_id: row.senderAgentId,
-            sender_client_id: row.senderClientId ?? 0,
-            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
-            state_vector: row.stateVector,
-            update: row.payload,
-            signature: row.signature,
-          }),
-        ),
+      const wire = new Uint8Array(
+        encodeDocumentUpdateEnvelope({
+          type: "document_update",
+          document_id: row.documentId,
+          epoch_id: row.epochId,
+          doc_prev_hash: row.docPrevHash,
+          sender_agent_id: row.senderAgentId,
+          sender_client_id: row.senderClientId ?? 0,
+          update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+          state_vector: row.stateVector,
+          update: row.payload,
+          signature: row.signature,
+        }),
       );
+      if (!spend(wire)) break;
+      envelopes.push(wire);
     }
   }
 
@@ -235,8 +268,8 @@ export function respondToReconcile(
   const genesis = peerHoldsNothing ? reads.genesisBytes(documentId) : null;
 
   return {
-    kind: "reply",
     block: { ...block, entries, envelopes, ...(genesis ? { genesis } : {}) },
     peerAhead,
+    truncated,
   };
 }

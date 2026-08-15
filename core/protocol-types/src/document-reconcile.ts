@@ -68,6 +68,13 @@ export interface DocumentReconcileBlock {
    * idempotent, like everything else in the exchange.
    */
   genesis?: Uint8Array;
+  /**
+   * A PER-DOCUMENT refusal (P3 review F4): in a batched frame, one document's stranger or
+   * removed ruling must not be silenced by another document's ordinary reply — refused-by-name
+   * is per document, so the refusal rides the block. May coexist with entries: a removed
+   * holder's block carries their own removal's closure AND the terminal ruling (R32 + R17).
+   */
+  refusal?: { reason: string; terminal: boolean };
 }
 
 export interface DocumentReconcileFrame {
@@ -106,6 +113,7 @@ export function encodeDocumentReconcile(frame: DocumentReconcileFrame): Uint8Arr
       entries: d.entries.map((e) => new Uint8Array(e)),
       envelopes: d.envelopes.map((e) => new Uint8Array(e)),
       ...(d.genesis ? { genesis: new Uint8Array(d.genesis) } : {}),
+      ...(d.refusal ? { refusal: { reason: d.refusal.reason, terminal: d.refusal.terminal } } : {}),
     })),
   });
 }
@@ -213,6 +221,18 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
       }
       genesis = new Uint8Array(g);
     }
+    let blockRefusal: { reason: string; terminal: boolean } | undefined;
+    if ("refusal" in d) {
+      const r = asMap(d["refusal"], "documents[].refusal");
+      const reason = present(r, "reason");
+      const terminal = present(r, "terminal");
+      if (typeof reason !== "string" || reason.length === 0 || typeof terminal !== "boolean") {
+        throw new Error(
+          "document_reconcile_field_type: a block refusal must carry a non-empty reason and a terminal flag",
+        );
+      }
+      blockRefusal = { reason, terminal };
+    }
     return {
       document_id: hex64(d, "document_id"),
       governance,
@@ -221,6 +241,7 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
       entries: byteList(d, "entries"),
       envelopes: byteList(d, "envelopes"),
       ...(genesis ? { genesis } : {}),
+      ...(blockRefusal ? { refusal: blockRefusal } : {}),
     };
   });
   let refusal: { reason: string; terminal: boolean } | undefined;

@@ -120,6 +120,7 @@ function reads(over: Partial<ReconcileReads> = {}): ReconcileReads {
     refusedHashes: () => [],
     membershipState: () => "untouched",
     genesisBytes: () => null,
+    removalClosure: () => null,
     ...over,
   };
 }
@@ -137,26 +138,33 @@ function block(over: Partial<Parameters<typeof respondToReconcile>[2]> = {}) {
 }
 
 describe("respondToReconcile — entitlement first (R17/R18/R19)", () => {
-  it("a STRANGER is refused by name, NON-terminal, and the sentence says why it is not final", () => {
+  it("a STRANGER is refused by name, NON-terminal, the sentence says why it is not final — and the refusal block leaks NO positions", () => {
     const r = respondToReconcile(reads(), "9".repeat(64), block());
-    expect(r.kind).toBe("refusal");
-    if (r.kind !== "refusal") return;
-    expect(r.terminal).toBe(false);
-    expect(r.reason).toMatch(/document_reconcile_stranger/);
-    expect(r.reason).toMatch(/non-terminal/);
-    expect(r.reason).toMatch(/admission may/);
+    expect(r.block.refusal).toBeDefined();
+    expect(r.block.refusal!.terminal).toBe(false);
+    expect(r.block.refusal!.reason).toMatch(/document_reconcile_stranger/);
+    expect(r.block.refusal!.reason).toMatch(/non-terminal/);
+    expect(r.block.refusal!.reason).toMatch(/admission may/);
+    expect(r.block.governance).toEqual([]);
+    expect(r.block.content).toEqual([]);
   });
 
-  it("a REMOVED holder is refused terminally, naming forward-only", () => {
+  it("a REMOVED holder gets a terminal ruling that DELIVERS — their own removal and its ancestors ride the refusal block (R32)", () => {
+    // The review's F1: the old shape refused bare, so a holder offline at removal time could
+    // never learn why the document went quiet — their own state said participant forever.
+    const closureWires = [new Uint8Array([1, 1]), new Uint8Array([2, 2])];
     const r = respondToReconcile(
-      reads({ membershipState: () => "removed" }),
+      reads({
+        membershipState: () => "removed",
+        removalClosure: () => closureWires,
+      }),
       "9".repeat(64),
       block(),
     );
-    expect(r).toMatchObject({ kind: "refusal", terminal: true });
-    if (r.kind !== "refusal") return;
-    expect(r.reason).toMatch(/document_reconcile_removed/);
-    expect(r.reason).toMatch(/forward-only/);
+    expect(r.block.refusal).toMatchObject({ terminal: true });
+    expect(r.block.refusal!.reason).toMatch(/document_reconcile_removed/);
+    expect(r.block.refusal!.reason).toMatch(/forward-only/);
+    expect(r.block.entries).toEqual(closureWires);
   });
 
   it("an INVITED seat is answered — invited may receive (R17)", () => {
@@ -166,7 +174,7 @@ describe("respondToReconcile — entitlement first (R17/R18/R19)", () => {
       invitee,
       block(),
     );
-    expect(r.kind).toBe("reply");
+    expect(r.block.refusal).toBeUndefined();
   });
 
   it("an underivable document refuses NON-terminally with the derivation's own reason", () => {
@@ -175,9 +183,8 @@ describe("respondToReconcile — entitlement first (R17/R18/R19)", () => {
       peer,
       block(),
     );
-    expect(r).toMatchObject({ kind: "refusal", terminal: false });
-    if (r.kind !== "refusal") return;
-    expect(r.reason).toContain("arrangement_admin_set_empty");
+    expect(r.block.refusal).toMatchObject({ terminal: false });
+    expect(r.block.refusal!.reason).toContain("arrangement_admin_set_empty");
   });
 });
 
@@ -197,8 +204,6 @@ describe("respondToReconcile — the governance difference", () => {
 
   it("a peer with no watermark for an author gets that author's whole chain, in seq order", () => {
     const r = respondToReconcile(govReads(), peer, block());
-    expect(r.kind).toBe("reply");
-    if (r.kind !== "reply") return;
     expect(r.block.entries).toHaveLength(2);
   });
 
@@ -208,7 +213,6 @@ describe("respondToReconcile — the governance difference", () => {
       peer,
       block({ governance: [{ author: admin.agentId, seq: 1, head_hashes: [hashHex(e1)] }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.entries).toHaveLength(1);
     expect(r.block.entries[0]).toEqual(wires[1]);
   });
@@ -219,7 +223,6 @@ describe("respondToReconcile — the governance difference", () => {
       peer,
       block({ governance: [{ author: admin.agentId, seq: 2, head_hashes: ["ff".repeat(32)] }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.entries).toHaveLength(1); // from seq 1: our seq-2 branch ships
   });
 
@@ -229,7 +232,6 @@ describe("respondToReconcile — the governance difference", () => {
       peer,
       block({ refused: [hashHex(e2)] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.entries).toHaveLength(1);
     expect(r.block.entries[0]).toEqual(wires[0]);
   });
@@ -240,7 +242,6 @@ describe("respondToReconcile — the governance difference", () => {
       peer,
       block({ governance: [{ author: admin.agentId, seq: 2, head_hashes: [hashHex(e2)] }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.entries).toHaveLength(0);
     expect(r.peerAhead).toBe(false);
   });
@@ -257,7 +258,6 @@ describe("respondToReconcile — the content difference", () => {
       peer,
       block({ content: [{ author: admin.agentId, count: 1, head_hash: rows[0]!.envelopeHash }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     // Rows 2 and 3 are past the count; row 2 is a payload-less stub → only row 3 ships.
     expect(r.block.envelopes).toHaveLength(1);
     expect(r.block.refused).toContain(rows[1]!.envelopeHash);
@@ -269,8 +269,28 @@ describe("respondToReconcile — the content difference", () => {
       peer,
       block({ content: [{ author: peer, count: 4, head_hash: "aa".repeat(32) }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.peerAhead).toBe(true);
+  });
+});
+
+describe("respondToReconcile — the reply byte budget (review F3)", () => {
+  it("stops adding payload when the budget runs out, keeps the positions, and SAYS it truncated", () => {
+    const e1 = entryOf({ author_seq: 1 });
+    const e2 = entryOf({ author_seq: 2, epoch_id: 2, parents: [hashHex(e1)], subject_agent_id: "e".repeat(64) });
+    const wires = [new Uint8Array(encodeDocumentAmendment(e1)), new Uint8Array(encodeDocumentAmendment(e2))];
+    const r = respondToReconcile(
+      reads({
+        watermarks: () => new Map([[admin.agentId, { seq: 2, headHashes: [hashHex(e2)] }]]),
+        entriesByAuthorAfter: () => wires,
+      }),
+      peer,
+      block(),
+      { remainingBytes: wires[0]!.length + 10 }, // room for one wire, not two
+    );
+    expect(r.truncated).toBe(true);
+    expect(r.block.entries).toHaveLength(1);
+    // The POSITION is intact — the peer learns exactly how far behind it still is.
+    expect(r.block.governance).toHaveLength(1);
   });
 });
 
@@ -285,7 +305,6 @@ describe("respondToReconcile — the joiner bootstrap", () => {
       "9".repeat(64),
       block(),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.genesis).toEqual(g);
   });
 
@@ -295,7 +314,6 @@ describe("respondToReconcile — the joiner bootstrap", () => {
       peer,
       block({ content: [{ author: peer, count: 1, head_hash: "aa".repeat(32) }] }),
     );
-    if (r.kind !== "reply") throw new Error("expected reply");
     expect(r.block.genesis).toBeUndefined();
   });
 });
