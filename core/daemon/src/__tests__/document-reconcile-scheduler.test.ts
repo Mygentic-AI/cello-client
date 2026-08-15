@@ -100,7 +100,6 @@ describe("the sweep (R39 trigger 3, R43 bounds)", () => {
     f.clock.now += RECONCILE_INFLIGHT_BOUND_MS + 1;
     resolveHang({ ok: true });
     await first;
-    const later = fixture(); // fresh — the point above proved honoring; expiry needs a hung one
     let hung = true;
     const neverSettles = new Promise<{ ok: true }>(() => {});
     const wedged = fixture({
@@ -112,7 +111,6 @@ describe("the sweep (R39 trigger 3, R43 bounds)", () => {
     hung = false;
     expect(await wedged.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
     expect(wedged.events).toContain("document.reconcile.inflight_expired");
-    void later;
   });
 
   it("chunks one party's documents at the R16 cap", async () => {

@@ -921,6 +921,18 @@ export class DocumentStore {
    * Trustworthy for stamping because every append site rules on admissibility before
    * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
    */
+  /** SYNC-P5 (review F6) — per-sender envelope counts without hauling payload blobs. */
+  envelopeCountsBySender(ownerAgentId: string, documentId: string): Map<string, number> {
+    const rows = this.#db
+      .prepare(
+        `SELECT sender_agent_id, COUNT(*) AS n FROM document_envelopes
+          WHERE owner_agent_id = ? AND document_id = ?
+          GROUP BY sender_agent_id`,
+      )
+      .all(ownerAgentId, documentId) as Array<{ sender_agent_id: string; n: number }>;
+    return new Map(rows.map((r) => [r.sender_agent_id, r.n]));
+  }
+
   /** SYNC-P5 — record what a party's exchange just showed us (display cache; see the table). */
   recordPartyView(
     ownerAgentId: string,

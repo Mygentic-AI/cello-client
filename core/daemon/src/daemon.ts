@@ -1358,7 +1358,7 @@ async function startDaemonHoldingLock(
     const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
     // SYNC-P5 (R39): a session coming up IS the party-became-reachable signal — every shared
     // document gets a reconcile attempt, and the scheduler's backoff resets (they just answered).
-    if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && (state === "created" || state === "active")) {
+    if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && state === "created") {
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId !== null) {
         void reconcileScheduler
@@ -3141,6 +3141,21 @@ async function startDaemonHoldingLock(
     handlers,
     logger,
     sessionNodeManager,
+    // SYNC-P5 (R39, review F5): the INITIATOR-side reachable trigger — the inbound side fires
+    // from the session-state dispatch; without this half, only the answering daemon reconciled
+    // on session-up and the initiator waited out a sweep interval.
+    onSessionOpened: (agentName, counterpartyPubkey) => {
+      if (!reconcileScheduler || !documentOwnerKeyForHook) return;
+      const ownerAgentId = documentOwnerKeyForHook(agentName);
+      if (ownerAgentId === null) return;
+      void reconcileScheduler
+        .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
+        .catch((err: unknown) => {
+          logger.warn("document.reconcile.reachable_trigger_failed", {
+            agentName, reason: err instanceof Error ? err.message : String(err),
+          });
+        });
+    },
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -3871,10 +3886,22 @@ async function startDaemonHoldingLock(
     Number.isFinite(reconcileTickOverride) && reconcileTickOverride >= 250
       ? reconcileTickOverride
       : 120_000;
-  let reconcileSweepRunning = false;
+  // Review F2: the guard is TIME-STAMPED, not a bare boolean — a pass that never settles (a
+  // dial with no timeout) would otherwise end the sweep silently for the daemon's lifetime,
+  // the exact R42 stall one level above the module that fixed it. Past the bound the wedge is
+  // WARNED and the guard force-released; the abandoned pass's own scheduler marks are
+  // themselves time-bounded, so double-attempts are latency, never correctness.
+  const RECONCILE_PASS_BOUND_MS = 5 * 60_000;
+  let reconcileSweepStartedAt: number | null = null;
   const reconcileSweepTimer = setInterval(() => {
-    if (reconcileSweepRunning) return;
-    reconcileSweepRunning = true;
+    if (reconcileSweepStartedAt !== null) {
+      if (Date.now() - reconcileSweepStartedAt < RECONCILE_PASS_BOUND_MS) return;
+      logger.warn("document.reconcile.sweep_wedged", {
+        heldMs: Date.now() - reconcileSweepStartedAt,
+        impact: "a sweep pass never settled; the guard is force-released so sweeping continues",
+      });
+    }
+    reconcileSweepStartedAt = Date.now();
     void (async () => {
       try {
         for (const agentName of perAgentSignaling.keys()) {
@@ -3890,7 +3917,7 @@ async function startDaemonHoldingLock(
           reason: err instanceof Error ? err.message : String(err),
         });
       } finally {
-        reconcileSweepRunning = false;
+        reconcileSweepStartedAt = null;
       }
     })();
   }, RECONCILE_SWEEP_MS);

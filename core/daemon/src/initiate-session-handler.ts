@@ -19,6 +19,11 @@ import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { IAutoNatService } from "@cello-protocol/transport";
 
 export interface InitiateSessionDeps {
+  /**
+   * SYNC-P5 (R39, review F5): an OUTBOUND session succeeding is the initiator-side
+   * party-became-reachable signal — fired after the session is usable, best-effort.
+   */
+  onSessionOpened?(agentName: string, counterpartyPubkey: string): void;
   handlers: Map<string, IpcHandler>;
   logger: Logger;
   sessionNodeManager: SessionNodeManager;
@@ -223,6 +228,7 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
 
     // AC-007: the session is usable immediately upon (relay) connection — the dcutr
     // upgrade runs in the background and is intentionally NOT awaited here.
+    deps.onSessionOpened?.(agentName, counterpartyPubkey);
     return { ok: true, sessionId, transportMode: result.mode, correlationId };
   }
 

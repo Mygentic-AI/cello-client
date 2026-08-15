@@ -474,13 +474,15 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     for (const [author, mark] of amendments.watermarks(ownerAgentId, documentId)) {
       if (mark.seq > (view.govSeqs[author] ?? 0)) behind = true;
     }
-    const log = store.getEnvelopeLog(ownerAgentId, documentId);
-    const counts = new Map<string, number>();
-    for (const row of log) counts.set(row.senderAgentId, (counts.get(row.senderAgentId) ?? 0) + 1);
-    for (const [author, count] of counts) {
+    for (const [author, count] of store.envelopeCountsBySender(ownerAgentId, documentId)) {
       if (count > (view.contentCounts[author] ?? 0)) behind = true;
     }
-    const blockedBy = view.refused.find((hash) => log.some((row) => row.docPrevHash === hash));
+    const blockedBy =
+      view.refused.length === 0
+        ? undefined
+        : view.refused.find((hash) =>
+            store.getEnvelopeLog(ownerAgentId, documentId).some((row) => row.docPrevHash === hash),
+          );
     return {
       sync: behind ? "behind" : "in_sync",
       lastSyncedAtMs: view.lastExchangeMs,
@@ -933,22 +935,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           });
         }
       }
-      // SYNC-P5 (spec §9): the block's position IS what this party last claimed — recorded as
-      // the display cache the list surface reads (in_sync|behind|unseen). Never consulted for
-      // correctness (R44).
-      if (store.getDocument(ownerAgentId, block.document_id)) {
-        store.recordPartyView(
-          ownerAgentId,
-          block.document_id,
-          senderAgentId,
-          {
-            govSeqs: Object.fromEntries(block.governance.map((g) => [g.author, g.seq])),
-            contentCounts: Object.fromEntries(block.content.map((c) => [c.author, c.count])),
-            refused: [...block.refused],
-          },
-          nowMs,
-        );
-      }
       // SYNC-R35: the sender's SIGNED refusal records — verified against their named refuser
       // and recorded as received rejections, exactly as a directly-sent frame would be. This is
       // how a third holder wedged behind a refused hash learns its name and reason (F5/F8), and
@@ -994,6 +980,23 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         }
       }
       const answer = respondToReconcile(reads, senderAgentId, block, replyBudget);
+      // SYNC-P5 (spec §9): the block's position IS what this party last claimed — recorded as
+      // the display cache the list surface reads (in_sync|behind|unseen). AFTER the entitlement
+      // ruling (P5 review F9): a stranger's claimed position is not worth a row. Never consulted
+      // for correctness (R44).
+      if (!answer.block.refusal && store.getDocument(ownerAgentId, block.document_id)) {
+        store.recordPartyView(
+          ownerAgentId,
+          block.document_id,
+          senderAgentId,
+          {
+            govSeqs: Object.fromEntries(block.governance.map((g) => [g.author, g.seq])),
+            contentCounts: Object.fromEntries(block.content.map((c) => [c.author, c.count])),
+            refused: [...block.refused],
+          },
+          nowMs,
+        );
+      }
       if (answer.block.refusal) {
         // Per-document, on the block (review F4) — a batch never silences one document's no.
         logger.warn("document.reconcile.refused", {

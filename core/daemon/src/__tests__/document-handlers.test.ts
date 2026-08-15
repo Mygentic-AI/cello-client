@@ -1581,6 +1581,30 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     await until(() => fA.layer.store.getDocument(fA.owner, documentId)!.status === "closed");
   });
 
+  it("sweepTargets: an ended document contributes NOTHING — quiescence is derived, not scheduled around (R43/AC18)", async () => {
+    const { fA, fB, fC, documentId } = await threeSeated();
+    const before = fA.layer.sweepTargets(fA.owner);
+    expect(before.get(fB.owner)).toContain(documentId);
+    expect(before.get(fC.owner)).toContain(documentId);
+
+    const killed = await fA.call("cello_doc_kill", { document_id: documentId });
+    expect(killed.ok, JSON.stringify(killed)).toBe(true);
+    // A converged-and-ended document MUST reach a quiescent state with no periodic traffic:
+    // the sweep's target map simply no longer contains it, for any party.
+    const after = fA.layer.sweepTargets(fA.owner);
+    expect(after.get(fB.owner) ?? []).not.toContain(documentId);
+    expect(after.get(fC.owner) ?? []).not.toContain(documentId);
+  });
+
+  it("sweepTargets: an underivable chain contributes NOTHING — the sweep never guesses at seats", async () => {
+    const { fA, fB, documentId } = await threeSeated();
+    fA.layer.store.rawDb
+      .prepare(`UPDATE document_entries SET received_bytes = ? WHERE document_id = ?`)
+      .run(new Uint8Array([0xff, 0xff, 0xff]), documentId);
+    const targets = fA.layer.sweepTargets(fA.owner);
+    expect(targets.get(fB.owner) ?? []).not.toContain(documentId);
+  });
+
   it("a CLOSED projection REOPENS when a concurrent admission arrives — the column follows the fold both ways (review F2)", async () => {
     // A closes, then invites D before ever seeing the other closes — legal on A's daemon, whose
     // world is not ended yet. B, holding all three closes, projects "closed". When A's invite

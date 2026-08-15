@@ -1388,9 +1388,27 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           layer.verifySignature,
         );
         if (!derived.ok) return [];
+        // Review F1 (P5): the genesis peer can refuse BEFORE ever holding the document, so no
+        // refuse_join entry exists anywhere — their signed answer lives on the handshake record.
+        // Without this read, a refused proposal rendered "pending" forever while the same
+        // daemon's publish gate knew "they said no" — two surfaces of one daemon contradicting.
         const open = [...derived.state.invited]
           .filter((seat) => seat !== who.ownerAgentId)
-          .map((seat) => ({ documentId: d.documentId, inviteeAgentId: seat, state: "pending" as const }));
+          .map((seat) => {
+            if (
+              seat === genesisRecord.peerAgentId &&
+              genesisRecord.proposerAgentId === who.ownerAgentId &&
+              genesisRecord.peerAccepted === false
+            ) {
+              return {
+                documentId: d.documentId,
+                inviteeAgentId: seat,
+                state: "refused" as const,
+                ...(genesisRecord.peerReason ? { reason: genesisRecord.peerReason } : {}),
+              };
+            }
+            return { documentId: d.documentId, inviteeAgentId: seat, state: "pending" as const };
+          });
         const refusedSeats = chain
           .filter((e) => e.body.kind === "refuse_join")
           .map((e) => e.body.subject_agent_id)

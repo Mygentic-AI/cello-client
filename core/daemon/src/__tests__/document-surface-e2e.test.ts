@@ -621,13 +621,16 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
     );
     await b.call("cello_doc_refuse", { document_id: documentId, reason: "wrong document type" });
 
-    await vi.waitFor(() => {
-      // Distinguishable from "not yet answered", which is the whole point: those two want
-      // opposite actions from the operator. The signed reason is on the handshake record.
-      expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(false);
-      expect(a.layer.handshake.get(a.owner, documentId)?.peerReason).toBe(
-        "wrong document type",
+    await vi.waitFor(async () => {
+      // Distinguishable from "not yet answered" ON THE SURFACE (P5 review F1): those two want
+      // opposite actions from the operator, and a refusal the operator cannot see leaves them
+      // waiting on nobody. The refused genesis peer holds no document and authors no entry, so
+      // the signed answer surfaces from the handshake record into the invitation ledger.
+      const list = await a.call("cello_doc_list");
+      const offer = ((list.joinOffers as Array<Record<string, unknown>> | undefined) ?? []).find(
+        (o) => o.documentId === documentId,
       );
+      expect(offer).toMatchObject({ state: "refused", reason: "wrong document type" });
     });
   });
 
