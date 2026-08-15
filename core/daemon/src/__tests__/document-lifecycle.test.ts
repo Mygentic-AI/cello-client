@@ -19,8 +19,6 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import {
-  documentAmendmentHash,
-  encodeDocumentAmendment,
 } from "@cello-protocol/protocol-types";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
 import { DocumentEngine } from "../document-engine.js";
@@ -49,7 +47,6 @@ function envelope(sender: string, prev: string | null, payload: Uint8Array | nul
     documentId: DOC,
     senderAgentId: sender,
     docPrevHash: prev,
-    epochId: 0,
     signature: new Uint8Array(64),
     stateVector: new Uint8Array([0]),
     payload: payload ?? update("some text. "),
@@ -78,27 +75,16 @@ function newFixture() {
     properties: { append_only: false }, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
-  const notified: Array<{ documentId: string; verb: string }> = [];
-  const rolledBack: string[] = [];
+  // SYNC-P4: closes are ENTRIES and the pending question is answered by the derivation on the
+  // layer; this unit only ever sees the injected answer.
+  const state = { ended: null as "closed" | "killed" | null, derived: true };
   const lifecycle = new DocumentLifecycle(
-    store,
-    logger,
-    {
-      notifyPeer: async (documentId, verb) => {
-        notified.push({ documentId, verb });
-        // The per-holder map is the notifier's answer now (DOD-MP-CONTROL-N-1). A bare `{ok: true}`
-        // stub is what this fixture used to return, and it is worth naming: `peerNotified` folds
-        // this map, so a stub with no entries would report "nobody was told" here and a stub that
-        // hardcodes success would hide a fan-out that reached nobody.
-        return { ok: true, holdersNotified: { [PEER]: true } };
-      },
-    },
-    (_a, _d, envelopeHash) => {
-      rolledBack.push(envelopeHash);
-      return { ok: true };
-    },
+    store, logger,
+    () => false,
+    () => false,
+    () => ({ derived: state.derived, ended: state.ended }),
   );
-  return { store, engine, lifecycle, events, notified, rolledBack, db };
+  return { store, engine, lifecycle, events, db, state };
 }
 
 describe("DocumentLifecycle — list", () => {
@@ -112,235 +98,18 @@ describe("DocumentLifecycle — list", () => {
       peerAgentId: PEER,
       documentType: "markdown",
       status: "active",
-      pendingDeliveries: 1,
     });
     // Tier is constant in V1; epoch is DERIVED since M14B / AMEND-1 — 0 here because this
     // document has no amendments, not because anything is hardcoded.
     expect(row!.assuranceTier).toBe("authenticated");
-    expect(row!.epochId).toBe(0);
   });
 
-  it("reports the CURRENT epoch once the document has amendments — not a constant", () => {
-    // A DECODABLE row — the list's removal overlay and the membership walk decode every stored
-    // amendment, and a garbage blob is a state no real daemon can hold (validate-before-append).
-    const f = newFixture();
-    const body = {
-      document_id: DOC,
-      epoch_id: 2,
-      prev_amendment_hash: null,
-      kind: "add_holder",
-      subject_agent_id: "f".repeat(64),
-      property_change: null,
-      state_hash: null,
-      authored_at_ms: 1,
-      author_agent_id: "a".repeat(64),
-      author_seq: 1,
-      parents: [],
-    } as const;
-    const hash = documentAmendmentHash(body);
-    const bytes = encodeDocumentAmendment({
-      body,
-      collection: {
-        document_id: DOC,
-        subject_kind: "document_amendment",
-        subject_hash: hash,
-        required_signers: ["a".repeat(64)],
-        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
-      },
-    });
-    f.db.prepare(
-      `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
-          received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 2, Buffer.from(bytes), 1);
-    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
-    expect(row!.epochId).toBe(2);
-  });
-
-  it("a removed owner's row says so — the overlay is derived, the stored status stays active", () => {
-    const f = newFixture();
-    const body = {
-      document_id: DOC,
-      epoch_id: 1,
-      prev_amendment_hash: null,
-      kind: "remove_holder",
-      subject_agent_id: AGENT,
-      property_change: null,
-      state_hash: null,
-      authored_at_ms: 1,
-      author_agent_id: "a".repeat(64),
-      author_seq: 1,
-      parents: [],
-    } as const;
-    const hash = documentAmendmentHash(body);
-    const bytes = encodeDocumentAmendment({
-      body,
-      collection: {
-        document_id: DOC,
-        subject_kind: "document_amendment",
-        subject_hash: hash,
-        required_signers: ["a".repeat(64)],
-        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
-      },
-    });
-    f.db.prepare(
-      `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
-          received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 1, Buffer.from(bytes), 1);
-    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
-    expect((row as unknown as { removed?: boolean }).removed).toBe(true);
-    expect(row!.status).toBe("active");
-    expect(f.lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
-  });
-
-  it("counts only what is actually pending, not the whole log", () => {
-    const f = newFixture();
-    const a = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, a);
-    f.store.appendEnvelope(AGENT, envelope(PEER, null));
-    f.store.markAcked(AGENT, DOC, a.envelopeHash, NOW);
-
-    // The peer's envelope is not ours to deliver, and ours was acked. "1 update pending" when
-    // nothing is pending is the kind of number an operator stops trusting.
-    expect(f.lifecycle.list(AGENT, NOW)[0]!.pendingDeliveries).toBe(0);
-  });
-});
-
-describe("DocumentLifecycle — close is BILATERAL", () => {
-  it("stays open until BOTH sides have closed", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-
-    // One side's close is a request, not a conclusion. Marking it closed here would tell this
-    // operator the collaboration ended while the peer is still writing into it.
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
-    expect(f.lifecycle.list(AGENT, NOW)[0]!.closePending).toBe(true);
-  });
-
-  it("closes once the peer's close arrives too", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(true);
-
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("closed");
-  });
-
-  it("closes when the PEER asks first and we then agree", async () => {
-    const f = newFixture();
-    f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW);
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
-
-    await f.lifecycle.close(AGENT, DOC, NOW + 1);
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("closed");
-  });
-
-  it("a repeated close from one side does not stand in for the other's", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    await f.lifecycle.close(AGENT, DOC, NOW + 1);
-    // Counting closes rather than distinguishing WHO closed would let one party close a document
-    // unilaterally by asking twice.
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
-  });
-
-  it("refuses publishing into a closed document, saying so", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1);
-
-    const verdict = f.lifecycle.canPublish(AGENT, DOC);
-    expect(verdict.ok).toBe(false);
-    expect((verdict as { reason: string }).reason).toBe("document_closed");
-  });
-});
-
-describe("DocumentLifecycle — kill is UNILATERAL, and honest about what it cannot do", () => {
-  it("stops accepting and publishing, notifies the peer, and KEEPS the local copy and log", async () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-
-    const res = await f.lifecycle.kill(AGENT, DOC, NOW);
-    expect(res.ok).toBe(true);
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("killed");
-    expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(false);
-    expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(false);
-    // Retained, not deleted. The log is the evidence of what was exchanged, and a kill that
-    // destroys it destroys the operator's own record along with it.
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
-    expect(f.notified).toEqual([{ documentId: DOC, verb: "kill" }]);
-  });
-
-  it("states plainly that the peer keeps what it holds", async () => {
-    const f = newFixture();
-    const res = await f.lifecycle.kill(AGENT, DOC, NOW);
-    // The one thing an operator is most likely to assume a kill does is the one thing it cannot
-    // do. Leaving that unsaid is a promise the protocol does not keep.
-    expect((res as { note: string }).note).toContain("keeps what it holds");
-  });
-
-  it("still kills when the peer cannot be notified — the local decision does not depend on them", async () => {
-    const { logger, events } = recordingLogger();
-    const db = new DatabaseSync(":memory:");
-    const store = new DocumentStore(db, logger);
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
-    const lifecycle = new DocumentLifecycle(
-      store,
-      logger,
-      { notifyPeer: async () => ({ ok: false, reason: "peer_offline" }) },
-      () => ({ ok: true }),
-    );
-
-    const res = await lifecycle.kill(AGENT, DOC, NOW);
-    expect(res.ok).toBe(true);
-    expect(store.getDocument(AGENT, DOC)!.status).toBe("killed");
-    // But it is REPORTED — a kill the peer never heard about leaves them publishing into a
-    // document that will never answer, and the operator should know that happened.
-    expect((res as { peerNotified: boolean }).peerNotified).toBe(false);
-    expect(events.some((e) => e.event === "document.kill.peer_not_notified")).toBe(true);
-  });
-});
-
-describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => {
-  it("writes a withdrawal record BESIDE the original, which is marked and never deleted", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(true);
-
-    const log = f.store.getEnvelopeLog(AGENT, DOC);
-    // The original is still there with its payload. "Marked, never deleted" is what keeps the log
-    // verifiable — a hole in an append-only log is indistinguishable from tampering.
-    expect(log.find((r) => r.envelopeHash === e.envelopeHash)!.payload).not.toBeNull();
-    // And the record is NOT an envelope. As one it advanced our per-sender chain over a node the
-    // peer will never hold — a withdrawal is never delivered — so our next update chained onto
-    // something they had never seen and they refused it as document_chain_broken, sending an
-    // operator to the chain layer for a withdrawal-scoping bug.
-    expect(log.filter((r) => r.kind === "withdrawal")).toHaveLength(0);
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
-  });
-
-  it("ROLLS BACK locally — the operator's own document no longer contains it", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-
-    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
-    // The clause is "local rollback + a withdrawal record". Only the record shipped, so the
-    // operator was told their update was withdrawn while their own file still contained it —
-    // replay applies every update payload in order, so it came back on every rebuild forever.
-    expect(f.rolledBack).toEqual([e.envelopeHash]);
-  });
-
-  it("REFUSES rather than reporting success when the rollback did not happen", () => {
+  
+  it("a removed owner's row says so — the overlay comes from the INJECTED derivation, the stored status stays active", () => {
+    // SYNC-D8: "was this owner written out?" is the layer's one fold-derived answer, injected
+    // here; this unit's job is only the plumbing — the overlay on the row, the named publish
+    // refusal, and the stored status staying untouched. The derivation itself is pinned in the
+    // derive and handlers suites.
     const { logger } = recordingLogger();
     const db = new DatabaseSync(":memory:");
     db.exec("PRAGMA foreign_keys = ON");
@@ -349,66 +118,13 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
-    const lifecycle = new DocumentLifecycle(
-      store, logger,
-      { notifyPeer: async () => ({ ok: true, holdersNotified: { [PEER]: true } }) },
-      () => ({ ok: false, reason: "nothing_tracked" }),
-    );
-    const e = envelope(AGENT, null);
-    store.appendEnvelope(AGENT, e);
-
-    const res = lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_withdraw_rollback_failed");
+    const lifecycle = new DocumentLifecycle(store, logger, () => false, () => true, () => ({ derived: true, ended: null }));
+    const row = lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
+    expect((row as unknown as { removed?: boolean }).removed).toBe(true);
+    expect(row!.status).toBe("active");
+    expect(lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
   });
 
-  it("refuses a SECOND withdrawal of the same envelope instead of reporting success", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
-    const second = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(second.ok).toBe(false);
-    expect((second as { reason: string }).reason).toBe("document_already_withdrawn");
-  });
-
-  it("REFUSES to withdraw an update the peer already has", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    f.store.markAcked(AGENT, DOC, e.envelopeHash, NOW);
-
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    // Withdrawing a delivered update would tell the operator their content was retracted when the
-    // peer is holding it. That is the promise a protocol cannot make, and saying so is the feature.
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_already_delivered");
-  });
-
-  it("refuses to withdraw someone else's envelope", () => {
-    const f = newFixture();
-    const e = envelope(PEER, null);
-    f.store.appendEnvelope(AGENT, e);
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_not_author");
-  });
-
-  it("refuses to withdraw an envelope that is not there, rather than writing a dangling record", () => {
-    const f = newFixture();
-    const res = f.lifecycle.withdraw(AGENT, DOC, "ff".repeat(32), NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_envelope_unknown");
-  });
-
-  it("the withdrawn update no longer counts as pending delivery", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    // Otherwise the delivery worker ships the very update that was just withdrawn.
-    expect(f.store.pendingDeliveries(AGENT, NOW + 1_000_000)).toHaveLength(0);
-  });
 });
 
 describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
@@ -424,27 +140,18 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
     expect((verdict as { detail: string }).detail).toMatch(/paused/);
   });
 
-  it("a paused agent STILL admits incoming updates, mechanically", () => {
-    const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
-    // Refusing inbound would make the pause visible to the peer as a protocol fault and would
-    // force a rejection round for something that is not the peer's doing.
-    expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
-  });
-
   it("a paused agent suppresses notifications", () => {
     const f = newFixture();
     f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     expect(f.lifecycle.shouldNotify(AGENT)).toBe(false);
   });
 
-  it("unpausing resumes all three", () => {
+  it("unpausing resumes publish and notifications", () => {
     const f = newFixture();
     f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     f.lifecycle.setPlatformPaused(AGENT, false, NOW + 1);
 
     expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(true);
-    expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
     expect(f.lifecycle.shouldNotify(AGENT)).toBe(true);
   });
 
@@ -458,54 +165,14 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
 });
 
 
-describe("DocumentLifecycle — a close only counts from the document's ACTUAL peer", () => {
-  it("refuses a close from anyone else, and the document stays open", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-
-    const res = f.lifecycle.recordPeerClose(AGENT, DOC, "someone-else", NOW + 1);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_close_not_peer");
-    // The closer id was written as `closed_by` and settled against ITSELF, so any second distinct
-    // string plus our own close flipped the document closed — the bilateral guarantee the whole
-    // table exists to protect, bypassed by passing a different string twice.
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
-  });
-
-  it("refuses a close for a document that does not exist", () => {
-    const f = newFixture();
-    const res = f.lifecycle.recordPeerClose(AGENT, "ff".repeat(32), PEER, NOW);
-    expect(res.ok).toBe(false);
-    // There is no foreign key on this table, and setDocumentStatus on a missing row updates zero
-    // rows and returns silently — so an unchecked write leaves an orphan and no signal.
-    expect((res as { reason: string }).reason).toBe("document_unknown");
-  });
-});
-
-describe("DocumentLifecycle — a close does not overwrite an ending the operator chose", () => {
-  it("a peer close arriving after a KILL leaves the document killed", async () => {
-    const f = newFixture();
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    await f.lifecycle.kill(AGENT, DOC, NOW + 1);
-    f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 2);
-
-    // "Closed by agreement" is a different fact from "I ended this", and it is the one the
-    // operator did not choose.
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("killed");
-  });
-});
-
 describe("DocumentLifecycle — a STALLED document is terminal too", () => {
-  it("refuses publish and admit, naming the stall", () => {
+  it("refuses publish, naming the stall", () => {
     const f = newFixture();
     f.store.setDocumentStatus(AGENT, DOC, "stalled");
-
-    for (const verdict of [f.lifecycle.canPublish(AGENT, DOC), f.lifecycle.canAdmit(AGENT, DOC)]) {
-      expect(verdict.ok).toBe(false);
-      // REJECT-1 stalls a document after its retry rounds. Two partial gates that each know half
-      // the terminal states is how a caller ends up wrong about the other half.
-      expect((verdict as { reason: string }).reason).toBe("document_stalled");
-    }
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    // REJECT-1 stalls a document after its retry rounds; the refusal names the stall's two causes.
+    expect((verdict as { reason: string }).reason).toBe("document_stalled");
   });
 });
 
@@ -522,57 +189,41 @@ describe("DocumentLifecycle — the pause records WHEN", () => {
   });
 });
 
-describe("DOD-MP-CLOSE-N-1 — 'cannot answer' is TWO facts, and they get different answers", () => {
-  /**
-   * The first cut folded both into one null. Refusing both broke every genuine pre-amendment
-   * document — it could then never be closed by anyone, which the bilateral suite above caught.
-   * Standing in for both restored the defect this unit exists to remove. Only one of them is legacy.
-   */
-  function withVerdict(verdict: import("../document-lifecycle.js").HolderVerdict) {
-    const db = new DatabaseSync(":memory:");
-    db.exec("PRAGMA foreign_keys = ON");
-    const events: string[] = [];
-    const rec = (e: string) => { events.push(e); };
-    const logger = { debug: rec, info: rec, warn: rec, error: rec } as unknown as Logger;
-    const store = new DocumentStore(db, logger);
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
-    const lifecycle = new DocumentLifecycle(
-      store, logger,
-      { notifyPeer: async () => ({ ok: true, holdersNotified: { [PEER]: true } }) },
-      () => ({ ok: true }),
-      undefined,
-      () => verdict,
-    );
-    return { store, lifecycle, events };
-  }
-
-  it("LEGACY (no chain at all) settles on the genesis pair — the pre-amendment document still works", async () => {
-    const f = withVerdict({ kind: "legacy" });
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(true);
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("closed");
+describe("endings gate publish through the FOLD — the column stands in only for legacy (review F2)", () => {
+  it("a DERIVED closed ending refuses publish, whatever the column says", () => {
+    const f = newFixture();
+    f.state.ended = "closed";
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_closed");
   });
 
-  it("UNKNOWN (a chain that will not replay) refuses to settle, and says so", async () => {
-    const f = withVerdict({ kind: "unknown", reason: "document_chain_underivable" });
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    // The peer's close is refused by the gate — a chain we cannot read may have removed them.
-    expect(f.lifecycle.recordPeerClose(AGENT, DOC, PEER, NOW + 1).ok).toBe(false);
-    // And even the local half does not settle it: standing in the pair here would complete a
-    // document that may have a third holder nobody can see.
-    expect(f.store.getDocument(AGENT, DOC)!.status).toBe("active");
-    expect(f.events).toContain("document.close.holders_underivable");
+  it("a DERIVED killed ending refuses publish, and the log is KEPT — a kill never destroys the record", () => {
+    const f = newFixture();
+    const e = envelope(AGENT, null);
+    f.store.appendEnvelope(AGENT, e);
+    f.state.ended = "killed";
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_killed");
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
   });
 
-  it("UNKNOWN reports closePending TRUE — 'still waiting' is the safe answer, 'nothing pending' is not", async () => {
-    const f = withVerdict({ kind: "unknown", reason: "document_chain_underivable" });
-    await f.lifecycle.close(AGENT, DOC, NOW);
-    const row = f.lifecycle.list(AGENT).find((r) => r.documentId === DOC)!;
-    // Reporting false would tell an operator this document needs nothing from anyone, when in
-    // fact nothing can settle it until the chain is readable again.
-    expect(row.closePending).toBe(true);
+  it("a stale closed COLUMN does not refuse when the fold derives the document live", () => {
+    // The F2 shape: a concurrently-arriving admission re-opened the derivation, and the column
+    // lagged. The publish gate asks the fold, so the lag costs nothing.
+    const f = newFixture();
+    f.store.setDocumentStatus(AGENT, DOC, "closed");
+    f.state.ended = null;
+    expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(true);
+  });
+
+  it("a LEGACY document (no derivation) is judged by its column — that record IS its ending", () => {
+    const f = newFixture();
+    f.state.derived = false;
+    f.store.setDocumentStatus(AGENT, DOC, "killed");
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_killed");
   });
 });

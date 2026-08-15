@@ -71,17 +71,12 @@ import {
   decodeCbor,
   decodeDocumentReconcile,
   decodeDocumentUpdateEnvelope,
-  decodeDocumentAck,
   decodeDocumentProposal,
   decodeDocumentRejection,
   decodeDocumentProposalAck,
-  decodeDocumentControl,
-  decodeDocumentJoinOffer,
-  decodeDocumentJoinAnswer,
   decodeDocumentAmendment,
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
-import type { DocumentAckInbound } from "./document-ack-inbound.js";
 import type { Logger } from "./types.js";
 
 /**
@@ -93,13 +88,9 @@ import type { Logger } from "./types.js";
 /** Every document frame kind that can arrive on the session channel. */
 export type DocumentFrameKind =
   | "update"
-  | "ack"
   | "proposal"
   | "rejection"
   | "proposal_ack"
-  | "control"
-  | "join_offer"
-  | "join_answer"
   | "amendment"
   | "reconcile";
 
@@ -121,7 +112,6 @@ export type FrameClassification =
 
 export interface DocumentFrameRouterDeps {
   inbound: DocumentInbound;
-  ackInbound: DocumentAckInbound;
   /**
    * Record an arriving PROPOSAL. Without this a proposal frame is not document traffic as far as
    * the router is concerned, so it falls through to the conversation path and lands in the
@@ -141,14 +131,10 @@ export interface DocumentFrameRouterDeps {
    * conversation path and the operator keeps publishing into a document that will never answer,
    * with nothing on their screen explaining why.
    */
-  recordControl(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * M14B / DOD-MP-JOIN-1 — an admin's offer to a third party. Validated (the invitee REPLAYS the
    * carried bytes) and recorded — pending or refused-with-reason, never dropped.
    */
-  recordJoinOffer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
-  /** The invitee's signed answer to an offer we authored. Settle-once. */
-  recordJoinAnswer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * An amendment reaching an EXISTING holder — validated against our own chain
    * (validate-before-append) and appended, so our derived participant set does not silently
@@ -196,17 +182,6 @@ export interface DocumentFrameRouterDeps {
   noticeInboundUpdate(ownerAgentId: string, inResponseTo: Uint8Array): void;
   /** Put an already-signed frame on the wire to whoever authored `wire` — the rejection, today. */
   sendFrameToPeer(ownerAgentId: string, inResponseTo: Uint8Array, bytes: Uint8Array): Promise<void>;
-  sendAck(
-    ownerAgentId: string,
-    /** The envelope as it arrived — the document id and the party to answer are both inside it. */
-    wire: Uint8Array,
-    outcome: {
-      envelopeHash: string;
-      admitted: boolean;
-      rejectionReason?: string;
-      correlationId: string;
-    },
-  ): Promise<void>;
   /**
    * Map the daemon's AGENT NAME — the only identifier the session content path carries — to the
    * stable owner key every document row is scoped by (M14-D5: our own K_local pubkey hex).
@@ -391,31 +366,7 @@ export class DocumentFrameRouter {
           });
         }
         if (res.ok) {
-          // ANSWER THE SENDER. Nothing did, and `encodeDocumentAck` had no production caller at all
-          // — the frame type, the preimage and the receiving half all existed and no code path ever
-          // produced one. The layer's own header names this as a distinct silent failure: an
-          // inbound path with no ack producer leaves the peer retrying until their document stalls
-          // at the unacked ceiling, and every redelivery re-triggers their gate.
-          //
-          // A REJECTION IS AN ACK. `admitted: false` says the peer has decided, so the sender stops
-          // retrying and supersedes instead — modelling it as "no ack" is what makes a refused
-          // envelope redeliver forever.
-          //
-          // A DUPLICATE IS ACKED TOO, and that is the case that matters most here: a redelivery is
-          // usually evidence the first ack was lost, so staying silent about it guarantees the loop
-          // never ends.
-          // NOT AWAITED, deliberately. This runs inside the per-owner queue, and that queue exists
-          // to serialize the CHAIN CHECK — an envelope's predecessor must be stored before the next
-          // is examined. It does not exist to serialize network I/O. Awaiting a dial here means one
-          // slow or unreachable peer stalls every subsequent inbound frame for that agent, and the
-          // symptom is not "the ack was slow": it is documents failing to converge, minutes later,
-          // for no reason visible at the point of failure. Measured — it turned a 7-second live run
-          // into a 124-second timeout.
-          //
-          // The ack is best-effort by contract anyway: it cannot fail the content we have already
-          // admitted, and a lost one is recovered by the sender's redelivery, which is acked in
-          // turn.
-          // THE SIGNED REFUSAL ITSELF, when there is one. The ack says "refused"; this frame is what
+          // THE SIGNED REFUSAL ITSELF, when there is one. This frame is what
           // advances the SENDER's retry round, and their entire supersede-then-stall protocol is
           // driven by receiving it. Without it their counter never leaves zero and a peer whose
           // every update is refused republishes forever, with its own surface reporting `active`.
@@ -432,41 +383,10 @@ export class DocumentFrameRouter {
                 });
               });
           }
-          void this.#d.sendAck(ownerAgentId, content, {
-            envelopeHash: res.envelopeHash,
-            admitted: res.admitted,
-            ...(res.admitted ? {} : { rejectionReason: res.rejectionReason }),
-            correlationId,
-          }).catch((err: unknown) => {
-            // Contained: an unhandled rejection out of a fire-and-forget send takes the daemon down,
-            // and the one thing an ack must never do is cost us content we already hold.
-            this.#d.logger.warn("document.ack.send_threw", {
-              correlationId,
-              reason: err instanceof Error ? err.message : String(err),
-            });
-          });
         }
-        // A TERMINAL REFUSAL IS ALSO AN ANSWER. Everything above hangs off `res.ok`, and that was
-        // the whole bug: a refusal the sender can never fix produced no ack at all, so their
-        // delivery never settled and the worker redelivered it on every tick, forever. The comment
-        // twenty lines up already named this failure mode and the code only covered the ok path.
-        //
-        // `terminal` is set exactly where redelivery cannot change the outcome AND the sender was
-        // authenticated first — see InboundResult. A non-terminal refusal deliberately stays
-        // silent, because there the retry IS the recovery path.
-        if (!res.ok && res.terminal === true && res.envelopeHash !== undefined) {
-          void this.#d.sendAck(ownerAgentId, content, {
-            envelopeHash: res.envelopeHash,
-            admitted: false,
-            rejectionReason: res.reason,
-            correlationId,
-          }).catch((err: unknown) => {
-            this.#d.logger.warn("document.ack.send_threw", {
-              correlationId,
-              reason: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
+        // SYNC-P4 (D4): no ack frame answers content anymore. An admitted envelope shows up in
+        // this holder's position at the next exchange — that IS the confirmation. A signed
+        // rejection (above) still travels, because it carries a decision, not a receipt.
         return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
       }
       if (kind === "proposal") {
@@ -481,18 +401,6 @@ export class DocumentFrameRouter {
         this.#d.recordProposalAck(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
       }
-      if (kind === "control") {
-        this.#d.recordControl(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
-      if (kind === "join_offer") {
-        this.#d.recordJoinOffer(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
-      if (kind === "join_answer") {
-        this.#d.recordJoinAnswer(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
       if (kind === "amendment") {
         this.#d.recordAmendment(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
@@ -503,8 +411,8 @@ export class DocumentFrameRouter {
         );
         return { consumed: true, kind, ok: rec.ok, reason: rec.reason };
       }
-      const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);
-      return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
+      // Exhaustive over the kind union — reaching here is a programming fault the catch reports.
+      throw new Error(`document_frame_unrouted: ${kind as string}`);
     } catch (err: unknown) {
       // Contained deliberately. The document layer refuses by returning a verdict, so reaching here
       // is a programming fault — and the cost of letting it escape is that a peer could stop the
@@ -570,7 +478,7 @@ function couldBeDocumentFrame(b: Uint8Array): boolean {
 }
 
 /**
- * `"update"`, `"ack"`, or `null` for "not document traffic".
+ * a frame kind, or `null` for "not document traffic".
  *
  * Guarded, then decode-based. The two document types are tried in turn and the first that decodes
  * wins; both decoders check a `type` discriminator before anything else, so neither can claim the
@@ -624,9 +532,6 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_update":
         decodeDocumentUpdateEnvelope(content);
         return "update";
-      case "document_ack":
-        decodeDocumentAck(content);
-        return "ack";
       case "document_proposal":
         decodeDocumentProposal(content);
         return "proposal";
@@ -636,15 +541,6 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_proposal_ack":
         decodeDocumentProposalAck(content);
         return "proposal_ack";
-      case "document_control":
-        decodeDocumentControl(content);
-        return "control";
-      case "document_join_offer":
-        decodeDocumentJoinOffer(content);
-        return "join_offer";
-      case "document_join_answer":
-        decodeDocumentJoinAnswer(content);
-        return "join_answer";
       case "document_amendment":
         decodeDocumentAmendment(content);
         return "amendment";

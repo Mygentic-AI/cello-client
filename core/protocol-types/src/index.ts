@@ -231,7 +231,6 @@ export { MONIKER_RE, validateMoniker } from "./moniker.js";
 export {
   DOCUMENT_UPDATE_DOMAIN,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   buildDocumentUpdateTbs,
   encodeDocumentUpdateEnvelope,
   decodeDocumentUpdateEnvelope,
@@ -257,23 +256,7 @@ export type {
   DocumentProperties,
   DocumentConsentState,
 } from "./document-proposal.js";
-export {
-  DOCUMENT_JOIN_OFFER_DOMAIN,
-  buildDocumentJoinOfferTbs,
-  encodeDocumentJoinOffer,
-  decodeDocumentJoinOffer,
-  validateDocumentJoinOffer,
-  arrangementGenesisFromProposal,
-} from "./document-join.js";
-export type { DocumentJoinOffer, JoinOfferValidation } from "./document-join.js";
-export {
-  DOCUMENT_JOIN_ANSWER_DOMAIN,
-  MAX_JOIN_REFUSAL_REASON_LENGTH,
-  buildDocumentJoinAnswerTbs,
-  encodeDocumentJoinAnswer,
-  decodeDocumentJoinAnswer,
-} from "./document-join-answer.js";
-export type { DocumentJoinAnswer } from "./document-join-answer.js";
+export { arrangementGenesisFromProposal } from "./document-proposal.js";
 export { documentGovernancePolicy } from "./document-governance.js";
 export type { GovernanceVerdict } from "./document-governance.js";
 export {
@@ -296,7 +279,11 @@ export type {
   SignerPolicy,
 } from "./document-amendment.js";
 export { MAX_ENTRY_PARENTS } from "./document-amendment.js";
-export { deriveDocumentState, checkEntryAdmissible } from "./document-derive.js";
+export {
+  deriveDocumentState,
+  deriveDocumentStateAt,
+  checkEntryAdmissible,
+} from "./document-derive.js";
 export {
   DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   MAX_RECONCILE_DOCUMENTS,
@@ -324,13 +311,6 @@ export type {
   MultisigStatus,
 } from "./document-multisig.js";
 export {
-  DOCUMENT_ACK_DOMAIN,
-  buildDocumentAckTbs,
-  encodeDocumentAck,
-  decodeDocumentAck,
-} from "./document-ack.js";
-export type { DocumentAck } from "./document-ack.js";
-export {
   encodeDocumentProposalAck,
   decodeDocumentProposalAck,
   buildDocumentProposalAckTbs,
@@ -340,17 +320,6 @@ export {
   MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
 } from "./document-proposal-ack.js";
 export type { DocumentProposalAck } from "./document-proposal-ack.js";
-export {
-  encodeDocumentControl,
-  decodeDocumentControl,
-  buildDocumentControlTbs,
-  assertDocumentControlConsistent,
-  DOCUMENT_CONTROL_DOMAIN,
-  DOCUMENT_CONTROL_VERSION,
-  DOCUMENT_CONTROL_VERBS,
-  MAX_CONTROL_REASON_LENGTH,
-} from "./document-control.js";
-export type { DocumentControl, DocumentControlVerb } from "./document-control.js";
 export {
   DOCUMENT_REJECTION_DOMAIN,
   DOCUMENT_REJECTION_VERSION,

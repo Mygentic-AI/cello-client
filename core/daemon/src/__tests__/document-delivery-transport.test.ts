@@ -1,14 +1,15 @@
 /**
- * DOD-DOC-DELIVERY-2 — the transport behind the delivery worker's seam (§16.4).
+ * DOD-DOC-DELIVERY-2 — the document frame carrier (§16.4). SYNC-P4: the delivery worker, the ack
+ * wait and the grace budget are deleted; what remains is session acquisition (reuse before open,
+ * opened-then-sealed), the reachability probe, and the suspect-session
+ * bypass — all exercised through `sendBytes`, the one send that survives.
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect } from "vitest";
 import {
   createDocumentDeliveryTransport,
-  DELIVERY_ACK_GRACE_MS,
   type DocumentTransportDeps,
 } from "../document-delivery-transport.js";
-import type { DocumentEnvelopeRow } from "../document-store.js";
 import type { Logger } from "../types.js";
 
 const AGENT = "agent-a";
@@ -23,19 +24,6 @@ function recordingLogger(): { logger: Logger; events: Array<{ event: string; fie
   const logger = { debug: push, info: push, warn: push, error: push, child: () => logger } as unknown as Logger;
   return { logger, events };
 }
-
-const envelope = {
-  envelopeHash: "11".repeat(32),
-  documentId: DOC,
-  senderAgentId: AGENT,
-  docPrevHash: null,
-  epochId: 0,
-  signature: new Uint8Array(64),
-  stateVector: new Uint8Array([0]),
-  payload: new Uint8Array([1, 2, 3]),
-  kind: "update" as const,
-  createdAtMs: 1,
-};
 
 function newTransport(over: Partial<DocumentTransportDeps> = {}) {
   const { logger, events } = recordingLogger();
@@ -62,23 +50,17 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
     sealSession: async (_a, sessionId) => {
       sealed.push(sessionId);
     },
-    encodeEnvelope: () => ({ bytes: new Uint8Array([9]), hash: new Uint8Array(32) }),
-    // Default: the peer answers immediately. Overridden per test to model a slow or silent one.
-    awaitAck: async () => ({ admitted: true }),
-    drainHeld: async () => {},
     logger,
     ...over,
   };
   return { transport: createDocumentDeliveryTransport(deps), events, opened, sends, sealed };
 }
 
-const deliverInput = (over: Partial<Parameters<ReturnType<typeof createDocumentDeliveryTransport>["deliver"]>[0]> = {}) => ({
+const sendInput = (over: Partial<Parameters<ReturnType<typeof createDocumentDeliveryTransport>["sendBytes"]>[0]> = {}) => ({
   peerAgentId: PEER,
   documentId: DOC,
-  envelope: envelope as DocumentEnvelopeRow,
+  bytes: new Uint8Array([9]),
   correlationId: "corr-1",
-  // The pass budget the worker hands down. Generous by default; individual tests shrink it.
-  ackGraceMs: 10_000,
   ...over,
 });
 
@@ -118,7 +100,7 @@ describe("delivery transport — reachability comes from discovery, not from a d
 describe("delivery transport — REUSE before open (§16.4)", () => {
   it("reuses the most recent active session and opens nothing", async () => {
     const t = newTransport({ activeSessionsWith: () => ["older", "newest"] });
-    const res = await t.transport.deliver(deliverInput());
+    const res = await t.transport.sendBytes(sendInput());
 
     expect(res).toMatchObject({ ok: true, sessionId: "newest", sessionOpened: false });
     // Opening is the expensive half — a negotiation, a dial and a seal — and a backlog for one
@@ -129,7 +111,7 @@ describe("delivery transport — REUSE before open (§16.4)", () => {
 
   it("opens one only when there is nothing to reuse, and says it opened", async () => {
     const t = newTransport();
-    const res = await t.transport.deliver(deliverInput());
+    const res = await t.transport.sendBytes(sendInput());
     expect(res).toMatchObject({ ok: true, sessionId: "opened-session", sessionOpened: true });
     expect(t.opened).toEqual([PEER]);
   });
@@ -138,7 +120,7 @@ describe("delivery transport — REUSE before open (§16.4)", () => {
     const t = newTransport({
       openSession: async () => ({ ok: false, reason: "counterparty_unavailable", guidance: "they did not accept" }),
     });
-    const res = await t.transport.deliver(deliverInput());
+    const res = await t.transport.sendBytes(sendInput());
     // A dial that was refused should say it was refused; document_delivery_threw is reserved for a
     // genuine programming fault.
     expect(res).toMatchObject({ ok: false, reason: "counterparty_unavailable" });
@@ -146,59 +128,11 @@ describe("delivery transport — REUSE before open (§16.4)", () => {
   });
 });
 
-describe("delivery transport — the session hint is honoured or REFUSED, never substituted", () => {
-  it("uses an explicit hint that names an active session", async () => {
-    const t = newTransport({ activeSessionsWith: () => ["a", "b"] });
-    const res = await t.transport.deliver(deliverInput({ sessionHint: "a" }));
-    expect(res).toMatchObject({ ok: true, sessionId: "a" });
-  });
-
-  it("REFUSES a hint that is not an active session with this peer", async () => {
-    const t = newTransport({ activeSessionsWith: () => ["a"] });
-    const res = await t.transport.deliver(deliverInput({ sessionHint: "not-a-session" }));
-
-    // The only reason to pass a hint is to control which sealed record the change lands in.
-    // Quietly substituting the daemon's own pick defeats exactly that, silently.
-    expect(res).toMatchObject({ ok: false, reason: "document_session_hint_invalid" });
-    expect(t.sends).toEqual([]);
-  });
-});
-
-describe("delivery transport — a send is SENT, not acked", () => {
-  it("returns admitted: null for a delivered envelope", async () => {
-    const t = newTransport({ activeSessionsWith: () => ["s"] });
-    const res = await t.transport.deliver(deliverInput());
-    // `true` would mark it acknowledged while the peer may never have applied it; `false` would
-    // count a send that worked as a failure and re-send content already in flight.
-    expect(res).toMatchObject({ ok: true, admitted: null });
-  });
-
-  it("returns admitted: null for content PARKED for an offline peer, too", async () => {
-    const t = newTransport({
-      activeSessionsWith: () => ["s"],
-      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
-    });
-    const res = await t.transport.deliver(deliverInput());
-    expect(res).toMatchObject({ ok: true, admitted: null });
-    expect(t.events.find((e) => e.event === "document.delivery.sent")!.fields.parked).toBe(true);
-  });
-
-  it("a failed send is a FAILURE, carrying the transport's own reason", async () => {
-    const t = newTransport({
-      activeSessionsWith: () => ["s"],
-      sendContent: async () => ({ ok: false, reason: "session_node_unavailable", error: "no active session node" }),
-    });
-    const res = await t.transport.deliver(deliverInput());
-    expect(res).toMatchObject({ ok: false, reason: "session_node_unavailable" });
-    expect((res as { detail?: string }).detail).toContain("no active session node");
-  });
-});
-
 
 describe("delivery transport — an OPENED session is sealed; a REUSED one is not ours to close", () => {
   it("seals the session it opened", async () => {
     const t = newTransport();
-    await t.transport.deliver(deliverInput());
+    await t.transport.sendBytes(sendInput());
     // §16.4: the autonomous session still happens because it carries signing, encryption and the
     // seal — the ceremony goes to zero, the seal does not. Walking away leaves a live node the
     // operator never started, and the sealed record the design exists for is never produced.
@@ -207,7 +141,7 @@ describe("delivery transport — an OPENED session is sealed; a REUSED one is no
 
   it("does NOT seal a session it merely reused", async () => {
     const t = newTransport({ activeSessionsWith: () => ["theirs"] });
-    await t.transport.deliver(deliverInput());
+    await t.transport.sendBytes(sendInput());
     // Its owner decides when that conversation ends.
     expect(t.sealed).toEqual([]);
   });
@@ -221,183 +155,6 @@ describe("delivery transport — an OPENED session is sealed; a REUSED one is no
  * the unacked ceiling retires the envelope. Measured live: `session.content.held` on the ack, then
  * `session.node.destroyed reason=sealed` three seconds later, then 90 re-sends against a cap of 5.
  */
-describe("a session the worker OPENED is not sealed until the peer has answered", () => {
-  it("waits for the ack BEFORE sealing", async () => {
-    const order: string[] = [];
-    let releaseAck: (() => void) | undefined;
-    const f = newTransport({
-      awaitAck: () =>
-        new Promise<{ admitted: boolean } | null>((resolve) => {
-          order.push("await");
-          releaseAck = () => resolve({ admitted: true });
-        }),
-      sealSession: async () => {
-        order.push("seal");
-      },
-    });
-
-    const inFlight = f.transport.deliver(deliverInput());
-    await vi.waitFor(() => expect(order).toEqual(["await"]));
-    // The seal has NOT happened yet. That is the whole property: sealing here is what deletes the
-    // held ack, so the wait has to come first rather than alongside.
-    expect(order).toEqual(["await"]);
-    releaseAck!();
-    await inFlight;
-    expect(order).toEqual(["await", "seal"]);
-  });
-
-  it("SEALS ANYWAY when the peer never answers, and says so", async () => {
-    // The grace period is a bound, not a promise. A peer that never answers must not leave an
-    // autonomous session running — that is the live node the seal exists to prevent.
-    const f = newTransport({ awaitAck: async () => null });
-    await f.transport.deliver(deliverInput());
-    expect(f.sealed).toEqual(["opened-session"]);
-    // Said out loud, because a seal that discards a held ack is otherwise invisible and this is the
-    // only moment anything knows it is about to happen.
-    expect(f.events.some((e) => e.event === "document.delivery.ack_grace_expired")).toBe(true);
-  });
-
-  it("does NOT wait on a session it REUSED — that one is not ours to close", async () => {
-    let waited = 0;
-    const f = newTransport({
-      activeSessionsWith: () => ["existing-session"],
-      awaitAck: async () => {
-        waited += 1;
-        return true;
-      },
-    });
-    await f.transport.deliver(deliverInput());
-    // A reused session stays alive because its owner keeps it, so the ack already has all the time
-    // it needs. Waiting here would hold up every delivery on a live conversation for nothing —
-    // and this asymmetry is exactly why the spine enforcers never saw the defect.
-    expect(waited).toBe(0);
-    expect(f.sealed).toEqual([]);
-  });
-});
-
-describe("the ack grace is a BUDGET the caller controls, not a fixed cost per envelope", () => {
-  it("passes the ENVELOPE HASH and the granted grace to the waiter", async () => {
-    // Pins the ARGUMENTS, not just that a wait happened. Both have been wrong in this feature
-    // before — the owner key vs the agent name, the sender id vs the owner key — and a stubbed
-    // seam that asserts nothing about what flows through it cannot catch either.
-    const calls: Array<[string, number]> = [];
-    const t = newTransport({
-      awaitAck: async (hash, acker, ms) => {
-        calls.push([hash, ms]);
-        // H1: the waiter is scoped to the holder being DIALED — pinned here with the hash.
-        expect(acker).toBe("peer-b");
-        return { admitted: true };
-      },
-    });
-    await t.transport.deliver(deliverInput({ ackGraceMs: 4_000 }));
-    expect(calls).toEqual([[envelope.envelopeHash, 4_000]]);
-  });
-
-  it("waits for the SMALLER of the standard grace and what the pass has left", async () => {
-    const calls: number[] = [];
-    const t = newTransport({ awaitAck: async (_h, _a, ms) => { calls.push(ms); return { admitted: true }; } });
-    await t.transport.deliver(deliverInput({ ackGraceMs: 500_000 }));
-    expect(calls).toEqual([DELIVERY_ACK_GRACE_MS]);
-  });
-
-  it("does NOT wait once the pass budget is spent — and STILL seals", async () => {
-    // The sweep must not stall behind whoever exhausted the budget. But the seal is unconditional:
-    // an autonomous session left running is the thing the seal exists to prevent, and trading the
-    // wait for that would be a worse defect than the one being fixed.
-    let waited = 0;
-    const t = newTransport({ awaitAck: async () => { waited += 1; return { admitted: true }; } });
-    await t.transport.deliver(deliverInput({ ackGraceMs: 0 }));
-    expect(waited).toBe(0);
-    expect(t.sealed).toEqual(["opened-session"]);
-  });
-
-  it("does NOT wait for PARKED content — an offline peer cannot answer within any grace", async () => {
-    let waited = 0;
-    const t = newTransport({
-      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
-      awaitAck: async () => { waited += 1; return { admitted: true }; },
-    });
-    await t.transport.deliver(deliverInput());
-    // Waiting here spent the budget on a certainty and fired ack_grace_expired on a designed,
-    // benign state — a warning that cried wolf on the normal offline-peer case.
-    expect(waited).toBe(0);
-    expect(t.events.some((e) => e.event === "document.delivery.ack_grace_expired")).toBe(false);
-    expect(t.sealed).toEqual(["opened-session"]);
-  });
-});
-
-describe("the grace DRAINS held content before waiting — otherwise it cannot help at all", () => {
-  it("drains BEFORE the wait, not after", async () => {
-    // The ordering is the property. An ack whose canonical sequence is ahead of our tree is HELD,
-    // and held content is never routed to the document layer — it waits for the missing sequence to
-    // arrive, not for time to pass. Waiting first and draining after would let the full grace
-    // expire on an ack already sitting in the buffer, which is the exact failure the grace was
-    // added to fix, made slower.
-    const order: string[] = [];
-    const t = newTransport({
-      drainHeld: async () => { order.push("drain"); },
-      awaitAck: async () => { order.push("await"); return { admitted: true }; },
-    });
-    await t.transport.deliver(deliverInput());
-    expect(order).toEqual(["drain", "await"]);
-  });
-
-  it("does not drain when it is not going to wait", async () => {
-    // No wait, no point unsticking anything for it — and a relay round trip per parked envelope is
-    // exactly the cost the pass budget exists to bound.
-    const t = newTransport({
-      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
-      drainHeld: async () => { throw new Error("drained on a parked send"); },
-    });
-    await expect(t.transport.deliver(deliverInput())).resolves.toMatchObject({ ok: true });
-  });
-
-  it("a drain that THROWS does not fail the delivery — the content already left", async () => {
-    // Caught by the test disagreeing with its own name: it asserted `rejects.toThrow()` and passed,
-    // which meant a relay hiccup during the drain surfaced as `document_delivery_threw` and
-    // re-sent content the peer already held. The name was right and the code was wrong.
-    const t = newTransport({ drainHeld: async () => { throw new Error("relay down"); } });
-    await expect(t.transport.deliver(deliverInput())).resolves.toMatchObject({ ok: true });
-    expect(t.events.some((e) => e.event === "document.delivery.drain_threw")).toBe(true);
-    // And the session is still sealed — a failed drain must not leave an autonomous session up.
-    expect(t.sealed).toEqual(["opened-session"]);
-  });
-});
-
-describe("an answer that arrives inside the grace is REPORTED, not discarded", () => {
-  it("returns admitted: true when the peer admitted it", async () => {
-    // `deliver` used to return `admitted: null` even when the ack had landed, so the worker took
-    // the in-flight branch every time. The consequence was not cosmetic: no production path ever
-    // returned a non-null answer, so `document.delivery.sweep { delivered: N }` was permanently 0
-    // and the acked/rejected branches were dead code. A sweep that delivered nothing looked
-    // byte-identical to a healthy idle one — the exact defect H3 was raised to fix, alive on a
-    // different field.
-    const t = newTransport({ awaitAck: async () => ({ admitted: true }) });
-    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: true });
-  });
-
-  it("returns admitted: false when the peer REFUSED it — a rejection is an answer", async () => {
-    const t = newTransport({ awaitAck: async () => ({ admitted: false }) });
-    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: false });
-  });
-
-  it("still returns admitted: null when nobody answered — the honest third state", async () => {
-    // The third state is not hedging. `true` would mark an envelope acknowledged the peer may never
-    // have applied, and `false` would count a send that WORKED as a failure and re-send content
-    // already in flight.
-    const t = newTransport({ awaitAck: async () => null });
-    expect(await t.transport.deliver(deliverInput())).toMatchObject({ ok: true, admitted: null });
-  });
-
-  it("returns null for a PARKED send, which is never waited on", async () => {
-    const t = newTransport({
-      sendContent: async () => ({ ok: true, delivered: false, parked: true }),
-      awaitAck: async () => ({ admitted: true }),
-    });
-    expect(await t.transport.deliver(deliverInput())).toMatchObject({ admitted: null });
-  });
-});
-
 /**
  * DOD-MP-SESSION-RETIRE-1, the remaining half — WIRED, not just implemented.
  *
@@ -428,11 +185,11 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
     // Two passes. Each one "succeeds" — the content reaches the peer directly — while the session's
     // record is permanently gone. Reading `ok` alone not only missed this, it called noteSuccess and
     // cleared the count, so the session stayed in rotation forever.
-    await t.transport.deliver(deliverInput());
-    await t.transport.deliver(deliverInput());
+    await t.transport.sendBytes(sendInput());
+    await t.transport.sendBytes(sendInput());
     expect(t.opened, "one bad answer must not churn a live session").toEqual([]);
 
-    const third = await t.transport.deliver(deliverInput());
+    const third = await t.transport.sendBytes(sendInput());
     expect(t.opened, "delivery must open a fresh session instead of reusing a dead record").toEqual([PEER]);
     expect(third.ok).toBe(true);
     // NOTHING WAS DESTROYED. The refused fix retired the session; this leaves it listed and usable
@@ -450,11 +207,11 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
       sendContent: async () =>
         gone ? relayGoneButDelivered : { ok: true as const, delivered: true as const },
     });
-    await t.transport.deliver(deliverInput());
+    await t.transport.sendBytes(sendInput());
     gone = false;
-    await t.transport.deliver(deliverInput()); // a witnessed leaf — clears the run
+    await t.transport.sendBytes(sendInput()); // a witnessed leaf — clears the run
     gone = true;
-    await t.transport.deliver(deliverInput()); // one more, not two in a row
+    await t.transport.sendBytes(sendInput()); // one more, not two in a row
     // A flaky relay is not a dead session. Opening a fresh one here would churn a session that is
     // demonstrably still recording.
     expect(t.opened).toEqual([]);
@@ -466,24 +223,10 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
       activeSessionsWith: () => ["s"],
       sendContent: async () => ({ ok: false as const, reason: "transport_unavailable", error: "away" }),
     });
-    for (let i = 0; i < 4; i++) await t.transport.deliver(deliverInput());
+    for (let i = 0; i < 4; i++) await t.transport.sendBytes(sendInput());
     // Otherwise every sweep against a sleeping counterparty opens a new session, each sealed moments
     // later — churn dressed up as availability.
     expect(t.opened).toEqual([]);
   });
 
-  it("a hint naming a suspect session is HONOURED, and the caller is told", async () => {
-    const t = newTransport({
-      activeSessionsWith: () => ["hinted"],
-      sendContent: async () => relayGoneButDelivered,
-    });
-    await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
-    await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
-    const third = await t.transport.deliver(deliverInput({ sessionHint: "hinted" }));
-    expect(third).toMatchObject({ ok: true, sessionId: "hinted" });
-    // Substituting another session would defeat the only reason to pass a hint — controlling which
-    // sealed record the change lands in. Silence would leave the caller aiming at a dead record.
-    expect(t.opened).toEqual([]);
-    expect(t.events.some((e) => e.event === "document.delivery.session.hint_suspect")).toBe(true);
-  });
 });

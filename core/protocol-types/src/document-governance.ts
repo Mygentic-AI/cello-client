@@ -68,7 +68,7 @@ export function documentGovernancePolicy(
 
   // SYNC-P2 — the subject's own acts: consent answers an admission, refuse_join declines one.
   // The claim is EXACTLY the subject; no admin can consent on anyone's behalf (R22).
-  if (kind === "consent" || kind === "refuse_join") {
+  if (kind === "consent" || kind === "refuse_join" || kind === "close") {
     if (subjectAgentId !== null && claimed.length === 1 && claimed[0] === subjectAgentId) {
       return { ok: true };
     }
@@ -77,6 +77,32 @@ export function documentGovernancePolicy(
       reason:
         `governance_consent_self: ${kind} is the subject's own act — the claim must be exactly ` +
         `[${subjectAgentId ?? "the subject"}] and the collection claims [${claimed.join(", ")}]`,
+    };
+  }
+
+  // SYNC-P4 (R28): a kill is one admin's own act — self-claimed AND admin-held.
+  if (kind === "kill") {
+    if (
+      subjectAgentId !== null &&
+      claimed.length === 1 &&
+      claimed[0] === subjectAgentId &&
+      state.admins.has(subjectAgentId)
+    ) {
+      return { ok: true };
+    }
+    if (subjectAgentId !== null && !state.admins.has(subjectAgentId)) {
+      return {
+        ok: false,
+        reason:
+          `governance_not_admin: ${subjectAgentId} holds no admin power over this document — ` +
+          `ending everyone's document takes a current admin's own signature`,
+      };
+    }
+    return {
+      ok: false,
+      reason:
+        `governance_consent_self: kill is the admin's own act — the claim must be exactly ` +
+        `[${subjectAgentId ?? "the admin"}] and the collection claims [${claimed.join(", ")}]`,
     };
   }
 

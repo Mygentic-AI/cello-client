@@ -56,9 +56,6 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
       sealSession: async () => {},
       activeSessionsWith: () => ["session-1"],
       openSession: async () => ({ ok: true, sessionId: "session-1" }) as never,
-      encodeEnvelope: () => ({ bytes: new Uint8Array([1, 2, 3]), hash: new Uint8Array(32).fill(9) }),
-      awaitAck: async () => true,
-      drainHeld: async () => {},
       sendContent: async (
         _agent: string,
         _sessionId: string,
@@ -73,10 +70,10 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     };
 
     const transport = createDocumentDeliveryTransport(deps as never);
-    await transport.deliver({
+    await transport.sendBytes({
       peerAgentId: "p".repeat(64),
       documentId: "d".repeat(64),
-      envelope: { envelopeHash: "e".repeat(64) } as never,
+      bytes: new Uint8Array([1, 2, 3]),
       correlationId: "corr-1",
     });
 

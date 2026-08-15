@@ -20,7 +20,11 @@ import {
 } from "../document-amendment.js";
 import { documentGovernancePolicy } from "../document-governance.js";
 import { buildDocumentMultisigTbs } from "../document-multisig.js";
-import { deriveDocumentState, checkEntryAdmissible } from "../document-derive.js";
+import {
+  deriveDocumentState,
+  deriveDocumentStateAt,
+  checkEntryAdmissible,
+} from "../document-derive.js";
 
 function makeSigner() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -193,7 +197,6 @@ describe("deriveDocumentState — determinism", () => {
     expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
     expect(s.properties["append_only"]).toBe(true);
     expect(s.voids).toEqual([]);
-    expect(s.interimMaxEpoch).toBe(4);
     expect(s.interimLastHash).toBe(hashHex(remove));
   });
 
@@ -924,6 +927,161 @@ describe("deriveDocumentState — invitation retraction (P3: the missing verb)",
   });
 });
 
+describe("deriveDocumentState — endings as entries (R26–R31)", () => {
+  function consented(a: Signer, b: Signer) {
+    const g = genesis(a, b, [a, b]);
+    const bc = consentEntry(b);
+    return { g, bc };
+  }
+
+  it("a document is CLOSED when every current participant has a close entry — derived, never tracked (R27)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const half = deriveOk(g, [bc, closeA], [a, b]);
+    expect(half.ended).toBeNull(); // B has not closed — one party alone is never the agreement
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, closeA, closeB], [a, b]);
+    expect(s.ended).toBe("closed");
+  });
+
+  it("CONCURRENT closes are the normal case, not a conflict (R27) — and both stand", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    // Both close blind to each other — same parents, both apply.
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, closeA, closeB], [a, b]);
+    expect(s.ended).toBe("closed");
+    expect(s.voids).toEqual([]);
+  });
+
+  it("close WAITS on an OPEN INVITATION — a seat at the table is someone the agreement must hear from (Entry 54 ruling)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [b],
+    );
+    const waiting = deriveOk(g, [bc, admitC, closeA, closeB], [a, b, c]);
+    expect(waiting.ended).toBeNull(); // C's invitation is open — the agreement waits
+    // Retracting the invitation completes it.
+    const retract = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 3, epoch_id: 3, parents: [hashHex(closeA)] },
+      [a],
+    );
+    const s2 = deriveOk(g, [bc, admitC, closeA, closeB, retract], [a, b, c]);
+    expect(s2.ended).toBe("closed");
+  });
+
+  it("a KILL by any admin ends the document immediately, one-sided (R28)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const kill = entry(
+      { kind: "kill", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, kill], [a, b]);
+    expect(s.ended).toBe("killed");
+  });
+
+  it("a NON-admin's kill is void by name — ending everyone's document takes admin power", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]); // b is NOT an admin
+    const bc = consentEntry(b);
+    const kill = entry(
+      { kind: "kill", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, kill], [a, b]);
+    expect(s.ended).toBeNull();
+    expect(s.voids[0]!.reason).toMatch(/governance_not_admin/);
+  });
+
+  it("a close is the CLOSER'S own act — nobody closes for you", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const forged = entry(
+      { kind: "close", subject_agent_id: b.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, forged], [a, b]);
+    expect(s.ended).toBeNull();
+    expect(s.voids[0]!.reason).toMatch(/consent_self|not_subject|governance_consent_self/);
+  });
+
+  it("a removal COMPLETES a standing agreement (D8's ruling, now derived): the removed holder's silence stops counting", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [b],
+    );
+    const notYet = deriveOk(g, [bc, admitC, cc, closeA, closeB], [a, b, c]);
+    expect(notYet.ended).toBeNull(); // C is still editing
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 3, epoch_id: 4, parents: [hashHex(closeA)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, admitC, cc, closeA, closeB, removeC], [a, b, c]);
+    expect(s.ended).toBe("closed"); // everyone who REMAINS has agreed
+  });
+
+  it("re-admission does NOT carry an old tenure's close: removal clears the subject's agreement", () => {
+    // B closes, is removed, is re-admitted, consents. If their OLD close still counted, A's own
+    // close would settle the document without B's new tenure ever agreeing — the exact leak the
+    // pre-pivot store closed by dropping the close row at removal. Derived now, so it is the
+    // FOLD's job: remove_holder clears the subject from `closes`.
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const removeB = entry(
+      { kind: "remove_holder", subject_agent_id: b.agentId, author_seq: 1, epoch_id: 3, parents: [hashHex(closeB)] },
+      [a],
+    );
+    const readmitB = entry(
+      { subject_agent_id: b.agentId, author_seq: 2, epoch_id: 4, parents: [hashHex(removeB)] },
+      [a],
+    );
+    const bc2 = consentEntry(b, { author_seq: 3, epoch_id: 5, parents: [hashHex(readmitB)] });
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 3, epoch_id: 6, parents: [hashHex(bc2)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, closeB, removeB, readmitB, bc2, closeA], [a, b]);
+    expect(s.ended).toBeNull(); // B's new tenure has not agreed — the old close is spent
+    expect([...s.closedBy]).toEqual([a.agentId]);
+  });
+});
+
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
   it("genesis alone: the proposer participates (their signature IS consent); the peer is invited", () => {
     const [a, b] = [makeSigner(), makeSigner()];
@@ -932,7 +1090,6 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
     expect([...s.invited]).toEqual([b.agentId]);
     expect([...s.admins]).toEqual([a.agentId]);
     expect(s.properties["topology"]).toBe("mesh");
-    expect(s.interimMaxEpoch).toBe(0);
     expect(s.interimLastHash).toBeNull();
   });
 
@@ -987,6 +1144,50 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
     const s = deriveOk(genesis(a, b), [env], [a, b, c]);
     expect(s.invited.has(c.agentId)).toBe(false);
     expect(s.voids[0]!.reason).toMatch(/amendment_state_hash_tier/);
+  });
+});
+
+describe("deriveDocumentStateAt — the world a frontier names (content admissibility's input)", () => {
+  it("derives the state at a PAST frontier — the author participates there even after a later removal (the AC14 shape)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    const all = [admitC, cc, removeC];
+    // At the pre-removal frontier, C participates…
+    const before = deriveDocumentStateAt(g, all, [hashHex(cc)], documentGovernancePolicy, makeVerify([a, b, c]));
+    expect(before.ok).toBe(true);
+    if (!before.ok) return;
+    expect(before.state.participants.has(c.agentId)).toBe(true);
+    // …and at the post-removal frontier, C does not — and the removal is IN that closure.
+    const after = deriveDocumentStateAt(g, all, [hashHex(removeC)], documentGovernancePolicy, makeVerify([a, b, c]));
+    expect(after.ok).toBe(true);
+    if (!after.ok) return;
+    expect(after.state.participants.has(c.agentId)).toBe(false);
+  });
+
+  it("a frontier naming an ancestor we do not hold reports MISSING — reconcile first, never guess", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const r = deriveDocumentStateAt(
+      genesis(a, b), [], ["ff".repeat(32)], documentGovernancePolicy, makeVerify([a, b]),
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/derive_frontier_missing/);
+    expect(r.missing).toEqual(["ff".repeat(32)]);
+  });
+
+  it("an EMPTY frontier is the genesis world — proposer participates, peer is invited", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const r = deriveDocumentStateAt(genesis(a, b), [], [], documentGovernancePolicy, makeVerify([a, b]));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.state.participants.has(a.agentId)).toBe(true);
+    expect(r.state.invited.has(b.agentId)).toBe(true);
   });
 });
 
@@ -1046,6 +1247,5 @@ describe("deriveDocumentState — authoring seeds", () => {
     expect(s.frontier).toEqual([hashHex(e2)]);
     expect(s.authorSeqs.get(a.agentId)).toBe(1);
     expect(s.authorSeqs.get(b.agentId)).toBe(2);
-    expect(s.interimMaxEpoch).toBe(2);
   });
 });

@@ -27,10 +27,8 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
-import { createDocumentControlNotifier } from "../document-control-notifier.js";
 import { DocumentPublish } from "../document-publish.js";
-import { DocumentDelivery } from "../document-delivery.js";
-import type { DocumentDeliveryTransport } from "../document-delivery.js";
+import type { DocumentDeliveryTransport } from "../document-delivery-transport.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
 
@@ -64,7 +62,6 @@ async function makeParty(agentName: string) {
   // Declared before the layer because the notifier needs the store, and the store is inside the
   // layer. Assigned immediately after; the notifier is only ever called from lifecycle, long after
   // construction.
-  let layerRef: ReturnType<typeof createDocumentLayer>;
 
   const layer = createDocumentLayer({
     db,
@@ -76,28 +73,9 @@ async function makeParty(agentName: string) {
     // The NAME→KEY map, exactly as the daemon does it. Both halves resolve through this one
     // function; when they did not, every row landed where the other half never looked.
     ownerKeyFor: (n) => (n === agentName ? owner : null),
-    // THE REAL NOTIFIER, not a stub. This seam was `async () => ({ ok: true })`, and that single
-    // line is why three tests here passed while `kill` told nobody: a stub on the far side reports
-    // success, sends nothing, and agrees with whatever the near side did. Only the TRANSPORT is
-    // substituted below — the part that genuinely has to be.
-    notifyPeer: createDocumentControlNotifier({
-      get store() {
-        return layerRef.store;
-      },
-      owners: () => [{ agentName, ownerAgentId: owner }],
-      // THE PRODUCTION FUNCTION, not a copy of it. The holder set is the thing that was wrong
-      // (DOD-MP-CONTROL-N-1), and a fixture that re-implemented the derivation — or worse, handed
-      // back a hardcoded peer — would restore exactly the assumption under test while staying
-      // green. Same call the daemon makes.
-      holders: (ownerAgentId, documentId) => layerRef.controlHolders(ownerAgentId, documentId),
-      sign: async (_n, tbs) => keys.sign(tbs),
-      send: (_n, input) => transport.sendBytes(input),
-      now: () => NOW,
-    }),
     rollback: () => ({ ok: true }),
     sign: async (_o, tbs) => keys.sign(tbs),
   });
-  layerRef = layer;
 
   const transport = {
     isPeerReachable: async () => ({ reachable: wire.online, unknownAgent: false }),
@@ -106,17 +84,10 @@ async function makeParty(agentName: string) {
       wire.deliverToPeer(input.bytes);
       return { ok: true as const, sessionId: "session-1", sessionOpened: true };
     },
-    deliver: async (input: { envelope: { payload: Uint8Array | null } }) => {
-      if (!wire.online || !wire.deliverToPeer) return { ok: false as const, reason: "peer_offline" };
-      // The worker hands the transport a LOG ROW; production re-encodes it into the wire envelope.
-      // Reproduced here rather than shortcut, because encoding is where the two halves can disagree
-      // about a field and the peer refuses something we believe we sent correctly.
-      wire.deliverToPeer(encodeFromRow(input.envelope));
-      return { ok: true as const, sessionId: "session-1", sessionOpened: false, admitted: null };
-    },
   } as unknown as DocumentDeliveryTransport;
 
   const publish = new DocumentPublish({
+    governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d),
     holdersFor: (o, d) => layer.holdersFor(o, d),
     store: layer.store,
     engine: layer.engine,
@@ -124,6 +95,7 @@ async function makeParty(agentName: string) {
     sign: async (_o, tbs) => keys.sign(tbs),
     senderIdFor: (o) => o,
     canPublish: (o, d) => layer.lifecycle.canPublish(o, d),
+    nudgeSeats: () => {},
   });
 
   const handlers = new Map<string, IpcHandler>();
@@ -139,14 +111,11 @@ async function makeParty(agentName: string) {
     now: () => NOW,
   });
 
-  const worker = new DocumentDelivery(layer.store, transport, logger);
-
   return {
     agentName,
     owner,
     layer,
     wire,
-    worker,
     /** DOD-DOC-WATCH-1 — the doorbells this party was rung with, in order. */
     nudges,
     // Exposed so a test can author an update the way a HOSTILE PEER would — below the operator
@@ -158,17 +127,23 @@ async function makeParty(agentName: string) {
       handlers.get(verb)!(params, "conn") as Promise<Record<string, unknown>>,
     /** The production entry point: whatever arrives on the session content path. */
     receive: (bytes: Uint8Array) => layer.onDocumentFrame(agentName, "session-1", bytes, "pk", "wire"),
-    /** Run one delivery pass, the way the daemon's sweep does. */
-    sweep: () =>
-      worker.tick(
-        owner,
-        (documentId) => {
-          const doc = layer.store.getDocument(owner, documentId);
-          return doc ? [doc.peerAgentId] : null;
-        },
-        NOW,
-        { senderAgentId: owner },
-      ),
+    /**
+     * Carry this party's own envelopes to the peer, the way the exchange does (SYNC-P4: the
+     * delivery worker is deleted; production nudges an initiated reconcile — here the fixture
+     * re-encodes the log rows and puts them on the same one-hop wire).
+     */
+    sweep: async () => {
+      let carried = 0;
+      for (const doc of layer.store.listDocuments(owner)) {
+        for (const row of layer.store.getEnvelopeLog(owner, doc.documentId)) {
+          if (row.senderAgentId !== owner || row.kind !== "update" || row.payload === null) continue;
+          if (!wire.online || !wire.deliverToPeer) continue;
+          wire.deliverToPeer(encodeFromRow(row));
+          carried += 1;
+        }
+      }
+      return { carried };
+    },
     text: (documentId: string) => layer.live.get(owner, documentId).getText("content").toString(),
     /** The map root as JSON — a `text` read is empty for a JSON document, whose content is the map. */
     json: (documentId: string) => layer.live.get(owner, documentId).getMap("data").toJSON() as Record<string, unknown>,
@@ -179,7 +154,8 @@ async function makeParty(agentName: string) {
 function encodeFromRow(row: unknown): Uint8Array {
   const r = row as {
     documentId: string; epochId: string; docPrevHash: string | null; senderAgentId: string;
-    senderClientId: number | null; stateVector: Uint8Array; payload: Uint8Array | null; signature: Uint8Array;
+    senderClientId: number | null; stateVector: Uint8Array; payload: Uint8Array | null;
+    governanceParents: string[]; signature: Uint8Array;
   };
   // The SHIPPED encoder, not a hand-built object: encoding is where the two halves can disagree
   // about a field, and the peer then refuses something we believe we sent correctly.
@@ -191,6 +167,9 @@ function encodeFromRow(row: unknown): Uint8Array {
     sender_agent_id: r.senderAgentId,
     sender_client_id: r.senderClientId ?? 0,
     update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+    // The ROW's real parents — an empty list here would re-encode bytes the signature never
+    // covered, and the peer would refuse an envelope we believe we sent correctly.
+    governance_parents: r.governanceParents ?? [],
     state_vector: r.stateVector,
     update: r.payload ?? new Uint8Array(0),
     signature: r.signature,
@@ -236,7 +215,7 @@ describe("two parties converge through the operator surface", () => {
     // `sent`, not `delivered`: the envelope LEFT and no ack has come back yet. `delivered` would be
     // the peer's daemon confirming admission, which is a separate frame — counting a send as an ack
     // is exactly the lie the transport's `admitted: null` exists to refuse.
-    expect(swept).toMatchObject({ attempted: 1, sent: 1, failed: 0 });
+    expect(swept).toMatchObject({ carried: 1 });
     await vi.waitFor(() => expect(b.text(documentId)).toBe("# Plan\n- ship it\n"));
 
     // 5. And it goes the other way, which is the property that makes it a shared document rather
@@ -380,26 +359,15 @@ describe("two parties converge through the operator surface", () => {
     a.wire.online = false;
     expect(await a.call("cello_doc_write", { document_id: documentId, content: "written while away" }))
       .toMatchObject({ ok: true, published: true });
-    // The sweep tries and gets nowhere. The change is NOT lost — pending is derived from the log,
-    // which is what makes it survivable.
+    // The carry gets nowhere while the wire is down. The change is NOT lost — the LOG is what
+    // survives (D1: no ledger, no schedule; any later exchange recomputes the difference).
     await a.sweep();
     expect(b.text(documentId)).toBe("");
-    // Still pending, and deliberately checked PAST the backoff window: a failed attempt schedules
-    // the next one, so asking at the same instant would report nothing pending for a reason that has
-    // nothing to do with whether the change survived.
-    expect(a.layer.store.pendingDeliveries(a.owner, NOW + 3_600_000, a.owner)).toHaveLength(1);
+    expect(a.layer.store.getEnvelopeLog(a.owner, documentId)).toHaveLength(1);
 
     a.wire.online = true;
     b.wire.online = true;
-    await a.worker.tick(
-      a.owner,
-      (documentId2) => {
-        const doc = a.layer.store.getDocument(a.owner, documentId2);
-        return doc ? [doc.peerAgentId] : null;
-      },
-      NOW + 3_600_000,
-      { senderAgentId: a.owner },
-    );
+    await a.sweep();
     await vi.waitFor(() => expect(b.text(documentId)).toBe("written while away"));
   });
 
@@ -811,12 +779,14 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     );
     await b.call("cello_doc_accept", { document_id: documentId });
 
-    expect(await a.call("cello_doc_kill", { document_id: documentId })).toMatchObject({
-      ok: true,
-      peerNotified: true,
-    });
+    // SYNC-P4: a kill is a signed ENTRY now — the result names the entry, reports per-holder
+    // delivery of it, and the ended verdict is DERIVED (any admin's kill suffices, immediately).
+    const killedRes = await a.call("cello_doc_kill", { document_id: documentId });
+    expect(killedRes).toMatchObject({ ok: true, ended: "killed" });
+    expect((killedRes.killDelivered as Record<string, boolean>)[b.owner]).toBe(true);
 
-    // Bob's copy is terminal too. Until the control frame existed, `notifyPeer` refused and Bob kept
+    // Bob's copy is terminal too — the kill ENTRY travels the ordinary carrier, and Bob's daemon
+    // derives the ending on arrival. Before endings were entries, a lost one-shot frame left Bob
     // publishing into a document that would never answer, with nothing on his screen explaining why.
     await vi.waitFor(() => expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("killed"));
     const write = await b.call("cello_doc_write", { document_id: documentId, content: "still typing" });
@@ -849,7 +819,10 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     // A decision to stop that depends on the other party being online is not a decision to stop.
     // But the operator is TOLD they were not told, because otherwise they will not understand why
     // the peer keeps writing.
-    expect(killed).toMatchObject({ ok: true, peerNotified: false });
+    expect(killed).toMatchObject({ ok: true, ended: "killed" });
+    // The entry did NOT reach the peer — the per-holder delivery map says so, and the difference
+    // is owed: the next reconcile exchange with bob carries the kill entry.
+    expect((killed.killDelivered as Record<string, boolean>)[b.owner]).not.toBe(true);
     expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("killed");
   });
 
@@ -954,12 +927,15 @@ describe("a KILL arriving after a settled CLOSE does not rewrite it", () => {
     await b.call("cello_doc_close", { document_id: documentId });
     await vi.waitFor(() => expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed"));
 
-    // The transport WILL redeliver, and nothing bounds a control frame's freshness — `sent_at_ms`
-    // is signed and never checked. Unconditional, this rewrote a settled agreement as a unilateral
-    // end: the operator's "closed by agreement" becomes "killed", and nothing says why.
-    const late = a.layer.lifecycle.recordPeerKill(a.owner, documentId, b.owner, NOW + 10_000);
-    expect(late).toMatchObject({ ok: true });
+    // A late kill must not rewrite a settled agreement as a unilateral end. In the entry model
+    // that is enforced at AUTHORING time: the killer's own daemon derives the world already ended
+    // and refuses to mint the entry at all — and had it somehow been minted, every receiver's
+    // causal gate refuses an entry authored after an ending in its closure (R30). Both operators
+    // keep "closed by agreement", which is the fact they chose.
+    const late = await b.call("cello_doc_kill", { document_id: documentId });
+    expect(late).toMatchObject({ ok: false });
     expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed");
+    expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("closed");
   });
 });
 

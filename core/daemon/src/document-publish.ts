@@ -40,6 +40,13 @@ export type PublishResult =
   | { ok: false; reason: string; detail: string };
 
 export interface DocumentPublishDeps {
+  /**
+   * SYNC-G1 — the author's governance frontier at publish time (entry hashes, the fold's
+   * heads). Stamped into the signed envelope as content's causal link to the governance that
+   * makes it admissible; receivers rule R20/R30 on it. Null when the frontier cannot be
+   * derived — the publish REFUSES rather than stamping a guess.
+   */
+  governanceFrontierFor(ownerAgentId: string, documentId: string): string[] | null;
   store: DocumentStore;
   engine: DocumentEngine;
   logger: Logger;
@@ -56,6 +63,12 @@ export interface DocumentPublishDeps {
    * envelope-first rule exists to prevent, arriving through the other door).
    */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
+  /**
+   * SYNC-P4 (R39's first trigger): a publish NUDGES every other seat by initiating a reconcile
+   * exchange with them — fire-and-forget, no ledger, no schedule. A nudge that does not land
+   * strands nothing: the difference it would have closed is recomputed at any later exchange.
+   */
+  nudgeSeats(ownerAgentId: string, documentId: string, seats: readonly string[]): void;
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
@@ -137,12 +150,21 @@ export class DocumentPublish {
       };
     }
 
+    // SYNC-G1: the frontier is stamped, or the publish refuses — a guessed anchor would let
+    // this envelope claim governance its author never held.
+    const governanceParents = this.#d.governanceFrontierFor(ownerAgentId, documentId);
+    if (governanceParents === null) {
+      return {
+        ok: false,
+        reason: "document_frontier_underivable",
+        detail:
+          "this document's governance could not be derived, so the envelope cannot name the " +
+          "frontier it was authored under — fix the chain before publishing",
+      };
+    }
     const envelope: DocumentUpdateEnvelope = {
       type: "document_update",
       document_id: documentId,
-      // The CURRENT epoch from the recorded amendment chain (M14B / DOD-MP-AMEND-1) — the
-      // constant-0 era ends the moment a document's first amendment lands.
-      epoch_id: this.#d.store.currentDocumentEpoch(ownerAgentId, documentId),
       // READ, never cached. Anything else appended since — a rejection, a withdrawal — moves this,
       // and a wrong link is refused by the peer and stops the document rebuilding locally.
       doc_prev_hash: this.#d.store.lastEnvelopeHashBySender(ownerAgentId, documentId, senderId),
@@ -151,6 +173,7 @@ export class DocumentPublish {
       update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
       state_vector: ourNow,
       update,
+      governance_parents: [...governanceParents].sort(),
       signature: new Uint8Array(0),
     };
     // TARGETS BEFORE THE ENVELOPE: a publish that cannot name its holders refuses before it
@@ -168,15 +191,12 @@ export class DocumentPublish {
     envelope.signature = await this.#d.sign(ownerAgentId, buildDocumentUpdateTbs(envelope));
     const envelopeHash = documentEnvelopeHash(envelope);
 
-    // ONE TRANSACTION (review M5): a crash between the append and the seed left an envelope
-    // in the log with zero delivery rows, and the bilateral backfill would re-seed only the
-    // genesis peer — every other holder silently never receiving it, forever.
-    const appended = this.#d.store.appendEnvelopeWithDeliveries(ownerAgentId, {
+    const appended = this.#d.store.appendEnvelope(ownerAgentId, {
       envelopeHash,
       documentId,
       senderAgentId: senderId,
       docPrevHash: envelope.doc_prev_hash,
-      epochId: envelope.epoch_id,
+      governanceParents: [...envelope.governance_parents],
       signature: envelope.signature,
       stateVector: envelope.state_vector,
       payload: update,
@@ -186,7 +206,7 @@ export class DocumentPublish {
       // inbound path stores for their envelopes.
       senderClientId: doc.clientID,
       createdAtMs: nowMs,
-    }, holders.filter((h) => h !== senderId), nowMs);
+    });
     if (!appended) {
       // The same content published twice hashes the same, so this is a genuine no-op rather than a
       // fault — but it is reported, because a caller that believes it published something new and
@@ -204,8 +224,10 @@ export class DocumentPublish {
       bytes: update.length,
       senderClientId: doc.clientID,
     });
-    // Fire and forget: the delivery worker derives pending FROM THE LOG, so writing the envelope is
-    // the whole of publishing. Nothing here waits for a peer.
+    // Fire and forget: the NUDGE (an initiated reconcile per seat) is how the envelope travels
+    // now — there is no delivery ledger and no worker. Nothing here waits for a peer, and a nudge
+    // that does not land is repaired by any later exchange.
+    this.#d.nudgeSeats(ownerAgentId, documentId, holders.filter((h) => h !== senderId));
     return { ok: true, envelopeHash, bytes: update.length };
   }
 }

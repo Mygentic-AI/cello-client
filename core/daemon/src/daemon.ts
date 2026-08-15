@@ -89,13 +89,9 @@ import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { registerDocumentHandlers } from "./document-handlers.js";
-import { createDocumentControlNotifier } from "./document-control-notifier.js";
 import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
-import { DocumentDelivery } from "./document-delivery.js";
-import { sweepAgentEvicting } from "./delivery-sweep-bound.js";
-import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
@@ -3641,38 +3637,6 @@ async function startDaemonHoldingLock(
       if (!agentName) return;
       notificationDispatcher.dispatchDocumentWatch(agentName, documentId, paths);
     },
-    notifyPeer: createDocumentControlNotifier({
-      get store() {
-        // Lazily, because `documentLayer` is what is being constructed. The notifier is only ever
-        // called from lifecycle, long after construction returns.
-        return documentLayer.store;
-      },
-      owners: () =>
-        loadedAgents
-          .filter((a) => a.pubkey)
-          .map((a) => ({ agentName: a.name, ownerAgentId: a.pubkey!.toLowerCase() })),
-      // DOD-MP-CONTROL-N-1 — the ONE implementation, on the layer, shared with every test fixture.
-      // A closure here instead would be untested by construction and hand-copied into fixtures
-      // that cannot disagree with it, which is exactly how the original defect survived.
-      holders: (ownerAgentId, documentId) => documentLayer.controlHolders(ownerAgentId, documentId),
-      sign: async (agentName, tbs) => {
-        const provider = keyProviders.get(agentName);
-        if (!provider) throw new Error(`document_control_unsigned: no key provider for ${agentName}`);
-        return provider.sign(tbs);
-      },
-      send: (agentName, input) => documentTransportFor(agentName).sendBytes(input),
-      // Given a logger so a signing failure is REPORTED rather than swallowed — the reason a
-      // local key fault used to reach the operator dressed as an absent peer.
-      logger,
-      now: () => Date.now(),
-    }),
-    rollback: () => ({
-      // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting
-      // success having reverted nothing tells an operator their update was retracted while their
-      // file still contains it.
-      ok: false,
-      reason: "document_rollback_not_wired",
-    }),
     sign: async (ownerAgentId, tbs) => {
       // Signs as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
       //
@@ -3712,14 +3676,8 @@ async function startDaemonHoldingLock(
   // agent, sessions belong to one agent, and `openSessionFor` signs as one agent. A single worker
   // with an agent-shaped hole in it is how a delivery ends up sent under the wrong identity.
   //
-  // CACHED per agent. A worker rebuilt every tick has its own re-entry guard (`#inFlight`)
-  // constructed away — permanently null, and the comment claiming it protected anything was wrong.
-  // The sweep's serial loop happens to cover it today; a cached worker means it is covered because
-  // the guard exists, not by accident of loop shape.
-  const documentDeliveryWorkers = new Map<string, DocumentDelivery>();
-  // Cached separately from the worker because the OPERATOR SURFACE needs it too: a proposal is not
-  // in the envelope log — there is no document yet — so it has no delivery record to schedule, and
-  // it still has to travel the same open-or-reuse-then-seal path an update does.
+  // The frame carrier, cached per agent (SYNC-P4: the delivery worker and its sweep are deleted —
+  // scheduling returns as the P5 reconcile triggers).
   const documentTransports = new Map<string, ReturnType<typeof createDocumentDeliveryTransport>>();
   const documentTransportFor = (agentName: string) => {
     const cached = documentTransports.get(agentName);
@@ -3799,90 +3757,9 @@ async function startDaemonHoldingLock(
             correlationId,
           );
         },
-        encodeEnvelope: (envelope) => {
-          const bytes = encodeDocumentUpdateEnvelope({
-            type: "document_update",
-            document_id: envelope.documentId,
-            epoch_id: envelope.epochId,
-            doc_prev_hash: envelope.docPrevHash,
-            sender_agent_id: envelope.senderAgentId,
-            sender_client_id: envelope.senderClientId ?? 0,
-            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
-            state_vector: envelope.stateVector,
-            update: envelope.payload ?? new Uint8Array(0),
-            signature: envelope.signature,
-          });
-          // Same defect as `sendBytes` had, on the UPDATE path: the receiver recomputes with the
-          // `0x00` domain prefix, so a bare hash is discarded at the authenticity check.
-          return { bytes, hash: wireContentHash(bytes) };
-        },
-        // The owner KEY, not the agent name — every document row is scoped by our own pubkey hex
-        // (M14-D5), and the store query behind this reads that column. Passing the name here
-        // returns no rows and the wait times out on every delivery.
-        awaitAck: async (envelopeHash, expectedAckerAgentId, timeoutMs) => {
-          const ownerKey = documentOwnerKeyFor(agentName);
-          if (ownerKey === null) {
-            // NOT "the peer stayed silent". `false` means the grace expired with no answer, and the
-            // caller logs exactly that — `graceMs: 10000`, a claim that ten seconds elapsed when
-            // none did, about a peer that was never asked. A delivery worker running for an agent
-            // whose own pubkey cannot be resolved is a wiring bug, and it says so here rather than
-            // arriving downstream dressed as a fact about the counterparty. Same distinction
-            // `abandoned_at` exists to keep: giving up is our decision, not evidence about them.
-            logger.error("document.delivery.ack_wait_unwired", { agentName, envelopeHash });
-            return null;
-          }
-          return documentLayer.awaitAck(ownerKey, envelopeHash, expectedAckerAgentId, timeoutMs);
-        },
-        drainHeld: async (sessionId, correlationId) => {
-          // ONLY WHEN THERE IS A GAP. `sealReadiness` already answers exactly this question, and
-          // gating on it keeps the ordinary delivery — the overwhelming majority — free of a relay
-          // round trip it does not need.
-          const readiness = sessionNodeManager.sealReadiness(agentName, sessionId);
-          if (readiness.heldCount === 0 && readiness.missingLeaves === 0) return;
-          logger.info("document.delivery.drain_held", {
-            agentName,
-            sessionId,
-            heldCount: readiness.heldCount,
-            missingLeaves: readiness.missingLeaves,
-            correlationId,
-          });
-          await autoRecoverForAgent(agentName, "delivery_ack_grace").catch((err: unknown) => {
-            // CONTAINED. A recovery that fails leaves the ack held and the grace expires — the same
-            // outcome as before, and never a reason to fail a delivery whose content already left.
-            logger.warn("document.delivery.drain_held_failed", {
-              agentName,
-              sessionId,
-              correlationId,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          });
-        },
     });
     documentTransports.set(agentName, transport);
     return transport;
-  };
-
-  const documentDeliveryFor = (agentName: string): DocumentDelivery => {
-    const existing = documentDeliveryWorkers.get(agentName);
-    if (existing) return existing;
-    const worker = new DocumentDelivery(
-      documentLayer.store,
-      documentTransportFor(agentName),
-      logger,
-      // DOD-MP-CONTROL-DURABLE-1 — control frames derive their recipients the way the NOTIFIER
-      // does, not the way envelopes do. `holdersFor` returns null for a document with no stored
-      // genesis proposal; `controlHolders` has an explicit legacy branch for it. Deriving the two
-      // halves differently turned a seeded row into a permanent no-op.
-      (documentId) => {
-        const ownerAgentId = documentOwnerKeyFor(agentName);
-        if (ownerAgentId === null) {
-          return { ok: false as const, reason: "document_owner_key_unavailable" };
-        }
-        return documentLayer.controlHolders(ownerAgentId, documentId);
-      },
-    );
-    documentDeliveryWorkers.set(agentName, worker);
-    return worker;
   };
 
   // M14 / DOD-DOC-TOOLS-1 — the OPERATOR SURFACE. Registered last of the document wiring, because
@@ -3891,6 +3768,8 @@ async function startDaemonHoldingLock(
   // published update never leaves.
   const documentPublish = new DocumentPublish({
     holdersFor: (ownerAgentId, documentId) => documentLayer.holdersFor(ownerAgentId, documentId),
+    governanceFrontierFor: (ownerAgentId, documentId) =>
+      documentLayer.governanceFrontierFor(ownerAgentId, documentId),
     store: documentLayer.store,
     engine: documentLayer.engine,
     logger,
@@ -3912,6 +3791,30 @@ async function startDaemonHoldingLock(
     // different facts that happen to coincide — see DocumentStore.pendingDeliveries.
     senderIdFor: (ownerAgentId) => ownerAgentId,
     canPublish: (ownerAgentId, documentId) => documentLayer.lifecycle.canPublish(ownerAgentId, documentId),
+    // SYNC-P4 (R39's first trigger): each seat gets an initiated reconcile exchange — the
+    // envelope rides the exchange's own difference computation. Fire-and-forget by contract.
+    nudgeSeats: (ownerAgentId, documentId, seats) => {
+      for (const seat of seats) {
+        void documentLayer
+          .initiateReconcile(ownerAgentId, seat, [documentId])
+          .then((sent) => {
+            if (!sent.ok) {
+              // NOT SILENT (review F3): a lost nudge is legal for correctness (any later
+              // exchange recomputes the difference — R40), but until P5's sweeps exist this
+              // line is the only trace an operator has for "my edit never arrived".
+              logger.warn("document.reconcile.nudge_failed", {
+                documentId, peerAgentId: seat, reason: sent.reason,
+              });
+            }
+          })
+          .catch((err: unknown) => {
+            logger.warn("document.reconcile.nudge_failed", {
+              documentId, peerAgentId: seat,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+    },
   });
   registerDocumentHandlers({
     handlers,
@@ -3930,125 +3833,6 @@ async function startDaemonHoldingLock(
     now: () => Date.now(),
   });
 
-  /**
-   * The delivery tick.
-   *
-   * Interval-driven rather than event-driven because the event we are actually waiting for — the
-   * peer coming back online — is not one this daemon observes. There is no presence subscription
-   * (parked, M14-P4), so the honest substitute is to ask periodically and let the per-envelope
-   * backoff keep the cost down: a peer that has been away an hour is checked at the cap, not every
-   * tick.
-   *
-   * Slow on purpose. Publish is fire-and-forget and nothing waits on this; a document that syncs a
-   * minute later is working correctly, while a tight loop over every attended agent is a cost paid
-   * forever for a case that is rare.
-   */
-  //
-  // Overridable for tests, the way `CELLO_SEAL_BILATERAL_TIMEOUT_MS` already is. The live enforcers
-  // spend their wall clock waiting for this tick — two of them is four minutes — and a test that
-  // must sit out a production-paced timer either runs slowly or is written with a window so tight
-  // that adding a second test to the file makes the first one fail. Both happened.
-  //
-  // Floored, so a misread env cannot turn the sweep into a busy loop against the directory.
-  const tickOverride = Number(process.env["CELLO_DOCUMENT_DELIVERY_TICK_MS"]);
-  const DOCUMENT_DELIVERY_TICK_MS =
-    Number.isFinite(tickOverride) && tickOverride >= 250 ? tickOverride : 60_000;
-  // DOD-MP-SWEEP-ALIVE-1 — how long ONE agent's pass may run before the sweep stops waiting for
-  // it. Generous relative to real work (the ack-grace budget for a whole pass is 30s) and finite,
-  // which is the only property that matters: the defect is an unbounded wait, not a slow one.
-  // Generous relative to what a HEALTHY pass can legitimately spend: the discovery lookup is
-  // bounded at 10s per (document, holder), the whole-pass ack grace is 30s, and only the dial is
-  // unbounded. Six pairs against a slow directory is already ~90s, so a 120s bound would warn on
-  // the normal case — and a signal that fires when nothing is wrong teaches an operator to ignore
-  // the one that matters. Scales with the tick so the fast-tick test path does not sit out minutes.
-  const DOCUMENT_DELIVERY_PASS_TIMEOUT_MS = Math.max(180_000, DOCUMENT_DELIVERY_TICK_MS * 3);
-  let documentDeliveryRunning = false;
-  let documentDeliveryStopping = false;
-  let documentDeliveryInFlight: Promise<void> | null = null;
-  const documentDeliveryTimer = setInterval(() => {
-    // NO OVERLAP. A tick that dials a slow peer can outlast the interval, and a second pass would
-    // re-send envelopes already in flight — the worker's own re-entry guard covers one agent, this
-    // covers the sweep across all of them.
-    if (documentDeliveryRunning) return;
-    documentDeliveryRunning = true;
-    documentDeliveryInFlight = (async () => {
-      try {
-        let agentsSwept = 0;
-        let stuck = 0;
-        let attempted = 0;
-        let delivered = 0;
-        let failed = 0;
-        for (const agentName of perAgentSignaling.keys()) {
-          // M2: a tick already running when the daemon stops must not keep dialling into a
-          // half-torn-down transport. `clearInterval` stops the NEXT tick, not this one.
-          if (documentDeliveryStopping) break;
-          const ownerAgentId = documentOwnerKeyFor(agentName);
-          // M14-D5: the owner key is our own pubkey hex. It is what BOTH halves scope by — the
-          // inbound router resolves the same function — and it is what the wire sender id is.
-          // Scoping the two halves differently returns nothing pending, reports nothing attempted,
-          // and leaves a fully synced document invisible with no error on any path.
-          if (ownerAgentId === null) continue;
-          // COUNTED AFTER THE PASS, not before — an agent whose pass never finished was not swept,
-          // and saying it was is what made the stall indistinguishable from an idle daemon.
-          // FANOUT-1: targets are the DERIVED holders minus ourselves — never per-sender
-          // config, never the genesis peer column (§7-1's silent-divergence hazard).
-          const holdersFor = (documentId: string): string[] | null => {
-            const holders = documentLayer.holdersFor(ownerAgentId, documentId);
-            return holders === null ? null : holders.filter((h) => h !== ownerAgentId);
-          };
-          // DOD-MP-SWEEP-ALIVE-1 — BOUNDED. The `finally` below releases the overlap guard only
-          // when this body settles, so an await that never settles ends document delivery for the
-          // life of the process, silently: the interval keeps firing, returns at the guard, and
-          // logs nothing. Observed live 2026-08-13. One wedged agent now degrades alone and loudly
-          // instead of taking every other agent's documents down with it.
-          const bounded = await sweepAgentEvicting({
-            logger,
-            timeoutMs: DOCUMENT_DELIVERY_PASS_TIMEOUT_MS,
-            agentName,
-            // Evicting the wedged worker is what makes the recovery real: `DocumentDelivery.tick`
-            // caches its pass and would otherwise hand back the same hung promise forever, so the
-            // agent would never deliver again AND every later pass would pay the full bound
-            // waiting for it — a 2x sweep-interval regression for every healthy agent.
-            workers: documentDeliveryWorkers,
-            run: () =>
-              documentDeliveryFor(agentName).tick(ownerAgentId, holdersFor, Date.now(), {
-                senderAgentId: ownerAgentId,
-              }),
-          });
-          if (!bounded.completed) {
-            stuck += 1;
-            continue;
-          }
-          agentsSwept++;
-          const result = bounded.value;
-          attempted += result.attempted;
-          delivered += result.delivered;
-          failed += result.failed;
-        }
-        // H3: a sweep that delivers nothing was byte-for-byte identical to a healthy idle one, which
-        // is what made every scoping bug above invisible. One line per tick, always.
-        // `stuck` IS PART OF THE LINE. Counting a wedged agent as swept reported `agents: 3,
-        // attempted: 0` — byte-for-byte a healthy idle sweep, which is the exact shape the comment
-        // below exists to prevent, on the one occasion it matters most.
-        logger.debug("document.delivery.sweep", { agents: agentsSwept, stuck, attempted, delivered, failed });
-        if (agentsSwept === 0 && documentLayer.store.anyDocumentExists()) {
-          logger.warn("document.delivery.sweep_empty", {
-            reason: "documents exist but no agent was swept — nothing will ever be delivered",
-          });
-        }
-      } catch (err: unknown) {
-        // Contained: one agent's delivery failure must not stop the sweep, and an unhandled
-        // rejection out of a timer takes the daemon down.
-        logger.warn("document.delivery.tick.failed", { reason: extractErrorMessage(err) });
-      } finally {
-        documentDeliveryRunning = false;
-        documentDeliveryInFlight = null;
-      }
-    })();
-    void documentDeliveryInFlight;
-  }, DOCUMENT_DELIVERY_TICK_MS);
-  // Never hold the process open on account of document delivery.
-  documentDeliveryTimer.unref?.();
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
@@ -4108,40 +3892,6 @@ async function startDaemonHoldingLock(
   let stoppedHookFired = false;
 
   async function stop(reason: string): Promise<void> {
-    // M14: stop the document delivery sweep first — it opens sessions, and a tick landing during
-    // teardown would dial into a daemon that is going away.
-    clearInterval(documentDeliveryTimer);
-    // `clearInterval` stops the NEXT tick; the flag stops the running one at its next agent.
-    documentDeliveryStopping = true;
-    // BOUNDED. This was a bare `await documentDeliveryInFlight`, and shutdown is the one place that
-    // must not block on the network: a sweep mid-dial against an unreachable peer held `stop()`
-    // open, so the interrupt-marking writes that follow did not complete before the process died —
-    // and sessions came back `active` after a restart, which is the exact defect AC-009 exists to
-    // catch. It failed on CI, where a directory node times out at 5s, and passed locally, where it
-    // does not.
-    //
-    // A tick still gets a moment to finish so the common case is orderly; after that we proceed
-    // without it. What the sweep leaves half-done is safe by construction — delivery state is
-    // derived from the log, so an interrupted pass is re-derived on the next start.
-    // NOT AWAITED AT ALL. Two attempts at waiting for it were both wrong, and the second was worse
-    // than the first:
-    //
-    //   1. a bare await blocked shutdown on the network — a sweep mid-dial against an unreachable
-    //      peer held `stop()` open past the point where the interrupt-marking writes had to happen;
-    //   2. bounding it with `setTimeout(...).unref()` looked like the fix and could HANG FOREVER: an
-    //      unref'd timer does not hold the event loop open, so while the loop is draining during
-    //      shutdown it may never fire, the race never settles, and `stop()` never reaches the line
-    //      that logs `daemon.stopped` — which is exactly what CI showed, a daemon whose log ends at
-    //      `daemon.started` with no shutdown events at all.
-    //
-    // There is nothing to wait for. `documentDeliveryStopping` stops the loop at its next agent, and
-    // whatever a half-finished sweep leaves behind is safe by construction: delivery state is
-    // DERIVED from the envelope log, so an interrupted pass is simply re-derived on the next start —
-    // the property the offline enforcer proves against two real daemons.
-    //
-    // The rule this cost two CI round trips to learn: shutdown may not await anything that can
-    // block on I/O, and a timeout that can outlive the event loop is not a bound.
-    void documentDeliveryInFlight;
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check

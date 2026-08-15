@@ -62,6 +62,14 @@ export interface DocumentReconcileBlock {
   /** Content envelope wires the peer lacks. Empty on step 1. */
   envelopes: Uint8Array[];
   /**
+   * SYNC-R35: this holder's OWN signed refusal records (document_rejection wires) for this
+   * document — the refusal travels by the ordinary exchange like anything else, so a third
+   * holder wedged behind a refused hash can learn its name and reason from any reply, not only
+   * from the refuser's one-shot frame. Few by construction (each is a retry round); attached
+   * whole and deduplicated by the receiver.
+   */
+  refusals?: Uint8Array[];
+  /**
    * The signed genesis proposal, included when the peer's position shows them holding NOTHING —
    * a joiner is simply very far behind (spec §4), and the anchor everything derives from is the
    * one record that is not an entry. Harmless when they already hold it: the bootstrap is
@@ -112,6 +120,9 @@ export function encodeDocumentReconcile(frame: DocumentReconcileFrame): Uint8Arr
       refused: [...d.refused],
       entries: d.entries.map((e) => new Uint8Array(e)),
       envelopes: d.envelopes.map((e) => new Uint8Array(e)),
+      ...(d.refusals && d.refusals.length > 0
+        ? { refusals: d.refusals.map((e) => new Uint8Array(e)) }
+        : {}),
       ...(d.genesis ? { genesis: new Uint8Array(d.genesis) } : {}),
       ...(d.refusal ? { refusal: { reason: d.refusal.reason, terminal: d.refusal.terminal } } : {}),
     })),
@@ -240,6 +251,7 @@ export function decodeDocumentReconcile(input: Uint8Array): DocumentReconcileFra
       refused: hexList(d, "refused"),
       entries: byteList(d, "entries"),
       envelopes: byteList(d, "envelopes"),
+      ...("refusals" in d ? { refusals: byteList(d, "refusals") } : {}),
       ...(genesis ? { genesis } : {}),
       ...(blockRefusal ? { refusal: blockRefusal } : {}),
     };

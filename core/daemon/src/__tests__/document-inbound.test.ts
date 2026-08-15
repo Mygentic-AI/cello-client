@@ -18,7 +18,6 @@ import {
   documentAmendmentHash,
   encodeDocumentAmendment,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
 import { DocumentStore } from "../document-store.js";
@@ -58,11 +57,11 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
   return {
     type: "document_update",
     document_id: DOC,
-    epoch_id: DOCUMENT_EPOCH_V1,
     doc_prev_hash: null,
     sender_agent_id: PEER,
     sender_client_id: PEER_CLIENT,
     update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+    governance_parents: [],
     state_vector: new Uint8Array([0]),
     update: update(PEER_CLIENT, "peer text. "),
     signature: new Uint8Array(64).fill(3),
@@ -74,6 +73,18 @@ function newFixture(
   opts: {
     verify?: () => boolean;
     currentHolders?: () => string[] | null;
+    deriveAtFrontier?: (
+      o: string,
+      d: string,
+      frontier: readonly string[],
+    ) =>
+      | {
+          ok: true;
+          participants: ReadonlySet<string>;
+          invited: ReadonlySet<string>;
+          ended: "closed" | "killed" | null;
+        }
+      | { ok: false; reason: string; missing?: string[] };
     order?: string[];
     appendOnly?: boolean;
     /** Omit the document entirely — the peer-refused-the-proposal case, which holds no row. */
@@ -107,14 +118,44 @@ function newFixture(
   const live = new Y.Doc();
   live.clientID = 9999;
 
+  // Test-side stand-in for the layer's fold-derived standing (SYNC-D8): last membership event
+  // over the recorded chain, "unknown" on undecodable bytes — enough for the gate's questions.
+  const walkStanding = (
+    o: string,
+    d: string,
+    a: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown" => {
+    let st: "participant" | "removed" | "stranger" = "stranger";
+    try {
+      for (const env of amendmentStore.chain(o, d)) {
+        if (env.body.subject_agent_id !== a) continue;
+        if (env.body.kind === "add_holder") st = "participant";
+        else if (env.body.kind === "remove_holder") st = "removed";
+      }
+    } catch {
+      return "unknown";
+    }
+    return st;
+  };
+
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
     // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
     // every older test in this file was written against.
     currentHolders: opts.currentHolders ?? (() => null),
+    deriveAtFrontier:
+      opts.deriveAtFrontier ??
+      ((o: string, d: string) => {
+        const holders = (opts.currentHolders ?? (() => null))(o, d);
+        if (holders === null) return { ok: false as const, reason: "document_genesis_missing" };
+        // The fake mirrors the layer's real semantics for a CURRENT-frontier envelope: current
+        // participants minus anyone the recorded chain says is removed.
+        const seated = holders.filter((h: string) => walkStanding(o, d, h) !== "removed");
+        return { ok: true as const, participants: new Set(seated), invited: new Set<string>(), ended: null };
+      }),
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
-    membershipOf: (o, d, a) => amendmentStore.membershipOf(o, d, a),
+    standingOf: (o, d, a) => walkStanding(o, d, a),
     sign: async () => new Uint8Array(64).fill(1),
   });
   return { inbound, store, engine, live, events, logger, db };
@@ -150,8 +191,6 @@ function plantAmendment2(
 ) {
   const body = {
     document_id: DOC,
-    epoch_id: epoch,
-    prev_amendment_hash: null,
     kind,
     subject_agent_id: subject,
     property_change: null,
@@ -174,10 +213,10 @@ function plantAmendment2(
   });
   db.prepare(
     `INSERT INTO document_entries
-       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
         received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, Buffer.from(bytes), 1);
 }
 
 describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement", () => {
@@ -211,21 +250,20 @@ describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(2);
   });
 
-  it("an UNKNOWN epoch-ahead sender is LOGGED as amendment lag, not as a stranger probe", async () => {
-    // F1: the honest new holder's first envelope — their add_holder amendment still in flight
-    // to us — is wire-silent (disclosure stands) but the LOG names the lag signature: unknown
-    // sender + epoch ahead of ours. Revert the discriminator and this reads as a stranger.
+  it("an UNKNOWN sender is refused wire-silent, and the LOG names the refusal (D7: the epoch-lag discriminator is gone)", async () => {
+    // The honest new holder's first envelope — their admission entry still in flight to us —
+    // refuses exactly like a stranger's now: there is no epoch to compare, and the admission
+    // resolves by the sender's ordinary retry once the entry lands. The LOG line is the trace.
     const f = newFixture({ currentHolders: () => [PEER] });
     const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(
-        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7, epoch_id: 1 }),
+        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7 }),
       ),
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
-    expect(f.events.some((e) => e.event === "document.inbound.sender_unknown_epoch_ahead")).toBe(true);
-    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(false);
+    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(true);
   });
 
   it("a STRANGER stays silently refused even when the chain derives — membership discloses nothing to non-parties", async () => {
@@ -252,7 +290,7 @@ describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement
   });
 });
 
-describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
+describe("DocumentInbound — the sender rulings that replaced the epoch gate (SYNC-P4)", () => {
   /**
    * Raise the document's current epoch by planting a DECODABLE amendment-chain row — the
    * membership walk (DOD-MP-REMOVE-1) decodes every stored row, so a garbage blob here is a
@@ -266,8 +304,6 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
   ) {
     const body = {
       document_id: DOC,
-      epoch_id: epoch,
-      prev_amendment_hash: null,
       kind,
       subject_agent_id: subject,
       property_change: null,
@@ -290,10 +326,10 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
     });
     db.prepare(
       `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
           received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, Buffer.from(bytes), 1);
   }
   const raiseEpoch = (db: DatabaseSync, epoch: number) => plantAmendment(db, epoch);
 
@@ -309,7 +345,7 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 1");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
   });
 
   it("a daemon that knows ITSELF removed stops applying — terminal, so the sender settles", async () => {
@@ -338,10 +374,10 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 2");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
   });
 
-  it("a REMOVED sender's envelope is TERMINAL, naming the removal epoch — never a silent drop", async () => {
+  it("a REMOVED sender's envelope is TERMINAL, naming the removal — never a silent drop", async () => {
     const f = newFixture();
     plantAmendment(f.db, 1, "remove_holder", PEER);
     const res = await f.inbound.receive(
@@ -350,28 +386,54 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 1");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 
-  it("an envelope BEHIND the current epoch is TERMINAL — its TBS binds the old epoch forever", async () => {
-    const f = newFixture();
-    raiseEpoch(f.db, 1);
-    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
-    expect(res).toMatchObject({ ok: false, reason: "document_epoch_stale", terminal: true });
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
-  });
-
-  it("an envelope AHEAD of us refuses NON-terminally — the amendment is still in flight here", async () => {
-    const f = newFixture();
-    const res = await f.inbound.receive(
+  it("a removed sender at their POST-removal frontier refuses by name — and their PRE-removal work ADMITS (the causal rulings that replaced the epoch gate)", async () => {
+    // The AC13 + AC14 pair, in one place: the same removed author is refused for what they
+    // authored after the removal and ADMITTED for what they authored before it — the equality
+    // gate could only do the first, and broke convergence doing it.
+    const f = newFixture({
+      currentHolders: () => [PEER],
+      deriveAtFrontier: (_o, _d, frontier) =>
+        frontier.includes("aa".repeat(32))
+          ? { ok: true, participants: new Set([PEER]), invited: new Set(), ended: null } // pre-removal world
+          : { ok: true, participants: new Set<string>(), invited: new Set(), ended: null }, // post-removal world
+    });
+    plantAmendment(f.db, 1, "add_holder", PEER);
+    plantAmendment(f.db, 2, "remove_holder", PEER);
+    const refused = await f.inbound.receive(
       AGENT,
-      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 2 })),
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["bb".repeat(32)] })),
       NOW,
     );
-    expect(res).toMatchObject({ ok: false, reason: "document_epoch_ahead" });
-    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    expect(refused).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
+    const admitted = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["aa".repeat(32)] })),
+      NOW,
+    );
+    expect(admitted).toMatchObject({ ok: true });
+  });
+
+  it("an envelope naming UNHELD governance ancestors refuses NON-terminally — reconcile delivers governance first", async () => {
+    const f = newFixture({
+      currentHolders: () => [PEER],
+      deriveAtFrontier: () => ({
+        ok: false,
+        reason: "derive_frontier_missing: 1 of the named governance ancestors are not held",
+        missing: ["cc".repeat(32)],
+      }),
+    });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["cc".repeat(32)] })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_governance_in_flight" });
+    expect((res as { terminal?: boolean }).terminal).not.toBe(true);
+    expect(f.events.some((e) => e.event === "document.inbound.governance_in_flight")).toBe(true);
   });
 
   it("an envelope AT the current post-amendment epoch admits normally", async () => {
@@ -669,7 +731,7 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
     expect((res as { envelopeHash?: string }).envelopeHash).toBe(documentEnvelopeHash(env));
   });
 
-  it("a KILLED and a CLOSED document are terminal too — they will never accept this envelope", async () => {
+  it("a KILLED and a CLOSED LEGACY document is terminal — no chain, so the column is its ending", async () => {
     for (const status of ["killed", "closed"] as const) {
       const f = newFixture({ status });
       const env = envelope();
@@ -679,6 +741,20 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
       // defect came straight back with every gate green. Caught in review, not by the gate.
       expect(res, status).toMatchObject({ terminal: true, envelopeHash: documentEnvelopeHash(env) });
     }
+  });
+
+  it("a DERIVABLE document whose column says closed still ADMITS an ending-free frontier (R30/AC16 — review F1)", async () => {
+    // The last edits before an agreed close are precisely what the exchange still owes every
+    // holder: A edits, goes offline, everyone closes, A returns — A's edit carries a frontier
+    // with no ending in it and MUST apply, even though this holder's status column already
+    // projects "closed". The old stored-status gate refused it terminally, silently losing it.
+    const f = newFixture({
+      status: "closed",
+      currentHolders: () => [PEER],
+    });
+    const env = envelope();
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
   });
 
   it("a NON-PARTY is answered with SILENCE even when the document is killed", async () => {

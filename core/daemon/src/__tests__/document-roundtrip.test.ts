@@ -29,8 +29,6 @@ import {
 } from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
 import { DocumentPublish } from "../document-publish.js";
-import { createDocumentDeliveryTransport } from "../document-delivery-transport.js";
-import { DocumentDelivery } from "../document-delivery.js";
 import { DocumentHandshake } from "../document-handshake.js";
 import type { Logger } from "../types.js";
 
@@ -63,12 +61,12 @@ async function makeParty(name: string, clientId: number) {
     // retrying until their document stalls.
     sendFrame: async () => ({ ok: true as const }),
     ownerKeyFor: (agentName) => (agentName === name ? id : null),
-    notifyPeer: async () => ({ ok: true }),
     rollback: () => ({ ok: true }),
     sign: async (_owner, tbs) => keys.sign(tbs),
   });
 
   const publish = new DocumentPublish({
+    governanceFrontierFor: () => [],
     // This harness seeds document rows directly (no handshake record), so chain derivation has
     // nothing to derive from — the bilateral row IS the fixture's arrangement.
     holdersFor: (o, d) => {
@@ -81,6 +79,8 @@ async function makeParty(name: string, clientId: number) {
     sign: async (_owner, tbs) => keys.sign(tbs),
     senderIdFor: () => id,
     canPublish: (owner, documentId) => layer.lifecycle.canPublish(owner, documentId),
+    // These tests drive the wire by hand (`sync`); the publish-time nudge is the daemon's wiring.
+    nudgeSeats: () => {},
   });
 
   // THE WORKING DOCUMENT IS THE LIVE DOCUMENT. There is exactly one Y.Doc per (agent, document),
@@ -112,100 +112,16 @@ async function openDocument(a: Awaited<ReturnType<typeof makeParty>>, b: Awaited
   }
 }
 
-/**
- * Drive the REAL delivery worker, with only the wire stubbed.
- *
- * The hand-rolled loop below reads the log and hands frames over directly. This one goes through
- * `DocumentDelivery` and `createDocumentDeliveryTransport` — so the pending derivation, the
- * reachability check, session reuse, the ack accounting and the backoff are all the production code
- * paths, and the only thing replaced is the transport's bytes-on-a-socket.
- *
- * The peer's REAL verdict comes back as the ack, which is what closes the loop: `admitted` is
- * whatever their inbound path actually decided, not a stub's guess.
- */
-function deliveryFor(
-  from: Awaited<ReturnType<typeof makeParty>>,
-  to: Awaited<ReturnType<typeof makeParty>>,
-  opts: { reachable?: () => boolean; swallowAck?: boolean } = {},
-) {
-  const sent: string[] = [];
-  const transport = createDocumentDeliveryTransport({
-    agentName: from.id,
-    logger: from.logger,
-    lookupPeer: async () => ({
-      kind: "result",
-      state: (opts.reachable?.() ?? true) ? "online" : "offline",
-      owningNodeIds: ["node-1"],
-    }),
-    // One long-lived session already open with this peer — the reuse path, which is what a real
-    // daemon takes for every delivery after the first.
-    activeSessionsWith: () => ["session-1"],
-    openSession: async () => ({ ok: true, sessionId: "session-1" }),
-    sealSession: async () => {},
-    // The sender's own `0x04` leaf. Required, not optional: `cello_send` takes its leaf position
-    // after every successful send, and a document sender that skips it leaves its own tree behind
-    // by one per frame — which starves its INBOUND, because the receive path holds anything whose
-    // canonical sequence is ahead of its own tree size.
-    appendLeaf: () => {},
-    sendContent: async (_agent, _session, content) => {
-      sent.push(Buffer.from(content).toString("hex").slice(0, 16));
-      // THE WIRE. Everything either side of this is production code.
-      const verdict = await to.layer.router.route(to.id, content, Date.now(), "wire");
-      lastVerdict = verdict;
-      return { ok: true, delivered: true };
-    },
-    encodeEnvelope: (envelope) => {
-      const bytes = encodeDocumentUpdateEnvelope({
-        type: "document_update",
-        document_id: envelope.documentId,
-        epoch_id: envelope.epochId,
-        doc_prev_hash: envelope.docPrevHash,
-        sender_agent_id: envelope.senderAgentId,
-        sender_client_id: envelope.senderClientId!,
-        update_encoding: "yjs-v1",
-        state_vector: envelope.stateVector,
-        update: envelope.payload!,
-        signature: envelope.signature,
-      });
-      return { bytes, hash: new Uint8Array(32) };
-    },
-  });
-
-  let lastVerdict: { consumed: boolean; ok?: boolean } = { consumed: false };
-  // The peer answered synchronously in-process, so the ack is available by the time deliver
-  // returns. A real transport waits for the ack frame; the SHAPE is the same three-valued outcome.
-  const acking = {
-    ...transport,
-    deliver: async (input: Parameters<typeof transport.deliver>[0]) => {
-      const res = await transport.deliver(input);
-      if (!res.ok) return res;
-      // `swallowAck` models the ordinary store-and-forward failure: the content left, and the
-      // answer did not come back. `admitted: null` is SENT-not-acked.
-      if (opts.swallowAck === true) return { ...res, admitted: null };
-      return { ...res, admitted: lastVerdict.ok === true };
-    },
-  };
-  return {
-    worker: new DocumentDelivery(from.layer.store, acking, from.logger),
-    sent,
-    tick: (nowMs: number) =>
-      new DocumentDelivery(from.layer.store, acking, from.logger).tick(
-        from.id,
-        () => [to.id],
-        nowMs,
-        { senderAgentId: from.id },
-      ),
-  };
+/** This party's own envelopes, as log rows — the exchange's source of truth (no ledger, R8/R9). */
+function ownRows(party: Awaited<ReturnType<typeof makeParty>>) {
+  return party.layer.store
+    .getEnvelopeLog(party.id, DOC)
+    .filter((row) => row.senderAgentId === party.id && row.kind === "update" && row.payload !== null);
 }
 
-/** Publish everything `from` has pending and hand each frame to `to`, as the wire would. */
-async function sync(
-  from: Awaited<ReturnType<typeof makeParty>>,
-  to: Awaited<ReturnType<typeof makeParty>>,
-  nowMs: number,
-): Promise<void> {
-  for (const row of from.layer.store.pendingDeliveries(from.id, nowMs, from.id)) {
-    const wire = encodeDocumentUpdateEnvelope({
+function wireFor(row: ReturnType<typeof ownRows>[number]): Uint8Array {
+  return new Uint8Array(
+    encodeDocumentUpdateEnvelope({
       type: "document_update",
       document_id: row.documentId,
       epoch_id: row.epochId,
@@ -213,12 +129,22 @@ async function sync(
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: [...row.governanceParents],
       state_vector: row.stateVector,
       update: row.payload!,
       signature: row.signature,
-    });
-    await to.layer.router.route(to.id, wire, nowMs, "roundtrip");
-    from.layer.store.markAcked(from.id, row.documentId, row.envelopeHash, nowMs);
+    }),
+  );
+}
+
+/** Hand every envelope `from` authored to `to`, as the exchange would — idempotent by design. */
+async function sync(
+  from: Awaited<ReturnType<typeof makeParty>>,
+  to: Awaited<ReturnType<typeof makeParty>>,
+  nowMs: number,
+): Promise<void> {
+  for (const row of ownRows(from)) {
+    await to.layer.router.route(to.id, wireFor(row), nowMs, "roundtrip");
   }
 }
 
@@ -276,7 +202,7 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
     docA.getText("content").insert(0, "genuine. ");
     await a.publish.publish(a.id, DOC, docA, NOW);
 
-    const row = a.layer.store.pendingDeliveries(a.id, NOW, a.id)[0]!;
+    const row = ownRows(a)[0]!;
     const forged = new Uint8Array(row.payload!);
     forged[forged.length - 1] ^= 0xff; // the content, not the signature
     const wire = encodeDocumentUpdateEnvelope({
@@ -287,6 +213,7 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: [...row.governanceParents],
       state_vector: row.stateVector,
       update: forged,
       signature: row.signature,
@@ -312,19 +239,7 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
     const docC = stranger.workingDoc(stranger.id);
     docC.getText("content").insert(0, "text from nobody. ");
     await stranger.publish.publish(stranger.id, DOC, docC, NOW);
-    const row = stranger.layer.store.pendingDeliveries(stranger.id, NOW, stranger.id)[0]!;
-    const wire = encodeDocumentUpdateEnvelope({
-      type: "document_update",
-      document_id: row.documentId,
-      epoch_id: row.epochId,
-      doc_prev_hash: row.docPrevHash,
-      sender_agent_id: row.senderAgentId,
-      sender_client_id: row.senderClientId!,
-      update_encoding: "yjs-v1",
-      state_vector: row.stateVector,
-      update: row.payload!,
-      signature: row.signature,
-    });
+    const wire = wireFor(ownRows(stranger)[0]!);
 
     // Perfectly signed — by the wrong party. A document is a pairwise agreement, so this is not a
     // rejection case; it does not belong here at all.
@@ -353,52 +268,12 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
 });
 
 
-describe("M14 round trip — through the REAL delivery worker", () => {
-  it("publishes, delivers, and the peer admits — with the ack settling the envelope", async () => {
-    const a = await makeParty("A", 6001);
-    const b = await makeParty("B", 6002);
-    await openDocument(a, b);
 
-    const docA = a.workingDoc(a.id);
-    docA.getText("content").insert(0, "through the worker. ");
-    await a.publish.publish(a.id, DOC, docA, NOW);
-
-    const delivery = deliveryFor(a, b);
-    const result = await delivery.tick(NOW);
-
-    expect(result).toMatchObject({ attempted: 1, delivered: 1 });
-    expect(b.layer.live.get(b.id, DOC).getText("content").toString()).toBe("through the worker. ");
-    // The ack settled it: nothing is pending, so the worker will not re-send. That is the property
-    // that makes delivery terminate rather than loop.
-    expect(a.layer.store.pendingDeliveries(a.id, NOW + 10_000_000, a.id)).toHaveLength(0);
-  });
-
-  it("does not DIAL an unreachable peer, and delivers once it is back", async () => {
-    const a = await makeParty("A", 7001);
-    const b = await makeParty("B", 7002);
-    await openDocument(a, b);
-
-    const docA = a.workingDoc(a.id);
-    docA.getText("content").insert(0, "written while they were away. ");
-    await a.publish.publish(a.id, DOC, docA, NOW);
-
-    let online = false;
-    const delivery = deliveryFor(a, b, { reachable: () => online });
-    const away = await delivery.tick(NOW);
-    expect(away).toMatchObject({ attempted: 0, deferred: 1 });
-    expect(delivery.sent).toEqual([]);
-
-    // The peer comes back. The envelope is still pending because it was deferred, not dropped —
-    // the log is the queue, so nothing was held in memory to lose.
-    online = true;
-    const back = await delivery.tick(NOW + 10_000_000);
-    expect(back).toMatchObject({ delivered: 1 });
-    expect(b.layer.live.get(b.id, DOC).getText("content").toString()).toBe(
-      "written while they were away. ",
-    );
-  });
-
-  it("a LOST ACK re-sends, and the peer treats the redelivery as a duplicate", async () => {
+describe("M14 round trip — a redelivered envelope is a duplicate, not a doubling", () => {
+  it("the peer holds a twice-delivered envelope ONCE — the exchange is idempotent by construction", async () => {
+    // SYNC-P4 (D1/D4): there is no ack and no ledger, so redelivery is the ORDINARY case — any
+    // two overlapping exchanges can carry the same envelope. Idempotence on the receiving side is
+    // what makes that safe.
     const a = await makeParty("A", 8001);
     const b = await makeParty("B", 8002);
     await openDocument(a, b);
@@ -407,27 +282,13 @@ describe("M14 round trip — through the REAL delivery worker", () => {
     docA.getText("content").insert(0, "once. ");
     await a.publish.publish(a.id, DOC, docA, NOW);
 
-    // The ack never comes back — the transport reports SENT, not acked. This is the ordinary
-    // failure a store-and-forward path produces, not an exotic one.
-    const delivery = deliveryFor(a, b, { swallowAck: true });
-    const first = await delivery.tick(NOW);
-    expect(first).toMatchObject({ sent: 1, delivered: 0 });
-    expect(delivery.sent).toHaveLength(1);
-    // Still pending, because SENT is not ACKED — that distinction is the whole reason the outcome
-    // is three-valued.
-    expect(a.layer.store.pendingDeliveries(a.id, NOW + 10_000_000, a.id)).toHaveLength(1);
+    await sync(a, b, NOW);
+    await sync(a, b, NOW + 1);
 
-    const second = await delivery.tick(NOW + 10_000_000);
-    expect(delivery.sent).toHaveLength(2);
-    void second;
-
-    // The peer received the SAME envelope twice and must hold it once. A second admission would
-    // double the text; a refusal would strand a delivery that was correct.
     expect(b.layer.store.getEnvelopeLog(b.id, DOC)).toHaveLength(1);
     expect(b.layer.live.get(b.id, DOC).getText("content").toString()).toBe("once. ");
   });
 });
-
 
 describe("M14 round trip — through the REAL handshake", () => {
   it("proposes, consents, and both sides mint the SAME document", async () => {

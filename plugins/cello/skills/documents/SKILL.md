@@ -22,7 +22,7 @@ cello_doc_invite({ document_id, invitee_pubkey })
 cello_doc_remove({ document_id, holder_pubkey })
                                              — remove a holder, or leave with your own key;
                                                forward-only — their copy stays theirs
-cello_doc_inbox()                            — documents offered to YOU (proposals AND join offers)
+cello_doc_inbox()                            — documents offered to YOU (proposals AND open invitations)
 cello_doc_accept({ document_id })            — their signed edits now apply to your copy
 cello_doc_refuse({ document_id, reason? })
 cello_doc_list()                             — yours, and where each one stands
@@ -148,13 +148,9 @@ document worse in a way that is tedious to undo.
 | `peerAccepted: false` | They refused. It is over; do not keep writing into it. |
 | `peerAccepted: true` | They agreed. Their edits apply to your copy and yours to theirs. |
 | `peerHasPublished` | Whether anything has actually come back. Accepted-and-untouched is a fine state. |
-| `pendingUnsent` | Your changes that have not left this machine yet. Usually means they are offline. |
-| `pendingSent` | Left this machine; the peer has **not confirmed** them. Not the same as arrived. |
-| `pendingDeliveries` | The total still outstanding — `pendingUnsent` + `pendingSent`. |
-| `abandonedDeliveries` | Updates that were **given up on** and will never be retried. Not delivered. Republish them. |
 | `closePending` | You closed; still waiting on at least one other current holder. It ends when everyone who holds it has said so. |
 | `yourStanding` | Where YOU stand: `holder`, `removed`, or `unknown`. Always present — an absent answer would read as "you are fine". |
-| `removed` / `removedAtEpoch` | You are out of this document's arrangement, and the epoch it happened at. |
+| `removed` | You are out of this document's arrangement. |
 | `standingGuidance` | The sentence version of the above, including what remains yours. Read this one to the operator. |
 
 ## Ending one
@@ -176,18 +172,16 @@ With more than two holders, a partial result is the ordinary one: some heard it,
 offline. That is why the result is a list rather than a yes/no — "they were told" names nobody when
 there are several of them.
 
-A holder who was offline is not forgotten: the ending is owed to them and re-sent when they come
-back. If it still cannot be confirmed after several tries the daemon stops and says so, naming them
-— at that point they may genuinely still believe the document is open, and telling them is the only
-thing that will fix it.
+A holder who was offline is not forgotten: the ending is a signed entry in the document's own
+record, and the next exchange with them — or with anyone who has it — carries it across. Nothing
+about ending waits on the network.
 
 
 ## When YOU are the one who was removed
 
 This is the view nobody thinks to describe, because it is the one you cannot see from the other
 side. If an admin removes you — or you leave with your own key — `cello_doc_list` marks that
-document `yourStanding: "removed"`, carries `removedAtEpoch`, and puts the whole of it in
-`standingGuidance` as a sentence.
+document `yourStanding: "removed"` and puts the whole of it in `standingGuidance` as a sentence.
 
 What that means, exactly:
 
@@ -197,8 +191,8 @@ What that means, exactly:
 - **What stops is the flow of edits, in both directions.** Your writes no longer publish to the
   other holders, and their changes no longer reach you. So the copy you keep is frozen at the moment
   you were removed — it is a real record, not a live one.
-- **Your write will refuse, and it will say why.** You will get `document_removed` naming the epoch,
-  not a vague failure. If you are seeing that reason, nothing is broken; the arrangement changed.
+- **Your write will refuse, and it will say why.** You will get `document_removed` by name, not a
+  vague failure. If you are seeing that reason, nothing is broken; the arrangement changed.
 
 If you want back in, there is no move you can make alone — an admin has to invite you again, and
 your own accept makes it real, exactly as it did the first time.

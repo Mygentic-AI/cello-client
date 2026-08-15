@@ -331,7 +331,7 @@ export class DocumentHandshake {
      * said no" for a peer who never saw it. Worse, settle-once is by VALUE, so the real peer's
      * later genuine answer contradicts and is discarded: the poisoned state is permanent.
      *
-     * Verified is not authorized. The control path (`recordPeerClose`, `recordPeerKill`) has
+     * Verified is not authorized. The old control path had
      * carried this check from the start; the ack path was written without it.
      */
     ackerAgentId: string,

@@ -14,7 +14,7 @@
  * Signed, chained to its predecessor, epoch-incrementing, and carrying `state_hash` — the
  * canonical-hash-at-boundary slot — as DEFINED-ABSENT (`null`) while the tier is `authenticated`.
  * Tier 2 fills the slot; it does not migrate the frame. Dropping the slot "because Tier 1 doesn't
- * use it" is the exact seam violation M14 forbade for `epoch_id`.
+ * use it" is the exact seam violation M14 forbade.
  *
  * ── WHO MUST SIGN IS INJECTED ─────────────────────────────────────────────────────────────────
  *
@@ -39,7 +39,7 @@ import {
  * refused by the mandatory-field discipline below; no compatibility is owed (all holders upgrade
  * together).
  */
-export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v2";
+export const DOCUMENT_AMENDMENT_DOMAIN = "CELLO-DOCUMENT-AMENDMENT-v3";
 
 /**
  * Ceiling on an entry's parent list. The honest frontier is bounded by the holder cap (D5: 20);
@@ -65,6 +65,11 @@ export const AMENDMENT_KINDS = [
   // party — nobody consents for you.
   "consent",
   "refuse_join",
+  // SYNC-P4 (R26-R28): endings are governance entries like everything else. A `close` is the
+  // closer's own signed agreement to end; the document is CLOSED when every current participant
+  // holds one (derived, never tracked). A `kill` is any single admin's immediate one-sided end.
+  "close",
+  "kill",
 ] as const;
 export type AmendmentKind = (typeof AMENDMENT_KINDS)[number];
 
@@ -79,10 +84,6 @@ export const AMENDABLE_PROPERTIES = new Set(["append_only"]);
 
 export interface DocumentAmendmentBody {
   document_id: string;
-  /** The epoch this amendment MINTS: previous epoch + 1. Genesis is epoch 0 and is not an amendment. */
-  epoch_id: number;
-  /** Hex hash of the predecessor amendment's TBS; null for the first (anchored to genesis via document_id). */
-  prev_amendment_hash: string | null;
   kind: AmendmentKind;
   /** The holder the amendment is about (pubkey hex). Null exactly for `change_property`. */
   subject_agent_id: string | null;
@@ -125,8 +126,6 @@ export function buildDocumentAmendmentTbs(
   const preimage = encodeCbor([
     DOCUMENT_AMENDMENT_DOMAIN,
     body.document_id,
-    body.epoch_id,
-    body.prev_amendment_hash,
     body.kind,
     body.subject_agent_id,
     body.property_change?.key ?? null,
@@ -159,8 +158,6 @@ export function encodeDocumentAmendment(env: DocumentAmendmentEnvelope): Uint8Ar
     type: "document_amendment",
     body: {
       document_id: env.body.document_id,
-      epoch_id: env.body.epoch_id,
-      prev_amendment_hash: env.body.prev_amendment_hash,
       kind: env.body.kind,
       subject_agent_id: env.body.subject_agent_id,
       property_change: env.body.property_change,
@@ -208,26 +205,11 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
   }
   const b = rawBody as Record<string, unknown>;
 
-  const epochId = present(b, "epoch_id");
-  if (typeof epochId !== "number" || !Number.isInteger(epochId) || epochId < 1) {
-    throw new Error(
-      `document_amendment_epoch: must be a positive integer (genesis is epoch 0 and is not an ` +
-        `amendment), got ${String(epochId)}`,
-    );
-  }
-
   const kind = str(b, "kind");
   if (!(AMENDMENT_KINDS as readonly string[]).includes(kind)) {
     throw new Error(
       `document_amendment_kind: "${kind}" is not an amendment kind this build knows ` +
         `(${AMENDMENT_KINDS.join(", ")})`,
-    );
-  }
-
-  const prevHash = present(b, "prev_amendment_hash");
-  if (prevHash !== null && (typeof prevHash !== "string" || !/^[0-9a-f]{64}$/.test(prevHash))) {
-    throw new Error(
-      "document_amendment_field_type: prev_amendment_hash must be 64-hex or explicit null",
     );
   }
 
@@ -315,8 +297,6 @@ export function decodeDocumentAmendment(input: Uint8Array): DocumentAmendmentEnv
   return {
     body: {
       document_id: str(b, "document_id"),
-      epoch_id: epochId,
-      prev_amendment_hash: prevHash,
       kind: kind as AmendmentKind,
       subject_agent_id: subject,
       property_change: propertyChange,

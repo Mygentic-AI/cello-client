@@ -37,6 +37,11 @@ export interface DocumentStateView {
   /** Admitted, not yet answered (R22) — a seat at the table, not a voice. Counts toward the cap. */
   invited: ReadonlySet<string>;
   admins: ReadonlySet<string>;
+  /** R27/R28 — DERIVED, never tracked: "closed" when every current participant has closed;
+   *  "killed" on any admin's kill; null while live. */
+  ended: "closed" | "killed" | null;
+  /** Who has agreed to close — the surface's "waiting on" list is its complement. */
+  closedBy: ReadonlySet<string>;
   properties: Record<string, string | number | boolean | undefined>;
   /** The total order actually folded (applied AND void entries — F4 keeps voids in history). */
   order: readonly string[];
@@ -49,7 +54,6 @@ export interface DocumentStateView {
   /** Highest seq per author among included entries — the watermark seed. */
   authorSeqs: ReadonlyMap<string, number>;
   /** Interim carrier fields until P4 deletes the epoch spine (D7, gated on SYNC-G1). */
-  interimMaxEpoch: number;
   interimLastHash: string | null;
 }
 
@@ -58,6 +62,55 @@ export type DeriveDocumentStateResult =
   | { ok: false; reason: string };
 
 type VerifyFn = (agentId: string, tbs: Uint8Array, signature: Uint8Array) => boolean;
+
+/**
+ * SYNC-G1 — the derivation AT a named governance frontier: the fold restricted to the ancestor
+ * closure of `frontierHashes`. This is what content admissibility rules on (R20/R30): was the
+ * envelope's author a participant in the world its signed `governance_parents` name? Judged
+ * from the named ancestors alone — the same bounded backdating concession Entry 48 accepted
+ * for governance: a lying daemon admits exactly what an honest holder AT THAT POSITION could
+ * have authored, and the fold's removal dominance keeps it out of governance regardless.
+ *
+ * A frontier hash not present in `entries` is the caller's signal to reconcile first — this
+ * function reports it rather than guessing (`missing`).
+ */
+export function deriveDocumentStateAt(
+  genesis: ArrangementGenesis,
+  entries: readonly DocumentAmendmentEnvelope[],
+  frontierHashes: readonly string[],
+  policy: SignerPolicy,
+  verify: VerifyFn,
+): { ok: true; state: DocumentStateView } | { ok: false; reason: string; missing?: string[] } {
+  const byHash = new Map(
+    entries.map((env) => [
+      Buffer.from(documentAmendmentHash(env.body)).toString("hex"),
+      env,
+    ]),
+  );
+  const missing = frontierHashes.filter((h) => !byHash.has(h));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason:
+        `derive_frontier_missing: ${missing.length} of the named governance ancestors are not ` +
+        `held — reconcile before ruling`,
+      missing,
+    };
+  }
+  const wanted = new Set<string>();
+  const queue = [...frontierHashes];
+  while (queue.length > 0) {
+    const h = queue.pop()!;
+    if (wanted.has(h)) continue;
+    wanted.add(h);
+    const env = byHash.get(h);
+    if (env) queue.push(...env.body.parents);
+  }
+  const subset = entries.filter((env) =>
+    wanted.has(Buffer.from(documentAmendmentHash(env.body)).toString("hex")),
+  );
+  return deriveDocumentState(genesis, subset, policy, verify);
+}
 
 /**
  * The STATE-INDEPENDENT admission check — what an inbound path may refuse outright, because no
@@ -124,6 +177,8 @@ interface FoldState {
    * promote_admin, with its signature requirements, re-arms them. A refusal spends nothing.
    */
   spentDeclaredAdmins: Set<string>;
+  closes: Set<string>;
+  killed: boolean;
   properties: Record<string, string | number | boolean | undefined>;
 }
 
@@ -369,6 +424,29 @@ export function deriveDocumentState(
         }
         break;
       }
+      case "close": {
+        if (subject === null) return `amendment_subject_required: close names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a close is the closer's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        if (!state.participants.has(subject)) {
+          return `amendment_subject_not_holder: ${subject} has no seat to close from`;
+        }
+        break;
+      }
+      case "kill": {
+        if (subject === null) return `amendment_subject_required: kill names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a kill is the admin's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        break;
+      }
       case "remove_holder": {
         if (subject === null) return `amendment_subject_required: remove_holder names nobody`;
         // An INVITED seat is removable too — that is invitation retraction (P3): an admin takes
@@ -446,9 +524,18 @@ export function deriveDocumentState(
       case "refuse_join":
         state.invited.delete(body.subject_agent_id!);
         break;
+      case "close":
+        state.closes.add(body.subject_agent_id!);
+        break;
+      case "kill":
+        state.killed = true;
+        break;
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
         state.invited.delete(body.subject_agent_id!);
+        // Their agreement is spent with their seat: a re-admitted holder returns to a document
+        // that WAITS on them again, instead of one their old tenure's close silently settles.
+        state.closes.delete(body.subject_agent_id!);
         if (state.admins.has(body.subject_agent_id!)) {
           state.spentDeclaredAdmins.add(body.subject_agent_id!);
         }
@@ -534,6 +621,8 @@ export function deriveDocumentState(
       invited: new Set(genesisInvited),
       admins: new Set(genesisAdmins),
       spentDeclaredAdmins: new Set(),
+      closes: new Set(),
+      killed: false,
       properties: { ...genesis.properties },
     };
     const order = linearize(subset);
@@ -603,12 +692,10 @@ export function deriveDocumentState(
   const frontier = [...included.keys()].filter((h) => !namedAsParent.has(h)).sort();
 
   const authorSeqs = new Map<string, number>();
-  let interimMaxEpoch = 0;
   for (const env of included.values()) {
     const author = env.body.author_agent_id;
     const seq = env.body.author_seq;
     if ((authorSeqs.get(author) ?? 0) < seq) authorSeqs.set(author, seq);
-    if (env.body.epoch_id > interimMaxEpoch) interimMaxEpoch = env.body.epoch_id;
   }
 
   return {
@@ -617,13 +704,20 @@ export function deriveDocumentState(
       participants: state.participants,
       invited: state.invited,
       admins: state.admins,
+      ended: state.killed
+        ? ("killed" as const)
+        : state.participants.size > 0 &&
+            state.invited.size === 0 &&
+            [...state.participants].every((participant) => state.closes.has(participant))
+          ? ("closed" as const)
+          : null,
+      closedBy: state.closes,
       properties: state.properties,
       order,
       frontier,
       voids,
       excluded,
       authorSeqs,
-      interimMaxEpoch,
       interimLastHash: order.length > 0 ? order[order.length - 1]! : null,
     },
   };

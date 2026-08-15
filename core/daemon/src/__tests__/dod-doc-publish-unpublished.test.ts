@@ -106,6 +106,7 @@ async function newFixture(opts: { publishBlocked?: string } = {}) {
   registerDocumentHandlers({
     handlers, logger, layer,
     publish: new DocumentPublish({
+      governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d),
       holdersFor: (o, d) => {
         const doc = layer.store.getDocument(o, d);
         return doc ? [doc.peerAgentId] : null;
@@ -115,6 +116,7 @@ async function newFixture(opts: { publishBlocked?: string } = {}) {
       senderIdFor: (o) => o,
       canPublish: (o, d) =>
         publishBlocked ? { ok: false as const, reason: publishBlocked, detail: "blocked for this test" } : layer.lifecycle.canPublish(o, d),
+      nudgeSeats: () => {},
     }),
     transportFor: () => transport,
     resolveAgent: (_c, explicit) => explicit ?? AGENT,

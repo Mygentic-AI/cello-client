@@ -22,7 +22,6 @@
  * admit when it says no.
  */
 
-import { createHash } from "node:crypto";
 import { verify } from "@cello-protocol/crypto";
 import { DocumentStore } from "./document-store.js";
 import { DocumentEngine } from "./document-engine.js";
@@ -30,9 +29,7 @@ import { DocumentGate } from "./document-gate.js";
 import { screeningRule, SCREEN_RULE_ID } from "./document-screen.js";
 import { DocumentRejections } from "./document-rejection.js";
 import { DocumentInbound } from "./document-inbound.js";
-import { DocumentAckInbound } from "./document-ack-inbound.js";
 import { DocumentAmendmentStore } from "./document-amendment-store.js";
-import { DocumentJoinStore } from "./document-join-store.js";
 import { DocumentFrameRouter } from "./document-frame-router.js";
 import { LiveDocuments } from "./document-live-docs.js";
 import { DocumentLifecycle } from "./document-lifecycle.js";
@@ -48,16 +45,8 @@ import {
   documentRejectionHash,
   decodeDocumentProposalAck,
   buildDocumentProposalAckTbs,
-  decodeDocumentControl,
-  buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
   encodeDocumentAmendment,
-  buildDocumentUpdateTbs,
-  documentEnvelopeHash,
-  buildDocumentJoinAnswerTbs,
-  encodeDocumentJoinAnswer,
-  buildDocumentJoinOfferTbs,
-  decodeDocumentJoinOffer,
   decodeDocumentAmendment,
   decodeDocumentProposal,
   encodeDocumentProposal,
@@ -68,19 +57,15 @@ import {
   MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
   type DocumentProposalAck,
   documentAmendmentHash,
-  validateDocumentJoinOffer,
   documentGovernancePolicy,
   arrangementGenesisFromProposal,
   deriveDocumentState,
+  deriveDocumentStateAt,
   checkEntryAdmissible,
   decodeDocumentReconcile,
   encodeDocumentReconcile,
   DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   type DocumentAmendmentEnvelope,
-  type DocumentJoinAnswer,
-  encodeDocumentAck,
-  buildDocumentAckTbs,
-  type DocumentAck,
 } from "@cello-protocol/protocol-types";
 import { LEAF_KIND_REJECT } from "./session-relay-client.js";
 import {
@@ -122,23 +107,6 @@ export interface DocumentLayerDeps {
    * stands — this is the narrow exception an agent asked for by name.
    */
   nudge?(ownerAgentId: string, documentId: string, paths: readonly string[]): void;
-  /**
-   * Tell EVERY current holder about an end. Injected — the transport is not this layer's.
-   * Per-holder because a document has N holders (DOD-MP-CONTROL-N-1), not one counterparty.
-   */
-  notifyPeer(
-    documentId: string,
-    verb: "kill" | "close",
-  ): Promise<
-    | { ok: true; holdersNotified: Record<string, boolean>; holderFailures: Record<string, string> }
-    | { ok: false; reason: string }
-  >;
-  /** Undo one envelope's operations on the live document, for withdraw. */
-  rollback(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-  ): { ok: true } | { ok: false; reason: string };
   /**
    * Sign as a given agent. Takes the agent id so a rejection cannot be signed with the wrong key —
    * the first version took no arguments and the composition root reached for whichever key
@@ -183,33 +151,19 @@ export interface DocumentLayer {
   lifecycle: DocumentLifecycle;
   notifications: DocumentNotifications;
   rejections: DocumentRejections;
-  /** M14B — the amendment chain (write path; reads go through `store.currentDocumentEpoch`). */
+  /** M14B — the entry chain: the fork-tolerant store the fold derives from. */
   amendments: DocumentAmendmentStore;
-  /** M14B — join offers pending consent, both roles. */
-  joins: DocumentJoinStore;
   /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
-  /**
-   * Who a control frame must be addressed to — everyone but the owner, derived (DOD-MP-CONTROL-N-1).
-   * Refuses by name rather than falling back to the genesis peer, which after a removal is the one
-   * party the frame must not reach.
-   */
-  controlHolders(
+  isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
+  /** SYNC-D8 — the ONE derivation of an agent's standing (R17 + removed/unknown), from the fold. */
+  standingOf(
     ownerAgentId: string,
     documentId: string,
-  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string };
-  isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
-  /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
-  acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
-    | { ok: true; documentId: string; inviterAgentId: string; documentType: string; applied: number; answerBytes: Uint8Array }
-    | { ok: false; reason: string; detail: string }
-  >;
-  refuseJoin(ownerAgentId: string, amendmentHash: string, reason: string | null, nowMs: number): Promise<
-    | { ok: true; documentId: string; inviterAgentId: string; answerBytes: Uint8Array }
-    | { ok: false; reason: string; detail: string }
-  >;
+    agentId: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /**
    * SYNC-P3 — step 1 of the reconcile exchange: send this holder's position for the named
    * documents to a peer. Everything after that is symmetric and handled by the frame router.
@@ -219,6 +173,19 @@ export interface DocumentLayer {
     peerAgentId: string,
     documentIds: readonly string[],
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * SYNC-G1 — the fold's governance frontier for a document, or null when it cannot be
+   * derived. Publish stamps this into every envelope's signed TBS as content's causal anchor.
+   */
+  governanceFrontierFor(ownerAgentId: string, documentId: string): string[] | null;
+  /**
+   * SYNC-P4 (R27/R28) — the DERIVED ending and who a pending close still waits on. Null when
+   * the document cannot be derived.
+   */
+  deriveEnded(
+    ownerAgentId: string,
+    documentId: string,
+  ): { ended: "closed" | "killed" | null; waitingOn: string[] } | null;
   router: DocumentFrameRouter;
   /**
    * The hook `SessionNodeManager.setOnDocumentFrame` takes. Handed out ready-shaped so the
@@ -232,24 +199,6 @@ export interface DocumentLayer {
     senderPubkey: string,
     correlationId?: string,
   ): { consumed: boolean; kind?: string; ok?: boolean; reason?: string };
-  /**
-   * Resolve when this envelope is SETTLED by the peer, or false when `timeoutMs` elapses first.
-   *
-   * The delivery transport holds a session it opened open until this resolves. See the comment on
-   * `DocumentTransportDeps.awaitAck`: the seal tears the session down and the teardown drops
-   * content still held for ordering, so sealing before the answer arrives can delete an ack that
-   * was correctly sent and correctly received.
-   *
-   * Resolves IMMEDIATELY if the envelope is already settled — the ack can win the race with the
-   * caller, and a waiter that only listened for future events would then wait out the full grace
-   * period on every fast peer.
-   */
-  awaitAck(
-    ownerAgentId: string,
-    envelopeHash: string,
-    expectedAckerAgentId: string,
-    timeoutMs: number,
-  ): Promise<{ admitted: boolean } | null>;
 }
 
 /**
@@ -297,23 +246,24 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const lifecycle = new DocumentLifecycle(
     store,
     logger,
-    { notifyPeer: deps.notifyPeer },
-    deps.rollback,
-    undefined,
-    // DOD-MP-CONTROL-N-1 — the inbound gate. `holdersFor` is declared below and resolved lazily,
-    // the same shape `live` uses above; the gate is only ever called long after construction.
-    // Wired HERE rather than left to the daemon so every consumer of the layer — including the
-    // e2e fixture — gets the real derivation and cannot silently keep the bilateral gate.
+    // SYNC-P4 — "am I waiting on someone?" answered by the DERIVATION, resolved lazily
+    // (`reconcileReads` is declared below; the list surface only ever asks long after
+    // construction). Legacy documents (no genesis record, so no entry set) are never
+    // close-pending: closing them is refused at the verb, so there is nothing to wait for.
     (ownerAgentId, documentId) => {
-      // LEGACY vs UNKNOWN, decided HERE because only this scope can tell them apart: no genesis
-      // record means no chain at all — a bilateral document predating amendments, for which the
-      // peer column IS the membership. A genesis record whose chain will not replay is a different
-      // fact, and one this daemon must not paper over by assuming two parties.
-      if (!handshake.get(ownerAgentId, documentId)) return { kind: "legacy" as const };
-      const holders = holdersFor(ownerAgentId, documentId);
-      return holders === null
-        ? { kind: "unknown" as const, reason: "document_chain_underivable" }
-        : { kind: "derived" as const, holders };
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      if (!derived.ok) return false;
+      return derived.state.ended === null && derived.state.closedBy.has(ownerAgentId);
+    },
+    // SYNC-D8 — "was this owner written out?" answered by the same fold as everything else.
+    (ownerAgentId, documentId) => standingOf(ownerAgentId, documentId, ownerAgentId) === "removed",
+    // Review F2 — "is it ended?" answered by the fold too; `derived: false` hands the pre-pivot
+    // bilateral record back to its column.
+    (ownerAgentId, documentId) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      return derived.ok
+        ? { derived: true, ended: derived.state.ended }
+        : { derived: false, ended: null };
     },
   );
   const notifications = new DocumentNotifications(store, logger);
@@ -351,78 +301,38 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     logger,
     verifySignature,
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
-    membershipOf: (ownerAgentId, documentId, agentId) =>
-      amendments.membershipOf(ownerAgentId, documentId, agentId),
+    standingOf: (ownerAgentId, documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),
     // The CONTENT door: strictly participants (R17 — invited seats receive, never author).
     currentHolders: (ownerAgentId: string, documentId: string) =>
       participantsFor(ownerAgentId, documentId),
+    // SYNC-G1 — the world an envelope's signed frontier names (R20's input for the causal gate).
+    deriveAtFrontier: (ownerAgentId: string, documentId: string, frontier: readonly string[]) => {
+      const record = handshake.get(ownerAgentId, documentId);
+      if (!record) return { ok: false as const, reason: "document_genesis_missing" };
+      try {
+        const at = deriveDocumentStateAt(
+          arrangementGenesisFromProposal(record.envelope),
+          amendments.chain(ownerAgentId, documentId),
+          frontier,
+          documentGovernancePolicy,
+          verifySignature,
+        );
+        if (!at.ok) return { ok: false as const, reason: at.reason, missing: at.missing };
+        return {
+          ok: true as const,
+          participants: at.state.participants,
+          invited: at.state.invited,
+          ended: at.state.ended,
+        };
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
     sign: deps.sign,
   });
-
-  // WAITERS for `awaitAck`, keyed by owner + envelope. A Set per key because two callers may wait
-  // on the same envelope (a redelivery racing the original), and dropping one of them would leave a
-  // session held open for the full grace period with the answer already in hand.
-  // KEYED BY ACKER TOO (FANOUT-1 review H1): an envelope-keyed waiter let ANY holder's ack —
-  // including a redelivered one from an already-settled holder — resolve the grace wait for
-  // whichever holder was being dialed, and the worker then settled the DIALED holder's row for
-  // content that never reached them. §7-1's silent divergence, through the sender's own
-  // bookkeeping.
-  const ackWaiters = new Map<string, Set<(admitted: boolean) => void>>();
-  const waiterKey = (ownerAgentId: string, envelopeHash: string, ackerAgentId: string) =>
-    `${ownerAgentId}\u0000${envelopeHash}\u0000${ackerAgentId}`;
-
-  const ackInbound = new DocumentAckInbound({
-    store,
-    rejections,
-    logger,
-    verifySignature,
-    currentHolders: (o: string, d: string) => holdersFor(o, d),
-    onSettled: (ownerAgentId, envelopeHash, ackerAgentId, admitted) => {
-      const key = waiterKey(ownerAgentId, envelopeHash, ackerAgentId);
-      const waiting = ackWaiters.get(key);
-      if (!waiting) return;
-      ackWaiters.delete(key);
-      // The OUTCOME, not just the fact of one. A caller told only "answered" has to report the
-      // envelope as still in flight, which is how `document.delivery.sweep { delivered: N }` came
-      // to be permanently 0 — a sweep that delivered nothing looked identical to a healthy one.
-      for (const wake of waiting) wake(admitted);
-    },
-  });
-
-  const awaitAck = async (
-    ownerAgentId: string,
-    envelopeHash: string,
-    expectedAckerAgentId: string,
-    timeoutMs: number,
-  ) => {
-    // ALREADY SETTLED WINS — by THE HOLDER BEING DIALED (H1): the per-acker read first, the
-    // envelope-level read only for the zero-row bilateral legacy.
-    const already =
-      store.holderSettlement(ownerAgentId, envelopeHash, expectedAckerAgentId) ??
-      store.envelopeSettlement(ownerAgentId, envelopeHash);
-    if (already) return already;
-
-    const key = waiterKey(ownerAgentId, envelopeHash, expectedAckerAgentId);
-    return new Promise<{ admitted: boolean } | null>((resolve) => {
-      let timer: ReturnType<typeof setTimeout>;
-      const wake = (admitted: boolean) => {
-        clearTimeout(timer);
-        resolve({ admitted });
-      };
-      const set = ackWaiters.get(key) ?? new Set<(admitted: boolean) => void>();
-      set.add(wake);
-      ackWaiters.set(key, set);
-      timer = setTimeout(() => {
-        // DEREGISTER on the way out. A waiter left in the map for an envelope that is never acked
-        // is a leak the length of the daemon's life, and `unref` is deliberately NOT used: the
-        // grace period must be able to hold the process just as the seal it precedes does.
-        const current = ackWaiters.get(key);
-        current?.delete(wake);
-        if (current && current.size === 0) ackWaiters.delete(key);
-        resolve(null);
-      }, timeoutMs);
-    });
-  };
 
   // The handshake verifies a proposal against its NAMED proposer — the same resolver, so a forged
   // proposal is refused before it can occupy a document_id (ON CONFLICT DO NOTHING makes the first
@@ -432,7 +342,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   // path (`currentDocumentEpoch`) has run through DocumentStore since AMEND-1; these are the
   // WRITE path, and every append below validates first (the standing AMEND-1 condition).
   const amendments = new DocumentAmendmentStore(db, logger);
-  const joins = new DocumentJoinStore(db, logger);
 
   /**
    * M14B / DOD-MP-FANOUT-1 — the CURRENT holders of a document, derived from genesis + the
@@ -511,109 +420,48 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   };
 
   /**
-   * Who a control frame (`close`, `kill`) must be addressed to — DOD-MP-CONTROL-N-1.
+   * SYNC-D8 — the ONE derivation of an agent's standing in a document, from the fold. The old
+   * old linear membership walk was a second derivation that could disagree with
+   * the fold about who is seated; every consumer now asks this.
    *
-   * THIS LIVES HERE, not as a closure in the composition root, for the reason
-   * `document-control-notifier.ts`'s own header records about itself: a closure in `daemon.ts` has
-   * no test, so every fixture hand-copies it, and a hand-copy cannot disagree with the original.
-   * The first draft of this WAS such a closure and had already drifted — it re-derived the
-   * arrangement itself and so never emitted `document.holders.underivable`, leaving the control
-   * path invisible to the exact log search meant to find it.
-   *
-   * Everyone EXCEPT the owner, because the owner is the one doing the ending. A chain that will
-   * not derive is refused by name rather than falling back to the genesis `peerAgentId` — that
-   * fallback is the original defect, and after a removal it aims the frame at precisely the
-   * removed holder.
+   *  - participant / invited: seated, per R17.
+   *  - removed: not seated, and an APPLIED remove_holder entry names them (fold-void removals
+   *    do not count — a void contributed nothing, F4).
+   *  - stranger: not seated, never removed.
+   *  - unknown: the chain does not derive (no genesis, undecodable bytes) — callers must not
+   *    treat this as any of the other four.
    */
-  const controlHolders = (
+  const standingOf = (
     ownerAgentId: string,
     documentId: string,
-  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string } => {
-    // LEGACY FIRST, and for the same reason the settle path checks it first: a document with no
-    // stored genesis proposal has NO CHAIN, so the peer column is not a fallback — it IS the
-    // membership. Without this branch the send path refused the very condition the settle path
-    // calls legacy, so no close frame ever left, neither side recorded the other's close, and such
-    // a document could never be ended by agreement at all. Reachable two ways: documents proposed
-    // before `recordOutgoing` shipped, and a crash between `createDocument` and `recordOutgoing`,
-    // which run in that order.
-    //
-    // The two paths must agree about what "cannot answer" means. Their disagreeing is the whole
-    // shape of this milestone's defects.
-    const doc = store.getDocument(ownerAgentId, documentId);
-    if (doc && !handshake.get(ownerAgentId, documentId)) {
-      return { ok: true, holders: [doc.peerAgentId] };
-    }
-    let derivedHolders: readonly string[] | null;
+    agentId: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown" => {
+    const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+    if (!derived.ok) return "unknown";
+    if (derived.state.participants.has(agentId)) return "participant";
+    if (derived.state.invited.has(agentId)) return "invited";
+    const inert = new Set([
+      ...derived.state.voids.map((v) => v.hash),
+      ...derived.state.excluded.map((e) => e.hash),
+    ]);
+    let chain: DocumentAmendmentEnvelope[];
     try {
-      derivedHolders = holdersFor(ownerAgentId, documentId);
-    } catch (err: unknown) {
-      // CONTAINED for the same reason `cello_doc_list` contains it: a chain this build cannot
-      // decode THROWS, and an uncontained throw would take down the close/kill verb entirely
-      // rather than reporting why the frame could not be addressed.
-      return {
-        ok: false,
-        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
-      };
+      chain = [...amendments.chain(ownerAgentId, documentId)];
+    } catch {
+      return "unknown";
     }
-    // A chain that EXISTS and will not replay keeps the refusal — it may name holders we cannot
-    // see, and addressing the genesis peer alone there is the original defect.
-    if (derivedHolders === null) return { ok: false, reason: "document_holders_underivable" };
-    return { ok: true, holders: derivedHolders.filter((p) => p !== ownerAgentId).sort() };
+    for (const env of chain) {
+      if (env.body.kind !== "remove_holder" || env.body.subject_agent_id !== agentId) continue;
+      const hash = Buffer.from(documentAmendmentHash(env.body)).toString("hex");
+      if (!inert.has(hash)) return "removed";
+    }
+    return "stranger";
   };
 
   /** Is this agent a CURRENT holder — the ack gate's membership question. */
   const isCurrentHolder = (ownerAgentId: string, documentId: string, agentId: string): boolean => {
     const holders = holdersFor(ownerAgentId, documentId);
     return holders !== null && holders.includes(agentId);
-  };
-
-  /** Sign and send a join answer — best-effort, never a veto over the local decision. */
-  const sendJoinAnswer = async (
-    ownerAgentId: string,
-    inviterAgentId: string,
-    documentId: string,
-    amendmentHash: string,
-    accepted: boolean,
-    reason: string | null,
-  ): Promise<void> => {
-    try {
-      const answer: DocumentJoinAnswer = {
-        type: "document_join_answer",
-        document_id: documentId,
-        amendment_hash: amendmentHash,
-        invitee_agent_id: ownerAgentId,
-        accepted,
-        refusal_reason: accepted ? null : reason,
-        answered_at_ms: Date.now(),
-        signature: new Uint8Array(0),
-      };
-      answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
-      await deps.sendFrame(ownerAgentId, inviterAgentId, encodeDocumentJoinAnswer(answer));
-    } catch (err: unknown) {
-      logger.warn("document.join.answer_send_failed", {
-        documentId,
-        amendmentHash,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
-
-  /** Re-send the STANDING decision for an already-decided offer a redelivery just matched. */
-  const resendJoinAnswer = async (
-    ownerAgentId: string,
-    amendmentHash: string,
-    inviterAgentId: string,
-  ): Promise<void> => {
-    const record = joins.get(ownerAgentId, amendmentHash);
-    if (!record || record.state === "pending") return;
-    await sendJoinAnswer(
-      ownerAgentId,
-      inviterAgentId,
-      record.documentId,
-      amendmentHash,
-      record.state === "accepted",
-      record.reason,
-    );
   };
 
   const recordAmendmentImpl = (ownerAgentId: string, wire: Uint8Array, nowMs: number): void => {
@@ -691,49 +539,38 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       ) {
         logger.warn("document.removed_from", {
           documentId,
-          epochId: applied.body.epoch_id,
           removedBy: applied.collection.required_signers.join(","),
         });
       }
       // THE ARRIVING CONSENT IS THE JOIN ANSWER (SYNC-P3, the D5 replacement): an inviter's
       // pending row settles from the entry itself — the subject's own signed yes or no — so
       // the legacy answer frame carries nothing the record does not. Settle-once semantics
-      // live in the store; a redelivered entry decides nothing twice.
-      if (
-        (applied.body.kind === "consent" || applied.body.kind === "refuse_join") &&
-        applied.body.subject_agent_id !== null &&
-        applied.body.subject_agent_id !== ownerAgentId
-      ) {
-        const subject = applied.body.subject_agent_id;
-        const pendingRow = joins
-          .outgoingFor(ownerAgentId)
-          .find(
-            (row) =>
-              row.documentId === documentId &&
-              row.inviteeAgentId === subject &&
-              row.state === "pending",
-          );
-        if (pendingRow) {
-          joins.settleFromEntry(
-            ownerAgentId,
-            pendingRow.amendmentHash,
-            applied.body.kind === "consent",
-            applied.body.kind === "refuse_join" ? "refused via the exchange" : null,
-            nowMs,
-          );
+      // SYNC-P4 (R27/R28, review F2): the stored status is a DISPLAY PROJECTION of the derived
+      // ending — recomputed on EVERY applied entry, in BOTH directions. One-way, kind-gated
+      // syncing let two holders converge on the fold while holding different status columns
+      // forever: a concurrently-authored admission re-opens the derivation (an invited seat
+      // blocks closure), and nothing ever wrote `active` back. The derivation is the truth; the
+      // column exists so the list surface does not re-derive every row, and no correctness gate
+      // reads it for endings anymore (canPublish/canAdmit ask the fold).
+      {
+        const derivedEnd = reconcileReads(ownerAgentId).deriveState(documentId);
+        if (derivedEnd.ok) {
+          const current = store.getDocument(ownerAgentId, documentId)?.status;
+          if (derivedEnd.state.ended !== null && current === "active") {
+            store.setDocumentStatus(
+              ownerAgentId,
+              documentId,
+              derivedEnd.state.ended === "killed" ? "killed" : "closed",
+            );
+            logger.info("document.ended.derived", { documentId, ended: derivedEnd.state.ended });
+          } else if (
+            derivedEnd.state.ended === null &&
+            (current === "closed" || current === "killed")
+          ) {
+            store.setDocumentStatus(ownerAgentId, documentId, "active");
+            logger.info("document.reopened.derived", { documentId });
+          }
         }
-      }
-      // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
-      // holder who had not closed leaves everyone who remains in agreement; without this the
-      // document stayed `active` forever reporting that it waited on nobody.
-      if (applied.body.kind === "remove_holder" || applied.body.kind === "add_holder") {
-        lifecycle.onMembershipChanged(
-          ownerAgentId,
-          documentId,
-          applied.body.kind === "remove_holder"
-            ? (applied.body.subject_agent_id ?? undefined)
-            : undefined,
-        );
       }
     };
     // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
@@ -835,8 +672,14 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     envelopeLog: (documentId) => store.getEnvelopeLog(ownerAgentId, documentId),
     refusedHashes: (documentId) =>
       rejections.quarantined(ownerAgentId, documentId).map((q) => q.rejectedEnvelopeHash),
-    membershipState: (documentId, agentId) =>
-      amendments.membershipOf(ownerAgentId, documentId, agentId).state,
+    // SYNC-R35: the exact signed frames, from the quarantine — rows born before the column hold
+    // none, and the exchange simply has nothing to attach for them.
+    refusalRecords: (documentId) =>
+      rejections
+        .quarantined(ownerAgentId, documentId)
+        .map((q) => q.rejectionWire)
+        .filter((w): w is Uint8Array => w !== undefined),
+    standingOf: (documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),
     genesisBytes: (documentId) => {
       const record = handshake.get(ownerAgentId, documentId);
       return record ? new Uint8Array(encodeDocumentProposal(record.envelope)) : null;
@@ -1039,6 +882,36 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           });
         }
       }
+      // SYNC-R35: the sender's SIGNED refusal records — verified against their named refuser
+      // and recorded as received rejections, exactly as a directly-sent frame would be. This is
+      // how a third holder wedged behind a refused hash learns its name and reason (F5/F8), and
+      // how the refusal keeps traveling once the refuser is gone. Idempotent by primary key.
+      for (const refusalWire of block.refusals ?? []) {
+        try {
+          const rej = decodeDocumentRejection(new Uint8Array(refusalWire));
+          if (rej.document_id !== block.document_id) {
+            throw new Error("document_refusal_document_mismatch: the record names another document");
+          }
+          if (!verifySignature(rej.rejecting_agent_id, buildDocumentRejectionTbs(rej), rej.signature)) {
+            throw new Error(
+              `document_rejection_signature_invalid: the refusal claims to come from ` +
+                `${rej.rejecting_agent_id} but its signature does not verify against that agent`,
+            );
+          }
+          rejections.recordIncomingRejection(ownerAgentId, rej.document_id, {
+            rejectionEnvelopeHash: documentRejectionHash(rej),
+            rejectedEnvelopeHash: rej.rejected_envelope_hash,
+            reason: rej.reason,
+            detail: rej.detail,
+            fromAgentId: rej.rejecting_agent_id,
+          });
+        } catch (err: unknown) {
+          logger.warn("document.reconcile.refusal_record_refused", {
+            documentId: block.document_id, senderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       for (const envWire of block.envelopes) {
         const res = await inbound.receive(ownerAgentId, envWire, nowMs, correlationId);
         if (res.ok && res.admitted) {
@@ -1072,6 +945,10 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           documentId: block.document_id, senderAgentId, correlationId,
         });
       }
+      // Refusal records RIDE replies; they never CAUSE one — counting them here would make any
+      // document with one standing refusal answer every exchange forever, and the exchange is
+      // terminated by silence. The wedge they exist to cure (F5) always involves a real
+      // difference, so they are on board whenever they matter.
       const hasDifference = answer.block.entries.length > 0 || answer.block.envelopes.length > 0;
       if (hasDifference || answer.peerAhead) {
         replyBlocks.push(answer.block);
@@ -1113,7 +990,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
 
   const router = new DocumentFrameRouter({
     inbound,
-    ackInbound,
     handleReconcile,
     logger,
     ownerKeyFor: deps.ownerKeyFor,
@@ -1154,71 +1030,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         })();
       }
     },
-    recordJoinOffer: (ownerAgentId, wire, nowMs) => {
-      const offer = decodeDocumentJoinOffer(wire);
-      // ADDRESSED TO US — the same multi-agent-daemon rule recordProposal enforces: consent
-      // belongs to the agent the inviter named, and a throw here is contained by the router.
-      if (offer.invitee_agent_id !== ownerAgentId) {
-        throw new Error(
-          `document_join_wrong_invitee: this offer is addressed to ${offer.invitee_agent_id}, ` +
-            `not to ${ownerAgentId}`,
-        );
-      }
-      const validation = validateDocumentJoinOffer(offer, documentGovernancePolicy, verifySignature);
-      if (validation.ok) {
-        const stored = joins.recordIncoming(
-          ownerAgentId, wire, validation.pendingAmendmentHash, { state: "pending" }, nowMs,
-        );
-        // REDELIVERY OF A DECIDED OFFER RE-SENDS THE ANSWER. A lost answer was otherwise lost
-        // forever: the invitee's decision stood, the inviter's row sat pending, and the
-        // inviter's only lever — re-inviting, which redelivers this exact offer — reached a
-        // DO-NOTHING insert. Now that redelivery is the recovery: the standing decision is
-        // re-signed and travels again. Best-effort, like every answer.
-        if (stored.state !== "pending") {
-          void resendJoinAnswer(ownerAgentId, validation.pendingAmendmentHash, offer.inviter_agent_id);
-        }
-        return;
-      }
-      // A REFUSAL IS RECORDED — AND ANSWERED — ONLY WHEN IT IS AUTHENTICATED. The first cut
-      // recorded every refusal under the admitting amendment's hash, and that was a standing
-      // veto: any party holding the amendment bytes (every holder gets them in the fan-out)
-      // could deliver a garbage offer FIRST, occupy the real settle key with a refused row, and
-      // the genuine offer would arrive to a DO-NOTHING insert — the admin's admission silently
-      // suppressed, both operators seeing nothing. So: an offer whose signature does not verify
-      // against its named inviter THROWS (contained + logged, nothing recorded — the forged-
-      // proposal treatment), and an authenticated refusal is recorded under the hash of ITS OWN
-      // BYTES — visible to the operator, never able to occupy a real join's settle key.
-      if (!verifySignature(offer.inviter_agent_id, buildDocumentJoinOfferTbs(offer), offer.signature)) {
-        throw new Error(validation.reason);
-      }
-      const refusalKey = createHash("sha256").update(wire).digest("hex");
-      joins.recordIncoming(
-        ownerAgentId, wire, refusalKey, { state: "refused", reason: validation.reason }, nowMs,
-      );
-      // BOTH ENDS get the sentence: the refusal answer travels back to the authenticated
-      // inviter, settling their row with the reason — the version-mismatch sentence was written
-      // for a human and was reaching a database column. The settle key is the admitting
-      // amendment's hash when one is recoverable (the inviter's row lives under it).
-      const last = offer.amendments[offer.amendments.length - 1];
-      if (last !== undefined) {
-        try {
-          const settleKey = Buffer.from(
-            documentAmendmentHash(decodeDocumentAmendment(last).body),
-          ).toString("hex");
-          void sendJoinAnswer(
-            ownerAgentId, offer.inviter_agent_id, offer.document_id, settleKey, false, validation.reason,
-          );
-        } catch {
-          // No recoverable settle key — the refusal stays visible locally and the inviter's
-          // re-invite (which redelivers) will meet the same recorded refusal.
-        }
-      }
-    },
-    recordJoinAnswer: (ownerAgentId, wire, nowMs) => {
-      const r = joins.recordAnswer(ownerAgentId, wire, verifySignature, nowMs);
-      // A refusal is a verdict the router contains and reports — never a silent drop.
-      if (!r.ok) throw new Error(r.reason);
-    },
     recordAmendment: recordAmendmentImpl,
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
@@ -1238,56 +1049,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           peerAgentId: env.sender_agent_id,
           reason: sent.reason,
         });
-      }
-    },
-    sendAck: async (ownerAgentId, wire, outcome) => {
-      const env = decodeDocumentUpdateEnvelope(wire);
-      const ack: DocumentAck = {
-        type: "document_ack",
-        // The wire version this build speaks. Inlined rather than imported because protocol-types
-        // exports the domain and the codec but not the constant; the decoder pins it by value.
-        ack_version: 1,
-        document_id: env.document_id,
-        envelope_hash: outcome.envelopeHash,
-        acker_agent_id: ownerAgentId,
-        admitted: outcome.admitted,
-        ...(outcome.admitted ? {} : { rejection_reason: outcome.rejectionReason ?? "refused" }),
-        acked_at_ms: Date.now(),
-        signature: new Uint8Array(0),
-      };
-      ack.signature = await deps.sign(ownerAgentId, buildDocumentAckTbs(ack));
-      // BEST-EFFORT, and it must be: an ack that could not be sent is not a reason to refuse
-      // content we have already admitted. The sender redelivers on its own timer, and the
-      // redelivery is acked too — which is the case this whole path exists to terminate.
-      const sent = await deps.sendFrame(ownerAgentId, env.sender_agent_id, encodeDocumentAck(ack));
-      if (!sent.ok) {
-        logger.warn("document.ack.unsent", {
-          documentId: env.document_id,
-          envelopeHash: outcome.envelopeHash,
-          reason: sent.reason,
-          correlationId: outcome.correlationId,
-        });
-      }
-    },
-    recordControl: (ownerAgentId, wire, nowMs) => {
-      const control = decodeDocumentControl(wire);
-      // VERIFIED FIRST. A kill frame ends a collaboration; unsigned, anyone reaching the channel
-      // could end any document between any two parties and each operator would believe the other
-      // walked away.
-      if (!verifySignature(control.sender_agent_id, buildDocumentControlTbs(control), control.signature)) {
-        throw new Error(
-          `document_control_signature_invalid: the ${control.verb} claims to come from ` +
-            `${control.sender_agent_id} but its signature does not verify against that agent`,
-        );
-      }
-      const verdict =
-        control.verb === "kill"
-          ? lifecycle.recordPeerKill(ownerAgentId, control.document_id, control.sender_agent_id, nowMs)
-          : lifecycle.recordPeerClose(ownerAgentId, control.document_id, control.sender_agent_id, nowMs);
-      if (!verdict.ok) {
-        // Refusals here are real: an unknown document, or a sender who is not this document's peer.
-        // Thrown so the router reports them rather than recording an end nobody was entitled to.
-        throw new Error(`${verdict.reason}: ${verdict.detail}`);
       }
     },
     recordProposalAck: (ownerAgentId, wire, _nowMs) => {
@@ -1337,218 +1098,39 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
   });
 
-  /**
-   * M14B / DOD-MP-JOIN-1 — the invitee's ACCEPT: consent becomes a held document.
-   *
-   * VALIDATE EVERYTHING, THEN MUTATE. The stored offer is re-validated at the moment of
-   * consequence (validate-before-append, on the bytes that will be appended), and the whole
-   * envelope-log snapshot is verified — every signature, every document binding — before one row
-   * lands. A snapshot with one bad envelope refuses the accept naming it, because skipping it
-   * silently would hand the joiner a document that reads complete and diverges from every other
-   * holder (NO-SILENT-DROP).
-   *
-   * Historical log envelopes are accepted at the epoch their SIGNED bytes claim — the inbound
-   * epoch gate is for live arrivals; a snapshot legitimately spans epochs 0..N.
-   */
-  const acceptJoin = async (ownerAgentId: string, amendmentHash: string, nowMs: number) => {
-    const record = joins.get(ownerAgentId, amendmentHash);
-    if (!record || record.role !== "invitee") {
-      return {
-        ok: false as const,
-        reason: "join_unknown_offer",
-        detail: `no join offer for this agent settles on ${amendmentHash.slice(0, 16)}…`,
-      };
-    }
-    if (record.state !== "pending") {
-      return {
-        ok: false as const,
-        reason: "join_already_decided",
-        detail: `this offer was already ${record.state} — a consent decision is made once`,
-      };
-    }
-    const validation = validateDocumentJoinOffer(record.offer, documentGovernancePolicy, verifySignature);
-    if (!validation.ok) {
-      // Recorded, not just returned: an offer that no longer validates is a settled fact.
-      joins.decide(ownerAgentId, amendmentHash, false, validation.reason, nowMs);
-      return { ok: false as const, reason: "join_offer_invalid", detail: validation.reason };
-    }
-    const documentId = record.documentId;
-
-    // WHO MAY APPEAR IN THE SNAPSHOT: anyone who held the document at ANY epoch of the carried
-    // chain — the genesis pair plus every add_holder subject (a removed holder's history stays
-    // legal). Without this, a malicious inviter plants envelopes signed by keys they control
-    // under identities that were never holders, and the joiner materializes content no
-    // legitimate holder ever saw — silent divergence the live path's sender-is-peer check
-    // would have refused.
-    const everHeld = new Set<string>([
-      validation.genesis.proposer_agent_id,
-      validation.genesis.peer_agent_id,
-    ]);
-    for (const amendment of validation.amendments) {
-      if (amendment.body.kind === "add_holder" && amendment.body.subject_agent_id !== null) {
-        everHeld.add(amendment.body.subject_agent_id);
-      }
-    }
-
-    // The WHOLE snapshot verified before any mutation.
-    const verified: Array<Parameters<typeof store.appendEnvelope>[1]> = [];
-    for (let i = 0; i < record.offer.envelope_log.length; i++) {
-      const bytes = record.offer.envelope_log[i]!;
-      let env;
-      try {
-        env = decodeDocumentUpdateEnvelope(bytes);
-      } catch (err: unknown) {
-        return {
-          ok: false as const,
-          reason: "join_log_invalid",
-          detail: `snapshot envelope ${i} does not decode: ${err instanceof Error ? err.message : String(err)}`,
-        };
-      }
-      if (env.document_id !== documentId) {
-        return {
-          ok: false as const,
-          reason: "join_log_invalid",
-          detail: `snapshot envelope ${i} names document ${env.document_id.slice(0, 16)}…, not this one`,
-        };
-      }
-      if (!verifySignature(env.sender_agent_id, buildDocumentUpdateTbs(env), env.signature)) {
-        return {
-          ok: false as const,
-          reason: "join_log_invalid",
-          detail: `snapshot envelope ${i} does not verify against its sender ${env.sender_agent_id}`,
-        };
-      }
-      if (!everHeld.has(env.sender_agent_id)) {
-        return {
-          ok: false as const,
-          reason: "join_log_invalid",
-          detail:
-            `snapshot envelope ${i} is signed by ${env.sender_agent_id}, who never held this ` +
-            `document at any epoch of the carried chain — refused before anything materializes`,
-        };
-      }
-      verified.push({
-        envelopeHash: documentEnvelopeHash(env),
-        documentId,
-        senderAgentId: env.sender_agent_id,
-        docPrevHash: env.doc_prev_hash,
-        epochId: env.epoch_id,
-        signature: env.signature,
-        stateVector: env.state_vector,
-        payload: env.update,
-        kind: "update",
-        referencesEnvelopeHash: null,
-        createdAtMs: nowMs,
-      });
-    }
-
-    // Mutations, in dependency order: genesis (LiveDocuments reads starting_content from it),
-    // the chain (idempotent on redelivery), the row, the log, the live rebuild, the file.
-    handshake.recordJoined(ownerAgentId, record.offer.genesis, nowMs);
-    try {
-      for (const bytes of record.offer.amendments) {
-        amendments.append(ownerAgentId, documentId, bytes, nowMs);
-      }
-    } catch (err: unknown) {
-      // TWO ADMINS INVITED THE SAME AGENT INDEPENDENTLY: each offer's chain is self-consistent
-      // and both sat pending, but their admitting amendments rival at one epoch — the second
-      // accept hits the store's fork refusal mid-append. Settled as refused with the conflict's
-      // own reason rather than thrown: a raw exception left the row pending and every retry
-      // rethrowing, a wedge the operator could not see past.
-      const reason = err instanceof Error ? err.message : String(err);
-      joins.decide(ownerAgentId, amendmentHash, false, reason, nowMs);
-      return { ok: false as const, reason: "join_conflicting_admission", detail: reason };
-    }
-    if (!store.getDocument(ownerAgentId, documentId)) {
-      store.createDocument({
-        documentId,
-        ownerAgentId,
-        // The inviter is this holder's live counterpart until fan-out delivery (P2) — the
-        // participants that MATTER derive from the amendment chain (Entry 9's decision).
-        peerAgentId: record.inviterAgentId,
-        documentType: validation.genesis.document_type,
-        properties: validation.genesis.properties,
-        status: "active",
-        createdAtMs: nowMs,
-      });
-    }
-    for (const row of verified) store.appendEnvelope(ownerAgentId, row);
-    const doc = live.get(ownerAgentId, documentId);
-    if (writePath) {
-      await writePath.materialize(ownerAgentId, documentId, validation.genesis.document_type, doc);
-    }
-    joins.decide(ownerAgentId, amendmentHash, true, null, nowMs);
-
-    const answer: DocumentJoinAnswer = {
-      type: "document_join_answer",
-      document_id: documentId,
-      amendment_hash: amendmentHash,
-      invitee_agent_id: ownerAgentId,
-      accepted: true,
-      refusal_reason: null,
-      answered_at_ms: nowMs,
-      signature: new Uint8Array(0),
-    };
-    answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
-    logger.info("document.join.accepted", { documentId, amendmentHash, applied: verified.length });
-    return {
-      ok: true as const,
-      documentId,
-      inviterAgentId: record.inviterAgentId,
-      documentType: validation.genesis.document_type,
-      applied: verified.length,
-      answerBytes: encodeDocumentJoinAnswer(answer),
-    };
-  };
-
-  /** The invitee's REFUSE — local and final; the signed answer travels best-effort. */
-  const refuseJoin = async (ownerAgentId: string, amendmentHash: string, reason: string | null, nowMs: number) => {
-    const record = joins.get(ownerAgentId, amendmentHash);
-    if (!record || record.role !== "invitee") {
-      return {
-        ok: false as const,
-        reason: "join_unknown_offer",
-        detail: `no join offer for this agent settles on ${amendmentHash.slice(0, 16)}…`,
-      };
-    }
-    const decided = joins.decide(ownerAgentId, amendmentHash, false, reason, nowMs);
-    if (!decided.decided) {
-      return {
-        ok: false as const,
-        reason: "join_already_decided",
-        detail: `this offer was already ${decided.state} — a consent decision is made once`,
-      };
-    }
-    const answer: DocumentJoinAnswer = {
-      type: "document_join_answer",
-      document_id: record.documentId,
-      amendment_hash: amendmentHash,
-      invitee_agent_id: ownerAgentId,
-      accepted: false,
-      refusal_reason: reason,
-      answered_at_ms: nowMs,
-      signature: new Uint8Array(0),
-    };
-    answer.signature = await deps.sign(ownerAgentId, buildDocumentJoinAnswerTbs(answer));
-    logger.info("document.join.refused", { documentId: record.documentId, amendmentHash });
-    return {
-      ok: true as const,
-      documentId: record.documentId,
-      inviterAgentId: record.inviterAgentId,
-      answerBytes: encodeDocumentJoinAnswer(answer),
-    };
-  };
-
   return {
     amendments,
-    joins,
     verifySignature,
     holdersFor,
-    controlHolders,
     isCurrentHolder,
-    acceptJoin,
-    refuseJoin,
+    standingOf,
     initiateReconcile,
+    governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      if (!derived.ok) {
+        // NAMED, not collapsed to null (review F4): the derivation's own reason — a missing
+        // genesis, undecodable bytes, a fold refusal — is the thing the operator hunts for,
+        // and the old holders gate logged it while this gate ran first and said nothing.
+        logger.error("document.frontier.underivable", { documentId, reason: derived.reason });
+        return null;
+      }
+      return [...derived.state.frontier];
+    },
+    deriveEnded: (ownerAgentId: string, documentId: string) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      if (!derived.ok) return null;
+      return {
+        ended: derived.state.ended,
+        // Who the ending still waits on: every participant without a close entry, AND every open
+        // invitation — an invited seat IS a seat (Entry 54), so a close cannot settle around it.
+        waitingOn: [
+          ...[...derived.state.participants].filter(
+            (participant) => !derived.state.closedBy.has(participant),
+          ),
+          ...derived.state.invited,
+        ],
+      };
+    },
     store,
     writePath,
     handshake,
@@ -1558,7 +1140,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     notifications,
     rejections,
     router,
-    awaitAck,
     onDocumentFrame: (agentName, _sessionId, content, senderPubkey, correlationId) =>
       // `agentName` names the owning agent for the session; the router maps it to the owner KEY
       // that scopes the store. The session id and the sender's transport pubkey are unused: a

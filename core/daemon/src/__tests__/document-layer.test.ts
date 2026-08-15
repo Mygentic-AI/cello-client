@@ -16,7 +16,6 @@ import {
   encodeDocumentUpdateEnvelope,
   buildDocumentUpdateTbs,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
@@ -87,11 +86,11 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
     const base: DocumentUpdateEnvelope = {
       type: "document_update",
       document_id: DOC,
-      epoch_id: DOCUMENT_EPOCH_V1,
       doc_prev_hash: null,
       sender_agent_id: PEER,
       sender_client_id: PEER_CLIENT,
       update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+      governance_parents: [],
       state_vector: new Uint8Array([0]),
       update: peerUpdate("from the peer. "),
       signature: new Uint8Array(64),

@@ -34,14 +34,8 @@ import {
   documentAmendmentHash,
   buildDocumentMultisigTbs,
   encodeDocumentAmendment,
-  buildDocumentJoinOfferTbs,
-  encodeDocumentJoinOffer,
-  validateDocumentJoinOffer,
-  encodeDocumentUpdateEnvelope,
-  DOCUMENT_UPDATE_ENCODING_V1,
   type DocumentAmendmentBody,
   type DocumentAmendmentEnvelope,
-  type DocumentJoinOffer,
   buildDocumentProposalTbs,
   documentIdFromProposal,
   seamViolation,
@@ -59,8 +53,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
-import type { DocumentDeliveryTransport } from "./document-delivery.js";
-import { DELIVERY_ACK_TIMEOUT_MS } from "./document-delivery.js";
+import type { DocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { lineHunks, isSupportedDocumentType, SUPPORTED_DOCUMENT_TYPES } from "./document-write-path.js";
 import { openingNoticeFor, rootForDocumentType } from "./document-types.js";
 import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./document-json.js";
@@ -532,74 +525,47 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         hasStartingContent: p.envelope.starting_content !== null,
         proposedAtMs: p.envelope.proposed_at_ms,
       })),
-      // M14B / DOD-MP-JOIN-1 — offers to join an EXISTING document, decided with the same
-      // accept/refuse verbs (route by document_id). THE RULES ARE SHOWN HERE, derived by replay
-      // of the carried bytes — the operator consents to what their own daemon computed — and
-      // cello_doc_accept re-derives at the moment of consequence. An entry whose stored bytes no
-      // longer validate says so, never silently omitted.
-      joins: layer.joins.pendingFor(who.ownerAgentId).map((j) => {
-        const derived = validateDocumentJoinOffer(
-          j.offer, documentGovernancePolicy, layer.verifySignature,
-        );
-        return {
-          documentId: j.documentId,
-          inviterAgentId: j.inviterAgentId,
-          amendmentHash: j.amendmentHash,
-          offeredAtMs: j.offer.offered_at_ms,
-          carriedEnvelopes: j.offer.envelope_log.length,
-          ...(derived.ok
-            ? {
-                participants: [...derived.arrangement.participants].sort(),
-                invited: [...(derived.arrangement.invited ?? [])].sort(),
-                admins: [...derived.arrangement.admins].sort(),
-                properties: derived.arrangement.properties,
-                assuranceTier: derived.genesis.properties.assurance_tier,
-                documentType: derived.genesis.document_type,
-              }
-            : { invalid: derived.reason }),
-        };
-      }),
-      // Auto-refused offers (version mismatch, chains that do not replay) — recorded with the
-      // sentence written for the operator, and listed so it actually reaches one.
-      refusedJoins: layer.joins.refusedFor(who.ownerAgentId).map((j) => ({
-        documentId: j.documentId,
-        inviterAgentId: j.inviterAgentId,
-        reason: j.reason,
-        offeredAtMs: j.offer.offered_at_ms,
-      })),
+      // SYNC-P4 (D5 deleted): open invitations, DERIVED — a document this daemon holds whose
+      // entry set says this agent is an invited seat. The operator consents to what their own
+      // daemon computed from the signed record, not to a carried snapshot; cello_doc_accept
+      // re-derives at the moment of consequence. The inviter shown is the author of the admit
+      // entry naming this agent (the genesis proposer for a genesis-named seat).
+      joins: layer.store
+        .listDocuments(who.ownerAgentId)
+        .filter((d) => d.status === "active")
+        .flatMap((d) => {
+          const genesisRecord = layer.handshake.get(who.ownerAgentId, d.documentId);
+          if (!genesisRecord) return [];
+          const derived = deriveDocumentState(
+            arrangementGenesisFromProposal(genesisRecord.envelope),
+            layer.amendments.chain(who.ownerAgentId, d.documentId),
+            documentGovernancePolicy,
+            layer.verifySignature,
+          );
+          if (!derived.ok || !derived.state.invited.has(who.ownerAgentId)) return [];
+          const admit = layer.amendments
+            .chain(who.ownerAgentId, d.documentId)
+            .find(
+              (e) => e.body.kind === "add_holder" && e.body.subject_agent_id === who.ownerAgentId,
+            );
+          return [
+            {
+              documentId: d.documentId,
+              inviterAgentId:
+                admit?.body.author_agent_id ?? genesisRecord.envelope.proposer_agent_id,
+              participants: [...derived.state.participants].sort(),
+              invited: [...derived.state.invited].sort(),
+              admins: [...derived.state.admins].sort(),
+              properties: derived.state.properties,
+              assuranceTier: "authenticated",
+              documentType: d.documentType,
+            },
+          ];
+        }),
     };
   });
 
-  /**
-   * Tell the INVITER what was decided — the join twin of `tellProposer`, and the same doctrine:
-   * best-effort, because consent is local and final the moment the operator makes it, and an
-   * unreachable inviter must not get a veto over the invitee's choice.
-   */
-  async function tellInviter(
-    who: Resolved,
-    documentId: string,
-    inviterAgentId: string,
-    answerBytes: Uint8Array,
-  ): Promise<boolean> {
-    try {
-      const sent = await deps.transportFor(who.agentName).sendBytes({
-        peerAgentId: inviterAgentId,
-        documentId,
-        bytes: answerBytes,
-        correlationId: randomUUID(),
-      });
-      if (!sent.ok) {
-        logger.warn("document.join.answer_unsent", { documentId, reason: sent.reason });
-      }
-      return sent.ok;
-    } catch (err: unknown) {
-      logger.warn("document.join.answer_send_threw", {
-        documentId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-  }
+  // The join-answer frame died with D5 — the consent/refusal ENTRY is the answer, and it fans out.
 
   handlers.set("cello_doc_accept", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -624,67 +590,37 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           layer.verifySignature,
         );
         if (standing.ok && standing.state.invited.has(who.ownerAgentId)) {
+          // THE JOIN PATH (SYNC-P4, D5 deleted): the document arrived through the exchange, this
+          // agent derives as an invited seat, and accepting IS authoring the consent entry (R21)
+          // — which travels to every holder over the same carrier as everything else. Until it
+          // reaches them, their fold shows this agent invited, not participating. Idempotent by
+          // re-run: a consent that failed to record is authored on the next accept.
           const consent = await authorConsent(who, documentId);
           if (!consent.ok) {
             return {
               ok: false,
               reason: "document_consent_unrecorded",
               guidance:
-                `You hold this document but your consent entry is still unrecorded ` +
+                `You hold this document but your consent entry is not recorded ` +
                 `(${consent.reason}) — run cello_doc_accept again once the named condition ` +
                 `clears.`,
             };
           }
+          const doc = layer.store.getDocument(who.ownerAgentId, documentId)!;
+          const joinFile = await materialize(who.ownerAgentId, documentId, doc.documentType);
           return {
             ok: true,
             documentId,
+            joined: true,
             consentEntry: consent.entryHash,
             consentDelivered: consent.holdersNotified,
-            guidance:
-              "Your earlier accept had recorded the decision but not your consent entry — it is " +
-              "now recorded and on its way to the other holders.",
+            filePath: joinFile.path,
+            ...(joinFile.path !== null && openingNoticeFor(doc.documentType) !== undefined
+              ? { fileNotice: openingNoticeFor(doc.documentType) }
+              : {}),
           };
         }
       }
-    }
-
-    // A join offer decided with the SAME verb the inbox advertises. Routed first by exact
-    // pending match, so a proposal and a join for different documents can never shadow each
-    // other; an id that matches neither falls through to the proposal path's own refusal.
-    const pendingJoin = layer.joins
-      .pendingFor(who.ownerAgentId)
-      .find((j) => j.documentId === documentId);
-    if (pendingJoin) {
-      const joined = await layer.acceptJoin(who.ownerAgentId, pendingJoin.amendmentHash, deps.now());
-      if (!joined.ok) return { ok: false, reason: joined.reason, guidance: joined.detail };
-      // R21: accepting IS authoring your consent entry — until it reaches the other holders,
-      // their fold shows this agent invited, not participating.
-      const consent = await authorConsent(who, documentId);
-      if (!consent.ok) {
-        return {
-          ok: false,
-          reason: "document_consent_unrecorded",
-          guidance:
-            `The join was applied but your consent entry could not be recorded ` +
-            `(${consent.reason}) — run cello_doc_accept again; the offer is idempotent.`,
-        };
-      }
-      const joinFile = await materialize(who.ownerAgentId, documentId, joined.documentType);
-      const told = await tellInviter(who, documentId, joined.inviterAgentId, joined.answerBytes);
-      return {
-        ok: true,
-        documentId,
-        joined: true,
-        peerAgentId: joined.inviterAgentId,
-        inviterNotified: told,
-        consentEntry: consent.entryHash,
-        consentDelivered: consent.holdersNotified,
-        appliedEnvelopes: joined.applied,
-        filePath: joinFile.path,
-        ...(joinFile.path !== null && openingNoticeFor(joined.documentType) !== undefined
-          ? { fileNotice: openingNoticeFor(joined.documentType) }
-          : {}),
-      };
     }
 
     const outcome = layer.handshake.accept(who.ownerAgentId, documentId, deps.now());
@@ -785,9 +721,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     holders: readonly string[];
     verb: string;
   }): Promise<Record<string, boolean>> => {
-    layer.store.seedAmendmentDeliveries(
-      args.ownerAgentId, args.documentId, args.amendmentHashHex, args.holders, deps.now(),
-    );
     const told: Record<string, boolean> = {};
     for (const holder of args.holders) {
       try {
@@ -800,12 +733,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // PARKED IS NOT NOTIFIED. The relay took it because the holder had no live counterparty.
         const landed = sent.ok && sent.parked !== true;
         told[holder] = landed;
-        if (landed) {
-          layer.store.markAmendmentSent(
-            args.ownerAgentId, args.documentId, args.amendmentHashHex, holder,
-            deps.now(), DELIVERY_ACK_TIMEOUT_MS,
-          );
-        } else {
+        if (!landed) {
           // NAMED, NOT JUST COUNTED. This used to record `false` with no log line anywhere, so the
           // only trace of a lost membership change was a boolean inside an `ok: true` response.
           logger.warn("document.amendment.holder_unnotified", {
@@ -842,20 +770,33 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   const authorConsent = async (who: {
     agentName: string;
     ownerAgentId: string;
-  }, documentId: string, kind: "consent" | "refuse_join" = "consent"): Promise<
+  }, documentId: string, kind: "consent" | "refuse_join" | "close" | "kill" = "consent"): Promise<
     | { ok: true; entryHash: string; holdersNotified: Record<string, boolean> }
     | { ok: false; reason: string }
   > => {
     const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
     if (!genesisRecord) return { ok: false, reason: "document_genesis_missing" };
     const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
-    const chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    let chain: ReturnType<typeof layer.amendments.chain>;
+    try {
+      chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
     if (!derived.ok) return { ok: false, reason: derived.reason };
+    // R29's author-side mirror of the R30 inbound gate: an ended world takes no further entries.
+    // Every other holder would refuse this entry (their gate finds the ending in its closure), so
+    // authoring it would only fork this daemon away from the agreement everyone else has settled —
+    // the concrete case being a late kill rewriting "closed by agreement" as a unilateral end.
+    if (derived.state.ended !== null) {
+      return { ok: false, reason: derived.state.ended === "killed" ? "document_killed" : "document_closed" };
+    }
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind,
       subject_agent_id: who.ownerAgentId,
       // A refusal names nothing it agrees to — it is the subject's own signed no (R24).
@@ -916,20 +857,26 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       ),
       verb: kind,
     });
+    // SYNC-P4: the AUTHOR'S own status projection — the inbound path projects on receipt, and
+    // the authoring daemon must not read "active" for a document its own entry just ended.
+    if ((kind === "close" || kind === "kill") && withNew.state.ended !== null) {
+      layer.store.setDocumentStatus(
+        who.ownerAgentId,
+        documentId,
+        withNew.state.ended === "killed" ? "killed" : "closed",
+      );
+    }
     return { ok: true, entryHash: entryHex, holdersNotified };
   };
 
   /**
    * M14B / DOD-MP-JOIN-1 — invite a third party into an existing document.
    *
-   * One admin's signature authors the admitting amendment (D2); the invitee's own consent makes
-   * the join real (their accept, on their daemon). VALIDATE-THEN-APPEND: the chain including the
-   * new amendment replays through the real policy before one byte lands — the AMEND-1 standing
-   * condition at its second production append site. The offer carries the genesis, the whole
-   * chain, and the update-log snapshot re-encoded from rows (lossless: the client id is a
-   * column, the encoding a pinned constant — the same re-encode the delivery path ships).
-   * Existing holders get the amendment frame BEST-EFFORT at P1; the epoch gate makes a missed
-   * one loud, and durable per-holder delivery is FANOUT-1.
+   * One admin's signature authors the admitting entry; the invitee's own consent makes the
+   * join real (their accept, on their daemon). VALIDATE-THEN-APPEND: the chain including the
+   * new entry derives through the real policy before one byte lands. The invitee gets a NOTICE
+   * — a step-1 reconcile frame (SYNC-R25) — and bootstraps the world through the exchange;
+   * existing holders get the entry best-effort, with any miss repaired by their next exchange.
    */
   handlers.set("cello_doc_invite", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -980,75 +927,53 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `Current admins: ${[...derived.state.admins].join(", ")}.`,
       };
     }
-    if (derived.state.participants.has(invitee) || derived.state.invited.has(invitee)) {
-      // A RE-RUN after the amendment landed but the offer did not reach them: re-send the STORED
-      // offer bytes (the proposal --retry precedent) rather than refusing — authoring afresh
-      // would try to admit a holder the chain already admitted, which the replay refuses.
-      const admitting = chain.find(
-        (e) => e.body.kind === "add_holder" && e.body.subject_agent_id === invitee,
-      );
-      const priorHash = admitting
-        ? Buffer.from(documentAmendmentHash(admitting.body)).toString("hex")
-        : null;
-      const outgoing = priorHash ? layer.joins.get(who.ownerAgentId, priorHash) : null;
-      if (outgoing && outgoing.role === "inviter" && outgoing.state === "pending") {
-        let resent = false;
-        try {
-          const sent = await deps.transportFor(who.agentName).sendBytes({
-            peerAgentId: invitee,
-            documentId,
-            bytes: new Uint8Array(encodeDocumentJoinOffer(outgoing.offer)),
-            correlationId: randomUUID(),
-          });
-          resent = sent.ok;
-        } catch (err: unknown) {
-          logger.warn("document.join.offer_resend_threw", {
-            documentId, error: err instanceof Error ? err.message : String(err),
-          });
-        }
-        // AND THE STALE HOLDERS. A holder who missed the amendment fan-out is wedged — their
-        // publishes refuse as epoch-stale with guidance they cannot follow, because no verb
-        // re-sent the amendment. The re-invite is the healing verb: it re-fans the admitting
-        // amendment to every other current holder, best-effort, reported per holder.
-        const admittingBytes = outgoing.offer.amendments[outgoing.offer.amendments.length - 1];
-        let holdersNotified: Record<string, boolean> = {};
-        // `priorHash` is non-null whenever `outgoing` is — the lookup is keyed by it — but the
-        // narrowing does not survive the branch, and an amendment seeded under a null key would be
-        // owed to a row nothing can ever join.
-        if (admittingBytes !== undefined && priorHash !== null) {
-          holdersNotified = await fanOutAmendment({
-            agentName: who.agentName,
-            ownerAgentId: who.ownerAgentId,
-            documentId,
-            amendmentHashHex: priorHash,
-            amendmentBytes: new Uint8Array(admittingBytes),
-            holders: [...derived.state.participants, ...derived.state.invited].filter(
-              (holder) => holder !== who.ownerAgentId && holder !== invitee,
-            ),
-            verb: "re-invite",
-          });
-        }
-        return {
-          ok: true,
-          documentId,
-          inviteeAgentId: invitee,
-          amendmentHash: priorHash,
-          resent: true,
-          offerSent: resent,
-          holdersNotified,
-        };
-      }
+    if (derived.state.participants.has(invitee)) {
       return {
         ok: false,
         reason: "document_already_holder",
         guidance: "That agent already holds this document — there is nothing to invite them to.",
       };
     }
+    if (derived.state.invited.has(invitee)) {
+      // A RE-RUN while the invitation is open: the admitting entry is already in the chain, so
+      // authoring afresh would only mint a void. Re-send the NOTICE (SYNC-R25) — initiating a
+      // reconcile exchange is idempotent by construction, and the invitee's empty-handed answer
+      // pulls the genesis and the whole entry set across. The other holders are re-fanned the
+      // admitting entry too: one who missed it is wedged, refusing the invitee by name.
+      const admitting = chain.find(
+        (e) => e.body.kind === "add_holder" && e.body.subject_agent_id === invitee,
+      );
+      const priorHash = admitting
+        ? Buffer.from(documentAmendmentHash(admitting.body)).toString("hex")
+        : null;
+      const renotice = await layer.initiateReconcile(who.ownerAgentId, invitee, [documentId]);
+      let holdersNotified: Record<string, boolean> = {};
+      if (admitting && priorHash !== null) {
+        holdersNotified = await fanOutAmendment({
+          agentName: who.agentName,
+          ownerAgentId: who.ownerAgentId,
+          documentId,
+          amendmentHashHex: priorHash,
+          amendmentBytes: new Uint8Array(encodeDocumentAmendment(admitting)),
+          holders: [...derived.state.participants, ...derived.state.invited].filter(
+            (holder) => holder !== who.ownerAgentId && holder !== invitee,
+          ),
+          verb: "re-invite",
+        });
+      }
+      return {
+        ok: true,
+        documentId,
+        inviteeAgentId: invitee,
+        amendmentHash: priorHash,
+        resent: true,
+        noticeSent: renotice.ok,
+        holdersNotified,
+      };
+    }
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind: "add_holder",
       subject_agent_id: invitee,
       property_change: null,
@@ -1102,60 +1027,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
 
-    // The snapshot: update rows only, re-encoded losslessly. Rejection records stay local —
-    // quarantine bridging is receiver-side state, not shared history.
-    const log = layer.store.getEnvelopeLog(who.ownerAgentId, documentId);
-    const snapshot: Uint8Array[] = [];
-    for (const row of log) {
-      if (row.kind !== "update" || row.payload === null) continue;
-      snapshot.push(
-        new Uint8Array(
-          encodeDocumentUpdateEnvelope({
-            type: "document_update",
-            document_id: row.documentId,
-            epoch_id: row.epochId,
-            doc_prev_hash: row.docPrevHash,
-            sender_agent_id: row.senderAgentId,
-            sender_client_id: row.senderClientId ?? 0,
-            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
-            state_vector: row.stateVector,
-            update: row.payload,
-            signature: row.signature,
-          }),
-        ),
-      );
-    }
-
-    const offer: DocumentJoinOffer = {
-      type: "document_join_offer",
-      feature_version: DOCUMENT_FEATURE_VERSION,
-      inviter_agent_id: who.ownerAgentId,
-      invitee_agent_id: invitee,
-      document_id: documentId,
-      genesis: new Uint8Array(encodeDocumentProposal(genesisRecord.envelope)),
-      amendments: [...chain.map((e) => new Uint8Array(encodeDocumentAmendment(e))), amendmentBytes],
-      envelope_log: snapshot,
-      offered_at_ms: deps.now(),
-      signature: new Uint8Array(0),
-    };
-    offer.signature = await deps.sign(who.agentName, buildDocumentJoinOfferTbs(offer));
-    const wire = new Uint8Array(encodeDocumentJoinOffer(offer));
     const amendHashHex = Buffer.from(amendHash).toString("hex");
-    layer.joins.recordOutgoing(who.ownerAgentId, wire, amendHashHex, deps.now());
-
-    // The offer to the invitee, then the amendment to every OTHER current holder — both
-    // best-effort at P1, each reported as a fact rather than assumed.
-    let offerSent = false;
-    try {
-      const sent = await deps.transportFor(who.agentName).sendBytes({
-        peerAgentId: invitee, documentId, bytes: wire, correlationId: randomUUID(),
-      });
-      offerSent = sent.ok;
-      if (!sent.ok) logger.warn("document.join.offer_unsent", { documentId, reason: sent.reason });
-    } catch (err: unknown) {
-      logger.warn("document.join.offer_send_threw", {
-        documentId, error: err instanceof Error ? err.message : String(err),
-      });
+    // THE NOTICE (SYNC-R25, replacing the D5 offer): no bespoke frame carrying history — the
+    // inviter initiates a reconcile exchange naming the document. The invitee's daemon answers
+    // the unheld position with an empty hand, and the step-2 reply carries the genesis and the
+    // whole entry set (the P3 bootstrap). Losing the notice strands nothing: the admission is in
+    // the chain, and any later exchange with any holder delivers it.
+    const notice = await layer.initiateReconcile(who.ownerAgentId, invitee, [documentId]);
+    const offerSent = notice.ok;
+    if (!notice.ok) {
+      logger.warn("document.join.notice_unsent", { documentId, reason: notice.reason });
     }
     // DOD-MP-INVITE-FANOUT-1 — RECORD WHAT IS OWED BEFORE TRYING TO SEND IT.
     //
@@ -1178,23 +1059,22 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       holders: owedHolders,
       verb: "invite",
     });
-    logger.info("document.join.invited", { documentId, invitee, epochId: body.epoch_id, offerSent });
+    logger.info("document.join.invited", { documentId, invitee, noticeSent: offerSent });
     return {
       ok: true,
       documentId,
       inviteeAgentId: invitee,
       amendmentHash: amendHashHex,
-      epochId: body.epoch_id,
-      offerSent,
+      noticeSent: offerSent,
       holdersNotified: holdersTold,
       ...(offerSent
         ? {}
         : {
             guidance:
-              "The amendment is recorded and the invitation exists, but the offer did not reach " +
+              "The admission is recorded and the invitation exists, but the notice did not reach " +
               "the invitee — they may be offline. Re-run cello_doc_invite with the same invitee " +
-              "once they are reachable: it re-sends this exact offer rather than authoring a " +
-              "second amendment.",
+              "once they are reachable: it re-sends the notice rather than authoring a second " +
+              "entry.",
           }),
     };
   });
@@ -1246,12 +1126,9 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // was offline at removal time never learned, and no other verb can ever re-send the
       // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
       // the chain never touched still refuses.
-      const membership = layer.amendments.membershipOf(who.ownerAgentId, documentId, holder);
-      if (membership.state === "removed") {
-        const removal = chain.find(
-          (e) => e.body.kind === "remove_holder" &&
-            e.body.subject_agent_id === holder &&
-            e.body.epoch_id === membership.epochId,
+      if (layer.standingOf(who.ownerAgentId, documentId, holder) === "removed") {
+        const removal = [...chain].reverse().find(
+          (e) => e.body.kind === "remove_holder" && e.body.subject_agent_id === holder,
         );
         let resendTold: Record<string, boolean> = {};
         if (removal) {
@@ -1287,7 +1164,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           documentId,
           removedAgentId: holder,
           resent: true,
-          epochId: membership.epochId,
           holdersNotified: resendTold,
         };
       }
@@ -1300,8 +1176,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind: "remove_holder",
       subject_agent_id: holder,
       property_change: null,
@@ -1356,12 +1230,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
-    // DOD-MP-CLOSE-N-1 — removing the one holder who had not closed leaves everyone who remains in
-    // agreement, so the removal itself can complete it. Without this the document sat `active`
-    // forever, reporting that it waited on nobody. Also drops the removed holder's close row, so a
-    // later re-admission does not carry their old agreement into a new tenure.
-    layer.lifecycle.onMembershipChanged(who.ownerAgentId, documentId, holder);
-
+    // SYNC-P4 (R27): a removal can COMPLETE a standing agreement — everyone who remains has
+    // agreed — and that now falls out of the DERIVATION; the author's daemon projects it here,
+    // exactly as receiving daemons project on arrival.
+    {
+      const afterRemove = layer.deriveEnded(who.ownerAgentId, documentId);
+      if (afterRemove?.ended) {
+        layer.store.setDocumentStatus(
+          who.ownerAgentId,
+          documentId,
+          afterRemove.ended === "killed" ? "killed" : "closed",
+        );
+      }
+    }
     // The amendment travels to EVERY current holder INCLUDING the removed one — being told is
     // how their daemon surfaces the removal to their operator. Best-effort at P1, per holder,
     // reported never assumed.
@@ -1406,14 +1287,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       }
     }
     logger.info("document.holder_removed", {
-      documentId, holder, epochId: body.epoch_id, voluntary: holder === who.ownerAgentId,
+      documentId, holder, voluntary: holder === who.ownerAgentId,
     });
     return {
       ok: true,
       documentId,
       removedAgentId: holder,
       voluntary: holder === who.ownerAgentId,
-      epochId: body.epoch_id,
       holdersNotified: holdersTold,
       guidance:
         "Removal is forward-only: their existing copy and its history remain theirs — new edits " +
@@ -1465,18 +1345,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           };
         }
       }
-    }
-
-    const pendingJoinRefusal = layer.joins
-      .pendingFor(who.ownerAgentId)
-      .find((j) => j.documentId === documentId);
-    if (pendingJoinRefusal) {
-      const refused = await layer.refuseJoin(
-        who.ownerAgentId, pendingJoinRefusal.amendmentHash, reason, deps.now(),
-      );
-      if (!refused.ok) return { ok: false, reason: refused.reason, guidance: refused.detail };
-      const told = await tellInviter(who, documentId, refused.inviterAgentId, refused.answerBytes);
-      return { ok: true, documentId, joined: false, inviterNotified: told };
     }
 
     const proposal = layer.handshake.get(who.ownerAgentId, documentId);
@@ -1559,20 +1427,45 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       }
     };
 
-    const outgoingJoins = layer.joins.outgoingFor(who.ownerAgentId).map((j) => ({
-      documentId: j.documentId,
-      inviteeAgentId: j.inviteeAgentId,
-      state: j.state,
-      ...(j.reason ? { reason: j.reason } : {}),
-      ...(j.state === "refused"
-        ? {
-            guidance:
-              "The invitee declined but the admitting amendment is already in the chain — they " +
-              "count as a holder until removed. The removal verb ships in the next unit of this " +
-              "milestone; nothing needs doing meanwhile.",
-          }
-        : {}),
-    }));
+    // SYNC-P4 (D5 deleted): the invitation ledger IS the entry set. An open invitation is an
+    // invited seat in the derivation; a refusal is the subject's own refuse_join entry in the
+    // chain. No stored offer rows — asked twice, the record answers twice, identically.
+    const outgoingJoins = layer.store
+      .listDocuments(who.ownerAgentId)
+      .flatMap((d) => {
+        const genesisRecord = layer.handshake.get(who.ownerAgentId, d.documentId);
+        if (!genesisRecord) return [];
+        let chain;
+        try {
+          chain = layer.amendments.chain(who.ownerAgentId, d.documentId);
+        } catch {
+          return [];
+        }
+        const derived = deriveDocumentState(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          chain,
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (!derived.ok) return [];
+        const open = [...derived.state.invited]
+          .filter((seat) => seat !== who.ownerAgentId)
+          .map((seat) => ({ documentId: d.documentId, inviteeAgentId: seat, state: "pending" as const }));
+        const refusedSeats = chain
+          .filter((e) => e.body.kind === "refuse_join")
+          .map((e) => e.body.subject_agent_id)
+          .filter((seat): seat is string => seat !== null && seat !== who.ownerAgentId)
+          .filter(
+            (seat) =>
+              !derived.state.participants.has(seat) && !derived.state.invited.has(seat),
+          );
+        const refused = [...new Set(refusedSeats)].map((seat) => ({
+          documentId: d.documentId,
+          inviteeAgentId: seat,
+          state: "refused" as const,
+        }));
+        return [...open, ...refused];
+      });
     return {
       ok: true,
       ...(outgoingJoins.length > 0 ? { joinOffers: outgoingJoins } : {}),
@@ -1580,8 +1473,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // WHOSE OFFER WAS IT, and has the other side actually shown up?
         //
         // Without these three fields, `cello_doc_list` renders identically for a document the peer
-        // refused, one whose offer never reached them, and one being actively co-edited — the only
-        // moving part is `pendingUnsent`, which also moves for a peer who is merely offline. An
+        // refused, one whose offer never reached them, and one being actively co-edited. An
         // operator cannot tell "they said no" from "they are asleep", and those want opposite
         // actions.
         const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
@@ -1600,7 +1492,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // confiscation reading FORWARD-ONLY-REMOVAL exists to forbid.
         //
         // ALWAYS PRESENT, exactly as `participants` is: an absent key is read as "fine", so on a
-        // chain this build cannot decode — where `removedFromArrangement` honestly cannot tell —
+        // chain this build cannot decode — where the standing derivation honestly cannot tell —
         // it says `unknown` rather than going quiet and rendering a removed holder as a holder.
         const standing: "removed" | "holder" | "unknown" =
           arrangement["arrangementUnavailable"] !== undefined
@@ -1608,15 +1500,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             : (d as { removed?: boolean }).removed === true
               ? "removed"
               : "holder";
-        const removedAtEpoch = (d as { removedAtEpoch?: number }).removedAtEpoch;
         return {
           ...d,
           yourStanding: standing,
           ...(standing === "removed"
             ? {
                 standingGuidance:
-                  `You are no longer a holder of this document` +
-                  (removedAtEpoch === undefined ? `. ` : `, as of epoch ${removedAtEpoch}. `) +
+                  `You are no longer a holder of this document. ` +
                   `Your copy and its full history remain yours, and you can still read it here or ` +
                   `open the file. What changed is only the flow of edits: yours no longer publish ` +
                   `to the other holders, and theirs no longer reach you.`,
@@ -2229,151 +2119,32 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
     }
-    const outcome = await layer.lifecycle.close(who.ownerAgentId, documentId, deps.now());
-    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
-    const status = layer.store.getDocument(who.ownerAgentId, documentId)?.status ?? "unknown";
-    // BILATERAL. The document settles when both sides have said it, so "closed" is not this call's
-    // answer to give — reporting it would tell an operator the collaboration is over while the peer
-    // is still editing.
-    //
-    // `peerNotified` is reported for the same reason `kill` reports it, and its absence here was an
-    // asymmetry with teeth: `status: "active"` after a close is INDISTINGUISHABLE from "sent fine,
-    // they have not answered yet". Control frames are fire-once — unlike update envelopes they are
-    // not in the log and the delivery sweep never retries them — so a close sent while the peer was
-    // offline means the document can never settle, forever, with nothing on either screen.
+    // SYNC-P4 (R26/R27): closing is authoring YOUR OWN close entry — the same self-signed act
+    // consent is, traveling the same carrier, settling by DERIVATION when every current
+    // participant has one. No control frame, no fan-out bookkeeping, no fire-once anything: a
+    // close that has not reached someone yet is just a difference the next exchange closes.
+    const closed = await authorConsent(who, documentId, "close");
+    if (!closed.ok) {
+      return {
+        ok: false,
+        reason: "document_close_unrecorded",
+        guidance: `Your close entry could not be recorded (${closed.reason}).`,
+      };
+    }
+    const derived = layer.governanceFrontierFor(who.ownerAgentId, documentId) !== null
+      ? layer.deriveEnded(who.ownerAgentId, documentId)
+      : null;
     return {
       ok: true,
       documentId,
-      status,
-      peerNotified: outcome.peerNotified,
-      holdersNotified: outcome.holdersNotified,
-      holderFailures: outcome.holderFailures,
-      ...(outcome.peerNotified
-        ? {}
-        : {
-            reason: outcome.notifyReason,
-            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
-          }),
+      closeEntry: closed.entryHash,
+      closeDelivered: closed.holdersNotified,
+      // DERIVED, at this instant: "closed" only when everyone seated has agreed — one party
+      // alone is never the whole agreement, and the surface says who is still being waited on.
+      ended: derived?.ended ?? null,
+      waitingOn: derived?.waitingOn ?? [],
     };
   });
-
-  /**
-   * What to tell an operator when a close or kill did not reach the peer — BRANCHED ON THE CAUSE.
-   *
-   * One string used to cover all three: a transport failure, a signing key that could not be
-   * loaded, and this daemon not holding the document's agent at all. Only the first is fixed by
-   * waiting, and that is what the single message told them to do. Traced end to end in the
-   * DOD-DOC-TOOLS-1 review: an exit-point label standing in for a local fault, pointing at the
-   * network.
-   */
-  function notifyGuidance(
-    verb: "close" | "kill",
-    reason?: string,
-    detail?: string,
-    holdersNotified?: Record<string, boolean>,
-    holderFailures?: Record<string, string>,
-  ): string {
-    // DOD-MP-CONTROL-DURABLE-1 — this said "A close is not retried", and that stopped being true
-    // when the ending became durable. A sentence telling the operator to do by hand what the daemon
-    // now does for them is not merely stale: it invites a second close for no reason, and it
-    // undersells the one case that still needs them — a holder we never manage to confirm.
-    const tail = verb === "close"
-      ? `The ending is owed to anyone who did not take it and is re-sent when they return; you do ` +
-        `not need to run this again. If it still cannot be confirmed the daemon says so, naming ` +
-        `them — that one needs you.`
-      : `The kill stands locally either way, and is re-sent to anyone who did not take it until ` +
-        `they do or the daemon reports that it gave up on them.`;
-    if (reason === "document_control_unsigned") {
-      return (
-        `Your ${verb} was recorded, but this agent's signing key could not be loaded, so nothing ` +
-        `could be sent to the peer${detail ? ` (${detail})` : ""}. Waiting will not help — the ` +
-        `fault is on this machine. ${tail}`
-      );
-    }
-    if (reason === "document_unknown") {
-      return (
-        `Your ${verb} was recorded, but this daemon does not hold the agent that owns the document, ` +
-        `so it could not tell the peer. That is a local wiring fault, not the peer being away. ${tail}`
-      );
-    }
-    // THE FOUR DERIVATION FAULTS (DOD-MP-CONTROL-N-1). Every one of these is a fact about THIS
-    // machine's record of the document, and not one of them is fixed by the counterparty coming
-    // online — which is what the generic sentence below tells the operator to wait for. That is the
-    // exact defect this function's header says it was written to remove, reintroduced by four new
-    // reasons that were never added to it.
-    if (reason === "document_holders_underivable" || reason === "document_genesis_missing") {
-      return (
-        `Your ${verb} was recorded, but this daemon could not work out who currently holds the ` +
-        `document, so it sent nothing to anyone. Waiting will not help — the signed history on this ` +
-        `machine is the problem, not the network. Look for a "document.holders.underivable" line in ` +
-        `the daemon log, which names the specific cause. ${tail}`
-      );
-    }
-    if (reason?.startsWith("document_chain_undecodable")) {
-      return (
-        `Your ${verb} was recorded, but this build cannot read part of the document's signed ` +
-        `history${detail ? ` (${detail})` : ""}, so it could not work out who to tell. That is ` +
-        `usually a client older than the document — upgrading is the fix, not waiting. ${tail}`
-      );
-    }
-    if (reason === "document_no_holders") {
-      return (
-        `Your ${verb} was recorded, and there is nobody left to tell — the signed history shows no ` +
-        `other current holder of this document. Nothing is pending and nothing needs retrying.`
-      );
-    }
-    // PARTIAL FAN-OUT is its own case and reads nothing like "the peer is offline". With three
-    // holders, two hearing you and one not is the ordinary outcome, and the operator needs to know
-    // WHICH one is still editing a document they think is live — a message saying "the peer" names
-    // nobody when there are several.
-    const missed = Object.entries(holdersNotified ?? {}).filter(([, told]) => !told).map(([h]) => h);
-    const reached = Object.values(holdersNotified ?? {}).filter(Boolean).length;
-    if (missed.length > 0 && reached > 0) {
-      return (
-        `Your ${verb} was recorded and reached ${reached} of ${reached + missed.length} other ` +
-        `holders, but not ${missed.join(", ")} — they will keep editing a document the rest of you ` +
-        `have ended. ${tail}`
-      );
-    }
-    if (missed.length > 0) {
-      // EVERY holder failed. This used to fall through to the generic sentence, which says "the
-      // peer" and names nobody — unusable when there are several, and the per-holder transport
-      // reasons live only in the log. It also arrives with no `reason` field at all, because the
-      // notifier returned ok: signing and addressing both worked, the sends did not.
-      //
-      // AND IT SAID "most likely offline", WHICH WAS A GUESS. Caught on the live fleet: every
-      // holder failed with `session_sealed` — the relay refusing a leaf for a session it has
-      // closed — and the operator was told to wait for people who were sitting right there.
-      // Waiting cannot reopen a sealed session. The cause is known per holder; it travels.
-      const causes = [...new Set(Object.values(holderFailures ?? {}))].filter(Boolean);
-      const because = causes.length > 0 ? ` (${causes.join(", ")})` : "";
-      // THE WHOLE FAMILY, not one substring. This tested `includes("sealed")`, so `session_sealed`
-      // got the useful sentence and every other way a session's record can be over —
-      // `relay_session_gone` (the relay restarted or swept it) and `session_not_found` — fell to
-      // generic wait-for-them advice, which is the one thing that cannot work when there is nothing
-      // left to wait for.
-      const sealed = causes.some(
-        (c) =>
-          c.includes("sealed") ||
-          c.includes("relay_session_gone") ||
-          c.includes("session_not_found"),
-      );
-      return (
-        `Your ${verb} was recorded but reached none of the ${missed.length} other ` +
-        `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")})${because}, so the document ` +
-        `cannot settle until they hear it. ` +
-        (sealed
-          ? `The session carrying this document has been sealed, so waiting will not help — ` +
-            `the document needs a fresh session to the other holders. `
-          : ``) +
-        `${tail}`
-      );
-    }
-    return (
-      `Your ${verb} was recorded but did not reach the peer${detail ? ` (${detail})` : ""}, so the ` +
-      `document cannot settle until they hear it. ${tail}`
-    );
-  }
 
   handlers.set("cello_doc_kill", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -2382,25 +2153,25 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
     }
-    const outcome = await layer.lifecycle.kill(who.ownerAgentId, documentId, deps.now());
-    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
-    // `peerNotified` is REPORTED, never hidden behind ok. A kill is deliberately independent of the
-    // peer being reachable — a decision to stop that depends on the other party being online is not
-    // a decision to stop — but an operator who believes the peer was told, when they were not, will
-    // not understand why updates keep arriving.
+    // SYNC-P4 (R28): a kill is one admin's own signed entry — immediate and one-sided the
+    // moment it applies anywhere, independent of anyone being reachable (a decision to stop
+    // that depends on the other party being online is not a decision to stop). It travels the
+    // same carrier as everything else; a holder who has not received it yet is a difference
+    // the next exchange closes.
+    const killed = await authorConsent(who, documentId, "kill");
+    if (!killed.ok) {
+      return {
+        ok: false,
+        reason: "document_kill_unrecorded",
+        guidance: `Your kill entry could not be recorded (${killed.reason}).`,
+      };
+    }
     return {
       ok: true,
       documentId,
-      peerNotified: outcome.peerNotified,
-      holdersNotified: outcome.holdersNotified,
-      holderFailures: outcome.holderFailures,
-      note: outcome.note,
-      ...(outcome.peerNotified
-        ? {}
-        : {
-            reason: outcome.notifyReason,
-            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
-          }),
+      killEntry: killed.entryHash,
+      killDelivered: killed.holdersNotified,
+      ended: "killed",
     };
   });
 

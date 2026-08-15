@@ -9,13 +9,11 @@ import { describe, it, expect, vi } from "vitest";
 import {
   DOCUMENT_FEATURE_VERSION,
   encodeDocumentUpdateEnvelope,
-  encodeDocumentAck,
   encodeDocumentProposal,
   encodeDocumentRejection,
+  encodeDocumentReconcile,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
-  type DocumentAck,
 } from "@cello-protocol/protocol-types";
 import {
   DocumentFrameRouter,
@@ -23,7 +21,6 @@ import {
   MAX_DOCUMENT_FRAME_FIELDS,
 } from "../document-frame-router.js";
 import type { DocumentInbound } from "../document-inbound.js";
-import type { DocumentAckInbound } from "../document-ack-inbound.js";
 import type { Logger } from "../types.js";
 
 /** The agent NAME the session path carries — deliberately not the owner key it maps to. */
@@ -45,28 +42,17 @@ function recordingLogger(): { logger: Logger; events: Array<{ event: string; fie
 const updateEnvelope: DocumentUpdateEnvelope = {
   type: "document_update",
   document_id: DOC,
-  epoch_id: DOCUMENT_EPOCH_V1,
   doc_prev_hash: null,
   sender_agent_id: "peer-agent",
   sender_client_id: 4242,
   update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+  governance_parents: [],
   state_vector: new Uint8Array([0]),
   update: new Uint8Array([1, 2, 3]),
   signature: new Uint8Array(64).fill(3),
 };
 
-const ackFrame: DocumentAck = {
-  type: "document_ack",
-  ack_version: 1,
-  document_id: DOC,
-  envelope_hash: "bb".repeat(32),
-  acker_agent_id: "peer-agent",
-  admitted: true,
-  acked_at_ms: NOW,
-  signature: new Uint8Array(64).fill(4),
-};
-
-function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {}) {
+function newRouter(over: { onUpdate?: () => unknown } = {}) {
   const { logger, events } = recordingLogger();
   const calls: string[] = [];
   /** Whichever id each downstream call was actually scoped by. */
@@ -78,28 +64,15 @@ function newRouter(over: { onUpdate?: () => unknown; onAck?: () => unknown } = {
       return over.onUpdate ? over.onUpdate() : { ok: true, admitted: true, envelopeHash: "x", duplicate: false };
     },
   } satisfies Pick<DocumentInbound, "receive"> as DocumentInbound;
-  const ackInbound = {
-    receive: (ownerAgentId: string) => {
-      calls.push("ack");
-      owners.push(ownerAgentId);
-      return over.onAck ? over.onAck() : { ok: true, admitted: true, envelopeHash: "x" };
-    },
-  } satisfies Pick<DocumentAckInbound, "receive"> as DocumentAckInbound;
   const recorded: string[] = [];
-  /** Every ack the router actually put on the wire — the only proof a delivery gets settled. */
-  const acks: Array<{ envelopeHash: string; admitted: boolean; rejectionReason?: string }> = [];
   return {
-    acks,
     router: new DocumentFrameRouter({
       inbound,
-      ackInbound,
       logger,
-      sendAck: async (_owner, _wire, outcome) => {
-        acks.push({
-          envelopeHash: outcome.envelopeHash,
-          admitted: outcome.admitted,
-          ...(outcome.rejectionReason ? { rejectionReason: outcome.rejectionReason } : {}),
-        });
+      handleReconcile: async (ownerAgentId: string) => {
+        calls.push("reconcile");
+        owners.push(ownerAgentId);
+        return { ok: true };
       },
       rewriteFile: async () => {},
       sendFrameToPeer: async () => {},
@@ -132,15 +105,6 @@ describe("DocumentFrameRouter — classification is by DECODE", () => {
     await vi.waitFor(() => expect(r.calls).toEqual(["update"]));
   });
 
-  it("routes an ack to the ack path", async () => {
-    const r = newRouter();
-    expect(r.router.routeSync(AGENT, encodeDocumentAck(ackFrame), NOW, "c")).toEqual({
-      consumed: true,
-      kind: "ack",
-    });
-    await vi.waitFor(() => expect(r.calls).toEqual(["ack"]));
-  });
-
   it("leaves an ordinary conversation message alone", async () => {
     const r = newRouter();
     const message = new TextEncoder().encode("Hey - did you see the draft I sent over?");
@@ -163,12 +127,23 @@ describe("DocumentFrameRouter — classification is by DECODE", () => {
   it("does not let one document type claim the other's frame", async () => {
     const r = newRouter();
     r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-    r.router.routeSync(AGENT, encodeDocumentAck(ackFrame), NOW, "c");
+    r.router.routeSync(
+      AGENT,
+      new Uint8Array(
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: 1,
+          documents: [],
+        }),
+      ),
+      NOW,
+      "c",
+    );
     // Both decoders check their `type` discriminator before anything else, so the try-in-turn
     // ordering cannot misassign a well-formed frame. And the two arrive in the order sent — the
     // per-owner queue is what guarantees an envelope's predecessor is stored before its successor
     // is chain-checked.
-    await vi.waitFor(() => expect(r.calls).toEqual(["update", "ack"]));
+    await vi.waitFor(() => expect(r.calls).toEqual(["update", "reconcile"]));
   });
 
   it("says nothing in the log for an ordinary message", async () => {
@@ -255,7 +230,7 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     // Against the CONSTANT, not a hardcoded 32. The earlier version compared to a literal, so
     // lowering MAX_DOCUMENT_FRAME_FIELDS to 8 kept it green while real frames were reclassified as
     // conversation — the exact defect its own comment described.
-    for (const wire of [encodeDocumentUpdateEnvelope(updateEnvelope), encodeDocumentAck(ackFrame)]) {
+    for (const wire of [encodeDocumentUpdateEnvelope(updateEnvelope)]) {
       expect(wire[0]).toBe(0xb9);
       expect((wire[1]! << 8) | wire[2]!).toBeLessThanOrEqual(MAX_DOCUMENT_FRAME_FIELDS);
     }
@@ -395,49 +370,4 @@ describe("DocumentFrameRouter — the AGENT NAME is mapped, never used as an own
   });
 });
 
-/**
- * DOD-DOC-INBOUND-TERMINAL-1 — the router half.
- *
- * `terminal` on an InboundResult is inert until something puts an ack on the wire, and this is the
- * only place that can. The router used to gate ack emission on `if (res.ok)`, so every refusal —
- * including ones that can never become acceptance — settled nothing and the sender redelivered
- * forever. Found live: a document whose proposal the peer refused sat at `pendingSent: 1`
- * indefinitely, because the peer answers `document_unknown` and nobody answered back.
- */
-describe("a TERMINAL refusal is ACKED, so the sender stops redelivering", () => {
-  it("sends a rejection ack naming the envelope and the reason", async () => {
-    const r = newRouter({
-      onUpdate: () => ({
-        ok: false,
-        reason: "document_unknown",
-        detail: "no such document",
-        terminal: true,
-        envelopeHash: "ee".repeat(32),
-      }),
-    });
 
-    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-
-    await vi.waitFor(() => expect(r.acks).toHaveLength(1));
-    expect(r.acks).toEqual([
-      // `admitted: false` is what makes the sender settle rather than retry, and the reason is what
-      // lets their operator see WHY their work never landed instead of watching a counter not move.
-      { envelopeHash: "ee".repeat(32), admitted: false, rejectionReason: "document_unknown" },
-    ]);
-  });
-
-  it("stays SILENT on a refusal that is not terminal — the retry is the recovery path", async () => {
-    const r = newRouter({
-      onUpdate: () => ({ ok: false, reason: "document_stalled", detail: "stopped accepting" }),
-    });
-    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-    await vi.waitFor(() => expect(r.calls).toEqual(["update"]));
-    expect(r.acks).toEqual([]);
-  });
-
-  it("still acks an ordinary ADMISSION — the terminal path did not displace the normal one", async () => {
-    const r = newRouter();
-    r.router.routeSync(AGENT, encodeDocumentUpdateEnvelope(updateEnvelope), NOW, "c");
-    await vi.waitFor(() => expect(r.acks).toEqual([{ envelopeHash: "x", admitted: true }]));
-  });
-});

@@ -47,8 +47,6 @@ const admin = makeSigner();
 function entryOf(over: Partial<DocumentAmendmentBody> = {}): DocumentAmendmentEnvelope {
   const body: DocumentAmendmentBody = {
     document_id: DOC,
-    epoch_id: 1,
-    prev_amendment_hash: null,
     kind: "add_holder",
     subject_agent_id: "c".repeat(64),
     property_change: null,
@@ -87,7 +85,7 @@ function hashHex(env: DocumentAmendmentEnvelope): string {
 function causalChain(...overs: Partial<DocumentAmendmentBody>[]): DocumentAmendmentEnvelope[] {
   let prev: string[] = [];
   return overs.map((over, i) => {
-    const env = entryOf({ epoch_id: i + 1, author_seq: i + 1, parents: prev, ...over });
+    const env = entryOf({ author_seq: i + 1, parents: prev, ...over });
     prev = [hashHex(env)];
     return env;
   });
@@ -106,9 +104,10 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     expect(() => new DocumentAmendmentStore(db as never, silent)).not.toThrow();
   });
 
-  it("opens a database populated BEFORE the pivot without touching its rows", () => {
-    // The pre-P1 table (epoch-keyed) may hold old-shape bytes. Constructing the new store over
-    // it must neither crash nor mistake those rows for entries.
+  it("opens a database populated BEFORE the pivot cleanly — the dead epoch-keyed table is dropped in place (D7)", () => {
+    // The pre-P1 table (epoch-keyed) may hold old-shape bytes no reader can decode and no code
+    // consults. Constructing the new store over it must neither crash nor mistake those rows for
+    // entries — and the residue sweep drops the table itself (review F6).
     const legacy = new DatabaseSync(":memory:");
     legacy.exec(`
       CREATE TABLE IF NOT EXISTS document_amendments (
@@ -124,10 +123,10 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
       .run(OWNER, DOC, 1, "ab".repeat(32), Buffer.from([1, 2, 3]), 500);
     const s2 = new DocumentAmendmentStore(legacy as never, silent);
     expect(s2.chain(OWNER, DOC)).toHaveLength(0);
-    const still = legacy
-      .prepare(`SELECT COUNT(*) AS n FROM document_amendments`)
+    const gone = legacy
+      .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'document_amendments'`)
       .get() as { n: number };
-    expect(still.n).toBe(1);
+    expect(gone.n).toBe(0);
   });
 
   it("append → chain round-trips the RECEIVED bytes", () => {
@@ -228,7 +227,7 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1000);
     expect(store.chain("other-owner", DOC)).toHaveLength(0);
     expect(store.chain(OWNER, "e".repeat(64))).toHaveLength(0);
-    expect(store.currentEpoch("other-owner", DOC)).toBe(0);
+    expect(store.chain("other-owner", DOC)).toHaveLength(0);
   });
 
   it("watermarks: highest CONTIGUOUS seq per author with head hashes; a held gap is not counted", () => {
@@ -258,26 +257,12 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     );
   });
 
-  it("membershipOf follows the LAST event in the recorded chain — add, remove, re-add is holder", () => {
-    const subject = "c".repeat(64);
-    const [one, two, three] = causalChain(
-      { subject_agent_id: subject },
-      { kind: "remove_holder", subject_agent_id: subject },
-      { subject_agent_id: subject },
-    );
-    store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1);
-    expect(store.membershipOf(OWNER, DOC, subject).state).toBe("holder");
-    store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "removed", epochId: 2 });
-    store.append(OWNER, DOC, encodeDocumentAmendment(three!), 3);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "holder", epochId: 3 });
-  });
 
-  it("currentEpoch is 0 with no entries and the max epoch afterwards", () => {
-    expect(store.currentEpoch(OWNER, DOC)).toBe(0);
+  it("the chain length tracks appended entries — the epoch spine is gone (D7)", () => {
+    expect(store.chain(OWNER, DOC)).toHaveLength(0);
     const [one, two] = causalChain({}, { kind: "promote_admin", subject_agent_id: "c".repeat(64) });
     store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1000);
     store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2000);
-    expect(store.currentEpoch(OWNER, DOC)).toBe(2);
+    expect(store.chain(OWNER, DOC)).toHaveLength(2);
   });
 });

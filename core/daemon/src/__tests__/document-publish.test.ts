@@ -35,8 +35,10 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
     properties: {}, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
+  const nudged: string[][] = [];
   const state = { publishHolders: [PEER] as string[] | null };
   const publish = new DocumentPublish({
+    governanceFrontierFor: () => [],
     // Bilateral default: the sole holder is the genesis peer; tests may widen or null it.
     holdersFor: () => state.publishHolders,
     store,
@@ -45,38 +47,30 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
     sign: async () => new Uint8Array(64).fill(5),
     senderIdFor: () => SENDER,
     canPublish: () => opts.canPublish ?? { ok: true },
+    nudgeSeats: (_o, _d, seats) => { nudged.push([...seats]); },
   });
   const doc = new Y.Doc();
   doc.clientID = 7777;
   return {
-    store, engine, publish, doc, db,
+    store, engine, publish, doc, db, nudged,
     get publishHolders() { return state.publishHolders; },
     set publishHolders(v: string[] | null) { state.publishHolders = v; },
   };
 }
 
-function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number) {
-  db.prepare(
-    `INSERT INTO document_entries
-       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
-        received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(owner, doc, "h".repeat(64), "a".repeat(64), epoch, epoch, Buffer.from([1]), 1);
-}
 
 describe("FANOUT-1 — publish SEEDS per-holder delivery rows through the production path", () => {
-  it("one publish, two holders, two pending rows — no hand-seeding anywhere", async () => {
-    // The one write that makes fan-out HAPPEN. Revert the seed call in publish and this is the
-    // test that goes red — without it a 3-party document delivers to the genesis peer only,
-    // the literal §7-1 divergence the DoD line quotes.
+  it("one publish, two holders, two nudges — no genesis-peer-only fan-out anywhere", async () => {
+    // The write that makes fan-out HAPPEN is now the nudge set. Nudge only the genesis peer and
+    // a 3-party document converges with one holder only — the literal §7-1 divergence the DoD
+    // line quotes, through the new machinery.
     const H2 = "ee".repeat(32);
     const f = newFixture();
     f.publishHolders = [PEER, H2];
     f.doc.getText("content").insert(0, "reaches both holders. ");
     const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
     expect(res.ok).toBe(true);
-    const pending = f.store.pendingHolderDeliveries(AGENT, NOW);
-    expect(new Set(pending.map((p) => p.holderAgentId))).toEqual(new Set([PEER, H2]));
+    expect(new Set(f.nudged.flat())).toEqual(new Set([PEER, H2]));
   });
 
   it("refuses when the chain does not derive — nothing appended, nothing invisible", async () => {
@@ -90,17 +84,7 @@ describe("FANOUT-1 — publish SEEDS per-holder delivery rows through the produc
 });
 
 describe("DocumentPublish — writes a signed, chained envelope and returns", () => {
-  it("stamps the CURRENT epoch from the recorded amendment chain — never a constant", async () => {
-    // REVERT-VISIBLE (AMEND-1 review T1): with the table non-empty, a producer reverted to the
-    // old constant 0 fails here and nowhere else.
-    const f = newFixture();
-    raiseEpoch(f.db, AGENT, DOC, 1);
-    f.doc.getText("content").insert(0, "post-amendment text. ");
-    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
-    expect(res.ok).toBe(true);
-    expect(f.store.getEnvelopeLog(AGENT, DOC)[0]!.epochId).toBe(1);
-  });
-
+  
 
   it("appends an update the peer can decode", async () => {
     const f = newFixture();
@@ -151,6 +135,7 @@ describe("DocumentPublish — writes a signed, chained envelope and returns", ()
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: row.governanceParents,
       state_vector: row.stateVector,
       update: row.payload!,
       signature: row.signature,
@@ -189,16 +174,24 @@ describe("DocumentPublish — refuses rather than writing something useless", ()
   });
 });
 
-describe("DocumentPublish — the published envelope is what DELIVERY picks up", () => {
-  it("becomes pending delivery immediately", async () => {
+describe("DocumentPublish — the publish NUDGES every other seat (SYNC-P4, R39's first trigger)", () => {
+  it("nudges each holder except the sender, once, after the append", async () => {
     const f = newFixture();
+    f.publishHolders = [SENDER, PEER, "cc".repeat(32)];
     f.doc.getText("content").insert(0, "deliver me. ");
     await f.publish.publish(AGENT, DOC, f.doc, NOW);
-    // Fire and forget: the worker derives pending FROM THE LOG, so writing the envelope is the
-    // whole of publishing.
-    // Scoped by OUR WIRE SENDER ID, not the owner key. M14-D5 makes them different, and passing
-    // the owner key here returned nothing pending — every published update sitting in the log
-    // undelivered with no error on any path.
-    expect(f.store.pendingDeliveries(AGENT, NOW, SENDER)).toHaveLength(1);
+    // No ledger and no worker: the nudge — an initiated reconcile per seat — is how the envelope
+    // travels, and the envelope itself is in the log for any later exchange to carry.
+    expect(f.nudged).toEqual([[PEER, "cc".repeat(32)]]);
+    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("a refused publish nudges nobody", async () => {
+    const f = newFixture();
+    f.publishHolders = null;
+    f.doc.getText("content").insert(0, "never leaves. ");
+    const res = await f.publish.publish(AGENT, DOC, f.doc, NOW);
+    expect(res.ok).toBe(false);
+    expect(f.nudged).toEqual([]);
   });
 });

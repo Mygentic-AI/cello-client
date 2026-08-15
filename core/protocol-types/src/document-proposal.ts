@@ -34,6 +34,7 @@
 
 import { createHash } from "node:crypto";
 import { encodeCbor, decodeCbor } from "./cbor.js";
+import type { ArrangementGenesis } from "./document-amendment.js";
 
 /** Domain tag in slot 0 of the to-be-signed array. Distinct from the UPDATE envelope's domain. */
 export const DOCUMENT_PROPOSAL_DOMAIN = "CELLO-DOCUMENT-PROPOSAL-v1";
@@ -449,5 +450,29 @@ export function decodeDocumentProposal(input: Uint8Array): DocumentProposalEnvel
     nonce: bytes(map, "nonce"),
     proposed_at_ms: proposedAt,
     signature: bytes(map, "signature"),
+  };
+}
+
+/**
+ * The genesis PROPOSAL as the fold's anchor (SYNC-P1). Lived in the join-offer module until D5
+ * deleted it; the conversion belongs to the proposal itself — every derivation starts here.
+ */
+export function arrangementGenesisFromProposal(
+  genesis: DocumentProposalEnvelope,
+): ArrangementGenesis {
+  return {
+    documentId: documentIdFromProposal(genesis),
+    proposerAgentId: genesis.proposer_agent_id,
+    peerAgentId: genesis.peer_agent_id,
+    adminSet: genesis.properties.admin_set ?? [genesis.proposer_agent_id, genesis.peer_agent_id],
+    properties: {
+      assurance_tier: genesis.properties.assurance_tier,
+      schema_enforcement: genesis.properties.schema_enforcement,
+      topology: genesis.properties.topology,
+      append_only: genesis.properties.append_only,
+      ...(genesis.properties.content_profile !== undefined
+        ? { content_profile: genesis.properties.content_profile }
+        : {}),
+    },
   };
 }
