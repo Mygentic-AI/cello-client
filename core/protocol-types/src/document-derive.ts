@@ -707,6 +707,7 @@ export function deriveDocumentState(
       ended: state.killed
         ? ("killed" as const)
         : state.participants.size > 0 &&
+            state.invited.size === 0 &&
             [...state.participants].every((participant) => state.closes.has(participant))
           ? ("closed" as const)
           : null,

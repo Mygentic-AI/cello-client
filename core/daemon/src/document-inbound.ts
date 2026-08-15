@@ -111,7 +111,13 @@ export interface DocumentInboundDeps {
     documentId: string,
     frontier: readonly string[],
   ):
-    | { ok: true; participants: ReadonlySet<string>; invited: ReadonlySet<string> }
+    | {
+        ok: true;
+        participants: ReadonlySet<string>;
+        invited: ReadonlySet<string>;
+        /** R30: content whose named world is already ENDED is refused everywhere. */
+        ended: "closed" | "killed" | null;
+      }
     | { ok: false; reason: string; missing?: string[] };
   /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
@@ -294,6 +300,26 @@ export class DocumentInbound {
           detail:
             `this update names governance ancestors this holder does not yet hold — ` +
             `reconcile delivers governance first; retry after it lands`,
+        };
+      }
+      // R30 / AC16: an ending among the envelope's own named ancestors means its author KNEW
+      // the document was over when they wrote — refused everywhere, terminally, including from
+      // a modified daemon: the parents are inside the signature.
+      if (at.ended !== null) {
+        this.#d.logger.warn("document.inbound.authored_after_ending", {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          ended: at.ended,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "document_authored_after_ending",
+          terminal: true,
+          envelopeHash,
+          detail:
+            `this update names a governance world in which the document was already ` +
+            `${at.ended} - content authored after an ending is refused everywhere (R30)`,
         };
       }
       senderIsParty = at.participants.has(env.sender_agent_id);

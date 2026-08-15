@@ -969,6 +969,29 @@ describe("deriveDocumentState — endings as entries (R26–R31)", () => {
     expect(s.voids).toEqual([]);
   });
 
+  it("close WAITS on an OPEN INVITATION — a seat at the table is someone the agreement must hear from (Entry 54 ruling)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(admitC)] },
+      [b],
+    );
+    const waiting = deriveOk(g, [bc, admitC, closeA, closeB], [a, b, c]);
+    expect(waiting.ended).toBeNull(); // C's invitation is open — the agreement waits
+    // Retracting the invitation completes it.
+    const retract = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 3, epoch_id: 3, parents: [hashHex(closeA)] },
+      [a],
+    );
+    const s2 = deriveOk(g, [bc, admitC, closeA, closeB, retract], [a, b, c]);
+    expect(s2.ended).toBe("closed");
+  });
+
   it("a KILL by any admin ends the document immediately, one-sided (R28)", () => {
     const [a, b] = [makeSigner(), makeSigner()];
     const { g, bc } = consented(a, b);

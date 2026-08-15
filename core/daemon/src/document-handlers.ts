@@ -842,14 +842,22 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   const authorConsent = async (who: {
     agentName: string;
     ownerAgentId: string;
-  }, documentId: string, kind: "consent" | "refuse_join" = "consent"): Promise<
+  }, documentId: string, kind: "consent" | "refuse_join" | "close" | "kill" = "consent"): Promise<
     | { ok: true; entryHash: string; holdersNotified: Record<string, boolean> }
     | { ok: false; reason: string }
   > => {
     const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
     if (!genesisRecord) return { ok: false, reason: "document_genesis_missing" };
     const genesisArr = arrangementGenesisFromProposal(genesisRecord.envelope);
-    const chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    let chain: ReturnType<typeof layer.amendments.chain>;
+    try {
+      chain = layer.amendments.chain(who.ownerAgentId, documentId);
+    } catch (err: unknown) {
+      return {
+        ok: false,
+        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
     const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
     if (!derived.ok) return { ok: false, reason: derived.reason };
     const body: DocumentAmendmentBody = {
@@ -916,6 +924,15 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       ),
       verb: kind,
     });
+    // SYNC-P4: the AUTHOR'S own status projection — the inbound path projects on receipt, and
+    // the authoring daemon must not read "active" for a document its own entry just ended.
+    if ((kind === "close" || kind === "kill") && withNew.state.ended !== null) {
+      layer.store.setDocumentStatus(
+        who.ownerAgentId,
+        documentId,
+        withNew.state.ended === "killed" ? "killed" : "closed",
+      );
+    }
     return { ok: true, entryHash: entryHex, holdersNotified };
   };
 
@@ -1357,6 +1374,19 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
+    // SYNC-P4 (R27): a removal can COMPLETE a standing agreement — everyone who remains has
+    // agreed — and that now falls out of the DERIVATION; the author's daemon projects it here,
+    // exactly as receiving daemons project on arrival.
+    {
+      const afterRemove = layer.deriveEnded(who.ownerAgentId, documentId);
+      if (afterRemove?.ended) {
+        layer.store.setDocumentStatus(
+          who.ownerAgentId,
+          documentId,
+          afterRemove.ended === "killed" ? "killed" : "closed",
+        );
+      }
+    }
     // DOD-MP-CLOSE-N-1 — removing the one holder who had not closed leaves everyone who remains in
     // agreement, so the removal itself can complete it. Without this the document sat `active`
     // forever, reporting that it waited on nobody. Also drops the removed holder's close row, so a
@@ -2230,151 +2260,32 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
     }
-    const outcome = await layer.lifecycle.close(who.ownerAgentId, documentId, deps.now());
-    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
-    const status = layer.store.getDocument(who.ownerAgentId, documentId)?.status ?? "unknown";
-    // BILATERAL. The document settles when both sides have said it, so "closed" is not this call's
-    // answer to give — reporting it would tell an operator the collaboration is over while the peer
-    // is still editing.
-    //
-    // `peerNotified` is reported for the same reason `kill` reports it, and its absence here was an
-    // asymmetry with teeth: `status: "active"` after a close is INDISTINGUISHABLE from "sent fine,
-    // they have not answered yet". Control frames are fire-once — unlike update envelopes they are
-    // not in the log and the delivery sweep never retries them — so a close sent while the peer was
-    // offline means the document can never settle, forever, with nothing on either screen.
+    // SYNC-P4 (R26/R27): closing is authoring YOUR OWN close entry — the same self-signed act
+    // consent is, traveling the same carrier, settling by DERIVATION when every current
+    // participant has one. No control frame, no fan-out bookkeeping, no fire-once anything: a
+    // close that has not reached someone yet is just a difference the next exchange closes.
+    const closed = await authorConsent(who, documentId, "close");
+    if (!closed.ok) {
+      return {
+        ok: false,
+        reason: "document_close_unrecorded",
+        guidance: `Your close entry could not be recorded (${closed.reason}).`,
+      };
+    }
+    const derived = layer.governanceFrontierFor(who.ownerAgentId, documentId) !== null
+      ? layer.deriveEnded(who.ownerAgentId, documentId)
+      : null;
     return {
       ok: true,
       documentId,
-      status,
-      peerNotified: outcome.peerNotified,
-      holdersNotified: outcome.holdersNotified,
-      holderFailures: outcome.holderFailures,
-      ...(outcome.peerNotified
-        ? {}
-        : {
-            reason: outcome.notifyReason,
-            guidance: notifyGuidance("close", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
-          }),
+      closeEntry: closed.entryHash,
+      closeDelivered: closed.holdersNotified,
+      // DERIVED, at this instant: "closed" only when everyone seated has agreed — one party
+      // alone is never the whole agreement, and the surface says who is still being waited on.
+      ended: derived?.ended ?? null,
+      waitingOn: derived?.waitingOn ?? [],
     };
   });
-
-  /**
-   * What to tell an operator when a close or kill did not reach the peer — BRANCHED ON THE CAUSE.
-   *
-   * One string used to cover all three: a transport failure, a signing key that could not be
-   * loaded, and this daemon not holding the document's agent at all. Only the first is fixed by
-   * waiting, and that is what the single message told them to do. Traced end to end in the
-   * DOD-DOC-TOOLS-1 review: an exit-point label standing in for a local fault, pointing at the
-   * network.
-   */
-  function notifyGuidance(
-    verb: "close" | "kill",
-    reason?: string,
-    detail?: string,
-    holdersNotified?: Record<string, boolean>,
-    holderFailures?: Record<string, string>,
-  ): string {
-    // DOD-MP-CONTROL-DURABLE-1 — this said "A close is not retried", and that stopped being true
-    // when the ending became durable. A sentence telling the operator to do by hand what the daemon
-    // now does for them is not merely stale: it invites a second close for no reason, and it
-    // undersells the one case that still needs them — a holder we never manage to confirm.
-    const tail = verb === "close"
-      ? `The ending is owed to anyone who did not take it and is re-sent when they return; you do ` +
-        `not need to run this again. If it still cannot be confirmed the daemon says so, naming ` +
-        `them — that one needs you.`
-      : `The kill stands locally either way, and is re-sent to anyone who did not take it until ` +
-        `they do or the daemon reports that it gave up on them.`;
-    if (reason === "document_control_unsigned") {
-      return (
-        `Your ${verb} was recorded, but this agent's signing key could not be loaded, so nothing ` +
-        `could be sent to the peer${detail ? ` (${detail})` : ""}. Waiting will not help — the ` +
-        `fault is on this machine. ${tail}`
-      );
-    }
-    if (reason === "document_unknown") {
-      return (
-        `Your ${verb} was recorded, but this daemon does not hold the agent that owns the document, ` +
-        `so it could not tell the peer. That is a local wiring fault, not the peer being away. ${tail}`
-      );
-    }
-    // THE FOUR DERIVATION FAULTS (DOD-MP-CONTROL-N-1). Every one of these is a fact about THIS
-    // machine's record of the document, and not one of them is fixed by the counterparty coming
-    // online — which is what the generic sentence below tells the operator to wait for. That is the
-    // exact defect this function's header says it was written to remove, reintroduced by four new
-    // reasons that were never added to it.
-    if (reason === "document_holders_underivable" || reason === "document_genesis_missing") {
-      return (
-        `Your ${verb} was recorded, but this daemon could not work out who currently holds the ` +
-        `document, so it sent nothing to anyone. Waiting will not help — the signed history on this ` +
-        `machine is the problem, not the network. Look for a "document.holders.underivable" line in ` +
-        `the daemon log, which names the specific cause. ${tail}`
-      );
-    }
-    if (reason?.startsWith("document_chain_undecodable")) {
-      return (
-        `Your ${verb} was recorded, but this build cannot read part of the document's signed ` +
-        `history${detail ? ` (${detail})` : ""}, so it could not work out who to tell. That is ` +
-        `usually a client older than the document — upgrading is the fix, not waiting. ${tail}`
-      );
-    }
-    if (reason === "document_no_holders") {
-      return (
-        `Your ${verb} was recorded, and there is nobody left to tell — the signed history shows no ` +
-        `other current holder of this document. Nothing is pending and nothing needs retrying.`
-      );
-    }
-    // PARTIAL FAN-OUT is its own case and reads nothing like "the peer is offline". With three
-    // holders, two hearing you and one not is the ordinary outcome, and the operator needs to know
-    // WHICH one is still editing a document they think is live — a message saying "the peer" names
-    // nobody when there are several.
-    const missed = Object.entries(holdersNotified ?? {}).filter(([, told]) => !told).map(([h]) => h);
-    const reached = Object.values(holdersNotified ?? {}).filter(Boolean).length;
-    if (missed.length > 0 && reached > 0) {
-      return (
-        `Your ${verb} was recorded and reached ${reached} of ${reached + missed.length} other ` +
-        `holders, but not ${missed.join(", ")} — they will keep editing a document the rest of you ` +
-        `have ended. ${tail}`
-      );
-    }
-    if (missed.length > 0) {
-      // EVERY holder failed. This used to fall through to the generic sentence, which says "the
-      // peer" and names nobody — unusable when there are several, and the per-holder transport
-      // reasons live only in the log. It also arrives with no `reason` field at all, because the
-      // notifier returned ok: signing and addressing both worked, the sends did not.
-      //
-      // AND IT SAID "most likely offline", WHICH WAS A GUESS. Caught on the live fleet: every
-      // holder failed with `session_sealed` — the relay refusing a leaf for a session it has
-      // closed — and the operator was told to wait for people who were sitting right there.
-      // Waiting cannot reopen a sealed session. The cause is known per holder; it travels.
-      const causes = [...new Set(Object.values(holderFailures ?? {}))].filter(Boolean);
-      const because = causes.length > 0 ? ` (${causes.join(", ")})` : "";
-      // THE WHOLE FAMILY, not one substring. This tested `includes("sealed")`, so `session_sealed`
-      // got the useful sentence and every other way a session's record can be over —
-      // `relay_session_gone` (the relay restarted or swept it) and `session_not_found` — fell to
-      // generic wait-for-them advice, which is the one thing that cannot work when there is nothing
-      // left to wait for.
-      const sealed = causes.some(
-        (c) =>
-          c.includes("sealed") ||
-          c.includes("relay_session_gone") ||
-          c.includes("session_not_found"),
-      );
-      return (
-        `Your ${verb} was recorded but reached none of the ${missed.length} other ` +
-        `holder${missed.length > 1 ? "s" : ""} (${missed.join(", ")})${because}, so the document ` +
-        `cannot settle until they hear it. ` +
-        (sealed
-          ? `The session carrying this document has been sealed, so waiting will not help — ` +
-            `the document needs a fresh session to the other holders. `
-          : ``) +
-        `${tail}`
-      );
-    }
-    return (
-      `Your ${verb} was recorded but did not reach the peer${detail ? ` (${detail})` : ""}, so the ` +
-      `document cannot settle until they hear it. ${tail}`
-    );
-  }
 
   handlers.set("cello_doc_kill", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -2383,25 +2294,25 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_list." };
     }
-    const outcome = await layer.lifecycle.kill(who.ownerAgentId, documentId, deps.now());
-    if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
-    // `peerNotified` is REPORTED, never hidden behind ok. A kill is deliberately independent of the
-    // peer being reachable — a decision to stop that depends on the other party being online is not
-    // a decision to stop — but an operator who believes the peer was told, when they were not, will
-    // not understand why updates keep arriving.
+    // SYNC-P4 (R28): a kill is one admin's own signed entry — immediate and one-sided the
+    // moment it applies anywhere, independent of anyone being reachable (a decision to stop
+    // that depends on the other party being online is not a decision to stop). It travels the
+    // same carrier as everything else; a holder who has not received it yet is a difference
+    // the next exchange closes.
+    const killed = await authorConsent(who, documentId, "kill");
+    if (!killed.ok) {
+      return {
+        ok: false,
+        reason: "document_kill_unrecorded",
+        guidance: `Your kill entry could not be recorded (${killed.reason}).`,
+      };
+    }
     return {
       ok: true,
       documentId,
-      peerNotified: outcome.peerNotified,
-      holdersNotified: outcome.holdersNotified,
-      holderFailures: outcome.holderFailures,
-      note: outcome.note,
-      ...(outcome.peerNotified
-        ? {}
-        : {
-            reason: outcome.notifyReason,
-            guidance: notifyGuidance("kill", outcome.notifyReason, outcome.notifyDetail, outcome.holdersNotified, outcome.holderFailures),
-          }),
+      killEntry: killed.entryHash,
+      killDelivered: killed.holdersNotified,
+      ended: "killed",
     };
   });
 

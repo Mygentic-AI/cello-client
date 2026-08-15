@@ -80,7 +80,12 @@ function newFixture(
       d: string,
       frontier: readonly string[],
     ) =>
-      | { ok: true; participants: ReadonlySet<string>; invited: ReadonlySet<string> }
+      | {
+          ok: true;
+          participants: ReadonlySet<string>;
+          invited: ReadonlySet<string>;
+          ended: "closed" | "killed" | null;
+        }
       | { ok: false; reason: string; missing?: string[] };
     order?: string[];
     appendOnly?: boolean;
@@ -130,7 +135,7 @@ function newFixture(
         const seated = holders.filter(
           (h: string) => amendmentStore.membershipOf(o, d, h).state !== "removed",
         );
-        return { ok: true as const, participants: new Set(seated), invited: new Set<string>() };
+        return { ok: true as const, participants: new Set(seated), invited: new Set<string>(), ended: null };
       }),
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
@@ -382,8 +387,8 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       currentHolders: () => [PEER],
       deriveAtFrontier: (_o, _d, frontier) =>
         frontier.includes("aa".repeat(32))
-          ? { ok: true, participants: new Set([PEER]), invited: new Set() } // pre-removal world
-          : { ok: true, participants: new Set<string>(), invited: new Set() }, // post-removal world
+          ? { ok: true, participants: new Set([PEER]), invited: new Set(), ended: null } // pre-removal world
+          : { ok: true, participants: new Set<string>(), invited: new Set(), ended: null }, // post-removal world
     });
     plantAmendment(f.db, 1, "add_holder", PEER);
     plantAmendment(f.db, 2, "remove_holder", PEER);

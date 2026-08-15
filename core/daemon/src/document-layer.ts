@@ -225,6 +225,14 @@ export interface DocumentLayer {
    * derived. Publish stamps this into every envelope's signed TBS as content's causal anchor.
    */
   governanceFrontierFor(ownerAgentId: string, documentId: string): string[] | null;
+  /**
+   * SYNC-P4 (R27/R28) — the DERIVED ending and who a pending close still waits on. Null when
+   * the document cannot be derived.
+   */
+  deriveEnded(
+    ownerAgentId: string,
+    documentId: string,
+  ): { ended: "closed" | "killed" | null; waitingOn: string[] } | null;
   router: DocumentFrameRouter;
   /**
    * The hook `SessionNodeManager.setOnDocumentFrame` takes. Handed out ready-shaped so the
@@ -379,6 +387,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           ok: true as const,
           participants: at.state.participants,
           invited: at.state.invited,
+          ended: at.state.ended,
         };
       } catch (err: unknown) {
         return {
@@ -765,6 +774,27 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
             ? (applied.body.subject_agent_id ?? undefined)
             : undefined,
         );
+      }
+      // SYNC-P4 (R27/R28): the stored status is a PROJECTION of the derived ending — synced
+      // whenever an entry that can move it applies. The derivation is the truth; the column is
+      // what the list surface reads without re-deriving every row.
+      if (
+        applied.body.kind === "close" ||
+        applied.body.kind === "kill" ||
+        applied.body.kind === "remove_holder"
+      ) {
+        const derivedEnd = reconcileReads(ownerAgentId).deriveState(documentId);
+        if (derivedEnd.ok && derivedEnd.state.ended !== null) {
+          store.setDocumentStatus(
+            ownerAgentId,
+            documentId,
+            derivedEnd.state.ended === "killed" ? "killed" : "closed",
+          );
+          logger.info("document.ended.derived", {
+            documentId,
+            ended: derivedEnd.state.ended,
+          });
+        }
       }
     };
     // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
@@ -1584,6 +1614,21 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
       const derived = reconcileReads(ownerAgentId).deriveState(documentId);
       return derived.ok ? [...derived.state.frontier] : null;
+    },
+    deriveEnded: (ownerAgentId: string, documentId: string) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      if (!derived.ok) return null;
+      return {
+        ended: derived.state.ended,
+        // Who the ending still waits on: every participant without a close entry, AND every open
+        // invitation — an invited seat IS a seat (Entry 54), so a close cannot settle around it.
+        waitingOn: [
+          ...[...derived.state.participants].filter(
+            (participant) => !derived.state.closedBy.has(participant),
+          ),
+          ...derived.state.invited,
+        ],
+      };
     },
     store,
     writePath,

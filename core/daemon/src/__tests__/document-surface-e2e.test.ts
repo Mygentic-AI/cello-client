@@ -816,10 +816,11 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     );
     await b.call("cello_doc_accept", { document_id: documentId });
 
-    expect(await a.call("cello_doc_kill", { document_id: documentId })).toMatchObject({
-      ok: true,
-      peerNotified: true,
-    });
+    // SYNC-P4: a kill is a signed ENTRY now — the result names the entry, reports per-holder
+    // delivery of it, and the ended verdict is DERIVED (any admin's kill suffices, immediately).
+    const killedRes = await a.call("cello_doc_kill", { document_id: documentId });
+    expect(killedRes).toMatchObject({ ok: true, ended: "killed" });
+    expect((killedRes.killDelivered as Record<string, boolean>)[b.owner]).toBe(true);
 
     // Bob's copy is terminal too. Until the control frame existed, `notifyPeer` refused and Bob kept
     // publishing into a document that would never answer, with nothing on his screen explaining why.
@@ -854,7 +855,10 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     // A decision to stop that depends on the other party being online is not a decision to stop.
     // But the operator is TOLD they were not told, because otherwise they will not understand why
     // the peer keeps writing.
-    expect(killed).toMatchObject({ ok: true, peerNotified: false });
+    expect(killed).toMatchObject({ ok: true, ended: "killed" });
+    // The entry did NOT reach the peer — the per-holder delivery map says so, and the difference
+    // is owed: the next reconcile exchange with bob carries the kill entry.
+    expect((killed.killDelivered as Record<string, boolean>)[b.owner]).not.toBe(true);
     expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("killed");
   });
 
