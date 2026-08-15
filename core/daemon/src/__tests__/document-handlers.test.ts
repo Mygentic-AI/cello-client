@@ -184,6 +184,14 @@ async function newFixture(opts: { sendFails?: string } = {}) {
 }
 
 /** Drain the router's per-owner async queue by polling the observable outcome. */
+async function untilAsync(pred: () => Promise<boolean>): Promise<void> {
+  for (let i = 0; i < 100; i++) {
+    if (await pred()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  expect(await pred()).toBe(true);
+}
+
 async function until(pred: () => boolean): Promise<void> {
   for (let i = 0; i < 100; i++) {
     if (pred()) return;
@@ -265,13 +273,14 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     )!;
     expect(row.arrangementUnavailable).toBeUndefined();
     expect(row.admins).toEqual([f.owner]);
-    // R22: the named peer has not consented yet — invited, not a participant.
+    // R22: the named peer has not consented yet — invited, not a participant (R46: an invited
+    // seat is a PARTY with class "invited", not a member of participants).
     expect(row.participants).toEqual([f.owner]);
-    expect(row.invited).toEqual([f.peer]);
+    expect(row.parties as Array<Record<string, unknown>>).toMatchObject([
+      { agentId: f.peer, class: "invited", sync: "unseen" },
+    ]);
     // PROPERTIES is the third part of the arrangement G0 named — surfaced and asserted.
     expect((row.properties as Record<string, unknown>).topology).toBe("mesh");
-    // And the admin set was DECLARED, not defaulted — the surface can tell them apart.
-    expect(row.adminSetDefaulted).toBe(false);
   });
 
   it("a document whose chain cannot be read degrades ONE row, naming the fault — the list survives", async () => {
@@ -298,13 +307,15 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     const rows = list.documents as Array<Record<string, unknown>>;
     expect(rows).toHaveLength(2);
     const ok = rows.find((r) => r.documentId === healthy.documentId)!;
-    expect(ok.arrangementUnavailable).toBeUndefined();
+    expect(ok.underivable).toBeUndefined();
     expect((ok.participants as string[]).length).toBe(1);
-    expect((ok.invited as string[]).length).toBe(1);
-    // The broken one says WHY, and its membership keys are null — never absent, which a caller
-    // coerces to [] and reads as "nobody holds this".
+    expect(
+      (ok.parties as Array<{ class: string }>).filter((party) => party.class === "invited"),
+    ).toHaveLength(1);
+    // The broken one says WHY (R48), and its derived keys are null — never absent, which a
+    // caller coerces to [] and reads as "nobody holds this".
     const bad = rows.find((r) => r.documentId === brokenId)!;
-    expect(String(bad.arrangementUnavailable)).toContain("document_chain_undecodable");
+    expect(String(bad.underivable)).toContain("document_chain_undecodable");
     expect(bad.participants).toBeNull();
     expect(bad.admins).toBeNull();
   });
@@ -1358,30 +1369,6 @@ describe("the surface refuses when it cannot name an agent or a document", () =>
 });
 
 
-describe("cello_doc_list distinguishes states that otherwise render identically", () => {
-  it("says WHOSE offer it was, and whether the peer has actually shown up", async () => {
-    const f = await newFixture();
-    const documentId = (await f.call("cello_doc_propose", { peer_pubkey: f.peer })).documentId as string;
-
-    const listed = ((await f.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
-    expect(listed).toMatchObject({ documentId, proposedByUs: true, peerHasPublished: false });
-    // Without these, a document the peer refused, one whose offer never arrived, and one being
-    // actively co-edited all render the same — the only moving part is pendingUnsent, which also
-    // moves for a peer who is merely offline. "They said no" and "they are asleep" want opposite
-    // actions from the operator.
-  });
-
-  it("marks a document we ACCEPTED as not ours", async () => {
-    const f = await newFixture();
-    const env = await f.incomingProposal();
-    const documentId = f.layer.handshake.recordProposal(f.owner, encodeDocumentProposal(env), NOW).documentId;
-    await f.call("cello_doc_accept", { document_id: documentId });
-
-    const listed = ((await f.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
-    expect(listed).toMatchObject({ proposedByUs: false, consentState: "accepted" });
-  });
-});
-
 describe("a document the peer REFUSED does not keep publishing", () => {
   it("refuses the write instead of authoring an envelope nobody will accept", async () => {
     const f = await newFixture();
@@ -1762,6 +1749,94 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
 });
 
 
+describe("cello_doc_list parties — sync is the display cache's answer (SYNC-R46, spec §9)", () => {
+  it("unseen → behind → in_sync, as exchanges actually happen", async () => {
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
+
+    const partyB = async () => {
+      const list = await fA.call("cello_doc_list", {});
+      const row = (list.documents as Array<Record<string, unknown>>).find(
+        (d) => d.documentId === documentId,
+      )!;
+      return (row.parties as Array<Record<string, unknown>>).find((p) => p.agentId === fB.owner)!;
+    };
+
+    // No exchange has ever been recorded — the honest answer is unseen, never a guess.
+    expect(await partyB()).toMatchObject({ class: "participant", sync: "unseen", lastSyncedAtMs: null });
+
+    // A writes; B's step-1 position (authored before the write reached them) shows them BEHIND.
+    await fA.call("cello_doc_write", { document_id: documentId, content: "ahead of B. " });
+    await fB.layer.initiateReconcile(fB.owner, fA.owner, [documentId]);
+    routeAll(fB, fA);
+    await untilAsync(async () => (await partyB()).sync === "behind");
+
+    // The exchange completes; B's NEXT position covers everything we hold — in_sync.
+    routeAll(fA, fB);
+    await until(() =>
+      fB.layer.store.getEnvelopeLog(fB.owner, documentId).some((r) => r.senderAgentId === fA.owner),
+    );
+    await fB.layer.initiateReconcile(fB.owner, fA.owner, [documentId]);
+    routeAll(fB, fA);
+    await untilAsync(async () => (await partyB()).sync === "in_sync");
+    expect((await partyB()).lastSyncedAtMs).not.toBeNull();
+  });
+
+  it("blockedBy names the refused entry our log holds work stacked on (R38's surface)", async () => {
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
+    await fA.call("cello_doc_write", { document_id: documentId, content: "first. " });
+    await fA.call("cello_doc_write", { document_id: documentId, content: "first. second. " });
+    const log = fA.layer.store.getEnvelopeLog(fA.owner, documentId);
+    expect(log.length).toBeGreaterThanOrEqual(2);
+    const refusedHash = log[0]!.envelopeHash;
+
+    // B's position claims a refusal of A's FIRST envelope — everything stacked on it is stuck
+    // for B until A supersedes, and the surface must say so by name.
+    fA.layer.onDocumentFrame(
+      AGENT,
+      "session-1",
+      new Uint8Array(
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+          documents: [{
+            document_id: documentId,
+            governance: [], content: [], refused: [refusedHash], entries: [], envelopes: [],
+          }],
+        }),
+      ),
+      fB.owner,
+    );
+    await untilAsync(async () => {
+      const list = await fA.call("cello_doc_list", {});
+      const row = (list.documents as Array<Record<string, unknown>>).find(
+        (d) => d.documentId === documentId,
+      )!;
+      const party = (row.parties as Array<Record<string, unknown>>).find(
+        (p) => p.agentId === fB.owner,
+      );
+      return party?.blockedBy === refusedHash;
+    });
+  });
+});
+
 describe("the admission SURVIVES an unreachable holder — through the exchange, not a ledger (SYNC-P4)", () => {
   it("a holder unreachable at invite time learns of the admission at the next exchange", async () => {
     const fA = await newFixture({ sendFails: "session_sealed" });
@@ -1870,9 +1945,6 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     expect(left).toMatchObject({ ok: true, voluntary: true });
 
     const row = await rowFor(fA, documentId);
-    // The row has carried `removed: true` since REMOVE-1. What was missing is that a bare flag is
-    // not feedback — it says nothing about when, about the copy, or about what actually stopped.
-    expect(row["removed"]).toBe(true);
     expect(row["yourStanding"]).toBe("removed");
 
     const sentence = String(row["standingGuidance"] ?? "");
@@ -1906,8 +1978,8 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
 
     const row = await rowFor(fA, documentId);
     // The ADMIN who removed somebody else must not be told they are out of their own document.
-    expect(row["yourStanding"], "the subject of the removal was someone else").toBe("holder");
-    expect(row["removed"]).toBeUndefined();
+    expect(row["yourStanding"], "the subject of the removal was someone else").toBe("participant");
+
     expect(row["standingGuidance"]).toBeUndefined();
   });
 
@@ -1920,7 +1992,7 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     const row = await rowFor(fA, documentId);
-    expect(row["yourStanding"]).toBe("holder");
+    expect(row["yourStanding"]).toBe("participant");
   });
 
   it("a chain this build cannot read says UNKNOWN, never 'holder'", async () => {
@@ -1937,10 +2009,10 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const row = await rowFor(fA, documentId);
-    expect(row["arrangementUnavailable"]).toBeDefined();
+    expect(row["underivable"]).toBeDefined();
     // ALWAYS PRESENT, exactly as `participants` is null rather than absent on the same failure.
     expect(row["yourStanding"], "silence here reads as 'you are fine'").toBe("unknown");
-    expect(String(row["standingGuidance"])).toContain("cannot tell");
+    expect(String(row["standingGuidance"])).toContain("cannot derive");
   });
 });
 

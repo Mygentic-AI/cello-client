@@ -81,51 +81,10 @@ function newFixture() {
   const lifecycle = new DocumentLifecycle(
     store, logger,
     () => false,
-    () => false,
     () => ({ derived: state.derived, ended: state.ended }),
   );
   return { store, engine, lifecycle, events, db, state };
 }
-
-describe("DocumentLifecycle — list", () => {
-  it("shows the peer, type, tier, epoch, status and the pending-delivery state", () => {
-    const f = newFixture();
-    f.store.appendEnvelope(AGENT, envelope(AGENT, null));
-
-    const [row] = f.lifecycle.list(AGENT, NOW);
-    expect(row).toMatchObject({
-      documentId: DOC,
-      peerAgentId: PEER,
-      documentType: "markdown",
-      status: "active",
-    });
-    // Tier is constant in V1; epoch is DERIVED since M14B / AMEND-1 — 0 here because this
-    // document has no amendments, not because anything is hardcoded.
-    expect(row!.assuranceTier).toBe("authenticated");
-  });
-
-  
-  it("a removed owner's row says so — the overlay comes from the INJECTED derivation, the stored status stays active", () => {
-    // SYNC-D8: "was this owner written out?" is the layer's one fold-derived answer, injected
-    // here; this unit's job is only the plumbing — the overlay on the row, the named publish
-    // refusal, and the stored status staying untouched. The derivation itself is pinned in the
-    // derive and handlers suites.
-    const { logger } = recordingLogger();
-    const db = new DatabaseSync(":memory:");
-    db.exec("PRAGMA foreign_keys = ON");
-    const store = new DocumentStore(db, logger);
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
-    const lifecycle = new DocumentLifecycle(store, logger, () => false, () => true, () => ({ derived: true, ended: null }));
-    const row = lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
-    expect((row as unknown as { removed?: boolean }).removed).toBe(true);
-    expect(row!.status).toBe("active");
-    expect(lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
-  });
-
-});
 
 describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
   it("a paused agent refuses outbound publishes LOUDLY", () => {

@@ -158,6 +158,14 @@ export interface DocumentLayer {
   /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
   isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
+  /** SYNC-P5 (R43) — the sweep's (party → shared active documents) map, seats from the fold. */
+  sweepTargets(ownerAgentId: string): Map<string, string[]>;
+  /** SYNC-R46 — one party's sync state from the display cache (never a correctness input). */
+  partySync(
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+  ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null; blockedBy?: string };
   /** SYNC-D8 — the ONE derivation of an agent's standing (R17 + removed/unknown), from the fold. */
   standingOf(
     ownerAgentId: string,
@@ -246,15 +254,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const lifecycle = new DocumentLifecycle(
     store,
     logger,
-    // SYNC-P4 — "am I waiting on someone?" answered by the DERIVATION, resolved lazily
-    // (`reconcileReads` is declared below; the list surface only ever asks long after
-    // construction). Legacy documents (no genesis record, so no entry set) are never
-    // close-pending: closing them is refused at the verb, so there is nothing to wait for.
-    (ownerAgentId, documentId) => {
-      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
-      if (!derived.ok) return false;
-      return derived.state.ended === null && derived.state.closedBy.has(ownerAgentId);
-    },
     // SYNC-D8 — "was this owner written out?" answered by the same fold as everything else.
     (ownerAgentId, documentId) => standingOf(ownerAgentId, documentId, ownerAgentId) === "removed",
     // Review F2 — "is it ended?" answered by the fold too; `derived: false` hands the pre-pivot
@@ -456,6 +455,58 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       if (!inert.has(hash)) return "removed";
     }
     return "stranger";
+  };
+
+  /**
+   * SYNC-R46 / spec §9 — one party's sync state, from the DISPLAY CACHE against our own
+   * positions. ONE implementation for the list surface and the sweep's believed-current
+   * suppression (R43) — two copies of "are they behind" is two daemons disagreeing about who
+   * needs an exchange. Never a correctness input (R44).
+   */
+  const partySync = (
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+  ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null; blockedBy?: string } => {
+    const view = store.partyView(ownerAgentId, documentId, partyAgentId);
+    if (!view) return { sync: "unseen", lastSyncedAtMs: null };
+    let behind = false;
+    for (const [author, mark] of amendments.watermarks(ownerAgentId, documentId)) {
+      if (mark.seq > (view.govSeqs[author] ?? 0)) behind = true;
+    }
+    const log = store.getEnvelopeLog(ownerAgentId, documentId);
+    const counts = new Map<string, number>();
+    for (const row of log) counts.set(row.senderAgentId, (counts.get(row.senderAgentId) ?? 0) + 1);
+    for (const [author, count] of counts) {
+      if (count > (view.contentCounts[author] ?? 0)) behind = true;
+    }
+    const blockedBy = view.refused.find((hash) => log.some((row) => row.docPrevHash === hash));
+    return {
+      sync: behind ? "behind" : "in_sync",
+      lastSyncedAtMs: view.lastExchangeMs,
+      ...(blockedBy ? { blockedBy } : {}),
+    };
+  };
+
+  /**
+   * SYNC-P5 (R43) — every (party → shared ACTIVE documents) pair one owner's sweep considers.
+   * Seats come from the FOLD, per document; an ended or underivable document contributes
+   * nothing, which is what lets a converged-and-ended document reach quiescence.
+   */
+  const sweepTargets = (ownerAgentId: string): Map<string, string[]> => {
+    const targets = new Map<string, string[]>();
+    for (const doc of store.listDocuments(ownerAgentId)) {
+      if (doc.status !== "active") continue;
+      const derived = reconcileReads(ownerAgentId).deriveState(doc.documentId);
+      if (!derived.ok || derived.state.ended !== null) continue;
+      for (const seat of [...derived.state.participants, ...derived.state.invited]) {
+        if (seat === ownerAgentId) continue;
+        const docs = targets.get(seat);
+        if (docs) docs.push(doc.documentId);
+        else targets.set(seat, [doc.documentId]);
+      }
+    }
+    return targets;
   };
 
   /** Is this agent a CURRENT holder — the ack gate's membership question. */
@@ -882,6 +933,22 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           });
         }
       }
+      // SYNC-P5 (spec §9): the block's position IS what this party last claimed — recorded as
+      // the display cache the list surface reads (in_sync|behind|unseen). Never consulted for
+      // correctness (R44).
+      if (store.getDocument(ownerAgentId, block.document_id)) {
+        store.recordPartyView(
+          ownerAgentId,
+          block.document_id,
+          senderAgentId,
+          {
+            govSeqs: Object.fromEntries(block.governance.map((g) => [g.author, g.seq])),
+            contentCounts: Object.fromEntries(block.content.map((c) => [c.author, c.count])),
+            refused: [...block.refused],
+          },
+          nowMs,
+        );
+      }
       // SYNC-R35: the sender's SIGNED refusal records — verified against their named refuser
       // and recorded as received rejections, exactly as a directly-sent frame would be. This is
       // how a third holder wedged behind a refused hash learns its name and reason (F5/F8), and
@@ -1104,6 +1171,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     holdersFor,
     isCurrentHolder,
     standingOf,
+    partySync,
+    sweepTargets,
     initiateReconcile,
     governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
       const derived = reconcileReads(ownerAgentId).deriveState(documentId);

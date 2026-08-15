@@ -593,21 +593,20 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
       expect(await b.call("cello_doc_inbox")).toMatchObject({ proposals: [{ documentId }] }),
     );
 
-    // Before the answer: unanswered, and the surface says so rather than guessing.
-    const before = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
-    expect(before.peerAccepted).toBeNull();
+    // Before the answer: unanswered, and the record says so rather than guessing. (R47 removed
+    // the peerAccepted list field; the peer's signed answer lives on the handshake record, and
+    // the R46 parties list shows their seat.)
+    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBeNull();
 
     expect(await b.call("cello_doc_accept", { document_id: documentId })).toMatchObject({
       ok: true,
       proposerNotified: true,
     });
 
-    await vi.waitFor(async () => {
-      const after = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
+    await vi.waitFor(() => {
       // A FACT now, from Bob's signature — not "he has published into it", which cannot tell
       // refused from unreceived from accepted-but-untouched.
-      expect(after.peerAccepted).toBe(true);
-      expect(after.peerHasPublished).toBe(false);
+      expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(true);
     });
   });
 
@@ -622,18 +621,14 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
     );
     await b.call("cello_doc_refuse", { document_id: documentId, reason: "wrong document type" });
 
-    await vi.waitFor(async () => {
-      const after = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
-      // Distinguishable from "not yet answered", which is the whole point: those two want opposite
-      // actions from the operator.
-      expect(after.peerAccepted).toBe(false);
-      // AND THE REASON. This assertion did not exist, and could not have: the reason was verified,
-      // stored, and read by nothing. That defeats why it is mandatory on the wire — a refusal whose
-      // reason the proposer cannot see leaves them unable to propose anything better. Without this
-      // line, replacing every reason with the constant "declined" keeps the suite green forever.
-      expect(after.peerRefusalReason).toBe("wrong document type");
+    await vi.waitFor(() => {
+      // Distinguishable from "not yet answered", which is the whole point: those two want
+      // opposite actions from the operator. The signed reason is on the handshake record.
+      expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(false);
+      expect(a.layer.handshake.get(a.owner, documentId)?.peerReason).toBe(
+        "wrong document type",
+      );
     });
-    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBe(false);
   });
 
   it("a decision made while the proposer is OFFLINE still stands locally", async () => {
@@ -655,9 +650,8 @@ describe("the proposer is TOLD the decision — not left to infer it", () => {
       proposerNotified: false,
     });
     expect(b.layer.store.getDocument(b.owner, documentId)).not.toBeNull();
-    // Alice is still waiting, and the surface reports waiting — never a refusal.
-    const alice = ((await a.call("cello_doc_list")).documents as Array<Record<string, unknown>>)[0]!;
-    expect(alice.peerAccepted).toBeNull();
+    // Alice is still waiting, and the record reports waiting — never a refusal.
+    expect(a.layer.handshake.peerDecision(a.owner, documentId)).toBeNull();
   });
 
   it("a CONTRADICTING second answer is refused, not applied", async () => {

@@ -378,6 +378,22 @@ export class DocumentStore {
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
     // D9 residue sweep (review F5): withdrawals have no reader or writer left.
     this.#db.exec(`DROP TABLE IF EXISTS document_withdrawals`);
+    // SYNC-P5 (spec §9): the per-party DISPLAY CACHE — last successful exchange and the
+    // position that party last claimed. Non-authoritative by construction: no correctness
+    // decision reads it (R44); it exists so `cello_doc_list` can say in_sync|behind|unseen
+    // without initiating an exchange per row.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS document_party_view (
+        owner_agent_id   TEXT    NOT NULL,
+        document_id      TEXT    NOT NULL,
+        party_agent_id   TEXT    NOT NULL,
+        last_exchange_ms INTEGER NOT NULL,
+        gov_seqs         TEXT    NOT NULL,
+        content_counts   TEXT    NOT NULL,
+        refused          TEXT    NOT NULL,
+        PRIMARY KEY (owner_agent_id, document_id, party_agent_id)
+      );
+    `);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
     // COLUMN BIRTH. A daemon that already holds an envelope log must gain the column without
     // losing the log. `ALTER TABLE ... ADD COLUMN` throws when it is already there, which is the
@@ -905,6 +921,64 @@ export class DocumentStore {
    * Trustworthy for stamping because every append site rules on admissibility before
    * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
    */
+  /** SYNC-P5 — record what a party's exchange just showed us (display cache; see the table). */
+  recordPartyView(
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+    view: {
+      govSeqs: Record<string, number>;
+      contentCounts: Record<string, number>;
+      refused: string[];
+    },
+    nowMs: number,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT INTO document_party_view
+           (owner_agent_id, document_id, party_agent_id, last_exchange_ms, gov_seqs,
+            content_counts, refused)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (owner_agent_id, document_id, party_agent_id) DO UPDATE SET
+           last_exchange_ms = excluded.last_exchange_ms,
+           gov_seqs = excluded.gov_seqs,
+           content_counts = excluded.content_counts,
+           refused = excluded.refused`,
+      )
+      .run(
+        ownerAgentId, documentId, partyAgentId, nowMs,
+        JSON.stringify(view.govSeqs), JSON.stringify(view.contentCounts),
+        JSON.stringify(view.refused),
+      );
+  }
+
+  partyView(
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+  ): {
+    lastExchangeMs: number;
+    govSeqs: Record<string, number>;
+    contentCounts: Record<string, number>;
+    refused: string[];
+  } | null {
+    const r = this.#db
+      .prepare(
+        `SELECT last_exchange_ms, gov_seqs, content_counts, refused FROM document_party_view
+          WHERE owner_agent_id = ? AND document_id = ? AND party_agent_id = ?`,
+      )
+      .get(ownerAgentId, documentId, partyAgentId) as
+      | { last_exchange_ms: number; gov_seqs: string; content_counts: string; refused: string }
+      | undefined;
+    if (!r) return null;
+    return {
+      lastExchangeMs: r.last_exchange_ms,
+      govSeqs: JSON.parse(r.gov_seqs) as Record<string, number>,
+      contentCounts: JSON.parse(r.content_counts) as Record<string, number>,
+      refused: JSON.parse(r.refused) as string[],
+    };
+  }
+
   /** Record a rejection the PEER sent us. Returns whether a row was written (idempotent by leaf). */
   recordRejectionReceived(
     ownerAgentId: string,

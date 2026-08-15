@@ -1,0 +1,149 @@
+/**
+ * SYNC-P5 (R39–R43) — the scheduler decides MOMENTS, never correctness. Every piece of its state
+ * is volatile: these tests drive a fake clock and a fake transport and assert exactly when an
+ * exchange is attempted, suppressed, backed off, and force-released.
+ */
+import { describe, it, expect } from "vitest";
+import {
+  ReconcileScheduler,
+  RECONCILE_BACKOFF_BASE_MS,
+  RECONCILE_BACKOFF_CAP_MS,
+  RECONCILE_BELIEVED_CURRENT_MS,
+  RECONCILE_INFLIGHT_BOUND_MS,
+  RECONCILE_BATCH_CAP,
+  type ReconcileSchedulerDeps,
+} from "../document-reconcile-scheduler.js";
+import type { Logger } from "./../types.js";
+
+const OWNER = "aa".repeat(32);
+const PEER = "bb".repeat(32);
+
+function recordingLogger(): { logger: Logger; events: string[] } {
+  const events: string[] = [];
+  const push = (event: string) => void events.push(event);
+  const logger = { debug: push, info: push, warn: push, error: push } as unknown as Logger;
+  return { logger, events };
+}
+
+function fixture(over: Partial<ReconcileSchedulerDeps> = {}) {
+  const { logger, events } = recordingLogger();
+  const clock = { now: 1_700_000_000_000 };
+  const sent: Array<{ peer: string; docs: readonly string[] }> = [];
+  const deps: ReconcileSchedulerDeps = {
+    now: () => clock.now,
+    logger,
+    sweepTargets: () => new Map([[PEER, ["d1"]]]),
+    partySync: () => ({ sync: "unseen", lastSyncedAtMs: null }),
+    initiateReconcile: async (_o, peer, docs) => {
+      sent.push({ peer, docs });
+      return { ok: true };
+    },
+    ...over,
+  };
+  return { scheduler: new ReconcileScheduler(deps), clock, sent, events };
+}
+
+describe("the sweep (R39 trigger 3, R43 bounds)", () => {
+  it("attempts an unseen party, and suppresses one believed current", async () => {
+    const f = fixture();
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+    expect(f.sent).toHaveLength(1);
+
+    const current = fixture({
+      partySync: () => ({ sync: "in_sync", lastSyncedAtMs: 1_700_000_000_000 - 1_000 }),
+    });
+    expect(await current.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedCurrent: 1 });
+    expect(current.sent).toHaveLength(0);
+  });
+
+  it("a belief EXPIRES — a quiet party is asked again past the window, cache or no cache", async () => {
+    const f = fixture({
+      partySync: () => ({
+        sync: "in_sync",
+        lastSyncedAtMs: 1_700_000_000_000 - RECONCILE_BELIEVED_CURRENT_MS - 1,
+      }),
+    });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
+  it("a party that does not answer is backed off, doubling to the cap — and a sweep inside the window skips", async () => {
+    const f = fixture({
+      initiateReconcile: async () => ({ ok: false, reason: "peer_offline" }),
+    });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1, failed: 1 });
+    // Inside the first backoff window: skipped, not re-dialed.
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS - 1;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    // Past it: attempted again, failure doubles the window.
+    f.clock.now += 2;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1, failed: 1 });
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS * 2 - 2;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ skippedBackoff: 1 });
+    // The cap holds: many failures never exceed it.
+    for (let i = 0; i < 10; i++) {
+      f.clock.now += RECONCILE_BACKOFF_CAP_MS + 1;
+      await f.scheduler.sweep(OWNER);
+    }
+    f.clock.now += RECONCILE_BACKOFF_CAP_MS + 1;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
+  it("a wedged in-flight mark is honored inside its bound and RELEASED LOUDLY past it (R42)", async () => {
+    let resolveHang!: (v: { ok: true }) => void;
+    const hang = new Promise<{ ok: true }>((r) => { resolveHang = r; });
+    const f = fixture({ initiateReconcile: () => hang });
+    const first = f.scheduler.sweep(OWNER); // parks in-flight, never settles this round
+    await new Promise((r) => setTimeout(r, 10));
+    // Inside the bound: the mark is honored.
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ skippedInFlight: 1 });
+    // Past the bound: released, loudly, and the party is attempted again.
+    f.clock.now += RECONCILE_INFLIGHT_BOUND_MS + 1;
+    resolveHang({ ok: true });
+    await first;
+    const later = fixture(); // fresh — the point above proved honoring; expiry needs a hung one
+    let hung = true;
+    const neverSettles = new Promise<{ ok: true }>(() => {});
+    const wedged = fixture({
+      initiateReconcile: () => (hung ? neverSettles : Promise.resolve({ ok: true as const })),
+    });
+    void wedged.scheduler.sweep(OWNER);
+    await new Promise((r) => setTimeout(r, 10));
+    wedged.clock.now += RECONCILE_INFLIGHT_BOUND_MS + 1;
+    hung = false;
+    expect(await wedged.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+    expect(wedged.events).toContain("document.reconcile.inflight_expired");
+    void later;
+  });
+
+  it("chunks one party's documents at the R16 cap", async () => {
+    const docs = Array.from({ length: RECONCILE_BATCH_CAP + 3 }, (_v, i) => `d${i}`);
+    const f = fixture({ sweepTargets: () => new Map([[PEER, docs]]) });
+    await f.scheduler.sweep(OWNER);
+    expect(f.sent).toHaveLength(2);
+    expect(f.sent[0]!.docs).toHaveLength(RECONCILE_BATCH_CAP);
+    expect(f.sent[1]!.docs).toHaveLength(3);
+  });
+});
+
+describe("onReachable (R39 trigger 2)", () => {
+  it("fires immediately and RESETS backoff — the backoff modeled silence, and they just answered", async () => {
+    let answer = false;
+    const f = fixture({
+      initiateReconcile: async (_o, peer, docs) => {
+        f.sent.push({ peer, docs });
+        return answer ? { ok: true } : { ok: false, reason: "peer_offline" };
+      },
+    });
+    await f.scheduler.sweep(OWNER); // fails → backoff armed
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ skippedBackoff: 1 });
+    answer = true;
+    await f.scheduler.onReachable(OWNER, PEER); // reachability overrides the backoff
+    expect(f.sent).toHaveLength(2);
+  });
+
+  it("does nothing for a party with no shared documents", async () => {
+    const f = fixture({ sweepTargets: () => new Map() });
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent).toHaveLength(0);
+  });
+});

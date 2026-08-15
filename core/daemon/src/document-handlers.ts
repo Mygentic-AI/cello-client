@@ -1363,73 +1363,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   handlers.set("cello_doc_list", async (params, connectionId) => {
     const who = resolve(params, connectionId);
     if (isRefusal(who)) return who;
-    // M14B / DOD-MP-JOIN-1 — the inviter's view of every offer they authored: who has answered,
-    // who is still thinking, and the refusal prose when there is one. Without this the answer
-    // arrived, flipped a row, and reached nobody; a refused-but-admitted holder additionally
-    // needs removing (REMOVE-1) and nothing else prompts it.
-    // THE DERIVED ARRANGEMENT, per document (enforcer review G0). Until now nothing surfaced who
-    // holds a document or who governs it: an operator could not answer "who is in this?", and
-    // "all holders derive the same arrangement" — the governance line's headline claim — was
-    // unassertable from outside the process. DERIVED here, never stored: each daemon computes it
-    // from its OWN chain, which is exactly the property worth comparing across machines.
-    const unavailable = (reason: string): Record<string, unknown> => ({
-      // THE KEYS ARE ALWAYS PRESENT, null on failure. Dropping them made `row.participants`
-      // undefined, which a consumer coerces to [] and reads as "nobody holds this" — a
-      // materially wrong answer to the question this surface exists to answer. `null` cannot
-      // be mistaken for an empty membership; an absent key already was, in this unit's own
-      // enforcer helper.
-      participants: null,
-      admins: null,
-      properties: null,
-      arrangementUnavailable: reason,
-    });
-    const arrangementFor = (
-      documentId: string,
-      genesisRecord: ReturnType<typeof layer.handshake.get>,
-    ): Record<string, unknown> => {
-      // The SAME name the invite path uses for the same fault, carrying the same sentence —
-      // one condition should not have two names, and the one an operator reads should be the
-      // one that says whose fault it is.
-      if (!genesisRecord) {
-        return unavailable(
-          "document_genesis_missing: the document has a row but no stored genesis proposal to " +
-            "replay from — this is a local-state fault, not the peer's",
-        );
-      }
-      // CONTAINED. `chain()` decodes every stored amendment and `documentIdFromProposal` parses
-      // the genesis — both THROW on bytes this build cannot read (a client downgrade past an
-      // amendment kind is the reachable case). Uncontained, that throw escapes the row, escapes
-      // the map, and the operator asking "what documents do I have?" gets NOTHING because one
-      // chain would not decode.
-      try {
-        const derived = deriveDocumentState(
-          arrangementGenesisFromProposal(genesisRecord.envelope),
-          layer.amendments.chain(who.ownerAgentId, documentId),
-          documentGovernancePolicy,
-          layer.verifySignature,
-        );
-        if (!derived.ok) return unavailable(derived.reason);
-        return {
-          participants: [...derived.state.participants].sort(),
-          invited: [...derived.state.invited].sort(),
-          admins: [...derived.state.admins].sort(),
-          properties: derived.state.properties,
-          // WAS THE ADMIN SET DECLARED, OR DEFAULTED? A genesis from before the admin slot
-          // existed carries none, and the replay hands both parties admin power. Rendering that
-          // identically to a declared set would have this surface state as agreed fact something
-          // the code decided — so it says which it is.
-          adminSetDefaulted: genesisRecord.envelope.properties.admin_set === undefined,
-        };
-      } catch (err: unknown) {
-        return unavailable(
-          `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    };
-
-    // SYNC-P4 (D5 deleted): the invitation ledger IS the entry set. An open invitation is an
-    // invited seat in the derivation; a refusal is the subject's own refuse_join entry in the
-    // chain. No stored offer rows — asked twice, the record answers twice, identically.
+    // SYNC-R45/R46 — everything here is DERIVED at the moment of asking (participants, admins,
+    // properties, ended, own standing) or read from the per-party DISPLAY CACHE (sync,
+    // lastSyncedAtMs — spec §9; never a correctness input, R44). R48: a row whose chain does not
+    // derive says so BY NAME (`underivable`) with every derived key present and null — an absent
+    // key was already misread once as "nobody holds this".
+    // SYNC-P4 (D5 replacement): the invitation ledger IS the entry set — an open invitation is
+    // an invited seat in the derivation; a refusal is the subject's refuse_join entry.
     const outgoingJoins = layer.store
       .listDocuments(who.ownerAgentId)
       .flatMap((d) => {
@@ -1466,90 +1406,85 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         }));
         return [...open, ...refused];
       });
+
+    const documents = layer.store.listDocuments(who.ownerAgentId).map((doc) => {
+      const base = {
+        documentId: doc.documentId,
+        documentType: doc.documentType,
+      };
+      const underivable = (reason: string) => ({
+        ...base,
+        underivable: reason,
+        participants: null,
+        admins: null,
+        properties: null,
+        ended: null,
+        yourStanding: "unknown" as const,
+        parties: null,
+        standingGuidance:
+          "This daemon cannot derive this document's arrangement, so nothing here should be " +
+          "taken as confirmation of anything — see the named reason.",
+      });
+      const genesisRecord = layer.handshake.get(who.ownerAgentId, doc.documentId);
+      if (!genesisRecord) return underivable("document_genesis_missing");
+      let chain;
+      try {
+        chain = layer.amendments.chain(who.ownerAgentId, doc.documentId);
+      } catch (err: unknown) {
+        return underivable(
+          `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const derived = deriveDocumentState(
+        arrangementGenesisFromProposal(genesisRecord.envelope),
+        chain,
+        documentGovernancePolicy,
+        layer.verifySignature,
+      );
+      if (!derived.ok) return underivable(derived.reason);
+      const state = derived.state;
+      const rawStanding = layer.standingOf(who.ownerAgentId, doc.documentId, who.ownerAgentId);
+      const yourStanding: "participant" | "invited" | "removed" | "unknown" =
+        rawStanding === "stranger" || rawStanding === "unknown" ? "unknown" : rawStanding;
+
+      // Sync + blockedBy come from the layer's ONE display-cache read (shared with the sweep's
+      // believed-current suppression): "behind" means we hold something the party's last claimed
+      // position did not cover; "unseen" means no exchange was ever recorded here.
+      const parties = [...state.participants, ...state.invited]
+        .filter((agentId) => agentId !== who.ownerAgentId)
+        .sort()
+        .map((agentId) => ({
+          agentId,
+          class: state.participants.has(agentId)
+            ? ("participant" as const)
+            : ("invited" as const),
+          ...layer.partySync(who.ownerAgentId, doc.documentId, agentId),
+        }));
+
+      return {
+        ...base,
+        participants: [...state.participants].sort(),
+        admins: [...state.admins].sort(),
+        properties: state.properties,
+        ended: state.ended,
+        yourStanding,
+        ...(yourStanding === "removed"
+          ? {
+              standingGuidance:
+                "You are no longer a holder of this document. Your copy and its full history " +
+                "remain yours, and you can still read it here or open the file. What changed is " +
+                "only the flow of edits: yours no longer publish to the other holders, and " +
+                "theirs no longer reach you.",
+            }
+          : {}),
+        parties,
+      };
+    });
+
     return {
       ok: true,
       ...(outgoingJoins.length > 0 ? { joinOffers: outgoingJoins } : {}),
-      documents: layer.lifecycle.list(who.ownerAgentId, deps.now()).map((d) => {
-        // WHOSE OFFER WAS IT, and has the other side actually shown up?
-        //
-        // Without these three fields, `cello_doc_list` renders identically for a document the peer
-        // refused, one whose offer never reached them, and one being actively co-edited. An
-        // operator cannot tell "they said no" from "they are asleep", and those want opposite
-        // actions.
-        const proposal = layer.handshake.get(who.ownerAgentId, d.documentId);
-        const peerAnswer = layer.handshake.peerAnswer(who.ownerAgentId, d.documentId);
-        const arrangement = arrangementFor(d.documentId, proposal);
-        // DOD-MP-REMOVE-FEEDBACK-1 — the SENTENCE for a fact the row already carried.
-        //
-        // The row has shipped `removed: true` since REMOVE-1. What was missing is that a bare flag
-        // is not feedback: it does not say when, it does not say the copy is still yours, and it
-        // does not say what actually stopped. So this completes the existing signal rather than
-        // adding a second name for it computed by a second walk of the same chain.
-        //
-        // NAMED `yourStanding`, NOT `yourAccess`: your access to the copy did not change — reading
-        // it still works and the file is still on disk, which the sentence itself says. A surface
-        // that renders a badge from the key alone would show "access: removed", which is the
-        // confiscation reading FORWARD-ONLY-REMOVAL exists to forbid.
-        //
-        // ALWAYS PRESENT, exactly as `participants` is: an absent key is read as "fine", so on a
-        // chain this build cannot decode — where the standing derivation honestly cannot tell —
-        // it says `unknown` rather than going quiet and rendering a removed holder as a holder.
-        const standing: "removed" | "holder" | "unknown" =
-          arrangement["arrangementUnavailable"] !== undefined
-            ? "unknown"
-            : (d as { removed?: boolean }).removed === true
-              ? "removed"
-              : "holder";
-        return {
-          ...d,
-          yourStanding: standing,
-          ...(standing === "removed"
-            ? {
-                standingGuidance:
-                  `You are no longer a holder of this document. ` +
-                  `Your copy and its full history remain yours, and you can still read it here or ` +
-                  `open the file. What changed is only the flow of edits: yours no longer publish ` +
-                  `to the other holders, and theirs no longer reach you.`,
-              }
-            : {}),
-          ...(standing === "unknown"
-            ? {
-                standingGuidance:
-                  `This daemon cannot read this document's amendment chain, so it cannot tell ` +
-                  `whether you are still a holder. Nothing here should be taken as confirmation ` +
-                  `that you are.`,
-              }
-            : {}),
-          proposedByUs: proposal?.proposerAgentId === who.ownerAgentId,
-          // THE PEER'S OWN SIGNED ANSWER — true accepted, false refused, null not yet heard. This
-          // replaced an inference ("they have published into it") that could not tell refused from
-          // unreceived from accepted-but-untouched, two of which want the operator to act.
-          //
-          // The REASON comes with it. It was stored and read by nothing, which defeats why it is
-          // mandatory on the wire: a refusal whose reason the proposer cannot see leaves them
-          // unable to propose anything better.
-          peerAccepted: peerAnswer.accepted,
-          peerRefusalReason: peerAnswer.reason,
-          // Kept alongside it, because they answer different questions: whether they agreed, and
-          // whether anything has actually come back. A document accepted an hour ago with nothing
-          // in it is a fine state; it is just not the same state.
-          peerHasPublished:
-            layer.store.knownEnvelopeHashesBySender(who.ownerAgentId, d.documentId, d.peerAgentId).size > 0,
-          consentState: proposal?.consentState ?? null,
-          // WHO HOLDS IT AND WHO GOVERNS IT — derived from THIS daemon's own chain (G0).
-          // `proposal` is passed rather than re-fetched: it is the same SQL read and the same
-          // CBOR decode of the same bytes, already in hand.
-          ...arrangement,
-          // DID OUR OFFER LEAVE? Only meaningful for a document WE proposed — for one we accepted
-          // there is no offer of ours to have sent. Without this, `peerAccepted: null` meant both
-          // "they are thinking" and "they were never asked", and the shipped guidance said WAIT,
-          // which is wrong for the second and leaves the operator waiting on nothing.
-          proposalSent:
-            proposal?.proposerAgentId === who.ownerAgentId
-              ? layer.handshake.proposalSent(who.ownerAgentId, d.documentId)
-              : null,
-        };
-      }),
+      documents,
     };
   });
 

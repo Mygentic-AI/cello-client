@@ -109,6 +109,9 @@ export interface DocumentProposalRecord {
   envelope: DocumentProposalEnvelope;
   consentState: DocumentConsentState;
   refusalReason?: string;
+  /** The PEER's signed answer to OUR proposal (null: unanswered), and their stated reason. */
+  peerAccepted?: boolean | null;
+  peerReason?: string;
   createdAtMs: number;
   decidedAtMs?: number;
 }
@@ -583,6 +586,8 @@ export class DocumentHandshake {
       envelope: decodeDocumentProposal(new Uint8Array(r["envelope"] as Uint8Array)),
       consentState: r["consent_state"] as DocumentConsentState,
       refusalReason: (r["refusal_reason"] as string | null) ?? undefined,
+      peerAccepted: r["peer_accepted"] == null ? null : r["peer_accepted"] === 1,
+      peerReason: (r["peer_reason"] as string | null) ?? undefined,
       createdAtMs: r["created_at"] as number,
       decidedAtMs: (r["decided_at"] as number | null) ?? undefined,
     }));

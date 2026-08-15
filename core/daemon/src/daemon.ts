@@ -92,6 +92,7 @@ import { registerDocumentHandlers } from "./document-handlers.js";
 import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
+import { ReconcileScheduler } from "./document-reconcile-scheduler.js";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
@@ -1340,6 +1341,12 @@ async function startDaemonHoldingLock(
     return { who: resolved.who, whoKnown: resolved.whoKnown };
   }
 
+  // SYNC-P5: assigned when the document layer is wired (below); the state-change hook runs for
+  // sessions, which exist only after startup completes — the guard covers the boot window where
+  // agent restoration can dispatch state events before the scheduler exists.
+  let reconcileScheduler: ReconcileScheduler | undefined;
+  let documentOwnerKeyForHook: ((agentName: string) => string | null) | undefined;
+
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
     sessionId: string,
@@ -1349,6 +1356,20 @@ async function startDaemonHoldingLock(
     // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
     // offered-name drop below so a terminal state's own doorbell still shows the name.
     const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
+    // SYNC-P5 (R39): a session coming up IS the party-became-reachable signal — every shared
+    // document gets a reconcile attempt, and the scheduler's backoff resets (they just answered).
+    if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && (state === "created" || state === "active")) {
+      const ownerAgentId = documentOwnerKeyForHook(agentName);
+      if (ownerAgentId !== null) {
+        void reconcileScheduler
+          .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
+          .catch((err: unknown) => {
+            logger.warn("document.reconcile.reachable_trigger_failed", {
+              agentName, reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+      }
+    }
     notificationDispatcher.dispatchSessionStateChanged(agentName, sessionId, state, counterpartyPubkey, who);
     void sendTelegramDoorbell(agentName, sessionId, "state_change", `Session ${state}`);
     // Reviewer HIGH fix (a60d68ed): telegramRungUnread had NO cleanup at all — a session that
@@ -3833,6 +3854,49 @@ async function startDaemonHoldingLock(
     now: () => Date.now(),
   });
 
+  // SYNC-P5 (R39–R43) — WHEN reconciling is attempted: the periodic sweep and the party-became-
+  // reachable trigger. All state volatile (R41); a lost tick costs latency, never correctness.
+  reconcileScheduler = new ReconcileScheduler({
+    now: () => Date.now(),
+    logger,
+    sweepTargets: (ownerAgentId) => documentLayer.sweepTargets(ownerAgentId),
+    partySync: (ownerAgentId, documentId, partyAgentId) =>
+      documentLayer.partySync(ownerAgentId, documentId, partyAgentId),
+    initiateReconcile: (ownerAgentId, peerAgentId, documentIds) =>
+      documentLayer.initiateReconcile(ownerAgentId, peerAgentId, documentIds),
+  });
+  // Overridable for tests (the delivery tick precedent); floored so a misread env cannot busy-loop.
+  const reconcileTickOverride = Number(process.env["CELLO_DOCUMENT_RECONCILE_SWEEP_MS"]);
+  const RECONCILE_SWEEP_MS =
+    Number.isFinite(reconcileTickOverride) && reconcileTickOverride >= 250
+      ? reconcileTickOverride
+      : 120_000;
+  let reconcileSweepRunning = false;
+  const reconcileSweepTimer = setInterval(() => {
+    if (reconcileSweepRunning) return;
+    reconcileSweepRunning = true;
+    void (async () => {
+      try {
+        for (const agentName of perAgentSignaling.keys()) {
+          const ownerAgentId = documentOwnerKeyFor(agentName);
+          if (ownerAgentId === null) continue;
+          const result = await reconcileScheduler.sweep(ownerAgentId);
+          if (result.attempted > 0 || result.failed > 0) {
+            logger.debug("document.reconcile.sweep", { agentName, ...result });
+          }
+        }
+      } catch (err: unknown) {
+        logger.warn("document.reconcile.sweep_threw", {
+          reason: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        reconcileSweepRunning = false;
+      }
+    })();
+  }, RECONCILE_SWEEP_MS);
+  reconcileSweepTimer.unref?.();
+  documentOwnerKeyForHook = documentOwnerKeyFor;
+
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
@@ -3892,6 +3956,7 @@ async function startDaemonHoldingLock(
   let stoppedHookFired = false;
 
   async function stop(reason: string): Promise<void> {
+    clearInterval(reconcileSweepTimer);
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check

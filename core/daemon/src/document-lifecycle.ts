@@ -31,23 +31,11 @@ const CREATE_LIFECYCLE_SQL = `
   );
 `;
 
-export interface DocumentListRow {
-  documentId: string;
-  peerAgentId: string;
-  documentType: string;
-  /** Constant in V1, shown because it is seam surface — a field nobody sees cannot be noticed. */
-  assuranceTier: string;
-  status: string;
-  /** We have closed and at least one current holder has not. */
-  closePending: boolean;
-}
-
 export type Verdict = { ok: true } | { ok: false; reason: string; detail: string };
 
 export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
-  readonly #closePendingFor: (ownerAgentId: string, documentId: string) => boolean;
   readonly #removedFor: (ownerAgentId: string, documentId: string) => boolean;
   readonly #endedFor: (
     ownerAgentId: string,
@@ -57,12 +45,6 @@ export class DocumentLifecycle {
   constructor(
     store: DocumentStore,
     logger: Logger,
-    /**
-     * "I have closed and the derivation is still waiting on someone" — the list row's question,
-     * answered from the entry set (SYNC-P4). Injected because the derivation lives on the layer;
-     * this unit keeps only the platform gates and the delivery-facing surfaces.
-     */
-    closePendingFor: (ownerAgentId: string, documentId: string) => boolean,
     /** SYNC-D8 — "was this owner written out?", answered by the layer's one fold derivation. */
     removedFor: (ownerAgentId: string, documentId: string) => boolean,
     /**
@@ -78,33 +60,9 @@ export class DocumentLifecycle {
   ) {
     this.#store = store;
     this.#logger = logger;
-    this.#closePendingFor = closePendingFor;
     this.#removedFor = removedFor;
     this.#endedFor = endedFor;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
-  }
-
-  list(ownerAgentId: string, nowMs: number): DocumentListRow[] {
-    // SYNC-P4 (D1/D2/D4): there is no delivery ledger to count "pending" from anymore — what a
-    // peer holds is computed at each exchange from positions, not tracked per envelope (R8/R9).
-    void nowMs;
-
-    return this.#store.listDocuments(ownerAgentId).map((d) => ({
-      documentId: d.documentId,
-      peerAgentId: d.peerAgentId,
-      documentType: d.documentType,
-      // DOD-MP-REMOVE-1 — display overlay, derived: a removed holder's row still says active in
-      // the table (removal is a chain fact, not a stored flag), and a list that said "active"
-      // would be the surface claiming more than forward-only allows. Answered by the layer's
-      // ONE fold derivation (SYNC-D8) — two derivations disagreeing about whether someone was
-      // removed is two daemons disagreeing about the arrangement.
-      ...(this.#removedFor(ownerAgentId, d.documentId) ? { removed: true } : {}),
-      assuranceTier: "authenticated",
-      status: d.status,
-      // "I have closed and the derivation is still waiting on someone" — derived from the entry
-      // set, ALL current seats (SYNC-P4; the DOD-MP-CLOSE-N-1 rule, now the fold's).
-      closePending: this.#closePendingFor(ownerAgentId, d.documentId),
-    }));
   }
 
   setPlatformPaused(agentId: string, paused: boolean, nowMs: number): void {

@@ -140,18 +140,21 @@ document worse in a way that is tedious to undo.
 
 ## Where a document stands
 
-`cello_doc_list` distinguishes states that look alike and want opposite actions:
+`cello_doc_list` answers, per document, from YOUR OWN daemon's derivation of the signed record:
 
 | Field | Means |
 |---|---|
-| `peerAccepted: null` | They have not answered — offline, thinking, **or the offer never reached them**. Check `proposalSent` before waiting. |
-| `peerAccepted: false` | They refused. It is over; do not keep writing into it. |
-| `peerAccepted: true` | They agreed. Their edits apply to your copy and yours to theirs. |
-| `peerHasPublished` | Whether anything has actually come back. Accepted-and-untouched is a fine state. |
-| `closePending` | You closed; still waiting on at least one other current holder. It ends when everyone who holds it has said so. |
-| `yourStanding` | Where YOU stand: `holder`, `removed`, or `unknown`. Always present — an absent answer would read as "you are fine". |
-| `removed` | You are out of this document's arrangement. |
-| `standingGuidance` | The sentence version of the above, including what remains yours. Read this one to the operator. |
+| `participants` / `admins` / `properties` | The arrangement as your daemon derives it. `null` (never absent) when the record cannot be derived — see `underivable`. |
+| `ended` | `null` while live; `closed` once every participant's own close is in the record; `killed` on any admin's kill. |
+| `yourStanding` | Where YOU stand: `participant`, `invited`, `removed`, or `unknown`. Always present — an absent answer would read as "you are fine". |
+| `parties` | Everyone else seated: `{ agentId, class, sync, lastSyncedAtMs, blockedBy? }`. `class` is `participant` or `invited`. |
+| `parties[].sync` | `in_sync` — their last exchange covered everything you hold. `behind` — you hold something their last position did not. `unseen` — no exchange with them was ever recorded here. It is a belief from the last exchange, not a live probe. |
+| `parties[].blockedBy` | They refused this entry, and you hold work stacked on it — their copy cannot advance past that hole until its author supersedes. |
+| `underivable` | The named reason the record cannot be derived. Nothing else in the row should be trusted when this is present. |
+| `standingGuidance` | The sentence version of your standing, including what remains yours. Read this one to the operator. |
+
+A peer's answer to a PROPOSAL (accepted, refused, and their stated reason) is a handshake fact,
+not a document row — a document they refused simply never gains them as a participant.
 
 ## Ending one
 
