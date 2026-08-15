@@ -107,12 +107,6 @@ export interface DocumentLayerDeps {
    * stands — this is the narrow exception an agent asked for by name.
    */
   nudge?(ownerAgentId: string, documentId: string, paths: readonly string[]): void;
-  /** Undo one envelope's operations on the live document, for withdraw. */
-  rollback(
-    ownerAgentId: string,
-    documentId: string,
-    envelopeHash: string,
-  ): { ok: true } | { ok: false; reason: string };
   /**
    * Sign as a given agent. Takes the agent id so a rejection cannot be signed with the wrong key —
    * the first version took no arguments and the composition root reached for whichever key
@@ -263,7 +257,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
     // SYNC-D8 — "was this owner written out?" answered by the same fold as everything else.
     (ownerAgentId, documentId) => standingOf(ownerAgentId, documentId, ownerAgentId) === "removed",
-    deps.rollback,
   );
   const notifications = new DocumentNotifications(store, logger);
   // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool

@@ -3637,13 +3637,6 @@ async function startDaemonHoldingLock(
       if (!agentName) return;
       notificationDispatcher.dispatchDocumentWatch(agentName, documentId, paths);
     },
-    rollback: () => ({
-      // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting
-      // success having reverted nothing tells an operator their update was retracted while their
-      // file still contains it.
-      ok: false,
-      reason: "document_rollback_not_wired",
-    }),
     sign: async (ownerAgentId, tbs) => {
       // Signs as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
       //

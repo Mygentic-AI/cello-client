@@ -75,20 +75,10 @@ function newFixture() {
     properties: { append_only: false }, status: "active", createdAtMs: 1,
   });
   const engine = new DocumentEngine(logger);
-  const rolledBack: string[] = [];
   // SYNC-P4: closes are ENTRIES and the pending question is answered by the derivation on the
   // layer; this unit only ever sees the injected answer.
-  const lifecycle = new DocumentLifecycle(
-    store,
-    logger,
-    () => false,
-    () => false,
-    (_a, _d, envelopeHash) => {
-      rolledBack.push(envelopeHash);
-      return { ok: true };
-    },
-  );
-  return { store, engine, lifecycle, events, rolledBack, db };
+  const lifecycle = new DocumentLifecycle(store, logger, () => false, () => false);
+  return { store, engine, lifecycle, events, db };
 }
 
 describe("DocumentLifecycle — list", () => {
@@ -122,118 +112,11 @@ describe("DocumentLifecycle — list", () => {
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
-    const lifecycle = new DocumentLifecycle(
-      store,
-      logger,
-      () => false,
-      () => true,
-      () => ({ ok: true }),
-    );
+    const lifecycle = new DocumentLifecycle(store, logger, () => false, () => true);
     const row = lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect((row as unknown as { removed?: boolean }).removed).toBe(true);
     expect(row!.status).toBe("active");
     expect(lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
-  });
-
-});
-
-describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => {
-  it("writes a withdrawal record BESIDE the original, which is marked and never deleted", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(true);
-
-    const log = f.store.getEnvelopeLog(AGENT, DOC);
-    // The original is still there with its payload. "Marked, never deleted" is what keeps the log
-    // verifiable — a hole in an append-only log is indistinguishable from tampering.
-    expect(log.find((r) => r.envelopeHash === e.envelopeHash)!.payload).not.toBeNull();
-    // And the record is NOT an envelope. As one it advanced our per-sender chain over a node the
-    // peer will never hold — a withdrawal is never delivered — so our next update chained onto
-    // something they had never seen and they refused it as document_chain_broken, sending an
-    // operator to the chain layer for a withdrawal-scoping bug.
-    expect(log.filter((r) => r.kind === "withdrawal")).toHaveLength(0);
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
-  });
-
-  it("ROLLS BACK locally — the operator's own document no longer contains it", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-
-    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
-    // The clause is "local rollback + a withdrawal record". Only the record shipped, so the
-    // operator was told their update was withdrawn while their own file still contained it —
-    // replay applies every update payload in order, so it came back on every rebuild forever.
-    expect(f.rolledBack).toEqual([e.envelopeHash]);
-  });
-
-  it("REFUSES rather than reporting success when the rollback did not happen", () => {
-    const { logger } = recordingLogger();
-    const db = new DatabaseSync(":memory:");
-    db.exec("PRAGMA foreign_keys = ON");
-    const store = new DocumentStore(db, logger);
-    store.createDocument({
-      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
-      properties: {}, status: "active", createdAtMs: 1,
-    });
-    const lifecycle = new DocumentLifecycle(
-      store, logger,
-      () => false,
-      () => false,
-      () => ({ ok: false, reason: "nothing_tracked" }),
-    );
-    const e = envelope(AGENT, null);
-    store.appendEnvelope(AGENT, e);
-
-    const res = lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_withdraw_rollback_failed");
-  });
-
-  it("refuses a SECOND withdrawal of the same envelope instead of reporting success", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    expect(f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW).ok).toBe(true);
-    const second = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(second.ok).toBe(false);
-    expect((second as { reason: string }).reason).toBe("document_already_withdrawn");
-  });
-
-  it("REFUSES to withdraw an update the peer already has", () => {
-    const f = newFixture();
-    const e = envelope(AGENT, null);
-    f.store.appendEnvelope(AGENT, e);
-    // The peer has it: acked_at set directly — the ack machinery is deleted (D4); the column
-    // survives on the row and withdrawal (itself dying in D9) still reads it.
-    f.db.prepare(
-      `UPDATE document_envelopes SET acked_at = ? WHERE owner_agent_id = ? AND envelope_hash = ?`,
-    ).run(NOW, AGENT, e.envelopeHash);
-
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    // Withdrawing a delivered update would tell the operator their content was retracted when the
-    // peer is holding it. That is the promise a protocol cannot make, and saying so is the feature.
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_already_delivered");
-  });
-
-  it("refuses to withdraw someone else's envelope", () => {
-    const f = newFixture();
-    const e = envelope(PEER, null);
-    f.store.appendEnvelope(AGENT, e);
-    const res = f.lifecycle.withdraw(AGENT, DOC, e.envelopeHash, NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_not_author");
-  });
-
-  it("refuses to withdraw an envelope that is not there, rather than writing a dangling record", () => {
-    const f = newFixture();
-    const res = f.lifecycle.withdraw(AGENT, DOC, "ff".repeat(32), NOW);
-    expect(res.ok).toBe(false);
-    expect((res as { reason: string }).reason).toBe("document_envelope_unknown");
   });
 
 });
