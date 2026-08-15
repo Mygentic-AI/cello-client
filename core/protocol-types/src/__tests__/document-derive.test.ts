@@ -1051,6 +1051,36 @@ describe("deriveDocumentState — endings as entries (R26–R31)", () => {
     const s = deriveOk(g, [bc, admitC, cc, closeA, closeB, removeC], [a, b, c]);
     expect(s.ended).toBe("closed"); // everyone who REMAINS has agreed
   });
+
+  it("re-admission does NOT carry an old tenure's close: removal clears the subject's agreement", () => {
+    // B closes, is removed, is re-admitted, consents. If their OLD close still counted, A's own
+    // close would settle the document without B's new tenure ever agreeing — the exact leak the
+    // pre-pivot store closed by dropping the close row at removal. Derived now, so it is the
+    // FOLD's job: remove_holder clears the subject from `closes`.
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const removeB = entry(
+      { kind: "remove_holder", subject_agent_id: b.agentId, author_seq: 1, epoch_id: 3, parents: [hashHex(closeB)] },
+      [a],
+    );
+    const readmitB = entry(
+      { subject_agent_id: b.agentId, author_seq: 2, epoch_id: 4, parents: [hashHex(removeB)] },
+      [a],
+    );
+    const bc2 = consentEntry(b, { author_seq: 3, epoch_id: 5, parents: [hashHex(readmitB)] });
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 3, epoch_id: 6, parents: [hashHex(bc2)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, closeB, removeB, readmitB, bc2, closeA], [a, b]);
+    expect(s.ended).toBeNull(); // B's new tenure has not agreed — the old close is spent
+    expect([...s.closedBy]).toEqual([a.agentId]);
+  });
 });
 
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {

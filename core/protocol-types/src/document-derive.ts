@@ -534,6 +534,9 @@ export function deriveDocumentState(
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
         state.invited.delete(body.subject_agent_id!);
+        // Their agreement is spent with their seat: a re-admitted holder returns to a document
+        // that WAITS on them again, instead of one their old tenure's close silently settles.
+        state.closes.delete(body.subject_agent_id!);
         if (state.admins.has(body.subject_agent_id!)) {
           state.spentDeclaredAdmins.add(body.subject_agent_id!);
         }
