@@ -492,7 +492,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       ) {
         logger.warn("document.removed_from", {
           documentId,
-          epochId: applied.body.epoch_id,
           removedBy: applied.collection.required_signers.join(","),
         });
       }

@@ -122,8 +122,6 @@ describe("DocumentStore — the append-only envelope log", () => {
     expect(log[0]!.docPrevHash).toBeNull(); // genesis
     expect(log[1]!.docPrevHash).toBe(log[0]!.envelopeHash);
     expect(log[2]!.docPrevHash).toBe(log[1]!.envelopeHash);
-    // epoch_id is CONSTANT 0 in V1 and must be stored, never omitted (§16.1 seam).
-    expect(log.every((e) => e.epochId === 0)).toBe(true);
     expect(log[0]!.stateVector).toBeInstanceOf(Uint8Array);
   });
 

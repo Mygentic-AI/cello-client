@@ -68,7 +68,6 @@ export interface DocumentListRow {
   documentType: string;
   /** Constant in V1, shown because it is seam surface — a field nobody sees cannot be noticed. */
   assuranceTier: string;
-  epochId: number;
   status: string;
   /** We have closed and at least one current holder has not. */
   closePending: boolean;
@@ -126,14 +125,10 @@ export class DocumentLifecycle {
       // it separately in the surface layer would be a second walk of one chain, which
       // `walkMembership`'s own header forbids: two walks disagreeing about whether someone was
       // removed is two daemons disagreeing about the arrangement.
-      ...(() => {
-        const standing = this.#store.removedFromArrangement(ownerAgentId, d.documentId);
-        return standing.removed
-          ? { removed: true, ...(standing.epochId === null ? {} : { removedAtEpoch: standing.epochId }) }
-          : {};
-      })(),
+      ...(this.#store.removedFromArrangement(ownerAgentId, d.documentId).removed
+        ? { removed: true }
+        : {}),
       assuranceTier: "authenticated",
-      epochId: this.#store.currentDocumentEpoch(ownerAgentId, d.documentId),
       status: d.status,
       // "I have closed and the derivation is still waiting on someone" — derived from the entry
       // set, ALL current seats (SYNC-P4; the DOD-MP-CLOSE-N-1 rule, now the fold's).
@@ -274,9 +269,8 @@ export class DocumentLifecycle {
         ok: false,
         reason: "document_removed",
         detail:
-          `you were removed from this document's arrangement at epoch ${membership.epochId} — ` +
-          `your copy and its history remain yours, but new edits no longer publish to the ` +
-          `other holders`,
+          `you were removed from this document's arrangement — your copy and its history remain ` +
+          `yours, but new edits no longer publish to the other holders`,
       };
     }
     if (doc.status === "stalled") {

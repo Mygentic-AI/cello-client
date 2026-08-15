@@ -24,7 +24,6 @@ import { encodeCbor, decodeCbor } from "../cbor.js";
 import {
   DOCUMENT_UPDATE_DOMAIN,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   buildDocumentUpdateTbs,
   encodeDocumentUpdateEnvelope,
   decodeDocumentUpdateEnvelope,
@@ -41,7 +40,6 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
   return {
     type: "document_update",
     document_id: DOC,
-    epoch_id: DOCUMENT_EPOCH_V1,
     doc_prev_hash: PREV,
     sender_agent_id: "agent-a",
     sender_client_id: 3_141_592,
@@ -101,29 +99,6 @@ describe("document update envelope — the decoder refuses loudly, naming the ga
     expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(
       /document_envelope_missing_field.*doc_prev_hash/,
     );
-  });
-
-  it("an ABSENT epoch_id is refused — it must not default to 0", () => {
-    const map = asMap(envelope());
-    delete map.epoch_id;
-    // §14: epoch_id is not optional. After a compaction an update that does not state its epoch
-    // cannot be verified unambiguously, and a decoder that supplies 0 makes the ambiguity silent.
-    expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(
-      /document_envelope_missing_field.*epoch_id/,
-    );
-  });
-
-  it("a non-zero epoch DECODES — correctness is the inbound path's ruling, not the decoder's", () => {
-    // AMENDED for M14B / DOD-MP-AMEND-1 (was: hard refusal of epoch !== 0). The decoder cannot
-    // know a document's current epoch; the inbound path derives it from the amendment chain and
-    // rules there. Shape is still enforced: negatives and non-integers refuse by name.
-    const map = asMap(envelope());
-    map.epoch_id = 3;
-    expect(decodeDocumentUpdateEnvelope(raw(map)).epoch_id).toBe(3);
-    for (const bad of [-1, 1.5]) {
-      map.epoch_id = bad;
-      expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(/document_envelope_epoch/);
-    }
   });
 
   it("an unrecognized update encoding is refused rather than guessed at", () => {
@@ -202,8 +177,7 @@ describe("document update TBS — the three bindings are INSIDE the signature", 
     expect(tbsOf({ sender_client_id: 999 })).not.toBe(tbsOf());
   });
 
-  it("the chain link, the epoch, the sender and the update bytes are all covered too", () => {
-    expect(tbsOf({ epoch_id: 1 })).not.toBe(tbsOf());
+  it("the chain link, the sender and the update bytes are all covered too", () => {
     expect(tbsOf({ doc_prev_hash: "dd".repeat(32) })).not.toBe(tbsOf());
     expect(tbsOf({ doc_prev_hash: null })).not.toBe(tbsOf());
     expect(tbsOf({ sender_agent_id: "agent-b" })).not.toBe(tbsOf());
@@ -228,7 +202,6 @@ describe("document update TBS — the three bindings are INSIDE the signature", 
       sender_client_id: a.sender_client_id,
       sender_agent_id: a.sender_agent_id,
       doc_prev_hash: a.doc_prev_hash,
-      epoch_id: a.epoch_id,
       document_id: a.document_id,
       type: a.type,
     };
@@ -284,24 +257,24 @@ describe("document update TBS — the FROZEN vector", () => {
   const FROZEN: DocumentUpdateEnvelope = {
     type: "document_update",
     document_id: "00".repeat(31) + "01",
-    epoch_id: 0,
     doc_prev_hash: "00".repeat(31) + "02",
     sender_agent_id: "vector-agent",
     sender_client_id: 4_294_967_290,
     update_encoding: "yjs-v1",
     state_vector: new Uint8Array([0, 1, 2, 3]),
     update: new Uint8Array([4, 5, 6, 7]),
-    // v2 (SYNC-G1, journaled: M14B Entry 58): the preimage gained governance_parents and the
-    // domain moved to v2 — the wire changed DELIBERATELY, and the vector was reissued below.
+    // v3 (SYNC-P4 D7, journaled: M14B RESUME STATE): epoch_id left the preimage and the domain
+    // moved to v3 — the wire changed DELIBERATELY, and the vector was reissued below. (v2 added
+    // governance_parents, Entry 58.)
     governance_parents: ["ab".repeat(32)],
     signature: new Uint8Array(64).fill(0xab),
   };
 
   it("the preimage and the hash are byte-for-byte what they were the day they were frozen", () => {
     expect(Buffer.from(buildDocumentUpdateTbs(FROZEN, { preHash: false })).toString("hex")).toBe(
-      "8a781843454c4c4f2d444f43554d454e542d5550444154452d7632784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303031007840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d6167656e741afffffffa66796a732d76314400010203440405060781784061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
+      "89781843454c4c4f2d444f43554d454e542d5550444154452d76337840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030317840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d6167656e741afffffffa66796a732d76314400010203440405060781784061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
     );
-    expect(documentEnvelopeHash(FROZEN)).toBe("3dfa9c925bcea6491c40e7a12324683cb2addfd315b6e7e65a3fe74b97651058");
+    expect(documentEnvelopeHash(FROZEN)).toBe("4d61ad4debf773f054a7c3eca50b65fb7a5a189e231f85fa2d14edb349ffa37b");
   });
 });
 

@@ -27,7 +27,7 @@
  *                      the binding is LEARNABLE, and this envelope is where it is learned. Outside
  *                      the signature, "learnable" would mean "assertable by anyone on the wire".
  *
- * `epoch_id` and `doc_prev_hash` are not optional and are not defaulted (§14). An update that does
+ * `doc_prev_hash` is not optional and is not defaulted (§14). An update that does
  * not state its epoch cannot be verified unambiguously after a compaction, and the chain link is
  * what lets the document log be extracted and verified across sealed sessions.
  */
@@ -42,7 +42,7 @@ import { encodeCbor, decodeCbor } from "./cbor.js";
  * link to the governance that made it admissible; the per-envelope epoch stamp it replaces is
  * deleted by the same phase. No compatibility owed: nothing was published between bumps.
  */
-export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v2";
+export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v3";
 
 /**
  * The pinned Yjs update encoding (§16.7-8). Pinned in the protocol types precisely so that two
@@ -52,7 +52,6 @@ export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v2";
 export const DOCUMENT_UPDATE_ENCODING_V1 = "yjs-v1";
 
 /** V1 has exactly one epoch. Compaction (which mints new epochs) is V2. */
-export const DOCUMENT_EPOCH_V1 = 0;
 
 /** A 32-byte hex digest — the shape of `document_id` and of every chain link. */
 const HEX32 = /^[0-9a-f]{64}$/;
@@ -61,8 +60,6 @@ export interface DocumentUpdateEnvelope {
   type: "document_update";
   /** Hash of the handshake proposal envelope that minted this document. */
   document_id: string;
-  /** Constant `DOCUMENT_EPOCH_V1` in V1 — carried explicitly, never omitted. */
-  epoch_id: number;
   /**
    * The per-sender chain link: the `documentEnvelopeHash` of this sender's previous envelope for
    * this document, or `null` for this sender's FIRST envelope. `null` and absent are different
@@ -110,7 +107,6 @@ export function buildDocumentUpdateTbs(
   const preimage = encodeCbor([
     DOCUMENT_UPDATE_DOMAIN,
     env.document_id,
-    env.epoch_id,
     env.doc_prev_hash, // null encodes distinctly from any string — genesis is unambiguous
     env.sender_agent_id,
     env.sender_client_id,
@@ -143,7 +139,6 @@ export function encodeDocumentUpdateEnvelope(env: DocumentUpdateEnvelope): Uint8
   return encodeCbor({
     type: env.type,
     document_id: env.document_id,
-    epoch_id: env.epoch_id,
     doc_prev_hash: env.doc_prev_hash,
     sender_agent_id: env.sender_agent_id,
     sender_client_id: env.sender_client_id,
@@ -157,8 +152,8 @@ export function encodeDocumentUpdateEnvelope(env: DocumentUpdateEnvelope): Uint8
 
 function requirePresent(map: Record<string, unknown>, field: string): unknown {
   // `in`, not a truthiness or nullish check. ABSENT and `null` are different facts: absent
-  // doc_prev_hash read as null would turn every gap in a chain into a fresh valid-looking genesis,
-  // and absent epoch_id read as 0 would make a post-compaction ambiguity silent. A decoder that
+  // doc_prev_hash read as null would turn every gap in a chain into a fresh valid-looking genesis.
+  // A decoder that
   // supplies a default for a field the spec calls mandatory is manufacturing the sender's claim.
   if (!(field in map)) {
     throw new Error(`document_envelope_missing_field: ${field} is mandatory and was not present`);
@@ -208,18 +203,6 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
   if (!HEX32.test(documentId)) {
     throw new Error(
       `document_envelope_document_id: must be a 32-byte lowercase hex digest, got "${documentId}"`,
-    );
-  }
-
-  const epochId = requirePresent(map, "epoch_id");
-  // SHAPE ONLY (M14B / DOD-MP-AMEND-1 — relaxed from a hard `!== 0` refusal). Epoch CORRECTNESS
-  // is a per-document fact — the current epoch is derived from the amendment chain — and a
-  // decoder cannot know it. The inbound path rules on it, and may trust this decoded value
-  // because `epoch_id` sits inside the signed TBS: a lie about the epoch fails verification
-  // before any epoch comparison runs.
-  if (typeof epochId !== "number" || !Number.isInteger(epochId) || epochId < 0) {
-    throw new Error(
-      `document_envelope_epoch: must be a non-negative integer, got ${String(epochId)}`,
     );
   }
 
@@ -277,7 +260,6 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
   return {
     type: "document_update",
     document_id: documentId,
-    epoch_id: epochId,
     doc_prev_hash: prev,
     sender_agent_id: senderAgentId,
     sender_client_id: clientId,

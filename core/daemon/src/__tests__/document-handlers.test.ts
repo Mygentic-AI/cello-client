@@ -288,11 +288,11 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
     f.db
       .prepare(
         `INSERT INTO document_entries
-           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
             received_bytes, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(f.owner, brokenId, "h".repeat(64), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
+      .run(f.owner, brokenId, "h".repeat(64), "a".repeat(64), 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const list = await f.call("cello_doc_list", {});
     const rows = list.documents as Array<Record<string, unknown>>;
@@ -401,7 +401,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       document_id: documentId,
       invitee_pubkey: fC.owner,
     });
-    expect(invited).toMatchObject({ ok: true, noticeSent: true, epochId: 1 });
+    expect(invited).toMatchObject({ ok: true, noticeSent: true });
 
     // The NOTICE crossed A's transport (a step-1 position frame — no offer, no carried history);
     // bouncing the exchange bootstraps C: empty hand, then the world with the genesis.
@@ -419,13 +419,13 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
       "hello from A",
     );
-    expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(2);
-    expect(fA.layer.store.currentDocumentEpoch(fA.owner, documentId)).toBe(1);
+    expect(fC.layer.amendments.chain(fC.owner, documentId)).toHaveLength(2);
+    expect(fA.layer.amendments.chain(fA.owner, documentId)).toHaveLength(1);
 
     // C's frames reach A — the CONSENT ENTRY is what turns C from invited into a participant
     // in A's own derivation. No answer frame exists to settle anything.
     routeAll(fC, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 2);
     expect(fA.layer.holdersFor(fA.owner, documentId)).toContain(fC.owner);
   });
 
@@ -492,7 +492,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(bAccept.ok).toBe(true);
     // B's consent entry reaches A — without it, A's fold shows B invited and fans out to nobody.
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     // A invites C; the amendment fans out to B.
     const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
@@ -500,7 +500,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const amendSend = fA.sent.filter((s) => s.peerAgentId === fB.owner).at(-1)!;
     const routedAmend = fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
     expect(routedAmend).toMatchObject({ consumed: true, kind: "amendment" });
-    await until(() => fB.layer.store.currentDocumentEpoch(fB.owner, documentId) === 2);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
 
     // The forged twin: a rogue key authors the next epoch claiming itself as the required signer.
     const rogue = generateKeypair();
@@ -544,7 +544,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // The router contains the refusal; the epoch NEVER advances on a forged amendment — and the
     // stranger's entry is NOT STORED, not even as history (SYNC-R18: refused, never absorbed).
     await new Promise((r) => setTimeout(r, 100));
-    expect(fB.layer.store.currentDocumentEpoch(fB.owner, documentId)).toBe(2);
+    expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(2);
     expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(chainLenBefore);
   });
 
@@ -561,11 +561,11 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     const amendSend = fA.sent.filter((s) => s.peerAgentId === fB.owner).at(-1)!;
     fB.layer.onDocumentFrame(AGENT, "session-1", amendSend.bytes, fA.owner);
-    await until(() => fB.layer.store.currentDocumentEpoch(fB.owner, documentId) === 2);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 2);
 
     // A — a genesis party, fully signed — authors an admission for someone who ALREADY holds.
     const chain = fB.layer.amendments.chain(fB.owner, documentId);
@@ -629,7 +629,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await fB.call("cello_doc_accept", { document_id: documentId });
     // B's consent reaches A — B is now a participant A can remove.
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     // A authors the invite of C and the removal of B — B receives NEITHER yet.
     const sentToB = fA.sent.filter((s) => s.peerAgentId === fB.owner).length;
@@ -638,7 +638,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       document_id: documentId,
       holder_pubkey: fB.owner,
     });
-    expect(removed).toMatchObject({ ok: true, epochId: 3 });
+    expect(removed).toMatchObject({ ok: true });
     const [inviteToB, removalToB] = fA.sent
       .filter((s) => s.peerAgentId === fB.owner)
       .slice(sentToB);
@@ -717,7 +717,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(typeof retry.consentEntry).toBe("string");
     // And the cure took: B's own derivation shows B participating again.
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) >= 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length >= 1);
   });
 
   it("CLOSE WAITS ON AN INVITED SEAT — one party alone is never the whole agreement (P2 review F5)", async () => {
@@ -762,7 +762,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     // Diverge: each writes; NOTHING is routed.
     await fA.call("cello_doc_write", { document_id: documentId, content: "alpha from A. " });
@@ -825,7 +825,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     // C joins FIRST (seated through the exchange), so C's copy predates what A writes next.
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
@@ -892,7 +892,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     // A invites C (the entry lands in A's chain; the notice frame the invite itself sent is
     // deliberately not routed) and writes content afterwards, so the exchange must carry both.
@@ -1006,7 +1006,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     await fA.call("cello_doc_write", { document_id: documentId, content: "signed by A. " });
 
     // A "forwards" its own envelope to B with the signature corrupted — as a hostile forwarder
@@ -1015,7 +1015,6 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const tampered = encodeDocumentUpdateEnvelope({
       type: "document_update",
       document_id: row.documentId,
-      epoch_id: row.epochId,
       doc_prev_hash: row.docPrevHash,
       sender_agent_id: row.senderAgentId,
       sender_client_id: 0,
@@ -1056,7 +1055,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
 
     // Bootstrap C through the exchange (the join test's flow, condensed).
@@ -1118,12 +1117,12 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // C's consent entry reaches A — C is a participant A can remove (an invited seat cannot be
     // removed through the holder door; it has not sat down yet).
     routeAll(fC, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 2);
 
     const removed = await fA.call("cello_doc_remove", {
       document_id: documentId, holder_pubkey: fC.owner,
     });
-    expect(removed).toMatchObject({ ok: true, voluntary: false, epochId: 3 });
+    expect(removed).toMatchObject({ ok: true, voluntary: false });
     expect((removed.holdersNotified as Record<string, boolean>)[fC.owner]).toBe(true);
 
     // C's daemon applies the removal: status flips, the event is the operator's notice —
@@ -1143,7 +1142,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // the missing file before it ever reaches this gate.)
     const gate = fC.layer.lifecycle.canPublish(fC.owner, documentId);
     expect(gate).toMatchObject({ ok: false, reason: "document_removed" });
-    expect((gate as { detail: string }).detail).toContain("epoch 3");
+    expect((gate as { detail: string }).detail).toContain("removed from this document");
     // And A's side refuses any post-removal envelope from C by membership (inbound-suite covers
     // the refusal shape; here we pin the derived arrangement dropped C).
     const chain = fA.layer.amendments.chain(fA.owner, documentId);
@@ -1162,7 +1161,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // A learns of C's consent before C leaves — otherwise the leave entry (which chains onto the
     // consent) sits held on A awaiting a parent A never got.
     routeAll(fC, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 2);
 
     // C is NOT an admin — leaving is still theirs (D3).
     const left = await fC.call("cello_doc_remove", {
@@ -1193,7 +1192,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     const res = await fA.call("cello_doc_remove", {
       document_id: documentId, holder_pubkey: fB.owner,
     });
@@ -1546,7 +1545,7 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
@@ -1659,7 +1658,7 @@ describe("the admission SURVIVES an unreachable holder — through the exchange,
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
 
     const invited = await fA.call("cello_doc_invite", {
       document_id: documentId,
@@ -1702,7 +1701,7 @@ describe("the admission SURVIVES an unreachable holder — through the exchange,
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     // The invitee gets the NOTICE (their bootstrap carries the chain), and a daemon does not fan
     // governance to itself — the per-holder report names exactly the existing other holders.
@@ -1744,7 +1743,7 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
     await fB.call("cello_doc_accept", { document_id: documentId });
     routeAll(fB, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 1);
     const left = await fA.call("cello_doc_remove", {
       document_id: documentId, holder_pubkey: fA.owner,
     });
@@ -1755,7 +1754,7 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     // not feedback — it says nothing about when, about the copy, or about what actually stopped.
     expect(row["removed"]).toBe(true);
     expect(row["yourStanding"]).toBe("removed");
-    expect(typeof row["removedAtEpoch"]).toBe("number");
+
     const sentence = String(row["standingGuidance"] ?? "");
     expect(sentence.length, "a flag with no sentence is not feedback").toBeGreaterThan(40);
     expect(sentence).toMatch(/no longer a holder|removed/i);
@@ -1779,7 +1778,7 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     routeAll(fC, fA);
-    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 2);
     const removed = await fA.call("cello_doc_remove", {
       document_id: documentId, holder_pubkey: fC.owner,
     });
@@ -1812,10 +1811,10 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     // reports not-removed — so a key that is merely ABSENT renders a removed holder as fine.
     fA.db.prepare(
       `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
           received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     const row = await rowFor(fA, documentId);
     expect(row["arrangementUnavailable"]).toBeDefined();
@@ -1834,10 +1833,10 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a write REFUSES on an unreadable chain, n
     const documentId = proposed.documentId as string;
     fA.db.prepare(
       `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
           received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, 1, Buffer.from([0xff, 0xff, 0xff]), 1);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(fA.owner, documentId, "ff".repeat(32), "a".repeat(64), 1, Buffer.from([0xff, 0xff, 0xff]), 1);
 
     // `holdersFor` is contracted to return null when it cannot derive, and the publish path is
     // already holding a named refusal for that. The chain decode threw straight past both, so the

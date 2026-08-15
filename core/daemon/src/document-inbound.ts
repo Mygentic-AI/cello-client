@@ -93,7 +93,7 @@ export interface DocumentInboundDeps {
     ownerAgentId: string,
     documentId: string,
     agentId: string,
-  ): { state: "holder" | "removed" | "untouched"; epochId: number | null };
+  ): { state: "holder" | "removed" | "untouched" };
   /**
    * DOD-MP-INBOUND-N-1 — the CURRENT derived holders, or null when the chain does not derive.
    * When it derives, membership is the WHOLE sender gate — the genesis-peer column is a
@@ -265,7 +265,6 @@ export class DocumentInbound {
         this.#d.logger.warn("document.inbound.sender_removed", {
           documentId: env.document_id,
           senderAgentId: env.sender_agent_id,
-          removedAtEpoch: legacyMembership.epochId,
           correlationId,
         });
         return {
@@ -274,9 +273,8 @@ export class DocumentInbound {
           terminal: true,
           envelopeHash,
           detail:
-            `this holder was removed from the document at epoch ${legacyMembership.epochId} — ` +
-            `the removal is forward-only (your copy is yours), but new edits are no longer ` +
-            `accepted`,
+            "this holder was removed from the document — the removal is forward-only (your " +
+            "copy is yours), but new edits are no longer accepted",
         };
       }
       senderIsParty = env.sender_agent_id === doc.peerAgentId;
@@ -334,7 +332,6 @@ export class DocumentInbound {
         this.#d.logger.warn("document.inbound.sender_removed", {
           documentId: env.document_id,
           senderAgentId: env.sender_agent_id,
-          removedAtEpoch: formerHolder.epochId,
           correlationId,
         });
         return {
@@ -343,30 +340,19 @@ export class DocumentInbound {
           terminal: true,
           envelopeHash,
           detail:
-            `this holder was removed from the document at epoch ${formerHolder.epochId} — the ` +
-            `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
+            "this holder was removed from the document — the removal is forward-only (your " +
+            "copy is yours), but new edits are no longer accepted",
         };
       }
-      // F1 (INBOUND-N-1 review): an UNKNOWN sender whose envelope claims an epoch ahead of
-      // ours is the amendment-in-flight signature — an honest new holder can ONLY arrive
-      // epoch-ahead, because a receiver holding their epoch would hold their amendment too.
-      // The wire stays silent (the disclosure decision stands); the LOG names the lag, so the
-      // operator debugging "the new collaborator's edits aren't landing" does not read that a
-      // stranger probed the document. Resolution is the sender's ordinary retry after the
-      // amendment lands — see Entry 18 for the settled shape and its retry-ceiling window.
-      const lagSignature =
-        formerHolder.state === "untouched" &&
-        env.epoch_id > this.#d.store.currentDocumentEpoch(ownerAgentId, env.document_id);
-      this.#d.logger.warn(
-        lagSignature ? "document.inbound.sender_unknown_epoch_ahead" : "document.inbound.not_peer",
-        {
-          documentId: env.document_id,
-          senderAgentId: env.sender_agent_id,
-          peerAgentId: doc.peerAgentId,
-          ...(lagSignature ? { envelopeEpoch: env.epoch_id } : {}),
-          correlationId,
-        },
-      );
+      // The wire stays silent (the disclosure decision stands); the LOG names the refusal, so
+      // the operator debugging "the new collaborator's edits aren't landing" has a line to find.
+      // An admission still in flight resolves by the sender's ordinary retry after it lands.
+      this.#d.logger.warn("document.inbound.not_peer", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        peerAgentId: doc.peerAgentId,
+        correlationId,
+      });
       return {
         ok: false,
         reason: "document_sender_not_peer",
@@ -391,7 +377,6 @@ export class DocumentInbound {
     if (selfMembership.removed) {
       this.#d.logger.warn("document.inbound.recipient_removed", {
         documentId: env.document_id,
-        removedAtEpoch: selfMembership.epochId,
         correlationId,
       });
       return {
@@ -400,8 +385,8 @@ export class DocumentInbound {
         terminal: true,
         envelopeHash,
         detail:
-          `this daemon was removed from the document's arrangement at epoch ` +
-          `${selfMembership.epochId} — the local copy remains, but new edits are no longer applied`,
+          "this daemon was removed from the document's arrangement — the local copy remains, " +
+          "but new edits are no longer applied",
       };
     }
 
@@ -599,7 +584,6 @@ export class DocumentInbound {
       documentId: env.document_id,
       senderAgentId: env.sender_agent_id,
       docPrevHash: env.doc_prev_hash,
-      epochId: env.epoch_id,
       governanceParents: [...env.governance_parents],
       signature: env.signature,
       stateVector: env.state_vector,

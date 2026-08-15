@@ -47,8 +47,6 @@ const admin = makeSigner();
 function entryOf(over: Partial<DocumentAmendmentBody> = {}): DocumentAmendmentEnvelope {
   const body: DocumentAmendmentBody = {
     document_id: DOC,
-    epoch_id: 1,
-    prev_amendment_hash: null,
     kind: "add_holder",
     subject_agent_id: "c".repeat(64),
     property_change: null,
@@ -87,7 +85,7 @@ function hashHex(env: DocumentAmendmentEnvelope): string {
 function causalChain(...overs: Partial<DocumentAmendmentBody>[]): DocumentAmendmentEnvelope[] {
   let prev: string[] = [];
   return overs.map((over, i) => {
-    const env = entryOf({ epoch_id: i + 1, author_seq: i + 1, parents: prev, ...over });
+    const env = entryOf({ author_seq: i + 1, parents: prev, ...over });
     prev = [hashHex(env)];
     return env;
   });
@@ -228,7 +226,7 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1000);
     expect(store.chain("other-owner", DOC)).toHaveLength(0);
     expect(store.chain(OWNER, "e".repeat(64))).toHaveLength(0);
-    expect(store.currentEpoch("other-owner", DOC)).toBe(0);
+    expect(store.chain("other-owner", DOC)).toHaveLength(0);
   });
 
   it("watermarks: highest CONTIGUOUS seq per author with head hashes; a held gap is not counted", () => {
@@ -268,16 +266,16 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1);
     expect(store.membershipOf(OWNER, DOC, subject).state).toBe("holder");
     store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "removed", epochId: 2 });
+    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "removed" });
     store.append(OWNER, DOC, encodeDocumentAmendment(three!), 3);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "holder", epochId: 3 });
+    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "holder" });
   });
 
-  it("currentEpoch is 0 with no entries and the max epoch afterwards", () => {
-    expect(store.currentEpoch(OWNER, DOC)).toBe(0);
+  it("the chain length tracks appended entries — the epoch spine is gone (D7)", () => {
+    expect(store.chain(OWNER, DOC)).toHaveLength(0);
     const [one, two] = causalChain({}, { kind: "promote_admin", subject_agent_id: "c".repeat(64) });
     store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1000);
     store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2000);
-    expect(store.currentEpoch(OWNER, DOC)).toBe(2);
+    expect(store.chain(OWNER, DOC)).toHaveLength(2);
   });
 });

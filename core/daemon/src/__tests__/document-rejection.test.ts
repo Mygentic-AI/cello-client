@@ -101,35 +101,7 @@ function envelope(payload: Uint8Array | null, prev: string | null): DocumentEnve
   };
 }
 
-function raiseEpoch(db: DatabaseSync, owner: string, doc: string, epoch: number) {
-  db.prepare(
-    `INSERT INTO document_entries
-       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
-        received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(owner, doc, "h".repeat(64), "a".repeat(64), epoch, epoch, Buffer.from([1]), 1);
-}
-
 describe("DocumentRejections — a rejection is a record, not a discard", () => {
-  it("stamps the rejection record with the CURRENT epoch, not a constant", async () => {
-    // The second locally-authored producer (TRACE-1 Entry 2). Revert-visible: table non-empty.
-    const { store, rejections, db } = newFixture();
-    raiseEpoch(db, AGENT, DOC, 1);
-    const base = envelope(baseUpdate(), null);
-    store.appendEnvelope(AGENT, base);
-    await rejections.reject(AGENT, DOC, {
-      rejectedEnvelopeHash: "ab".repeat(32),
-      quarantined: refusedUpdate(),
-      reason: "document_append_only_violation",
-      detail: "removes existing content",
-      senderAgentId: PEER,
-      ...crypto(),
-      rejectedDocPrevHash: base.envelopeHash,
-    });
-    const record = store.getEnvelopeLog(AGENT, DOC).find((e) => e.kind === "rejection");
-    expect(record!.epochId).toBe(1);
-  });
-
 
   it("writes a 0x05 row REFERENCING the refused envelope, and never the refused payload", async () => {
     const { store, engine, rejections } = newFixture();

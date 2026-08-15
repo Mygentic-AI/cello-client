@@ -231,7 +231,6 @@ export { MONIKER_RE, validateMoniker } from "./moniker.js";
 export {
   DOCUMENT_UPDATE_DOMAIN,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   buildDocumentUpdateTbs,
   encodeDocumentUpdateEnvelope,
   decodeDocumentUpdateEnvelope,

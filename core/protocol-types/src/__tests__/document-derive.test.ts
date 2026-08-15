@@ -197,7 +197,6 @@ describe("deriveDocumentState — determinism", () => {
     expect([...s.participants].sort()).toEqual([a.agentId, b.agentId].sort());
     expect(s.properties["append_only"]).toBe(true);
     expect(s.voids).toEqual([]);
-    expect(s.interimMaxEpoch).toBe(4);
     expect(s.interimLastHash).toBe(hashHex(remove));
   });
 
@@ -1091,7 +1090,6 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
     expect([...s.invited]).toEqual([b.agentId]);
     expect([...s.admins]).toEqual([a.agentId]);
     expect(s.properties["topology"]).toBe("mesh");
-    expect(s.interimMaxEpoch).toBe(0);
     expect(s.interimLastHash).toBeNull();
   });
 
@@ -1249,6 +1247,5 @@ describe("deriveDocumentState — authoring seeds", () => {
     expect(s.frontier).toEqual([hashHex(e2)]);
     expect(s.authorSeqs.get(a.agentId)).toBe(1);
     expect(s.authorSeqs.get(b.agentId)).toBe(2);
-    expect(s.interimMaxEpoch).toBe(2);
   });
 });

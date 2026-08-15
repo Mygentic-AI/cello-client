@@ -13,7 +13,6 @@ import {
   encodeDocumentRejection,
   encodeDocumentReconcile,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
 import {
@@ -43,7 +42,6 @@ function recordingLogger(): { logger: Logger; events: Array<{ event: string; fie
 const updateEnvelope: DocumentUpdateEnvelope = {
   type: "document_update",
   document_id: DOC,
-  epoch_id: DOCUMENT_EPOCH_V1,
   doc_prev_hash: null,
   sender_agent_id: "peer-agent",
   sender_client_id: 4242,
@@ -287,7 +285,7 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     // b9 00 0a — cbor.ts documents this encoder's non-minimal map header deliberately, so a guard
     // that only admitted the inline-count form would route every genuine document frame to the
     // transcript.
-    expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000b");
+    expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000a");
     expect(r.router.routeSync(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
   });
 });

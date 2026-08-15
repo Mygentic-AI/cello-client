@@ -49,7 +49,6 @@ function envelope(sender: string, prev: string | null, payload: Uint8Array | nul
     documentId: DOC,
     senderAgentId: sender,
     docPrevHash: prev,
-    epochId: 0,
     signature: new Uint8Array(64),
     stateVector: new Uint8Array([0]),
     payload: payload ?? update("some text. "),
@@ -108,47 +107,9 @@ describe("DocumentLifecycle — list", () => {
     // Tier is constant in V1; epoch is DERIVED since M14B / AMEND-1 — 0 here because this
     // document has no amendments, not because anything is hardcoded.
     expect(row!.assuranceTier).toBe("authenticated");
-    expect(row!.epochId).toBe(0);
   });
 
-  it("reports the CURRENT epoch once the document has amendments — not a constant", () => {
-    // A DECODABLE row — the list's removal overlay and the membership walk decode every stored
-    // amendment, and a garbage blob is a state no real daemon can hold (validate-before-append).
-    const f = newFixture();
-    const body = {
-      document_id: DOC,
-      epoch_id: 2,
-      prev_amendment_hash: null,
-      kind: "add_holder",
-      subject_agent_id: "f".repeat(64),
-      property_change: null,
-      state_hash: null,
-      authored_at_ms: 1,
-      author_agent_id: "a".repeat(64),
-      author_seq: 1,
-      parents: [],
-    } as const;
-    const hash = documentAmendmentHash(body);
-    const bytes = encodeDocumentAmendment({
-      body,
-      collection: {
-        document_id: DOC,
-        subject_kind: "document_amendment",
-        subject_hash: hash,
-        required_signers: ["a".repeat(64)],
-        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
-      },
-    });
-    f.db.prepare(
-      `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
-          received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 2, Buffer.from(bytes), 1);
-    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
-    expect(row!.epochId).toBe(2);
-  });
-
+  
   it("a removed owner's row says so — the overlay is derived, the stored status stays active", () => {
     const f = newFixture();
     const body = {
@@ -177,10 +138,10 @@ describe("DocumentLifecycle — list", () => {
     });
     f.db.prepare(
       `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
           received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, 1, Buffer.from(bytes), 1);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, Buffer.from(bytes), 1);
     const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect((row as unknown as { removed?: boolean }).removed).toBe(true);
     expect(row!.status).toBe("active");

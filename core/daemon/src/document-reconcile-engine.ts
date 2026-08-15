@@ -227,7 +227,6 @@ export function respondToReconcile(
         encodeDocumentUpdateEnvelope({
           type: "document_update",
           document_id: row.documentId,
-          epoch_id: row.epochId,
           doc_prev_hash: row.docPrevHash,
           sender_agent_id: row.senderAgentId,
           sender_client_id: row.senderClientId ?? 0,

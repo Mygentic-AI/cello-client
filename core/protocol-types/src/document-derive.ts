@@ -54,7 +54,6 @@ export interface DocumentStateView {
   /** Highest seq per author among included entries — the watermark seed. */
   authorSeqs: ReadonlyMap<string, number>;
   /** Interim carrier fields until P4 deletes the epoch spine (D7, gated on SYNC-G1). */
-  interimMaxEpoch: number;
   interimLastHash: string | null;
 }
 
@@ -693,12 +692,10 @@ export function deriveDocumentState(
   const frontier = [...included.keys()].filter((h) => !namedAsParent.has(h)).sort();
 
   const authorSeqs = new Map<string, number>();
-  let interimMaxEpoch = 0;
   for (const env of included.values()) {
     const author = env.body.author_agent_id;
     const seq = env.body.author_seq;
     if ((authorSeqs.get(author) ?? 0) < seq) authorSeqs.set(author, seq);
-    if (env.body.epoch_id > interimMaxEpoch) interimMaxEpoch = env.body.epoch_id;
   }
 
   return {
@@ -721,7 +718,6 @@ export function deriveDocumentState(
       voids,
       excluded,
       authorSeqs,
-      interimMaxEpoch,
       interimLastHash: order.length > 0 ? order[order.length - 1]! : null,
     },
   };

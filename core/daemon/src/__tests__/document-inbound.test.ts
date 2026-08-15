@@ -18,7 +18,6 @@ import {
   documentAmendmentHash,
   encodeDocumentAmendment,
   DOCUMENT_UPDATE_ENCODING_V1,
-  DOCUMENT_EPOCH_V1,
   type DocumentUpdateEnvelope,
 } from "@cello-protocol/protocol-types";
 import { DocumentStore } from "../document-store.js";
@@ -58,7 +57,6 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
   return {
     type: "document_update",
     document_id: DOC,
-    epoch_id: DOCUMENT_EPOCH_V1,
     doc_prev_hash: null,
     sender_agent_id: PEER,
     sender_client_id: PEER_CLIENT,
@@ -199,10 +197,10 @@ function plantAmendment2(
   });
   db.prepare(
     `INSERT INTO document_entries
-       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+       (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
         received_bytes, recorded_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, Buffer.from(bytes), 1);
 }
 
 describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement", () => {
@@ -236,21 +234,20 @@ describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(2);
   });
 
-  it("an UNKNOWN epoch-ahead sender is LOGGED as amendment lag, not as a stranger probe", async () => {
-    // F1: the honest new holder's first envelope — their add_holder amendment still in flight
-    // to us — is wire-silent (disclosure stands) but the LOG names the lag signature: unknown
-    // sender + epoch ahead of ours. Revert the discriminator and this reads as a stranger.
+  it("an UNKNOWN sender is refused wire-silent, and the LOG names the refusal (D7: the epoch-lag discriminator is gone)", async () => {
+    // The honest new holder's first envelope — their admission entry still in flight to us —
+    // refuses exactly like a stranger's now: there is no epoch to compare, and the admission
+    // resolves by the sender's ordinary retry once the entry lands. The LOG line is the trace.
     const f = newFixture({ currentHolders: () => [PEER] });
     const res = await f.inbound.receive(
       AGENT,
       encodeDocumentUpdateEnvelope(
-        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7, epoch_id: 1 }),
+        envelope({ sender_agent_id: "0".repeat(63) + "4", sender_client_id: 7 }),
       ),
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_not_peer" });
-    expect(f.events.some((e) => e.event === "document.inbound.sender_unknown_epoch_ahead")).toBe(true);
-    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(false);
+    expect(f.events.some((e) => e.event === "document.inbound.not_peer")).toBe(true);
   });
 
   it("a STRANGER stays silently refused even when the chain derives — membership discloses nothing to non-parties", async () => {
@@ -315,10 +312,10 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
     });
     db.prepare(
       `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
           received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, epoch, Buffer.from(bytes), 1);
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), epoch, Buffer.from(bytes), 1);
   }
   const raiseEpoch = (db: DatabaseSync, epoch: number) => plantAmendment(db, epoch);
 
@@ -334,7 +331,7 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 1");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
   });
 
   it("a daemon that knows ITSELF removed stops applying — terminal, so the sender settles", async () => {
@@ -363,7 +360,7 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 2");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
   });
 
   it("a REMOVED sender's envelope is TERMINAL, naming the removal epoch — never a silent drop", async () => {
@@ -375,7 +372,7 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
       NOW,
     );
     expect(res).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
-    expect((res as { detail: string }).detail).toContain("epoch 1");
+    expect((res as { detail: string }).detail).toContain("removal is forward-only");
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 

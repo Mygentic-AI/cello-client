@@ -165,9 +165,6 @@ export class DocumentPublish {
     const envelope: DocumentUpdateEnvelope = {
       type: "document_update",
       document_id: documentId,
-      // The CURRENT epoch from the recorded amendment chain (M14B / DOD-MP-AMEND-1) — the
-      // constant-0 era ends the moment a document's first amendment lands. (Dies with D7.)
-      epoch_id: this.#d.store.currentDocumentEpoch(ownerAgentId, documentId),
       // READ, never cached. Anything else appended since — a rejection, a withdrawal — moves this,
       // and a wrong link is refused by the peer and stops the document rebuilding locally.
       doc_prev_hash: this.#d.store.lastEnvelopeHashBySender(ownerAgentId, documentId, senderId),
@@ -200,7 +197,6 @@ export class DocumentPublish {
       senderAgentId: senderId,
       docPrevHash: envelope.doc_prev_hash,
       governanceParents: [...envelope.governance_parents],
-      epochId: envelope.epoch_id,
       signature: envelope.signature,
       stateVector: envelope.state_vector,
       payload: update,

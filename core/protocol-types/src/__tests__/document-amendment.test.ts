@@ -39,8 +39,6 @@ const DOC_ID = "d".repeat(64);
 function body(over: Partial<DocumentAmendmentBody> = {}): DocumentAmendmentBody {
   return {
     document_id: DOC_ID,
-    epoch_id: 1,
-    prev_amendment_hash: null,
     kind: "add_holder",
     subject_agent_id: "c".repeat(64),
     property_change: null,
@@ -97,12 +95,8 @@ describe("amendment TBS — the epoch event's final frame shape", () => {
 
   it("the hash excludes nothing that is agreed — every body field moves it", () => {
     const base = documentAmendmentHash(body());
-    expect(documentAmendmentHash(body({ epoch_id: 2 }))).not.toEqual(base);
     expect(documentAmendmentHash(body({ kind: "remove_holder" }))).not.toEqual(base);
     expect(documentAmendmentHash(body({ subject_agent_id: "e".repeat(64) }))).not.toEqual(base);
-    expect(
-      documentAmendmentHash(body({ prev_amendment_hash: "ab".repeat(32) })),
-    ).not.toEqual(base);
     expect(
       documentAmendmentHash(body({ kind: "change_property", subject_agent_id: null, property_change: { key: "append_only", value: true } })),
     ).not.toEqual(base);
@@ -120,18 +114,17 @@ describe("amendment TBS — the epoch event's final frame shape", () => {
         { preHash: false },
       ),
     ) as unknown[];
-    expect(arr[10]).toBe("f".repeat(64));
-    expect(arr[11]).toBe(3);
-    expect(arr[12]).toEqual(["ab".repeat(32), "cd".repeat(32)]);
+    expect(arr[8]).toBe("f".repeat(64));
+    expect(arr[9]).toBe(3);
+    expect(arr[10]).toEqual(["ab".repeat(32), "cd".repeat(32)]);
   });
 
   it("FROZEN VECTOR — field order is wire law; regenerate only on a journaled preimage change", () => {
-    // SYNC-P1 (journaled: M14B Entry 49) — the preimage gained author_agent_id, author_seq,
-    // parents, and the domain moved to v2. The prior v1 vector is retired with the domain.
+    // SYNC-P4 D7 (journaled: M14B RESUME STATE) — the epoch spine left the preimage:
+    // epoch_id and prev_amendment_hash are gone and the domain moved to v3. The v2 vector is
+    // retired with the domain.
     const tbs = buildDocumentAmendmentTbs({
       document_id: "ab".repeat(32),
-      epoch_id: 1,
-      prev_amendment_hash: null,
       kind: "add_holder",
       subject_agent_id: "cd".repeat(32),
       property_change: null,
@@ -142,7 +135,7 @@ describe("amendment TBS — the epoch event's final frame shape", () => {
       parents: [],
     });
     expect(Buffer.from(tbs).toString("hex")).toBe(
-      "bb3053db48b53847bd5fd12879e6353f9fd7d5f6e0762fb6040f2a2b3d3f0528",
+      "d81a1cc0af5de61520d17d670a16b222b032670ad40a6fb6c3249bbcdab04bb0",
     );
   });
 });
@@ -156,10 +149,7 @@ describe("amendment wire — strict round-trip", () => {
 
   it.each([
     ["document_id", undefined, /document_amendment_missing_field: document_id/],
-    ["epoch_id", undefined, /document_amendment_missing_field: epoch_id/],
-    ["epoch_id", 0, /document_amendment_epoch: must be a positive integer/],
     ["kind", "make_owner", /document_amendment_kind/],
-    ["prev_amendment_hash", undefined, /document_amendment_missing_field: prev_amendment_hash/],
     ["state_hash", undefined, /document_amendment_missing_field: state_hash/],
     ["subject_agent_id", undefined, /document_amendment_missing_field: subject_agent_id/],
     ["author_agent_id", undefined, /document_amendment_missing_field: author_agent_id/],

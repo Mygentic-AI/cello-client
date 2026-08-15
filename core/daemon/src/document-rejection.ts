@@ -243,7 +243,6 @@ export class DocumentRejections {
       documentId,
       senderAgentId: agentId, // WE authored the rejection, whoever authored the update
       docPrevHash: this.#store.lastEnvelopeHashBySender(agentId, documentId, agentId),
-      epochId: this.#store.currentDocumentEpoch(agentId, documentId),
       governanceParents: [],
       signature: envelope.signature,
       // A ONE-BYTE PLACEHOLDER, and it has to be — an empty blob here THREW on the real driver.

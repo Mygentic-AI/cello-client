@@ -797,8 +797,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind,
       subject_agent_id: who.ownerAgentId,
       // A refusal names nothing it agrees to — it is the subject's own signed no (R24).
@@ -979,8 +977,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind: "add_holder",
       subject_agent_id: invitee,
       property_change: null,
@@ -1066,13 +1062,12 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       holders: owedHolders,
       verb: "invite",
     });
-    logger.info("document.join.invited", { documentId, invitee, epochId: body.epoch_id, noticeSent: offerSent });
+    logger.info("document.join.invited", { documentId, invitee, noticeSent: offerSent });
     return {
       ok: true,
       documentId,
       inviteeAgentId: invitee,
       amendmentHash: amendHashHex,
-      epochId: body.epoch_id,
       noticeSent: offerSent,
       holdersNotified: holdersTold,
       ...(offerSent
@@ -1136,10 +1131,8 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // the chain never touched still refuses.
       const membership = layer.amendments.membershipOf(who.ownerAgentId, documentId, holder);
       if (membership.state === "removed") {
-        const removal = chain.find(
-          (e) => e.body.kind === "remove_holder" &&
-            e.body.subject_agent_id === holder &&
-            e.body.epoch_id === membership.epochId,
+        const removal = [...chain].reverse().find(
+          (e) => e.body.kind === "remove_holder" && e.body.subject_agent_id === holder,
         );
         let resendTold: Record<string, boolean> = {};
         if (removal) {
@@ -1175,7 +1168,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           documentId,
           removedAgentId: holder,
           resent: true,
-          epochId: membership.epochId,
           holdersNotified: resendTold,
         };
       }
@@ -1188,8 +1180,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
 
     const body: DocumentAmendmentBody = {
       document_id: documentId,
-      epoch_id: derived.state.interimMaxEpoch + 1,
-      prev_amendment_hash: derived.state.interimLastHash,
       kind: "remove_holder",
       subject_agent_id: holder,
       property_change: null,
@@ -1301,14 +1291,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       }
     }
     logger.info("document.holder_removed", {
-      documentId, holder, epochId: body.epoch_id, voluntary: holder === who.ownerAgentId,
+      documentId, holder, voluntary: holder === who.ownerAgentId,
     });
     return {
       ok: true,
       documentId,
       removedAgentId: holder,
       voluntary: holder === who.ownerAgentId,
-      epochId: body.epoch_id,
       holdersNotified: holdersTold,
       guidance:
         "Removal is forward-only: their existing copy and its history remain theirs — new edits " +

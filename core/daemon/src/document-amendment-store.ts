@@ -55,6 +55,18 @@ export const DOCUMENT_AMENDMENTS_CREATE_SQL = `
  * epoch read consume `document_entries`, so the tables must exist whichever module constructs
  * first. Keep both consumers on THIS string.
  */
+/**
+ * D7 — the epoch spine is deleted. A database born before that carries a NOT NULL `epoch_id`
+ * with no default, which would refuse every insert from this build. Dropped in place (SQLite
+ * ≥3.35 / SQLCipher 4.5); a fresh database never has it.
+ */
+export function dropLegacyEpochColumn(db: { exec(sql: string): void; prepare(sql: string): { all(...a: unknown[]): unknown[] } }, table: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  if (cols.some((c) => c.name === "epoch_id")) {
+    db.exec(`ALTER TABLE ${table} DROP COLUMN epoch_id`);
+  }
+}
+
 export const DOCUMENT_ENTRIES_CREATE_SQL = `
   CREATE TABLE IF NOT EXISTS document_entries (
     owner_agent_id  TEXT    NOT NULL,
@@ -62,7 +74,6 @@ export const DOCUMENT_ENTRIES_CREATE_SQL = `
     entry_hash      TEXT    NOT NULL,
     author_agent_id TEXT    NOT NULL,
     author_seq      INTEGER NOT NULL,
-    epoch_id        INTEGER NOT NULL,
     received_bytes  BLOB    NOT NULL,
     recorded_at     INTEGER NOT NULL,
     PRIMARY KEY (owner_agent_id, document_id, entry_hash)
@@ -82,7 +93,6 @@ export const DOCUMENT_ENTRIES_CREATE_SQL = `
 
 export interface MembershipVerdict {
   state: "holder" | "removed" | "untouched";
-  epochId: number | null;
 }
 
 /**
@@ -96,18 +106,12 @@ export function walkMembership(
   agentId: string,
 ): MembershipVerdict {
   let state: MembershipVerdict["state"] = "untouched";
-  let epochId: number | null = null;
   for (const env of chain) {
     if (env.body.subject_agent_id !== agentId) continue;
-    if (env.body.kind === "add_holder") {
-      state = "holder";
-      epochId = env.body.epoch_id;
-    } else if (env.body.kind === "remove_holder") {
-      state = "removed";
-      epochId = env.body.epoch_id;
-    }
+    if (env.body.kind === "add_holder") state = "holder";
+    else if (env.body.kind === "remove_holder") state = "removed";
   }
-  return { state, epochId };
+  return { state };
 }
 
 export interface AmendmentAppendResult {
@@ -117,8 +121,6 @@ export interface AmendmentAppendResult {
   held: boolean;
   /** Hex of the entry's TBS hash. */
   entryHash: string;
-  /** The interim epoch stamp the entry carries (D7 deletes the spine at P4). */
-  epochId: number;
   /** Previously-held entries this arrival completed, now applied — envelopes included, so the
    *  caller can run the same post-apply surfacing it runs for a direct arrival (review F2: the
    *  held path silently dropped removal notices and lifecycle completion). */
@@ -160,6 +162,7 @@ export class DocumentAmendmentStore {
     this.#logger = logger;
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
+    dropLegacyEpochColumn(this.#db, "document_entries");
   }
 
   /**
@@ -181,13 +184,12 @@ export class DocumentAmendmentStore {
       );
     }
     const hash = Buffer.from(documentAmendmentHash(env.body)).toString("hex");
-    const epochId = env.body.epoch_id;
 
     if (this.#hasEntry(ownerAgentId, documentId, hash)) {
-      return { recorded: false, held: false, entryHash: hash, epochId, promoted: [] };
+      return { recorded: false, held: false, entryHash: hash, promoted: [] };
     }
     if (this.#hasPending(ownerAgentId, documentId, hash)) {
-      return { recorded: false, held: true, entryHash: hash, epochId, promoted: [] };
+      return { recorded: false, held: true, entryHash: hash, promoted: [] };
     }
 
     const missing = env.body.parents.filter(
@@ -223,12 +225,12 @@ export class DocumentAmendmentStore {
         kind: env.body.kind,
         missingParents: missing,
       });
-      return { recorded: true, held: true, entryHash: hash, epochId, promoted: [] };
+      return { recorded: true, held: true, entryHash: hash, promoted: [] };
     }
 
     this.#insertEntry(ownerAgentId, documentId, hash, env, receivedBytes, nowMs);
     const promoted = this.#promoteReady(ownerAgentId, documentId, nowMs);
-    return { recorded: true, held: false, entryHash: hash, epochId, promoted };
+    return { recorded: true, held: false, entryHash: hash, promoted };
   }
 
   /** Every applied entry, decoded from the stored received bytes. The set is ancestry-closed. */
@@ -237,7 +239,7 @@ export class DocumentAmendmentStore {
       .prepare(
         `SELECT received_bytes FROM document_entries
           WHERE owner_agent_id = ? AND document_id = ?
-          ORDER BY epoch_id ASC, author_seq ASC, entry_hash ASC`,
+          ORDER BY author_seq ASC, entry_hash ASC`,
       )
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
     return rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes)));
@@ -341,17 +343,6 @@ export class DocumentAmendmentStore {
     return walkMembership(this.chain(ownerAgentId, documentId), agentId);
   }
 
-  /** The highest interim epoch stamp among applied entries, or 0 — genesis — with none. */
-  currentEpoch(ownerAgentId: string, documentId: string): number {
-    const r = this.#db
-      .prepare(
-        `SELECT MAX(epoch_id) AS max_epoch FROM document_entries
-          WHERE owner_agent_id = ? AND document_id = ?`,
-      )
-      .get(ownerAgentId, documentId) as { max_epoch?: number | null } | undefined;
-    return r?.max_epoch ?? 0;
-  }
-
   #hasEntry(ownerAgentId: string, documentId: string, hash: string): boolean {
     return (
       this.#db
@@ -385,9 +376,9 @@ export class DocumentAmendmentStore {
     this.#db
       .prepare(
         `INSERT INTO document_entries
-           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq, epoch_id,
+           (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
             received_bytes, recorded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         ownerAgentId,
@@ -395,7 +386,6 @@ export class DocumentAmendmentStore {
         hash,
         env.body.author_agent_id,
         env.body.author_seq,
-        env.body.epoch_id,
         // Copied — the caller may reuse or zero its buffer after we return.
         Buffer.from(bytes),
         nowMs,

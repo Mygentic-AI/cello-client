@@ -37,6 +37,7 @@ import { addColumnIfMissing } from "./column-birth.js";
 import {
   DOCUMENT_AMENDMENTS_CREATE_SQL,
   DOCUMENT_ENTRIES_CREATE_SQL,
+  dropLegacyEpochColumn,
   walkMembership,
   type MembershipVerdict,
 } from "./document-amendment-store.js";
@@ -82,9 +83,6 @@ export interface DocumentEnvelopeRow {
   senderAgentId: string;
   /** The sender's previous envelope for this document, or null at genesis (§9.1). */
   docPrevHash: string | null;
-  /** Constant 0 in V1 and NEVER omitted — after a compaction an update that does not state its
-   *  epoch cannot be verified unambiguously (§14, §16.1 seam). */
-  epochId: number;
   signature: Uint8Array;
   /** The sender's Yjs state vector at publish time (§7). */
   stateVector: Uint8Array;
@@ -191,7 +189,6 @@ const CREATE_ENVELOPES_SQL = `
     envelope_hash   TEXT    NOT NULL,
     sender_agent_id TEXT    NOT NULL,
     doc_prev_hash   TEXT,
-    epoch_id        INTEGER NOT NULL,
     signature       BLOB    NOT NULL,
     state_vector    BLOB    NOT NULL,
     payload         BLOB,
@@ -376,7 +373,9 @@ export class DocumentStore {
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
+    dropLegacyEpochColumn(this.#db, "document_entries");
     this.#db.exec(CREATE_ENVELOPES_SQL);
+    dropLegacyEpochColumn(this.#db, "document_envelopes");
     this.#db.exec(CREATE_QUARANTINE_SQL);
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
     // Owned by DocumentLifecycle, created HERE too because `pendingDeliveries` references it and a
@@ -473,10 +472,10 @@ export class DocumentStore {
       info = this.#db
       .prepare(
         `INSERT INTO document_envelopes
-           (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash, epoch_id,
+           (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash,
             signature, state_vector, payload, governance_parents, kind, references_hash,
             sender_client_id, created_at, log_index)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE((SELECT MAX(log_index) + 1 FROM document_envelopes
                            WHERE owner_agent_id = ? AND document_id = ?), 0)
          ON CONFLICT (owner_agent_id, document_id, envelope_hash) DO NOTHING`,
@@ -487,7 +486,6 @@ export class DocumentStore {
         envelope.envelopeHash,
         envelope.senderAgentId,
         envelope.docPrevHash,
-        envelope.epochId,
         Buffer.from(envelope.signature),
         Buffer.from(envelope.stateVector),
         envelope.payload === null ? null : Buffer.from(envelope.payload),
@@ -575,7 +573,6 @@ export class DocumentStore {
       governanceParents: [],
       // EXEMPT from current-epoch stamping (M14B Entry 5): a stub is a SYNTHETIC verification
       // node — never on the wire, never replayed — and the chain walk checks hash linkage only.
-      epochId: 0,
       signature: new Uint8Array(0),
       stateVector: new Uint8Array(0),
       payload: null,
@@ -921,7 +918,7 @@ export class DocumentStore {
   removedFromArrangement(
     ownerAgentId: string,
     documentId: string,
-  ): { removed: boolean; epochId: number | null } {
+  ): { removed: boolean } {
     return this.memberRemoved(ownerAgentId, documentId, ownerAgentId);
   }
 
@@ -930,12 +927,12 @@ export class DocumentStore {
     ownerAgentId: string,
     documentId: string,
     agentId: string,
-  ): { removed: boolean; epochId: number | null } {
+  ): { removed: boolean } {
     const rows = this.#db
       .prepare(
         `SELECT received_bytes FROM document_entries
           WHERE owner_agent_id = ? AND document_id = ?
-          ORDER BY epoch_id ASC, author_seq ASC, entry_hash ASC`,
+          ORDER BY author_seq ASC, entry_hash ASC`,
       )
       .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
     // CONTAINED, for the same reason the arrangement read is: `decodeDocumentAmendment` throws
@@ -955,19 +952,9 @@ export class DocumentStore {
         agentId,
         reason: err instanceof Error ? err.message : String(err),
       });
-      return { removed: false, epochId: null };
+      return { removed: false };
     }
-    return { removed: verdict.state === "removed", epochId: verdict.epochId };
-  }
-
-  currentDocumentEpoch(ownerAgentId: string, documentId: string): number {
-    const r = this.#db
-      .prepare(
-        `SELECT MAX(epoch_id) AS max_epoch FROM document_entries
-          WHERE owner_agent_id = ? AND document_id = ?`,
-      )
-      .get(ownerAgentId, documentId) as { max_epoch?: number | null } | undefined;
-    return r?.max_epoch ?? 0;
+    return { removed: verdict.state === "removed" };
   }
 
   /** Record a rejection the PEER sent us. Returns whether a row was written (idempotent by leaf). */
@@ -1226,7 +1213,6 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     documentId: r["document_id"] as string,
     senderAgentId: r["sender_agent_id"] as string,
     docPrevHash: (r["doc_prev_hash"] as string | null) ?? null,
-    epochId: r["epoch_id"] as number,
     signature: toU8(r["signature"]),
     stateVector: toU8(r["state_vector"]),
     payload: payload === null || payload === undefined ? null : toU8(payload),
