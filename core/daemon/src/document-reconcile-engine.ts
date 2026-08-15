@@ -33,8 +33,8 @@ export interface ReconcileReads {
   envelopeLog(documentId: string): DocumentEnvelopeRow[];
   /** Hashes THIS holder has refused — its own decisions, surfaced into its position (R36). */
   refusedHashes(documentId: string): string[];
-  /** The interim membership walk — "removed" is the one verdict consulted here. */
-  membershipState(documentId: string, agentId: string): "holder" | "removed" | "untouched";
+  /** SYNC-D8 — the fold-derived standing; "removed" is the one verdict consulted here. */
+  standingOf(documentId: string, agentId: string): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /** The signed genesis proposal bytes — the anchor a joiner-with-nothing must be handed. */
   genesisBytes(documentId: string): Uint8Array | null;
   /**
@@ -138,7 +138,7 @@ export function respondToReconcile(
   const isParticipant = state.participants.has(peerAgentId);
   const isInvited = state.invited.has(peerAgentId);
   if (!isParticipant && !isInvited) {
-    if (reads.membershipState(documentId, peerAgentId) === "removed") {
+    if (reads.standingOf(documentId, peerAgentId) === "removed") {
       // R32: the ruling is terminal, but it DELIVERS — the removal entry and its ancestors,
       // so the removed holder can derive their own removal, surface it with its reason, and
       // stop asking. Idempotent like everything here: asking again gets the same closure.

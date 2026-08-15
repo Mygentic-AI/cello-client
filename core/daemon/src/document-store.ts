@@ -38,8 +38,6 @@ import {
   DOCUMENT_AMENDMENTS_CREATE_SQL,
   DOCUMENT_ENTRIES_CREATE_SQL,
   dropLegacyEpochColumn,
-  walkMembership,
-  type MembershipVerdict,
 } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
@@ -63,7 +61,6 @@ export type DocumentEnvelopeKind = "update" | "withdrawal" | "rejection";
  */
 export type { DocumentProperties } from "@cello-protocol/protocol-types";
 import type { DocumentProperties } from "@cello-protocol/protocol-types";
-import { decodeDocumentAmendment } from "@cello-protocol/protocol-types";
 
 export interface DocumentRow {
   documentId: string;
@@ -909,54 +906,6 @@ export class DocumentStore {
    * Trustworthy for stamping because every append site rules on admissibility before
    * recording — a row in document_amendments is post-validation by invariant (M14B Entry 5).
    */
-  /**
-   * DOD-MP-REMOVE-1 — was THIS OWNER written out of the arrangement? DERIVED from the recorded
-   * chain, never stored: a status column would need a CHECK-constraint rebuild on every operator
-   * DB, and a stored flag can drift from the chain that actually governs. Forward-only by
-   * construction — nothing here touches content.
-   */
-  removedFromArrangement(
-    ownerAgentId: string,
-    documentId: string,
-  ): { removed: boolean } {
-    return this.memberRemoved(ownerAgentId, documentId, ownerAgentId);
-  }
-
-  /** The same walk for ANY agent — the delivery worker asks it about the TARGET (F1). */
-  memberRemoved(
-    ownerAgentId: string,
-    documentId: string,
-    agentId: string,
-  ): { removed: boolean } {
-    const rows = this.#db
-      .prepare(
-        `SELECT received_bytes FROM document_entries
-          WHERE owner_agent_id = ? AND document_id = ?
-          ORDER BY author_seq ASC, entry_hash ASC`,
-      )
-      .all(ownerAgentId, documentId) as Array<{ received_bytes: Uint8Array }>;
-    // CONTAINED, for the same reason the arrangement read is: `decodeDocumentAmendment` throws
-    // on bytes this build cannot read, and this runs once PER ROW inside `list` — so one
-    // undecodable chain took down the operator's whole document list. Reporting not-removed
-    // here is not a health claim: the same row carries `arrangementUnavailable` naming the
-    // undecodable chain, so the surface says it cannot answer rather than answering wrongly.
-    let verdict: MembershipVerdict;
-    try {
-      verdict = walkMembership(
-        rows.map((r) => decodeDocumentAmendment(new Uint8Array(r.received_bytes))),
-        agentId,
-      );
-    } catch (err: unknown) {
-      this.#logger.error("document.membership.undecodable", {
-        documentId,
-        agentId,
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      return { removed: false };
-    }
-    return { removed: verdict.state === "removed" };
-  }
-
   /** Record a rejection the PEER sent us. Returns whether a row was written (idempotent by leaf). */
   recordRejectionReceived(
     ownerAgentId: string,

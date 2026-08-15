@@ -19,8 +19,6 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import * as Y from "yjs";
 import {
-  documentAmendmentHash,
-  encodeDocumentAmendment,
 } from "@cello-protocol/protocol-types";
 import { DocumentStore, type DocumentEnvelopeRow } from "../document-store.js";
 import { DocumentEngine } from "../document-engine.js";
@@ -84,6 +82,7 @@ function newFixture() {
     store,
     logger,
     () => false,
+    () => false,
     (_a, _d, envelopeHash) => {
       rolledBack.push(envelopeHash);
       return { ok: true };
@@ -110,42 +109,30 @@ describe("DocumentLifecycle — list", () => {
   });
 
   
-  it("a removed owner's row says so — the overlay is derived, the stored status stays active", () => {
-    const f = newFixture();
-    const body = {
-      document_id: DOC,
-      epoch_id: 1,
-      prev_amendment_hash: null,
-      kind: "remove_holder",
-      subject_agent_id: AGENT,
-      property_change: null,
-      state_hash: null,
-      authored_at_ms: 1,
-      author_agent_id: "a".repeat(64),
-      author_seq: 1,
-      parents: [],
-    } as const;
-    const hash = documentAmendmentHash(body);
-    const bytes = encodeDocumentAmendment({
-      body,
-      collection: {
-        document_id: DOC,
-        subject_kind: "document_amendment",
-        subject_hash: hash,
-        required_signers: ["a".repeat(64)],
-        signatures: [{ signer_agent_id: "a".repeat(64), signature: new Uint8Array(64) }],
-      },
+  it("a removed owner's row says so — the overlay comes from the INJECTED derivation, the stored status stays active", () => {
+    // SYNC-D8: "was this owner written out?" is the layer's one fold-derived answer, injected
+    // here; this unit's job is only the plumbing — the overlay on the row, the named publish
+    // refusal, and the stored status staying untouched. The derivation itself is pinned in the
+    // derive and handlers suites.
+    const { logger } = recordingLogger();
+    const db = new DatabaseSync(":memory:");
+    db.exec("PRAGMA foreign_keys = ON");
+    const store = new DocumentStore(db, logger);
+    store.createDocument({
+      documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
+      properties: {}, status: "active", createdAtMs: 1,
     });
-    f.db.prepare(
-      `INSERT INTO document_entries
-         (owner_agent_id, document_id, entry_hash, author_agent_id, author_seq,
-          received_bytes, recorded_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-    ).run(AGENT, DOC, Buffer.from(hash).toString("hex"), "a".repeat(64), 1, Buffer.from(bytes), 1);
-    const row = f.lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
+    const lifecycle = new DocumentLifecycle(
+      store,
+      logger,
+      () => false,
+      () => true,
+      () => ({ ok: true }),
+    );
+    const row = lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect((row as unknown as { removed?: boolean }).removed).toBe(true);
     expect(row!.status).toBe("active");
-    expect(f.lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
+    expect(lifecycle.canPublish(AGENT, DOC)).toMatchObject({ ok: false, reason: "document_removed" });
   });
 
 });
@@ -194,6 +181,7 @@ describe("DocumentLifecycle — withdraw touches ONE UNDELIVERED update", () => 
     });
     const lifecycle = new DocumentLifecycle(
       store, logger,
+      () => false,
       () => false,
       () => ({ ok: false, reason: "nothing_tracked" }),
     );

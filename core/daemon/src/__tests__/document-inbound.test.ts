@@ -118,6 +118,26 @@ function newFixture(
   const live = new Y.Doc();
   live.clientID = 9999;
 
+  // Test-side stand-in for the layer's fold-derived standing (SYNC-D8): last membership event
+  // over the recorded chain, "unknown" on undecodable bytes — enough for the gate's questions.
+  const walkStanding = (
+    o: string,
+    d: string,
+    a: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown" => {
+    let st: "participant" | "removed" | "stranger" = "stranger";
+    try {
+      for (const env of amendmentStore.chain(o, d)) {
+        if (env.body.subject_agent_id !== a) continue;
+        if (env.body.kind === "add_holder") st = "participant";
+        else if (env.body.kind === "remove_holder") st = "removed";
+      }
+    } catch {
+      return "unknown";
+    }
+    return st;
+  };
+
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
     // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
@@ -130,14 +150,12 @@ function newFixture(
         if (holders === null) return { ok: false as const, reason: "document_genesis_missing" };
         // The fake mirrors the layer's real semantics for a CURRENT-frontier envelope: current
         // participants minus anyone the recorded chain says is removed.
-        const seated = holders.filter(
-          (h: string) => amendmentStore.membershipOf(o, d, h).state !== "removed",
-        );
+        const seated = holders.filter((h: string) => walkStanding(o, d, h) !== "removed");
         return { ok: true as const, participants: new Set(seated), invited: new Set<string>(), ended: null };
       }),
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
-    membershipOf: (o, d, a) => amendmentStore.membershipOf(o, d, a),
+    standingOf: (o, d, a) => walkStanding(o, d, a),
     sign: async () => new Uint8Array(64).fill(1),
   });
   return { inbound, store, engine, live, events, logger, db };

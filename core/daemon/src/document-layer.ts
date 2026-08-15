@@ -164,6 +164,12 @@ export interface DocumentLayer {
   /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
   isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
+  /** SYNC-D8 — the ONE derivation of an agent's standing (R17 + removed/unknown), from the fold. */
+  standingOf(
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /**
    * SYNC-P3 — step 1 of the reconcile exchange: send this holder's position for the named
    * documents to a peer. Everything after that is symmetric and handled by the frame router.
@@ -255,6 +261,8 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       if (!derived.ok) return false;
       return derived.state.ended === null && derived.state.closedBy.has(ownerAgentId);
     },
+    // SYNC-D8 — "was this owner written out?" answered by the same fold as everything else.
+    (ownerAgentId, documentId) => standingOf(ownerAgentId, documentId, ownerAgentId) === "removed",
     deps.rollback,
   );
   const notifications = new DocumentNotifications(store, logger);
@@ -292,8 +300,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     logger,
     verifySignature,
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
-    membershipOf: (ownerAgentId, documentId, agentId) =>
-      amendments.membershipOf(ownerAgentId, documentId, agentId),
+    standingOf: (ownerAgentId, documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),
     // The CONTENT door: strictly participants (R17 — invited seats receive, never author).
     currentHolders: (ownerAgentId: string, documentId: string) =>
       participantsFor(ownerAgentId, documentId),
@@ -409,6 +416,45 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     }
     if (!derived.ok) return null;
     return [...derived.state.participants];
+  };
+
+  /**
+   * SYNC-D8 — the ONE derivation of an agent's standing in a document, from the fold. The old
+   * linear membership walk (`walkMembership`) was a second derivation that could disagree with
+   * the fold about who is seated; every consumer now asks this.
+   *
+   *  - participant / invited: seated, per R17.
+   *  - removed: not seated, and an APPLIED remove_holder entry names them (fold-void removals
+   *    do not count — a void contributed nothing, F4).
+   *  - stranger: not seated, never removed.
+   *  - unknown: the chain does not derive (no genesis, undecodable bytes) — callers must not
+   *    treat this as any of the other four.
+   */
+  const standingOf = (
+    ownerAgentId: string,
+    documentId: string,
+    agentId: string,
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown" => {
+    const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+    if (!derived.ok) return "unknown";
+    if (derived.state.participants.has(agentId)) return "participant";
+    if (derived.state.invited.has(agentId)) return "invited";
+    const inert = new Set([
+      ...derived.state.voids.map((v) => v.hash),
+      ...derived.state.excluded.map((e) => e.hash),
+    ]);
+    let chain: DocumentAmendmentEnvelope[];
+    try {
+      chain = [...amendments.chain(ownerAgentId, documentId)];
+    } catch {
+      return "unknown";
+    }
+    for (const env of chain) {
+      if (env.body.kind !== "remove_holder" || env.body.subject_agent_id !== agentId) continue;
+      const hash = Buffer.from(documentAmendmentHash(env.body)).toString("hex");
+      if (!inert.has(hash)) return "removed";
+    }
+    return "stranger";
   };
 
   /** Is this agent a CURRENT holder — the ack gate's membership question. */
@@ -619,8 +665,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     envelopeLog: (documentId) => store.getEnvelopeLog(ownerAgentId, documentId),
     refusedHashes: (documentId) =>
       rejections.quarantined(ownerAgentId, documentId).map((q) => q.rejectedEnvelopeHash),
-    membershipState: (documentId, agentId) =>
-      amendments.membershipOf(ownerAgentId, documentId, agentId).state,
+    standingOf: (documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),
     genesisBytes: (documentId) => {
       const record = handshake.get(ownerAgentId, documentId);
       return record ? new Uint8Array(encodeDocumentProposal(record.envelope)) : null;
@@ -1010,6 +1055,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     verifySignature,
     holdersFor,
     isCurrentHolder,
+    standingOf,
     initiateReconcile,
     governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
       const derived = reconcileReads(ownerAgentId).deriveState(documentId);

@@ -88,12 +88,12 @@ export interface DocumentInboundDeps {
   verifySignature(senderAgentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** The live document to apply admitted updates to. */
   liveDocFor(ownerAgentId: string, documentId: string): Y.Doc;
-  /** DOD-MP-REMOVE-1 — the sender's last membership event in the recorded amendment chain. */
-  membershipOf(
+  /** SYNC-D8 — the ONE fold-derived standing (R17 + removed/unknown); the walk is deleted. */
+  standingOf(
     ownerAgentId: string,
     documentId: string,
     agentId: string,
-  ): { state: "holder" | "removed" | "untouched" };
+  ): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /**
    * DOD-MP-INBOUND-N-1 — the CURRENT derived holders, or null when the chain does not derive.
    * When it derives, membership is the WHOLE sender gate — the genesis-peer column is a
@@ -255,13 +255,11 @@ export class DocumentInbound {
     const senderHolders = this.#d.currentHolders(ownerAgentId, env.document_id);
     let senderIsParty: boolean;
     if (senderHolders === null) {
-      // Bilateral legacy — no derivable chain; the row's peer column is the membership. The
-      // membership WALK still rules removal here (there is no frontier world to consult), so a
-      // removed legacy peer is refused by name, never re-admitted through the row.
-      const legacyMembership = this.#d.membershipOf(
-        ownerAgentId, env.document_id, env.sender_agent_id,
-      );
-      if (legacyMembership.state === "removed") {
+      // Bilateral legacy — no derivable chain; the row's peer column is the membership. A
+      // genesis-less document can hold no validated entries, so `standingOf` answers `unknown`
+      // here and the removed branch below is unreachable in practice — kept so the two paths
+      // cannot drift about what "removed" means (SYNC-D8: one derivation).
+      if (this.#d.standingOf(ownerAgentId, env.document_id, env.sender_agent_id) === "removed") {
         this.#d.logger.warn("document.inbound.sender_removed", {
           documentId: env.document_id,
           senderAgentId: env.sender_agent_id,
@@ -327,8 +325,7 @@ export class DocumentInbound {
       // named one (REMOVE-1 review F4): they hold the removal fact already — no new disclosure —
       // and the silent path left their delivery worker redelivering forever, which is the exact
       // silent drop the DoD line forbids. A true stranger still gets silence.
-      const formerHolder = this.#d.membershipOf(ownerAgentId, env.document_id, env.sender_agent_id);
-      if (formerHolder.state === "removed") {
+      if (this.#d.standingOf(ownerAgentId, env.document_id, env.sender_agent_id) === "removed") {
         this.#d.logger.warn("document.inbound.sender_removed", {
           documentId: env.document_id,
           senderAgentId: env.sender_agent_id,
@@ -373,8 +370,7 @@ export class DocumentInbound {
     // "new edits stop flowing either way" is a lie if the removed party's own daemon keeps
     // admitting what still arrives from holders whose worker has not yet gated. TERMINAL — the
     // sender's delivery settles instead of retrying at a door that will never open.
-    const selfMembership = this.#d.store.removedFromArrangement(ownerAgentId, env.document_id);
-    if (selfMembership.removed) {
+    if (this.#d.standingOf(ownerAgentId, env.document_id, ownerAgentId) === "removed") {
       this.#d.logger.warn("document.inbound.recipient_removed", {
         documentId: env.document_id,
         correlationId,

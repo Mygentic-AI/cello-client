@@ -91,29 +91,6 @@ export const DOCUMENT_ENTRIES_CREATE_SQL = `
   );
 `;
 
-export interface MembershipVerdict {
-  state: "holder" | "removed" | "untouched";
-}
-
-/**
- * The last membership event naming this agent in an ordered chain — ONE implementation, because
- * two walks disagreeing about whether someone was removed is two daemons disagreeing about the
- * arrangement. INTERIM: P1d re-points its consumers at the fold's derived participant set; the
- * walk survives only until then.
- */
-export function walkMembership(
-  chain: readonly DocumentAmendmentEnvelope[],
-  agentId: string,
-): MembershipVerdict {
-  let state: MembershipVerdict["state"] = "untouched";
-  for (const env of chain) {
-    if (env.body.subject_agent_id !== agentId) continue;
-    if (env.body.kind === "add_holder") state = "holder";
-    else if (env.body.kind === "remove_holder") state = "removed";
-  }
-  return { state };
-}
-
 export interface AmendmentAppendResult {
   /** False on an idempotent redelivery — the entry (or its pending row) already existed. */
   recorded: boolean;
@@ -329,18 +306,6 @@ export class DocumentAmendmentStore {
       out.set(author, { seq, headHashes: seqs.get(seq)! });
     }
     return out;
-  }
-
-  /**
-   * This agent's LAST membership event in the recorded set (chain order). INTERIM — P1d derives
-   * membership from the fold; see `walkMembership`.
-   */
-  membershipOf(
-    ownerAgentId: string,
-    documentId: string,
-    agentId: string,
-  ): MembershipVerdict {
-    return walkMembership(this.chain(ownerAgentId, documentId), agentId);
   }
 
   #hasEntry(ownerAgentId: string, documentId: string, hash: string): boolean {

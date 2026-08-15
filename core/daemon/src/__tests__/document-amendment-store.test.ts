@@ -256,20 +256,6 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     );
   });
 
-  it("membershipOf follows the LAST event in the recorded chain — add, remove, re-add is holder", () => {
-    const subject = "c".repeat(64);
-    const [one, two, three] = causalChain(
-      { subject_agent_id: subject },
-      { kind: "remove_holder", subject_agent_id: subject },
-      { subject_agent_id: subject },
-    );
-    store.append(OWNER, DOC, encodeDocumentAmendment(one!), 1);
-    expect(store.membershipOf(OWNER, DOC, subject).state).toBe("holder");
-    store.append(OWNER, DOC, encodeDocumentAmendment(two!), 2);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "removed" });
-    store.append(OWNER, DOC, encodeDocumentAmendment(three!), 3);
-    expect(store.membershipOf(OWNER, DOC, subject)).toEqual({ state: "holder" });
-  });
 
   it("the chain length tracks appended entries — the epoch spine is gone (D7)", () => {
     expect(store.chain(OWNER, DOC)).toHaveLength(0);

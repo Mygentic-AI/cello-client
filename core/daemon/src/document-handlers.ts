@@ -1129,8 +1129,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       // was offline at removal time never learned, and no other verb can ever re-send the
       // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
       // the chain never touched still refuses.
-      const membership = layer.amendments.membershipOf(who.ownerAgentId, documentId, holder);
-      if (membership.state === "removed") {
+      if (layer.standingOf(who.ownerAgentId, documentId, holder) === "removed") {
         const removal = [...chain].reverse().find(
           (e) => e.body.kind === "remove_holder" && e.body.subject_agent_id === holder,
         );

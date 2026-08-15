@@ -119,7 +119,7 @@ function reads(over: Partial<ReconcileReads> = {}): ReconcileReads {
     entriesByAuthorAfter: () => [],
     envelopeLog: () => [],
     refusedHashes: () => [],
-    membershipState: () => "untouched",
+    standingOf: () => "stranger",
     genesisBytes: () => null,
     removalClosure: () => null,
     ...over,
@@ -156,7 +156,7 @@ describe("respondToReconcile — entitlement first (R17/R18/R19)", () => {
     const closureWires = [new Uint8Array([1, 1]), new Uint8Array([2, 2])];
     const r = respondToReconcile(
       reads({
-        membershipState: () => "removed",
+        standingOf: () => "removed",
         removalClosure: () => closureWires,
       }),
       "9".repeat(64),

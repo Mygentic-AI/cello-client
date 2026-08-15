@@ -79,6 +79,7 @@ export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
   readonly #closePendingFor: (ownerAgentId: string, documentId: string) => boolean;
+  readonly #removedFor: (ownerAgentId: string, documentId: string) => boolean;
   readonly #rollback: (
     ownerAgentId: string,
     documentId: string,
@@ -94,6 +95,8 @@ export class DocumentLifecycle {
      * this unit keeps only the platform gates and the delivery-facing surfaces.
      */
     closePendingFor: (ownerAgentId: string, documentId: string) => boolean,
+    /** SYNC-D8 — "was this owner written out?", answered by the layer's one fold derivation. */
+    removedFor: (ownerAgentId: string, documentId: string) => boolean,
     /**
      * Undo one envelope's operations on the LIVE document, as inverses. Injected because the live
      * `Y.Doc` and its UndoManager belong to the engine, not here — and REQUIRED, because a default
@@ -105,6 +108,7 @@ export class DocumentLifecycle {
     this.#store = store;
     this.#logger = logger;
     this.#closePendingFor = closePendingFor;
+    this.#removedFor = removedFor;
     this.#rollback = rollback;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
@@ -125,9 +129,7 @@ export class DocumentLifecycle {
       // it separately in the surface layer would be a second walk of one chain, which
       // `walkMembership`'s own header forbids: two walks disagreeing about whether someone was
       // removed is two daemons disagreeing about the arrangement.
-      ...(this.#store.removedFromArrangement(ownerAgentId, d.documentId).removed
-        ? { removed: true }
-        : {}),
+      ...(this.#removedFor(ownerAgentId, d.documentId) ? { removed: true } : {}),
       assuranceTier: "authenticated",
       status: d.status,
       // "I have closed and the derivation is still waiting on someone" — derived from the entry
@@ -263,8 +265,7 @@ export class DocumentLifecycle {
     // the copy is theirs (reading, the file, the history all remain), but publishing into an
     // arrangement that no longer includes them would only be refused by every holder, so it is
     // refused here first, naming the actual condition and the epoch it happened at.
-    const membership = this.#store.removedFromArrangement(ownerAgentId, documentId);
-    if (membership.removed) {
+    if (this.#removedFor(ownerAgentId, documentId)) {
       return {
         ok: false,
         reason: "document_removed",

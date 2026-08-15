@@ -649,14 +649,14 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     await until(() => fB.layer.amendments.pending(fB.owner, documentId).length === 1);
     expect(fB.layer.amendments.chain(fB.owner, documentId)).toHaveLength(1);
     expect(fB.events).not.toContain("document.removed_from");
-    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(false);
+    expect((fB.layer.standingOf(fB.owner, documentId, fB.owner) === "removed")).toBe(false);
 
     // The parent arrives: the removal PROMOTES — and its notice fires with it.
     fB.layer.onDocumentFrame(AGENT, "session-1", inviteToB!.bytes, fA.owner);
     await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 3);
     expect(fB.layer.amendments.pending(fB.owner, documentId)).toHaveLength(0);
     expect(fB.events).toContain("document.removed_from");
-    expect(fB.layer.store.removedFromArrangement(fB.owner, documentId).removed).toBe(true);
+    expect((fB.layer.standingOf(fB.owner, documentId, fB.owner) === "removed")).toBe(true);
   });
 
   it("INVITED WINDOW: an invite while the peer's consent is in flight still reaches every seat (P2 review F4)", async () => {
@@ -1130,7 +1130,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const removalSend = fA.sent.filter((s) => s.peerAgentId === fC.owner).at(-1)!;
     fC.layer.onDocumentFrame(AGENT, "session-1", removalSend.bytes, fA.owner);
     await until(
-      () => fC.layer.store.removedFromArrangement(fC.owner, documentId).removed,
+      () => (fC.layer.standingOf(fC.owner, documentId, fC.owner) === "removed"),
     );
     // The warn IS the operator's notice — the surfacing clause, pinned.
     expect(fC.events).toContain("document.removed_from");
@@ -1147,7 +1147,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // the refusal shape; here we pin the derived arrangement dropped C).
     const chain = fA.layer.amendments.chain(fA.owner, documentId);
     expect(chain.at(-1)!.body.kind).toBe("remove_holder");
-    expect(fA.layer.amendments.membershipOf(fA.owner, documentId, fC.owner).state).toBe("removed");
+    expect(fA.layer.standingOf(fA.owner, documentId, fC.owner)).toBe("removed");
   });
 
   it("REMOVE-1: voluntary leave — a holder removes THEMSELVES on their own signature", async () => {
@@ -1168,7 +1168,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       document_id: documentId, holder_pubkey: fC.owner,
     });
     expect(left).toMatchObject({ ok: true, voluntary: true });
-    expect(fC.layer.store.removedFromArrangement(fC.owner, documentId).removed).toBe(true);
+    expect((fC.layer.standingOf(fC.owner, documentId, fC.owner) === "removed")).toBe(true);
     expect(fC.layer.lifecycle.canPublish(fC.owner, documentId)).toMatchObject({
       ok: false,
       reason: "document_removed",
@@ -1176,7 +1176,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     // The leave amendment reaches A and A's arrangement drops C.
     routeAll(fC, fA);
     await until(
-      () => fA.layer.amendments.membershipOf(fA.owner, documentId, fC.owner).state === "removed",
+      () => fA.layer.standingOf(fA.owner, documentId, fC.owner) === "removed",
     );
   });
 
