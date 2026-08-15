@@ -12,12 +12,8 @@
  * because opening is the expensive half — a directory negotiation, a dial, and a seal — and a
  * backlog of pending envelopes for one peer would otherwise pay it per envelope. It is also the
  * behaviour an operator expects when they are mid-conversation about the document: the change lands
- * in the same sealed record as the discussion, without anyone passing a session hint.
- *
- * An explicit `sessionHint` overrides the choice but NOT the validation — a hint naming a session
- * that is not active with this peer is refused rather than silently replaced by the daemon's own
- * pick, because the one reason to pass a hint is to control which sealed record the change lands
- * in, and quietly choosing a different one defeats exactly that.
+ * in the same sealed record as the discussion. (SYNC-D10: the explicit session hint is deleted —
+ * the daemon's reuse-most-recent choice is the whole rule.)
  *
  * ── WHAT AN ACK IS HERE, AND WHAT IT IS NOT ───────────────────────────────────────────────────
  *
@@ -125,7 +121,6 @@ export interface DocumentDeliveryTransport {
     peerAgentId: string;
     documentId: string;
     bytes: Uint8Array;
-    sessionHint?: string;
     correlationId: string;
     /** The witnessed leaf DOMAIN. Defaults to the document kind (0x04); a refusal passes 0x05. */
     leafKind?: number;
@@ -169,7 +164,7 @@ export function createDocumentDeliveryTransport(
   }
 
   /**
-   * Acquire a session with the peer — the hint, then the most recent active one, then a fresh dial.
+   * Acquire a session with the peer — the most recent active one, else a fresh dial (SYNC-D10).
    *
    * ONE implementation for every document frame kind. A proposal that opened its own session by a
    * separate code path would drift on which session gets reused and on whether a session this
@@ -177,41 +172,12 @@ export function createDocumentDeliveryTransport(
    */
   async function acquireSession(
     peerAgentId: string,
-    sessionHint: string | undefined,
     correlationId: string,
   ): Promise<
     | { ok: true; sessionId: string; sessionOpened: boolean }
     | { ok: false; reason: string; detail?: string }
   > {
     const active = deps.activeSessionsWith(deps.agentName, peerAgentId);
-    if (sessionHint !== undefined) {
-      if (!active.includes(sessionHint)) {
-        // Refused, not replaced. The only reason to pass a hint is to control which sealed record
-        // the change lands in; quietly substituting the daemon's own pick would defeat exactly
-        // that, and it would do so silently.
-        return {
-          ok: false,
-          reason: "document_session_hint_invalid",
-          detail:
-            `session ${sessionHint.slice(0, 16)}… is not an active session with ${peerAgentId}, ` +
-            `so the change cannot be placed in that record`,
-        };
-      }
-      if (suspects.isSuspect(sessionHint)) {
-        // HONOURED, NOT SUBSTITUTED — the only reason to pass a hint is to control which sealed
-        // record the change lands in, and quietly picking another session would defeat exactly
-        // that. But a caller aiming at a session whose record is gone should be told.
-        deps.logger.warn("document.delivery.session.hint_suspect", {
-          peerAgentId,
-          sessionId: sessionHint,
-          correlationId,
-          impact:
-            "this session has answered terminally more than once — the change is being placed in " +
-            "it as asked, and its record may no longer be growing",
-        });
-      }
-      return { ok: true, sessionId: sessionHint, sessionOpened: false };
-    }
     // Most recent LAST — activeSessionsWith is ordered oldest-first by the daemon's adapter.
     //
     // DOD-MP-SESSION-RETIRE-1 — a session that has answered terminally more than once is skipped
@@ -256,8 +222,8 @@ export function createDocumentDeliveryTransport(
     },
 
     async sendBytes(input) {
-      const { peerAgentId, documentId, bytes, sessionHint, correlationId } = input;
-      const session = await acquireSession(peerAgentId, sessionHint, correlationId);
+      const { peerAgentId, documentId, bytes, correlationId } = input;
+      const session = await acquireSession(peerAgentId, correlationId);
       if (!session.ok) return session;
 
       // THE WIRE HASH, domain-separated. This was `sha256(bytes)`, and the receiver recomputes

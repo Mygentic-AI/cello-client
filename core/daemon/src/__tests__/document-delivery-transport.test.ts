@@ -1,7 +1,7 @@
 /**
  * DOD-DOC-DELIVERY-2 — the document frame carrier (§16.4). SYNC-P4: the delivery worker, the ack
  * wait and the grace budget are deleted; what remains is session acquisition (reuse before open,
- * hint honoured-or-refused, opened-then-sealed), the reachability probe, and the suspect-session
+ * opened-then-sealed), the reachability probe, and the suspect-session
  * bypass — all exercised through `sendBytes`, the one send that survives.
  */
 
@@ -128,24 +128,6 @@ describe("delivery transport — REUSE before open (§16.4)", () => {
   });
 });
 
-describe("delivery transport — the session hint is honoured or REFUSED, never substituted", () => {
-  it("uses an explicit hint that names an active session", async () => {
-    const t = newTransport({ activeSessionsWith: () => ["a", "b"] });
-    const res = await t.transport.sendBytes(sendInput({ sessionHint: "a" }));
-    expect(res).toMatchObject({ ok: true, sessionId: "a" });
-  });
-
-  it("REFUSES a hint that is not an active session with this peer", async () => {
-    const t = newTransport({ activeSessionsWith: () => ["a"] });
-    const res = await t.transport.sendBytes(sendInput({ sessionHint: "not-a-session" }));
-
-    // The only reason to pass a hint is to control which sealed record the change lands in.
-    // Quietly substituting the daemon's own pick defeats exactly that, silently.
-    expect(res).toMatchObject({ ok: false, reason: "document_session_hint_invalid" });
-    expect(t.sends).toEqual([]);
-  });
-});
-
 
 describe("delivery transport — an OPENED session is sealed; a REUSED one is not ours to close", () => {
   it("seals the session it opened", async () => {
@@ -247,18 +229,4 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
     expect(t.opened).toEqual([]);
   });
 
-  it("a hint naming a suspect session is HONOURED, and the caller is told", async () => {
-    const t = newTransport({
-      activeSessionsWith: () => ["hinted"],
-      sendContent: async () => relayGoneButDelivered,
-    });
-    await t.transport.sendBytes(sendInput({ sessionHint: "hinted" }));
-    await t.transport.sendBytes(sendInput({ sessionHint: "hinted" }));
-    const third = await t.transport.sendBytes(sendInput({ sessionHint: "hinted" }));
-    expect(third).toMatchObject({ ok: true, sessionId: "hinted" });
-    // Substituting another session would defeat the only reason to pass a hint — controlling which
-    // sealed record the change lands in. Silence would leave the caller aiming at a dead record.
-    expect(t.opened).toEqual([]);
-    expect(t.events.some((e) => e.event === "document.delivery.session.hint_suspect")).toBe(true);
-  });
 });
