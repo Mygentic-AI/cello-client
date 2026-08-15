@@ -589,6 +589,7 @@ export class DocumentInbound {
       senderAgentId: env.sender_agent_id,
       docPrevHash: env.doc_prev_hash,
       epochId: env.epoch_id,
+      governanceParents: [...env.governance_parents],
       signature: env.signature,
       stateVector: env.state_vector,
       payload: env.update,

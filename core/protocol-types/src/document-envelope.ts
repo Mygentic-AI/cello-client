@@ -36,7 +36,13 @@ import { createHash } from "node:crypto";
 import { encodeCbor, decodeCbor } from "./cbor.js";
 
 /** Domain tag in slot 0 of the to-be-signed array. */
-export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v1";
+/**
+ * v2 (SYNC-G1, journal Entry 58): the envelope gains `governance_parents` — the author's
+ * governance frontier at authoring — inside the signed preimage. It is the content's causal
+ * link to the governance that made it admissible; the per-envelope epoch stamp it replaces is
+ * deleted by the same phase. No compatibility owed: nothing was published between bumps.
+ */
+export const DOCUMENT_UPDATE_DOMAIN = "CELLO-DOCUMENT-UPDATE-v2";
 
 /**
  * The pinned Yjs update encoding (§16.7-8). Pinned in the protocol types precisely so that two
@@ -72,6 +78,13 @@ export interface DocumentUpdateEnvelope {
   state_vector: Uint8Array;
   /** The Yjs update payload. */
   update: Uint8Array;
+  /**
+   * SYNC-G1 — the author's GOVERNANCE frontier when authoring: governance entry hashes,
+   * canonical (strictly ascending, capped). This is what R20/R30 rule on for content: was the
+   * author a participant at THESE ancestors, and is no ending among them. Empty = authored at
+   * genesis, before any governance entry existed.
+   */
+  governance_parents: string[];
   /** Ed25519 (RFC 8032) over `buildDocumentUpdateTbs`. */
   signature: Uint8Array;
 }
@@ -104,6 +117,7 @@ export function buildDocumentUpdateTbs(
     env.update_encoding,
     env.state_vector,
     env.update,
+    [...env.governance_parents],
   ]);
   if (opts.preHash === false) return preimage;
   return new Uint8Array(createHash("sha256").update(preimage).digest());
@@ -136,6 +150,7 @@ export function encodeDocumentUpdateEnvelope(env: DocumentUpdateEnvelope): Uint8
     update_encoding: env.update_encoding,
     state_vector: env.state_vector,
     update: env.update,
+    governance_parents: [...env.governance_parents],
     signature: env.signature,
   });
 }
@@ -235,6 +250,30 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
     );
   }
 
+  const rawParents = requirePresent(map, "governance_parents");
+  if (!Array.isArray(rawParents)) {
+    throw new Error("document_envelope_governance_parents: must be an array of entry hashes");
+  }
+  if (rawParents.length > 64) {
+    throw new Error(
+      `document_envelope_governance_parents_cap: ${rawParents.length} exceeds the ceiling of 64`,
+    );
+  }
+  const governanceParents = rawParents.map((h) => {
+    if (typeof h !== "string" || !HEX32.test(h)) {
+      throw new Error("document_envelope_governance_parents: must hold 64-hex entry hashes");
+    }
+    return h;
+  });
+  for (let i = 1; i < governanceParents.length; i++) {
+    if (governanceParents[i]! <= governanceParents[i - 1]!) {
+      throw new Error(
+        "document_envelope_governance_parents_canonical: strictly ascending, no duplicates — " +
+          "one envelope, one identity",
+      );
+    }
+  }
+
   return {
     type: "document_update",
     document_id: documentId,
@@ -245,6 +284,7 @@ export function decodeDocumentUpdateEnvelope(bytes: Uint8Array): DocumentUpdateE
     update_encoding: encoding,
     state_vector: requireBytes(map, "state_vector"),
     update: requireBytes(map, "update"),
+    governance_parents: governanceParents,
     signature: requireBytes(map, "signature"),
   };
 }

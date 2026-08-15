@@ -37,6 +37,7 @@ function newFixture(opts: { canPublish?: { ok: false; reason: string; detail: st
   const engine = new DocumentEngine(logger);
   const state = { publishHolders: [PEER] as string[] | null };
   const publish = new DocumentPublish({
+    governanceFrontierFor: () => [],
     // Bilateral default: the sole holder is the genesis peer; tests may widen or null it.
     holdersFor: () => state.publishHolders,
     store,
@@ -151,6 +152,7 @@ describe("DocumentPublish — writes a signed, chained envelope and returns", ()
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: row.governanceParents,
       state_vector: row.stateVector,
       update: row.payload!,
       signature: row.signature,

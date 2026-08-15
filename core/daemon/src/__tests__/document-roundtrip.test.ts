@@ -69,6 +69,7 @@ async function makeParty(name: string, clientId: number) {
   });
 
   const publish = new DocumentPublish({
+    governanceFrontierFor: () => [],
     // This harness seeds document rows directly (no handshake record), so chain derivation has
     // nothing to derive from — the bilateral row IS the fixture's arrangement.
     holdersFor: (o, d) => {
@@ -163,6 +164,7 @@ function deliveryFor(
         sender_agent_id: envelope.senderAgentId,
         sender_client_id: envelope.senderClientId!,
         update_encoding: "yjs-v1",
+        governance_parents: [],
         state_vector: envelope.stateVector,
         update: envelope.payload!,
         signature: envelope.signature,
@@ -213,6 +215,7 @@ async function sync(
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: [],
       state_vector: row.stateVector,
       update: row.payload!,
       signature: row.signature,
@@ -287,6 +290,7 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: [],
       state_vector: row.stateVector,
       update: forged,
       signature: row.signature,
@@ -321,6 +325,7 @@ describe("M14 round trip — an edit reaches the other side and converges", () =
       sender_agent_id: row.senderAgentId,
       sender_client_id: row.senderClientId!,
       update_encoding: "yjs-v1",
+      governance_parents: [],
       state_vector: row.stateVector,
       update: row.payload!,
       signature: row.signature,

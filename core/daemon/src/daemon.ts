@@ -3809,6 +3809,7 @@ async function startDaemonHoldingLock(
             sender_client_id: envelope.senderClientId ?? 0,
             update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
             state_vector: envelope.stateVector,
+            governance_parents: [...envelope.governanceParents],
             update: envelope.payload ?? new Uint8Array(0),
             signature: envelope.signature,
           });
@@ -3891,6 +3892,8 @@ async function startDaemonHoldingLock(
   // published update never leaves.
   const documentPublish = new DocumentPublish({
     holdersFor: (ownerAgentId, documentId) => documentLayer.holdersFor(ownerAgentId, documentId),
+    governanceFrontierFor: (ownerAgentId, documentId) =>
+      documentLayer.governanceFrontierFor(ownerAgentId, documentId),
     store: documentLayer.store,
     engine: documentLayer.engine,
     logger,

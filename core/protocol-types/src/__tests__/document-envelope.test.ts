@@ -46,6 +46,7 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
     sender_agent_id: "agent-a",
     sender_client_id: 3_141_592,
     update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+    governance_parents: [],
     state_vector: new Uint8Array([1, 2, 3]),
     update: new Uint8Array([9, 8, 7, 6]),
     signature: new Uint8Array(64).fill(7),
@@ -219,6 +220,7 @@ describe("document update TBS — the three bindings are INSIDE the signature", 
     // Rebuild with the keys in a deliberately different order. A map-based TBS would diverge here;
     // the array form must not.
     const b: DocumentUpdateEnvelope = {
+      governance_parents: a.governance_parents,
       signature: a.signature,
       update: a.update,
       state_vector: a.state_vector,
@@ -289,14 +291,17 @@ describe("document update TBS — the FROZEN vector", () => {
     update_encoding: "yjs-v1",
     state_vector: new Uint8Array([0, 1, 2, 3]),
     update: new Uint8Array([4, 5, 6, 7]),
+    // v2 (SYNC-G1, journaled: M14B Entry 58): the preimage gained governance_parents and the
+    // domain moved to v2 — the wire changed DELIBERATELY, and the vector was reissued below.
+    governance_parents: ["ab".repeat(32)],
     signature: new Uint8Array(64).fill(0xab),
   };
 
   it("the preimage and the hash are byte-for-byte what they were the day they were frozen", () => {
     expect(Buffer.from(buildDocumentUpdateTbs(FROZEN, { preHash: false })).toString("hex")).toBe(
-      "89781843454c4c4f2d444f43554d454e542d5550444154452d7631784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303031007840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d6167656e741afffffffa66796a732d763144000102034404050607",
+      "8a781843454c4c4f2d444f43554d454e542d5550444154452d7632784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303031007840303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030326c766563746f722d6167656e741afffffffa66796a732d76314400010203440405060781784061626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162616261626162",
     );
-    expect(documentEnvelopeHash(FROZEN)).toBe("07911cf71294a91003cf94fee2b1fc165cf10fe167fc3885ca92b4fcb691002f");
+    expect(documentEnvelopeHash(FROZEN)).toBe("3dfa9c925bcea6491c40e7a12324683cb2addfd315b6e7e65a3fe74b97651058");
   });
 });
 

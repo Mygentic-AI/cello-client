@@ -90,6 +90,8 @@ export interface DocumentEnvelopeRow {
   stateVector: Uint8Array;
   /** NULLABLE — a purged envelope keeps its hash and signature, proving it existed (§16.7-12). */
   payload: Uint8Array | null;
+  /** SYNC-G1: the author's governance frontier at authoring — entry hashes, from the signed TBS. */
+  governanceParents: string[];
   kind: DocumentEnvelopeKind;
   /** For a withdrawal or rejection: the envelope it concerns. */
   referencesEnvelopeHash?: string | null;
@@ -193,6 +195,9 @@ const CREATE_ENVELOPES_SQL = `
     signature       BLOB    NOT NULL,
     state_vector    BLOB    NOT NULL,
     payload         BLOB,
+    -- SYNC-G1: the author's governance frontier at authoring (JSON array of entry hashes) —
+    -- content's causal link to the governance that made it admissible. Inside the signed TBS.
+    governance_parents TEXT NOT NULL DEFAULT '[]',
     kind            TEXT    NOT NULL CHECK (kind IN ('update', 'withdrawal', 'rejection')),
     -- The Yjs clientID the sender SIGNED for (ENVELOPE-1 puts it inside the TBS). Recorded so the
     -- gate's authorship rule has a binding derived from authenticated data rather than from a seam
@@ -352,6 +357,21 @@ export class DocumentStore {
     this.#db = db;
     this.#logger = logger;
     this.#db.exec(CREATE_DOCUMENTS_SQL);
+    // SYNC-G1 birth-gated column (the consent-migration precedent): a database created before
+    // the causal-anchor column exists gains it here, defaulted to the empty frontier — CREATE
+    // IF NOT EXISTS cannot add columns, and a client-side migration that fails is unrecoverable
+    // on an operator machine, so the ALTER is guarded by the actual table shape.
+    const envelopeColumns = this.#db
+      .prepare(`PRAGMA table_info(document_envelopes)`)
+      .all() as Array<{ name: string }>;
+    if (
+      envelopeColumns.length > 0 &&
+      !envelopeColumns.some((c) => c.name === "governance_parents")
+    ) {
+      this.#db.exec(
+        `ALTER TABLE document_envelopes ADD COLUMN governance_parents TEXT NOT NULL DEFAULT '[]'`,
+      );
+    }
     // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
     this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
@@ -547,9 +567,9 @@ export class DocumentStore {
       .prepare(
         `INSERT INTO document_envelopes
            (owner_agent_id, document_id, envelope_hash, sender_agent_id, doc_prev_hash, epoch_id,
-            signature, state_vector, payload, kind, references_hash, sender_client_id,
-            created_at, log_index)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            signature, state_vector, payload, governance_parents, kind, references_hash,
+            sender_client_id, created_at, log_index)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                 COALESCE((SELECT MAX(log_index) + 1 FROM document_envelopes
                            WHERE owner_agent_id = ? AND document_id = ?), 0)
          ON CONFLICT (owner_agent_id, document_id, envelope_hash) DO NOTHING`,
@@ -564,6 +584,7 @@ export class DocumentStore {
         Buffer.from(envelope.signature),
         Buffer.from(envelope.stateVector),
         envelope.payload === null ? null : Buffer.from(envelope.payload),
+        JSON.stringify(envelope.governanceParents ?? []),
         envelope.kind,
         envelope.referencesEnvelopeHash ?? null,
         envelope.senderClientId ?? null,
@@ -644,6 +665,7 @@ export class DocumentStore {
       documentId: q.documentId,
       senderAgentId: q.rejectedSenderAgentId,
       docPrevHash: q.rejectedDocPrevHash,
+      governanceParents: [],
       // EXEMPT from current-epoch stamping (M14B Entry 5): a stub is a SYNTHETIC verification
       // node — never on the wire, never replayed — and the chain walk checks hash linkage only.
       epochId: 0,
@@ -2214,6 +2236,7 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     signature: toU8(r["signature"]),
     stateVector: toU8(r["state_vector"]),
     payload: payload === null || payload === undefined ? null : toU8(payload),
+    governanceParents: JSON.parse((r["governance_parents"] as string | null) ?? "[]") as string[],
     kind: r["kind"] as DocumentEnvelopeKind,
     senderClientId: (r["sender_client_id"] as number | null) ?? null,
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,

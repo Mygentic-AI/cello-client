@@ -131,6 +131,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     logger,
     layer,
     publish: new DocumentPublish({
+      governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d),
       holdersFor: (o, d) => layer.holdersFor(o, d),
       store: layer.store,
       engine: layer.engine,
@@ -1047,6 +1048,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       sender_agent_id: row.senderAgentId,
       sender_client_id: 0,
       update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+      governance_parents: [],
       state_vector: row.stateVector,
       update: row.payload!,
       signature: new Uint8Array(64),
@@ -2058,9 +2060,11 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a write REFUSES on an unreadable chain, n
     // this case — the edit is applied to the local copy and NOT published — and the reason names
     // the chain rather than the CBOR reader.
     expect(res.published).toBe(false);
-    expect(String(res.reason)).toBe("document_chain_invalid");
+    // The refusal moved EARLIER and got more precise: the frontier cannot be derived from an
+    // unreadable chain, and publish refuses before building anything.
+    expect(String(res.reason)).toBe("document_frontier_underivable");
     const said = `${String(res.guidance ?? "")} ${String(res.detail ?? "")}`;
     expect(said).not.toMatch(/end of buffer/i);
-    expect(said).toMatch(/does not derive from its recorded chain/i);
+    expect(said).toMatch(/governance could not be derived|does not derive from its recorded chain/i);
   });
 });

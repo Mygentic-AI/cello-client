@@ -1119,6 +1119,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
             sender_client_id: row.senderClientId ?? 0,
             update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
             state_vector: row.stateVector,
+            governance_parents: [...row.governanceParents],
             update: row.payload,
             signature: row.signature,
           }),

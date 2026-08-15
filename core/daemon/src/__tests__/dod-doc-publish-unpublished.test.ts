@@ -106,6 +106,7 @@ async function newFixture(opts: { publishBlocked?: string } = {}) {
   registerDocumentHandlers({
     handlers, logger, layer,
     publish: new DocumentPublish({
+      governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d),
       holdersFor: (o, d) => {
         const doc = layer.store.getDocument(o, d);
         return doc ? [doc.peerAgentId] : null;

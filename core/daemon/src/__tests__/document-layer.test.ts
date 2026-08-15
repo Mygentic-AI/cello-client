@@ -92,6 +92,7 @@ async function newFixture(opts: { knowPeerKey?: boolean } = {}) {
       sender_agent_id: PEER,
       sender_client_id: PEER_CLIENT,
       update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+      governance_parents: [],
       state_vector: new Uint8Array([0]),
       update: peerUpdate("from the peer. "),
       signature: new Uint8Array(64),

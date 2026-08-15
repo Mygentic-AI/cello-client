@@ -117,6 +117,7 @@ async function makeParty(agentName: string) {
   } as unknown as DocumentDeliveryTransport;
 
   const publish = new DocumentPublish({
+    governanceFrontierFor: (o, d) => layer.governanceFrontierFor(o, d),
     holdersFor: (o, d) => layer.holdersFor(o, d),
     store: layer.store,
     engine: layer.engine,
@@ -179,7 +180,8 @@ async function makeParty(agentName: string) {
 function encodeFromRow(row: unknown): Uint8Array {
   const r = row as {
     documentId: string; epochId: string; docPrevHash: string | null; senderAgentId: string;
-    senderClientId: number | null; stateVector: Uint8Array; payload: Uint8Array | null; signature: Uint8Array;
+    senderClientId: number | null; stateVector: Uint8Array; payload: Uint8Array | null;
+    governanceParents: string[]; signature: Uint8Array;
   };
   // The SHIPPED encoder, not a hand-built object: encoding is where the two halves can disagree
   // about a field, and the peer then refuses something we believe we sent correctly.
@@ -191,6 +193,9 @@ function encodeFromRow(row: unknown): Uint8Array {
     sender_agent_id: r.senderAgentId,
     sender_client_id: r.senderClientId ?? 0,
     update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+    // The ROW's real parents — an empty list here would re-encode bytes the signature never
+    // covered, and the peer would refuse an envelope we believe we sent correctly.
+    governance_parents: r.governanceParents ?? [],
     state_vector: r.stateVector,
     update: r.payload ?? new Uint8Array(0),
     signature: r.signature,

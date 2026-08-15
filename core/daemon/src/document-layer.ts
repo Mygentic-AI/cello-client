@@ -219,6 +219,11 @@ export interface DocumentLayer {
     peerAgentId: string,
     documentIds: readonly string[],
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * SYNC-G1 — the fold's governance frontier for a document, or null when it cannot be
+   * derived. Publish stamps this into every envelope's signed TBS as content's causal anchor.
+   */
+  governanceFrontierFor(ownerAgentId: string, documentId: string): string[] | null;
   router: DocumentFrameRouter;
   /**
    * The hook `SessionNodeManager.setOnDocumentFrame` takes. Handed out ready-shaped so the
@@ -1433,6 +1438,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         senderAgentId: env.sender_agent_id,
         docPrevHash: env.doc_prev_hash,
         epochId: env.epoch_id,
+        governanceParents: [...env.governance_parents],
         signature: env.signature,
         stateVector: env.state_vector,
         payload: env.update,
@@ -1549,6 +1555,10 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     acceptJoin,
     refuseJoin,
     initiateReconcile,
+    governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      return derived.ok ? [...derived.state.frontier] : null;
+    },
     store,
     writePath,
     handshake,

@@ -106,6 +106,7 @@ function contentRow(sender: string, payload: Uint8Array | null = new Uint8Array(
     signature: new Uint8Array(64),
     stateVector: new Uint8Array([0]),
     payload,
+    governanceParents: [],
     kind: payload === null ? "reject" : "update",
     createdAtMs: 1,
   } as DocumentEnvelopeRow;

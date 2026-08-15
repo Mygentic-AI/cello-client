@@ -40,6 +40,13 @@ export type PublishResult =
   | { ok: false; reason: string; detail: string };
 
 export interface DocumentPublishDeps {
+  /**
+   * SYNC-G1 — the author's governance frontier at publish time (entry hashes, the fold's
+   * heads). Stamped into the signed envelope as content's causal link to the governance that
+   * makes it admissible; receivers rule R20/R30 on it. Null when the frontier cannot be
+   * derived — the publish REFUSES rather than stamping a guess.
+   */
+  governanceFrontierFor(ownerAgentId: string, documentId: string): string[] | null;
   store: DocumentStore;
   engine: DocumentEngine;
   logger: Logger;
@@ -137,11 +144,23 @@ export class DocumentPublish {
       };
     }
 
+    // SYNC-G1: the frontier is stamped, or the publish refuses — a guessed anchor would let
+    // this envelope claim governance its author never held.
+    const governanceParents = this.#d.governanceFrontierFor(ownerAgentId, documentId);
+    if (governanceParents === null) {
+      return {
+        ok: false,
+        reason: "document_frontier_underivable",
+        detail:
+          "this document's governance could not be derived, so the envelope cannot name the " +
+          "frontier it was authored under — fix the chain before publishing",
+      };
+    }
     const envelope: DocumentUpdateEnvelope = {
       type: "document_update",
       document_id: documentId,
       // The CURRENT epoch from the recorded amendment chain (M14B / DOD-MP-AMEND-1) — the
-      // constant-0 era ends the moment a document's first amendment lands.
+      // constant-0 era ends the moment a document's first amendment lands. (Dies with D7.)
       epoch_id: this.#d.store.currentDocumentEpoch(ownerAgentId, documentId),
       // READ, never cached. Anything else appended since — a rejection, a withdrawal — moves this,
       // and a wrong link is refused by the peer and stops the document rebuilding locally.
@@ -151,6 +170,7 @@ export class DocumentPublish {
       update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
       state_vector: ourNow,
       update,
+      governance_parents: [...governanceParents].sort(),
       signature: new Uint8Array(0),
     };
     // TARGETS BEFORE THE ENVELOPE: a publish that cannot name its holders refuses before it
@@ -176,6 +196,7 @@ export class DocumentPublish {
       documentId,
       senderAgentId: senderId,
       docPrevHash: envelope.doc_prev_hash,
+      governanceParents: [...envelope.governance_parents],
       epochId: envelope.epoch_id,
       signature: envelope.signature,
       stateVector: envelope.state_vector,

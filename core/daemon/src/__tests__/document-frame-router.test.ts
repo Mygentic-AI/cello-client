@@ -50,6 +50,7 @@ const updateEnvelope: DocumentUpdateEnvelope = {
   sender_agent_id: "peer-agent",
   sender_client_id: 4242,
   update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+  governance_parents: [],
   state_vector: new Uint8Array([0]),
   update: new Uint8Array([1, 2, 3]),
   signature: new Uint8Array(64).fill(3),
@@ -310,7 +311,7 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     // b9 00 0a — cbor.ts documents this encoder's non-minimal map header deliberately, so a guard
     // that only admitted the inline-count form would route every genuine document frame to the
     // transcript.
-    expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000a");
+    expect(Buffer.from(wire.slice(0, 3)).toString("hex")).toBe("b9000b");
     expect(r.router.routeSync(AGENT, wire, NOW, "c")).toMatchObject({ consumed: true, kind: "update" });
   });
 });
