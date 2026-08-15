@@ -297,6 +297,18 @@ export type {
 } from "./document-amendment.js";
 export { MAX_ENTRY_PARENTS } from "./document-amendment.js";
 export { deriveDocumentState, checkEntryAdmissible } from "./document-derive.js";
+export {
+  DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+  MAX_RECONCILE_DOCUMENTS,
+  encodeDocumentReconcile,
+  decodeDocumentReconcile,
+} from "./document-reconcile.js";
+export type {
+  DocumentReconcileFrame,
+  DocumentReconcileBlock,
+  GovernancePosition,
+  ContentPosition,
+} from "./document-reconcile.js";
 export type { DocumentStateView, DeriveDocumentStateResult } from "./document-derive.js";
 export {
   DOCUMENT_MULTISIG_DOMAIN,

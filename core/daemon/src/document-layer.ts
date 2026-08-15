@@ -51,6 +51,7 @@ import {
   decodeDocumentControl,
   buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
+  encodeDocumentAmendment,
   buildDocumentUpdateTbs,
   documentEnvelopeHash,
   buildDocumentJoinAnswerTbs,
@@ -59,6 +60,9 @@ import {
   decodeDocumentJoinOffer,
   decodeDocumentAmendment,
   decodeDocumentProposal,
+  encodeDocumentProposal,
+  documentIdFromProposal,
+  buildDocumentProposalTbs,
   encodeDocumentProposalAck,
   DOCUMENT_PROPOSAL_ACK_VERSION,
   MAX_PROPOSAL_REFUSAL_REASON_LENGTH,
@@ -69,6 +73,9 @@ import {
   arrangementGenesisFromProposal,
   deriveDocumentState,
   checkEntryAdmissible,
+  decodeDocumentReconcile,
+  encodeDocumentReconcile,
+  DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   type DocumentAmendmentEnvelope,
   type DocumentJoinAnswer,
   encodeDocumentAck,
@@ -76,6 +83,11 @@ import {
   type DocumentAck,
 } from "@cello-protocol/protocol-types";
 import { LEAF_KIND_REJECT } from "./session-relay-client.js";
+import {
+  buildReconcileBlock,
+  respondToReconcile,
+  type ReconcileReads,
+} from "./document-reconcile-engine.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 
@@ -198,6 +210,15 @@ export interface DocumentLayer {
     | { ok: true; documentId: string; inviterAgentId: string; answerBytes: Uint8Array }
     | { ok: false; reason: string; detail: string }
   >;
+  /**
+   * SYNC-P3 — step 1 of the reconcile exchange: send this holder's position for the named
+   * documents to a peer. Everything after that is symmetric and handled by the frame router.
+   */
+  initiateReconcile(
+    ownerAgentId: string,
+    peerAgentId: string,
+    documentIds: readonly string[],
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
   router: DocumentFrameRouter;
   /**
    * The hook `SessionNodeManager.setOnDocumentFrame` takes. Handed out ready-shaped so the
@@ -595,9 +616,505 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     );
   };
 
+  const recordAmendmentImpl = (ownerAgentId: string, wire: Uint8Array, nowMs: number): void => {
+    // An entry reaching an EXISTING holder. The door refuses only what no future entry can
+    // ever make good — a broken collection binding, an unproven author, a failed signature
+    // (checkEntryAdmissible). Everything semantic is the FOLD's ruling at consumption, and a
+    // fold-void entry is still history (F4): bouncing it here would leave two holders holding
+    // different sets.
+    const env = decodeDocumentAmendment(wire);
+    const documentId = env.body.document_id;
+    if (!store.getDocument(ownerAgentId, documentId)) {
+      throw new Error(`document_unknown: no document ${documentId.slice(0, 16)}… for this agent`);
+    }
+    const record = handshake.get(ownerAgentId, documentId);
+    if (!record) {
+      throw new Error(
+        `document_genesis_missing: ${documentId.slice(0, 16)}… has a row but no stored genesis ` +
+          `proposal to replay from`,
+      );
+    }
+    const admissible = checkEntryAdmissible(env, verifySignature);
+    if (!admissible.ok) throw new Error(admissible.reason);
+    // THE STRANGER DOOR (SYNC-R18, interim until P3's full entitlement classes): a fold-void
+    // entry is history only when its author is KNOWN to this document — a genesis party or
+    // someone an EFFECTIVE admission names (which covers invited and removed authors, whose
+    // earlier work must still converge, R20). Effective, not merely held: a hostile holder can
+    // mint a self-signed, fold-void admission naming any key, and counting it would hand that
+    // key an unbounded license to grow every holder's entry set (review F4). A stranger's
+    // governance is refused by name, never stored.
+    const author = env.body.author_agent_id;
+    const genesisArr = arrangementGenesisFromProposal(record.envelope);
+    let authorKnown =
+      genesisArr.proposerAgentId === author || genesisArr.peerAgentId === author;
+    if (!authorKnown) {
+      const held = amendments.chain(ownerAgentId, documentId);
+      const doorDerived = deriveDocumentState(
+        genesisArr,
+        held,
+        documentGovernancePolicy,
+        verifySignature,
+      );
+      if (!doorDerived.ok) throw new Error(doorDerived.reason);
+      const inert = new Set([
+        ...doorDerived.state.voids.map((v) => v.hash),
+        ...doorDerived.state.excluded.map((e) => e.hash),
+      ]);
+      authorKnown = held.some(
+        (e) =>
+          e.body.kind === "add_holder" &&
+          e.body.subject_agent_id === author &&
+          !inert.has(Buffer.from(documentAmendmentHash(e.body)).toString("hex")),
+      );
+    }
+    if (!authorKnown) {
+      throw new Error(
+        `document_author_stranger: ${author} is neither a genesis party nor named by any ` +
+          `effective admission — a stranger's governance is refused, not stored`,
+      );
+    }
+    const appended = amendments.append(ownerAgentId, documentId, wire, nowMs);
+    // Post-apply surfacing runs for EVERYTHING that just applied: the direct arrival, and
+    // every held entry this arrival promoted (review F2 — the held path silently dropped the
+    // removal notice and the lifecycle completion, reintroducing the stuck-`active` defect
+    // CLOSE-N-1 fixed, on exactly the out-of-order path the pending table exists for).
+    const surfaceApplied = (applied: DocumentAmendmentEnvelope) => {
+      // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just
+      // stored: the row flips to `removed` (publishes refuse locally, naming the condition;
+      // the copy, the file, the history all remain — forward-only by doctrine), and the event
+      // is the operator's notice. Everyone else's arrangement changes are visible through
+      // list/inbox derivation; being written out of one is the change an operator must not
+      // miss.
+      if (
+        applied.body.kind === "remove_holder" &&
+        applied.body.subject_agent_id === ownerAgentId
+      ) {
+        logger.warn("document.removed_from", {
+          documentId,
+          epochId: applied.body.epoch_id,
+          removedBy: applied.collection.required_signers.join(","),
+        });
+      }
+      // THE ARRIVING CONSENT IS THE JOIN ANSWER (SYNC-P3, the D5 replacement): an inviter's
+      // pending row settles from the entry itself — the subject's own signed yes or no — so
+      // the legacy answer frame carries nothing the record does not. Settle-once semantics
+      // live in the store; a redelivered entry decides nothing twice.
+      if (
+        (applied.body.kind === "consent" || applied.body.kind === "refuse_join") &&
+        applied.body.subject_agent_id !== null &&
+        applied.body.subject_agent_id !== ownerAgentId
+      ) {
+        const subject = applied.body.subject_agent_id;
+        const pendingRow = joins
+          .outgoingFor(ownerAgentId)
+          .find(
+            (row) =>
+              row.documentId === documentId &&
+              row.inviteeAgentId === subject &&
+              row.state === "pending",
+          );
+        if (pendingRow) {
+          joins.settleFromEntry(
+            ownerAgentId,
+            pendingRow.amendmentHash,
+            applied.body.kind === "consent",
+            applied.body.kind === "refuse_join" ? "refused via the exchange" : null,
+            nowMs,
+          );
+        }
+      }
+      // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
+      // holder who had not closed leaves everyone who remains in agreement; without this the
+      // document stayed `active` forever reporting that it waited on nobody.
+      if (applied.body.kind === "remove_holder" || applied.body.kind === "add_holder") {
+        lifecycle.onMembershipChanged(
+          ownerAgentId,
+          documentId,
+          applied.body.kind === "remove_holder"
+            ? (applied.body.subject_agent_id ?? undefined)
+            : undefined,
+        );
+      }
+    };
+    // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
+    // with it and fire on promotion. The store's `document.entry.held` event is the trace.
+    if (!appended.held) surfaceApplied(env);
+    for (const promoted of appended.promoted) surfaceApplied(promoted.envelope);
+  };
+
+  const rewriteFileImpl = async (ownerAgentId: string, inResponseTo: Uint8Array): Promise<void> => {
+    if (!writePath) return;
+    const env = decodeDocumentUpdateEnvelope(inResponseTo);
+    const document = store.getDocument(ownerAgentId, env.document_id);
+    if (!document) return;
+    await writePath.materialize(
+      ownerAgentId,
+      env.document_id,
+      document.documentType,
+      live.get(ownerAgentId, env.document_id),
+    );
+  };
+
+  const noticeInboundUpdateImpl = (ownerAgentId: string, inResponseTo: Uint8Array): void => {
+    const env = decodeDocumentUpdateEnvelope(inResponseTo);
+    // COUNTED FROM THE LOG, not incremented blindly: envelopes redeliver, and a counter bumped on
+    // every arrival would drift upward on ordinary retries and tell the operator there is more to
+    // read than there is.
+    const unread = notifications.unreadFromPeer(ownerAgentId, env.document_id);
+    notifications.notice(ownerAgentId, env.document_id, unread, Date.now());
+
+    // DOD-DOC-WATCH-1 — the selective nudge.
+    //
+    // Matched against what changed since THIS agent last READ, not against this envelope. Per
+    // envelope re-fires on redelivery and on the peer's every keystroke; the net difference from
+    // the read mark asks the question an operator actually has — has the thing I am waiting on
+    // moved since I saw it — and self-cancels the moment they read.
+    //
+    // Wrapped whole: a notification is a courtesy on a path whose real job (admitting the peer's
+    // update) has already succeeded, and must never be able to fail it.
+    try {
+      const watches = notifications.watches(ownerAgentId, env.document_id);
+      if (watches.length === 0) return;
+      if (!notifications.nudgeOwed(ownerAgentId, env.document_id)) return;
+      const document = store.getDocument(ownerAgentId, env.document_id);
+      if (!document) return;
+      const seen = notifications.lastSeen(ownerAgentId, env.document_id);
+      const after = projectDocumentText(live.get(ownerAgentId, env.document_id), document.documentType);
+      // NEVER READ is not "everything changed" for the purposes of a nudge — the agent has not
+      // established a baseline, so there is nothing it can be waiting on a change to.
+      if (seen === null || seen === after) return;
+      // A text document has no key paths, so the only thing it can report is that it moved. That
+      // is why the whole-document watch has to be spelled `*` rather than implied.
+      const paths =
+        rootForDocumentType(document.documentType) === "map"
+          ? changedKeyPaths(seen, after) ?? ["*"]
+          : ["*"];
+      const hits = matchWatchedPaths(watches, paths);
+      if (hits.length === 0) return;
+      // THE AGENT'S OWN PATTERNS travel, never the changed paths. A changed path can carry a key
+      // the PEER named, and a doorbell body is an unscreened route into the agent's context —
+      // see `matchingWatches`. The precise field comes from cello_doc_diff, which IS screened.
+      const firedWatches = matchingWatches(watches, paths);
+      notifications.markNudged(ownerAgentId, env.document_id, Date.now());
+      logger.info("document.watch.nudged", {
+        documentId: env.document_id,
+        paths: hits.length,
+        watches: firedWatches.length,
+      });
+      deps.nudge?.(ownerAgentId, env.document_id, firedWatches);
+    } catch (err: unknown) {
+      logger.warn("document.watch.nudge_failed", {
+        documentId: env.document_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  /** SYNC-P3 — the reads the reconcile engine consumes, over THIS owner's stores. */
+  const reconcileReads = (ownerAgentId: string): ReconcileReads => ({
+    deriveState: (documentId) => {
+      const record = handshake.get(ownerAgentId, documentId);
+      if (!record) return { ok: false, reason: "document_genesis_missing" };
+      try {
+        return deriveDocumentState(
+          arrangementGenesisFromProposal(record.envelope),
+          amendments.chain(ownerAgentId, documentId),
+          documentGovernancePolicy,
+          verifySignature,
+        );
+      } catch (err: unknown) {
+        return {
+          ok: false,
+          reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
+    watermarks: (documentId) => amendments.watermarks(ownerAgentId, documentId),
+    entriesByAuthorAfter: (documentId, author, afterSeq) =>
+      amendments.entriesByAuthorAfter(ownerAgentId, documentId, author, afterSeq),
+    envelopeLog: (documentId) => store.getEnvelopeLog(ownerAgentId, documentId),
+    refusedHashes: (documentId) =>
+      rejections.quarantined(ownerAgentId, documentId).map((q) => q.rejectedEnvelopeHash),
+    membershipState: (documentId, agentId) =>
+      amendments.membershipOf(ownerAgentId, documentId, agentId).state,
+    genesisBytes: (documentId) => {
+      const record = handshake.get(ownerAgentId, documentId);
+      return record ? new Uint8Array(encodeDocumentProposal(record.envelope)) : null;
+    },
+    removalClosure: (documentId, agentId) => {
+      // The LAST removal naming them, plus every ancestor — walked over the held entry set.
+      const chain = amendments.chain(ownerAgentId, documentId);
+      const byHash = new Map(
+        chain.map((env) => [
+          Buffer.from(documentAmendmentHash(env.body)).toString("hex"),
+          env,
+        ]),
+      );
+      let removalHash: string | null = null;
+      for (const [hash, env] of byHash) {
+        if (env.body.kind === "remove_holder" && env.body.subject_agent_id === agentId) {
+          removalHash = hash;
+        }
+      }
+      if (!removalHash) return null;
+      const wanted = new Set<string>([removalHash]);
+      const queue = [removalHash];
+      while (queue.length > 0) {
+        const env = byHash.get(queue.pop()!);
+        if (!env) continue;
+        for (const parent of env.body.parents) {
+          if (!wanted.has(parent)) {
+            wanted.add(parent);
+            queue.push(parent);
+          }
+        }
+      }
+      // Foldable order: parents before children — the chain read is already epoch/seq ordered.
+      return chain
+        .filter((env) =>
+          wanted.has(Buffer.from(documentAmendmentHash(env.body)).toString("hex")),
+        )
+        .map((env) => new Uint8Array(encodeDocumentAmendment(env)));
+    },
+  });
+
+  /**
+   * SYNC-P3 — one arriving reconcile frame, all three steps. Apply what it carries (governance
+   * entries FIRST, R12 — through the same causal door every amendment takes; then content
+   * envelopes through the same inbound gate every update takes), then answer: a version this
+   * build does not speak or a stranger gets the named refusal ON the frame; a peer that lacks
+   * something gets the difference; a converged exchange gets silence — which is what terminates
+   * it (R15: idempotence is the absence of a difference, not bookkeeping).
+   */
+  const handleReconcile = async (
+    ownerAgentId: string,
+    wire: Uint8Array,
+    senderAgentId: string,
+    nowMs: number,
+    correlationId: string,
+  ): Promise<{ ok: boolean; reason?: string }> => {
+    const frame = decodeDocumentReconcile(wire);
+    if (frame.refusal) {
+      // The peer's answer to OUR exchange — a fact to surface, never to retry blindly.
+      logger.warn("document.reconcile.refused_by_peer", {
+        senderAgentId, reason: frame.refusal.reason, terminal: frame.refusal.terminal, correlationId,
+      });
+      return { ok: true };
+    }
+    for (const block of frame.documents) {
+      if (block.refusal) {
+        logger.warn("document.reconcile.refused_by_peer", {
+          documentId: block.document_id, senderAgentId,
+          reason: block.refusal.reason, terminal: block.refusal.terminal, correlationId,
+        });
+      }
+    }
+    if (frame.exchange_version !== DOCUMENT_RECONCILE_EXCHANGE_VERSION) {
+      const reason =
+        `document_reconcile_version: you speak exchange version ${frame.exchange_version} and ` +
+        `this holder speaks ${DOCUMENT_RECONCILE_EXCHANGE_VERSION} — upgrade together; there is ` +
+        `no dual-speak mode`;
+      logger.warn("document.reconcile.version_refused", { senderAgentId, correlationId, reason });
+      await deps.sendFrame(
+        ownerAgentId, senderAgentId,
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+          documents: [],
+          refusal: { reason, terminal: false },
+        }),
+      );
+      return { ok: false, reason: "document_reconcile_version" };
+    }
+    const reads = reconcileReads(ownerAgentId);
+    const replyBlocks = [];
+    // One reply frame's payload allowance, shared across its blocks (review F3): headroom under
+    // the router's 2 MiB frame ceiling so positions, hashes, and CBOR overhead always fit.
+    const replyBudget = { remainingBytes: 1_500_000 };
+    for (const block of frame.documents) {
+      // THE NOTICE, RECEIVED (R25): a position for a document this holder does not hold, with
+      // no genesis attached, IS the invitation pointer — the frame already names the document
+      // and the session names the inviter. The answer is our EMPTY position ("I hold nothing;
+      // send everything"), and the peer's reply carries the genesis and the lot. Two empty
+      // hands stay silent, so nothing ping-pongs.
+      if (!block.genesis && !store.getDocument(ownerAgentId, block.document_id)) {
+        const peerClaimsAnything =
+          block.governance.length > 0 || block.content.length > 0 ||
+          block.entries.length > 0 || block.envelopes.length > 0;
+        if (peerClaimsAnything) {
+          replyBlocks.push({
+            document_id: block.document_id,
+            governance: [], content: [], refused: [], entries: [], envelopes: [],
+          });
+          logger.info("document.reconcile.notice_received", {
+            documentId: block.document_id, viaAgentId: senderAgentId, correlationId,
+          });
+        }
+        continue;
+      }
+      // THE JOINER BOOTSTRAP (spec §4 — a joiner is simply very far behind): a block carrying
+      // the genesis for a document this holder does not have is the invitation arriving. The
+      // anchor is validated the way every genesis is — its hash IS the document id, its
+      // signature is the proposer's — and recording it is idempotent. The invitee then derives
+      // their own standing (invited) from the entries that follow; their ACCEPT is the ordinary
+      // consent-authoring accept.
+      if (block.genesis && !store.getDocument(ownerAgentId, block.document_id)) {
+        try {
+          const genesisEnv = decodeDocumentProposal(block.genesis);
+          if (documentIdFromProposal(genesisEnv) !== block.document_id) {
+            throw new Error(
+              "document_reconcile_genesis_mismatch: the carried genesis does not hash to the " +
+                "block's document id — the anchor cannot be swapped",
+            );
+          }
+          // THE ANCHOR IS VERIFIED, NOT TAKEN (P3 review F2): a proposal is only a proposal
+          // under its proposer's own signature — an unsigned or forged genesis stored here
+          // would attribute a document to someone who never made it, and hand any session
+          // peer an unlimited license to grow this store with fabricated documents.
+          if (
+            !verifySignature(
+              genesisEnv.proposer_agent_id,
+              buildDocumentProposalTbs(genesisEnv),
+              genesisEnv.signature,
+            )
+          ) {
+            throw new Error(
+              `document_reconcile_genesis_unsigned: the carried genesis does not verify ` +
+                `against its named proposer ${genesisEnv.proposer_agent_id}`,
+            );
+          }
+          // AND IT MUST NAME US (F2's entitlement half): this holder bootstraps only a
+          // document it is a party to — the genesis peer, or the subject of an admission
+          // carried in the same block. Anything else is a stranger's document and is refused,
+          // not stored.
+          const namedAsGenesisPeer = genesisEnv.peer_agent_id === ownerAgentId;
+          const namedByAdmission = block.entries.some((entryWire) => {
+            try {
+              const env = decodeDocumentAmendment(entryWire);
+              return env.body.kind === "add_holder" && env.body.subject_agent_id === ownerAgentId;
+            } catch {
+              return false;
+            }
+          });
+          if (!namedAsGenesisPeer && !namedByAdmission) {
+            throw new Error(
+              "document_reconcile_not_invited: the carried world names this holder nowhere — " +
+                "neither the genesis peer nor the subject of any carried admission; a document " +
+                "we are no party to is refused, not stored",
+            );
+          }
+          handshake.recordJoined(ownerAgentId, block.genesis, nowMs);
+          store.createDocument({
+            documentId: block.document_id,
+            ownerAgentId,
+            // The GENESIS FACT, not the messenger (F6): the peer column is the proposer's —
+            // whoever's session happened to carry the frame may be any holder (forwarding).
+            peerAgentId: genesisEnv.proposer_agent_id,
+            documentType: genesisEnv.document_type,
+            properties: genesisEnv.properties,
+            status: "active",
+            createdAtMs: nowMs,
+          });
+          logger.info("document.reconcile.joined", {
+            documentId: block.document_id, viaAgentId: senderAgentId, correlationId,
+          });
+        } catch (err: unknown) {
+          logger.warn("document.reconcile.genesis_refused", {
+            documentId: block.document_id, senderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+          continue;
+        }
+      }
+      // APPLY FIRST (R12 order: governance, then content). Both doors are the ordinary ones —
+      // idempotent, held-until-whole, refusal-recording — so a redelivered exchange changes
+      // nothing.
+      for (const entryWire of block.entries) {
+        try {
+          recordAmendmentImpl(ownerAgentId, entryWire, nowMs);
+        } catch (err: unknown) {
+          logger.warn("document.reconcile.entry_refused", {
+            documentId: block.document_id, senderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      for (const envWire of block.envelopes) {
+        const res = await inbound.receive(ownerAgentId, envWire, nowMs, correlationId);
+        if (res.ok && res.admitted) {
+          try {
+            noticeInboundUpdateImpl(ownerAgentId, envWire);
+          } catch { /* the notice is a row; the content is already the truth */ }
+          void rewriteFileImpl(ownerAgentId, envWire).catch((err: unknown) => {
+            logger.warn("document.reconcile.rewrite_failed", {
+              correlationId,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
+        }
+      }
+      const answer = respondToReconcile(reads, senderAgentId, block, replyBudget);
+      if (answer.block.refusal) {
+        // Per-document, on the block (review F4) — a batch never silences one document's no.
+        logger.warn("document.reconcile.refused", {
+          documentId: block.document_id, senderAgentId,
+          reason: answer.block.refusal.reason, terminal: answer.block.refusal.terminal,
+          correlationId,
+        });
+        replyBlocks.push(answer.block);
+        continue;
+      }
+      if (answer.truncated) {
+        // The byte budget cut the payload (review F3) — LOUD, never a silently-oversized frame
+        // the router would drop as unshaped. The exchange is idempotent: the peer's next
+        // initiate picks up from its advanced position.
+        logger.warn("document.reconcile.truncated", {
+          documentId: block.document_id, senderAgentId, correlationId,
+        });
+      }
+      const hasDifference = answer.block.entries.length > 0 || answer.block.envelopes.length > 0;
+      if (hasDifference || answer.peerAhead) {
+        replyBlocks.push(answer.block);
+      }
+    }
+    if (replyBlocks.length > 0) {
+      await deps.sendFrame(
+        ownerAgentId, senderAgentId,
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+          documents: replyBlocks,
+        }),
+      );
+    }
+    return { ok: true };
+  };
+
+  /** SYNC-P3 — step 1: send our position for these documents to a peer. */
+  const initiateReconcile = async (
+    ownerAgentId: string,
+    peerAgentId: string,
+    documentIds: readonly string[],
+  ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+    const reads = reconcileReads(ownerAgentId);
+    const blocks = documentIds.map((id) => buildReconcileBlock(reads, id));
+    const sent = await deps.sendFrame(
+      ownerAgentId, peerAgentId,
+      encodeDocumentReconcile({
+        type: "document_reconcile",
+        exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+        documents: blocks,
+      }),
+    );
+    if (!sent.ok) return { ok: false, reason: sent.reason ?? "document_reconcile_send_failed" };
+    logger.info("document.reconcile.initiated", { peerAgentId, documents: documentIds.length });
+    return { ok: true };
+  };
+
   const router = new DocumentFrameRouter({
     inbound,
     ackInbound,
+    handleReconcile,
     logger,
     ownerKeyFor: deps.ownerKeyFor,
     recordProposal: (ownerAgentId, wire, nowMs) => {
@@ -702,172 +1219,12 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // A refusal is a verdict the router contains and reports — never a silent drop.
       if (!r.ok) throw new Error(r.reason);
     },
-    recordAmendment: (ownerAgentId, wire, nowMs) => {
-      // An entry reaching an EXISTING holder. The door refuses only what no future entry can
-      // ever make good — a broken collection binding, an unproven author, a failed signature
-      // (checkEntryAdmissible). Everything semantic is the FOLD's ruling at consumption, and a
-      // fold-void entry is still history (F4): bouncing it here would leave two holders holding
-      // different sets.
-      const env = decodeDocumentAmendment(wire);
-      const documentId = env.body.document_id;
-      if (!store.getDocument(ownerAgentId, documentId)) {
-        throw new Error(`document_unknown: no document ${documentId.slice(0, 16)}… for this agent`);
-      }
-      const record = handshake.get(ownerAgentId, documentId);
-      if (!record) {
-        throw new Error(
-          `document_genesis_missing: ${documentId.slice(0, 16)}… has a row but no stored genesis ` +
-            `proposal to replay from`,
-        );
-      }
-      const admissible = checkEntryAdmissible(env, verifySignature);
-      if (!admissible.ok) throw new Error(admissible.reason);
-      // THE STRANGER DOOR (SYNC-R18, interim until P3's full entitlement classes): a fold-void
-      // entry is history only when its author is KNOWN to this document — a genesis party or
-      // someone an EFFECTIVE admission names (which covers invited and removed authors, whose
-      // earlier work must still converge, R20). Effective, not merely held: a hostile holder can
-      // mint a self-signed, fold-void admission naming any key, and counting it would hand that
-      // key an unbounded license to grow every holder's entry set (review F4). A stranger's
-      // governance is refused by name, never stored.
-      const author = env.body.author_agent_id;
-      const genesisArr = arrangementGenesisFromProposal(record.envelope);
-      let authorKnown =
-        genesisArr.proposerAgentId === author || genesisArr.peerAgentId === author;
-      if (!authorKnown) {
-        const held = amendments.chain(ownerAgentId, documentId);
-        const doorDerived = deriveDocumentState(
-          genesisArr,
-          held,
-          documentGovernancePolicy,
-          verifySignature,
-        );
-        if (!doorDerived.ok) throw new Error(doorDerived.reason);
-        const inert = new Set([
-          ...doorDerived.state.voids.map((v) => v.hash),
-          ...doorDerived.state.excluded.map((e) => e.hash),
-        ]);
-        authorKnown = held.some(
-          (e) =>
-            e.body.kind === "add_holder" &&
-            e.body.subject_agent_id === author &&
-            !inert.has(Buffer.from(documentAmendmentHash(e.body)).toString("hex")),
-        );
-      }
-      if (!authorKnown) {
-        throw new Error(
-          `document_author_stranger: ${author} is neither a genesis party nor named by any ` +
-            `effective admission — a stranger's governance is refused, not stored`,
-        );
-      }
-      const appended = amendments.append(ownerAgentId, documentId, wire, nowMs);
-      // Post-apply surfacing runs for EVERYTHING that just applied: the direct arrival, and
-      // every held entry this arrival promoted (review F2 — the held path silently dropped the
-      // removal notice and the lifecycle completion, reintroducing the stuck-`active` defect
-      // CLOSE-N-1 fixed, on exactly the out-of-order path the pending table exists for).
-      const surfaceApplied = (applied: DocumentAmendmentEnvelope) => {
-        // DOD-MP-REMOVE-1 — a removal NAMING THIS AGENT is applied and SURFACED, not just
-        // stored: the row flips to `removed` (publishes refuse locally, naming the condition;
-        // the copy, the file, the history all remain — forward-only by doctrine), and the event
-        // is the operator's notice. Everyone else's arrangement changes are visible through
-        // list/inbox derivation; being written out of one is the change an operator must not
-        // miss.
-        if (
-          applied.body.kind === "remove_holder" &&
-          applied.body.subject_agent_id === ownerAgentId
-        ) {
-          logger.warn("document.removed_from", {
-            documentId,
-            epochId: applied.body.epoch_id,
-            removedBy: applied.collection.required_signers.join(","),
-          });
-        }
-        // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
-        // holder who had not closed leaves everyone who remains in agreement; without this the
-        // document stayed `active` forever reporting that it waited on nobody.
-        if (applied.body.kind === "remove_holder" || applied.body.kind === "add_holder") {
-          lifecycle.onMembershipChanged(
-            ownerAgentId,
-            documentId,
-            applied.body.kind === "remove_holder"
-              ? (applied.body.subject_agent_id ?? undefined)
-              : undefined,
-          );
-        }
-      };
-      // An entry held for missing parents (R14) is recorded but NOT applied — its notices wait
-      // with it and fire on promotion. The store's `document.entry.held` event is the trace.
-      if (!appended.held) surfaceApplied(env);
-      for (const promoted of appended.promoted) surfaceApplied(promoted.envelope);
-    },
+    recordAmendment: recordAmendmentImpl,
     // `_nowMs` unused: the received-rejection row takes its clock where it is written, and the
     // rejection's own SIGNED timestamp is inside the envelope. A second clock read here would put a
     // third time on one event.
-    rewriteFile: async (ownerAgentId, inResponseTo) => {
-      if (!writePath) return;
-      const env = decodeDocumentUpdateEnvelope(inResponseTo);
-      const document = store.getDocument(ownerAgentId, env.document_id);
-      if (!document) return;
-      await writePath.materialize(
-        ownerAgentId,
-        env.document_id,
-        document.documentType,
-        live.get(ownerAgentId, env.document_id),
-      );
-    },
-    noticeInboundUpdate: (ownerAgentId, inResponseTo) => {
-      const env = decodeDocumentUpdateEnvelope(inResponseTo);
-      // COUNTED FROM THE LOG, not incremented blindly: envelopes redeliver, and a counter bumped on
-      // every arrival would drift upward on ordinary retries and tell the operator there is more to
-      // read than there is.
-      const unread = notifications.unreadFromPeer(ownerAgentId, env.document_id);
-      notifications.notice(ownerAgentId, env.document_id, unread, Date.now());
-
-      // DOD-DOC-WATCH-1 — the selective nudge.
-      //
-      // Matched against what changed since THIS agent last READ, not against this envelope. Per
-      // envelope re-fires on redelivery and on the peer's every keystroke; the net difference from
-      // the read mark asks the question an operator actually has — has the thing I am waiting on
-      // moved since I saw it — and self-cancels the moment they read.
-      //
-      // Wrapped whole: a notification is a courtesy on a path whose real job (admitting the peer's
-      // update) has already succeeded, and must never be able to fail it.
-      try {
-        const watches = notifications.watches(ownerAgentId, env.document_id);
-        if (watches.length === 0) return;
-        if (!notifications.nudgeOwed(ownerAgentId, env.document_id)) return;
-        const document = store.getDocument(ownerAgentId, env.document_id);
-        if (!document) return;
-        const seen = notifications.lastSeen(ownerAgentId, env.document_id);
-        const after = projectDocumentText(live.get(ownerAgentId, env.document_id), document.documentType);
-        // NEVER READ is not "everything changed" for the purposes of a nudge — the agent has not
-        // established a baseline, so there is nothing it can be waiting on a change to.
-        if (seen === null || seen === after) return;
-        // A text document has no key paths, so the only thing it can report is that it moved. That
-        // is why the whole-document watch has to be spelled `*` rather than implied.
-        const paths =
-          rootForDocumentType(document.documentType) === "map"
-            ? changedKeyPaths(seen, after) ?? ["*"]
-            : ["*"];
-        const hits = matchWatchedPaths(watches, paths);
-        if (hits.length === 0) return;
-        // THE AGENT'S OWN PATTERNS travel, never the changed paths. A changed path can carry a key
-        // the PEER named, and a doorbell body is an unscreened route into the agent's context —
-        // see `matchingWatches`. The precise field comes from cello_doc_diff, which IS screened.
-        const firedWatches = matchingWatches(watches, paths);
-        notifications.markNudged(ownerAgentId, env.document_id, Date.now());
-        logger.info("document.watch.nudged", {
-          documentId: env.document_id,
-          paths: hits.length,
-          watches: firedWatches.length,
-        });
-        deps.nudge?.(ownerAgentId, env.document_id, firedWatches);
-      } catch (err: unknown) {
-        logger.warn("document.watch.nudge_failed", {
-          documentId: env.document_id,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    },
+    rewriteFile: rewriteFileImpl,
+    noticeInboundUpdate: noticeInboundUpdateImpl,
     sendFrameToPeer: async (ownerAgentId, inResponseTo, bytes) => {
       // Addressed to whoever AUTHORED the envelope being answered, taken from the envelope itself
       // rather than from the document row: the row's peer and the envelope's sender are the same
@@ -1191,6 +1548,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     isCurrentHolder,
     acceptJoin,
     refuseJoin,
+    initiateReconcile,
     store,
     writePath,
     handshake,
@@ -1201,13 +1559,13 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     rejections,
     router,
     awaitAck,
-    onDocumentFrame: (agentName, _sessionId, content, _senderPubkey, correlationId) =>
+    onDocumentFrame: (agentName, _sessionId, content, senderPubkey, correlationId) =>
       // `agentName` names the owning agent for the session; the router maps it to the owner KEY
       // that scopes the store. The session id and the sender's transport pubkey are unused: a
       // document is bound to its PEER by the handshake, not to whichever session carried the
       // frame, and the envelope's own signed `sender_agent_id` is what the inbound path checks
       // against that binding. Trusting the transport identity instead would let a frame arriving
       // on any session act on any document that session's peer happens to share.
-      router.routeSync(agentName, content, Date.now(), correlationId ?? "frame"),
+      router.routeSync(agentName, content, Date.now(), correlationId ?? "frame", senderPubkey),
   };
 }

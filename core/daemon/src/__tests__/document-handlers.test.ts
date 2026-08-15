@@ -32,6 +32,10 @@ import {
   type DocumentControl,
   type DocumentAmendmentBody,
   type DocumentProposalEnvelope,
+  encodeDocumentReconcile,
+  DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+  encodeDocumentUpdateEnvelope,
+  DOCUMENT_UPDATE_ENCODING_V1,
 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
@@ -766,6 +770,358 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect((closed.holdersNotified as Record<string, boolean>)[fB.owner]).toBe(true);
     // …and NOT settled: the agreement waits on the seat that has not spoken.
     expect(fA.layer.store.getDocument(fA.owner, documentId)!.status).not.toBe("closed");
+  });
+
+  it("RECONCILE (P3): two diverged holders converge through ONE exchange, and a repeat exchange moves nothing", async () => {
+    // The pivot's core claim, in process: no delivery ledger ran here — both sides simply
+    // compare positions and close the gap. A and B each write while the other never receives
+    // it; one initiate → step-1 position → step-2 reply with B's missing content → step-3
+    // catch-up with A's — then a second exchange finds no difference and sends NOTHING, which
+    // is the termination rule (idempotence is the absence of a difference).
+    // Governance divergence during content divergence still trips the interim per-envelope
+    // epoch stamp — the exact coupling the P4 gate (SYNC-G1) exists to delete — so this pins
+    // the content half; the governance half is pinned in the engine suite.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // Diverge: each writes; NOTHING is routed.
+    await fA.call("cello_doc_write", { document_id: documentId, content: "alpha from A. " });
+    await fB.call("cello_doc_write", { document_id: documentId, content: "beta from B. " });
+    expect(fA.layer.store.getEnvelopeLog(fA.owner, documentId)).toHaveLength(1);
+    expect(fB.layer.store.getEnvelopeLog(fB.owner, documentId)).toHaveLength(1);
+
+    // Step 1: A sends its position.
+    const beforeInitiate = fA.sent.length;
+    const initiated = await fA.layer.initiateReconcile(fA.owner, fB.owner, [documentId]);
+    expect(initiated.ok).toBe(true);
+    const step1 = fA.sent.slice(beforeInitiate).find((send) => send.peerAgentId === fB.owner)!;
+
+    // Step 2: B answers with what A lacks + B's own position.
+    const bBefore = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fB.sent.length > bBefore);
+    const step2 = fB.sent.slice(bBefore).find((send) => send.peerAgentId === fA.owner)!;
+
+    // Step 3: A applies B's content and, seeing B behind, sends the catch-up.
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", step2.bytes, fB.owner);
+    await until(() => fA.sent.length > aBefore);
+    const step3 = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fB.owner)!;
+    const b2Before = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step3.bytes, fA.owner);
+
+    // CONVERGED: both hold both writes, unaided by any queue.
+    await until(
+      () =>
+        String((fA.layer.live.get(fA.owner, documentId).getText("content") ?? "")).includes("beta from B") &&
+        String((fB.layer.live.get(fB.owner, documentId).getText("content") ?? "")).includes("alpha from A"),
+    );
+
+    // IDEMPOTENCE: a fresh exchange over converged state moves nothing at all.
+    await new Promise((r) => setTimeout(r, 50));
+    const quietA = fA.sent.length;
+    const quietB = Math.max(fB.sent.length, b2Before);
+    await fA.layer.initiateReconcile(fA.owner, fB.owner, [documentId]);
+    const secondStep1 = fA.sent.slice(quietA).find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", secondStep1.bytes, fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    // B answered the converged position with SILENCE — no reply frame at all.
+    expect(fB.sent.length).toBe(quietB);
+  });
+
+  it("FORWARDING is load-bearing (AC2 shape): the author is GONE, and their signed work reaches a third holder through someone else's exchange", async () => {
+    // The standing ruling that unlocked the pivot: holders forward each other's signed entries,
+    // and forwarding confers no trust — the receiver verifies the author's signature itself.
+    // Here A authors content, A is never heard from again, and C ends up holding A's write
+    // because B's exchange carried it. Without forwarding, three holders cannot converge when
+    // an author goes offline; this is that claim, in process.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // C joins FIRST (offer routed), so the offer's snapshot predates what A writes next.
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    const offerSend = fA.sent.filter((send) => send.peerAgentId === fC.owner).at(-1)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
+    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await fC.call("cello_doc_accept", { document_id: documentId });
+    // B must know C is seated before it will answer C's exchange: route C's consent AND the
+    // admitting entry to B (in production the amendment carrier owes B both; here we route).
+    const inviteToB = fA.sent.filter((send) => send.peerAgentId === fB.owner).at(-1)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", inviteToB.bytes, fA.owner);
+    routeAll(fC, fB);
+    routeAll(fC, fA);
+    await until(() => fB.layer.amendments.chain(fB.owner, documentId).length === 3);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
+
+    // NOW A writes — after the offer, so C does not hold it — and B fetches it through the
+    // exchange: the last answer A ever gives. (Everyone is at the same interim epoch stamp;
+    // the stamp's coupling to content is the P4 gate's deletion target.)
+    await fA.call("cello_doc_write", { document_id: documentId, content: "A's last words. " });
+    const bInit = fB.sent.length;
+    await fB.layer.initiateReconcile(fB.owner, fA.owner, [documentId]);
+    const bStep1 = fB.sent.slice(bInit).find((send) => send.peerAgentId === fA.owner)!;
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", bStep1.bytes, fB.owner);
+    await until(() => fA.sent.length > aBefore);
+    const aStep2 = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", aStep2.bytes, fA.owner);
+    await until(() =>
+      String(fB.layer.live.get(fB.owner, documentId).getText("content")).includes("A's last words"),
+    );
+
+    // C reconciles with B — NOT with A, who no longer exists. The offer carried the governance
+    // history; A's CONTENT arrives only here, forwarded by B, and C verifies A's signature
+    // itself on apply.
+    const cBefore = fC.sent.length;
+    await fC.layer.initiateReconcile(fC.owner, fB.owner, [documentId]);
+    const step1 = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fB.owner)!;
+    const bBefore = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fC.owner);
+    await until(() => fB.sent.length > bBefore);
+    const step2 = fB.sent.slice(bBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step2.bytes, fB.owner);
+
+    await until(() =>
+      String(fC.layer.live.get(fC.owner, documentId).getText("content")).includes("A's last words"),
+    );
+    // And the envelope C holds is A's — the author's signed identity, not the forwarder's.
+    const cLog = fC.layer.store.getEnvelopeLog(fC.owner, documentId);
+    expect(cLog.some((row) => row.senderAgentId === fA.owner)).toBe(true);
+  });
+
+  it("JOIN VIA THE EXCHANGE: no offer frame anywhere — the invite's own step-1 is the notice, and the reply carries the world", async () => {
+    // The D5 replacement, end to end: A invites C and simply initiates a reconcile toward
+    // them. C, holding nothing, answers with an empty hand; A's reply carries the genesis,
+    // every entry, and the content; C bootstraps, derives its OWN standing as invited, and
+    // accepting is the ordinary consent-authoring accept — the same verb, the same cure
+    // branch, no bespoke history-carrying offer and no answer frame in the flow at all.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+
+    // A invites C (the entry lands in A's chain; the legacy offer send is IGNORED — nothing
+    // from it is routed) and writes content afterwards, so the exchange must carry both.
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+    await fA.call("cello_doc_write", { document_id: documentId, content: "history before C. " });
+
+    // The notice IS a step-1 position frame.
+    const aInit = fA.sent.length;
+    await fA.layer.initiateReconcile(fA.owner, fC.owner, [documentId]);
+    const step1 = fA.sent.slice(aInit).find((send) => send.peerAgentId === fC.owner)!;
+
+    // C answers with an empty hand…
+    const cBefore = fC.sent.length;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fC.sent.length > cBefore);
+    const emptyHand = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fA.owner)!;
+
+    // …and A's reply carries the genesis, the entries, and the content.
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", emptyHand.bytes, fC.owner);
+    await until(() => fA.sent.length > aBefore);
+    const world = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", world.bytes, fA.owner);
+
+    // C bootstrapped: the document exists, the content is there, and C's OWN derivation says
+    // invited — the surface shows an invitation without any join-store row behind it.
+    await until(() => fC.layer.store.getDocument(fC.owner, documentId) !== null);
+    await until(() =>
+      String(fC.layer.live.get(fC.owner, documentId).getText("content")).includes("history before C"),
+    );
+
+    // Accepting is the ORDINARY accept — the consent-authoring cure branch, same verb.
+    const accepted = await fC.call("cello_doc_accept", { document_id: documentId });
+    expect(accepted.ok, JSON.stringify(accepted)).toBe(true);
+    expect(typeof accepted.consentEntry).toBe("string");
+
+    // C's consent reaches A, and A's own derivation seats C as a participant.
+    routeAll(fC, fA);
+    await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
+    await until(() => fA.layer.holdersFor(fA.owner, documentId)!.includes(fC.owner));
+    // The inviter's join surface settled FROM THE ENTRY — no answer frame was ever routed.
+    expect(
+      fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state,
+    ).toBe("accepted");
+    const list = await fA.call("cello_doc_list", {});
+    const row = (list.documents as Array<Record<string, unknown>>).find(
+      (d) => d.documentId === documentId,
+    )!;
+    expect(row.participants).toContain(fC.owner);
+  });
+
+  it("A FORGED OR STRANGER-ADDRESSED GENESIS IS REFUSED, NOT STORED (review F2) — no session peer can spawn documents on this daemon", async () => {
+    // Two adversarial bootstraps, both through the real router: (a) a genesis whose signature
+    // does not verify against its named proposer; (b) a perfectly signed genesis for a document
+    // that names this holder NOWHERE. Both must leave the store untouched — the old code
+    // recorded both, handing any session peer an unlimited license to grow the store with
+    // fabricated documents attributed to proposers who never signed them.
+    const fA = await newFixture();
+    const fC = await newFixture();
+
+    // (a) Forged: a real proposal from A to C, signature stripped.
+    const honest = await fA.call("cello_doc_propose", { peer_pubkey: fC.owner });
+    const honestId = honest.documentId as string;
+    const proposalToC = fA.sent.find((send) => send.peerAgentId === fC.owner)!;
+    const forgedGenesis = decodeDocumentProposal(proposalToC.bytes);
+    forgedGenesis.signature = new Uint8Array(64);
+    const forgedWire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: honestId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [],
+        genesis: new Uint8Array(encodeDocumentProposal(forgedGenesis)),
+      }],
+    });
+    fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(forgedWire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fC.layer.store.getDocument(fC.owner, honestId)).toBeNull();
+    expect(fC.events).toContain("document.reconcile.genesis_refused");
+
+    // (b) Signed but a stranger's: A proposes to A's own bare-key peer — C is named nowhere.
+    const strangerDoc = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
+    const strangerId = strangerDoc.documentId as string;
+    const strangerGenesis = fA.layer.handshake.get(fA.owner, strangerId)!.envelope;
+    const strangerWire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: strangerId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [],
+        genesis: new Uint8Array(encodeDocumentProposal(strangerGenesis)),
+      }],
+    });
+    fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(strangerWire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fC.layer.store.getDocument(fC.owner, strangerId)).toBeNull();
+  });
+
+  it("A FORWARDED ENVELOPE WITH A CORRUPTED SIGNATURE IS REFUSED — forwarding confers no trust, verified not asserted (R2)", async () => {
+    // The AC2 test proves delivery; this proves VERIFICATION: B forwards A's envelope with the
+    // signature corrupted, and C's gate refuses it — the forwarder cannot vouch for content.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await fA.call("cello_doc_write", { document_id: documentId, content: "signed by A. " });
+
+    // A "forwards" its own envelope to B with the signature corrupted — as a hostile forwarder
+    // would after tampering.
+    const row = fA.layer.store.getEnvelopeLog(fA.owner, documentId)[0]!;
+    const tampered = encodeDocumentUpdateEnvelope({
+      type: "document_update",
+      document_id: row.documentId,
+      epoch_id: row.epochId,
+      doc_prev_hash: row.docPrevHash,
+      sender_agent_id: row.senderAgentId,
+      sender_client_id: 0,
+      update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
+      state_vector: row.stateVector,
+      update: row.payload!,
+      signature: new Uint8Array(64),
+    });
+    const wire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+      documents: [{
+        document_id: documentId,
+        governance: [], content: [], refused: [], entries: [], envelopes: [new Uint8Array(tampered)],
+      }],
+    });
+    fB.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(wire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    // The tampered envelope was NOT applied.
+    expect(
+      String(fB.layer.live.get(fB.owner, documentId).getText("content")),
+    ).not.toContain("signed by A");
+  });
+
+  it("REFUSAL VIA THE EXCHANGE: the invitee's signed no settles the inviter's surface, and an unanswered invitation can be RETRACTED", async () => {
+    // Both halves of ending an invitation under the new model: the invitee declines by
+    // authoring their own refuse_join entry (no answer frame anywhere), and separately, an
+    // admin takes back an offer nobody answered with the same removal verb every seat answers
+    // to — a consent racing the retraction loses under removal dominance.
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const fC = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((send) => send.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+    await fB.call("cello_doc_accept", { document_id: documentId });
+    routeAll(fB, fA);
+    await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
+
+    // Bootstrap C through the exchange (the join test's flow, condensed).
+    const aInit = fA.sent.length;
+    await fA.layer.initiateReconcile(fA.owner, fC.owner, [documentId]);
+    const step1 = fA.sent.slice(aInit).find((send) => send.peerAgentId === fC.owner)!;
+    const cBefore = fC.sent.length;
+    fC.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fA.owner);
+    await until(() => fC.sent.length > cBefore);
+    const emptyHand = fC.sent.slice(cBefore).find((send) => send.peerAgentId === fA.owner)!;
+    const aBefore = fA.sent.length;
+    fA.layer.onDocumentFrame(AGENT, "session-1", emptyHand.bytes, fC.owner);
+    await until(() => fA.sent.length > aBefore);
+    const world = fA.sent.slice(aBefore).find((send) => send.peerAgentId === fC.owner)!;
+    fC.layer.onDocumentFrame(AGENT, "session-1", world.bytes, fA.owner);
+    await until(() => fC.layer.store.getDocument(fC.owner, documentId) !== null);
+
+    // C DECLINES — their own signed entry, authored and fanned like everything else.
+    const refused = await fC.call("cello_doc_refuse", { document_id: documentId });
+    expect(refused.ok, JSON.stringify(refused)).toBe(true);
+    expect(typeof refused.refusalEntry).toBe("string");
+    routeAll(fC, fA);
+    await until(
+      () =>
+        fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state ===
+        "refused",
+    );
+    // C is no longer a seat anywhere.
+    expect(fA.layer.holdersFor(fA.owner, documentId)).not.toContain(fC.owner);
+
+    // RETRACTION: invite a fourth key that never answers, then take the offer back.
+    const ghost = "9".repeat(64);
+    await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: ghost });
+    expect(fA.layer.holdersFor(fA.owner, documentId)).toContain(ghost);
+    const retracted = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: ghost,
+    });
+    expect(retracted.ok, JSON.stringify(retracted)).toBe(true);
+    expect(fA.layer.holdersFor(fA.owner, documentId)).not.toContain(ghost);
   });
 
   it("REMOVE-1: an admin removes the joined holder — forward-only on the removed daemon", async () => {

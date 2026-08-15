@@ -269,6 +269,29 @@ export class DocumentAmendmentStore {
   }
 
   /**
+   * This author's applied entries with seq strictly beyond `afterSeq`, as WIRE BYTES in seq
+   * order — what a reconcile reply carries to a peer whose watermark for this author is behind
+   * ours (R10 step 2/3). Forked seqs both ship: the peer's fold rules on them like ours did.
+   */
+  entriesByAuthorAfter(
+    ownerAgentId: string,
+    documentId: string,
+    authorAgentId: string,
+    afterSeq: number,
+  ): Uint8Array[] {
+    const rows = this.#db
+      .prepare(
+        `SELECT received_bytes FROM document_entries
+          WHERE owner_agent_id = ? AND document_id = ? AND author_agent_id = ? AND author_seq > ?
+          ORDER BY author_seq ASC, entry_hash ASC`,
+      )
+      .all(ownerAgentId, documentId, authorAgentId, afterSeq) as Array<{
+      received_bytes: Uint8Array;
+    }>;
+    return rows.map((r) => new Uint8Array(r.received_bytes));
+  }
+
+  /**
    * Per-author position: the highest CONTIGUOUS seq held and the head hash(es) at it. A held
    * (pending) entry is not counted — a gap ends the walk (R13: report contiguous, never highest
    * received).

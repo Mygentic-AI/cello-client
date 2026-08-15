@@ -69,6 +69,7 @@
 
 import {
   decodeCbor,
+  decodeDocumentReconcile,
   decodeDocumentUpdateEnvelope,
   decodeDocumentAck,
   decodeDocumentProposal,
@@ -99,7 +100,8 @@ export type DocumentFrameKind =
   | "control"
   | "join_offer"
   | "join_answer"
-  | "amendment";
+  | "amendment"
+  | "reconcile";
 
 export type FrameRouting =
   | { consumed: false }
@@ -154,6 +156,19 @@ export interface DocumentFrameRouterDeps {
    * gate makes a missed one loud.
    */
   recordAmendment(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
+  /**
+   * SYNC-P3 — answer (or absorb) a reconcile exchange. Needs the SESSION's authenticated sender:
+   * the frame is unsigned by design, and entitlement (R17/R18) is a question about who is
+   * ASKING, which only the transport identity can answer. Everything the frame carries is still
+   * individually signed and verified on apply.
+   */
+  handleReconcile(
+    ownerAgentId: string,
+    wire: Uint8Array,
+    senderAgentId: string,
+    nowMs: number,
+    correlationId: string,
+  ): Promise<{ ok: boolean; reason?: string }>;
   /**
    * Tell the sender what happened to their envelope — admitted or refused, both of which SETTLE it.
    *
@@ -242,6 +257,7 @@ export class DocumentFrameRouter {
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
+    senderAgentId = "",
   ): FrameClassification {
     const kind = classify(content);
     if (kind === "unshaped") return { consumed: false };
@@ -272,7 +288,7 @@ export class DocumentFrameRouter {
       // which would hand an operator's agent a CBOR envelope as something a person said.
       return { consumed: true, kind };
     }
-    void this.#enqueue(ownerAgentId, content, nowMs, correlationId, kind);
+    void this.#enqueue(ownerAgentId, content, nowMs, correlationId, kind, senderAgentId);
     return { consumed: true, kind };
   }
 
@@ -291,6 +307,7 @@ export class DocumentFrameRouter {
     nowMs: number,
     correlationId: string,
     kind: DocumentFrameKind,
+    senderAgentId: string,
   ): Promise<void> {
     const previous = this.#queues.get(ownerAgentId) ?? Promise.resolve();
     const next = previous
@@ -300,7 +317,9 @@ export class DocumentFrameRouter {
       .then(async () => {
         // `kind` is passed through rather than re-derived: `classify` does up to two full CBOR
         // decodes, and this runs on every inbound frame.
-        const outcome = await this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind);
+        const outcome = await this.#dispatch(
+          ownerAgentId, content, nowMs, correlationId, kind, senderAgentId,
+        );
         if (outcome.consumed && !outcome.ok) {
           this.#d.logger.warn("document.frame.refused", {
             kind: outcome.kind,
@@ -323,12 +342,13 @@ export class DocumentFrameRouter {
     content: Uint8Array,
     nowMs: number,
     correlationId: string,
+    senderAgentId = "",
   ): Promise<FrameRouting> {
     const kind = classify(content);
     // Both non-kinds mean "not ours" to this async entry point. `routeSync` is the path that
     // distinguishes them, because it is the one that decides what the session does with the frame.
     if (kind === "unshaped" || kind === "undecodable") return { consumed: false };
-    return this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind);
+    return this.#dispatch(ownerAgentId, content, nowMs, correlationId, kind, senderAgentId);
   }
 
   async #dispatch(
@@ -337,6 +357,7 @@ export class DocumentFrameRouter {
     nowMs: number,
     correlationId: string,
     kind: DocumentFrameKind,
+    senderAgentId: string,
   ): Promise<FrameRouting> {
     try {
       if (kind === "update") {
@@ -475,6 +496,12 @@ export class DocumentFrameRouter {
       if (kind === "amendment") {
         this.#d.recordAmendment(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
+      }
+      if (kind === "reconcile") {
+        const rec = await this.#d.handleReconcile(
+          ownerAgentId, content, senderAgentId, nowMs, correlationId,
+        );
+        return { consumed: true, kind, ok: rec.ok, reason: rec.reason };
       }
       const res = this.#d.ackInbound.receive(ownerAgentId, content, nowMs, correlationId);
       return { consumed: true, kind, ok: res.ok, reason: res.ok ? undefined : res.reason };
@@ -621,6 +648,9 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_amendment":
         decodeDocumentAmendment(content);
         return "amendment";
+      case "document_reconcile":
+        decodeDocumentReconcile(content);
+        return "reconcile";
       default:
         // A frame type this build does not know. Reported by the caller rather than silently
         // treated as conversation — see `routeSync`.

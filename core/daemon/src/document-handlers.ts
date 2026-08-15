@@ -842,7 +842,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   const authorConsent = async (who: {
     agentName: string;
     ownerAgentId: string;
-  }, documentId: string): Promise<
+  }, documentId: string, kind: "consent" | "refuse_join" = "consent"): Promise<
     | { ok: true; entryHash: string; holdersNotified: Record<string, boolean> }
     | { ok: false; reason: string }
   > => {
@@ -856,12 +856,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       document_id: documentId,
       epoch_id: derived.state.interimMaxEpoch + 1,
       prev_amendment_hash: derived.state.interimLastHash,
-      kind: "consent",
+      kind,
       subject_agent_id: who.ownerAgentId,
-      property_change: {
-        key: "consents_to",
-        value: `${String(derived.state.properties["assurance_tier"])}/${DOCUMENT_FEATURE_VERSION}`,
-      },
+      // A refusal names nothing it agrees to — it is the subject's own signed no (R24).
+      property_change:
+        kind === "consent"
+          ? {
+              key: "consents_to",
+              value: `${String(derived.state.properties["assurance_tier"])}/${DOCUMENT_FEATURE_VERSION}`,
+            }
+          : null,
       state_hash: null,
       authored_at_ms: deps.now(),
       author_agent_id: who.ownerAgentId,
@@ -910,7 +914,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       holders: [...withNew.state.participants, ...withNew.state.invited].filter(
         (p) => p !== who.ownerAgentId,
       ),
-      verb: "consent",
+      verb: kind,
     });
     return { ok: true, entryHash: entryHex, holdersNotified };
   };
@@ -1237,7 +1241,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (!derived.ok) {
       return { ok: false, reason: "document_chain_invalid", guidance: derived.reason };
     }
-    if (!derived.state.participants.has(holder)) {
+    if (!derived.state.participants.has(holder) && !derived.state.invited.has(holder)) {
       // ALREADY REMOVED is the HEALING path, not a refusal (REMOVE-1 review F3): a holder who
       // was offline at removal time never learned, and no other verb can ever re-send the
       // removal amendment — a second cello_doc_remove is the invite-retry precedent. A subject
@@ -1429,6 +1433,40 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     if (documentId.length === 0) {
       return { ok: false, reason: "invalid_document_id", guidance: "Pass 'document_id' from cello_doc_inbox." };
     }
+    // THE NEW-MODEL INVITATION (SYNC-P3): the document arrived through the exchange and this
+    // agent derives as an INVITED seat — declining is authoring your own signed refuse_join
+    // entry (R24), which reaches every holder over the same carrier as everything else and
+    // settles the inviter's surface from the record itself.
+    if (layer.store.getDocument(who.ownerAgentId, documentId)) {
+      const genesisRecord = layer.handshake.get(who.ownerAgentId, documentId);
+      if (genesisRecord) {
+        const standing = deriveDocumentState(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          layer.amendments.chain(who.ownerAgentId, documentId),
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (standing.ok && standing.state.invited.has(who.ownerAgentId)) {
+          const refusal = await authorConsent(who, documentId, "refuse_join");
+          if (!refusal.ok) {
+            return {
+              ok: false,
+              reason: "document_refusal_unrecorded",
+              guidance: `Your refusal entry could not be recorded (${refusal.reason}) — run ` +
+                `cello_doc_refuse again once the named condition clears.`,
+            };
+          }
+          return {
+            ok: true,
+            documentId,
+            joined: false,
+            refusalEntry: refusal.entryHash,
+            refusalDelivered: refusal.holdersNotified,
+          };
+        }
+      }
+    }
+
     const pendingJoinRefusal = layer.joins
       .pendingFor(who.ownerAgentId)
       .find((j) => j.documentId === documentId);

@@ -371,8 +371,11 @@ export function deriveDocumentState(
       }
       case "remove_holder": {
         if (subject === null) return `amendment_subject_required: remove_holder names nobody`;
-        if (!state.participants.has(subject)) {
-          return `amendment_subject_not_holder: ${subject} does not hold this document`;
+        // An INVITED seat is removable too — that is invitation retraction (P3): an admin takes
+        // back an unanswered offer, and a consent concurrent with the retraction is void under
+        // the same removal-dominance every other authority conflict follows.
+        if (!state.participants.has(subject) && !state.invited.has(subject)) {
+          return `amendment_subject_not_holder: ${subject} neither holds this document nor holds an invitation to it`;
         }
         break;
       }
@@ -445,6 +448,7 @@ export function deriveDocumentState(
         break;
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
+        state.invited.delete(body.subject_agent_id!);
         if (state.admins.has(body.subject_agent_id!)) {
           state.spentDeclaredAdmins.add(body.subject_agent_id!);
         }

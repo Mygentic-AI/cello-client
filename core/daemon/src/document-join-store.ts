@@ -158,6 +158,29 @@ export class DocumentJoinStore {
   }
 
   /**
+   * SYNC-P3 — settle an INVITER-side pending row from the subject's own signed ENTRY (consent or
+   * refuse_join) arriving over the exchange. The entry is the answer; there is no answer frame
+   * behind it and no bytes to store. Settle-once like everything here: a decided row is
+   * untouched, so a redelivered entry decides nothing twice.
+   */
+  settleFromEntry(
+    ownerAgentId: string,
+    amendmentHash: string,
+    accepted: boolean,
+    reason: string | null,
+    nowMs: number,
+  ): { settled: boolean } {
+    const r = this.#db
+      .prepare(
+        `UPDATE document_join_offers
+            SET state = ?, reason = ?, decided_at = ?
+          WHERE owner_agent_id = ? AND amendment_hash = ? AND role = 'inviter' AND state = 'pending'`,
+      )
+      .run(accepted ? "accepted" : "refused", reason, nowMs, ownerAgentId, amendmentHash);
+    return { settled: (r.changes ?? 0) > 0 };
+  }
+
+  /**
    * Record the invitee's signed ANSWER on the inviter's side. The caller verifies the signature
    * against the invitee named in the STORED offer first. Settle-once: a contradicting second
    * answer is refused with both records retained (the stored answer stands).
