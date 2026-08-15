@@ -58,6 +58,22 @@ function routeAll(from: HandlerFixture, to: HandlerFixture) {
   }
 }
 
+/**
+ * SYNC-P4 (D5 deleted): seat an invitee through the EXCHANGE. `cello_doc_invite` already put the
+ * notice — a step-1 position frame — on the inviter's wire; bouncing the exchange lands the
+ * genesis and the entry set on the invitee (empty hand → world → bootstrap). Bounded, and safe
+ * to repeat: every frame in the exchange is idempotent on arrival.
+ */
+async function seatViaExchange(inviter: HandlerFixture, invitee: HandlerFixture, documentId: string) {
+  for (let i = 0; i < 6 && invitee.layer.store.getDocument(invitee.owner, documentId) === null; i++) {
+    routeAll(inviter, invitee);
+    await new Promise((r) => setTimeout(r, 25));
+    routeAll(invitee, inviter);
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  await until(() => invitee.layer.store.getDocument(invitee.owner, documentId) !== null);
+}
+
 async function newFixture(opts: { sendFails?: string } = {}) {
   /** Mutable so a test can fail the first send and succeed the retry — the real recovery sequence. */
   let sendFails = opts.sendFails;
@@ -361,7 +377,7 @@ describe("cello_doc_propose — a document exists and the offer leaves", () => {
 });
 
 describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
-  it("invite → offer → inbox → accept → materialized content → answer settled on the inviter", async () => {
+  it("invite → notice → exchange bootstrap → inbox → accept — the consent entry seats the joiner on the inviter", async () => {
     const fA = await newFixture(); // the inviter's daemon
     const fC = await newFixture(); // the invitee's daemon — its own DB, its own keys
 
@@ -380,25 +396,20 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       document_id: documentId,
       invitee_pubkey: fC.owner,
     });
-    expect(invited).toMatchObject({ ok: true, offerSent: true, epochId: 1 });
+    expect(invited).toMatchObject({ ok: true, noticeSent: true, epochId: 1 });
 
-    // The offer crossed A's transport addressed to C; C receives it on the session channel and
-    // the router queues the validation.
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner);
-    expect(offerSend).toBeDefined();
-    const routed = fC.layer.onDocumentFrame(AGENT, "session-1", offerSend!.bytes, fA.owner);
-    expect(routed.consumed).toBe(true);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    // The NOTICE crossed A's transport (a step-1 position frame — no offer, no carried history);
+    // bouncing the exchange bootstraps C: empty hand, then the world with the genesis.
+    await seatViaExchange(fA, fC, documentId);
 
     const inbox = await fC.call("cello_doc_inbox");
     expect((inbox.joins as Array<{ documentId: string }>)[0]?.documentId).toBe(documentId);
 
-    // C consents BY DERIVING — the accept re-replays the carried bytes.
+    // C consents BY DERIVING — their own daemon computed the rules from the signed record.
     const accepted = await fC.call("cello_doc_accept", { document_id: documentId });
     expect(accepted).toMatchObject({ ok: true, joined: true });
-    expect(accepted.appliedEnvelopes as number).toBeGreaterThanOrEqual(1);
 
-    // C's copy carries A's content, rebuilt from the snapshot. C's accept AUTHORED their
+    // C's copy carries A's content, applied from the exchange. C's accept AUTHORED their
     // consent entry (R21), so C's chain holds the admission plus the consent.
     expect(fC.layer.live.get(fC.owner, documentId).getText("content").toString()).toContain(
       "hello from A",
@@ -406,12 +417,9 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(2);
     expect(fA.layer.store.currentDocumentEpoch(fA.owner, documentId)).toBe(1);
 
-    // C's frames reach A — the signed answer settles the offer, and the CONSENT ENTRY is what
-    // turns C from invited into a participant in A's own derivation.
+    // C's frames reach A — the CONSENT ENTRY is what turns C from invited into a participant
+    // in A's own derivation. No answer frame exists to settle anything.
     routeAll(fC, fA);
-    await until(
-      () => fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.state === "accepted",
-    );
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);
     expect(fA.layer.holdersFor(fA.owner, documentId)).toContain(fC.owner);
   });
@@ -424,12 +432,21 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     });
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
-    // The AMENDMENT half is valid and delivered — and C holds NOTHING until C's own accept.
-    expect(fC.layer.store.getDocument(fC.owner, documentId)).toBeNull();
-    expect(fC.layer.store.currentDocumentEpoch(fC.owner, documentId)).toBe(0);
+    await seatViaExchange(fA, fC, documentId);
+    // The admission is delivered and C even HOLDS the record now — but no fold anywhere seats
+    // C as a participant until C's OWN consent entry exists (R22): the admission alone admits
+    // nobody, on either daemon.
+    const cInbox = await fC.call("cello_doc_inbox");
+    expect((cInbox.joins as Array<{ documentId: string }>)[0]?.documentId).toBe(documentId);
+    // `holdersFor` is the FAN-OUT set and deliberately includes invited seats — the seat that
+    // proves participation is the derived participants list on each surface.
+    for (const f of [fA, fC]) {
+      const list = await f.call("cello_doc_list", {});
+      const row = (list.documents as Array<Record<string, unknown>>).find(
+        (d) => d.documentId === documentId,
+      )!;
+      expect(row.participants).not.toContain(fC.owner);
+    }
   });
 
   it("the inbox SHOWS THE RULES the invitee is consenting to — participants, admins, properties", async () => {
@@ -440,9 +457,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     });
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await seatViaExchange(fA, fC, documentId);
     const inbox = await fC.call("cello_doc_inbox");
     const entry = (inbox.joins as Array<Record<string, unknown>>)[0]!;
     expect(entry.documentId).toBe(documentId);
@@ -453,34 +468,6 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(entry.admins).toEqual([fA.owner]);
     expect((entry.properties as Record<string, unknown>).append_only).toBe(true);
     expect(entry.assuranceTier).toBe("authenticated");
-  });
-
-  it("a REFUSED join settles on the inviter with the operator's reason — and C still holds nothing", async () => {
-    const fA = await newFixture();
-    const fC = await newFixture();
-    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
-    const documentId = proposed.documentId as string;
-    const invited = await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
-    const refused = await fC.call("cello_doc_refuse", {
-      document_id: documentId, reason: "not this one thanks",
-    });
-    expect(refused).toMatchObject({ ok: true, joined: false });
-    expect(fC.layer.store.getDocument(fC.owner, documentId)).toBeNull();
-    const answerSend = fC.sent.find((s) => s.peerAgentId === fA.owner)!;
-    fA.layer.onDocumentFrame(AGENT, "session-1", answerSend.bytes, fC.owner);
-    await until(
-      () => fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.state === "refused",
-    );
-    expect(fA.layer.joins.get(fA.owner, invited.amendmentHash as string)?.reason).toBe(
-      "not this one thanks",
-    );
-    // And the inviter's list SURFACES the answer.
-    const list = await fA.call("cello_doc_list");
-    const offers = list.joinOffers as Array<Record<string, unknown>>;
-    expect(offers.find((o) => o.documentId === documentId)).toMatchObject({ state: "refused" });
   });
 
   it("an existing holder VALIDATES an arriving amendment before appending — a forged one is refused", async () => {
@@ -839,11 +826,9 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     routeAll(fB, fA);
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
 
-    // C joins FIRST (offer routed), so the offer's snapshot predates what A writes next.
+    // C joins FIRST (seated through the exchange), so C's copy predates what A writes next.
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.filter((send) => send.peerAgentId === fC.owner).at(-1)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     // B must know C is seated before it will answer C's exchange: route C's consent AND the
     // admitting entry to B (in production the amendment carrier owes B both; here we route).
@@ -908,8 +893,8 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     routeAll(fB, fA);
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
 
-    // A invites C (the entry lands in A's chain; the legacy offer send is IGNORED — nothing
-    // from it is routed) and writes content afterwards, so the exchange must carry both.
+    // A invites C (the entry lands in A's chain; the notice frame the invite itself sent is
+    // deliberately not routed) and writes content afterwards, so the exchange must carry both.
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
     await fA.call("cello_doc_write", { document_id: documentId, content: "history before C. " });
 
@@ -947,10 +932,13 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     routeAll(fC, fA);
     await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
     await until(() => fA.layer.holdersFor(fA.owner, documentId)!.includes(fC.owner));
-    // The inviter's join surface settled FROM THE ENTRY — no answer frame was ever routed.
-    expect(
-      fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state,
-    ).toBe("accepted");
+    // The inviter's invitation surface settled FROM THE ENTRY — C is a participant, so no
+    // pending-invitation row survives anywhere.
+    {
+      const settledList = await fA.call("cello_doc_list", {});
+      const rows = (settledList.joinOffers as Array<Record<string, unknown>> | undefined) ?? [];
+      expect(rows.find((r) => r.inviteeAgentId === fC.owner)).toBeUndefined();
+    }
     const list = await fA.call("cello_doc_list", {});
     const row = (list.documents as Array<Record<string, unknown>>).find(
       (d) => d.documentId === documentId,
@@ -1090,11 +1078,18 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(refused.ok, JSON.stringify(refused)).toBe(true);
     expect(typeof refused.refusalEntry).toBe("string");
     routeAll(fC, fA);
-    await until(
-      () =>
-        fA.layer.joins.outgoingFor(fA.owner).find((r) => r.inviteeAgentId === fC.owner)?.state ===
-        "refused",
+    await until(() =>
+      fA.layer.amendments
+        .chain(fA.owner, documentId)
+        .some((e) => e.body.kind === "refuse_join" && e.body.subject_agent_id === fC.owner),
     );
+    // The inviter's surface shows the refusal — derived from the entry, no answer frame anywhere.
+    const refusedList = await fA.call("cello_doc_list", {});
+    expect(
+      ((refusedList.joinOffers as Array<Record<string, unknown>> | undefined) ?? []).find(
+        (r) => r.inviteeAgentId === fC.owner,
+      ),
+    ).toMatchObject({ state: "refused" });
     // C is no longer a seat anywhere.
     expect(fA.layer.holdersFor(fA.owner, documentId)).not.toContain(fC.owner);
 
@@ -1117,9 +1112,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     });
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     // C's consent entry reaches A — C is a participant A can remove (an invited seat cannot be
     // removed through the holder door; it has not sat down yet).
@@ -1163,9 +1156,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offerSend = fA.sent.find((s) => s.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     // A learns of C's consent before C leaves — otherwise the leave entry (which chains onto the
     // consent) sits held on A awaiting a parent A never got.
@@ -1209,7 +1200,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     expect(String(res.guidance)).toContain("governance_remove_admin_first");
   });
 
-  it("an under-signed offer admits nobody — recorded refused on the invitee, named", async () => {
+  it("a non-admin cannot invite — refused at authoring, and no notice leaves", async () => {
     const fA = await newFixture();
     const fC = await newFixture();
     const proposed = await fA.call("cello_doc_propose", {
@@ -1222,7 +1213,7 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
       document_id: documentId,
       invitee_pubkey: fC.owner,
     });
-    // The inviter's own daemon refuses at authoring — a non-admin cannot even mint the offer.
+    // The inviter's own daemon refuses at authoring — a non-admin cannot even mint the entry.
     expect(invited).toMatchObject({ ok: false, reason: "document_not_admin" });
     expect(fA.sent.find((s) => s.peerAgentId === fC.owner)).toBeUndefined();
   });
@@ -1556,9 +1547,7 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     routeAll(fB, fA);
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 1);
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    const offer = fA.sent.find((send) => send.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offer.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     routeAll(fC, fA);
     await until(() => fA.layer.amendments.chain(fA.owner, documentId).length === 3);
@@ -1813,11 +1802,8 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fA.peer });
     const documentId = proposed.documentId as string;
     await fA.call("cello_doc_invite", { document_id: documentId, invitee_pubkey: fC.owner });
-    // C consents — an invited seat that never sat down cannot be removed through the holder
-    // door (invitation retraction is a different verb, owed by the exchange work).
-    const offerSend = fA.sent.find((send) => send.peerAgentId === fC.owner)!;
-    fC.layer.onDocumentFrame(AGENT, "session-1", offerSend.bytes, fA.owner);
-    await until(() => fC.layer.joins.pendingFor(fC.owner).length === 1);
+    // C consents — seated through the exchange, then the ordinary consent-authoring accept.
+    await seatViaExchange(fA, fC, documentId);
     await fC.call("cello_doc_accept", { document_id: documentId });
     routeAll(fC, fA);
     await until(() => fA.layer.store.currentDocumentEpoch(fA.owner, documentId) === 2);

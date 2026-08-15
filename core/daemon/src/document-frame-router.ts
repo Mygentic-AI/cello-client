@@ -75,8 +75,6 @@ import {
   decodeDocumentProposal,
   decodeDocumentRejection,
   decodeDocumentProposalAck,
-  decodeDocumentJoinOffer,
-  decodeDocumentJoinAnswer,
   decodeDocumentAmendment,
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
@@ -96,8 +94,6 @@ export type DocumentFrameKind =
   | "proposal"
   | "rejection"
   | "proposal_ack"
-  | "join_offer"
-  | "join_answer"
   | "amendment"
   | "reconcile";
 
@@ -143,9 +139,6 @@ export interface DocumentFrameRouterDeps {
    * M14B / DOD-MP-JOIN-1 — an admin's offer to a third party. Validated (the invitee REPLAYS the
    * carried bytes) and recorded — pending or refused-with-reason, never dropped.
    */
-  recordJoinOffer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
-  /** The invitee's signed answer to an offer we authored. Settle-once. */
-  recordJoinAnswer(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * An amendment reaching an EXISTING holder — validated against our own chain
    * (validate-before-append) and appended, so our derived participant set does not silently
@@ -478,14 +471,6 @@ export class DocumentFrameRouter {
         this.#d.recordProposalAck(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
       }
-      if (kind === "join_offer") {
-        this.#d.recordJoinOffer(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
-      if (kind === "join_answer") {
-        this.#d.recordJoinAnswer(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
       if (kind === "amendment") {
         this.#d.recordAmendment(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
@@ -629,12 +614,6 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_proposal_ack":
         decodeDocumentProposalAck(content);
         return "proposal_ack";
-      case "document_join_offer":
-        decodeDocumentJoinOffer(content);
-        return "join_offer";
-      case "document_join_answer":
-        decodeDocumentJoinAnswer(content);
-        return "join_answer";
       case "document_amendment":
         decodeDocumentAmendment(content);
         return "amendment";

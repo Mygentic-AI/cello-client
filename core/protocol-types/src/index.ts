@@ -257,23 +257,7 @@ export type {
   DocumentProperties,
   DocumentConsentState,
 } from "./document-proposal.js";
-export {
-  DOCUMENT_JOIN_OFFER_DOMAIN,
-  buildDocumentJoinOfferTbs,
-  encodeDocumentJoinOffer,
-  decodeDocumentJoinOffer,
-  validateDocumentJoinOffer,
-  arrangementGenesisFromProposal,
-} from "./document-join.js";
-export type { DocumentJoinOffer, JoinOfferValidation } from "./document-join.js";
-export {
-  DOCUMENT_JOIN_ANSWER_DOMAIN,
-  MAX_JOIN_REFUSAL_REASON_LENGTH,
-  buildDocumentJoinAnswerTbs,
-  encodeDocumentJoinAnswer,
-  decodeDocumentJoinAnswer,
-} from "./document-join-answer.js";
-export type { DocumentJoinAnswer } from "./document-join-answer.js";
+export { arrangementGenesisFromProposal } from "./document-proposal.js";
 export { documentGovernancePolicy } from "./document-governance.js";
 export type { GovernanceVerdict } from "./document-governance.js";
 export {

@@ -34,14 +34,8 @@ import {
   documentAmendmentHash,
   buildDocumentMultisigTbs,
   encodeDocumentAmendment,
-  buildDocumentJoinOfferTbs,
-  encodeDocumentJoinOffer,
-  validateDocumentJoinOffer,
-  encodeDocumentUpdateEnvelope,
-  DOCUMENT_UPDATE_ENCODING_V1,
   type DocumentAmendmentBody,
   type DocumentAmendmentEnvelope,
-  type DocumentJoinOffer,
   buildDocumentProposalTbs,
   documentIdFromProposal,
   seamViolation,
@@ -532,74 +526,47 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         hasStartingContent: p.envelope.starting_content !== null,
         proposedAtMs: p.envelope.proposed_at_ms,
       })),
-      // M14B / DOD-MP-JOIN-1 — offers to join an EXISTING document, decided with the same
-      // accept/refuse verbs (route by document_id). THE RULES ARE SHOWN HERE, derived by replay
-      // of the carried bytes — the operator consents to what their own daemon computed — and
-      // cello_doc_accept re-derives at the moment of consequence. An entry whose stored bytes no
-      // longer validate says so, never silently omitted.
-      joins: layer.joins.pendingFor(who.ownerAgentId).map((j) => {
-        const derived = validateDocumentJoinOffer(
-          j.offer, documentGovernancePolicy, layer.verifySignature,
-        );
-        return {
-          documentId: j.documentId,
-          inviterAgentId: j.inviterAgentId,
-          amendmentHash: j.amendmentHash,
-          offeredAtMs: j.offer.offered_at_ms,
-          carriedEnvelopes: j.offer.envelope_log.length,
-          ...(derived.ok
-            ? {
-                participants: [...derived.arrangement.participants].sort(),
-                invited: [...(derived.arrangement.invited ?? [])].sort(),
-                admins: [...derived.arrangement.admins].sort(),
-                properties: derived.arrangement.properties,
-                assuranceTier: derived.genesis.properties.assurance_tier,
-                documentType: derived.genesis.document_type,
-              }
-            : { invalid: derived.reason }),
-        };
-      }),
-      // Auto-refused offers (version mismatch, chains that do not replay) — recorded with the
-      // sentence written for the operator, and listed so it actually reaches one.
-      refusedJoins: layer.joins.refusedFor(who.ownerAgentId).map((j) => ({
-        documentId: j.documentId,
-        inviterAgentId: j.inviterAgentId,
-        reason: j.reason,
-        offeredAtMs: j.offer.offered_at_ms,
-      })),
+      // SYNC-P4 (D5 deleted): open invitations, DERIVED — a document this daemon holds whose
+      // entry set says this agent is an invited seat. The operator consents to what their own
+      // daemon computed from the signed record, not to a carried snapshot; cello_doc_accept
+      // re-derives at the moment of consequence. The inviter shown is the author of the admit
+      // entry naming this agent (the genesis proposer for a genesis-named seat).
+      joins: layer.store
+        .listDocuments(who.ownerAgentId)
+        .filter((d) => d.status === "active")
+        .flatMap((d) => {
+          const genesisRecord = layer.handshake.get(who.ownerAgentId, d.documentId);
+          if (!genesisRecord) return [];
+          const derived = deriveDocumentState(
+            arrangementGenesisFromProposal(genesisRecord.envelope),
+            layer.amendments.chain(who.ownerAgentId, d.documentId),
+            documentGovernancePolicy,
+            layer.verifySignature,
+          );
+          if (!derived.ok || !derived.state.invited.has(who.ownerAgentId)) return [];
+          const admit = layer.amendments
+            .chain(who.ownerAgentId, d.documentId)
+            .find(
+              (e) => e.body.kind === "add_holder" && e.body.subject_agent_id === who.ownerAgentId,
+            );
+          return [
+            {
+              documentId: d.documentId,
+              inviterAgentId:
+                admit?.body.author_agent_id ?? genesisRecord.envelope.proposer_agent_id,
+              participants: [...derived.state.participants].sort(),
+              invited: [...derived.state.invited].sort(),
+              admins: [...derived.state.admins].sort(),
+              properties: derived.state.properties,
+              assuranceTier: "authenticated",
+              documentType: d.documentType,
+            },
+          ];
+        }),
     };
   });
 
-  /**
-   * Tell the INVITER what was decided — the join twin of `tellProposer`, and the same doctrine:
-   * best-effort, because consent is local and final the moment the operator makes it, and an
-   * unreachable inviter must not get a veto over the invitee's choice.
-   */
-  async function tellInviter(
-    who: Resolved,
-    documentId: string,
-    inviterAgentId: string,
-    answerBytes: Uint8Array,
-  ): Promise<boolean> {
-    try {
-      const sent = await deps.transportFor(who.agentName).sendBytes({
-        peerAgentId: inviterAgentId,
-        documentId,
-        bytes: answerBytes,
-        correlationId: randomUUID(),
-      });
-      if (!sent.ok) {
-        logger.warn("document.join.answer_unsent", { documentId, reason: sent.reason });
-      }
-      return sent.ok;
-    } catch (err: unknown) {
-      logger.warn("document.join.answer_send_threw", {
-        documentId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-  }
+  // The join-answer frame died with D5 — the consent/refusal ENTRY is the answer, and it fans out.
 
   handlers.set("cello_doc_accept", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -624,67 +591,37 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           layer.verifySignature,
         );
         if (standing.ok && standing.state.invited.has(who.ownerAgentId)) {
+          // THE JOIN PATH (SYNC-P4, D5 deleted): the document arrived through the exchange, this
+          // agent derives as an invited seat, and accepting IS authoring the consent entry (R21)
+          // — which travels to every holder over the same carrier as everything else. Until it
+          // reaches them, their fold shows this agent invited, not participating. Idempotent by
+          // re-run: a consent that failed to record is authored on the next accept.
           const consent = await authorConsent(who, documentId);
           if (!consent.ok) {
             return {
               ok: false,
               reason: "document_consent_unrecorded",
               guidance:
-                `You hold this document but your consent entry is still unrecorded ` +
+                `You hold this document but your consent entry is not recorded ` +
                 `(${consent.reason}) — run cello_doc_accept again once the named condition ` +
                 `clears.`,
             };
           }
+          const doc = layer.store.getDocument(who.ownerAgentId, documentId)!;
+          const joinFile = await materialize(who.ownerAgentId, documentId, doc.documentType);
           return {
             ok: true,
             documentId,
+            joined: true,
             consentEntry: consent.entryHash,
             consentDelivered: consent.holdersNotified,
-            guidance:
-              "Your earlier accept had recorded the decision but not your consent entry — it is " +
-              "now recorded and on its way to the other holders.",
+            filePath: joinFile.path,
+            ...(joinFile.path !== null && openingNoticeFor(doc.documentType) !== undefined
+              ? { fileNotice: openingNoticeFor(doc.documentType) }
+              : {}),
           };
         }
       }
-    }
-
-    // A join offer decided with the SAME verb the inbox advertises. Routed first by exact
-    // pending match, so a proposal and a join for different documents can never shadow each
-    // other; an id that matches neither falls through to the proposal path's own refusal.
-    const pendingJoin = layer.joins
-      .pendingFor(who.ownerAgentId)
-      .find((j) => j.documentId === documentId);
-    if (pendingJoin) {
-      const joined = await layer.acceptJoin(who.ownerAgentId, pendingJoin.amendmentHash, deps.now());
-      if (!joined.ok) return { ok: false, reason: joined.reason, guidance: joined.detail };
-      // R21: accepting IS authoring your consent entry — until it reaches the other holders,
-      // their fold shows this agent invited, not participating.
-      const consent = await authorConsent(who, documentId);
-      if (!consent.ok) {
-        return {
-          ok: false,
-          reason: "document_consent_unrecorded",
-          guidance:
-            `The join was applied but your consent entry could not be recorded ` +
-            `(${consent.reason}) — run cello_doc_accept again; the offer is idempotent.`,
-        };
-      }
-      const joinFile = await materialize(who.ownerAgentId, documentId, joined.documentType);
-      const told = await tellInviter(who, documentId, joined.inviterAgentId, joined.answerBytes);
-      return {
-        ok: true,
-        documentId,
-        joined: true,
-        peerAgentId: joined.inviterAgentId,
-        inviterNotified: told,
-        consentEntry: consent.entryHash,
-        consentDelivered: consent.holdersNotified,
-        appliedEnvelopes: joined.applied,
-        filePath: joinFile.path,
-        ...(joinFile.path !== null && openingNoticeFor(joined.documentType) !== undefined
-          ? { fileNotice: openingNoticeFor(joined.documentType) }
-          : {}),
-      };
     }
 
     const outcome = layer.handshake.accept(who.ownerAgentId, documentId, deps.now());
@@ -1004,68 +941,48 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           `Current admins: ${[...derived.state.admins].join(", ")}.`,
       };
     }
-    if (derived.state.participants.has(invitee) || derived.state.invited.has(invitee)) {
-      // A RE-RUN after the amendment landed but the offer did not reach them: re-send the STORED
-      // offer bytes (the proposal --retry precedent) rather than refusing — authoring afresh
-      // would try to admit a holder the chain already admitted, which the replay refuses.
+    if (derived.state.participants.has(invitee)) {
+      return {
+        ok: false,
+        reason: "document_already_holder",
+        guidance: "That agent already holds this document — there is nothing to invite them to.",
+      };
+    }
+    if (derived.state.invited.has(invitee)) {
+      // A RE-RUN while the invitation is open: the admitting entry is already in the chain, so
+      // authoring afresh would only mint a void. Re-send the NOTICE (SYNC-R25) — initiating a
+      // reconcile exchange is idempotent by construction, and the invitee's empty-handed answer
+      // pulls the genesis and the whole entry set across. The other holders are re-fanned the
+      // admitting entry too: one who missed it is wedged, refusing the invitee by name.
       const admitting = chain.find(
         (e) => e.body.kind === "add_holder" && e.body.subject_agent_id === invitee,
       );
       const priorHash = admitting
         ? Buffer.from(documentAmendmentHash(admitting.body)).toString("hex")
         : null;
-      const outgoing = priorHash ? layer.joins.get(who.ownerAgentId, priorHash) : null;
-      if (outgoing && outgoing.role === "inviter" && outgoing.state === "pending") {
-        let resent = false;
-        try {
-          const sent = await deps.transportFor(who.agentName).sendBytes({
-            peerAgentId: invitee,
-            documentId,
-            bytes: new Uint8Array(encodeDocumentJoinOffer(outgoing.offer)),
-            correlationId: randomUUID(),
-          });
-          resent = sent.ok;
-        } catch (err: unknown) {
-          logger.warn("document.join.offer_resend_threw", {
-            documentId, error: err instanceof Error ? err.message : String(err),
-          });
-        }
-        // AND THE STALE HOLDERS. A holder who missed the amendment fan-out is wedged — their
-        // publishes refuse as epoch-stale with guidance they cannot follow, because no verb
-        // re-sent the amendment. The re-invite is the healing verb: it re-fans the admitting
-        // amendment to every other current holder, best-effort, reported per holder.
-        const admittingBytes = outgoing.offer.amendments[outgoing.offer.amendments.length - 1];
-        let holdersNotified: Record<string, boolean> = {};
-        // `priorHash` is non-null whenever `outgoing` is — the lookup is keyed by it — but the
-        // narrowing does not survive the branch, and an amendment seeded under a null key would be
-        // owed to a row nothing can ever join.
-        if (admittingBytes !== undefined && priorHash !== null) {
-          holdersNotified = await fanOutAmendment({
-            agentName: who.agentName,
-            ownerAgentId: who.ownerAgentId,
-            documentId,
-            amendmentHashHex: priorHash,
-            amendmentBytes: new Uint8Array(admittingBytes),
-            holders: [...derived.state.participants, ...derived.state.invited].filter(
-              (holder) => holder !== who.ownerAgentId && holder !== invitee,
-            ),
-            verb: "re-invite",
-          });
-        }
-        return {
-          ok: true,
+      const renotice = await layer.initiateReconcile(who.ownerAgentId, invitee, [documentId]);
+      let holdersNotified: Record<string, boolean> = {};
+      if (admitting && priorHash !== null) {
+        holdersNotified = await fanOutAmendment({
+          agentName: who.agentName,
+          ownerAgentId: who.ownerAgentId,
           documentId,
-          inviteeAgentId: invitee,
-          amendmentHash: priorHash,
-          resent: true,
-          offerSent: resent,
-          holdersNotified,
-        };
+          amendmentHashHex: priorHash,
+          amendmentBytes: new Uint8Array(encodeDocumentAmendment(admitting)),
+          holders: [...derived.state.participants, ...derived.state.invited].filter(
+            (holder) => holder !== who.ownerAgentId && holder !== invitee,
+          ),
+          verb: "re-invite",
+        });
       }
       return {
-        ok: false,
-        reason: "document_already_holder",
-        guidance: "That agent already holds this document — there is nothing to invite them to.",
+        ok: true,
+        documentId,
+        inviteeAgentId: invitee,
+        amendmentHash: priorHash,
+        resent: true,
+        noticeSent: renotice.ok,
+        holdersNotified,
       };
     }
 
@@ -1126,61 +1043,16 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     const amendmentBytes = new Uint8Array(encodeDocumentAmendment(amendment));
     layer.amendments.append(who.ownerAgentId, documentId, amendmentBytes, deps.now());
 
-    // The snapshot: update rows only, re-encoded losslessly. Rejection records stay local —
-    // quarantine bridging is receiver-side state, not shared history.
-    const log = layer.store.getEnvelopeLog(who.ownerAgentId, documentId);
-    const snapshot: Uint8Array[] = [];
-    for (const row of log) {
-      if (row.kind !== "update" || row.payload === null) continue;
-      snapshot.push(
-        new Uint8Array(
-          encodeDocumentUpdateEnvelope({
-            type: "document_update",
-            document_id: row.documentId,
-            epoch_id: row.epochId,
-            doc_prev_hash: row.docPrevHash,
-            sender_agent_id: row.senderAgentId,
-            sender_client_id: row.senderClientId ?? 0,
-            update_encoding: DOCUMENT_UPDATE_ENCODING_V1,
-            state_vector: row.stateVector,
-            governance_parents: [...row.governanceParents],
-            update: row.payload,
-            signature: row.signature,
-          }),
-        ),
-      );
-    }
-
-    const offer: DocumentJoinOffer = {
-      type: "document_join_offer",
-      feature_version: DOCUMENT_FEATURE_VERSION,
-      inviter_agent_id: who.ownerAgentId,
-      invitee_agent_id: invitee,
-      document_id: documentId,
-      genesis: new Uint8Array(encodeDocumentProposal(genesisRecord.envelope)),
-      amendments: [...chain.map((e) => new Uint8Array(encodeDocumentAmendment(e))), amendmentBytes],
-      envelope_log: snapshot,
-      offered_at_ms: deps.now(),
-      signature: new Uint8Array(0),
-    };
-    offer.signature = await deps.sign(who.agentName, buildDocumentJoinOfferTbs(offer));
-    const wire = new Uint8Array(encodeDocumentJoinOffer(offer));
     const amendHashHex = Buffer.from(amendHash).toString("hex");
-    layer.joins.recordOutgoing(who.ownerAgentId, wire, amendHashHex, deps.now());
-
-    // The offer to the invitee, then the amendment to every OTHER current holder — both
-    // best-effort at P1, each reported as a fact rather than assumed.
-    let offerSent = false;
-    try {
-      const sent = await deps.transportFor(who.agentName).sendBytes({
-        peerAgentId: invitee, documentId, bytes: wire, correlationId: randomUUID(),
-      });
-      offerSent = sent.ok;
-      if (!sent.ok) logger.warn("document.join.offer_unsent", { documentId, reason: sent.reason });
-    } catch (err: unknown) {
-      logger.warn("document.join.offer_send_threw", {
-        documentId, error: err instanceof Error ? err.message : String(err),
-      });
+    // THE NOTICE (SYNC-R25, replacing the D5 offer): no bespoke frame carrying history — the
+    // inviter initiates a reconcile exchange naming the document. The invitee's daemon answers
+    // the unheld position with an empty hand, and the step-2 reply carries the genesis and the
+    // whole entry set (the P3 bootstrap). Losing the notice strands nothing: the admission is in
+    // the chain, and any later exchange with any holder delivers it.
+    const notice = await layer.initiateReconcile(who.ownerAgentId, invitee, [documentId]);
+    const offerSent = notice.ok;
+    if (!notice.ok) {
+      logger.warn("document.join.notice_unsent", { documentId, reason: notice.reason });
     }
     // DOD-MP-INVITE-FANOUT-1 — RECORD WHAT IS OWED BEFORE TRYING TO SEND IT.
     //
@@ -1203,23 +1075,23 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       holders: owedHolders,
       verb: "invite",
     });
-    logger.info("document.join.invited", { documentId, invitee, epochId: body.epoch_id, offerSent });
+    logger.info("document.join.invited", { documentId, invitee, epochId: body.epoch_id, noticeSent: offerSent });
     return {
       ok: true,
       documentId,
       inviteeAgentId: invitee,
       amendmentHash: amendHashHex,
       epochId: body.epoch_id,
-      offerSent,
+      noticeSent: offerSent,
       holdersNotified: holdersTold,
       ...(offerSent
         ? {}
         : {
             guidance:
-              "The amendment is recorded and the invitation exists, but the offer did not reach " +
+              "The admission is recorded and the invitation exists, but the notice did not reach " +
               "the invitee — they may be offline. Re-run cello_doc_invite with the same invitee " +
-              "once they are reachable: it re-sends this exact offer rather than authoring a " +
-              "second amendment.",
+              "once they are reachable: it re-sends the notice rather than authoring a second " +
+              "entry.",
           }),
     };
   });
@@ -1499,18 +1371,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       }
     }
 
-    const pendingJoinRefusal = layer.joins
-      .pendingFor(who.ownerAgentId)
-      .find((j) => j.documentId === documentId);
-    if (pendingJoinRefusal) {
-      const refused = await layer.refuseJoin(
-        who.ownerAgentId, pendingJoinRefusal.amendmentHash, reason, deps.now(),
-      );
-      if (!refused.ok) return { ok: false, reason: refused.reason, guidance: refused.detail };
-      const told = await tellInviter(who, documentId, refused.inviterAgentId, refused.answerBytes);
-      return { ok: true, documentId, joined: false, inviterNotified: told };
-    }
-
     const proposal = layer.handshake.get(who.ownerAgentId, documentId);
     const outcome = layer.handshake.refuse(who.ownerAgentId, documentId, reason, deps.now());
     if (!outcome.ok) return { ok: false, reason: outcome.reason, guidance: outcome.detail };
@@ -1591,20 +1451,45 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       }
     };
 
-    const outgoingJoins = layer.joins.outgoingFor(who.ownerAgentId).map((j) => ({
-      documentId: j.documentId,
-      inviteeAgentId: j.inviteeAgentId,
-      state: j.state,
-      ...(j.reason ? { reason: j.reason } : {}),
-      ...(j.state === "refused"
-        ? {
-            guidance:
-              "The invitee declined but the admitting amendment is already in the chain — they " +
-              "count as a holder until removed. The removal verb ships in the next unit of this " +
-              "milestone; nothing needs doing meanwhile.",
-          }
-        : {}),
-    }));
+    // SYNC-P4 (D5 deleted): the invitation ledger IS the entry set. An open invitation is an
+    // invited seat in the derivation; a refusal is the subject's own refuse_join entry in the
+    // chain. No stored offer rows — asked twice, the record answers twice, identically.
+    const outgoingJoins = layer.store
+      .listDocuments(who.ownerAgentId)
+      .flatMap((d) => {
+        const genesisRecord = layer.handshake.get(who.ownerAgentId, d.documentId);
+        if (!genesisRecord) return [];
+        let chain;
+        try {
+          chain = layer.amendments.chain(who.ownerAgentId, d.documentId);
+        } catch {
+          return [];
+        }
+        const derived = deriveDocumentState(
+          arrangementGenesisFromProposal(genesisRecord.envelope),
+          chain,
+          documentGovernancePolicy,
+          layer.verifySignature,
+        );
+        if (!derived.ok) return [];
+        const open = [...derived.state.invited]
+          .filter((seat) => seat !== who.ownerAgentId)
+          .map((seat) => ({ documentId: d.documentId, inviteeAgentId: seat, state: "pending" as const }));
+        const refusedSeats = chain
+          .filter((e) => e.body.kind === "refuse_join")
+          .map((e) => e.body.subject_agent_id)
+          .filter((seat): seat is string => seat !== null && seat !== who.ownerAgentId)
+          .filter(
+            (seat) =>
+              !derived.state.participants.has(seat) && !derived.state.invited.has(seat),
+          );
+        const refused = [...new Set(refusedSeats)].map((seat) => ({
+          documentId: d.documentId,
+          inviteeAgentId: seat,
+          state: "refused" as const,
+        }));
+        return [...open, ...refused];
+      });
     return {
       ok: true,
       ...(outgoingJoins.length > 0 ? { joinOffers: outgoingJoins } : {}),
