@@ -35,7 +35,6 @@ import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
 import { addColumnIfMissing } from "./column-birth.js";
 import {
-  DOCUMENT_AMENDMENTS_CREATE_SQL,
   DOCUMENT_ENTRIES_CREATE_SQL,
   dropLegacyEpochColumn,
 } from "./document-amendment-store.js";
@@ -316,17 +315,6 @@ const CREATE_REJECTIONS_RECEIVED_SQL = `
   );
 `;
 
-/** Mirrors `DocumentLifecycle`'s definition exactly — see the note at the exec site. */
-const CREATE_WITHDRAWALS_SQL = `
-  CREATE TABLE IF NOT EXISTS document_withdrawals (
-    owner_agent_id TEXT    NOT NULL,
-    document_id    TEXT    NOT NULL,
-    envelope_hash  TEXT    NOT NULL,
-    created_at     INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id, envelope_hash)
-  );
-`;
-
 const CREATE_SNAPSHOTS_SQL = `
   CREATE TABLE IF NOT EXISTS document_snapshots (
     owner_agent_id      TEXT    NOT NULL,
@@ -374,7 +362,7 @@ export class DocumentStore {
     }
     // M14B / DOD-MP-AMEND-1 — the amendments table this store READS (currentDocumentEpoch);
     // DocumentAmendmentStore owns writes. Shared definition, whichever constructs first wins.
-    this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
+    this.#db.exec(`DROP TABLE IF EXISTS document_amendments`);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
     dropLegacyEpochColumn(this.#db, "document_entries");
     this.#db.exec(CREATE_ENVELOPES_SQL);
@@ -388,12 +376,8 @@ export class DocumentStore {
       }
     }
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
-    // Owned by DocumentLifecycle, created HERE too because `pendingDeliveries` references it and a
-    // store used without the lifecycle module is a legitimate configuration. Both statements are
-    // CREATE TABLE IF NOT EXISTS over the same definition, so whichever runs first wins and the
-    // other is a no-op — the alternative is a query that throws on a missing table and takes an
-    // entire delivery pass down with it.
-    this.#db.exec(CREATE_WITHDRAWALS_SQL);
+    // D9 residue sweep (review F5): withdrawals have no reader or writer left.
+    this.#db.exec(`DROP TABLE IF EXISTS document_withdrawals`);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
     // COLUMN BIRTH. A daemon that already holds an envelope log must gain the column without
     // losing the log. `ALTER TABLE ... ADD COLUMN` throws when it is already there, which is the

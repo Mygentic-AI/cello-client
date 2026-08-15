@@ -77,8 +77,14 @@ function newFixture() {
   const engine = new DocumentEngine(logger);
   // SYNC-P4: closes are ENTRIES and the pending question is answered by the derivation on the
   // layer; this unit only ever sees the injected answer.
-  const lifecycle = new DocumentLifecycle(store, logger, () => false, () => false);
-  return { store, engine, lifecycle, events, db };
+  const state = { ended: null as "closed" | "killed" | null, derived: true };
+  const lifecycle = new DocumentLifecycle(
+    store, logger,
+    () => false,
+    () => false,
+    () => ({ derived: state.derived, ended: state.ended }),
+  );
+  return { store, engine, lifecycle, events, db, state };
 }
 
 describe("DocumentLifecycle — list", () => {
@@ -112,7 +118,7 @@ describe("DocumentLifecycle — list", () => {
       documentId: DOC, ownerAgentId: AGENT, peerAgentId: PEER, documentType: "markdown",
       properties: {}, status: "active", createdAtMs: 1,
     });
-    const lifecycle = new DocumentLifecycle(store, logger, () => false, () => true);
+    const lifecycle = new DocumentLifecycle(store, logger, () => false, () => true, () => ({ derived: true, ended: null }));
     const row = lifecycle.list(AGENT, NOW).find((r) => r.documentId === DOC);
     expect((row as unknown as { removed?: boolean }).removed).toBe(true);
     expect(row!.status).toBe("active");
@@ -134,27 +140,18 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
     expect((verdict as { detail: string }).detail).toMatch(/paused/);
   });
 
-  it("a paused agent STILL admits incoming updates, mechanically", () => {
-    const f = newFixture();
-    f.lifecycle.setPlatformPaused(AGENT, true, NOW);
-    // Refusing inbound would make the pause visible to the peer as a protocol fault and would
-    // force a rejection round for something that is not the peer's doing.
-    expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
-  });
-
   it("a paused agent suppresses notifications", () => {
     const f = newFixture();
     f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     expect(f.lifecycle.shouldNotify(AGENT)).toBe(false);
   });
 
-  it("unpausing resumes all three", () => {
+  it("unpausing resumes publish and notifications", () => {
     const f = newFixture();
     f.lifecycle.setPlatformPaused(AGENT, true, NOW);
     f.lifecycle.setPlatformPaused(AGENT, false, NOW + 1);
 
     expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(true);
-    expect(f.lifecycle.canAdmit(AGENT, DOC).ok).toBe(true);
     expect(f.lifecycle.shouldNotify(AGENT)).toBe(true);
   });
 
@@ -169,16 +166,13 @@ describe("DocumentLifecycle — the kill switch (§16.7-11)", () => {
 
 
 describe("DocumentLifecycle — a STALLED document is terminal too", () => {
-  it("refuses publish and admit, naming the stall", () => {
+  it("refuses publish, naming the stall", () => {
     const f = newFixture();
     f.store.setDocumentStatus(AGENT, DOC, "stalled");
-
-    for (const verdict of [f.lifecycle.canPublish(AGENT, DOC), f.lifecycle.canAdmit(AGENT, DOC)]) {
-      expect(verdict.ok).toBe(false);
-      // REJECT-1 stalls a document after its retry rounds. Two partial gates that each know half
-      // the terminal states is how a caller ends up wrong about the other half.
-      expect((verdict as { reason: string }).reason).toBe("document_stalled");
-    }
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    // REJECT-1 stalls a document after its retry rounds; the refusal names the stall's two causes.
+    expect((verdict as { reason: string }).reason).toBe("document_stalled");
   });
 });
 
@@ -195,25 +189,41 @@ describe("DocumentLifecycle — the pause records WHEN", () => {
   });
 });
 
-describe("the terminal statuses gate publish AND admit — the projection is what these read", () => {
-  it("a closed document refuses both, naming the closure", () => {
+describe("endings gate publish through the FOLD — the column stands in only for legacy (review F2)", () => {
+  it("a DERIVED closed ending refuses publish, whatever the column says", () => {
     const f = newFixture();
-    f.store.setDocumentStatus(AGENT, DOC, "closed");
-    for (const verdict of [f.lifecycle.canPublish(AGENT, DOC), f.lifecycle.canAdmit(AGENT, DOC)]) {
-      expect(verdict.ok).toBe(false);
-      expect((verdict as { reason: string }).reason).toBe("document_closed");
-    }
+    f.state.ended = "closed";
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_closed");
   });
 
-  it("a killed document refuses both, and the log is KEPT — a kill never destroys the record", () => {
+  it("a DERIVED killed ending refuses publish, and the log is KEPT — a kill never destroys the record", () => {
     const f = newFixture();
     const e = envelope(AGENT, null);
     f.store.appendEnvelope(AGENT, e);
-    f.store.setDocumentStatus(AGENT, DOC, "killed");
-    for (const verdict of [f.lifecycle.canPublish(AGENT, DOC), f.lifecycle.canAdmit(AGENT, DOC)]) {
-      expect(verdict.ok).toBe(false);
-      expect((verdict as { reason: string }).reason).toBe("document_killed");
-    }
+    f.state.ended = "killed";
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_killed");
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(1);
+  });
+
+  it("a stale closed COLUMN does not refuse when the fold derives the document live", () => {
+    // The F2 shape: a concurrently-arriving admission re-opened the derivation, and the column
+    // lagged. The publish gate asks the fold, so the lag costs nothing.
+    const f = newFixture();
+    f.store.setDocumentStatus(AGENT, DOC, "closed");
+    f.state.ended = null;
+    expect(f.lifecycle.canPublish(AGENT, DOC).ok).toBe(true);
+  });
+
+  it("a LEGACY document (no derivation) is judged by its column — that record IS its ending", () => {
+    const f = newFixture();
+    f.state.derived = false;
+    f.store.setDocumentStatus(AGENT, DOC, "killed");
+    const verdict = f.lifecycle.canPublish(AGENT, DOC);
+    expect(verdict.ok).toBe(false);
+    expect((verdict as { reason: string }).reason).toBe("document_killed");
   });
 });

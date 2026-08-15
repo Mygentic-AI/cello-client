@@ -151,7 +151,7 @@ export interface DocumentLayer {
   lifecycle: DocumentLifecycle;
   notifications: DocumentNotifications;
   rejections: DocumentRejections;
-  /** M14B — the amendment chain (write path; reads go through `store.currentDocumentEpoch`). */
+  /** M14B — the entry chain: the fork-tolerant store the fold derives from. */
   amendments: DocumentAmendmentStore;
   /** The layer's one Ed25519 verifier seam — for handlers that run the replay themselves. */
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
@@ -257,6 +257,14 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     },
     // SYNC-D8 — "was this owner written out?" answered by the same fold as everything else.
     (ownerAgentId, documentId) => standingOf(ownerAgentId, documentId, ownerAgentId) === "removed",
+    // Review F2 — "is it ended?" answered by the fold too; `derived: false` hands the pre-pivot
+    // bilateral record back to its column.
+    (ownerAgentId, documentId) => {
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      return derived.ok
+        ? { derived: true, ended: derived.state.ended }
+        : { derived: false, ended: null };
+    },
   );
   const notifications = new DocumentNotifications(store, logger);
   // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool
@@ -413,7 +421,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
 
   /**
    * SYNC-D8 — the ONE derivation of an agent's standing in a document, from the fold. The old
-   * linear membership walk (`walkMembership`) was a second derivation that could disagree with
+   * old linear membership walk was a second derivation that could disagree with
    * the fold about who is seated; every consumer now asks this.
    *
    *  - participant / invited: seated, per R17.
@@ -537,25 +545,31 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       // THE ARRIVING CONSENT IS THE JOIN ANSWER (SYNC-P3, the D5 replacement): an inviter's
       // pending row settles from the entry itself — the subject's own signed yes or no — so
       // the legacy answer frame carries nothing the record does not. Settle-once semantics
-      // SYNC-P4 (R27/R28): the stored status is a PROJECTION of the derived ending — synced
-      // whenever an entry that can move it applies. The derivation is the truth; the column is
-      // what the list surface reads without re-deriving every row.
-      if (
-        applied.body.kind === "close" ||
-        applied.body.kind === "kill" ||
-        applied.body.kind === "remove_holder"
-      ) {
+      // SYNC-P4 (R27/R28, review F2): the stored status is a DISPLAY PROJECTION of the derived
+      // ending — recomputed on EVERY applied entry, in BOTH directions. One-way, kind-gated
+      // syncing let two holders converge on the fold while holding different status columns
+      // forever: a concurrently-authored admission re-opens the derivation (an invited seat
+      // blocks closure), and nothing ever wrote `active` back. The derivation is the truth; the
+      // column exists so the list surface does not re-derive every row, and no correctness gate
+      // reads it for endings anymore (canPublish/canAdmit ask the fold).
+      {
         const derivedEnd = reconcileReads(ownerAgentId).deriveState(documentId);
-        if (derivedEnd.ok && derivedEnd.state.ended !== null) {
-          store.setDocumentStatus(
-            ownerAgentId,
-            documentId,
-            derivedEnd.state.ended === "killed" ? "killed" : "closed",
-          );
-          logger.info("document.ended.derived", {
-            documentId,
-            ended: derivedEnd.state.ended,
-          });
+        if (derivedEnd.ok) {
+          const current = store.getDocument(ownerAgentId, documentId)?.status;
+          if (derivedEnd.state.ended !== null && current === "active") {
+            store.setDocumentStatus(
+              ownerAgentId,
+              documentId,
+              derivedEnd.state.ended === "killed" ? "killed" : "closed",
+            );
+            logger.info("document.ended.derived", { documentId, ended: derivedEnd.state.ended });
+          } else if (
+            derivedEnd.state.ended === null &&
+            (current === "closed" || current === "killed")
+          ) {
+            store.setDocumentStatus(ownerAgentId, documentId, "active");
+            logger.info("document.reopened.derived", { documentId });
+          }
         }
       }
     };
@@ -1093,7 +1107,14 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     initiateReconcile,
     governanceFrontierFor: (ownerAgentId: string, documentId: string) => {
       const derived = reconcileReads(ownerAgentId).deriveState(documentId);
-      return derived.ok ? [...derived.state.frontier] : null;
+      if (!derived.ok) {
+        // NAMED, not collapsed to null (review F4): the derivation's own reason — a missing
+        // genesis, undecodable bytes, a fold refusal — is the thing the operator hunts for,
+        // and the old holders gate logged it while this gate ran first and said nothing.
+        logger.error("document.frontier.underivable", { documentId, reason: derived.reason });
+        return null;
+      }
+      return [...derived.state.frontier];
     },
     deriveEnded: (ownerAgentId: string, documentId: string) => {
       const derived = reconcileReads(ownerAgentId).deriveState(documentId);

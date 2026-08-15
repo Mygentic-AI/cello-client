@@ -104,9 +104,10 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
     expect(() => new DocumentAmendmentStore(db as never, silent)).not.toThrow();
   });
 
-  it("opens a database populated BEFORE the pivot without touching its rows", () => {
-    // The pre-P1 table (epoch-keyed) may hold old-shape bytes. Constructing the new store over
-    // it must neither crash nor mistake those rows for entries.
+  it("opens a database populated BEFORE the pivot cleanly — the dead epoch-keyed table is dropped in place (D7)", () => {
+    // The pre-P1 table (epoch-keyed) may hold old-shape bytes no reader can decode and no code
+    // consults. Constructing the new store over it must neither crash nor mistake those rows for
+    // entries — and the residue sweep drops the table itself (review F6).
     const legacy = new DatabaseSync(":memory:");
     legacy.exec(`
       CREATE TABLE IF NOT EXISTS document_amendments (
@@ -122,10 +123,10 @@ describe("DocumentAmendmentStore — the fork-tolerant entry store", () => {
       .run(OWNER, DOC, 1, "ab".repeat(32), Buffer.from([1, 2, 3]), 500);
     const s2 = new DocumentAmendmentStore(legacy as never, silent);
     expect(s2.chain(OWNER, DOC)).toHaveLength(0);
-    const still = legacy
-      .prepare(`SELECT COUNT(*) AS n FROM document_amendments`)
+    const gone = legacy
+      .prepare(`SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'document_amendments'`)
       .get() as { n: number };
-    expect(still.n).toBe(1);
+    expect(gone.n).toBe(0);
   });
 
   it("append → chain round-trips the RECEIVED bytes", () => {

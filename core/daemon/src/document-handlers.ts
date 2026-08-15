@@ -872,14 +872,11 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   /**
    * M14B / DOD-MP-JOIN-1 — invite a third party into an existing document.
    *
-   * One admin's signature authors the admitting amendment (D2); the invitee's own consent makes
-   * the join real (their accept, on their daemon). VALIDATE-THEN-APPEND: the chain including the
-   * new amendment replays through the real policy before one byte lands — the AMEND-1 standing
-   * condition at its second production append site. The offer carries the genesis, the whole
-   * chain, and the update-log snapshot re-encoded from rows (lossless: the client id is a
-   * column, the encoding a pinned constant — the same re-encode the delivery path ships).
-   * Existing holders get the amendment frame BEST-EFFORT at P1; the epoch gate makes a missed
-   * one loud, and durable per-holder delivery is FANOUT-1.
+   * One admin's signature authors the admitting entry; the invitee's own consent makes the
+   * join real (their accept, on their daemon). VALIDATE-THEN-APPEND: the chain including the
+   * new entry derives through the real policy before one byte lands. The invitee gets a NOTICE
+   * — a step-1 reconcile frame (SYNC-R25) — and bootstraps the world through the exchange;
+   * existing holders get the entry best-effort, with any miss repaired by their next exchange.
    */
   handlers.set("cello_doc_invite", async (params, connectionId) => {
     const who = resolve(params, connectionId);
@@ -1495,7 +1492,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         // confiscation reading FORWARD-ONLY-REMOVAL exists to forbid.
         //
         // ALWAYS PRESENT, exactly as `participants` is: an absent key is read as "fine", so on a
-        // chain this build cannot decode — where `removedFromArrangement` honestly cannot tell —
+        // chain this build cannot decode — where the standing derivation honestly cannot tell —
         // it says `unknown` rather than going quiet and rendering a removed holder as a holder.
         const standing: "removed" | "holder" | "unknown" =
           arrangement["arrangementUnavailable"] !== undefined

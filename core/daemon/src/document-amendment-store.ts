@@ -38,18 +38,6 @@ import type { Logger } from "./types.js";
  * writes it. Rows predating the pivot stay untouched — old-shape bytes are not decodable by the
  * v2 codec and are not migrated (no compatibility owed; essentially no documents exist).
  */
-export const DOCUMENT_AMENDMENTS_CREATE_SQL = `
-  CREATE TABLE IF NOT EXISTS document_amendments (
-    owner_agent_id  TEXT    NOT NULL,
-    document_id     TEXT    NOT NULL,
-    epoch_id        INTEGER NOT NULL,
-    amendment_hash  TEXT    NOT NULL,
-    received_bytes  BLOB    NOT NULL,
-    recorded_at     INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id, epoch_id)
-  );
-`;
-
 /**
  * Shared with `DocumentStore` (the :352 shared-definition precedent): its membership walk and
  * epoch read consume `document_entries`, so the tables must exist whichever module constructs
@@ -137,7 +125,10 @@ export class DocumentAmendmentStore {
   constructor(db: DaemonDatabase, logger: Logger) {
     this.#db = db;
     this.#logger = logger;
-    this.#db.exec(DOCUMENT_AMENDMENTS_CREATE_SQL);
+    // D7/D9 residue sweep (review F5/F6): the epoch-keyed legacy table and the withdrawals
+    // table have no reader or writer left — never born on a fresh database, dropped in place
+    // on one that predates the pivot.
+    this.#db.exec(`DROP TABLE IF EXISTS document_amendments`);
     this.#db.exec(DOCUMENT_ENTRIES_CREATE_SQL);
     dropLegacyEpochColumn(this.#db, "document_entries");
   }

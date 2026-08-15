@@ -191,8 +191,6 @@ function plantAmendment2(
 ) {
   const body = {
     document_id: DOC,
-    epoch_id: epoch,
-    prev_amendment_hash: null,
     kind,
     subject_agent_id: subject,
     property_change: null,
@@ -292,7 +290,7 @@ describe("DOD-MP-INBOUND-N-1 — the sender gate follows the DERIVED arrangement
   });
 });
 
-describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
+describe("DocumentInbound — the sender rulings that replaced the epoch gate (SYNC-P4)", () => {
   /**
    * Raise the document's current epoch by planting a DECODABLE amendment-chain row — the
    * membership walk (DOD-MP-REMOVE-1) decodes every stored row, so a garbage blob here is a
@@ -306,8 +304,6 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
   ) {
     const body = {
       document_id: DOC,
-      epoch_id: epoch,
-      prev_amendment_hash: null,
       kind,
       subject_agent_id: subject,
       property_change: null,
@@ -381,7 +377,7 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
     expect((res as { detail: string }).detail).toContain("removal is forward-only");
   });
 
-  it("a REMOVED sender's envelope is TERMINAL, naming the removal epoch — never a silent drop", async () => {
+  it("a REMOVED sender's envelope is TERMINAL, naming the removal — never a silent drop", async () => {
     const f = newFixture();
     plantAmendment(f.db, 1, "remove_holder", PEER);
     const res = await f.inbound.receive(
@@ -735,7 +731,7 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
     expect((res as { envelopeHash?: string }).envelopeHash).toBe(documentEnvelopeHash(env));
   });
 
-  it("a KILLED and a CLOSED document are terminal too — they will never accept this envelope", async () => {
+  it("a KILLED and a CLOSED LEGACY document is terminal — no chain, so the column is its ending", async () => {
     for (const status of ["killed", "closed"] as const) {
       const f = newFixture({ status });
       const env = envelope();
@@ -745,6 +741,20 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
       // defect came straight back with every gate green. Caught in review, not by the gate.
       expect(res, status).toMatchObject({ terminal: true, envelopeHash: documentEnvelopeHash(env) });
     }
+  });
+
+  it("a DERIVABLE document whose column says closed still ADMITS an ending-free frontier (R30/AC16 — review F1)", async () => {
+    // The last edits before an agreed close are precisely what the exchange still owes every
+    // holder: A edits, goes offline, everyone closes, A returns — A's edit carries a frontier
+    // with no ending in it and MUST apply, even though this holder's status column already
+    // projects "closed". The old stored-status gate refused it terminally, silently losing it.
+    const f = newFixture({
+      status: "closed",
+      currentHolders: () => [PEER],
+    });
+    const env = envelope();
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
   });
 
   it("a NON-PARTY is answered with SILENCE even when the document is killed", async () => {

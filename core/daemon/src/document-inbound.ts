@@ -389,15 +389,16 @@ export class DocumentInbound {
     // 4b (SYNC-G1): the epoch-equality ruling and the current-state removed-sender check are
     // GONE — both are the causal sender gate's job now, ruled at the envelope's signed
     // frontier before anything else ran. (D7: the epoch stamp itself dies with this phase.)
-    // 5. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
-    // comment describing the bug it was written to fix — "after a restart the document row said
-    // `stalled` while the daemon happily accepted updates on it". The only inbound path in the
-    // codebase was reintroducing it, and a killed document is defined by LIFECYCLE-1 as one that
-    // stops accepting.
-    if (doc.status === "killed" || doc.status === "closed") {
+    // 5. The document must still ACCEPT — but for a document whose chain DERIVES, the ending
+    // ruling already happened at step 4 (R30: an ending in the envelope's own named ancestors
+    // refuses terminally; a frontier free of endings MUST be admitted, AC16 — the last edits
+    // before an agreed close are precisely the content the exchange still owes every holder,
+    // and the status column is a display projection that can lag the fold; review F1). Only a
+    // LEGACY document — no derivable chain, so no frontier to rule at — is judged by its stored
+    // status here, because for the pre-pivot bilateral record the column IS its ending.
+    if (senderHolders === null && (doc.status === "killed" || doc.status === "closed")) {
       // TERMINAL, and for the same reason `document_stalled` below is NOT: these are DECISIONS.
-      // Nothing the sender does makes a killed or closed document accept this envelope, so leaving
-      // their delivery outstanding buys nothing and costs a redelivery per tick, forever.
+      // Nothing the sender does makes a killed or closed legacy document accept this envelope.
       return {
         ok: false,
         reason: doc.status === "killed" ? "document_killed" : "document_closed",

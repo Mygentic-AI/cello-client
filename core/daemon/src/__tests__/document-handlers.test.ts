@@ -1594,6 +1594,29 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     await until(() => fA.layer.store.getDocument(fA.owner, documentId)!.status === "closed");
   });
 
+  it("a CLOSED projection REOPENS when a concurrent admission arrives — the column follows the fold both ways (review F2)", async () => {
+    // A closes, then invites D before ever seeing the other closes — legal on A's daemon, whose
+    // world is not ended yet. B, holding all three closes, projects "closed". When A's invite
+    // lands, B's fold has an open invited seat again, so the derivation says the agreement never
+    // settled — and the status column must FOLLOW it back, or B refuses publishes forever on a
+    // document every fold says is live.
+    const { fA, fB, fC, documentId } = await threeSeated();
+    await fA.call("cello_doc_close", { document_id: documentId });
+    await fB.call("cello_doc_close", { document_id: documentId });
+    await fC.call("cello_doc_close", { document_id: documentId });
+    routeAll(fA, fB);
+    routeAll(fC, fB);
+    await until(() => fB.layer.store.getDocument(fB.owner, documentId)!.status === "closed");
+
+    const invited = await fA.call("cello_doc_invite", {
+      document_id: documentId, invitee_pubkey: "d".repeat(64),
+    });
+    expect(invited.ok, JSON.stringify(invited)).toBe(true);
+    routeAll(fA, fB);
+    await until(() => fB.layer.store.getDocument(fB.owner, documentId)!.status === "active");
+    expect(fB.events).toContain("document.reopened.derived");
+  });
+
   it("a KILL is one admin's entry — immediate locally, and the entry stops the other daemons when it lands", async () => {
     const { fA, fB, documentId } = await threeSeated();
     const killed = await fA.call("cello_doc_kill", { document_id: documentId });
@@ -1826,7 +1849,7 @@ describe("DOD-MP-REMOVE-FEEDBACK-1 — a holder who is out is told, on the surfa
     )!;
   };
 
-  it("the row says they are out, at which epoch, and that the copy is theirs", async () => {
+  it("the row says they are out, and that the copy is theirs", async () => {
     const fA = await newFixture();
     const fB = await newFixture();
     const proposed = await fA.call("cello_doc_propose", {

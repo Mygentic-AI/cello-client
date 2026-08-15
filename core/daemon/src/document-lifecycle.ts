@@ -49,6 +49,10 @@ export class DocumentLifecycle {
   readonly #logger: Logger;
   readonly #closePendingFor: (ownerAgentId: string, documentId: string) => boolean;
   readonly #removedFor: (ownerAgentId: string, documentId: string) => boolean;
+  readonly #endedFor: (
+    ownerAgentId: string,
+    documentId: string,
+  ) => { derived: boolean; ended: "closed" | "killed" | null };
 
   constructor(
     store: DocumentStore,
@@ -61,11 +65,22 @@ export class DocumentLifecycle {
     closePendingFor: (ownerAgentId: string, documentId: string) => boolean,
     /** SYNC-D8 — "was this owner written out?", answered by the layer's one fold derivation. */
     removedFor: (ownerAgentId: string, documentId: string) => boolean,
+    /**
+     * SYNC-P4 review F2 — "is this document ended?", answered by the fold, never the status
+     * column. `derived: false` means the chain does not derive (legacy bilateral, undecodable
+     * bytes); ONLY there does the stored column stand in, because for a pre-pivot document the
+     * column IS the record of its ending.
+     */
+    endedFor: (
+      ownerAgentId: string,
+      documentId: string,
+    ) => { derived: boolean; ended: "closed" | "killed" | null },
   ) {
     this.#store = store;
     this.#logger = logger;
     this.#closePendingFor = closePendingFor;
     this.#removedFor = removedFor;
+    this.#endedFor = endedFor;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
@@ -80,10 +95,8 @@ export class DocumentLifecycle {
       documentType: d.documentType,
       // DOD-MP-REMOVE-1 — display overlay, derived: a removed holder's row still says active in
       // the table (removal is a chain fact, not a stored flag), and a list that said "active"
-      // would be the surface claiming more than forward-only allows.
-      // DOD-MP-REMOVE-FEEDBACK-1 — the epoch travels with the flag, from the SAME walk. Deriving
-      // it separately in the surface layer would be a second walk of one chain, which
-      // `walkMembership`'s own header forbids: two walks disagreeing about whether someone was
+      // would be the surface claiming more than forward-only allows. Answered by the layer's
+      // ONE fold derivation (SYNC-D8) — two derivations disagreeing about whether someone was
       // removed is two daemons disagreeing about the arrangement.
       ...(this.#removedFor(ownerAgentId, d.documentId) ? { removed: true } : {}),
       assuranceTier: "authenticated",
@@ -129,10 +142,19 @@ export class DocumentLifecycle {
     if (!doc) {
       return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
     }
-    if (doc.status === "closed") {
+    // THE FOLD RULES ENDINGS (review F2): the status column is a display projection that can lag
+    // the derivation (a concurrently-arriving admission re-opens a closure). Only a document whose
+    // chain does not derive — the pre-pivot bilateral record — is judged by its column.
+    const ending = this.#endedFor(ownerAgentId, documentId);
+    const ended = ending.derived
+      ? ending.ended
+      : doc.status === "closed" || doc.status === "killed"
+        ? (doc.status as "closed" | "killed")
+        : null;
+    if (ended === "closed") {
       return { ok: false, reason: "document_closed", detail: "this document was closed by agreement" };
     }
-    if (doc.status === "killed") {
+    if (ended === "killed") {
       return { ok: false, reason: "document_killed", detail: "this document was ended locally" };
     }
     // DOD-MP-REMOVE-1, forward-only — DERIVED from the amendment chain, never a stored flag:
@@ -173,38 +195,6 @@ export class DocumentLifecycle {
     return { ok: true };
   }
 
-  /** Inbound. A pause does NOT refuse it — see the header. */
-  canAdmit(ownerAgentId: string, documentId: string): Verdict {
-    const doc = this.#store.getDocument(ownerAgentId, documentId);
-    if (!doc) {
-      return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
-    }
-    if (doc.status === "killed") {
-      return { ok: false, reason: "document_killed", detail: "this document was ended locally" };
-    }
-    if (doc.status === "closed") {
-      return { ok: false, reason: "document_closed", detail: "this document was closed by agreement" };
-    }
-    if (doc.status === "stalled") {
-      return {
-        ok: false,
-        reason: "document_stalled",
-        // NAMES BOTH CAUSES, because `stalled` has two and this text asserted one of them.
-        //
-        // It is set by REJECT-1 after the peer's gate refuses repeatedly, AND by the delivery
-        // worker's unacked ceiling — where the peer's daemon never answered at all. Those are
-        // opposite subsystems. An operator hitting the second was told to go and read rejection
-        // reasons, which do not exist for it, and the shipped skill sent them to a `cello_doc_list`
-        // field that does not exist either.
-        detail:
-          "this document stopped accepting updates. Two things set that state and they need " +
-          "different actions: the peer's gate REFUSED your updates repeatedly (look for " +
-          "document.rejection.received), or their daemon never CONFIRMED them at all (look for " +
-          "document.delivery.unacked_limit — that one may be a local fault, not theirs)",
-      };
-    }
-    return { ok: true };
-  }
 
   shouldNotify(agentId: string): boolean {
     return !this.isPlatformPaused(agentId);

@@ -27,9 +27,10 @@
  *                      the binding is LEARNABLE, and this envelope is where it is learned. Outside
  *                      the signature, "learnable" would mean "assertable by anyone on the wire".
  *
- * `doc_prev_hash` is not optional and is not defaulted (§14). An update that does
- * not state its epoch cannot be verified unambiguously after a compaction, and the chain link is
- * what lets the document log be extracted and verified across sealed sessions.
+ * `doc_prev_hash` is not optional and is not defaulted (§14): the chain link is what lets the
+ * document log be extracted and verified across sealed sessions, and a decoder that read absence
+ * as null would turn every gap into a valid-looking genesis. `governance_parents` is likewise
+ * mandatory — it is content's only causal link to the governance that makes it admissible.
  */
 
 import { createHash } from "node:crypto";

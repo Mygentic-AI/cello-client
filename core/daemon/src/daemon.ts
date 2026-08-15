@@ -3795,9 +3795,24 @@ async function startDaemonHoldingLock(
     // envelope rides the exchange's own difference computation. Fire-and-forget by contract.
     nudgeSeats: (ownerAgentId, documentId, seats) => {
       for (const seat of seats) {
-        void documentLayer.initiateReconcile(ownerAgentId, seat, [documentId]).catch(() => {
-          // initiateReconcile reports its own failures; nothing here may throw out of publish.
-        });
+        void documentLayer
+          .initiateReconcile(ownerAgentId, seat, [documentId])
+          .then((sent) => {
+            if (!sent.ok) {
+              // NOT SILENT (review F3): a lost nudge is legal for correctness (any later
+              // exchange recomputes the difference — R40), but until P5's sweeps exist this
+              // line is the only trace an operator has for "my edit never arrived".
+              logger.warn("document.reconcile.nudge_failed", {
+                documentId, peerAgentId: seat, reason: sent.reason,
+              });
+            }
+          })
+          .catch((err: unknown) => {
+            logger.warn("document.reconcile.nudge_failed", {
+              documentId, peerAgentId: seat,
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          });
       }
     },
   });

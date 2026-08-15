@@ -101,6 +101,41 @@ describe("document update envelope — the decoder refuses loudly, naming the ga
     );
   });
 
+  it("an ABSENT governance_parents is refused — the causal link is not optional (SYNC-G1)", () => {
+    // This field is the envelope's ONLY link to the governance world that makes it admissible
+    // (R20/R30 rule on it). A decoder that defaulted it to [] would hand every legacy or forged
+    // envelope the genesis world for free.
+    const map = asMap(envelope());
+    delete map.governance_parents;
+    expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(
+      /document_envelope_missing_field.*governance_parents/,
+    );
+  });
+
+  it("a NON-CANONICAL governance_parents list is refused — one envelope, one identity", () => {
+    // Descending order and duplicates each yield a second byte-identity for the same logical
+    // envelope; the strictly-ascending rule is what makes the hash a canonical name.
+    const a = "aa".repeat(32);
+    const b = "bb".repeat(32);
+    for (const bad of [[b, a], [a, a]]) {
+      const map = asMap(envelope());
+      map.governance_parents = bad;
+      expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(
+        /document_envelope_governance_parents_canonical/,
+      );
+    }
+  });
+
+  it("a governance_parents list past the cap of 64 is refused by name", () => {
+    const map = asMap(envelope());
+    map.governance_parents = Array.from({ length: 65 }, (_v, i) =>
+      i.toString(16).padStart(2, "0").repeat(32).slice(0, 64),
+    ).sort();
+    expect(() => decodeDocumentUpdateEnvelope(raw(map))).toThrow(
+      /document_envelope_governance_parents_cap/,
+    );
+  });
+
   it("an unrecognized update encoding is refused rather than guessed at", () => {
     const map = asMap(envelope());
     map.update_encoding = "yjs-v2";
