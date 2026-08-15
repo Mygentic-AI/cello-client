@@ -37,6 +37,11 @@ export interface DocumentStateView {
   /** Admitted, not yet answered (R22) — a seat at the table, not a voice. Counts toward the cap. */
   invited: ReadonlySet<string>;
   admins: ReadonlySet<string>;
+  /** R27/R28 — DERIVED, never tracked: "closed" when every current participant has closed;
+   *  "killed" on any admin's kill; null while live. */
+  ended: "closed" | "killed" | null;
+  /** Who has agreed to close — the surface's "waiting on" list is its complement. */
+  closedBy: ReadonlySet<string>;
   properties: Record<string, string | number | boolean | undefined>;
   /** The total order actually folded (applied AND void entries — F4 keeps voids in history). */
   order: readonly string[];
@@ -173,6 +178,8 @@ interface FoldState {
    * promote_admin, with its signature requirements, re-arms them. A refusal spends nothing.
    */
   spentDeclaredAdmins: Set<string>;
+  closes: Set<string>;
+  killed: boolean;
   properties: Record<string, string | number | boolean | undefined>;
 }
 
@@ -418,6 +425,29 @@ export function deriveDocumentState(
         }
         break;
       }
+      case "close": {
+        if (subject === null) return `amendment_subject_required: close names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a close is the closer's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        if (!state.participants.has(subject)) {
+          return `amendment_subject_not_holder: ${subject} has no seat to close from`;
+        }
+        break;
+      }
+      case "kill": {
+        if (subject === null) return `amendment_subject_required: kill names nobody`;
+        if (body.author_agent_id !== subject) {
+          return (
+            `entry_consent_not_subject: a kill is the admin's own act — authored by ` +
+            `${body.author_agent_id}, names ${subject}`
+          );
+        }
+        break;
+      }
       case "remove_holder": {
         if (subject === null) return `amendment_subject_required: remove_holder names nobody`;
         // An INVITED seat is removable too — that is invitation retraction (P3): an admin takes
@@ -494,6 +524,12 @@ export function deriveDocumentState(
         break;
       case "refuse_join":
         state.invited.delete(body.subject_agent_id!);
+        break;
+      case "close":
+        state.closes.add(body.subject_agent_id!);
+        break;
+      case "kill":
+        state.killed = true;
         break;
       case "remove_holder":
         state.participants.delete(body.subject_agent_id!);
@@ -583,6 +619,8 @@ export function deriveDocumentState(
       invited: new Set(genesisInvited),
       admins: new Set(genesisAdmins),
       spentDeclaredAdmins: new Set(),
+      closes: new Set(),
+      killed: false,
       properties: { ...genesis.properties },
     };
     const order = linearize(subset);
@@ -666,6 +704,13 @@ export function deriveDocumentState(
       participants: state.participants,
       invited: state.invited,
       admins: state.admins,
+      ended: state.killed
+        ? ("killed" as const)
+        : state.participants.size > 0 &&
+            [...state.participants].every((participant) => state.closes.has(participant))
+          ? ("closed" as const)
+          : null,
+      closedBy: state.closes,
       properties: state.properties,
       order,
       frontier,

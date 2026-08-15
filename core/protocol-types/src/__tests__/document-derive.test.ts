@@ -928,6 +928,108 @@ describe("deriveDocumentState — invitation retraction (P3: the missing verb)",
   });
 });
 
+describe("deriveDocumentState — endings as entries (R26–R31)", () => {
+  function consented(a: Signer, b: Signer) {
+    const g = genesis(a, b, [a, b]);
+    const bc = consentEntry(b);
+    return { g, bc };
+  }
+
+  it("a document is CLOSED when every current participant has a close entry — derived, never tracked (R27)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const half = deriveOk(g, [bc, closeA], [a, b]);
+    expect(half.ended).toBeNull(); // B has not closed — one party alone is never the agreement
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, closeA, closeB], [a, b]);
+    expect(s.ended).toBe("closed");
+  });
+
+  it("CONCURRENT closes are the normal case, not a conflict (R27) — and both stand", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    // Both close blind to each other — same parents, both apply.
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, closeA, closeB], [a, b]);
+    expect(s.ended).toBe("closed");
+    expect(s.voids).toEqual([]);
+  });
+
+  it("a KILL by any admin ends the document immediately, one-sided (R28)", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const kill = entry(
+      { kind: "kill", subject_agent_id: a.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, kill], [a, b]);
+    expect(s.ended).toBe("killed");
+  });
+
+  it("a NON-admin's kill is void by name — ending everyone's document takes admin power", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]); // b is NOT an admin
+    const bc = consentEntry(b);
+    const kill = entry(
+      { kind: "kill", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 2, parents: [hashHex(bc)] },
+      [b],
+    );
+    const s = deriveOk(g, [bc, kill], [a, b]);
+    expect(s.ended).toBeNull();
+    expect(s.voids[0]!.reason).toMatch(/governance_not_admin/);
+  });
+
+  it("a close is the CLOSER'S own act — nobody closes for you", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const { g, bc } = consented(a, b);
+    const forged = entry(
+      { kind: "close", subject_agent_id: b.agentId, epoch_id: 2, parents: [hashHex(bc)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, forged], [a, b]);
+    expect(s.ended).toBeNull();
+    expect(s.voids[0]!.reason).toMatch(/consent_self|not_subject|governance_consent_self/);
+  });
+
+  it("a removal COMPLETES a standing agreement (D8's ruling, now derived): the removed holder's silence stops counting", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const bc = consentEntry(b);
+    const admitC = entry({ subject_agent_id: c.agentId, parents: [hashHex(bc)] }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const closeA = entry(
+      { kind: "close", subject_agent_id: a.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    const closeB = entry(
+      { kind: "close", subject_agent_id: b.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [b],
+    );
+    const notYet = deriveOk(g, [bc, admitC, cc, closeA, closeB], [a, b, c]);
+    expect(notYet.ended).toBeNull(); // C is still editing
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 3, epoch_id: 4, parents: [hashHex(closeA)] },
+      [a],
+    );
+    const s = deriveOk(g, [bc, admitC, cc, closeA, closeB, removeC], [a, b, c]);
+    expect(s.ended).toBe("closed"); // everyone who REMAINS has agreed
+  });
+});
+
 describe("deriveDocumentState — replay-parity cases (coverage carried from the deleted linear replay)", () => {
   it("genesis alone: the proposer participates (their signature IS consent); the peer is invited", () => {
     const [a, b] = [makeSigner(), makeSigner()];

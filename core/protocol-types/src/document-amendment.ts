@@ -65,6 +65,11 @@ export const AMENDMENT_KINDS = [
   // party — nobody consents for you.
   "consent",
   "refuse_join",
+  // SYNC-P4 (R26-R28): endings are governance entries like everything else. A `close` is the
+  // closer's own signed agreement to end; the document is CLOSED when every current participant
+  // holds one (derived, never tracked). A `kill` is any single admin's immediate one-sided end.
+  "close",
+  "kill",
 ] as const;
 export type AmendmentKind = (typeof AMENDMENT_KINDS)[number];
 
