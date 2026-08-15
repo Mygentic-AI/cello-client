@@ -120,6 +120,8 @@ export interface QuarantineEntry {
   limitName?: string;
   limitValue?: number;
   limitActual?: number;
+  /** SYNC-R35: the exact signed refusal frame, when this row was written after the column shipped. */
+  rejectionWire?: Uint8Array;
 }
 
 /** A handle over the sender's local edits, so a rejection can be rolled back as inverses. */
@@ -302,6 +304,9 @@ export class DocumentRejections {
       limitName: input.limit?.name,
       limitValue: input.limit?.limit,
       limitActual: input.limit?.actual,
+      // SYNC-R35: the EXACT signed frame, kept so the refusal travels by the ordinary exchange —
+      // a third holder wedged behind this hole can only learn its name and reason from us.
+      rejectionWire: new Uint8Array(encodeDocumentRejection(envelope)),
       createdAtMs: input.nowMs,
     });
     if (!held) {
@@ -441,6 +446,7 @@ export class DocumentRejections {
       limitName: r.limitName,
       limitValue: r.limitValue,
       limitActual: r.limitActual,
+      rejectionWire: r.rejectionWire,
     }));
   }
 

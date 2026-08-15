@@ -118,6 +118,8 @@ export interface QuarantineRow {
   limitName?: string;
   limitValue?: number;
   limitActual?: number;
+  /** SYNC-R35: the exact signed refusal frame; absent on rows born before it. */
+  rejectionWire?: Uint8Array;
   createdAtMs: number;
 }
 
@@ -279,6 +281,10 @@ const CREATE_QUARANTINE_SQL = `
     limit_name            TEXT,
     limit_value           INTEGER,
     limit_actual          INTEGER,
+    -- SYNC-R35: the EXACT signed refusal frame, so the refusal can travel by the ordinary
+    -- exchange (re-encoding from columns cannot reproduce the signed bytes). Nullable: rows
+    -- born before R35 hold no wire, and the exchange simply has nothing to attach for them.
+    rejection_wire        BLOB,
     created_at            INTEGER NOT NULL,
     PRIMARY KEY (owner_agent_id, document_id, rejection_envelope_hash),
     FOREIGN KEY (owner_agent_id, document_id) REFERENCES documents (owner_agent_id, document_id)
@@ -374,6 +380,13 @@ export class DocumentStore {
     this.#db.exec(CREATE_ENVELOPES_SQL);
     dropLegacyEpochColumn(this.#db, "document_envelopes");
     this.#db.exec(CREATE_QUARANTINE_SQL);
+    // SYNC-R35, birth-gated like the epoch drops: a database born earlier lacks the column.
+    {
+      const cols = this.#db.prepare(`PRAGMA table_info(document_quarantine)`).all() as Array<{ name?: string }>;
+      if (!cols.some((c) => c.name === "rejection_wire")) {
+        this.#db.exec(`ALTER TABLE document_quarantine ADD COLUMN rejection_wire BLOB`);
+      }
+    }
     this.#db.exec(CREATE_REJECTIONS_RECEIVED_SQL);
     // Owned by DocumentLifecycle, created HERE too because `pendingDeliveries` references it and a
     // store used without the lifecycle module is a legitimate configuration. Both statements are
@@ -683,8 +696,8 @@ export class DocumentStore {
         `INSERT INTO document_quarantine
            (owner_agent_id, document_id, rejection_envelope_hash, rejected_envelope_hash,
             rejected_sender_agent_id, rejected_doc_prev_hash, payload, reason, detail,
-            rule, limit_name, limit_value, limit_actual, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            rule, limit_name, limit_value, limit_actual, rejection_wire, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (owner_agent_id, document_id, rejection_envelope_hash) DO NOTHING`,
       )
       .run(
@@ -701,6 +714,7 @@ export class DocumentStore {
         row.limitName ?? null,
         row.limitValue ?? null,
         row.limitActual ?? null,
+        row.rejectionWire ? Buffer.from(row.rejectionWire) : null,
         row.createdAtMs,
       );
     return Number(info.changes) > 0;
@@ -730,6 +744,7 @@ export class DocumentStore {
       limitName: (r["limit_name"] as string | null) ?? undefined,
       limitValue: (r["limit_value"] as number | null) ?? undefined,
       limitActual: (r["limit_actual"] as number | null) ?? undefined,
+      rejectionWire: r["rejection_wire"] == null ? undefined : toU8(r["rejection_wire"]),
       createdAtMs: r["created_at"] as number,
     }));
   }

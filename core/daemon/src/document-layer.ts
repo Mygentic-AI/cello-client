@@ -658,6 +658,13 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     envelopeLog: (documentId) => store.getEnvelopeLog(ownerAgentId, documentId),
     refusedHashes: (documentId) =>
       rejections.quarantined(ownerAgentId, documentId).map((q) => q.rejectedEnvelopeHash),
+    // SYNC-R35: the exact signed frames, from the quarantine — rows born before the column hold
+    // none, and the exchange simply has nothing to attach for them.
+    refusalRecords: (documentId) =>
+      rejections
+        .quarantined(ownerAgentId, documentId)
+        .map((q) => q.rejectionWire)
+        .filter((w): w is Uint8Array => w !== undefined),
     standingOf: (documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),
     genesisBytes: (documentId) => {
       const record = handshake.get(ownerAgentId, documentId);
@@ -861,6 +868,36 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           });
         }
       }
+      // SYNC-R35: the sender's SIGNED refusal records — verified against their named refuser
+      // and recorded as received rejections, exactly as a directly-sent frame would be. This is
+      // how a third holder wedged behind a refused hash learns its name and reason (F5/F8), and
+      // how the refusal keeps traveling once the refuser is gone. Idempotent by primary key.
+      for (const refusalWire of block.refusals ?? []) {
+        try {
+          const rej = decodeDocumentRejection(new Uint8Array(refusalWire));
+          if (rej.document_id !== block.document_id) {
+            throw new Error("document_refusal_document_mismatch: the record names another document");
+          }
+          if (!verifySignature(rej.rejecting_agent_id, buildDocumentRejectionTbs(rej), rej.signature)) {
+            throw new Error(
+              `document_rejection_signature_invalid: the refusal claims to come from ` +
+                `${rej.rejecting_agent_id} but its signature does not verify against that agent`,
+            );
+          }
+          rejections.recordIncomingRejection(ownerAgentId, rej.document_id, {
+            rejectionEnvelopeHash: documentRejectionHash(rej),
+            rejectedEnvelopeHash: rej.rejected_envelope_hash,
+            reason: rej.reason,
+            detail: rej.detail,
+            fromAgentId: rej.rejecting_agent_id,
+          });
+        } catch (err: unknown) {
+          logger.warn("document.reconcile.refusal_record_refused", {
+            documentId: block.document_id, senderAgentId, correlationId,
+            reason: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
       for (const envWire of block.envelopes) {
         const res = await inbound.receive(ownerAgentId, envWire, nowMs, correlationId);
         if (res.ok && res.admitted) {
@@ -894,6 +931,10 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           documentId: block.document_id, senderAgentId, correlationId,
         });
       }
+      // Refusal records RIDE replies; they never CAUSE one — counting them here would make any
+      // document with one standing refusal answer every exchange forever, and the exchange is
+      // terminated by silence. The wedge they exist to cure (F5) always involves a real
+      // difference, so they are on board whenever they matter.
       const hasDifference = answer.block.entries.length > 0 || answer.block.envelopes.length > 0;
       if (hasDifference || answer.peerAhead) {
         replyBlocks.push(answer.block);

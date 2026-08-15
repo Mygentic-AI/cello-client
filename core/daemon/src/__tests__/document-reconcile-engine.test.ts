@@ -119,6 +119,7 @@ function reads(over: Partial<ReconcileReads> = {}): ReconcileReads {
     entriesByAuthorAfter: () => [],
     envelopeLog: () => [],
     refusedHashes: () => [],
+    refusalRecords: () => [],
     standingOf: () => "stranger",
     genesisBytes: () => null,
     removalClosure: () => null,
@@ -271,6 +272,37 @@ describe("respondToReconcile — the content difference", () => {
       block({ content: [{ author: peer, count: 4, head_hash: "aa".repeat(32) }] }),
     );
     expect(r.peerAhead).toBe(true);
+  });
+});
+
+describe("respondToReconcile — refusal records ride the reply (SYNC-R35)", () => {
+  it("attaches this holder's signed refusal records beside a real difference", () => {
+    const record = new Uint8Array([0xca, 0xfe, 0x05]);
+    const rows = [contentRow(admin.agentId), contentRow(admin.agentId)];
+    const r = respondToReconcile(
+      reads({
+        envelopeLog: () => rows,
+        refusalRecords: () => [record],
+      }),
+      peer,
+      block({ content: [{ author: admin.agentId, count: 1, head_hash: rows[0]!.envelopeHash }] }),
+    );
+    // The peer is behind, so the reply exists anyway — and the refusal record is on board,
+    // which is the only way a THIRD holder wedged behind a refused hash learns its reason.
+    expect(r.block.envelopes).toHaveLength(1);
+    expect(r.block.refusals).toEqual([record]);
+  });
+
+  it("spends the reply budget on records too — an oversized one is dropped loudly, not silently oversized", () => {
+    const record = new Uint8Array(64).fill(7);
+    const r = respondToReconcile(
+      reads({ refusalRecords: () => [record] }),
+      peer,
+      block(),
+      { remainingBytes: 8 },
+    );
+    expect(r.block.refusals).toBeUndefined();
+    expect(r.truncated).toBe(true);
   });
 });
 

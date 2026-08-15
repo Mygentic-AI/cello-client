@@ -1639,6 +1639,103 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     expect(res.ok).toBe(false);
     expect(String(res.reason)).toBe("document_close_unrecorded");
   });
+
+  describe("a refusal travels by the ordinary exchange (SYNC-R35 — P3 review F5/F8)", () => {
+  it("a THIRD holder learns the refused hash AND the reason from the refuser's reply", async () => {
+    // The wedge F5 named: B refused one of A's envelopes; C, behind, can only learn what that
+    // hole is — and WHY — from B. The signed refusal record rides B's reply beside the ordinary
+    // difference, is verified against B's signature, and lands in C's received-rejections record.
+    const { fA, fB, fC, documentId } = await threeSeated();
+
+    const refusedHash = "ab".repeat(32);
+    const rejected = await fB.layer.rejections.reject(fB.owner, documentId, {
+      rejectedEnvelopeHash: refusedHash,
+      quarantined: new Uint8Array([9, 9, 9]),
+      reason: "document_content_refused",
+      detail: "screened: the bytes contain a refused codepoint",
+      // A synthetic author: quarantine stubs occupy the refused author's chain position on B,
+      // and naming fA here would make A's REAL first envelope read as a second genesis.
+      senderAgentId: "e".repeat(64),
+      rejectedDocPrevHash: null,
+      sign: async (tbs: Uint8Array) => fB.keys.sign(tbs),
+      nowMs: NOW,
+    });
+    expect(rejected.wire).toBeInstanceOf(Uint8Array);
+
+    // A real difference so B answers at all: A's content reaches B (via one exchange) but not C.
+    await fA.call("cello_doc_write", { document_id: documentId, content: "carried with the refusal. " });
+    await fB.layer.initiateReconcile(fB.owner, fA.owner, [documentId]);
+    const hasAsUpdate = () =>
+      fB.layer.store
+        .getEnvelopeLog(fB.owner, documentId)
+        .some((row) => row.senderAgentId === fA.owner && row.kind === "update");
+    for (let i = 0; i < 6 && !hasAsUpdate(); i++) {
+      routeAll(fB, fA);
+      await new Promise((r) => setTimeout(r, 30));
+      routeAll(fA, fB);
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    await until(hasAsUpdate);
+
+    // C initiates; B replies with the envelope C lacks — and the refusal record on board.
+    const before = fC.sent.length;
+    await fC.layer.initiateReconcile(fC.owner, fB.owner, [documentId]);
+    const step1 = fC.sent.slice(before).find((send) => send.peerAgentId === fB.owner)!;
+    const bBefore = fB.sent.length;
+    fB.layer.onDocumentFrame(AGENT, "session-1", step1.bytes, fC.owner);
+    await until(() => fB.sent.length > bBefore);
+    routeAll(fB, fC);
+
+    await until(() => {
+      const row = fC.layer.store.rawDb
+        .prepare(
+          `SELECT reason, from_agent_id FROM document_rejections_received
+            WHERE owner_agent_id = ? AND document_id = ? AND rejected_envelope_hash = ?`,
+        )
+        .get(fC.owner, documentId, refusedHash) as { reason?: string; from_agent_id?: string } | undefined;
+      return row?.reason === "document_content_refused" && row?.from_agent_id === fB.owner;
+    });
+  });
+
+  it("a record whose signature does not verify is refused and recorded NOWHERE", async () => {
+    const { fB, fC, documentId } = await threeSeated();
+    const forged = await fB.layer.rejections.reject(fB.owner, documentId, {
+      rejectedEnvelopeHash: "cd".repeat(32),
+      quarantined: new Uint8Array([1]),
+      reason: "document_content_refused",
+      senderAgentId: fC.owner,
+      rejectedDocPrevHash: null,
+      // Signed with the WRONG key — a forwarder cannot mint refusals in B's name.
+      sign: async (tbs: Uint8Array) => fC.keys.sign(tbs),
+      nowMs: NOW,
+    });
+    fC.layer.onDocumentFrame(
+      AGENT,
+      "session-1",
+      new Uint8Array(
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION,
+          documents: [{
+            document_id: documentId,
+            governance: [], content: [], refused: [], entries: [], envelopes: [],
+            refusals: [new Uint8Array(forged.wire!)],
+          }],
+        }),
+      ),
+      fB.owner,
+    );
+    await new Promise((r) => setTimeout(r, 60));
+    const row = fC.layer.store.rawDb
+      .prepare(
+        `SELECT 1 AS present FROM document_rejections_received
+          WHERE owner_agent_id = ? AND rejected_envelope_hash = ?`,
+      )
+      .get(fC.owner, "cd".repeat(32));
+    expect(row).toBeUndefined();
+  });
+});
+
 });
 
 

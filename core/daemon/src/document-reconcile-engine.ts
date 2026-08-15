@@ -33,6 +33,8 @@ export interface ReconcileReads {
   envelopeLog(documentId: string): DocumentEnvelopeRow[];
   /** Hashes THIS holder has refused — its own decisions, surfaced into its position (R36). */
   refusedHashes(documentId: string): string[];
+  /** SYNC-R35: this holder's own SIGNED refusal records (document_rejection wires). */
+  refusalRecords(documentId: string): Uint8Array[];
   /** SYNC-D8 — the fold-derived standing; "removed" is the one verdict consulted here. */
   standingOf(documentId: string, agentId: string): "participant" | "invited" | "removed" | "stranger" | "unknown";
   /** The signed genesis proposal bytes — the anchor a joiner-with-nothing must be handed. */
@@ -267,8 +269,23 @@ export function respondToReconcile(
     peerBlock.governance.length === 0 && peerBlock.content.length === 0;
   const genesis = peerHoldsNothing ? reads.genesisBytes(documentId) : null;
 
+  // SYNC-R35: our own signed refusal records ride every reply, whole — few by construction
+  // (each one is a retry round), deduplicated on the receiving side, and the only way a THIRD
+  // holder wedged behind a refused hash ever learns its name and reason (P3 review F5/F8).
+  const refusals: Uint8Array[] = [];
+  for (const wire of reads.refusalRecords(documentId)) {
+    if (!spend(wire)) break;
+    refusals.push(wire);
+  }
+
   return {
-    block: { ...block, entries, envelopes, ...(genesis ? { genesis } : {}) },
+    block: {
+      ...block,
+      entries,
+      envelopes,
+      ...(refusals.length > 0 ? { refusals } : {}),
+      ...(genesis ? { genesis } : {}),
+    },
     peerAhead,
     truncated,
   };
