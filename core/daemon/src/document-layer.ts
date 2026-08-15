@@ -48,8 +48,6 @@ import {
   documentRejectionHash,
   decodeDocumentProposalAck,
   buildDocumentProposalAckTbs,
-  decodeDocumentControl,
-  buildDocumentControlTbs,
   decodeDocumentUpdateEnvelope,
   encodeDocumentAmendment,
   buildDocumentUpdateTbs,
@@ -123,17 +121,6 @@ export interface DocumentLayerDeps {
    * stands — this is the narrow exception an agent asked for by name.
    */
   nudge?(ownerAgentId: string, documentId: string, paths: readonly string[]): void;
-  /**
-   * Tell EVERY current holder about an end. Injected — the transport is not this layer's.
-   * Per-holder because a document has N holders (DOD-MP-CONTROL-N-1), not one counterparty.
-   */
-  notifyPeer(
-    documentId: string,
-    verb: "kill" | "close",
-  ): Promise<
-    | { ok: true; holdersNotified: Record<string, boolean>; holderFailures: Record<string, string> }
-    | { ok: false; reason: string }
-  >;
   /** Undo one envelope's operations on the live document, for withdraw. */
   rollback(
     ownerAgentId: string,
@@ -192,15 +179,6 @@ export interface DocumentLayer {
   verifySignature(agentId: string, tbs: Uint8Array, signature: Uint8Array): boolean;
   /** M14B / FANOUT-1 — current holders derived from the chain; null when underivable. */
   holdersFor(ownerAgentId: string, documentId: string): string[] | null;
-  /**
-   * Who a control frame must be addressed to — everyone but the owner, derived (DOD-MP-CONTROL-N-1).
-   * Refuses by name rather than falling back to the genesis peer, which after a removal is the one
-   * party the frame must not reach.
-   */
-  controlHolders(
-    ownerAgentId: string,
-    documentId: string,
-  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string };
   isCurrentHolder(ownerAgentId: string, documentId: string, agentId: string): boolean;
   /** M14B / DOD-MP-JOIN-1 — the invitee's consent decisions. Validate-everything-then-mutate. */
   acceptJoin(ownerAgentId: string, amendmentHash: string, nowMs: number): Promise<
@@ -311,24 +289,16 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   const lifecycle = new DocumentLifecycle(
     store,
     logger,
-    { notifyPeer: deps.notifyPeer },
-    deps.rollback,
-    undefined,
-    // DOD-MP-CONTROL-N-1 — the inbound gate. `holdersFor` is declared below and resolved lazily,
-    // the same shape `live` uses above; the gate is only ever called long after construction.
-    // Wired HERE rather than left to the daemon so every consumer of the layer — including the
-    // e2e fixture — gets the real derivation and cannot silently keep the bilateral gate.
+    // SYNC-P4 — "am I waiting on someone?" answered by the DERIVATION, resolved lazily
+    // (`reconcileReads` is declared below; the list surface only ever asks long after
+    // construction). Legacy documents (no genesis record, so no entry set) are never
+    // close-pending: closing them is refused at the verb, so there is nothing to wait for.
     (ownerAgentId, documentId) => {
-      // LEGACY vs UNKNOWN, decided HERE because only this scope can tell them apart: no genesis
-      // record means no chain at all — a bilateral document predating amendments, for which the
-      // peer column IS the membership. A genesis record whose chain will not replay is a different
-      // fact, and one this daemon must not paper over by assuming two parties.
-      if (!handshake.get(ownerAgentId, documentId)) return { kind: "legacy" as const };
-      const holders = holdersFor(ownerAgentId, documentId);
-      return holders === null
-        ? { kind: "unknown" as const, reason: "document_chain_underivable" }
-        : { kind: "derived" as const, holders };
+      const derived = reconcileReads(ownerAgentId).deriveState(documentId);
+      if (!derived.ok) return false;
+      return derived.state.ended === null && derived.state.closedBy.has(ownerAgentId);
     },
+    deps.rollback,
   );
   const notifications = new DocumentNotifications(store, logger);
   // THE FILE SURFACE. Built, tested and instantiated NOWHERE until now — the same defect the tool
@@ -550,57 +520,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     return [...derived.state.participants];
   };
 
-  /**
-   * Who a control frame (`close`, `kill`) must be addressed to — DOD-MP-CONTROL-N-1.
-   *
-   * THIS LIVES HERE, not as a closure in the composition root, for the reason
-   * `document-control-notifier.ts`'s own header records about itself: a closure in `daemon.ts` has
-   * no test, so every fixture hand-copies it, and a hand-copy cannot disagree with the original.
-   * The first draft of this WAS such a closure and had already drifted — it re-derived the
-   * arrangement itself and so never emitted `document.holders.underivable`, leaving the control
-   * path invisible to the exact log search meant to find it.
-   *
-   * Everyone EXCEPT the owner, because the owner is the one doing the ending. A chain that will
-   * not derive is refused by name rather than falling back to the genesis `peerAgentId` — that
-   * fallback is the original defect, and after a removal it aims the frame at precisely the
-   * removed holder.
-   */
-  const controlHolders = (
-    ownerAgentId: string,
-    documentId: string,
-  ): { ok: true; holders: readonly string[] } | { ok: false; reason: string } => {
-    // LEGACY FIRST, and for the same reason the settle path checks it first: a document with no
-    // stored genesis proposal has NO CHAIN, so the peer column is not a fallback — it IS the
-    // membership. Without this branch the send path refused the very condition the settle path
-    // calls legacy, so no close frame ever left, neither side recorded the other's close, and such
-    // a document could never be ended by agreement at all. Reachable two ways: documents proposed
-    // before `recordOutgoing` shipped, and a crash between `createDocument` and `recordOutgoing`,
-    // which run in that order.
-    //
-    // The two paths must agree about what "cannot answer" means. Their disagreeing is the whole
-    // shape of this milestone's defects.
-    const doc = store.getDocument(ownerAgentId, documentId);
-    if (doc && !handshake.get(ownerAgentId, documentId)) {
-      return { ok: true, holders: [doc.peerAgentId] };
-    }
-    let derivedHolders: readonly string[] | null;
-    try {
-      derivedHolders = holdersFor(ownerAgentId, documentId);
-    } catch (err: unknown) {
-      // CONTAINED for the same reason `cello_doc_list` contains it: a chain this build cannot
-      // decode THROWS, and an uncontained throw would take down the close/kill verb entirely
-      // rather than reporting why the frame could not be addressed.
-      return {
-        ok: false,
-        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
-      };
-    }
-    // A chain that EXISTS and will not replay keeps the refusal — it may name holders we cannot
-    // see, and addressing the genesis peer alone there is the original defect.
-    if (derivedHolders === null) return { ok: false, reason: "document_holders_underivable" };
-    return { ok: true, holders: derivedHolders.filter((p) => p !== ownerAgentId).sort() };
-  };
-
   /** Is this agent a CURRENT holder — the ack gate's membership question. */
   const isCurrentHolder = (ownerAgentId: string, documentId: string, agentId: string): boolean => {
     const holders = holdersFor(ownerAgentId, documentId);
@@ -762,18 +681,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
             nowMs,
           );
         }
-      }
-      // DOD-MP-CLOSE-N-1 — a membership change can COMPLETE an agreement. Removing the one
-      // holder who had not closed leaves everyone who remains in agreement; without this the
-      // document stayed `active` forever reporting that it waited on nobody.
-      if (applied.body.kind === "remove_holder" || applied.body.kind === "add_holder") {
-        lifecycle.onMembershipChanged(
-          ownerAgentId,
-          documentId,
-          applied.body.kind === "remove_holder"
-            ? (applied.body.subject_agent_id ?? undefined)
-            : undefined,
-        );
       }
       // SYNC-P4 (R27/R28): the stored status is a PROJECTION of the derived ending — synced
       // whenever an entry that can move it applies. The derivation is the truth; the column is
@@ -1330,27 +1237,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         });
       }
     },
-    recordControl: (ownerAgentId, wire, nowMs) => {
-      const control = decodeDocumentControl(wire);
-      // VERIFIED FIRST. A kill frame ends a collaboration; unsigned, anyone reaching the channel
-      // could end any document between any two parties and each operator would believe the other
-      // walked away.
-      if (!verifySignature(control.sender_agent_id, buildDocumentControlTbs(control), control.signature)) {
-        throw new Error(
-          `document_control_signature_invalid: the ${control.verb} claims to come from ` +
-            `${control.sender_agent_id} but its signature does not verify against that agent`,
-        );
-      }
-      const verdict =
-        control.verb === "kill"
-          ? lifecycle.recordPeerKill(ownerAgentId, control.document_id, control.sender_agent_id, nowMs)
-          : lifecycle.recordPeerClose(ownerAgentId, control.document_id, control.sender_agent_id, nowMs);
-      if (!verdict.ok) {
-        // Refusals here are real: an unknown document, or a sender who is not this document's peer.
-        // Thrown so the router reports them rather than recording an end nobody was entitled to.
-        throw new Error(`${verdict.reason}: ${verdict.detail}`);
-      }
-    },
     recordProposalAck: (ownerAgentId, wire, _nowMs) => {
       const ack = decodeDocumentProposalAck(wire);
       // VERIFIED against the agent it names, before anything is written. A refusal ack makes the
@@ -1606,7 +1492,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     joins,
     verifySignature,
     holdersFor,
-    controlHolders,
     isCurrentHolder,
     acceptJoin,
     refuseJoin,

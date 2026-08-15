@@ -27,7 +27,6 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeDocumentUpdateEnvelope, DOCUMENT_UPDATE_ENCODING_V1 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
-import { createDocumentControlNotifier } from "../document-control-notifier.js";
 import { DocumentPublish } from "../document-publish.js";
 import { DocumentDelivery } from "../document-delivery.js";
 import type { DocumentDeliveryTransport } from "../document-delivery.js";
@@ -64,7 +63,6 @@ async function makeParty(agentName: string) {
   // Declared before the layer because the notifier needs the store, and the store is inside the
   // layer. Assigned immediately after; the notifier is only ever called from lifecycle, long after
   // construction.
-  let layerRef: ReturnType<typeof createDocumentLayer>;
 
   const layer = createDocumentLayer({
     db,
@@ -76,28 +74,9 @@ async function makeParty(agentName: string) {
     // The NAME→KEY map, exactly as the daemon does it. Both halves resolve through this one
     // function; when they did not, every row landed where the other half never looked.
     ownerKeyFor: (n) => (n === agentName ? owner : null),
-    // THE REAL NOTIFIER, not a stub. This seam was `async () => ({ ok: true })`, and that single
-    // line is why three tests here passed while `kill` told nobody: a stub on the far side reports
-    // success, sends nothing, and agrees with whatever the near side did. Only the TRANSPORT is
-    // substituted below — the part that genuinely has to be.
-    notifyPeer: createDocumentControlNotifier({
-      get store() {
-        return layerRef.store;
-      },
-      owners: () => [{ agentName, ownerAgentId: owner }],
-      // THE PRODUCTION FUNCTION, not a copy of it. The holder set is the thing that was wrong
-      // (DOD-MP-CONTROL-N-1), and a fixture that re-implemented the derivation — or worse, handed
-      // back a hardcoded peer — would restore exactly the assumption under test while staying
-      // green. Same call the daemon makes.
-      holders: (ownerAgentId, documentId) => layerRef.controlHolders(ownerAgentId, documentId),
-      sign: async (_n, tbs) => keys.sign(tbs),
-      send: (_n, input) => transport.sendBytes(input),
-      now: () => NOW,
-    }),
     rollback: () => ({ ok: true }),
     sign: async (_o, tbs) => keys.sign(tbs),
   });
-  layerRef = layer;
 
   const transport = {
     isPeerReachable: async () => ({ reachable: wire.online, unknownAgent: false }),
@@ -822,7 +801,8 @@ describe("ending a document — the peer is TOLD, over the wire", () => {
     expect(killedRes).toMatchObject({ ok: true, ended: "killed" });
     expect((killedRes.killDelivered as Record<string, boolean>)[b.owner]).toBe(true);
 
-    // Bob's copy is terminal too. Until the control frame existed, `notifyPeer` refused and Bob kept
+    // Bob's copy is terminal too — the kill ENTRY travels the ordinary carrier, and Bob's daemon
+    // derives the ending on arrival. Before endings were entries, a lost one-shot frame left Bob
     // publishing into a document that would never answer, with nothing on his screen explaining why.
     await vi.waitFor(() => expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("killed"));
     const write = await b.call("cello_doc_write", { document_id: documentId, content: "still typing" });
@@ -963,12 +943,15 @@ describe("a KILL arriving after a settled CLOSE does not rewrite it", () => {
     await b.call("cello_doc_close", { document_id: documentId });
     await vi.waitFor(() => expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed"));
 
-    // The transport WILL redeliver, and nothing bounds a control frame's freshness — `sent_at_ms`
-    // is signed and never checked. Unconditional, this rewrote a settled agreement as a unilateral
-    // end: the operator's "closed by agreement" becomes "killed", and nothing says why.
-    const late = a.layer.lifecycle.recordPeerKill(a.owner, documentId, b.owner, NOW + 10_000);
-    expect(late).toMatchObject({ ok: true });
+    // A late kill must not rewrite a settled agreement as a unilateral end. In the entry model
+    // that is enforced at AUTHORING time: the killer's own daemon derives the world already ended
+    // and refuses to mint the entry at all — and had it somehow been minted, every receiver's
+    // causal gate refuses an entry authored after an ending in its closure (R30). Both operators
+    // keep "closed by agreement", which is the fact they chose.
+    const late = await b.call("cello_doc_kill", { document_id: documentId });
+    expect(late).toMatchObject({ ok: false });
     expect(a.layer.store.getDocument(a.owner, documentId)?.status).toBe("closed");
+    expect(b.layer.store.getDocument(b.owner, documentId)?.status).toBe("closed");
   });
 });
 

@@ -28,83 +28,7 @@
 import type { DocumentStore } from "./document-store.js";
 import type { Logger } from "./types.js";
 
-/**
- * "Did every holder hear it?" — and NO on an empty map.
- *
- * `[].every(…)` is `true`, so folding an empty fan-out with `every` alone reports that everybody
- * was notified precisely when nobody was. The notifier refuses a holder-less document by name, so
- * this is the second line rather than the first, but the vacuous-truth reading is the one that
- * would surface to an operator as a clean close that told no one.
- */
-function everyHolderNotified(ok: boolean, holders: Record<string, boolean>): boolean {
-  const told = Object.values(holders ?? {});
-  return ok && told.length > 0 && told.every((v) => v);
-}
-
-/**
- * Who currently holds this document, derived from the chain — the INBOUND authorization gate.
- *
- * DOD-MP-CONTROL-N-1 fixed the outbound half first and that was only half the defect: the
- * receiving side still authorized a `close`/`kill` by `sender === doc.peerAgentId`, the same
- * genesis column. Two ordinary-command consequences, no rewritten daemon required:
- *
- *  - **A REMOVED holder could still end the creator's document.** A created with B, invited C,
- *    removed B. A's `peerAgentId` is still B, so B's kill was accepted by A and refused by C —
- *    the two operators left in different states by a party who holds no rights at all.
- *  - **A JOINER's end reached nobody.** With {A, B, C}, C's close is now correctly addressed to
- *    both, and BOTH refused it, because C is neither one's `peerAgentId`. The sender was told
- *    everyone heard them while nothing was recorded anywhere.
- *
- * THREE ANSWERS, because "cannot answer" is two different facts and collapsing them costs either
- * correctness or working documents:
- *
- *  - `derived` — the chain replayed. This is the whole gate and the whole settlement set.
- *  - `legacy` — there is no genesis record and so no chain at all: a bilateral document that
- *    predates amendments. The row's peer column stands in, which is exactly right for two parties.
- *  - `unknown` — a chain EXISTS and will not replay (a bad signature, a fork, bytes this build
- *    cannot read). Standing in the pair here would settle a three-holder document on two,
- *    silently — the very defect DOD-MP-CLOSE-N-1 removes — so settlement refuses and the inbound
- *    gate fails closed.
- *
- * The first draft folded `legacy` and `unknown` into one null. Refusing both broke every genuine
- * pre-amendment document, which could then never be closed by anyone; standing in for both
- * restored the defect. They are separated here because only one of them is legacy.
- */
-export type HolderVerdict =
-  | { kind: "derived"; holders: readonly string[] }
-  | { kind: "legacy" }
-  | { kind: "unknown"; reason: string };
-
-export type CurrentHolders = (ownerAgentId: string, documentId: string) => HolderVerdict;
-
-/** How the peer is told about a unilateral end. Injected — the transport is not this unit's. */
-export interface LifecycleNotifier {
-  notifyPeer(
-    documentId: string,
-    verb: "kill" | "close",
-    // `detail` carries the underlying description when the failure is LOCAL — a key that could not
-    // be loaded reads nothing like a peer who is offline, and one guidance string for both sent
-    // operators to wait for someone who was already there.
-    // `holdersNotified` is per-holder because a control frame goes to EVERY current holder
-    // (DOD-MP-CONTROL-N-1). With N holders a partial fan-out is the ordinary failure, and the one
-    // boolean this used to return could not tell "all three heard you" from "one of three did".
-  ): Promise<
-    | { ok: true; holdersNotified: Record<string, boolean>; holderFailures: Record<string, string> }
-    | { ok: false; reason: string; detail?: string }
-  >;
-}
-
 const CREATE_LIFECYCLE_SQL = `
-  CREATE TABLE IF NOT EXISTS document_closes (
-    owner_agent_id TEXT    NOT NULL,
-    document_id    TEXT    NOT NULL,
-    -- WHO closed, not how many closes there were. Counting would let one party close a document
-    -- unilaterally by asking twice, which is precisely the bilateral guarantee gone.
-    closed_by      TEXT    NOT NULL,
-    created_at     INTEGER NOT NULL,
-    PRIMARY KEY (owner_agent_id, document_id, closed_by)
-  );
-
   -- WITHDRAWALS live here, NOT in document_envelopes, and that placement is the fix for three
   -- separate defects rather than a filing preference.
   --
@@ -170,7 +94,7 @@ export type Verdict = { ok: true } | { ok: false; reason: string; detail: string
 export class DocumentLifecycle {
   readonly #store: DocumentStore;
   readonly #logger: Logger;
-  readonly #notifier: LifecycleNotifier;
+  readonly #closePendingFor: (ownerAgentId: string, documentId: string) => boolean;
   /**
    * Our own wire sender id for an agent. M14-D5 makes it the pubkey hex, which is NOT the local
    * owner key this store is otherwise keyed by — and passing the wrong one here reports every
@@ -182,52 +106,16 @@ export class DocumentLifecycle {
     documentId: string,
     envelopeHash: string,
   ) => { ok: true } | { ok: false; reason: string };
-  readonly #currentHolders: CurrentHolders;
-
-  /**
-   * May this sender end this document? Derived membership is the WHOLE gate when the chain
-   * derives — a joined third holder's close is as admissible as the genesis peer's, and a removed
-   * holder's is not admissible at all. The peer column stands in only when the chain cannot
-   * answer. Mirrors `document-inbound.ts`'s sender gate deliberately; two different answers to
-   * "is this agent a party to this document" is how the two paths drift apart.
-   *
-   * TWO KINDS OF "CANNOT ANSWER", and they get different answers because only one of them is
-   * legacy. A null derivation is the pre-amendment bilateral document — the peer column stands in,
-   * which NARROWS who may act and is the same rule the update path uses. A THROW is bytes this
-   * build cannot read, which is not a legacy document but an unknown one: this gate FAILS CLOSED
-   * rather than admitting the genesis peer, who by then may be a holder the chain removed. The
-   * operator's own `kill` is unaffected — it is local and needs no gate.
-   */
-  #senderMayEnd(ownerAgentId: string, documentId: string, senderAgentId: string, peerAgentId: string): boolean {
-    const v = this.#holderVerdict(ownerAgentId, documentId);
-    if (v.kind === "derived") return v.holders.includes(senderAgentId);
-    if (v.kind === "legacy") return senderAgentId === peerAgentId;
-    // UNKNOWN fails closed. Admitting the genesis peer here would admit a party the chain may have
-    // removed — and the chain is precisely what we could not read. The operator's own `kill` is
-    // unaffected: it is local and needs no gate.
-    this.#logger.warn("document.end.holders_unknown", { documentId, reason: v.reason });
-    return false;
-  }
-
-  /** The injected derivation, with its throw contained and named. */
-  #holderVerdict(ownerAgentId: string, documentId: string): HolderVerdict {
-    try {
-      return this.#currentHolders(ownerAgentId, documentId);
-    } catch (err: unknown) {
-      // `holdersFor` decodes every stored amendment and THROWS on bytes this build cannot read.
-      // Uncontained, that throw escaped the row, escaped the map, and the operator asking "what
-      // documents do I have" got a raw CBOR decoder string naming no document — the regression
-      // already fixed once in `arrangementFor`, re-opened through this call site.
-      const reason = err instanceof Error ? err.message : String(err);
-      this.#logger.error("document.holders.undecodable", { documentId, reason });
-      return { kind: "unknown", reason };
-    }
-  }
 
   constructor(
     store: DocumentStore,
     logger: Logger,
-    notifier: LifecycleNotifier,
+    /**
+     * "I have closed and the derivation is still waiting on someone" — the list row's question,
+     * answered from the entry set (SYNC-P4). Injected because the derivation lives on the layer;
+     * this unit keeps only the platform gates and the delivery-facing surfaces.
+     */
+    closePendingFor: (ownerAgentId: string, documentId: string) => boolean,
     /**
      * Undo one envelope's operations on the LIVE document, as inverses. Injected because the live
      * `Y.Doc` and its UndoManager belong to the engine, not here — and REQUIRED, because a default
@@ -236,21 +124,12 @@ export class DocumentLifecycle {
     rollback: (ownerAgentId: string, documentId: string, envelopeHash: string) =>
       { ok: true } | { ok: false; reason: string },
     senderAgentId: (ownerAgentId: string) => string = (id) => id,
-    /**
-     * The inbound authorization gate (DOD-MP-CONTROL-N-1). Defaults to "cannot answer", which
-     * routes to the `peerAgentId` check — the pre-multiplayer behaviour — so a caller that has not
-     * been wired yet is bilateral-correct rather than open. It is NOT defaulted to a permissive
-     * answer: a membership gate whose default admits everyone is worse than no gate, because it
-     * reads as one.
-     */
-    currentHolders: CurrentHolders = () => ({ kind: "legacy" }),
   ) {
     this.#store = store;
     this.#logger = logger;
-    this.#notifier = notifier;
+    this.#closePendingFor = closePendingFor;
     this.#rollback = rollback;
     this.#senderAgentId = senderAgentId;
-    this.#currentHolders = currentHolders;
     this.#store.rawDb.exec(CREATE_LIFECYCLE_SQL);
   }
 
@@ -300,232 +179,12 @@ export class DocumentLifecycle {
         (pendingByDocument.get(d.documentId)?.total ?? 0) -
         (pendingByDocument.get(d.documentId)?.sent ?? 0),
       abandonedDeliveries: this.#store.abandonedCount(ownerAgentId, d.documentId),
-      // "I have closed and we are still waiting on someone" — ALL of them, not just the genesis
-      // peer (DOD-MP-CLOSE-N-1). Against the peer alone this read "not pending" the moment the
-      // genesis pair agreed, while a joiner had not answered and the document was still open.
-      closePending: this.#closePendingFor(ownerAgentId, d.documentId, d.peerAgentId),
+      // "I have closed and the derivation is still waiting on someone" — derived from the entry
+      // set, ALL current seats (SYNC-P4; the DOD-MP-CLOSE-N-1 rule, now the fold's).
+      closePending: this.#closePendingFor(ownerAgentId, d.documentId),
     }));
   }
 
-  /** Our half of a bilateral close. Completes only when the peer's half is also on record. */
-  async close(
-    ownerAgentId: string,
-    documentId: string,
-    nowMs: number,
-  ): Promise<
-    | (Verdict & {
-        ok: true;
-        peerNotified: boolean;
-        holdersNotified: Record<string, boolean>;
-        holderFailures: Record<string, string>;
-        notifyReason?: string;
-        notifyDetail?: string;
-      })
-    | (Verdict & { ok: false })
-  > {
-    const doc = this.#store.getDocument(ownerAgentId, documentId);
-    if (!doc) {
-      return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
-    }
-    this.#recordClose(ownerAgentId, documentId, ownerAgentId, nowMs);
-    const notified = await this.#notifier.notifyPeer(documentId, "close");
-    if (!notified.ok) {
-      // RAISED to error, and RETURNED, matching `kill`. This was a warn whose outcome went nowhere:
-      // the caller answered `{ok: true, status: "active"}`, which is indistinguishable from "sent
-      // fine, they have not answered yet". Control frames are fire-once — not in the log, never
-      // swept — so a close the peer never received means the document can never settle, and neither
-      // operator has anything to look at.
-      this.#logger.error("document.close.peer_not_notified", {
-        documentId,
-        reason: notified.reason,
-        detail: notified.detail ?? "",
-      });
-    }
-    this.#settleClose(ownerAgentId, documentId);
-    const holdersNotified = notified.ok ? notified.holdersNotified : {};
-    const holderFailures = notified.ok ? notified.holderFailures : {};
-    // EVERY current holder, not "the send returned ok" — with N holders a partial fan-out is the
-    // normal failure and one boolean cannot describe it. The map is the precise answer; this stays
-    // as the summary a caller can branch on.
-    const allNotified = everyHolderNotified(notified.ok, holdersNotified);
-    this.#logger.info("document.close.requested", { documentId, peerNotified: allNotified, holdersNotified });
-    // THE REASON TRAVELS. It used to stop here, so one guidance string covered a transport failure,
-    // a missing signing key and a wiring fault — and it told the operator to wait for their peer,
-    // which only helps for the first of the three.
-    return {
-      ok: true,
-      peerNotified: allNotified,
-      holdersNotified,
-      holderFailures,
-      ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
-    };
-  }
-
-  /** The peer's half, arriving over the session. */
-  recordPeerClose(
-    ownerAgentId: string,
-    documentId: string,
-    peerAgentId: string,
-    nowMs: number,
-  ): Verdict {
-    const doc = this.#store.getDocument(ownerAgentId, documentId);
-    if (!doc) {
-      // Without this the row is written for a document that does not exist — there is no foreign
-      // key on this table — and `setDocumentStatus` updates zero rows and returns silently.
-      return {
-        ok: false,
-        reason: "document_unknown",
-        detail: `no document ${documentId.slice(0, 16)}… for this agent`,
-      };
-    }
-    if (!this.#senderMayEnd(ownerAgentId, documentId, peerAgentId, doc.peerAgentId)) {
-      // THE PARTY GUARANTEE. The closer id came from the caller and was written as `closed_by`
-      // and settled against ITSELF, so any second distinct string — a stale contact id, a
-      // pubkey-vs-name mismatch, a hostile session — plus our own close flipped the document to
-      // closed. The whole point of recording WHO closed is defeated if who is never checked.
-      //
-      // The check is now MEMBERSHIP, not identity-with-one-peer: a joiner is a party and their
-      // close must count, a removed holder is not and theirs must not.
-      this.#logger.warn("document.close.not_holder", {
-        documentId,
-        claimedBy: peerAgentId,
-        peerAgentId: doc.peerAgentId,
-      });
-      return {
-        ok: false,
-        reason: "document_close_not_peer",
-        detail:
-          `${peerAgentId} does not currently hold this document, so their close is not one of the ` +
-          `halves that can settle it`,
-      };
-    }
-    // RECORDED AGAINST THE SENDER, not against `doc.peerAgentId`. Writing the peer column here
-    // credited a joiner's close to the genesis peer — the wrong name on the record, and with two
-    // joiners closing it would settle twice against one identity.
-    this.#recordClose(ownerAgentId, documentId, peerAgentId, nowMs);
-    this.#settleClose(ownerAgentId, documentId);
-    this.#logger.info("document.close.peer_requested", { documentId, peerAgentId });
-    return { ok: true };
-  }
-
-  /**
-   * The peer KILLED the document. Their half of the unilateral end.
-   *
-   * Terminal immediately, and there is no reciprocal step: a kill is one-sided by definition, which
-   * is what separates it from a close. Continuing to publish afterwards would send updates to a
-   * party who has stopped listening — refused at their end forever, with nothing on this screen
-   * explaining why.
-   *
-   * The SENDER IS CHECKED against the document's peer for the same reason `recordPeerClose` checks
-   * it: without that, any string plus a valid-looking frame ends someone else's document.
-   */
-  recordPeerKill(
-    ownerAgentId: string,
-    documentId: string,
-    peerAgentId: string,
-    nowMs: number,
-  ): Verdict {
-    const doc = this.#store.getDocument(ownerAgentId, documentId);
-    if (!doc) {
-      return {
-        ok: false,
-        reason: "document_unknown",
-        detail: `no document ${documentId.slice(0, 16)}… for this agent`,
-      };
-    }
-    if (!this.#senderMayEnd(ownerAgentId, documentId, peerAgentId, doc.peerAgentId)) {
-      this.#logger.warn("document.kill.not_holder", {
-        documentId,
-        claimedBy: peerAgentId,
-        peerAgentId: doc.peerAgentId,
-      });
-      return {
-        ok: false,
-        reason: "document_kill_not_peer",
-        detail: `${peerAgentId} does not currently hold this document, so their kill is not theirs to make`,
-      };
-    }
-    void nowMs;
-    if (doc.status !== "active" && doc.status !== "stalled") {
-      // ONLY FROM ACTIVE, the same guard `#settleClose` carries and for the mirror reason. The
-      // transport WILL redeliver, and nothing bounds a control frame's freshness — `sent_at_ms` is
-      // signed and never checked. Unconditional, a kill arriving after a bilateral close rewrote a
-      // settled agreement as a unilateral end.
-      this.#logger.info("document.kill.peer_requested.ignored", {
-        documentId,
-        status: doc.status,
-      });
-      return { ok: true };
-    }
-    this.#store.setDocumentStatus(ownerAgentId, documentId, "killed");
-    this.#logger.info("document.kill.peer_requested", { documentId, peerAgentId: doc.peerAgentId });
-    return { ok: true };
-  }
-
-  /**
-   * Unilateral end. Local, and deliberately not contingent on the peer hearing about it — a
-   * decision to stop that depends on the other party being online is not a decision to stop.
-   */
-  async kill(
-    ownerAgentId: string,
-    documentId: string,
-    nowMs: number,
-  ): Promise<
-    | {
-        ok: true;
-        peerNotified: boolean;
-        holdersNotified: Record<string, boolean>;
-        holderFailures: Record<string, string>;
-        note: string;
-        notifyReason?: string;
-        notifyDetail?: string;
-      }
-    | { ok: false; reason: string; detail: string }
-  > {
-    const doc = this.#store.getDocument(ownerAgentId, documentId);
-    if (!doc) {
-      return { ok: false, reason: "document_unknown", detail: `no document ${documentId.slice(0, 16)}…` };
-    }
-    void nowMs;
-
-    this.#store.setDocumentStatus(ownerAgentId, documentId, "killed");
-    const notified = await this.#notifier.notifyPeer(documentId, "kill");
-    if (!notified.ok) {
-      // Reported, not swallowed: a kill the peer never heard about leaves them publishing into a
-      // document that will never answer, and the operator is the one who needs to know that.
-      this.#logger.error("document.kill.peer_not_notified", {
-        documentId,
-        peerAgentId: doc.peerAgentId,
-        reason: notified.reason,
-        detail: notified.detail ?? "",
-      });
-    }
-    const holdersNotified = notified.ok ? notified.holdersNotified : {};
-    const holderFailures = notified.ok ? notified.holderFailures : {};
-    const allNotified = everyHolderNotified(notified.ok, holdersNotified);
-    this.#logger.info("document.killed", { documentId, peerNotified: allNotified, holdersNotified });
-
-    return {
-      ok: true,
-      peerNotified: allNotified,
-      holdersNotified,
-      holderFailures,
-      note:
-        "this document no longer accepts or publishes updates, and your local copy and log are " +
-        "retained. Your peer keeps what it holds — a kill stops the collaboration, it does not " +
-        "retract content they already have.",
-      // Same reason `close` carries it: a local signing fault and an absent peer are opposite
-      // problems and only one of them is fixed by waiting.
-      ...(notified.ok ? {} : { notifyReason: notified.reason, notifyDetail: notified.detail }),
-    };
-  }
-
-  /**
-   * Withdraw ONE undelivered update: a withdrawal record beside the original.
-   *
-   * Every refusal here is the same shape — say no rather than produce a record that claims
-   * something untrue about the log.
-   */
   withdraw(
     ownerAgentId: string,
     documentId: string,
@@ -726,131 +385,4 @@ export class DocumentLifecycle {
     return !this.isPlatformPaused(agentId);
   }
 
-  // ─── internals ────────────────────────────────────────────────────────────
-
-  #recordClose(ownerAgentId: string, documentId: string, closedBy: string, nowMs: number): void {
-    this.#store.rawDb
-      .prepare(
-        `INSERT INTO document_closes (owner_agent_id, document_id, closed_by, created_at)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT (owner_agent_id, document_id, closed_by) DO NOTHING`,
-      )
-      .run(ownerAgentId, documentId, closedBy, nowMs);
-  }
-
-  #hasClosed(ownerAgentId: string, documentId: string, who: string): boolean {
-    const r = this.#store.rawDb
-      .prepare(
-        `SELECT 1 AS present FROM document_closes
-          WHERE owner_agent_id = ? AND document_id = ? AND closed_by = ?`,
-      )
-      .get(ownerAgentId, documentId, who) as { present?: number } | undefined;
-    return r?.present === 1;
-  }
-
-  /**
-   * A document is complete BY AGREEMENT, so every current holder must have said it — DOD-MP-CLOSE-N-1.
-   *
-   * This settled on the owner plus `doc.peerAgentId`. With three holders that flipped the document
-   * to `closed` as soon as TWO of them had closed, while the third was still editing — which is
-   * exactly the failure this unit's own header forbids: "One side's close is a REQUEST — treating
-   * it as a conclusion would tell this operator the collaboration ended while the peer is still
-   * writing into it." Two of three is a conclusion drawn from a request.
-   *
-   * Ruled under M14B-PROCEDURE §3a as the least-reversal-risk reading. Requiring ALL is the
-   * conservative direction: it never claims an agreement that does not exist, and it is identical
-   * to the old behaviour for a two-party document. Loosening later (say, an admin closing for
-   * everyone) only widens what settles and strands nothing; shipping the loose rule first would
-   * leave documents already marked closed that never were, and no migration can un-say that.
-   *
-   * A chain that will not derive REFUSES to settle. It does NOT fall back to the genesis pair:
-   * that fallback re-creates this unit's own defect silently — a three-holder document settling on
-   * two, with the surface showing `closed` and nothing saying the derivation failed. The inbound
-   * gate's null branch NARROWS (fewer parties may act) and `controlHolders`' refuses by name; the
-   * same syntax here would WIDEN, which is the opposite safety direction.
-   */
-  /**
-   * Who must agree before this document is complete. Null means REFUSE — never a smaller set.
-   *
-   * The throw is contained here rather than at each call site because `holdersFor` decodes every
-   * stored amendment and throws on bytes this build cannot read, and an uncontained throw took the
-   * ENTIRE `cello_doc_list` down — the operator asking "what documents do I have" got a raw CBOR
-   * decoder string naming no document. That exact regression was fixed once already in
-   * `arrangementFor`; this unit re-opened it through a different call site.
-   */
-  #mustAgree(ownerAgentId: string, documentId: string, peerAgentId: string): readonly string[] | null {
-    const v = this.#holderVerdict(ownerAgentId, documentId);
-    // LEGACY is the one stand-in that is not a fallback: no chain exists, so the genesis pair IS
-    // the whole membership. `unknown` gets no such courtesy — a chain we cannot read may hold any
-    // number of holders, and settling on two of them is the defect this unit removes.
-    if (v.kind === "legacy") return [ownerAgentId, peerAgentId];
-    if (v.kind === "unknown") return null;
-    const holders = v.holders;
-    // `[].every()` is TRUE and `[].some()` is FALSE — an empty set would settle instantly on
-    // nobody's agreement in one function and report "waiting on nobody" in the other. A derived
-    // arrangement always contains its proposer, so this is the second line rather than the first;
-    // it is here because the vacuous reading of this idiom already had to be closed once in this file.
-    if (holders.length === 0) return null;
-    return holders;
-  }
-
-  /** Have WE closed while at least one current holder has not? The list row's question. */
-  #closePendingFor(ownerAgentId: string, documentId: string, peerAgentId: string): boolean {
-    if (!this.#hasClosed(ownerAgentId, documentId, ownerAgentId)) return false;
-    const mustAgree = this.#mustAgree(ownerAgentId, documentId, peerAgentId);
-    // CANNOT PROVE the rest have closed — so we are still waiting. "Still waiting" is the safe
-    // answer here and "nothing pending" is not: the latter tells an operator a document needs
-    // nothing from anyone when in fact nothing can ever settle it.
-    if (mustAgree === null) return true;
-    return mustAgree.some((h) => !this.#hasClosed(ownerAgentId, documentId, h));
-  }
-
-  /**
-   * Settle if EVERY current holder has now said it — idempotent, `active`-only, safe to call from
-   * anywhere the answer could have changed. That includes a MEMBERSHIP change: removing the one
-   * holder who had not closed leaves everyone who remains in agreement, and without re-evaluating
-   * here the document stayed `active` forever with `closePending` reading false — open, waiting on
-   * nobody, and unsettleable, because control frames are fire-once and never swept.
-   */
-  #settleClose(ownerAgentId: string, documentId: string, peerAgentId?: string): void {
-    // ONLY FROM ACTIVE. Unconditional, a peer close arriving after a unilateral kill overwrote
-    // `killed` with `closed` — the operator's own decision replaced by "closed by agreement", which
-    // is a different fact and the one they did not choose. Same for `stalled`.
-    if (this.#store.getDocument(ownerAgentId, documentId)?.status !== "active") return;
-    const peer = peerAgentId ?? this.#store.getDocument(ownerAgentId, documentId)?.peerAgentId ?? "";
-    const mustAgree = this.#mustAgree(ownerAgentId, documentId, peer);
-    if (mustAgree === null) {
-      this.#logger.warn("document.close.holders_underivable", { documentId });
-      return;
-    }
-    if (mustAgree.every((h) => this.#hasClosed(ownerAgentId, documentId, h))) {
-      this.#store.setDocumentStatus(ownerAgentId, documentId, "closed");
-      // The epoch travels: `mustAgree` is derived per daemon from an eventually-consistent chain,
-      // so two holders can legitimately reach this line with different-sized sets. Without the
-      // epoch their logs cannot be reconciled.
-      this.#logger.info("document.closed", {
-        documentId,
-        agreedBy: mustAgree.length,
-        epochId: this.#store.currentDocumentEpoch(ownerAgentId, documentId),
-      });
-    }
-  }
-
-  /**
-   * A membership amendment landed — the agreement may now be complete, or a re-admitted holder's
-   * stale close may need clearing. Called from the layer after any chain append.
-   */
-  onMembershipChanged(ownerAgentId: string, documentId: string, removedAgentId?: string): void {
-    if (removedAgentId !== undefined) {
-      // FORWARD-ONLY, applied to the close record too. `document_closes` is keyed by identity with
-      // no epoch, so a holder who closed, was removed, and was later re-admitted would have their
-      // OLD close counted against their NEW tenure — this unit's headline failure, one epoch
-      // removed. Dropping the row on removal is the cheaper half of that fix and matches the
-      // forward-only doctrine: their past participation is not carried into a future one.
-      this.#store.rawDb
-        .prepare(`DELETE FROM document_closes WHERE owner_agent_id = ? AND document_id = ? AND closed_by = ?`)
-        .run(ownerAgentId, documentId, removedAgentId);
-    }
-    this.#settleClose(ownerAgentId, documentId);
-  }
 }

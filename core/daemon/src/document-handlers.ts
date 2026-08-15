@@ -860,6 +860,13 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     }
     const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
     if (!derived.ok) return { ok: false, reason: derived.reason };
+    // R29's author-side mirror of the R30 inbound gate: an ended world takes no further entries.
+    // Every other holder would refuse this entry (their gate finds the ending in its closure), so
+    // authoring it would only fork this daemon away from the agreement everyone else has settled —
+    // the concrete case being a late kill rewriting "closed by agreement" as a unilateral end.
+    if (derived.state.ended !== null) {
+      return { ok: false, reason: derived.state.ended === "killed" ? "document_killed" : "document_closed" };
+    }
     const body: DocumentAmendmentBody = {
       document_id: documentId,
       epoch_id: derived.state.interimMaxEpoch + 1,
@@ -1387,12 +1394,6 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         );
       }
     }
-    // DOD-MP-CLOSE-N-1 — removing the one holder who had not closed leaves everyone who remains in
-    // agreement, so the removal itself can complete it. Without this the document sat `active`
-    // forever, reporting that it waited on nobody. Also drops the removed holder's close row, so a
-    // later re-admission does not carry their old agreement into a new tenure.
-    layer.lifecycle.onMembershipChanged(who.ownerAgentId, documentId, holder);
-
     // The amendment travels to EVERY current holder INCLUDING the removed one — being told is
     // how their daemon surfaces the removal to their operator. Best-effort at P1, per holder,
     // reported never assumed.

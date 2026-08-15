@@ -34,7 +34,6 @@ import {
 } from "@cello-protocol/protocol-types";
 import { registerDocumentHandlers } from "../document-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "../document-layer.js";
-import { createDocumentControlNotifier } from "../document-control-notifier.js";
 import { DocumentPublish } from "../document-publish.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { DocumentDeliveryTransport } from "../document-delivery.js";
@@ -90,22 +89,6 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     },
     publicKeyFor: agentPublicKeyFromId,
     ownerKeyFor: (agentName) => (agentName === AGENT ? owner : null),
-    // THE REAL NOTIFIER over the REAL derivation (DOD-MP-CONTROL-N-1). This was
-    // `async () => ({ ok: true })`, which is why nothing here noticed that close/kill addressed the
-    // genesis peer alone: a stub reports success, sends nothing, and agrees with whatever the near
-    // side did. Only the SEND is captured, into the same array everything else uses.
-    notifyPeer: (documentId, verb) =>
-      createDocumentControlNotifier({
-        get store() { return layer.store; },
-        owners: () => [{ agentName: AGENT, ownerAgentId: owner }],
-        holders: (o, d) => layer.controlHolders(o, d),
-        sign: async (_n, tbs) => keys.sign(tbs),
-        send: async (_n, input) => {
-          sent.push({ peerAgentId: input.peerAgentId, bytes: input.bytes });
-          return { ok: true as const };
-        },
-        now: () => NOW,
-      })(documentId, verb),
     rollback: () => ({ ok: true }),
     sign: async (_owner, tbs) => keys.sign(tbs),
   });

@@ -75,7 +75,6 @@ import {
   decodeDocumentProposal,
   decodeDocumentRejection,
   decodeDocumentProposalAck,
-  decodeDocumentControl,
   decodeDocumentJoinOffer,
   decodeDocumentJoinAnswer,
   decodeDocumentAmendment,
@@ -97,7 +96,6 @@ export type DocumentFrameKind =
   | "proposal"
   | "rejection"
   | "proposal_ack"
-  | "control"
   | "join_offer"
   | "join_answer"
   | "amendment"
@@ -141,7 +139,6 @@ export interface DocumentFrameRouterDeps {
    * conversation path and the operator keeps publishing into a document that will never answer,
    * with nothing on their screen explaining why.
    */
-  recordControl(ownerAgentId: string, wire: Uint8Array, nowMs: number): void;
   /**
    * M14B / DOD-MP-JOIN-1 — an admin's offer to a third party. Validated (the invitee REPLAYS the
    * carried bytes) and recorded — pending or refused-with-reason, never dropped.
@@ -481,10 +478,6 @@ export class DocumentFrameRouter {
         this.#d.recordProposalAck(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
       }
-      if (kind === "control") {
-        this.#d.recordControl(ownerAgentId, content, nowMs);
-        return { consumed: true, kind, ok: true };
-      }
       if (kind === "join_offer") {
         this.#d.recordJoinOffer(ownerAgentId, content, nowMs);
         return { consumed: true, kind, ok: true };
@@ -636,9 +629,6 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
       case "document_proposal_ack":
         decodeDocumentProposalAck(content);
         return "proposal_ack";
-      case "document_control":
-        decodeDocumentControl(content);
-        return "control";
       case "document_join_offer":
         decodeDocumentJoinOffer(content);
         return "join_offer";

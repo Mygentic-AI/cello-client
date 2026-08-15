@@ -89,7 +89,6 @@ import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { registerDocumentHandlers } from "./document-handlers.js";
-import { createDocumentControlNotifier } from "./document-control-notifier.js";
 import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
@@ -3641,31 +3640,6 @@ async function startDaemonHoldingLock(
       if (!agentName) return;
       notificationDispatcher.dispatchDocumentWatch(agentName, documentId, paths);
     },
-    notifyPeer: createDocumentControlNotifier({
-      get store() {
-        // Lazily, because `documentLayer` is what is being constructed. The notifier is only ever
-        // called from lifecycle, long after construction returns.
-        return documentLayer.store;
-      },
-      owners: () =>
-        loadedAgents
-          .filter((a) => a.pubkey)
-          .map((a) => ({ agentName: a.name, ownerAgentId: a.pubkey!.toLowerCase() })),
-      // DOD-MP-CONTROL-N-1 — the ONE implementation, on the layer, shared with every test fixture.
-      // A closure here instead would be untested by construction and hand-copied into fixtures
-      // that cannot disagree with it, which is exactly how the original defect survived.
-      holders: (ownerAgentId, documentId) => documentLayer.controlHolders(ownerAgentId, documentId),
-      sign: async (agentName, tbs) => {
-        const provider = keyProviders.get(agentName);
-        if (!provider) throw new Error(`document_control_unsigned: no key provider for ${agentName}`);
-        return provider.sign(tbs);
-      },
-      send: (agentName, input) => documentTransportFor(agentName).sendBytes(input),
-      // Given a logger so a signing failure is REPORTED rather than swallowed — the reason a
-      // local key fault used to reach the operator dressed as an absent peer.
-      logger,
-      now: () => Date.now(),
-    }),
     rollback: () => ({
       // Likewise: withdraw REFUSES rather than claiming a rollback that did not happen. Reporting
       // success having reverted nothing tells an operator their update was retracted while their
@@ -3870,17 +3844,6 @@ async function startDaemonHoldingLock(
       documentLayer.store,
       documentTransportFor(agentName),
       logger,
-      // DOD-MP-CONTROL-DURABLE-1 — control frames derive their recipients the way the NOTIFIER
-      // does, not the way envelopes do. `holdersFor` returns null for a document with no stored
-      // genesis proposal; `controlHolders` has an explicit legacy branch for it. Deriving the two
-      // halves differently turned a seeded row into a permanent no-op.
-      (documentId) => {
-        const ownerAgentId = documentOwnerKeyFor(agentName);
-        if (ownerAgentId === null) {
-          return { ok: false as const, reason: "document_owner_key_unavailable" };
-        }
-        return documentLayer.controlHolders(ownerAgentId, documentId);
-      },
     );
     documentDeliveryWorkers.set(agentName, worker);
     return worker;
