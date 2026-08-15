@@ -57,6 +57,14 @@ export interface ReconcileSchedulerDeps {
     peerAgentId: string,
     documentIds: readonly string[],
   ): Promise<{ ok: true } | { ok: false; reason?: string }>;
+  /**
+   * Test-pace override for the failure backoff (the enforcers' lesson: a restarted daemon's
+   * first attempts can fail while its own signaling settles, and the production 30s-doubling
+   * ladder walks a fast-sweep test out of its window). Omitted = the production constants.
+   */
+  backoffBaseMs?: number;
+  /** Same test-pace escape for the believed-current window — see backoffBaseMs. */
+  believedCurrentMs?: number;
 }
 
 interface PartyState {
@@ -143,7 +151,7 @@ export class ReconcileScheduler {
         return (
           view.sync === "in_sync" &&
           view.lastSyncedAtMs !== null &&
-          now - view.lastSyncedAtMs < RECONCILE_BELIEVED_CURRENT_MS
+          now - view.lastSyncedAtMs < (this.#d.believedCurrentMs ?? RECONCILE_BELIEVED_CURRENT_MS)
         );
       });
       if (current) {
@@ -192,8 +200,8 @@ export class ReconcileScheduler {
       s.nextAttemptMs = now; // the believed-current check is the steady-state suppressor
     } else {
       s.failures += 1;
-      s.nextAttemptMs =
-        now + Math.min(RECONCILE_BACKOFF_BASE_MS * 2 ** (s.failures - 1), RECONCILE_BACKOFF_CAP_MS);
+      const base = this.#d.backoffBaseMs ?? RECONCILE_BACKOFF_BASE_MS;
+      s.nextAttemptMs = now + Math.min(base * 2 ** (s.failures - 1), RECONCILE_BACKOFF_CAP_MS);
     }
     return allOk;
   }
