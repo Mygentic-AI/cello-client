@@ -72,6 +72,7 @@ import {
   documentGovernancePolicy,
   arrangementGenesisFromProposal,
   deriveDocumentState,
+  deriveDocumentStateAt,
   checkEntryAdmissible,
   decodeDocumentReconcile,
   encodeDocumentReconcile,
@@ -361,6 +362,31 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     // The CONTENT door: strictly participants (R17 — invited seats receive, never author).
     currentHolders: (ownerAgentId: string, documentId: string) =>
       participantsFor(ownerAgentId, documentId),
+    // SYNC-G1 — the world an envelope's signed frontier names (R20's input for the causal gate).
+    deriveAtFrontier: (ownerAgentId: string, documentId: string, frontier: readonly string[]) => {
+      const record = handshake.get(ownerAgentId, documentId);
+      if (!record) return { ok: false as const, reason: "document_genesis_missing" };
+      try {
+        const at = deriveDocumentStateAt(
+          arrangementGenesisFromProposal(record.envelope),
+          amendments.chain(ownerAgentId, documentId),
+          frontier,
+          documentGovernancePolicy,
+          verifySignature,
+        );
+        if (!at.ok) return { ok: false as const, reason: at.reason, missing: at.missing };
+        return {
+          ok: true as const,
+          participants: at.state.participants,
+          invited: at.state.invited,
+        };
+      } catch (err: unknown) {
+        return {
+          ok: false as const,
+          reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        };
+      }
+    },
     sign: deps.sign,
   });
 

@@ -102,6 +102,18 @@ export interface DocumentInboundDeps {
    */
   currentHolders(ownerAgentId: string, documentId: string): string[] | null;
   /**
+   * SYNC-G1 — the derived state AT the envelope's signed governance frontier (R20's input).
+   * `missing` names ancestors not yet held: the caller answers NON-terminally and the exchange
+   * delivers governance first.
+   */
+  deriveAtFrontier(
+    ownerAgentId: string,
+    documentId: string,
+    frontier: readonly string[],
+  ):
+    | { ok: true; participants: ReadonlySet<string>; invited: ReadonlySet<string> }
+    | { ok: false; reason: string; missing?: string[] };
+  /**
    * Sign as the OWNING agent, over the rejection's canonical preimage (DOD-DOC-REJECT-2).
    *
    * Takes the agent so it cannot sign with the wrong key. ASYNC, and that is what makes `receive`
@@ -226,11 +238,66 @@ export class DocumentInbound {
     // the whole gate — a joined third holder's envelope is as admissible as the genesis peer's,
     // and a removed genesis peer's is not admissible at all. Only when the chain cannot answer
     // (bilateral legacy, no genesis record) does the row's peer column stand in.
+    // SYNC-G1 (R20): admissibility is ruled AT THE ENVELOPE'S SIGNED FRONTIER — the governance
+    // world its author actually held — never at our current state, which refuses a removed
+    // author's legitimate earlier work and breaks convergence for every holder who was behind
+    // at removal time (the AC14 case; the old epoch-equality gate broke it three documented
+    // times). An honest removed daemon names a frontier containing its own removal and refuses
+    // HERE, by name (AC13); a backdating daemon admits exactly what an honest holder at that
+    // position could have authored — the same bounded concession the governance fold accepted,
+    // and the fold's removal dominance keeps such a daemon out of governance regardless.
     const senderHolders = this.#d.currentHolders(ownerAgentId, env.document_id);
-    const senderIsParty =
-      senderHolders === null
-        ? env.sender_agent_id === doc.peerAgentId
-        : senderHolders.includes(env.sender_agent_id);
+    let senderIsParty: boolean;
+    if (senderHolders === null) {
+      // Bilateral legacy — no derivable chain; the row's peer column is the membership. The
+      // membership WALK still rules removal here (there is no frontier world to consult), so a
+      // removed legacy peer is refused by name, never re-admitted through the row.
+      const legacyMembership = this.#d.membershipOf(
+        ownerAgentId, env.document_id, env.sender_agent_id,
+      );
+      if (legacyMembership.state === "removed") {
+        this.#d.logger.warn("document.inbound.sender_removed", {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          removedAtEpoch: legacyMembership.epochId,
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "document_sender_removed",
+          terminal: true,
+          envelopeHash,
+          detail:
+            `this holder was removed from the document at epoch ${legacyMembership.epochId} — ` +
+            `the removal is forward-only (your copy is yours), but new edits are no longer ` +
+            `accepted`,
+        };
+      }
+      senderIsParty = env.sender_agent_id === doc.peerAgentId;
+    } else {
+      const at = this.#d.deriveAtFrontier(
+        ownerAgentId, env.document_id, env.governance_parents,
+      );
+      if (!at.ok) {
+        // Ancestors not held: the governance is IN FLIGHT — non-terminal, the exchange
+        // delivers governance before content and this envelope admits on redelivery.
+        this.#d.logger.warn("document.inbound.governance_in_flight", {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          missing: at.missing ?? [],
+          correlationId,
+        });
+        return {
+          ok: false,
+          reason: "document_governance_in_flight",
+          envelopeHash,
+          detail:
+            `this update names governance ancestors this holder does not yet hold — ` +
+            `reconcile delivers governance first; retry after it lands`,
+        };
+      }
+      senderIsParty = at.participants.has(env.sender_agent_id);
+    }
     if (!senderIsParty) {
       // A REMOVED former holder is upgraded from the silent stranger-refusal to the TERMINAL
       // named one (REMOVE-1 review F4): they hold the removal fact already — no new disclosure —
@@ -312,91 +379,9 @@ export class DocumentInbound {
       };
     }
 
-    // 4b. THE EPOCH RULING (M14B / DOD-MP-AMEND-1) — moved here from the decoder, which cannot
-    // know a per-document fact. The decoded value is trustworthy at this point: `epoch_id` sits
-    // inside the signed TBS verified at step 2, so a lie about the epoch already failed there.
-    // The two directions are different facts and get different answers:
-    // - BEHIND us: the envelope was authored under an epoch that has been amended past. Its TBS
-    //   binds that epoch forever, so redelivery can never change the answer — TERMINAL; the
-    //   sender's daemon re-publishes its content under the current epoch.
-    // - AHEAD of us: the sender has applied an amendment we have not yet received. Once it
-    //   arrives, this envelope becomes admittable — so the refusal is NON-terminal and their
-    //   ordinary redelivery retry resolves it. (Richer lag handling is DOD-MP-INBOUND-N-1.)
-    const currentEpoch = this.#d.store.currentDocumentEpoch(ownerAgentId, env.document_id);
-    if (env.epoch_id !== currentEpoch) {
-      const behind = env.epoch_id < currentEpoch;
-      this.#d.logger.warn("document.inbound.epoch_mismatch", {
-        documentId: env.document_id,
-        envelopeEpoch: env.epoch_id,
-        currentEpoch,
-        behind,
-        correlationId,
-      });
-      if (behind) {
-        // ERROR FIDELITY (REMOVE-1 review F2): a removed holder who MISSED the removal
-        // amendment publishes at the old epoch and lands here — and "republish under the
-        // current epoch" is an instruction they cannot follow, concealing a membership fact
-        // behind an epoch label. The behind branch is the one place this answer is definitive:
-        // our chain already contains their removal. (The AHEAD case must NOT do this — there
-        // OUR chain may be the stale one.)
-        const senderMembership = this.#d.membershipOf(
-          ownerAgentId, env.document_id, env.sender_agent_id,
-        );
-        if (senderMembership.state === "removed") {
-          return {
-            ok: false,
-            reason: "document_sender_removed",
-            terminal: true,
-            envelopeHash,
-            detail:
-              `this holder was removed from the document at epoch ${senderMembership.epochId} — ` +
-              `the removal is forward-only (your copy is yours), but new edits are no longer ` +
-              `accepted`,
-          };
-        }
-        return {
-          ok: false,
-          reason: "document_epoch_stale",
-          terminal: true,
-          envelopeHash,
-          detail:
-            `this update was authored under epoch ${env.epoch_id} and the document is at epoch ` +
-            `${currentEpoch} — republish it under the current epoch`,
-        };
-      }
-      return {
-        ok: false,
-        reason: "document_epoch_ahead",
-        detail:
-          `this update names epoch ${env.epoch_id} and this holder is at epoch ${currentEpoch} — ` +
-          `an amendment is still in flight here; retry after it lands`,
-      };
-    }
-
-    // 4c. A REMOVED HOLDER'S envelope refuses NAMING THE REMOVAL (DOD-MP-REMOVE-1) — never a
-    // silent drop, and never a generic condition: "you were removed at epoch N" is a different
-    // fact to hand an operator than any transport or chain error, and it is TERMINAL — no
-    // redelivery changes a membership fact. The sender was authenticated at step 2, so answering
-    // discloses only what the removal amendment already told them.
-    const membership = this.#d.membershipOf(ownerAgentId, env.document_id, env.sender_agent_id);
-    if (membership.state === "removed") {
-      this.#d.logger.warn("document.inbound.sender_removed", {
-        documentId: env.document_id,
-        senderAgentId: env.sender_agent_id,
-        removedAtEpoch: membership.epochId,
-        correlationId,
-      });
-      return {
-        ok: false,
-        reason: "document_sender_removed",
-        terminal: true,
-        envelopeHash,
-        detail:
-          `this holder was removed from the document at epoch ${membership.epochId} — the ` +
-          `removal is forward-only (your copy is yours), but new edits are no longer accepted`,
-      };
-    }
-
+    // 4b (SYNC-G1): the epoch-equality ruling and the current-state removed-sender check are
+    // GONE — both are the causal sender gate's job now, ruled at the envelope's signed
+    // frontier before anything else ran. (D7: the epoch stamp itself dies with this phase.)
     // 5. The document must still ACCEPT. `acceptsUpdates` exists for exactly this and carries a
     // comment describing the bug it was written to fix — "after a restart the document row said
     // `stalled` while the daemon happily accepted updates on it". The only inbound path in the

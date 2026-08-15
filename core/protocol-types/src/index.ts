@@ -296,7 +296,11 @@ export type {
   SignerPolicy,
 } from "./document-amendment.js";
 export { MAX_ENTRY_PARENTS } from "./document-amendment.js";
-export { deriveDocumentState, checkEntryAdmissible } from "./document-derive.js";
+export {
+  deriveDocumentState,
+  deriveDocumentStateAt,
+  checkEntryAdmissible,
+} from "./document-derive.js";
 export {
   DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   MAX_RECONCILE_DOCUMENTS,

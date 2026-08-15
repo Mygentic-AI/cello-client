@@ -75,6 +75,13 @@ function newFixture(
   opts: {
     verify?: () => boolean;
     currentHolders?: () => string[] | null;
+    deriveAtFrontier?: (
+      o: string,
+      d: string,
+      frontier: readonly string[],
+    ) =>
+      | { ok: true; participants: ReadonlySet<string>; invited: ReadonlySet<string> }
+      | { ok: false; reason: string; missing?: string[] };
     order?: string[];
     appendOnly?: boolean;
     /** Omit the document entirely — the peer-refused-the-proposal case, which holds no row. */
@@ -113,6 +120,18 @@ function newFixture(
     // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
     // every older test in this file was written against.
     currentHolders: opts.currentHolders ?? (() => null),
+    deriveAtFrontier:
+      opts.deriveAtFrontier ??
+      ((o: string, d: string) => {
+        const holders = (opts.currentHolders ?? (() => null))(o, d);
+        if (holders === null) return { ok: false as const, reason: "document_genesis_missing" };
+        // The fake mirrors the layer's real semantics for a CURRENT-frontier envelope: current
+        // participants minus anyone the recorded chain says is removed.
+        const seated = holders.filter(
+          (h: string) => amendmentStore.membershipOf(o, d, h).state !== "removed",
+        );
+        return { ok: true as const, participants: new Set(seated), invited: new Set<string>() };
+      }),
     verifySignature: opts.verify ?? (() => true),
     liveDocFor: () => live,
     membershipOf: (o, d, a) => amendmentStore.membershipOf(o, d, a),
@@ -355,24 +374,50 @@ describe("DocumentInbound — the EPOCH ruling (M14B / DOD-MP-AMEND-1)", () => {
     expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
   });
 
-  it("an envelope BEHIND the current epoch is TERMINAL — its TBS binds the old epoch forever", async () => {
-    const f = newFixture();
-    raiseEpoch(f.db, 1);
-    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
-    expect(res).toMatchObject({ ok: false, reason: "document_epoch_stale", terminal: true });
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
-  });
-
-  it("an envelope AHEAD of us refuses NON-terminally — the amendment is still in flight here", async () => {
-    const f = newFixture();
-    const res = await f.inbound.receive(
+  it("a removed sender at their POST-removal frontier refuses by name — and their PRE-removal work ADMITS (the causal rulings that replaced the epoch gate)", async () => {
+    // The AC13 + AC14 pair, in one place: the same removed author is refused for what they
+    // authored after the removal and ADMITTED for what they authored before it — the equality
+    // gate could only do the first, and broke convergence doing it.
+    const f = newFixture({
+      currentHolders: () => [PEER],
+      deriveAtFrontier: (_o, _d, frontier) =>
+        frontier.includes("aa".repeat(32))
+          ? { ok: true, participants: new Set([PEER]), invited: new Set() } // pre-removal world
+          : { ok: true, participants: new Set<string>(), invited: new Set() }, // post-removal world
+    });
+    plantAmendment(f.db, 1, "add_holder", PEER);
+    plantAmendment(f.db, 2, "remove_holder", PEER);
+    const refused = await f.inbound.receive(
       AGENT,
-      encodeDocumentUpdateEnvelope(envelope({ epoch_id: 2 })),
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["bb".repeat(32)] })),
       NOW,
     );
-    expect(res).toMatchObject({ ok: false, reason: "document_epoch_ahead" });
-    expect((res as { terminal?: boolean }).terminal).toBeUndefined();
-    expect(f.store.getEnvelopeLog(AGENT, DOC)).toHaveLength(0);
+    expect(refused).toMatchObject({ ok: false, reason: "document_sender_removed", terminal: true });
+    const admitted = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["aa".repeat(32)] })),
+      NOW,
+    );
+    expect(admitted).toMatchObject({ ok: true });
+  });
+
+  it("an envelope naming UNHELD governance ancestors refuses NON-terminally — reconcile delivers governance first", async () => {
+    const f = newFixture({
+      currentHolders: () => [PEER],
+      deriveAtFrontier: () => ({
+        ok: false,
+        reason: "derive_frontier_missing: 1 of the named governance ancestors are not held",
+        missing: ["cc".repeat(32)],
+      }),
+    });
+    const res = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ governance_parents: ["cc".repeat(32)] })),
+      NOW,
+    );
+    expect(res).toMatchObject({ ok: false, reason: "document_governance_in_flight" });
+    expect((res as { terminal?: boolean }).terminal).not.toBe(true);
+    expect(f.events.some((e) => e.event === "document.inbound.governance_in_flight")).toBe(true);
   });
 
   it("an envelope AT the current post-amendment epoch admits normally", async () => {

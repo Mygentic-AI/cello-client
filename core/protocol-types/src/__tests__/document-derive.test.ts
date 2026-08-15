@@ -20,7 +20,11 @@ import {
 } from "../document-amendment.js";
 import { documentGovernancePolicy } from "../document-governance.js";
 import { buildDocumentMultisigTbs } from "../document-multisig.js";
-import { deriveDocumentState, checkEntryAdmissible } from "../document-derive.js";
+import {
+  deriveDocumentState,
+  deriveDocumentStateAt,
+  checkEntryAdmissible,
+} from "../document-derive.js";
 
 function makeSigner() {
   const { publicKey, privateKey } = generateKeyPairSync("ed25519");
@@ -987,6 +991,50 @@ describe("deriveDocumentState — replay-parity cases (coverage carried from the
     const s = deriveOk(genesis(a, b), [env], [a, b, c]);
     expect(s.invited.has(c.agentId)).toBe(false);
     expect(s.voids[0]!.reason).toMatch(/amendment_state_hash_tier/);
+  });
+});
+
+describe("deriveDocumentStateAt — the world a frontier names (content admissibility's input)", () => {
+  it("derives the state at a PAST frontier — the author participates there even after a later removal (the AC14 shape)", () => {
+    const [a, b, c] = [makeSigner(), makeSigner(), makeSigner()];
+    const g = genesis(a, b, [a]);
+    const admitC = entry({ subject_agent_id: c.agentId }, [a]);
+    const cc = consentEntry(c, { epoch_id: 2, parents: [hashHex(admitC)] });
+    const removeC = entry(
+      { kind: "remove_holder", subject_agent_id: c.agentId, author_seq: 2, epoch_id: 3, parents: [hashHex(cc)] },
+      [a],
+    );
+    const all = [admitC, cc, removeC];
+    // At the pre-removal frontier, C participates…
+    const before = deriveDocumentStateAt(g, all, [hashHex(cc)], documentGovernancePolicy, makeVerify([a, b, c]));
+    expect(before.ok).toBe(true);
+    if (!before.ok) return;
+    expect(before.state.participants.has(c.agentId)).toBe(true);
+    // …and at the post-removal frontier, C does not — and the removal is IN that closure.
+    const after = deriveDocumentStateAt(g, all, [hashHex(removeC)], documentGovernancePolicy, makeVerify([a, b, c]));
+    expect(after.ok).toBe(true);
+    if (!after.ok) return;
+    expect(after.state.participants.has(c.agentId)).toBe(false);
+  });
+
+  it("a frontier naming an ancestor we do not hold reports MISSING — reconcile first, never guess", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const r = deriveDocumentStateAt(
+      genesis(a, b), [], ["ff".repeat(32)], documentGovernancePolicy, makeVerify([a, b]),
+    );
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toMatch(/derive_frontier_missing/);
+    expect(r.missing).toEqual(["ff".repeat(32)]);
+  });
+
+  it("an EMPTY frontier is the genesis world — proposer participates, peer is invited", () => {
+    const [a, b] = [makeSigner(), makeSigner()];
+    const r = deriveDocumentStateAt(genesis(a, b), [], [], documentGovernancePolicy, makeVerify([a, b]));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.state.participants.has(a.agentId)).toBe(true);
+    expect(r.state.invited.has(b.agentId)).toBe(true);
   });
 });
 

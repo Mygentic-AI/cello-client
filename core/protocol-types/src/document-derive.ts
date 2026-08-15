@@ -60,6 +60,55 @@ export type DeriveDocumentStateResult =
 type VerifyFn = (agentId: string, tbs: Uint8Array, signature: Uint8Array) => boolean;
 
 /**
+ * SYNC-G1 — the derivation AT a named governance frontier: the fold restricted to the ancestor
+ * closure of `frontierHashes`. This is what content admissibility rules on (R20/R30): was the
+ * envelope's author a participant in the world its signed `governance_parents` name? Judged
+ * from the named ancestors alone — the same bounded backdating concession Entry 48 accepted
+ * for governance: a lying daemon admits exactly what an honest holder AT THAT POSITION could
+ * have authored, and the fold's removal dominance keeps it out of governance regardless.
+ *
+ * A frontier hash not present in `entries` is the caller's signal to reconcile first — this
+ * function reports it rather than guessing (`missing`).
+ */
+export function deriveDocumentStateAt(
+  genesis: ArrangementGenesis,
+  entries: readonly DocumentAmendmentEnvelope[],
+  frontierHashes: readonly string[],
+  policy: SignerPolicy,
+  verify: VerifyFn,
+): { ok: true; state: DocumentStateView } | { ok: false; reason: string; missing?: string[] } {
+  const byHash = new Map(
+    entries.map((env) => [
+      Buffer.from(documentAmendmentHash(env.body)).toString("hex"),
+      env,
+    ]),
+  );
+  const missing = frontierHashes.filter((h) => !byHash.has(h));
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason:
+        `derive_frontier_missing: ${missing.length} of the named governance ancestors are not ` +
+        `held — reconcile before ruling`,
+      missing,
+    };
+  }
+  const wanted = new Set<string>();
+  const queue = [...frontierHashes];
+  while (queue.length > 0) {
+    const h = queue.pop()!;
+    if (wanted.has(h)) continue;
+    wanted.add(h);
+    const env = byHash.get(h);
+    if (env) queue.push(...env.body.parents);
+  }
+  const subset = entries.filter((env) =>
+    wanted.has(Buffer.from(documentAmendmentHash(env.body)).toString("hex")),
+  );
+  return deriveDocumentState(genesis, subset, policy, verify);
+}
+
+/**
  * The STATE-INDEPENDENT admission check — what an inbound path may refuse outright, because no
  * future entry can ever make it good: the collection must bind to this entry, the claimed author
  * must be in the required set, and every claimed signature must verify. Everything else — subject
