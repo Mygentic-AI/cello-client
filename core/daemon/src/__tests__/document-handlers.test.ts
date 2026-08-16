@@ -28,6 +28,7 @@ import {
   type DocumentAmendmentBody,
   type DocumentProposalEnvelope,
   encodeDocumentReconcile,
+  decodeDocumentReconcile,
   DOCUMENT_RECONCILE_EXCHANGE_VERSION,
   encodeDocumentUpdateEnvelope,
   DOCUMENT_UPDATE_ENCODING_V1,
@@ -1003,6 +1004,32 @@ describe("JOIN-1 — the full join roundtrip, two daemons in process", () => {
     fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(strangerWire), fA.owner);
     await new Promise((r) => setTimeout(r, 100));
     expect(fC.layer.store.getDocument(fC.owner, strangerId)).toBeNull();
+  });
+
+  it("SYNC-AC19 — a peer speaking ANOTHER exchange version is refused BY NAME, and the refusal reaches them", async () => {
+    // The version gate had no test at all, and a gate nobody exercises is a gate nobody notices
+    // going quiet. What matters is not that the frame is dropped — it is that the OTHER SIDE is
+    // TOLD, in a sentence naming both versions, because the alternative (silence) is
+    // indistinguishable from a lost frame and sends the operator hunting the transport.
+    const fA = await newFixture();
+    const fC = await newFixture();
+    const wire = encodeDocumentReconcile({
+      type: "document_reconcile",
+      exchange_version: DOCUMENT_RECONCILE_EXCHANGE_VERSION + 1,
+      documents: [],
+    });
+    fC.layer.onDocumentFrame(AGENT, "session-1", new Uint8Array(wire), fA.owner);
+    await new Promise((r) => setTimeout(r, 100));
+    expect(fC.events).toContain("document.reconcile.version_refused");
+    const reply = fC.sent.find((send) => send.peerAgentId === fA.owner);
+    expect(reply, "the version refusal never left this holder — the peer learns nothing").toBeDefined();
+    const decoded = decodeDocumentReconcile(reply!.bytes);
+    expect(decoded.refusal?.reason).toContain("document_reconcile_version");
+    // NON-terminal: the two sides can upgrade and try again. A terminal ruling here would tell a
+    // peer to stop asking forever over something a version bump fixes.
+    expect(decoded.refusal?.terminal).toBe(false);
+    // And it names BOTH versions, so the sentence is actionable without reading the source.
+    expect(decoded.refusal?.reason).toContain(String(DOCUMENT_RECONCILE_EXCHANGE_VERSION));
   });
 
   it("A FORWARDED ENVELOPE WITH A CORRUPTED SIGNATURE IS REFUSED — forwarding confers no trust, verified not asserted (R2)", async () => {

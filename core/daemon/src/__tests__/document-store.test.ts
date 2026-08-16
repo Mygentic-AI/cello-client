@@ -15,6 +15,7 @@ import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { DocumentStore, DocumentChainError, type DocumentEnvelopeRow } from "../document-store.js";
+import { DocumentAmendmentStore } from "../document-amendment-store.js";
 
 const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} } as never;
 
@@ -332,6 +333,43 @@ describe("DocumentStore — schema discipline", () => {
       expect(cols.map((c) => c.name), `${table} must not key on a mutable attribute`)
         .not.toContain("agent_name");
     }
+  });
+
+  it("SYNC-AC3 — the document schema holds NO per-recipient delivery DEBT; the one per-party table is a display cache", () => {
+    // The pivot's central claim, asserted where it can be enumerated rather than argued: after a
+    // reconciling exchange there is nothing anywhere that says "X still owes Y this entry".
+    // Differences are recomputed at every exchange, so a debt row has no reader — and a debt row
+    // with no reader is exactly what silently comes back to life. Schema-driven on purpose: a
+    // table added next month is covered without anyone remembering this test exists.
+    //
+    // `document_party_view` is the deliberate exception and the reason the check is on COLUMNS
+    // rather than "no per-party table": R44 permits a per-party DISPLAY cache, and R41 makes it a
+    // belief — wrong costs latency, never correctness. Belief columns (when we last heard from
+    // them, what we think they hold) are fine; debt columns are not.
+    const db = new DatabaseSync(":memory:");
+    new DocumentStore(db, NOOP_LOGGER);
+    new DocumentAmendmentStore(db, NOOP_LOGGER);
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>)
+      .map((t) => t.name)
+      .filter((n) => !n.startsWith("sqlite_"));
+    // A DENYLIST, because these are schema names the code chooses — the reverse (an allowlist of
+    // permitted names) goes stale into a rubber stamp the first time a table is renamed.
+    const DEBT_TABLE = /deliver|outbox|dispatch|_acks?$|undelivered|redeliver/;
+    const DEBT_COLUMN =
+      /^(delivered|delivered_at_ms|delivery_[a-z_]+|acked|acked_at_ms|ack_[a-z_]+|undelivered[a-z_]*|attempts|attempt_count|next_attempt_at_ms|retry_[a-z_]+|last_attempt_at_ms|pending_for[a-z_]*)$/;
+    for (const table of tables) {
+      expect(DEBT_TABLE.test(table), `${table} is a delivery ledger by name — SYNC-D2 deleted these`).toBe(false);
+      const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((c) => c.name);
+      for (const col of cols) {
+        expect(
+          DEBT_COLUMN.test(col),
+          `${table}.${col} records a per-recipient delivery debt; differences are DERIVED at every exchange (R8/R9)`,
+        ).toBe(false);
+      }
+    }
+    // Positive control: the enumeration actually saw the document schema, so a future refactor
+    // that moves these tables elsewhere fails here instead of passing over an empty list.
+    expect(tables).toEqual(expect.arrayContaining(["documents", "document_envelopes", "document_entries"]));
   });
 });
 

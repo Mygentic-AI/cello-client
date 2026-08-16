@@ -48,11 +48,24 @@ import type { Logger } from "./types.js";
  * with no default, which would refuse every insert from this build. Dropped in place (SQLite
  * ≥3.35 / SQLCipher 4.5); a fresh database never has it.
  */
-export function dropLegacyEpochColumn(db: { exec(sql: string): void; prepare(sql: string): { all(...a: unknown[]): unknown[] } }, table: string): void {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
-  if (cols.some((c) => c.name === "epoch_id")) {
-    db.exec(`ALTER TABLE ${table} DROP COLUMN epoch_id`);
+type ColumnDropper = { exec(sql: string): void; prepare(sql: string): { all(...a: unknown[]): unknown[] } };
+
+/**
+ * Drop columns a previous milestone left behind, birth-gated: only what the table actually still
+ * has is touched, so this is safe on a database created yesterday and on one created before the
+ * column existed. Dead schema is not free — it is the design a future author reads and rebuilds.
+ */
+export function dropLegacyColumns(db: ColumnDropper, table: string, columns: readonly string[]): void {
+  const held = new Set(
+    (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>).map((c) => c.name),
+  );
+  for (const column of columns) {
+    if (held.has(column)) db.exec(`ALTER TABLE ${table} DROP COLUMN ${column}`);
   }
+}
+
+export function dropLegacyEpochColumn(db: ColumnDropper, table: string): void {
+  dropLegacyColumns(db, table, ["epoch_id"]);
 }
 
 export const DOCUMENT_ENTRIES_CREATE_SQL = `

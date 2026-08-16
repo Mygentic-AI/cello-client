@@ -63,7 +63,13 @@ export interface ReconcileSchedulerDeps {
    * ladder walks a fast-sweep test out of its window). Omitted = the production constants.
    */
   backoffBaseMs?: number;
-  /** Same test-pace escape for the believed-current window — see backoffBaseMs. */
+  /**
+   * Same test-pace escape for the believed-current window — see backoffBaseMs. CLAMPED to the
+   * production constant as a CEILING (review F5): the backoff has a cap and this did not, and an
+   * override longer than the production window would let one mis-set environment variable suppress
+   * sweeps for as long as it liked. R41 permits scheduling state to DELAY an exchange, never to
+   * forbid one, so the only direction this knob may move is shorter.
+   */
   believedCurrentMs?: number;
 }
 
@@ -146,12 +152,16 @@ export class ReconcileScheduler {
       // Believed current (R43): every shared document in_sync and heard from recently. The
       // cache may be wrong — that costs one suppression window of latency, never correctness
       // (R40: the next exchange recovers anything).
+      const believedWindow = Math.min(
+        this.#d.believedCurrentMs ?? RECONCILE_BELIEVED_CURRENT_MS,
+        RECONCILE_BELIEVED_CURRENT_MS,
+      );
       const current = docs.every((documentId) => {
         const view = this.#d.partySync(ownerAgentId, documentId, peerAgentId);
         return (
           view.sync === "in_sync" &&
           view.lastSyncedAtMs !== null &&
-          now - view.lastSyncedAtMs < (this.#d.believedCurrentMs ?? RECONCILE_BELIEVED_CURRENT_MS)
+          now - view.lastSyncedAtMs < believedWindow
         );
       });
       if (current) {

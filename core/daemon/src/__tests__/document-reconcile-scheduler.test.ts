@@ -66,6 +66,20 @@ describe("the sweep (R39 trigger 3, R43 bounds)", () => {
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
   });
 
+  it("a believed-current OVERRIDE can only shorten the window, never lengthen it (R41)", async () => {
+    // The knob exists so tests need not wait out production patience. Pointed the other way it
+    // would let one environment variable suppress sweeping for as long as it liked — scheduling
+    // state may DELAY an exchange, never forbid one. The production window is the ceiling.
+    const f = fixture({
+      believedCurrentMs: RECONCILE_BELIEVED_CURRENT_MS * 100,
+      partySync: () => ({
+        sync: "in_sync",
+        lastSyncedAtMs: 1_700_000_000_000 - RECONCILE_BELIEVED_CURRENT_MS - 1,
+      }),
+    });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
   it("a party that does not answer is backed off, doubling to the cap — and a sweep inside the window skips", async () => {
     const f = fixture({
       initiateReconcile: async () => ({ ok: false, reason: "peer_offline" }),

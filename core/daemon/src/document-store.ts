@@ -33,10 +33,10 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
-import { addColumnIfMissing } from "./column-birth.js";
 import {
   DOCUMENT_ENTRIES_CREATE_SQL,
   dropLegacyEpochColumn,
+  dropLegacyColumns,
 } from "./document-amendment-store.js";
 
 /** Lifecycle states a document can hold (§3.5). `stalled` is DOD-DOC-REJECT-1's terminal state. */
@@ -94,11 +94,6 @@ export interface DocumentEnvelopeRow {
   senderClientId?: number | null;
   /** Position in this document's log. Assigned on append; absent until then. */
   logIndex?: number;
-  /** DELIVERY bookkeeping, read back from the log. Absent on a row being appended. */
-  deliveredAtMs?: number | null;
-  ackedAtMs?: number | null;
-  attempts?: number;
-  nextAttemptAtMs?: number | null;
 }
 
 export interface QuarantineRow {
@@ -202,33 +197,6 @@ const CREATE_ENVELOPES_SQL = `
     references_hash TEXT,
     created_at      INTEGER NOT NULL,
     log_index       INTEGER NOT NULL,
-    -- DELIVERY-1. Pending outbound is DERIVED from these columns rather than held in a queue:
-    -- a queue in memory does not survive a restart, and a queue in its own table is a second
-    -- source of truth that can disagree with the log about what was sent. "Unacknowledged
-    -- envelopes I authored" is the whole definition, and it is a WHERE clause.
-    -- TWO facts, and they are genuinely different: delivered_at is when the envelope LEFT (or was
-    -- parked for an offline peer), acked_at is when the peer's daemon said it admitted or rejected
-    -- it. An earlier version had delivered_at with no real writer — its only assignment was a
-    -- COALESCE inside the ack, so it always equalled acked_at and the distinction was one the
-    -- schema could not express. It has a writer now (markDelivered), so the distinction is real:
-    -- "sent, awaiting confirmation" is exactly the state a store-and-forward transport leaves an
-    -- envelope in, and an operator asking why something has not landed needs to tell it from
-    -- "never sent".
-    delivered_at    INTEGER,
-    acked_at        INTEGER,
-    -- A THIRD fact, and it is not either of the two above. abandoned_at is when WE STOPPED TRYING
-    -- (the unacked ceiling) — a local decision, and NOT a claim about the peer.
-    --
-    -- It exists because the ceiling first stopped delivery by calling markAcked, and acked_at means
-    -- "the peer's daemon said it admitted or rejected it". Overloading it made withdraw tell the
-    -- operator "your peer holds it, so it cannot be withdrawn" about an envelope the peer may never
-    -- have seen. Same class as any other false claim of confirmation, and a column is cheaper.
-    abandoned_at    INTEGER,
-    -- How many times delivery has been attempted, and when the next attempt is due. On the row,
-    -- because a backoff that resets on restart is not a backoff — a daemon restarting in a
-    -- reconnect loop would hammer an unreachable peer at full rate forever.
-    attempts        INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at INTEGER,
     PRIMARY KEY (owner_agent_id, document_id, envelope_hash),
     -- A duplicate index would make ORDER BY log_index non-deterministic, and this log's entire
     -- value is deterministic replay. Two daemons on one DB file (the orphan-process case this
@@ -367,6 +335,15 @@ export class DocumentStore {
     dropLegacyEpochColumn(this.#db, "document_entries");
     this.#db.exec(CREATE_ENVELOPES_SQL);
     dropLegacyEpochColumn(this.#db, "document_envelopes");
+    // SYNC-AC3 residue. P4 deleted the delivery worker and its ledgers but left DELIVERY-1's
+    // bookkeeping columns standing on the envelope log — no writer, no reader, and exactly the
+    // per-recipient DEBT the pivot exists to abolish ("X still owes Y this envelope"). Dead
+    // columns are not harmless here: the next author to see `next_attempt_at` in the schema
+    // reasonably concludes retry state belongs on the row and rebuilds the machine. Dropped on
+    // open, birth-gated like the epoch column beside it.
+    dropLegacyColumns(this.#db, "document_envelopes", [
+      "delivered_at", "acked_at", "abandoned_at", "attempts", "next_attempt_at",
+    ]);
     this.#db.exec(CREATE_QUARANTINE_SQL);
     // SYNC-R35, birth-gated like the epoch drops: a database born earlier lacks the column.
     {
@@ -395,15 +372,6 @@ export class DocumentStore {
       );
     `);
     this.#db.exec(CREATE_SNAPSHOTS_SQL);
-    // COLUMN BIRTH. A daemon that already holds an envelope log must gain the column without
-    // losing the log. `ALTER TABLE ... ADD COLUMN` throws when it is already there, which is the
-    // guard — the same pattern `document-handshake.ts` uses, rather than a version number nobody
-    // maintains.
-    addColumnIfMissing(this.#db, this.#logger, {
-      table: "document_envelopes",
-      column: "abandoned_at",
-      sql: "ALTER TABLE document_envelopes ADD COLUMN abandoned_at INTEGER",
-    });
     // Reading the log in arrival order is the only access pattern that matters.
     this.#db.exec(
       "CREATE INDEX IF NOT EXISTS idx_document_envelopes_order ON document_envelopes (owner_agent_id, document_id, log_index)",
@@ -1256,10 +1224,6 @@ function toEnvelopeRow(r: Record<string, unknown>): DocumentEnvelopeRow {
     referencesEnvelopeHash: (r["references_hash"] as string | null) ?? null,
     createdAtMs: r["created_at"] as number,
     logIndex: r["log_index"] as number,
-    deliveredAtMs: (r["delivered_at"] as number | null) ?? null,
-    ackedAtMs: (r["acked_at"] as number | null) ?? null,
-    attempts: (r["attempts"] as number | null) ?? 0,
-    nextAttemptAtMs: (r["next_attempt_at"] as number | null) ?? null,
   };
 }
 
