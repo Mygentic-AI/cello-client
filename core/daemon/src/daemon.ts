@@ -3581,13 +3581,9 @@ async function startDaemonHoldingLock(
     renderedHandlers,
   );
 
-  try {
-    await ipcServer.start();
-  } catch (err: unknown) {
-    // As above: startDaemon's catch releases the singleton lock for us.
-    await removeLockIfOwned(lockFilePath, process.pid, logger);
-    throw err;
-  }
+  // THE SOCKET OPENS LAST — see the deferred start below. Accepting clients here would accept
+  // `cello_start_agent`, which brings an agent online, creates its standing receiver, and drains
+  // parked content — all of it arriving before the document frame hook exists.
 
   // MCP-002: Instantiate NotificationDispatcher (wired to IPC server)
   const notificationDispatcher = new NotificationDispatcher({
@@ -3931,6 +3927,32 @@ async function startDaemonHoldingLock(
   }, RECONCILE_SWEEP_MS);
   reconcileSweepTimer.unref?.();
   documentOwnerKeyForHook = documentOwnerKeyFor;
+
+  // ── THE SOCKET OPENS ONLY NOW, and the ordering is load-bearing (2026-08-16). ──
+  //
+  // This used to run ~120 lines earlier, immediately after the server was created — before
+  // `setOnDocumentFrame` above. That opened a window on every daemon start: a client connects,
+  // calls `cello_start_agent`, the agent comes online, its standing receiver drains whatever the
+  // relay parked — and any DOCUMENT frame in that drain found `#onDocumentFrame` still unset. The
+  // routing fork in session-node-manager treats an unconsumed frame as conversation, so those
+  // frames were appended as `msg` leaves, written to the durable transcript, rang the doorbell,
+  // and were handed to the agent by `cello_receive` as raw canonical CBOR.
+  //
+  // Reported from the live fleet by a counterparty who pasted the bytes back
+  // (`dtyperdocument_reconcile…`), reproduced in `j-stale-session.spine.test.ts`, and it is why
+  // documents accumulated unaccepted: the frames were not lost in transit, they were EATEN as
+  // messages, so the document layer never saw them while the sender was told they were delivered.
+  //
+  // The comment at that fork claimed an unwired hook "cannot change the conversation path". It
+  // can, and did. Nothing between here and the server's creation needs a live socket, so the
+  // honest fix is to finish wiring before anyone can knock.
+  try {
+    await ipcServer.start();
+  } catch (err: unknown) {
+    // As above: startDaemon's catch releases the singleton lock for us.
+    await removeLockIfOwned(lockFilePath, process.pid, logger);
+    throw err;
+  }
 
 
   // MCP-001: Clean up per-connection state when a connection disconnects

@@ -421,7 +421,7 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -4639,7 +4639,12 @@ export class SessionNodeManager {
       // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
       // leafs it at its canonical index when the gap fills, but never buffers it for the agent. This
       // keeps leafIndex === canonicalSeq for screened-out content too (code-review HIGH-1).
-      held.set(canonicalSeq, { content: deliverContent, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
+      // THE PEER'S RAW BYTES RIDE ALONG. Classification (document frame vs conversation) reads
+      // byte 0, and `deliverContent` is the SCREENED copy — for a CBOR frame that is no longer a
+      // map header, so a held document frame was released into the CONVERSATION path: transcript,
+      // doorbell, and `cello_receive` handing an agent raw CBOR as though a person typed it.
+      // The in-order path has always passed these bytes; only the held path dropped them.
+      held.set(canonicalSeq, { content: deliverContent, originalContent: content, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
       this.#logger.info("session.content.held", {
         sessionId,
         canonicalSeq,
@@ -4962,7 +4967,7 @@ export class SessionNodeManager {
       if (entry.screenedOut) {
         this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
       } else {
-        this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId);
+        this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);
       }
       released++;
       this.#logger.info("session.content.released", {
