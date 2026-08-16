@@ -145,9 +145,11 @@ export function documentGovernancePolicy(
     return {
       ok: false,
       reason:
-        "governance_remove_admin_first: removing an admin from the document takes the " +
-        "remove_admin rule (all other admins) — a single admin cannot expel a fellow admin " +
-        "through the holder door, and holder removal drops admin status too",
+        "governance_remove_admin_first: a fellow admin cannot be expelled through the holder " +
+        "door — holder removal would drop their admin status with it. Demotion takes every " +
+        "other admin's signature, and NO VERB FOR THAT EXISTS YET: today the only way an admin " +
+        "leaves is to remove themselves (pass their own agent id). Do not wait for a demote " +
+        "command; there isn't one.",
     };
   }
 

@@ -310,8 +310,9 @@ const DOC_VERB_HELP: Record<string, string> = {
     "their next edit is refused with a reason naming the removal. Nothing reaches onto their\n" +
     "disk, and no surface here will claim otherwise.\n" +
     "\n" +
-    "You cannot remove a fellow admin this way: demote them first, which takes the agreement\n" +
-    "of every other admin.\n",
+    "You cannot remove a fellow admin this way, and there is no demote command to reach for:\n" +
+    "demotion needs every other admin's signature and that verb is not built. Today an admin\n" +
+    "leaves only by removing THEMSELVES. Choose your admins accordingly.\n",
 };
 
 
