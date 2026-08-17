@@ -143,6 +143,13 @@ export interface AgentInfo {
    */
   standing_receiver_ready?: boolean;
   /**
+   * DOD-M12B-RESERVATION-RETRY-1: whether a NAT'd peer can actually DIAL this agent.
+   * `standing_receiver_ready` only says a receiver EXISTS — it is true for a plain TCP node no relay
+   * would give a circuit reservation to, which behind NAT is reachable by nobody. That difference
+   * was visible only in the log, where it appeared 481 times and nobody acted.
+   */
+  standing_receiver_reachability?: "reserved" | "retrying" | "unreachable" | "absent";
+  /**
    * Whether THIS agent is the current (selected) agent for the requesting connection. Kept SEPARATE
    * from `state` — `state` must not overload the value "current", or two equally healthy agents read
    * as different readiness levels. A selected agent reads `state: "online"` + `selected: true`.

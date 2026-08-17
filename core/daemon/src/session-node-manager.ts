@@ -513,7 +513,10 @@ export class SessionNodeManager {
    * DOD-M12B-RESERVATION-RETRY-1: per-agent re-attempt state for a receiver the relay refused a
    * reservation to. `attempts` counts RETRIES, not the creation attempt.
    */
-  readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number }>();
+  /** The reason the last reservation attempt was refused, per agent — captured at the rejection so
+   *  the retry and give-up can name a CAUSE instead of only their own exit point. */
+  readonly #srLastRejectionReason = new Map<string, string>();
+  readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
   /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
   #parkedDrainBackstopMs: number;
@@ -2321,6 +2324,27 @@ export class SessionNodeManager {
   getStandingReceiverReady(agentName?: string): boolean {
     if (agentName !== undefined) return this.#standingReceivers.has(agentName);
     return this.#standingReceivers.size > 0;
+  }
+
+  /**
+   * DOD-M12B-RESERVATION-RETRY-1 — whether a NAT'd peer can actually DIAL this agent.
+   *
+   * `standing_receiver_ready` answers "is there a receiver?", which is true for a plain TCP node
+   * that no relay would give a circuit reservation to. Behind NAT that node is reachable by nobody,
+   * and the difference was visible only in the log — where it was visible 481 times and nobody
+   * acted. `"retrying"` and `"unreachable"` are the states an operator can do something about.
+   *
+   *   reserved    — holds a circuit reservation; a NAT'd peer can dial it.
+   *   retrying    — no reservation yet, still re-asking on a backoff.
+   *   unreachable — the retry budget is spent. Only peers that can connect DIRECTLY will get in.
+   *   absent      — no receiver at all (the agent is not online).
+   */
+  getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" {
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return "absent";
+    if (sr.hasReservation && sr.relayPeerId !== undefined) return "reserved";
+    const retry = this.#srReservationRetry.get(agentName);
+    return retry !== undefined && retry.attempts > SR_RESERVATION_MAX_RETRIES ? "unreachable" : "retrying";
   }
 
   /** First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use (gater-open). */
@@ -7552,7 +7576,11 @@ export class SessionNodeManager {
    */
   #retryReservationIfDue(agentName: string): void {
     const now = Date.now();
-    const state = this.#srReservationRetry.get(agentName) ?? { attempts: 0, nextAt: now + this.#srReservationRetryMs };
+    const state = this.#srReservationRetry.get(agentName)
+      ?? { attempts: 0, nextAt: now + this.#srReservationRetryMs, correlationId: randomUUID() };
+    // The reason the LAST attempt was refused, captured where it is actually known.
+    const lastReason = this.#srLastRejectionReason.get(agentName);
+    if (lastReason !== undefined) state.lastReason = lastReason;
     if (state.attempts === 0 && !this.#srReservationRetry.has(agentName)) {
       // First sighting — schedule, do not fire. The creation attempt just happened.
       this.#srReservationRetry.set(agentName, state);
@@ -7567,6 +7595,14 @@ export class SessionNodeManager {
         this.#logger.error("session.standing_receiver.reservation.gave_up", {
           agentName,
           attempts: SR_RESERVATION_MAX_RETRIES,
+          correlationId: state.correlationId,
+          // WHY, not just the consequence. Three different problems reach this one message and they
+          // need three different responses: `relay_granted_no_reservation` is relay CAPACITY (and a
+          // trustless-cello problem), `relay_unreachable` is the NETWORK, and
+          // `reservation_did_not_complete_in_time` is LATENCY — and the only one of the three that
+          // can pin a slot it never uses, so its appearance is also the signal that this retry
+          // budget needs tightening.
+          ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
           impact:
             "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
         });
@@ -7575,12 +7611,20 @@ export class SessionNodeManager {
     }
 
     state.attempts += 1;
-    state.nextAt = now + this.#srReservationRetryMs * 2 ** (state.attempts - 1);
+    // The FINAL attempt gets a fixed settle window rather than another doubled wait: at the top of
+    // the ladder that would be 80 minutes of silence after the last thing we did, which is a long
+    // time to tell an operator nothing. Every earlier attempt doubles, which is what keeps a fleet
+    // off a scarce relay.
+    state.nextAt = now + (state.attempts >= SR_RESERVATION_MAX_RETRIES
+      ? this.#srReservationRetryMs
+      : this.#srReservationRetryMs * 2 ** (state.attempts - 1));
     this.#srReservationRetry.set(agentName, state);
     this.#logger.warn("session.standing_receiver.reservation.retry", {
       agentName,
       attempt: state.attempts,
       maxAttempts: SR_RESERVATION_MAX_RETRIES,
+      correlationId: state.correlationId,
+      ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
       impact: "this agent currently holds no circuit reservation, so a NAT'd peer cannot dial it",
     });
     void this.#rebuildStandingReceiver(agentName);
@@ -7609,8 +7653,9 @@ export class SessionNodeManager {
         this.#retryReservationIfDue(agentName);
         continue;
       }
-      // It has one — any earlier retry budget is spent and irrelevant.
+      // It has one — any earlier retry budget, and the reason the last attempt failed, are stale.
       this.#srReservationRetry.delete(agentName);
+      this.#srLastRejectionReason.delete(agentName);
 
       // Watch the CONNECTION to the relay, not the circuit address.
       //
@@ -7745,15 +7790,17 @@ export class SessionNodeManager {
         return candidate;
       }
 
+      const rejectionReason =
+        outcome === "started"
+          ? "relay_granted_no_reservation"
+          : outcome === "failed"
+            ? "relay_unreachable"
+            : "reservation_did_not_complete_in_time";
+      this.#srLastRejectionReason.set(agentName, rejectionReason);
       this.#logger.warn("session.standing_receiver.relay.rejected", {
         agentName,
         circuitAddr,
-        reason:
-          outcome === "started"
-            ? "relay_granted_no_reservation"
-            : outcome === "failed"
-              ? "relay_unreachable"
-              : "reservation_did_not_complete_in_time",
+        reason: rejectionReason,
         ...(error !== "" ? { error } : {}),
         correlationId,
       });
@@ -7839,9 +7886,18 @@ export class SessionNodeManager {
     autoNat.emitInitialResult();
 
     const circuitAddrs = node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length;
-    // The relay we actually reserved with — the watchdog watches our connection to it.
+    // FROM THE ADDRESS THE NODE ACTUALLY HOLDS, not from `reservations.addrs[0]`.
+    //
+    // `#startReceiverNode` tries candidates in order and returns the FIRST that actually grants —
+    // so when candidate 0 refuses (the measured `relay_granted_no_reservation` case) and candidate 1
+    // grants, reading candidate 0's address records a relay we are not connected to. The watchdog
+    // then evaluates `getConnections().some(c => c.peerId === relayPeerId)` against that wrong peer,
+    // finds it false on every tick forever, and rebuilds on the 30-second grid — churning the very
+    // reservations this unit exists to conserve. Dormant while the pool is size 1; the pool is
+    // designed to be larger.
+    const heldCircuitAddr = node.listenAddresses().find((a) => a.includes("/p2p-circuit"));
     const reservedRelayPeerId =
-      circuitAddrs > 0 ? reservations.addrs[0]?.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1] : undefined;
+      circuitAddrs > 0 ? heldCircuitAddr?.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1] : undefined;
     this.#standingReceivers.set(agentName, {
       node,
       gater,
@@ -7903,6 +7959,14 @@ export class SessionNodeManager {
     // gets a fresh set on its next connect — holding the old ones would keep a
     // retired agent's relay list alive for the daemon's lifetime.
     this.#directoryRelayEndpoints.delete(agentName);
+    // DOD-M12B-RESERVATION-RETRY-1: and the retry budget with them. A spent budget that survives an
+    // offline→online cycle is a LATCH: the new receiver gets no reservation, the watchdog finds
+    // `attempts` already past the cap, and returns having done nothing — no retry and not even a
+    // second give-up. The agent is undialable and the machinery is inert and mute until a daemon
+    // restart. Same reason the line above exists ("holding the old ones would keep a retired agent's
+    // relay list alive for the daemon's lifetime").
+    this.#srReservationRetry.delete(agentName);
+    this.#srLastRejectionReason.delete(agentName);
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) {
       // L1: an #ensureStandingReceiver for this agent may be in flight (parked on start(), so no

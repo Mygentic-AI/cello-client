@@ -109,7 +109,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     const { snm, dir } = await makeManager({ factory, logger, retryMs: 40 });
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
-    await snm.ensureStandingReceiverForAgent("alice", "corr");
+    await snm.ensureStandingReceiverForAgent("alice");
     const afterFirst = factory.circuitAttempts;
     expect(afterFirst, "the first attempt happens at creation").toBeGreaterThan(0);
 
@@ -123,6 +123,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
       events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length,
       "and the re-attempt must be visible, not silent",
     ).toBeGreaterThan(0);
+    expect(snm.getStandingReceiverReachability("alice"), "and the operator can see it is still trying").toBe("retrying");
   }, 30_000);
 
   it("STOPS after a bounded number of attempts, and says the agent is undialable", async () => {
@@ -133,7 +134,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     const { snm, dir } = await makeManager({ factory, logger, retryMs: 20 });
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
-    await snm.ensureStandingReceiverForAgent("alice", "corr");
+    await snm.ensureStandingReceiverForAgent("alice");
     await new Promise((r) => setTimeout(r, 800));
 
     const gaveUp = events.filter((e) => e.event === "session.standing_receiver.reservation.gave_up");
@@ -146,6 +147,12 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     const attemptsAtGiveUp = factory.circuitAttempts;
     await new Promise((r) => setTimeout(r, 300));
     expect(factory.circuitAttempts, "nothing may keep asking after the budget is spent").toBe(attemptsAtGiveUp);
+
+    // AND IT REACHES A SURFACE THE OPERATOR READS, not only the log — which is where this was
+    // visible 481 times while nobody acted. `standing_receiver_ready` is TRUE for this agent: a
+    // receiver exists. It is simply one nobody behind NAT can dial, and that is the distinction.
+    expect(snm.getStandingReceiverReady("alice"), "a receiver DOES exist — that is the trap").toBe(true);
+    expect(snm.getStandingReceiverReachability("alice")).toBe("unreachable");
   }, 30_000);
 
   it("STOPS as soon as a reservation is granted — no churn once the agent is reachable", async () => {
@@ -155,7 +162,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
     const { snm, dir } = await makeManager({ factory, logger, retryMs: 30 });
     cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
 
-    await snm.ensureStandingReceiverForAgent("alice", "corr");
+    await snm.ensureStandingReceiverForAgent("alice");
     await new Promise((r) => setTimeout(r, 400));
     const settled = factory.circuitAttempts;
     expect(settled, "it should have kept trying until one was granted").toBeGreaterThanOrEqual(3);
@@ -165,5 +172,68 @@ describe("DOD-M12B-RESERVATION-RETRY-1: a receiver with no reservation is tried 
       factory.circuitAttempts,
       "a granted reservation ends the retry — burning slots on a healthy receiver is the hazard the code already names",
     ).toBe(settled);
+    expect(snm.getStandingReceiverReachability("alice"), "and the agent reads as dialable again").toBe("reserved");
+  }, 30_000);
+});
+
+describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
+  let cleanup: (() => Promise<void>) | null = null;
+  afterEach(async () => { if (cleanup) await cleanup(); cleanup = null; });
+
+  it("the wait GROWS between attempts — a fixed interval is what churns a scarce relay", async () => {
+    // THE CLAUSE THAT PROTECTS THE SCARCE RESOURCE, and it was the one with no assertion: replacing
+    // the doubling with a flat `now + retryMs` left every other case green. A reservation is held by
+    // the relay for its full TTL even after the client disconnects, so a fleet re-asking on a fixed
+    // short interval is exactly how one is exhausted.
+    const { logger, events } = makeLogger();
+    const factory = new SlotStarvedFactory();
+    const { snm, dir } = await makeManager({ factory, logger, retryMs: 30 });
+    cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
+
+    await snm.ensureStandingReceiverForAgent("alice");
+    const at: number[] = [];
+    const started = Date.now();
+    // Record when each retry fires, by watching the event count change.
+    let seen = 0;
+    for (let i = 0; i < 120 && seen < 4; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      const n = events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length;
+      while (seen < n) { at.push(Date.now() - started); seen += 1; }
+    }
+    expect(at.length, "needs at least three retries to compare two gaps").toBeGreaterThanOrEqual(3);
+
+    const gaps = at.slice(1).map((v, i) => v - at[i]!);
+    expect(
+      gaps[1]! > gaps[0]!,
+      `each wait must be longer than the last — got gaps ${gaps.join(", ")}ms. A flat interval passes every other test in this file.`,
+    ).toBe(true);
+  }, 30_000);
+
+  it("taking the agent OFFLINE and back re-arms the budget — a spent latch must not survive", async () => {
+    // Without clearing the state on removal, a fresh receiver inherits a spent budget: the watchdog
+    // finds `attempts` past the cap and returns having done NOTHING — no retry, and not even a
+    // second give-up. The agent is undialable and the machinery is inert and mute until a daemon
+    // restart, while the relay may have had slots free for hours.
+    const { logger, events } = makeLogger();
+    const factory = new SlotStarvedFactory();
+    const { snm, dir } = await makeManager({ factory, logger, retryMs: 20 });
+    cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
+
+    await snm.ensureStandingReceiverForAgent("alice");
+    await new Promise((r) => setTimeout(r, 800));
+    expect(
+      events.filter((e) => e.event === "session.standing_receiver.reservation.gave_up").length,
+      "the budget must be spent before this test means anything",
+    ).toBe(1);
+
+    await snm.removeStandingReceiverForAgent("alice");
+    const before = events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length;
+    await snm.ensureStandingReceiverForAgent("alice");
+    await new Promise((r) => setTimeout(r, 300));
+
+    expect(
+      events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length,
+      "a restarted agent must get a fresh budget — the relay may have had slots free for hours",
+    ).toBeGreaterThan(before);
   }, 30_000);
 });

@@ -1951,6 +1951,7 @@ async function startDaemonHoldingLock(
           // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
           standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+          standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
           // DOD-COATTEND-VISIBLE-1 AC2: how many sessions are driving this agent, including this
           // one. Live, not a high-water mark — it drops when a session disconnects. `selected` says
           // whether YOU hold it; this says whether anyone else does too.
@@ -2164,6 +2165,7 @@ async function startDaemonHoldingLock(
         ...a,
         state: agentStateFor(a),
         standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
+        standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
       })),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),
