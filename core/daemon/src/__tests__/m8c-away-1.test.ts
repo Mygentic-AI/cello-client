@@ -34,6 +34,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { Stream } from "@libp2p/interface";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
+import { markAsAutoReply } from "../away-detection.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -322,8 +323,12 @@ describe("M8C-AWAY-1: away response", () => {
 
     // The RESOLVED custom text is what landed in the transcript — not the system default (bypass:
     // reverting the caller to the constant would send "session request has been received…" here).
+    // DOD-M12B-AWAY-MARK-1: a CONFIGURED away message is marked too, and this is the test that
+    // proves it — an operator's own wording was previously indistinguishable from a person by
+    // construction, because the detector could only match this daemon's default strings. Asserted
+    // through markAsAutoReply rather than a pasted literal so the resolved text stays exact.
     const { messages } = snm.readTranscript("bob", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe("Hey - reach me on Signal");
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe(markAsAutoReply("Hey - reach me on Signal"));
     // Observability AC: contact.away.resolved fired with the matched level.
     expect(events.find((e) => e.event === "contact.away.resolved" && e.context.level === "contact")).toBeDefined();
   });

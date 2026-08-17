@@ -41,7 +41,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS } from "../away-detection.js";
+import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, AWAY_AUTO_REPLY_MARKER } from "../away-detection.js";
 
 const ONE_SHOT = "Agent is currently away. Your message has been received and will be read when the operator returns. This inbox accepts one message per visit — please close the session now (send with signal: wrap) instead of sending more.";
 const OFFER = "Alice is currently away. Leave a message (send with signal: wrap to close) and it will be read when they return.";
@@ -73,7 +73,13 @@ describe("an away responder recognises another away responder", () => {
   it("exposes the texts it matches, so the check cannot drift from what is actually sent", () => {
     // Both the detector and the sender read this list. A second hardcoded copy is how a reworded
     // away message would silently stop being recognised, and the loop would come back.
-    expect(AWAY_AUTO_REPLY_TEXTS.oneShot).toBe(ONE_SHOT);
-    expect(AWAY_AUTO_REPLY_TEXTS.offerFor("Alice")).toBe(OFFER);
+    //
+    // DOD-M12B-AWAY-MARK-1: what this daemon SENDS now carries the marker; ONE_SHOT and OFFER above
+    // are the pre-marker bodies, kept verbatim because the two tests at the top of this file assert
+    // an un-upgraded peer's away reply is still recognised. Both facts are pinned here at once —
+    // the sent text is the marker plus the unchanged body, so neither the wording nor the marker
+    // can drift away from the detector without failing.
+    expect(AWAY_AUTO_REPLY_TEXTS.oneShot).toBe(`${AWAY_AUTO_REPLY_MARKER} ${ONE_SHOT}`);
+    expect(AWAY_AUTO_REPLY_TEXTS.offerFor("Alice")).toBe(`${AWAY_AUTO_REPLY_MARKER} ${OFFER}`);
   });
 });

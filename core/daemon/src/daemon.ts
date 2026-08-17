@@ -113,7 +113,7 @@ import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS } from "./away-detection.js";
+import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply } from "./away-detection.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
 
@@ -1075,7 +1075,9 @@ async function startDaemonHoldingLock(
           // Reviewer F2: token at the END — the daemon's own output must honor the
           // DOD-SIGNAL-TOKEN-1 append-at-end contract that DOD-WRAP-SUBSTRING-1 detection
           // is anchored on (a counterparty daemon's end-anchored detector must see this close).
-          const rejectText = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
+          // DOD-M12B-AWAY-MARK-1: machine-generated, so it is marked — and the marker goes at the
+          // FRONT precisely so [[WRAP]] keeps the end position the counterparty's detector anchors on.
+          const rejectText = markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]");
           const rejectBytes = new TextEncoder().encode(rejectText);
           const rejectHash = wireContentHash(rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
@@ -1227,8 +1229,16 @@ async function startDaemonHoldingLock(
     try {
       // DOD-AWAY-TIER-1: resolve most-specific-first — per-contact away_message → per-tier away
       // (settings) → agent default (settings) → the system default (code, per kind). Total.
-      const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
-        ?? (isKnown ? systemDefault : STRANGER_TEXT);
+      // DOD-M12B-AWAY-MARK-1: THE choke point. Every away reply this daemon sends passes through
+      // this one expression — the per-contact message, the per-tier message, the agent default, the
+      // system default and the stranger ack — so marking here is what makes "an operator's
+      // CONFIGURED away message is indistinguishable from a person" go away, which is the half
+      // exact-text matching could not reach by construction. markAsAutoReply is idempotent, so the
+      // system defaults (already marked at their source) do not pick up a second token.
+      const awayText = markAsAutoReply(
+        sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
+          ?? (isKnown ? systemDefault : STRANGER_TEXT),
+      );
       const draftBytes = new TextEncoder().encode(awayText);
       // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
       // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn
