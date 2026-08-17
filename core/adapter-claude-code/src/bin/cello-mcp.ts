@@ -13,6 +13,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 import { buildChannelParams } from "../channel-params.js";
 import { summarizeInboundFrame } from "../frame-trace.js";
+import { SIGNAL_ERROR, SIGNAL_VALUES } from "../signal-guidance.js";
 
 // --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
@@ -470,27 +471,10 @@ server.tool("cello_await_session", "Wait for an inbound session request", {
   return jsonText(result);
 });
 
-const SIGNAL_ERROR =
-  "Missing signal token. Every cello_send message must end with one of:\n\n" +
-  "  [[OVER]]\n" +
-  "    Your turn is complete. You are now entering read mode and waiting for\n" +
-  "    a reply. Use this for most messages.\n\n" +
-  "  [[STANDBY EST:Xm]]\n" +
-  "    Your turn is not yet complete, but your full response will take time.\n" +
-  "    Use this when you want to acknowledge immediately — letting the other\n" +
-  "    party know you received their message and are working on it — before\n" +
-  "    going off to do the work. Replace X with your estimate in minutes.\n" +
-  "    The other party does not need to reply. A follow-up message is coming\n" +
-  "    in approximately X minutes.\n\n" +
-  "  [[WRAP]]\n" +
-  "    This is your final message. You intend to close the session after\n" +
-  "    sending. No reply is expected or needed.\n\n" +
-  "Append the appropriate token to your message and resend.";
-
 server.tool("cello_send", "Send a message in an active session. REQUIRED: every message must include a signal parameter declaring your next action.", {
   cello_session_id: z.string().describe("Session ID"),
   content: z.string().describe("Message content (UTF-8 text)"),
-  signal: z.enum(["over", "standby", "wrap"]).optional().describe(
+  signal: z.enum(SIGNAL_VALUES).optional().describe(
     "REQUIRED. Declares your next action after sending:\n" +
     "  \"over\"    — your turn is complete; you are entering read mode waiting for a reply.\n" +
     "  \"standby\" — your turn is not yet complete; you are going to do work and will follow up. Requires est_minutes.\n" +
