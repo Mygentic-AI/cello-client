@@ -91,9 +91,33 @@ export class ReconcileScheduler {
   readonly #d: ReconcileSchedulerDeps;
   /** Volatile by design (R41): keyed per (owner, party); dies with the process. */
   readonly #state = new Map<string, PartyState>();
+  /** DOD-M12B-SHUTDOWN-1: set by stop(); every entry point refuses once it is true. */
+  #stopped = false;
 
   constructor(deps: ReconcileSchedulerDeps) {
     this.#d = deps;
+  }
+
+  /**
+   * DOD-M12B-SHUTDOWN-1 — refuse all further work. Idempotent, and one-way on purpose.
+   *
+   * Clearing the sweep timer stops the NEXT tick and nothing else: the pass already running walks
+   * every agent, and each step dials a peer and opens a session. Measured 2026-08-17 — `cello
+   * logout` reported the daemon down, the socket was already gone, and the process ran on for 30+
+   * seconds still logging `document.reconcile.sweep`, dialling on its way out. It took a signal to
+   * exit. A shutdown that keeps starting new outbound work is not draining.
+   *
+   * Guarded at the top of every entry point rather than inside the loop, so `sweepTargets` — a
+   * database read — is not run either. Never un-set: a reachability trigger firing from a session
+   * tearing down during shutdown must not be able to restart the sweeper on the way out.
+   */
+  stop(): void {
+    if (this.#stopped) return;
+    this.#stopped = true;
+    this.#d.logger.info("document.reconcile.stopped", {
+      reason: "shutdown",
+      impact: "no further reconcile attempts will be started",
+    });
   }
 
   #key(ownerAgentId: string, peerAgentId: string): string {
@@ -115,6 +139,7 @@ export class ReconcileScheduler {
    * for every shared document, in R16-capped batches.
    */
   async onReachable(ownerAgentId: string, peerAgentId: string): Promise<void> {
+    if (this.#stopped) return;
     const docs = this.#d.sweepTargets(ownerAgentId).get(peerAgentId);
     if (!docs || docs.length === 0) return;
     const s = this.#stateFor(this.#key(ownerAgentId, peerAgentId));
@@ -157,6 +182,8 @@ export class ReconcileScheduler {
     const result: SweepResult = {
       attempted: 0, skippedBackoff: 0, skippedInFlight: 0, skippedCurrent: 0, failed: 0,
     };
+    // DOD-M12B-SHUTDOWN-1: the in-flight pass stops HERE, not at the next timer tick.
+    if (this.#stopped) return result;
     const now = this.#d.now();
     for (const [peerAgentId, docs] of this.#d.sweepTargets(ownerAgentId)) {
       if (docs.length === 0) continue;

@@ -4193,6 +4193,15 @@ async function startDaemonHoldingLock(
 
   async function stop(reason: string): Promise<void> {
     clearInterval(reconcileSweepTimer);
+    // DOD-M12B-SHUTDOWN-1: clearing the timer only stops the NEXT tick. The pass already running
+    // walks every agent, and each step dials a peer and opens a session — which is why a daemon
+    // reported down, with its socket already removed, was still logging `document.reconcile.sweep`
+    // 30 seconds later and had to be signalled to exit. This is what stops the pass in flight, and
+    // it also blocks `onReachable`, so a session tearing down during shutdown cannot hand the
+    // sweeper a fresh reason to dial on the way out.
+    // Optional because a stop() can land before the composition root finished wiring — a daemon
+    // that fails during startup still runs this path, and there is nothing to sweep in that case.
+    reconcileScheduler?.stop();
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check
