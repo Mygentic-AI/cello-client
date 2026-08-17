@@ -136,6 +136,87 @@ describe("DOD-MSG-4: strict in-order content gate", () => {
     expect(drain.map((d) => d && Buffer.from(d.contentHex, "hex").toString())).toEqual(["m0", "m1", "m2"]);
   });
 
+  /**
+   * REGRESSION, found live 2026-08-16 from `cello relay-receipts` on Andre's daemon.
+   *
+   * The file header above claims the leaf-index === canonical-sequence invariant is kept "BY
+   * CONSTRUCTION". It is not. It rests on a second assumption, stated in session-node-manager.ts:
+   *
+   *   "The relay already assigns every submission a unique position: a REDELIVERY carries the same
+   *    position, a genuinely new identical message carries a NEW one."
+   *
+   * Production falsifies it. One content hash held 49 DIFFERENT relay positions in session
+   * f54e0d07 (49 receipts, ONE distinct message, max sequence 98); another was submitted 69 times.
+   * Every unacknowledged send is retried, and each retry is witnessed at a NEW canonical sequence
+   * while the receiver deduplicates by content hash and appends nothing.
+   *
+   * So the receiver's tree stands still while the canonical counter advances — and because the gate
+   * is `canonicalSeq > tree.size()`, every genuinely new message afterwards is held behind a gap
+   * that no message will ever fill. Held content is never acknowledged, so it is retried, which
+   * burns another sequence and widens the gap that caused it. The repair mechanism is the thing
+   * that makes it unrepairable.
+   *
+   * Measured consequence on 2026-08-16: `session.content.held.discarded` (verified content
+   * destroyed at teardown, memory-only) fired 20 times on one daemon in one day.
+   */
+  // `it.fails` DELIBERATELY: this asserts the defect still EXISTS, so the gate stays green while the
+  // fix is an open design decision (see below). The moment the defect is fixed this test starts
+  // FAILING — that is the signal to change `it.fails` back to `it`. Do not delete it to make that
+  // stop.
+  //
+  // WHY NO FIX IS SHIPPED WITH THIS TEST. Every route restores `leafIndex === canonicalSeq` by
+  // changing what the Merkle tree contains, and the tree root is what the seal signs over — so the
+  // wrong choice silently invalidates receipts, which is the product. The three routes, and they
+  // are not equivalent:
+  //   1. SOURCE (relay/sender contract): a resubmission must carry the position it was FIRST
+  //      assigned instead of taking a new one. Fixes the cause; needs a relay-side change and is
+  //      the only option that keeps both parties' roots identical by construction.
+  //   2. RECEIVER accounting: track canonical positions consumed by a deduplicated redelivery so
+  //      the gate can advance past a position nothing will ever fill. Client-only, but it concedes
+  //      that leaf index and canonical sequence have permanently diverged.
+  //   3. BOUND THE HOLD: release held content in canonical order rather than discarding it at
+  //      teardown, per this file's own stated policy that "losing content is worse than a transient
+  //      mis-order the seal cross-check will catch". Stops the destruction; changes roots.
+  // This is a §9-class decision in the sense of the reconcile-don't-deliver design note
+  // (docs/planning/discussion_logs/2026-08-14_1155_...): settle it before writing code, because
+  // under "ask what they have and send the difference" this whole failure class cannot occur.
+  it.fails("REGRESSION: a redelivery witnessed at a NEW canonical sequence must not strand every later message", async () => {
+    const mgr = await makeManager(logger, join(tempDir, "resubmit.db"));
+    await seedAgents(mgr.getDb(), [AGENT]);
+    await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
+
+    const c0 = new TextEncoder().encode("m0");
+    const c1 = new TextEncoder().encode("m1");
+    const h0 = msgLeafHash(c0), h1 = msgLeafHash(c1);
+    const hx = (h: Uint8Array) => Buffer.from(h).toString("hex");
+
+    // Seq 0: m0 arrives and appends normally.
+    mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
+    await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+    expect(mgr.getSessionTree(AGENT, sid).size()).toBe(1);
+
+    // The sender never saw an ack, so it RESUBMITS m0 byte-identical. The relay witnesses the
+    // resubmission at canonical sequence 1 — a NEW position for content already held.
+    mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 1);
+    await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+    expect(mgr.getSessionTree(AGENT, sid).size(), "the redelivery is deduplicated — no second leaf").toBe(1);
+
+    // Canonical sequence 1 is now consumed by a redelivery that appended nothing, so the tree can
+    // never reach size 2. m1, a genuinely new message, is witnessed at 2.
+    mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 2);
+    await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+
+    // THE DEFECT: m1 is verified, held, and unreachable forever — no message will ever fill seq 1.
+    expect(
+      mgr.getSessionTree(AGENT, sid).size(),
+      "m1 must be delivered: the only gap is a position a redelivery consumed, and nothing will ever fill it",
+    ).toBe(2);
+    expect(
+      mgr.takeReceivedContent(AGENT, sid) !== null,
+      "m1 must be readable by the agent, not stranded in the in-memory hold buffer",
+    ).toBe(true);
+  });
+
   it("the in-order happy path is unchanged — sequential arrivals append immediately", async () => {
     const mgr = await makeManager(logger, join(tempDir, "happy.db"));
     await seedAgents(mgr.getDb(), [AGENT]);
