@@ -208,8 +208,8 @@ export interface ActiveSessionInfo {
   counterpartyPubkey: string;
   /** Direct-path counterparty liveness; 'unknown' before any session-node observation.
    *  DOD-M12B-ACK-1: 'impaired' means the connection is up and our writes on it are failing —
-   *  distinct from 'gone' (the connection dropped), which feeds the unilateral-seal gate. It is
-   *  daemon-local and is NOT the relay's SessionLiveness wire type. */
+   *  distinct from 'gone' (the connection dropped), which is what cello_receive turns into "call
+   *  cello_close_session". It is daemon-local and is NOT the relay's SessionLiveness wire type. */
   liveness: "alive" | "impaired" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;

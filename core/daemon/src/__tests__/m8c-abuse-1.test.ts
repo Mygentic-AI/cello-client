@@ -407,6 +407,45 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     for (const e of reaped) expect(e.context["priorStatus"]).toBe("interrupted");
   });
 
+  /**
+   * DOD-M12B-ACK-1. The half-open reaper's question is "did the counterparty ever ESTABLISH?", and
+   * an impaired session is one where it plainly did — the connection is up, only our writes on it
+   * are failing. Reaping those would abandon exactly the sessions M12B exists to repair, silently,
+   * five minutes in.
+   */
+  it("DOD-M12B-ACK-1: an IMPAIRED half-open session is not reaped — the connection is up, only the writes are failing", async () => {
+    const { logger, events } = makeLogger();
+    await makeAgentDir("bob");
+    const h = await start(logger, new FakeNode());
+    const snm = h.getSessionNodeManager();
+
+    // Two sessions in the reapable shape: old, interrupted, zero received. The only difference is
+    // that one of them has a live-but-impaired counterparty.
+    const old = Date.now() - 60 * 60 * 1000;
+    const bobId = resolveAgentId(snm.getDb(), "bob");
+    const impairedSid = "1a".repeat(32);
+    const deadSid = "1b".repeat(32);
+    for (const sid of [impairedSid, deadSid]) {
+      snm.getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 0, ?)`,
+      ).run(sid, bobId, "5e".repeat(32), old, old, old);
+    }
+    snm.markSessionLivenessForTest("bob", impairedSid, "impaired");
+
+    // getStatus() is what drives the reap (compute-on-read).
+    h.getStatus();
+    await wait(100);
+
+    const status = (sid: string): string =>
+      (snm.getDb().prepare("SELECT status FROM sessions WHERE session_id = ?").get(sid) as { status: string }).status;
+    expect(status(impairedSid), "an impaired session's counterparty DID establish — it must survive").toBe("interrupted");
+    // The control: without the impaired flag the same row is provably dead and still gets reaped,
+    // so this test cannot pass by the reaper simply not running.
+    expect(status(deadSid), "the reaper must still reap a genuinely dead half-open").toBe("abandoned");
+    expect(events.filter((e) => e.event === "session.half_open.reaped").map((e) => e.context["sessionId"])).toEqual([deadSid]);
+  });
+
   it("CC-10/D18 guard: old interrupted sessions WITH received content still count — the accept-path reap must NOT free the D18 evasion attacker's slots", async () => {
     // D18's attack: send content, disconnect (→ interrupted), open a fresh session, repeat.
     // Those sessions have RECEIVED bytes on the victim's side, so the reap must skip them and

@@ -25,9 +25,8 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 import { createNode } from "@cello-protocol/transport";
-import { generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair, msgLeafHash } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -57,10 +56,6 @@ class RealNodeFactory implements ISessionNodeFactory {
       nodeType: config.nodeType,
     });
   }
-}
-
-function msgLeafHash(content: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -150,7 +145,47 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     expect(A.manager.getSessionLiveness("alice", SID)).toBe("alive");
   }, 60_000);
 
-  it("`impaired` does not override a counterparty that is genuinely gone", async () => {
+  it("an UNKNOWN session whose writes fail is impaired too — the lie just moves lanes otherwise", async () => {
+    const { A } = await liveSession();
+    // A session whose recorded counterparty peer id has gone stale never sees a matching
+    // peer-connect, so liveness sits at `unknown` while every send fails forever. cello_receive
+    // renders `unknown` as healthy-and-quiet ("do not resend your last message"), so guarding the
+    // downgrade on `alive` alone would relocate the 70-minute lie rather than fix it.
+    A.manager.markSessionLivenessForTest("alice", SID, "gone");
+    A.manager.markSessionLivenessForTest("alice", SID, "alive");
+    // Force the true starting state by using a session the connect event never labelled.
+    const UNSEEN = "66".repeat(16);
+    await A.manager.createSessionNode(UNSEEN, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-U");
+    expect(A.manager.getSessionLiveness("alice", UNSEEN)).toBe("unknown");
+
+    const content = new TextEncoder().encode("into the void");
+    await A.manager.sendContent("alice", UNSEEN, content, msgLeafHash(content), "corr-U");
+    expect(A.manager.getSessionLiveness("alice", UNSEEN)).toBe("impaired");
+  }, 60_000);
+
+  it("a failed ACK impairs, and a later successful ACK clears it — the listening side must not latch", async () => {
+    const { A, B } = await liveSession();
+
+    // B is the LISTENER here: it sends no content, only acknowledgements — which is exactly why
+    // the direct-send fault cannot reach it, and why the ACK path needs its own seam.
+    B.manager.injectAckFault(1);
+    await send(A, "first");
+    const impaired = await pollFor(() => B.manager.getSessionLiveness("bob", SID) === "impaired" || null);
+    expect(impaired, "a failed delivery ACK must impair the session it was owed on").not.toBeNull();
+
+    // The cause names the ACK, not the caller's own send — B's operator sent nothing at all, so a
+    // surface that talks about "your last message" would be describing one they never wrote.
+    expect(B.manager.getSessionImpairment("bob", SID)?.cause).toBe("delivery_ack");
+
+    // The next ACK succeeds. If clearing only ever happened on the CONTENT path, a listening agent
+    // would report a broken conversation for the rest of the session.
+    await send(A, "second");
+    const cleared = await pollFor(() => B.manager.getSessionLiveness("bob", SID) === "alive" || null);
+    expect(cleared, "a successful ACK must clear the impairment it set").not.toBeNull();
+    expect(B.manager.getSessionImpairment("bob", SID)).toBeNull();
+  }, 60_000);
+
+  it("`impaired` does not override a counterparty that is genuinely gone (the `gone` guard in #markSessionImpaired)", async () => {
     const { A, B } = await liveSession();
     await send(A, "first");
     expect(await pollFor(() => B.manager.takeReceivedContent("bob", SID))).not.toBeNull();

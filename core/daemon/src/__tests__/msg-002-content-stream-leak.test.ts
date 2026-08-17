@@ -3,32 +3,34 @@
  *
  * Every content frame and every delivery ACK opens a fresh `/cello/content/1.0.0` stream on the
  * one muxed connection the session holds. libp2p caps INBOUND streams per protocol per connection
- * at DEFAULT_MAX_INBOUND_STREAMS = 32 (nothing in this codebase passes `maxInboundStreams`), and
- * it enforces the cap AFTER multistream-select has already answered. So the sender's `newStream`
+ * and enforces that cap AFTER multistream-select has already answered, so the sender's `newStream`
  * resolves normally and the very next `stream.send(...)` throws
  * `Cannot write to a stream that is closed` — the error that produced 115 failures on one live
  * daemon in 3.5 hours (M12B Entry 10), 89 of them ordinary messages parking instead of delivering.
  *
- * Measured on that daemon: EXACTLY 32 successful outbound content streams preceded the first
- * failure, on both affected sessions. The cap is never released because the receiving handler
- * reads one frame and returns without closing the stream, so a half-closed stream sits in
- * `connection.streams` for the life of the connection and the session never recovers.
+ * Measured on that daemon against libp2p's registrar default of 32: EXACTLY 32 successful outbound
+ * content streams preceded the first failure, on both affected sessions. The slot was never
+ * released because the receiving handler read one frame and returned without closing the stream,
+ * so a half-closed stream sat in `connection.streams` for the life of the connection.
  *
  * This test rides the seam-3 harness (real Noise/yamux over loopback TCP, two independent
  * SessionNodeManager instances) because the defect lives in libp2p's per-connection accounting —
  * a FakeNode cannot express it.
  *
- * Revert test: restore the missing `stream.close()` in `#handleContentStream` to a bare `return`
- * and this fails at frame 33 with `Cannot write to a stream that is closed`.
+ * THE LAST ASSERTION IS THE LOAD-BEARING ONE. Delivering 40 messages proves only that 40 fit —
+ * which a raised cap over a live leak would also satisfy. Counting the streams still open after
+ * the run is what proves the slot came back.
+ *
+ * Revert test: turn `#handleContentStream`'s `finally` back into a bare `return` and this fails —
+ * at frame 33 under libp2p's default cap, and on the stream census under the raised one.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createHash } from "node:crypto";
 import { createNode } from "@cello-protocol/transport";
-import { generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair, msgLeafHash } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -58,11 +60,6 @@ class RealNodeFactory implements ISessionNodeFactory {
       nodeType: config.nodeType,
     });
   }
-}
-
-/** RFC 6962 §2.1 leaf hash for a message content leaf — MUST match ingest's cross-check. */
-function msgLeafHash(content: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
 }
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -155,5 +152,20 @@ describe("DOD-M12B-ACK-1: content streams are not leaked at the receiver", () =>
       () => A.events.filter((e) => e.event === "content.delivery.acked").length === MESSAGE_COUNT || null,
     );
     expect(acked, `only ${A.events.filter((e) => e.event === "content.delivery.acked").length} of ${MESSAGE_COUNT} ACKs came back`).not.toBeNull();
+
+    // THE SLOT WAS RELEASED — not merely "40 happened to fit".
+    //
+    // Without this, an implementation that keeps the leak and simply raises the cap passes
+    // everything above and dies at message 513 instead of 33. Counting live streams is the only
+    // assertion that distinguishes "we closed what we opened" from "we bought more room".
+    // A small allowance, not zero: the last ACK's stream may still be retiring when we look.
+    const census = await pollFor(() => {
+      const c = A.manager.countSessionContentStreams("alice", SID);
+      return c && c.inbound <= 2 && c.outbound <= 2 ? c : null;
+    });
+    expect(
+      census,
+      `content streams never drained: ${JSON.stringify(A.manager.countSessionContentStreams("alice", SID))} after ${MESSAGE_COUNT} messages`,
+    ).not.toBeNull();
   }, 120_000);
 });

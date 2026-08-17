@@ -71,6 +71,53 @@ const AUTOACK_BROKER_GRACE_MS = 30_000;
 
 const MAX_REFUSED_PARKED_ENTRIES = 512;
 
+/**
+ * DOD-M12B-ACK-1 — inbound `/cello/content/1.0.0` streams allowed per connection.
+ *
+ * libp2p's registrar default is 32, and it enforces the cap AFTER protocol negotiation has already
+ * answered, so exceeding it resets a stream the sender believes it just opened and the sender's
+ * next write fails with a message that names nothing. Content delivery is bursty by design (a
+ * document sweep opened 99 events in one second on a live daemon), and a slot stays occupied for
+ * the whole of ingest — which awaits SQLCipher and the security gateway. 32 is simply too close to
+ * normal traffic to be a safety limit.
+ *
+ * This is headroom, NOT the fix. The fix is that #handleContentStream now closes what it opens; a
+ * raised cap without that would only move the cliff. Kept finite on purpose: an unbounded cap would
+ * let a peer pin memory by opening streams it never uses, and the ceiling is what makes a future
+ * leak of this shape show up as a bounded failure instead of a heap.
+ */
+const CONTENT_MAX_INBOUND_STREAMS = 512;
+
+/**
+ * DOD-M12B-ACK-1 — how long an inbound content stream may stay open after we have closed our end.
+ *
+ * Closing our write end retires the stream only once the PEER has closed its end too, so a peer
+ * that opens streams and never closes them still fills our inbound slots — a guard that runs only
+ * on the party it constrains is not a guard. After this window we reset it ourselves, which the
+ * muxer honours unilaterally.
+ *
+ * It cannot be zero: an immediate reset would land while a well-behaved sender is still inside its
+ * own `await stream.close()`, rejecting that close and turning every ordinary send into a park.
+ * The frame is already ingested long before this fires, so nothing waits on it.
+ */
+const CONTENT_STREAM_LINGER_MS = 30_000;
+
+/**
+ * DOD-M12B-ACK-1 — why a session is impaired, and what became of the content that revealed it.
+ *
+ * `cause` separates "your own message did not reach them" (`direct_send`) from "our acknowledgement
+ * to them did not go out" (`delivery_ack`) — on the second the operator sent nothing at all, so a
+ * surface that talks about their last send is describing a message they never wrote.
+ *
+ * `retained` is what makes it safe to advise. A parked or durably-queued message must NOT be
+ * resent — a resend takes a second canonical position, which is this milestone's founding defect.
+ * A LOST one must be, and `cello_send` has already said so. `unknown` means do not claim either.
+ */
+export interface SessionImpairment {
+  cause: "direct_send" | "delivery_ack";
+  retained: "parked" | "durable" | "lost" | "unknown";
+}
+
 // Persistence bounds are TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-migration). The two
 // consts below DERIVE from the grid's UNKNOWN row rather than restating it — the grid is the single
 // source (DOD-TIER-2 AC4), so these can never drift from it.
@@ -402,12 +449,20 @@ export class SessionNodeManager {
   readonly #autoNatProbers: () => string[];
   // M7-SESSION-003: per-session direct-path counterparty liveness, observed on the
   // session node's onPeerConnect ('alive') / onPeerDisconnect ('gone'). This is
-  // the liveness authority for direct sessions — the unilateral-seal gate reads
-  // it (relay sessions query the relay instead). NEVER the directory (SI-002).
+  // the liveness authority for direct sessions (relay sessions query the relay
+  // instead). NEVER the directory (SI-002). Read by exactly three consumers: the
+  // half-open reaper, both status surfaces, and cello_receive. No seal path reads
+  // it — the coupling to sealing runs through the receive guidance, which turns
+  // 'gone' into "call cello_close_session".
   // DOD-M12B-ACK-1 adds 'impaired': connection up, our writes on it failing. It sits BELOW
-  // 'alive' and never above 'gone' — see #markSessionImpaired for why the seal gate must not
-  // see it as a dead counterparty.
+  // 'alive' and never above 'gone' — see #markSessionImpaired.
   #sessionLiveness = new Map<string, "alive" | "impaired" | "gone">();
+  // DOD-M12B-ACK-1: WHY a session is impaired and what became of the content. Separate from the
+  // state above because the state is what surfaces print and this is what they must explain.
+  #impairmentCause = new Map<string, SessionImpairment>();
+  // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
+  // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
+  #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
   // M7-UPGRADE-002: sessions whose content integrity could NOT be verified (a content_hash
   // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
   // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
@@ -532,6 +587,8 @@ export class SessionNodeManager {
   // with its agent away), and the park deposit that follows has to be refused. One without the
   // other reproduces nothing.
   #sendFaultRemaining = 0;
+  // DOD-M12B-ACK-1 — the same seam for the delivery-ACK write. See injectAckFault.
+  #ackFaultRemaining = 0;
 
   /** Arm the park-deposit fault. Returns the count now armed. */
   injectParkFault(count: number, cause?: string): number {
@@ -544,6 +601,15 @@ export class SessionNodeManager {
   injectSendFault(count: number): number {
     this.#sendFaultRemaining = Math.max(0, count);
     return this.#sendFaultRemaining;
+  }
+
+  /** DOD-M12B-ACK-1: arm the delivery-ACK write fault — the sibling of injectSendFault for the
+   *  path that fails on a LISTENING agent. Without it the ACK failure branch (which impairs the
+   *  session and, until this milestone, could never clear it again) is unreachable from a test:
+   *  a listener sends no content, so the direct-send fault never fires for it. */
+  injectAckFault(count: number): number {
+    this.#ackFaultRemaining = Math.max(0, count);
+    return this.#ackFaultRemaining;
   }
 
   getSendFaultRemaining(): number {
@@ -2635,49 +2701,136 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-ACK-1 — live `/cello/content/1.0.0` stream counts on a session's direct path, or null
+   * when the session has no active node.
+   *
+   * Answerable at runtime on purpose, in the same spirit as getConnectionMonitorPolicy: the count
+   * is what decides whether the next send survives, and until this existed it could only be
+   * recovered by measuring a log after the fact. It is also what lets the regression assert that a
+   * slot was RELEASED, rather than that some particular number of messages happened to fit.
+   */
+  countSessionContentStreams(agentName: string, sessionId: string): { inbound: number; outbound: number } | null {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry || typeof entry.node.countProtocolStreams !== "function") return null;
+    return entry.node.countProtocolStreams(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+  }
+
+  /**
+   * DOD-M12B-ACK-1 — the live content-stream counts for a peer, as log context.
+   *
+   * A diagnostic must not be able to break the failure path it describes, so a node that predates
+   * `countProtocolStreams` (test fakes do) yields no fields rather than throwing.
+   */
+  #streamCensus(node: CelloNode, peerId: string): Record<string, number> {
+    if (typeof node.countProtocolStreams !== "function") return {};
+    try {
+      const { inbound, outbound } = node.countProtocolStreams(peerId, CELLO_CONTENT_PROTOCOL_ID);
+      return { contentStreamsInbound: inbound, contentStreamsOutbound: outbound, contentStreamsInboundCap: CONTENT_MAX_INBOUND_STREAMS };
+    } catch {
+      return {};
+    }
+  }
+
+  /**
    * DOD-M12B-ACK-1 — the connection is up and delivery on it is not working.
    *
    * Liveness is otherwise driven ONLY by libp2p peer-connect/peer-disconnect, so it answers "is
-   * there a connection object?" while every surface printing it is read as "can I talk to them?".
-   * When a write fails on a connection libp2p still considers open, those two diverge and the
-   * operator is told the conversation is healthy. Measured 2026-08-17: one session reported
-   * `alive` for 70 minutes after every write had started failing, another never stopped.
+   * there a connection object?" while every surface that prints it is read as "can I talk to them?".
+   * Measured 2026-08-17: one session reported `alive` for 70 minutes after every write had started
+   * failing, another never stopped.
    *
-   * ONLY downgrades from 'alive'. 'gone' is the stronger and more actionable statement — the
-   * counterparty's connection dropped, no reply can arrive, and the unilateral-seal gate reads
-   * it — so a failed write must never soften it. 'unknown' already claims nothing.
+   * ONLY 'gone' is protected, and 'gone' is NOT protected because a seal gate reads it — nothing in
+   * the code does. It is protected because the receive surface turns 'gone' into "call
+   * cello_close_session", and a failed write must never be able to produce that instruction.
+   *
+   * 'unknown' is DOWNGRADED just like 'alive', which is not obvious and is the point. A session
+   * whose recorded `counterpartySessionPeerId` has gone stale never sees a matching peer-connect,
+   * so it sits at 'unknown' while every send fails forever — the exact case documented at
+   * #wireSessionLiveness — and the receive surface renders 'unknown' as healthy-and-quiet, which is
+   * the 70-minute lie relocated one lane over. 'unknown' claims nothing; the surface built on it does.
    */
-  #markSessionImpaired(agentName: string, sessionId: string, reason: string, correlationId?: string): void {
+  #markSessionImpaired(
+    agentName: string,
+    sessionId: string,
+    opts: { cause: "direct_send" | "delivery_ack"; error: string; correlationId?: string },
+  ): void {
     const key = this.#k(agentName, sessionId);
-    if (this.#sessionLiveness.get(key) !== "alive") return;
+    const prior = this.#sessionLiveness.get(key);
+    if (prior === "gone") {
+      // Declining is a decision, so it is logged. A silent early return here is the shape that let
+      // the original defect hide for a day: nothing recorded that writes were failing on a session
+      // every surface was still calling healthy.
+      this.#logger.debug("session.liveness.impairment.declined", {
+        sessionId, liveness: prior, cause: opts.cause, error: opts.error, correlationId: opts.correlationId,
+      });
+      return;
+    }
+    // The CAUSE is refreshed even when the state does not move, because the receive surface builds
+    // its guidance from it and a stale cause would describe the wrong failure.
+    this.#impairmentCause.set(key, { cause: opts.cause, retained: "unknown" });
+    if (prior === "impaired") return;
     this.#sessionLiveness.set(key, "impaired");
     this.#logger.warn("session.liveness.changed", {
       sessionId,
+      counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
       transportPath: "direct",
       liveness: "impaired",
-      observedBy: "direct_send",
-      reason,
-      correlationId,
+      observedBy: opts.cause,
+      priorLiveness: prior ?? "unknown",
+      // `reason` is a contract string and `error` is the message — the convention every other
+      // failure log in this file follows. Collapsing them makes grouping by `reason` useless.
+      reason: "write_failed",
+      error: opts.error,
+      correlationId: opts.correlationId,
     });
+  }
+
+  /**
+   * DOD-M12B-ACK-1 — what became of the content whose send caused the impairment.
+   *
+   * The receive surface has no memory of the last send, so without this it can only guess — and the
+   * guess it would make ("it was parked, do not resend") is FALSE in the two cases that matter
+   * most: a refused park whose durable enqueue was dropped, and one that threw. In both the message
+   * is gone and `cello_send` has already told the caller to send it again, so a receive that says
+   * "do not resend" contradicts it later, while the agent is sitting there waiting.
+   */
+  #noteImpairmentRetention(agentName: string, sessionId: string, retained: "parked" | "durable" | "lost"): void {
+    const key = this.#k(agentName, sessionId);
+    const current = this.#impairmentCause.get(key);
+    if (!current) return;
+    this.#impairmentCause.set(key, { cause: current.cause, retained });
+  }
+
+  /** DOD-M12B-ACK-1: why this session is impaired, for the surface that has to explain it. Null
+   *  when it is not impaired — a caller must not narrate a failure that is not current. */
+  getSessionImpairment(agentName: string, sessionId: string): SessionImpairment | null {
+    const key = this.#k(agentName, sessionId);
+    if (this.#sessionLiveness.get(key) !== "impaired") return null;
+    return this.#impairmentCause.get(key) ?? null;
   }
 
   /**
    * DOD-M12B-ACK-1 — a delivery landed, so the impairment is over.
    *
-   * Without this an `impaired` flag is a one-way door: one bad write would make a session report
-   * a broken conversation for the rest of its life, which is the same class of lie in the other
-   * direction. Only clears 'impaired' — it never manufactures 'alive' out of 'gone' or 'unknown',
-   * because a successful write says nothing about a connection libp2p has already declared dead.
+   * Without this an `impaired` flag is a one-way door: one bad write would make a session report a
+   * broken conversation for the rest of its life, which is the same class of lie in the other
+   * direction. Called from BOTH send paths — an agent that mostly listens sends content rarely and
+   * ACKs constantly, so clearing only on content would leave exactly those sessions impaired
+   * forever. Only clears 'impaired': a successful write says nothing about a connection libp2p has
+   * already declared 'gone'.
    */
-  #clearSessionImpairment(agentName: string, sessionId: string, correlationId?: string): void {
+  #clearSessionImpairment(agentName: string, sessionId: string, observedBy: "direct_send" | "delivery_ack", correlationId?: string): void {
     const key = this.#k(agentName, sessionId);
     if (this.#sessionLiveness.get(key) !== "impaired") return;
     this.#sessionLiveness.set(key, "alive");
+    this.#impairmentCause.delete(key);
     this.#logger.info("session.liveness.changed", {
       sessionId,
+      counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
       transportPath: "direct",
       liveness: "alive",
-      observedBy: "direct_send",
+      observedBy,
+      reason: "write_succeeded",
       correlationId,
     });
   }
@@ -2686,7 +2839,7 @@ export class SessionNodeManager {
    *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
    *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
    *  up a real libp2p peer connection. */
-  markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "gone"): void {
+  markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "impaired" | "gone"): void {
     this.#sessionLiveness.set(this.#k(agentName, sessionId), state);
   }
 
@@ -3012,6 +3165,11 @@ export class SessionNodeManager {
     }
     // Signal any in-flight standing-receiver replacement to self-stop (review M2).
     this.#shuttingDown = true;
+
+    // DOD-M12B-ACK-1: drop the inbound-content linger resets. The nodes they would reset are being
+    // torn down here anyway, so firing after this point is pure noise on the way out.
+    for (const timer of this.#lingeringStreams) clearTimeout(timer);
+    this.#lingeringStreams.clear();
 
     // Cancel every armed awaiting-ACK timer so an un-acked send (e.g. a rejected /
     // tampered frame that never produced a `persisted` ACK) does not leave a 20s
@@ -3967,10 +4125,10 @@ export class SessionNodeManager {
       // A close that failed for a benign reason costs a redundant park, which the receiver dedups
       // on the content hash. A false delivered costs the message.
       await stream.close();
-      this.#clearSessionImpairment(agentName, sessionId, correlationId);
+      this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
       return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
-      this.#markSessionImpaired(agentName, sessionId, err instanceof Error ? err.message : String(err), correlationId);
+      this.#markSessionImpaired(agentName, sessionId, { cause: "direct_send", error: err instanceof Error ? err.message : String(err), correlationId });
       if (sendStream !== undefined) {
         try { sendStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -3999,10 +4157,15 @@ export class SessionNodeManager {
         contentHash: hashHex,
         counterpartySessionPeerId: entry.counterpartySessionPeerId,
         error: err instanceof Error ? err.message : String(err),
+        // "Cannot write to a stream that is closed" names where the write died, never why. The
+        // why is almost always the per-protocol stream cap, and these two numbers are what turn
+        // that from a log-measurement session into a grep.
+        ...this.#streamCensus(entry.node, entry.counterpartySessionPeerId),
         correlationId,
       });
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (attempt.outcome === "parked") {
+        this.#noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
@@ -4077,6 +4240,11 @@ export class SessionNodeManager {
       // F3: the two failures are NOT interchangeable to the caller. `reason` is a contract string
       // and stays put; `guidance` carries the difference, because "we are retrying this" and "this
       // message is gone, send it again" demand opposite actions from the operator.
+      //
+      // The same distinction is recorded on the session, because `cello_receive` will be asked
+      // about this later and would otherwise have to guess — and its guess ("it was parked, do not
+      // resend") is the exact opposite of what the lost case needs.
+      this.#noteImpairmentRetention(agentName, sessionId, durable ? "durable" : "lost");
       return {
         ok: false,
         reason: "session_stream_unavailable",
@@ -5254,14 +5422,35 @@ export class SessionNodeManager {
    */
   async #sendDeliveryAck(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!entry) return;
+    if (!entry) {
+      // NOT a silent return. No ACK is exactly this milestone's symptom — the sender's TTF expires
+      // and the message parks — so the one case where we knowingly decline to send one has to say
+      // so, or it is indistinguishable from the defect.
+      this.#logger.debug("content.delivery.ack.skipped", {
+        agentName,
+        sessionId,
+        contentHash: Buffer.from(contentHash).toString("hex"),
+        reason: "session_node_gone",
+        correlationId,
+      });
+      return;
+    }
     // Held outside the try so the catch can retire a stream that was opened and then failed to
     // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
-    // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
-    // connection). See the note on #handleContentStream's finally.
+    // `finally` retires — same defect, other end, other cap. See the note on #handleContentStream.
+    // Assigned IMMEDIATELY after newStream: anything between the two is a window where a throw
+    // leaks the stream because the catch cannot see it.
     let ackStream: Stream | undefined;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      ackStream = stream;
+      // Injected ACK-write failure — thrown from inside the try so it lands in exactly the catch a
+      // real reset lands in, and the whole downstream path (impair → abort → log) runs unmodified.
+      if (this.#ackFaultRemaining > 0) {
+        this.#ackFaultRemaining -= 1;
+        this.#logger.warn("content.delivery.ack.fault.injected", { sessionId });
+        throw new Error("connection_lost: injected delivery-ack fault");
+      }
       const frame = encodeCbor({
         type: "content_delivery_ack",
         session_id: sessionId,
@@ -5269,28 +5458,41 @@ export class SessionNodeManager {
         level: "persisted",
         correlation_id: correlationId,
       }) as Uint8Array;
-      ackStream = stream;
       stream.send(lp.encode.single(frame));
-      // The receiver-side counterpart to the sender's content.delivery.acked: B has acknowledged
-      // this content `persisted`, so the sender stops retrying/parking. Emitted for BOTH a normally
-      // delivered message AND a terminal-screen block (the block is a definitive receipt — the leaf
-      // is recorded, so the sender must stop) — and deliberately NOT for a transient hold.
+      // NOT SWALLOWED, for the same reason the direct-send path stopped swallowing it: `close()`
+      // waits for the write buffer to drain, so a reset mid-flush throws HERE and that is exactly
+      // the case where the bytes never left. A swallowed close made two things happen at once —
+      // this log claimed the ACK went out while the sender's TTF fired and parked, and the abort in
+      // the catch below (the thing that frees the stream slot) became unreachable.
+      await stream.close();
+      // AFTER the close, because that is when it is true. The receiver-side counterpart to the
+      // sender's content.delivery.acked: B has acknowledged this content `persisted`, so the sender
+      // stops retrying/parking. Emitted for BOTH a normally delivered message AND a terminal-screen
+      // block (the block is a definitive receipt — the leaf is recorded, so the sender must stop) —
+      // and deliberately NOT for a transient hold.
       this.#logger.info("content.delivery.ack.sent", {
         sessionId,
         contentHash: Buffer.from(contentHash).toString("hex"),
         correlationId,
       });
-      try { await stream.close(); } catch { /* best-effort close */ }
+      // An agent that mostly LISTENS sends content rarely and ACKs constantly. Clearing only on the
+      // content path would leave exactly those sessions reporting a broken conversation forever
+      // after one bad ACK — the one-way door, on the other send path.
+      this.#clearSessionImpairment(agentName, sessionId, "delivery_ack", correlationId);
     } catch (err: unknown) {
       this.#logger.warn("content.delivery.ack.send.failed", {
         sessionId,
         contentHash: Buffer.from(contentHash).toString("hex"),
         error: err instanceof Error ? err.message : String(err),
+        // "Cannot write to a stream that is closed" names where the write died, never why. The
+        // why is almost always the per-protocol stream cap, and these two numbers are what turn
+        // that from a log-measurement session into a grep.
+        ...this.#streamCensus(entry.node, entry.counterpartySessionPeerId),
         correlationId,
       });
       // The ACK travels the same direct path as our own content, so a failure here is the same
       // evidence: writes to this counterparty are not landing.
-      this.#markSessionImpaired(agentName, sessionId, err instanceof Error ? err.message : String(err), correlationId);
+      this.#markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: err instanceof Error ? err.message : String(err), correlationId });
       if (ackStream !== undefined) {
         try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -5355,8 +5557,16 @@ export class SessionNodeManager {
   async #registerContentHandler(agentName: string, sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
     try {
       await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
-        void this.#handleContentStream(agentName, sessionId, stream);
-      });
+        // `.catch` is not decoration: the handler builds its length-prefixed decoder before its own
+        // try, and a throw there would otherwise become an unhandled rejection that takes the
+        // daemon down for one malformed inbound stream.
+        void this.#handleContentStream(agentName, sessionId, stream).catch((err: unknown) => {
+          this.#logger.warn("session.content.stream.handler.failed", {
+            sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, { maxInboundStreams: CONTENT_MAX_INBOUND_STREAMS });
     } catch (err: unknown) {
       this.#logger.error("session.content.handler.register.failed", {
         sessionId,
@@ -5585,27 +5795,25 @@ export class SessionNodeManager {
   }
 
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
-    const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
+    // CLOSING THIS STREAM IS WHAT KEEPS THE SESSION ALIVE PAST ITS 33RD MESSAGE.
+    //
+    // Every content frame and every delivery ACK opens a fresh /cello/content/1.0.0 stream on the
+    // one muxed connection the session holds, and libp2p caps INBOUND streams per protocol per
+    // connection. It enforces that cap AFTER multistream-select has answered, so an over-cap stream
+    // negotiates fine and is reset an instant later, and the SENDER's next `stream.send(...)`
+    // throws "Cannot write to a stream that is closed" — an error that names the exit point and not
+    // one thing about the cause.
+    //
+    // A stream leaves the muxer's set only on its `close` event, and closing our write end triggers
+    // that only once the peer has closed its end too. So a handler that reads its frame and returns
+    // leaves the stream half-open for the life of the connection and the count only ever rises.
+    // Measured on a live daemon: 115 failures over 3.5 hours, with EXACTLY 32 successful streams
+    // before the first one on both affected sessions (M12B Entry 10).
+    //
+    // The decoder is built INSIDE the try so a malformed stream cannot throw past the close below.
+    let iter: AsyncIterator<Uint8Array> | undefined;
     try {
-      // THE 33RD FRAME USED TO KILL THE SESSION, and this `finally` is why it no longer does.
-      //
-      // Every content frame and every delivery ACK opens a fresh /cello/content/1.0.0 stream on the
-      // one muxed connection the session holds. libp2p caps INBOUND streams per protocol per
-      // connection at 32 (DEFAULT_MAX_INBOUND_STREAMS — nothing here passes maxInboundStreams), and
-      // it enforces the cap AFTER multistream-select has answered. So the 33rd stream negotiates
-      // fine, is reset an instant later, and the SENDER's next `stream.send(...)` throws
-      // "Cannot write to a stream that is closed" — an error that names the exit point and not one
-      // thing about the cause.
-      //
-      // Reading one frame and returning left every stream half-closed: the sender closes its write
-      // end, we never close ours, so the stream stays in `connection.streams` for the life of the
-      // connection. The count only ever goes up, which is why the session never recovered —
-      // measured on a live daemon as 115 failures over 3.5 hours, with EXACTLY 32 successful
-      // streams before the first one on both affected sessions (M12B Entry 10).
-      //
-      // Closing our write end is what retires the stream: with the sender's end already closed the
-      // stream transitions to closed and the muxer drops it. Order does not matter — whichever
-      // side closes second triggers the transition.
+      iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
       const result = await iter.next();
       if (result.done || result.value === undefined) return;
       const bytes = result.value instanceof Uint8Array ? result.value
@@ -5700,13 +5908,36 @@ export class SessionNodeManager {
       });
     } finally {
       // `close()` waits only for OUR write buffer, which is empty here, so this cannot stall the
-      // handler; it runs on every exit above, and there are several early returns. If it throws,
-      // the stream is already unusable and `abort` retires it with a reset rather than leaving it
-      // to occupy a slot — a leaked slot is the whole defect.
+      // handler; it runs on every exit above, and there are several early returns.
       try {
         await stream.close();
       } catch (err: unknown) {
+        // NOT SILENT. A close that fails here is the signature of the cap biting from the other
+        // side, and it was the absence of exactly this line that turned the original diagnosis
+        // into a 6,451-record log measurement.
+        this.#logger.warn("session.content.stream.close.failed", {
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
         try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+        return;
+      }
+      // OUR CLOSE ALONE DOES NOT FREE THE SLOT — the peer has to close its end too, and a peer
+      // owns its own daemon. Without this, someone who opens content streams and never closes them
+      // pins every inbound slot we have and puts us straight back into the defect above, with the
+      // same unreadable error. `abort` resets unilaterally, so it works regardless of the peer;
+      // the delay is what keeps it from landing while a well-behaved sender is still inside its
+      // own `close()`. Unref'd so it can never hold the process open at shutdown, and tracked so
+      // teardown can drop it.
+      if (stream.status === "open" || stream.status === "closing") {
+        const linger = setTimeout(() => {
+          this.#lingeringStreams.delete(linger);
+          if (stream.status !== "open" && stream.status !== "closing") return;
+          this.#logger.debug("session.content.stream.linger.reset", { sessionId });
+          try { stream.abort(new Error("inbound content stream not closed by peer")); } catch { /* already gone */ }
+        }, CONTENT_STREAM_LINGER_MS);
+        linger.unref?.();
+        this.#lingeringStreams.add(linger);
       }
     }
   }
