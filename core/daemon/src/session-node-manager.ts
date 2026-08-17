@@ -3757,6 +3757,27 @@ export class SessionNodeManager {
    * annexed, not stranded), which the early return skipped entirely.
    */
   markSealed(agentName: string, sessionId: string): boolean {
+    // `#updateSessionStatus` has NO status guard, so this method has to carry one. Two rows must
+    // not be overwritten:
+    //
+    //   'abandoned' — terminal, and terminal BY THE OPERATOR'S CHOICE. A force-abandon is the
+    //     documented way to give up a receipt. Silently resurrecting the session as `sealed`
+    //     because a certificate turned up afterwards would overturn that decision without asking.
+    //     The certificate is still stored by `recordSealCertificate`, so nothing is lost — it is
+    //     retrievable, and the row keeps saying what the operator did.
+    //   'sealed'    — already there. Re-writing it re-runs the terminal disposition hooks for no
+    //     reason (they are idempotent — a reap and an annex that find nothing — but a status write
+    //     that changes nothing should not report that it landed).
+    const current = this.getSessionRecord(agentName, sessionId)?.status;
+    if (current === "abandoned" || current === "sealed") {
+      this.#logger.info("session.seal.status.not_written", {
+        agentName, sessionId, currentStatus: current,
+        impact: current === "abandoned"
+          ? "a certificate arrived for a session the operator force-abandoned; it is stored and retrievable, but the row keeps saying abandoned"
+          : "already sealed — nothing to write",
+      });
+      return false;
+    }
     return this.#updateSessionStatus(agentName, sessionId, "sealed");
   }
 

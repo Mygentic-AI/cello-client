@@ -78,6 +78,25 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a sealed session's ROW says sealed", 
     expect(statusOf(fx)).toBe("sealed");
   }, 60_000);
 
+  it("a force-ABANDONED session is not resurrected as sealed — that was the operator's decision", async () => {
+    // `#updateSessionStatus` has no status guard, so markSealed has to carry one. A certificate
+    // arriving after a force-abandon must not silently overturn the choice to give up the receipt.
+    // The certificate is still stored and retrievable; the row keeps saying what the operator did.
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016g-" });
+    seedNodelessInterrupted(fx, "abandoned");
+
+    expect(fx.snm.markSealed("alice", SID), "it must report that it did NOT write").toBe(false);
+    expect(statusOf(fx)).toBe("abandoned");
+  }, 60_000);
+
+  it("an already-sealed session is not re-written — a no-op must not report that it landed", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016h-" });
+    seedNodelessInterrupted(fx, "sealed");
+
+    expect(fx.snm.markSealed("alice", SID)).toBe(false);
+    expect(statusOf(fx)).toBe("sealed");
+  }, 60_000);
+
   it("a NEVER-MESSAGED session is not offered for sealing — a dead handshake is not a conversation", async () => {
     // `classifySession` deliberately hides a 0-message interrupted session in the "failed" bucket so
     // it does not clutter status. Sealing one spends a directory ceremony to notarize nothing, and
