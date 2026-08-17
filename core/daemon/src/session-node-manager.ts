@@ -36,8 +36,9 @@ import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
+import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
-import type { Logger, SessionRecord } from "./types.js";
+import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
@@ -101,6 +102,41 @@ const CONTENT_MAX_INBOUND_STREAMS = 512;
  * The frame is already ingested long before this fires, so nothing waits on it.
  */
 const CONTENT_STREAM_LINGER_MS = 30_000;
+
+/**
+ * DOD-M12B-SHUTDOWN-1 — how long one teardown step may block the daemon's exit.
+ *
+ * Chosen against the surface that complains: `cello logout` gives up and reports the daemon still
+ * running after 5 s, so a step that can burn longer than that guarantees the message the operator
+ * saw. Two steps at 2 s each stay inside it.
+ */
+const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
+
+/**
+ * DOD-M12B-REDIAL-1 — the shortest gap between two re-dials of one session.
+ *
+ * Long enough that a burst of sends against a peer that is genuinely gone costs one dial rather
+ * than one per message; short enough that a peer coming back is picked up on the next thing the
+ * operator says. It is cleared on a successful dial, so it never delays a live counterparty.
+ */
+const REDIAL_COOLDOWN_MS = 15_000;
+
+/**
+ * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
+ *
+ * A REASON, not a boolean. The three causes are not interchangeable, and collapsing them made the
+ * operator's guidance blame the network for a session this side had already torn down — which is
+ * the most common case, since force-abandon is largely used on `interrupted` sessions and those
+ * have no node left to send on.
+ *
+ * `told: true` means the bytes left this node. There is no acknowledgement, so it is not proof the
+ * far side acted — a counterparty on an older client does not understand the frame and keeps
+ * calling. The guidance says so rather than promising they will stop.
+ */
+export interface AbandonNoticeResult {
+  told: boolean;
+  reason: "sent" | "no_local_node" | "send_failed";
+}
 
 /**
  * DOD-M12B-ACK-1 — why a session is impaired, and what became of the content that revealed it.
@@ -460,6 +496,22 @@ export class SessionNodeManager {
   // DOD-M12B-ACK-1: WHY a session is impaired and what became of the content. Separate from the
   // state above because the state is what surfaces print and this is what they must explain.
   #impairmentCause = new Map<string, SessionImpairment>();
+  // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
+  // process; the Map is the working copy from then on.
+  #heldRestored = new Set<string>();
+  // DOD-M12B-SEAL-STUCK-1: sessions whose post-restore release has been attempted. Separate from
+  // #heldRestored so a READ-ONLY probe can hydrate without performing (or consuming) the release.
+  #heldReleased = new Set<string>();
+  // DOD-M12B-SEAL-STUCK-1: sessions whose ordering state THIS PROCESS has observed — a relay
+  // witness recorded for it. `#witnessedSeq` is memory-only, so for a session that predates this
+  // daemon "no gap recorded" means "not recorded", not "no gap", and that difference decides
+  // whether we may tell an operator the session is safe to close.
+  #orderingObserved = new Set<string>();
+  // DOD-M12B-INDEX-1: sessions whose tree and whose relay counter have provably parted. A diverged
+  // session can never produce a root the counterparty agrees with, so it must never be reported as
+  // safe to close — the close would be signed, refused as `leaf_count_mismatch`, and the receipt
+  // lost for good.
+  #diverged = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -479,7 +531,7 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -589,6 +641,18 @@ export class SessionNodeManager {
   #sendFaultRemaining = 0;
   // DOD-M12B-ACK-1 — the same seam for the delivery-ACK write. See injectAckFault.
   #ackFaultRemaining = 0;
+  // DOD-M12B-REDIAL-1 — makes the next N `newStream` calls report the connection as gone, BEFORE
+  // the node is touched. The sibling of injectSendFault for the one condition that used to end a
+  // conversation permanently; a real connection drop is not reproducible in-process.
+  #connectionLossRemaining = 0;
+  // DOD-M12B-REDIAL-1: the counterparty addresses this session dialled, kept so it can dial them
+  // again. They arrived in the FROST-signed assignment and were used once and dropped, which is
+  // why nothing could ever re-dial.
+  #counterpartyAddrs = new Map<string, string[]>();
+  // DOD-M12B-REDIAL-1: when this session may next attempt a re-dial. Continuous re-dialling is what
+  // produced the 2026-08-17 notification storm, so a burst of sends against a peer that is gone
+  // costs one attempt, not one per message.
+  #redialNotBefore = new Map<string, number>();
 
   /** Arm the park-deposit fault. Returns the count now armed. */
   injectParkFault(count: number, cause?: string): number {
@@ -610,6 +674,13 @@ export class SessionNodeManager {
   injectAckFault(count: number): number {
     this.#ackFaultRemaining = Math.max(0, count);
     return this.#ackFaultRemaining;
+  }
+
+  /** DOD-M12B-REDIAL-1: arm the connection-loss fault — the next N direct sends find no open
+   *  connection, exactly as they do after any blip. See #connectionLossRemaining. */
+  injectConnectionLoss(count: number): number {
+    this.#connectionLossRemaining = Math.max(0, count);
+    return this.#connectionLossRemaining;
   }
 
   getSendFaultRemaining(): number {
@@ -962,6 +1033,10 @@ export class SessionNodeManager {
       // watermark: this records "operator acknowledged via dismiss", not "operator received via
       // cello_receive". NULL = not yet dismissed.
       "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
+      // DOD-M12B-ABANDON-NOTIFY-1: epoch-ms when the counterparty told us they force-abandoned.
+      // Deliberately NOT a status — the session stays sealable, so the operator can still take a
+      // unilateral receipt. It stops this side calling them, nothing more.
+      "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1058,6 +1133,67 @@ export class SessionNodeManager {
         PRIMARY KEY (agent_id, session_id, leaf_index)
       )
     `);
+
+    // DOD-M12B-STRAND-1 — content we RECEIVED and VERIFIED but cannot append yet.
+    //
+    // Held content used to live only in `#heldContent`, a Map that died with the session node. The
+    // teardown path said so itself: "the content is unrecoverable by the time we are here."
+    // Measured on one daemon in one morning: 367 held, 8 released, **24 destroyed**. Each
+    // destruction is permanent and one-sided — the sender was never acknowledged, so it believes
+    // the message is merely pending, while the only copy the receiver will ever see is gone and
+    // every later message in that session is stuck behind a gap nothing can fill.
+    //
+    // `canonical_seq` is the RELAY's position, not a local counter, and it is part of the key: that
+    // is what lets a frame come back after a restart and land at its OWN index rather than the next
+    // free slot. Appending it anywhere else would change the root the seal signs over.
+    //
+    // Keyed on agent_id, never agent_name — agent_name is a mutable display label (see the repo
+    // guide). `content_blob` is the SCREENED copy that gets delivered; `original_blob` is the peer's
+    // raw bytes, which the release path needs because classification reads byte 0 and the screened
+    // copy is no longer a CBOR map header for a document frame.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS held_content (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        canonical_seq INTEGER NOT NULL,
+        content_blob BLOB NOT NULL,
+        original_blob BLOB,
+        content_hash_hex TEXT NOT NULL,
+        screened_out INTEGER NOT NULL DEFAULT 0,
+        correlation_id TEXT,
+        held_at INTEGER NOT NULL,
+        -- DOD-M12B-INDEX-1: 'received' (default) or 'sent'. A held frame of OUR OWN must be
+        -- released down the sent path — appended and transcribed as sent — never down the received
+        -- path, which would put our words in the counterparty's mouth in the sealed record and hand
+        -- them back to our own agent through cello_receive as though they had just arrived.
+        origin TEXT NOT NULL DEFAULT 'received',
+        -- DOD-M12B-INDEX-1: 'msg' or 'doc'. A held document leaf must come back as a document leaf.
+        leaf_kind TEXT NOT NULL DEFAULT 'msg',
+        PRIMARY KEY (agent_id, session_id, canonical_seq)
+      )
+    `);
+
+    // DOD-M12B-INDEX-1: `CREATE TABLE IF NOT EXISTS` is a NO-OP against a table that already
+    // exists, so a database created between DOD-M12B-STRAND-1 and this change has `held_content`
+    // WITHOUT `origin`. On those every insert throws and every restore throws — holds go back to
+    // memory-only, silently at the surface, and that now includes our own sent messages, which
+    // nobody else holds a copy of. Loud in the log is not the same as visible.
+    try {
+      this.#db.exec("ALTER TABLE held_content ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
+    // DOD-M12B-INDEX-1: and the LEAF KIND. `#releaseHeld` used to append every held frame as "msg",
+    // so a document leaf that had to wait for its position came back as a conversation message —
+    // the distinction survived the immediate append and was destroyed by the hold, unrecoverably
+    // after a restart.
+    try {
+      this.#db.exec("ALTER TABLE held_content ADD COLUMN leaf_kind TEXT NOT NULL DEFAULT 'msg'");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
 
     // DOD-LOG-1 (PERSIST-LOG-001) / PERSIST-002 (AC-010): the durable, ENCRYPTED-at-rest readable
     // transcript. Each row is keyed by the canonical leaf `sequence`, so it JOINS to
@@ -1929,6 +2065,10 @@ export class SessionNodeManager {
    *  otherwise let multiple held chunks each individually pass the size gate while cumulatively
    *  exceeding it once #releaseHeld drains them. */
   #getHeldBytesTotal(agentName: string, sessionId: string): number {
+    // DOD-M12B-STRAND-1: hydrate first. Reading the Map before the durable holds are back
+    // under-counts, and this gate exists to stop several held chunks each passing the size cap
+    // individually while cumulatively exceeding it — an under-count is the bypass.
+    this.#ensureHeldRestored(agentName, sessionId);
     const held = this.#heldContent.get(this.#k(agentName, sessionId));
     if (!held) return 0;
     let total = 0;
@@ -2835,6 +2975,25 @@ export class SessionNodeManager {
     });
   }
 
+  /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — drive the REAL inbound content handler with one framed message and
+   * a claimed peer identity.
+   *
+   * The handler is registered on a live libp2p node, so without this the only way to reach its
+   * branches is a full two-node transport fixture — which is why the session-abandoned branch and
+   * its peer pinning had no coverage at all. This feeds the same function the protocol handler
+   * calls, including the authentication check, rather than a copy of its logic.
+   */
+  async handleContentFrameForTest(agentName: string, sessionId: string, framedBytes: Uint8Array, remotePeerId?: string): Promise<void> {
+    const source = {
+      async *[Symbol.asyncIterator]() { yield framedBytes; },
+      close: async (): Promise<void> => {},
+      abort: (): void => {},
+      status: "closed",
+    } as unknown as Stream;
+    await this.#handleContentStream(agentName, sessionId, source, remotePeerId);
+  }
+
   /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
    *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
    *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
@@ -3131,22 +3290,70 @@ export class SessionNodeManager {
     // destroyed with the session three seconds later. The sender then re-sent that envelope 90
     // times against a ceiling of 5, and every surface reported the delivery as merely pending.
     //
-    // This is a LOSS REPORT, not a fix — the content is unrecoverable by the time we are here. The
-    // fix is upstream, in not tearing a session down while an answer is still owed on it.
+    // DOD-M12B-STRAND-1 — THIS IS NO LONGER AN EPITAPH. Dropping the Map now drops a CACHE: the
+    // frames are rows in `held_content`, and #restoreHeldContent brings them back the next time
+    // this session gets a node. `session.content.held.discarded` is kept, at WARN rather than
+    // ERROR, and only for what it now means — a gap is still open on a session going away, which
+    // is worth an alarm even though nothing is lost.
+    //
+    // It fires ONLY when the durable rows are confirmed present. A hold whose persist failed is a
+    // genuine loss and must not be reported with the same event as a survivor, so it gets its own
+    // error naming the count that is actually gone. The check is a COUNT against the store rather
+    // than a belief about the write that ran earlier.
     const strandedHolds = this.#heldContent.get(key);
     if (strandedHolds && strandedHolds.size > 0) {
-      this.#logger.error("session.content.held.discarded", {
+      const canonicalSeqs = [...strandedHolds.keys()].sort((a, b) => a - b);
+      // NULL means "we could not find out", and it must never render as "destroyed". The bare
+      // catch this replaces coerced a failed COUNT to 0, which then claimed every held frame had
+      // been lost — asserting a cause it had not established. It is not hypothetical:
+      // #requireAgentId THROWS for a retired agent, on this exact path, so retiring an agent with
+      // an open hold fabricated a data-loss alarm pointing at the persistence layer while the real
+      // fault was name resolution.
+      let durable: number | null = null;
+      try {
+        const row = this.#db?.prepare(
+          "SELECT COUNT(*) AS n FROM held_content WHERE agent_id = ? AND session_id = ?",
+        ).get(this.#requireAgentId(agentName), sessionId) as { n: number } | undefined;
+        durable = row?.n ?? 0;
+      } catch (err: unknown) {
+        this.#logger.warn("session.content.held.durable_count.failed", {
+          agentName, sessionId,
+          impact: "cannot say whether the held frames are durable — reported as unknown, NOT as lost",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      const lost = durable === null ? null : strandedHolds.size - durable;
+      this.#logger.warn("session.content.held.discarded", {
         agentName,
         sessionId,
         count: strandedHolds.size,
-        canonicalSeqs: [...strandedHolds.keys()].sort((a, b) => a - b),
+        durable,
+        canonicalSeqs,
         // NULL when the tree was not cached at teardown. Honest, and cheap — reloading the leaf
         // table to fill in a diagnostic field is not worth a disk read on every teardown, let
         // alone the cache resurrection it caused.
         treeSize: treeSizeBeforeEviction,
       });
+      if (lost !== null && lost > 0) {
+        this.#logger.error("session.content.held.lost", {
+          agentName,
+          sessionId,
+          lost,
+          held: strandedHolds.size,
+          impact: "verified content was NOT written to held_content and is destroyed by this teardown — the sender was never acknowledged and believes it is still pending",
+        });
+      }
     }
     this.#heldContent.delete(key);
+    // DOD-M12B-STRAND-1: the hydration guard goes with the cache it guards. Without this, a session
+    // torn down and given a node again inside ONE process would never re-read its durable holds —
+    // the frames would sit in the table, unreleasable, which is indistinguishable from the loss
+    // this unit exists to stop.
+    this.#heldRestored.delete(key);
+    this.#heldReleased.delete(key);
+    this.#diverged.delete(key);
+    this.#counterpartyAddrs.delete(key);
+    this.#redialNotBefore.delete(key);
     this.#highWaterSeq.delete(key);
   }
 
@@ -3155,6 +3362,35 @@ export class SessionNodeManager {
    * Called from the SIGTERM / cello logout path (AC-009).
    * SQLite writes complete before this method returns.
    */
+  /**
+   * DOD-M12B-SHUTDOWN-1 — wait for a teardown step, but never forever.
+   *
+   * Every step of shutdown used to be an unbounded `await` on libp2p. That is what makes "the
+   * daemon acknowledged the request but is still running" possible: nothing on the daemon side
+   * emits a word while it hangs, so the operator's own message ("it may be stuck closing sessions
+   * or its database") was a guess. Past the deadline the step is ABANDONED and SAID — the resources
+   * it was closing are reclaimed by the OS on exit, and an exit is worth more than a tidy one.
+   */
+  async #boundedTeardown(work: Promise<unknown>, step: string, count: number): Promise<void> {
+    if (count === 0) return;
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), SHUTDOWN_STEP_DEADLINE_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([work.then(() => "done" as const), deadline]);
+    if (timer) clearTimeout(timer);
+    if (outcome === "timeout") {
+      this.#logger.error("session.shutdown.step.timeout", {
+        step, count, waitedMs: Date.now() - started,
+        impact: "this teardown step did not finish and was abandoned so the daemon can exit; the OS reclaims what it held",
+      });
+    } else {
+      this.#logger.debug("session.shutdown.step.done", { step, count, tookMs: Date.now() - started });
+    }
+  }
+
   async gracefulShutdown(): Promise<void> {
     // DOD-NAT-REACHABILITY-1: stop the reservation watchdog before anything is torn
     // down — a tick landing mid-shutdown would try to rebuild a receiver we are in
@@ -3228,27 +3464,39 @@ export class SessionNodeManager {
         }),
       );
     }
-    await Promise.all(stopPromises);
+    // DOD-M12B-SHUTDOWN-1: BOUNDED. `node.stop()` awaits libp2p's own teardown, which has no
+    // deadline of its own — one connection that will not close holds this, and this holds the whole
+    // daemon. Measured 2026-08-17: `cello logout` acknowledged, then the process was still alive
+    // 30+ seconds later and needed a signal. An abandoned stop costs a socket the OS reclaims when
+    // we exit; an unbounded wait costs the exit itself.
+    await this.#boundedTeardown(Promise.all(stopPromises), "session_nodes", stopPromises.length);
     this.#activeNodes.clear();
     // Evict in-memory per-session caches (trees reload from SQLite; received-content
     // plaintext must not survive shutdown in memory).
     this.#trees.clear();
     this.#receivedContent.clear();
 
-    // Stop ALL per-agent standing receivers (DOD-LOOP-1).
-    for (const [agentName, sr] of this.#standingReceivers) {
-      sr.autoNat.stop();
-      try {
-        await sr.node.stop();
-      } catch (err: unknown) {
-        this.#logger.error("session.node.stop.failed", {
-          sessionId: "standing_receiver_shutdown",
-          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId: "n/a",
-        });
-      }
-    }
+    // Stop ALL per-agent standing receivers (DOD-LOOP-1). In PARALLEL and BOUNDED: this was a
+    // sequential await per agent with no deadline, so five agents meant five chances for one stuck
+    // libp2p teardown to hold the exit — and it sits between the operator being told the daemon is
+    // stopping and the process actually going.
+    await this.#boundedTeardown(
+      Promise.all([...this.#standingReceivers].map(async ([agentName, sr]) => {
+        sr.autoNat.stop();
+        try {
+          await sr.node.stop();
+        } catch (err: unknown) {
+          this.#logger.error("session.node.stop.failed", {
+            sessionId: "standing_receiver_shutdown",
+            agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+            error: err instanceof Error ? err.message : String(err),
+            correlationId: "n/a",
+          });
+        }
+      })),
+      "standing_receivers",
+      this.#standingReceivers.size,
+    );
     this.#standingReceivers.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
@@ -3888,6 +4136,9 @@ export class SessionNodeManager {
     for (const addr of addrs) {
       try {
         await entry.node.dial(addr);
+        // DOD-M12B-REDIAL-1: keep them. They arrived in the signed assignment and were used once
+        // and dropped, which is the reason nothing could ever dial this counterparty again.
+        this.#counterpartyAddrs.set(this.#k(agentName, sessionId), [...addrs]);
         this.#logger.info("session.transport.connected", {
           sessionId,
           addr,
@@ -3942,7 +4193,14 @@ export class SessionNodeManager {
      * document exclusions were dead while every document leaf arrived here as a message.
      */
     leafKind: number = LEAF_KIND_MSG,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string }> {
+  ): Promise<
+    // DOD-M12B-INDEX-1: `sequenceNumber` is the position the relay assigned this message, carried
+    // out so the caller can place its leaf THERE rather than at whatever the tail happens to be.
+    // Absent when no ordering authority answered — the documented relay-degraded case.
+    | { ok: true; delivered: true; sequenceNumber?: number }
+    | { ok: true; delivered: false; parked: true; sequenceNumber?: number }
+    | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string; sequenceNumber?: number }
+  > {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       // M12-P13: no node, so nothing was witnessed and nothing was queued — the caller must NOT
@@ -3966,6 +4224,8 @@ export class SessionNodeManager {
     // the leaf_deliver witness stream / arrival order.
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
+    // DOD-M12B-INDEX-1: the relay's answer to "where does this message go", carried to the caller.
+    let assignedSeq: number | undefined;
     // DOD-MP-SESSION-RETIRE-1 — the relay's answer SURVIVES to the caller even when the direct send
     // then succeeds. `relay_session_gone` is deliberately not terminal (it also fires for perfectly
     // live sessions whenever the relay restarts, because the relay stores sessions in memory), so
@@ -3983,9 +4243,20 @@ export class SessionNodeManager {
         if (witnessed.ok) {
           orderingS1 = witnessed.structure1_cbor;
           orderingS2 = witnessed.structure2_cbor;
+          // 1-BASED → 0-BASED. The relay numbers the first leaf of a session 1
+          // (`relay-node.ts`: `const seq = state.seq_counter + 1`), and this tree is 0-indexed.
+          // Every RECEIVE path in this file normalises with -1 and says so; the send path took the
+          // raw number, which puts every comparison against `tree.size()` one position out — so a
+          // perfectly healthy first message reads as "ahead of the tail" and is held behind a gap
+          // that does not exist. Do not remove this without changing both receive sites too.
+          assignedSeq = witnessed.sequence_number - 1;
           this.#logger.info("session.relay.hash.submitted", {
             sessionId,
-            sequenceNumber: witnessed.sequence_number,
+            // BOTH SPACES, NAMED. The relay's number is 1-based and the leaf index is 0-based, and
+            // reading one as the other is the defect this milestone exists to stop — so a log that
+            // carries only "sequenceNumber" invites exactly that mistake on the next investigation.
+            relaySequence: witnessed.sequence_number,
+            leafIndex: assignedSeq,
             correlationId,
           });
         } else if (isTerminalRelayRefusal(witnessed.reason)) {
@@ -4079,7 +4350,7 @@ export class SessionNodeManager {
     // connection). See the note on #handleContentStream's finally.
     let sendStream: Stream | undefined;
     try {
-      const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      const stream = await this.#openContentStream(agentName, sessionId, entry, correlationId);
       sendStream = stream;
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
       // receiver's `persisted` ACK can come back fast (in-process / low-latency
@@ -4126,7 +4397,7 @@ export class SessionNodeManager {
       // on the content hash. A false delivered costs the message.
       await stream.close();
       this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
-      return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+      return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
       this.#markSessionImpaired(agentName, sessionId, { cause: "direct_send", error: err instanceof Error ? err.message : String(err), correlationId });
       if (sendStream !== undefined) {
@@ -4166,7 +4437,7 @@ export class SessionNodeManager {
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
-        return { ok: true, delivered: false, parked: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+        return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
       // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
@@ -4249,6 +4520,9 @@ export class SessionNodeManager {
         ok: false,
         reason: "session_stream_unavailable",
         error: errMsg,
+        // Carried on the failure path too: a DURABLY QUEUED message still owns the position the
+        // relay witnessed for it before delivery was attempted, and its leaf must go there.
+        ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }),
         // M12-P13: the machine-readable half of the distinction below. M12-P12 shipped it in the
         // guidance SENTENCE only, so the callers that have to ACT on it — commit the leaf for a
         // queued message, never for a lost one — would have had to substring-match English. None
@@ -4901,6 +5175,7 @@ export class SessionNodeManager {
       : this.#witnessedSeq.get(key)?.get(contentHashHex);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
+      this.#ensureHeldRestored(agentName, sessionId);
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
       // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
@@ -4912,6 +5187,9 @@ export class SessionNodeManager {
       // doorbell, and `cello_receive` handing an agent raw CBOR as though a person typed it.
       // The in-order path has always passed these bytes; only the held path dropped them.
       held.set(canonicalSeq, { content: deliverContent, originalContent: content, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
+      // DOD-M12B-STRAND-1: and to disk, before we answer. The in-memory Map is the working copy;
+      // this row is the one that survives the teardown that used to destroy it.
+      this.#persistHeldContent(agentName, sessionId, canonicalSeq, deliverContent, content, contentHashHex, terminalBlock === true, correlationId);
       this.#logger.info("session.content.held", {
         sessionId,
         canonicalSeq,
@@ -5007,6 +5285,9 @@ export class SessionNodeManager {
   recordWitnessedSequence(agentName: string, sessionId: string, contentHashHex: string, sequenceNumber: number): void {
     if (sequenceNumber < 0) return;
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-SEAL-STUCK-1: this process has now seen this session's ordering state, so an empty
+    // witness map for it means "no gap" rather than "never looked".
+    this.#orderingObserved.add(key);
     let map = this.#witnessedSeq.get(key);
     if (!map) { map = new Map(); this.#witnessedSeq.set(key, map); }
     map.set(contentHashHex, sequenceNumber);
@@ -5062,8 +5343,21 @@ export class SessionNodeManager {
    */
   sealReadiness(agentName: string, sessionId: string): {
     ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number;
+    /** DOD-M12B-INDEX-1: of `heldCount`, how many are THIS side's own sends versus the
+     *  counterparty's. They block a seal identically and mean completely different things. */
+    heldOwn: number; heldReceived: number;
   } {
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-STRAND-1: hydrate first. An under-counted `heldCount` reports a gapped session as
+    // READY, and this gate's whole purpose is to stop a short chain being signed — the counterparty
+    // answers `leaf_count_mismatch`, which is TERMINAL and costs the receipt permanently. Failing
+    // open here is the one outcome worse than refusing a healthy close.
+    //
+    // Hydrate WITHOUT releasing: this is a read path now — the status surface asks it for every
+    // active session — and a read that appends leaves, advances the root and rings the doorbell is
+    // a diagnostic command that delivers messages. The release still runs on every path that was
+    // going to mutate anyway.
+    this.#ensureHeldRestored(agentName, sessionId, { release: false });
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
@@ -5083,7 +5377,105 @@ export class SessionNodeManager {
     // ordering authority has committed and this tree has not — no arithmetic, no space mismatch,
     // and it cannot go negative.
     const missingLeaves = this.#witnessedSeq.get(key)?.size ?? 0;
-    return { ready: missingLeaves === 0 && heldCount === 0, treeSize, highWaterSeq, heldCount, missingLeaves };
+    // DOD-M12B-INDEX-1: our OWN held sends are counted separately. They block a seal just as a
+    // received hold does, but they are not "a message from the counterparty that has not arrived" —
+    // and a refusal that calls them that tells the operator to wait for something already in hand,
+    // which is how a close-retry loop ends at force-abandon and no receipt.
+    let heldOwn = 0;
+    for (const e of this.#heldContent.get(key)?.values() ?? []) if (e.origin === "sent") heldOwn++;
+    return {
+      ready: missingLeaves === 0 && heldCount === 0,
+      treeSize, highWaterSeq, heldCount, missingLeaves,
+      heldOwn, heldReceived: heldCount - heldOwn,
+    };
+  }
+
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — the operator-facing answer to "can this session be closed?".
+   *
+   * THREE STATES, because there are three answers. `sealReadiness` above returns a boolean plus raw
+   * counters, and both of its counters are easy to misread on a surface:
+   *
+   *  - `missingLeaves` is `#witnessedSeq.size`, which is every position the relay witnessed that
+   *    this tree has not appended — and a HELD frame keeps its witness entry. So it INCLUDES the
+   *    held ones. Reporting it beside `heldCount` counts the same message twice and labels one copy
+   *    "never received" when it is sitting on our own disk. Split here into what each actually is.
+   *  - Neither counter survives a restart on its own: `#witnessedSeq` is memory-only. Held content
+   *    is durable since DOD-M12B-STRAND-1, but a position the relay witnessed for content that
+   *    never arrived leaves no trace. So for a session carrying leaves this process did not watch
+   *    arrive, "clean" is unknowable — and saying `ready` there invites a close that gets
+   *    `leaf_count_mismatch` back, which is terminal and costs the receipt for good.
+   */
+  sealReadinessView(agentName: string, sessionId: string): SealReadinessView {
+    const key = this.#k(agentName, sessionId);
+    const r = this.sealReadiness(agentName, sessionId);
+    if (!r.ready) {
+      const oldestHeldMs = this.#oldestHeldMs(agentName, sessionId);
+      return {
+        state: "blocked",
+        // The witness map counts a held frame until it is appended, so subtract the RECEIVED holds
+        // to avoid reporting one message twice. NOT the own-sends: the witness map only ever
+        // carries counterparty leaves, so subtracting ours would push this count below the truth.
+        awaitingArrival: Math.max(0, r.missingLeaves - r.heldReceived),
+        heldBehindGap: r.heldCount,
+        oldestHeldMs,
+      };
+    }
+    if (this.#diverged.has(key)) {
+      // NOT `ready`. The tree is ahead of the relay's counter for good, so a close here signs a root
+      // the counterparty answers `leaf_count_mismatch` to — terminal, and the receipt is gone. The
+      // raw counters cannot see this: nothing is missing and nothing is held.
+      return { state: "unknown", reason: "record_diverged_from_relay" };
+    }
+    if (r.treeSize > 0 && !this.#orderingObserved.has(key)) {
+      return {
+        state: "unknown",
+        reason: "witness_state_predates_daemon_start",
+      };
+    }
+    return { state: "ready" };
+  }
+
+  /** DOD-M12B-INDEX-1 — this agent's own K_local pubkey, for attributing its own held content.
+   *  Null when it cannot be resolved: an UNATTRIBUTED annex row is true, a falsely attributed one
+   *  is not, and this is the record that outlives the session. */
+  #ownPubkeyHex(agentName: string): string | null {
+    if (!this.#db) return null;
+    try {
+      // BY agent_id, never by agent_name. The name is a mutable, reuse-freed display label, and
+      // scoping on it hands one identity's rows to another keypair (DOD-AGENT-ID-JOINKEY-1).
+      const row = this.#db
+        .prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?")
+        .get(this.#requireAgentId(agentName)) as { k_local_pubkey: string } | undefined;
+      return row?.k_local_pubkey ?? null;
+    } catch (err: unknown) {
+      // An unattributed annex row is truthful; an unattributed row nobody knows about is not. This
+      // throws for a retired agent, and without a line here EVERY own held message would land in
+      // the record that outlives the session with no sender and no explanation.
+      this.#logger.warn("session.own_pubkey.unresolved", {
+        agentName,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "this agent's own held content will be annexed without a sender",
+      });
+      return null;
+    }
+  }
+
+  /** DOD-M12B-SEAL-STUCK-1 — how long the oldest held frame for this session has been waiting, or
+   *  null when nothing is held. This is what separates "stuck since this morning" from "in flight
+   *  40 ms ago", and without it a healthy mid-conversation window reads as a stranded session. */
+  #oldestHeldMs(agentName: string, sessionId: string): number | null {
+    if (!this.#db) return null;
+    try {
+      const row = this.#db.prepare(
+        "SELECT MIN(held_at) AS oldest FROM held_content WHERE agent_id = ? AND session_id = ?",
+      ).get(this.#requireAgentId(agentName), sessionId) as { oldest: number | null } | undefined;
+      if (!row || row.oldest === null) return null;
+      return Date.now() - row.oldest;
+    } catch {
+      // A diagnostic detail must not be able to break the surface it decorates.
+      return null;
+    }
   }
 
   /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
@@ -5215,12 +5607,519 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — tell the counterparty we have hung up. Best effort, never blocking.
+   *
+   * A force-abandon marks the session terminal HERE and did nothing else, so the other side kept
+   * its half live, kept retrying delivery into it, and kept trying to re-establish — forever,
+   * because nothing would ever answer. That is what produced the 2026-08-17 notification storm:
+   * surviving halves calling continuously while the operator saw connection requests from agents
+   * nobody was driving.
+   *
+   * BEST EFFORT, and every caller must treat it that way. A peer that is offline cannot be told, so
+   * this is an improvement on silence rather than a guarantee — and it must never delay or fail the
+   * abandon, which is the operator's escape hatch out of a session that can never seal.
+   */
+  async notifyCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<AbandonNoticeResult> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) {
+      // NAMES ITS CAUSE, and it is not the network. An `interrupted` session has no node — the
+      // restart sweep and markInterrupted both tear it down — and `interrupted` is exactly the
+      // status force-abandon exists for. Reporting this as "could not be reached" sends the
+      // operator to debug a connection when the answer is in our own process. At INFO, not debug,
+      // because it is the common case and it changes what the operator is told.
+      this.#logger.info("session.abandon.notice.skipped", {
+        agentName, sessionId, reason: "no_local_node", correlationId,
+        impact: "this side had already torn the session down, so there was nothing to send on — the counterparty was not told",
+      });
+      return { told: false, reason: "no_local_node" };
+    }
+    let stream: Stream | undefined;
+    try {
+      // Through the RE-DIAL path, not a bare newStream. A session worth force-abandoning is very
+      // often one whose connection blipped — the peer is online and calling us, which is the whole
+      // complaint — so one demand-driven dial is the difference between telling them and not.
+      stream = await this.#openContentStream(agentName, sessionId, entry, correlationId);
+      // Typed against protocol-types so the shape cannot drift from the declaration the receiving
+      // side (and any second client implementation) reads.
+      const notice: SessionAbandonedNotice = {
+        type: "session_abandoned_notice",
+        session_id: sessionId,
+        ...(correlationId === undefined ? {} : { correlation_id: correlationId }),
+      };
+      const frame = encodeCbor(notice) as Uint8Array;
+      stream.send(lp.encode.single(frame));
+      await stream.close();
+      this.#logger.info("session.abandon.notice.sent", { agentName, sessionId, correlationId });
+      return { told: true, reason: "sent" };
+    } catch (err: unknown) {
+      if (stream !== undefined) {
+        try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
+      this.#logger.warn("session.abandon.notice.failed", {
+        agentName, sessionId, correlationId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "the counterparty was not told and may keep calling until it gives up",
+      });
+      return { told: false, reason: "send_failed" };
+    }
+  }
+
+  /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — the receiving half: our counterparty has abandoned, so retire.
+   *
+   * RETIRING IS NOT DELETING. The counterparty walking away forfeits the notarized receipt; it must
+   * not also cost the operator the record of what was actually said. The transcript and the tree
+   * stay exactly as they are.
+   *
+   * Only an `active` or `interrupted` session moves. A SEALED session has a notarized receipt and
+   * must never be turned into an abandoned one by a late or duplicated notice — that would destroy
+   * the artifact this protocol exists to produce. An unknown session is refused rather than
+   * created: an authenticated stream proves who is speaking, not that a session exists.
+   */
+  async retireOnCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<boolean> {
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) {
+      this.#logger.warn("session.abandon.notice.unknown_session", { agentName, sessionId, correlationId });
+      return false;
+    }
+    if (record.status !== "active" && record.status !== "interrupted") {
+      this.#logger.debug("session.abandon.notice.ignored", {
+        agentName, sessionId, status: record.status, correlationId,
+        reason: "session already terminal",
+      });
+      return false;
+    }
+    // THE TRANSPORT IS RETIRED. THE SESSION IS NOT.
+    //
+    // The first build flipped the status to `abandoned`, and that was wrong twice over. It handed
+    // the abandoning party a button that DENIES US OUR RECEIPT: the unilateral seal exists for
+    // exactly this case — "the counterparty never co-closes" — and produces a notarized certificate
+    // after a grace period, but `cello_close_session` refuses an `abandoned` session outright. So
+    // one frame from them destroyed a recovery path that already existed, remotely and for free.
+    // Today the abandoner can only go silent, and going silent is what the unilateral seal was
+    // built to survive.
+    //
+    // What the DoD actually asks for is that we stop calling them. That is a transport concern:
+    // mark it, stop re-dialling, stop retrying delivery — and leave the session sealable.
+    const marked = this.#markCounterpartyAbandoned(agentName, sessionId);
+    if (!marked) return false;
+    // The addresses go, so the demand-driven re-dial has nothing to dial. This is the storm.
+    const key = this.#k(agentName, sessionId);
+    this.#counterpartyAddrs.delete(key);
+    this.#logger.warn("session.counterparty.abandoned", {
+      agentName, sessionId, priorStatus: record.status, correlationId,
+      impact: "the counterparty ended this session on their side, so nothing more will arrive and replies cannot reach them — this side stops calling. The session is NOT terminal: a unilateral seal is still available, and the transcript is intact",
+    });
+    // AWAITED, and `retireSessionNode` NOT `destroySessionNode`. The latter writes the status back
+    // — `error` maps to `interrupted` — a few hundred milliseconds later, which silently undid the
+    // whole unit; the former is the method that tears a node down without touching the status, and
+    // it is what the local force-abandon path already uses.
+    await this.retireSessionNode(agentName, sessionId);
+    return true;
+  }
+
+  /** DOD-M12B-ABANDON-NOTIFY-1 — durable "they hung up" marker. Not a status: the session stays
+   *  sealable, which is the whole point of not making this terminal. */
+  #markCounterpartyAbandoned(agentName: string, sessionId: string): boolean {
+    if (!this.#db) return false;
+    try {
+      const res = this.#db
+        .prepare("UPDATE sessions SET counterparty_abandoned_at = ?, updated_at = ? WHERE agent_id = ? AND session_id = ? AND counterparty_abandoned_at IS NULL")
+        .run(Date.now(), Date.now(), this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
+      // No rows changed means it was already marked — a duplicated notice, which must not
+      // re-announce. "Did not throw" is not "landed"; the row count is the answer.
+      return Number(res?.changes ?? 0) > 0;
+    } catch (err: unknown) {
+      this.#logger.error("session.counterparty.abandoned.write.failed", {
+        agentName, sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "this side will go on trying to reach a counterparty that has hung up",
+      });
+      return false;
+    }
+  }
+
+  /** DOD-M12B-ABANDON-NOTIFY-1: has the counterparty told us they hung up? */
+  counterpartyAbandonedAt(agentName: string, sessionId: string): number | null {
+    if (!this.#db) return null;
+    try {
+      const row = this.#db
+        .prepare("SELECT counterparty_abandoned_at FROM sessions WHERE agent_id = ? AND session_id = ?")
+        .get(this.#requireAgentId(agentName), sessionId) as { counterparty_abandoned_at: number | null } | undefined;
+      return row?.counterparty_abandoned_at ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * DOD-M12B-REDIAL-1 — open a content stream, re-dialling once if the connection has gone.
+   *
+   * `newStream` never dials. It looks for an already-open connection filed under the recorded peer
+   * id and throws `connection_lost` when there is none — and NOTHING re-dialled: not on
+   * `session.liveness.changed → gone`, not on signaling reconnect, not on agent offline→online, not
+   * in the drain hook. So one blip and that session parked EVERY message for the rest of its life,
+   * on both sides, permanently. The relay backstop kept the messages moving, which is exactly why
+   * it hid: nothing was lost, the conversation just stopped being a conversation.
+   *
+   * DEMAND-DRIVEN, never a timer. A background re-dial loop is what produced the 2026-08-17
+   * notification storm — surviving halves of abandoned sessions dialling continuously while the
+   * operator saw connection requests from agents nobody was driving. This fires only when a send
+   * actually needs the connection, and a cooldown bounds a burst against a peer that is genuinely
+   * gone: five sends cost one dial, not five.
+   */
+  async #openContentStream(
+    agentName: string,
+    sessionId: string,
+    entry: { node: CelloNode; counterpartySessionPeerId: string },
+    correlationId?: string,
+  ): Promise<Stream> {
+    const attempt = async (): Promise<Stream> => {
+      if (this.#connectionLossRemaining > 0) {
+        this.#connectionLossRemaining -= 1;
+        throw { reason: "no_connection", message: "injected connection loss" };
+      }
+      return entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+    };
+    try {
+      return await attempt();
+    } catch (err: unknown) {
+      const reason = (err as { reason?: string } | null)?.reason;
+      // ONLY for a missing connection, and `no_connection` is the reason that means exactly that.
+      // NOT `connection_lost`, which is the transport's catch-all default and therefore also covers
+      // a stream that failed on a healthy connection — the per-protocol stream cap of
+      // DOD-M12B-ACK-1. Dialling there fixes nothing and shows the counterparty a connection
+      // request caused by a defect on this side, which is the storm this unit exists to avoid.
+      if (reason !== "no_connection") throw err;
+
+      const key = this.#k(agentName, sessionId);
+      const addrs = this.#counterpartyAddrs.get(key);
+      if (!addrs || addrs.length === 0) {
+        // ABSENT IS NOT FINE, and it is not silent. A session we never dialled — the responder's
+        // half — has no addresses to dial back with, and that is a real limitation the operator
+        // should be able to see rather than infer from a park.
+        this.#logger.warn("session.transport.redial.unavailable", {
+          sessionId, agentName, correlationId,
+          impact: "the direct path is down and this side holds no address for the counterparty, so every send parks until they re-establish",
+        });
+        throw err;
+      }
+      const now = Date.now();
+      const notBefore = this.#redialNotBefore.get(key) ?? 0;
+      if (now < notBefore) {
+        this.#logger.debug("session.transport.redial.cooldown", {
+          sessionId, agentName, retryInMs: notBefore - now, correlationId,
+        });
+        throw err;
+      }
+      this.#redialNotBefore.set(key, now + REDIAL_COOLDOWN_MS);
+      this.#logger.info("session.transport.redial.attempted", { sessionId, agentName, addrs: addrs.length, correlationId });
+      const reconnected = await this.connectToCounterparty(agentName, sessionId, addrs);
+      if (!reconnected.ok) {
+        this.#logger.warn("session.transport.redial.failed", {
+          sessionId, agentName, reason: reconnected.reason, error: reconnected.error, correlationId,
+        });
+        throw err;
+      }
+      this.#logger.info("session.transport.redial.succeeded", { sessionId, agentName, correlationId });
+      // Cleared so the NEXT blip is repaired immediately: the cooldown exists to bound a dead peer,
+      // not to make a live one wait.
+      this.#redialNotBefore.delete(key);
+      return attempt();
+    }
+  }
+
+  /**
+   * DOD-M12B-INDEX-1 — commit THIS agent's own leaf at the position the relay assigned it.
+   *
+   * The receiver has always enforced "leaf index === canonical position": content witnessed ahead
+   * of the next expected leaf is held, not appended out of order. The sender never did. It had the
+   * position in hand — the relay answers about 4 ms before the append — and called a push-only
+   * append that puts the leaf at the tail whatever the tail happens to be. While its own tree has
+   * no gap the two agree and nothing shows; the first gap puts its leaf at someone else's index,
+   * parts its root from the counterparty's, and the next seal gets `leaf_count_mismatch`, which is
+   * terminal.
+   *
+   * DELIVERY IS NOT DEFERRED BY THIS. The caller has already put the bytes on the wire; only the
+   * leaf waits for its slot, exactly as a received message does. Holding our own send is only
+   * affordable because holds are durable (DOD-M12B-STRAND-1) — before that it would have risked
+   * losing the message outright.
+   *
+   * `assignedSeq` absent means no ordering authority answered. That is the documented degradation
+   * and it appends in arrival order as before: with no position there is no discipline to enforce,
+   * and refusing would take messaging down whenever the relay is unreachable.
+   */
+  placeOwnLeaf(
+    agentName: string,
+    sessionId: string,
+    contentHashHex: string,
+    sentBytes: Uint8Array,
+    assignedSeq: number | undefined,
+    correlationId?: string,
+    kind: WritableSessionTreeLeafKind = "msg",
+  ): { placed: true; leafIndex: number; diverged?: true } | { placed: false; heldAt: number } {
+    // Hydrate before reading the frontier: a durable hold this process has not read back yet would
+    // make the tree look further along than it is.
+    this.#ensureHeldRestored(agentName, sessionId);
+    const nextExpected = this.getSessionTree(agentName, sessionId).size();
+
+    if (assignedSeq === undefined) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
+      return { placed: true, leafIndex };
+    }
+
+    if (assignedSeq === nextExpected) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
+      return { placed: true, leafIndex };
+    }
+
+    if (assignedSeq < nextExpected) {
+      // THE TREE AND THE RELAY HAVE ALREADY DIVERGED, and refusing here does not undo that.
+      //
+      // This side is AHEAD of the relay's counter, which happens by design: a message whose relay
+      // submit failed still appends unwitnessed (the documented degradation). From then on every
+      // ack comes back behind our frontier and the two can never agree again — the seal was already
+      // lost at the unwitnessed append, not here.
+      //
+      // So the choice is between a record that is short by every subsequent message and one that is
+      // complete but skewed. Appending at the tail keeps the operator's own words in their own
+      // transcript, which is worth more than a tidiness the roots cannot recover anyway; writing
+      // over the assigned slot is the one thing never done, because that rewrites a leaf a root has
+      // already been computed over. The divergence is reported at ERROR and carried to the caller
+      // rather than dressed up as an ordinary success.
+      this.#logger.error("session.tree.position_behind_frontier", {
+        agentName, sessionId, assignedSeq, nextExpected, contentHash: contentHashHex, correlationId,
+        impact: "this side's tree is ahead of the relay's counter, so the two can no longer agree on a root — the message is kept in the local record and this session can no longer be sealed bilaterally",
+      });
+      this.#diverged.add(this.#k(agentName, sessionId));
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
+      return { placed: true, leafIndex, diverged: true };
+    }
+
+    // Ahead of the tail: hold it, exactly as the receiver holds theirs, and let #releaseHeld put it
+    // in at its own index when the gap fills.
+    const key = this.#k(agentName, sessionId);
+    let held = this.#heldContent.get(key);
+    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
+    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent", kind });
+    this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent", kind);
+    this.#logger.info("session.content.held", {
+      sessionId, canonicalSeq: assignedSeq, nextExpected, gap: assignedSeq - nextExpected,
+      origin: "sent", correlationId,
+    });
+    return { placed: false, heldAt: assignedSeq };
+  }
+
+  /**
+   * DOD-M12B-STRAND-1 — write one held frame to the durable store.
+   *
+   * LOGS LOUD, does not refuse. The caller answers `held: true` either way, and that is correct:
+   * held content is never `persisted`-acked, so the sender keeps its copy and retries whether or
+   * not this row lands. What a failure costs is the restart case — the frame is memory-only again,
+   * exactly as it was before this unit — so it is reported at ERROR here and counted again by the
+   * teardown alarm, and never allowed to look like a success.
+   */
+  #persistHeldContent(
+    agentName: string,
+    sessionId: string,
+    canonicalSeq: number,
+    deliverContent: Uint8Array,
+    originalContent: Uint8Array,
+    contentHashHex: string,
+    screenedOut: boolean,
+    correlationId?: string,
+    origin: "received" | "sent" = "received",
+    leafKind: WritableSessionTreeLeafKind = "msg",
+  ): void {
+    if (!this.#db) return;
+    try {
+      // A position may legitimately be re-written by a redelivery of the SAME frame. Different
+      // content at the same relay position means the relay contradicted itself, and destroying the
+      // first copy silently is not an option for verified content.
+      const existing = this.#db.prepare(
+        "SELECT content_hash_hex FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
+      ).get(this.#requireAgentId(agentName), sessionId, canonicalSeq) as { content_hash_hex: string } | undefined;
+      if (existing && existing.content_hash_hex !== contentHashHex) {
+        this.#logger.error("session.content.held.position_conflict", {
+          agentName, sessionId, canonicalSeq, correlationId,
+          existingContentHash: existing.content_hash_hex, incomingContentHash: contentHashHex,
+          impact: "two different frames claim one canonical position — the earlier held copy is being replaced",
+        });
+      }
+      this.#db.prepare(
+        `INSERT OR REPLACE INTO held_content
+           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at, origin, leaf_kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        this.#requireAgentId(agentName), sessionId, canonicalSeq,
+        Buffer.from(deliverContent), Buffer.from(originalContent), contentHashHex,
+        screenedOut ? 1 : 0, correlationId ?? null, Date.now(), origin, leafKind,
+      );
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.persist.failed", {
+        agentName, sessionId, canonicalSeq, contentHash: contentHashHex, correlationId,
+        impact: "this frame is held IN MEMORY ONLY and will be destroyed if the daemon restarts",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** DOD-M12B-STRAND-1 — drop one held frame from the durable store, on release or on a refusal
+   *  that supersedes it. A row that outlives its release re-appends on the next boot. */
+  #deleteHeldContent(agentName: string, sessionId: string, canonicalSeq: number): void {
+    if (!this.#db) return;
+    try {
+      this.#db.prepare(
+        "DELETE FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
+      ).run(this.#requireAgentId(agentName), sessionId, canonicalSeq);
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.delete.failed", {
+        agentName, sessionId, canonicalSeq,
+        impact: "the released frame's durable row survives and will be re-appended on the next boot",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * DOD-M12B-STRAND-1 — restore this session's held frames into memory.
+   *
+   * Called when a session node is (re)created, which is the moment the session becomes able to
+   * append again. Loading at daemon boot instead would be wrong for the same reason the old code
+   * was wrong: a frame is only releasable against a tree, and the tree is loaded per session.
+   *
+   * A frame whose content the tree ALREADY HOLDS at that position is dropped — re-appending it
+   * would change the root a seal signs over. That test is `hashAt`, not `canonical_seq < frontier`:
+   * the two counters are different spaces and this file documents them drifting, so the index
+   * comparison alone would destroy a frame the tree never held. See the drift branch below.
+   */
+  #ensureHeldRestored(agentName: string, sessionId: string, opts?: { release?: boolean }): void {
+    const key = this.#k(agentName, sessionId);
+    if (!this.#heldRestored.has(key)) {
+      // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
+      // away instead of recursing.
+      this.#heldRestored.add(key);
+      this.#restoreHeldContent(agentName, sessionId);
+    }
+    // A RESTORED FRAME MAY ALREADY BE IN ORDER, and nothing else would ever notice.
+    //
+    // #releaseHeld has one caller: the tail of a successful inbound ingest. Every other way the tree
+    // grows — an outbound send leaf, a queued or rejected leaf — advances the frontier without
+    // draining. While holds died with the session node that cost seconds; now the hold is durable,
+    // so the stall is durable too: the counterparty's message sits on disk at exactly the next slot,
+    // is never delivered, and `sealReadiness` counts it, so the session cannot close either.
+    // Undeliverable AND unsealable, forever, from one restart.
+    //
+    // TRACKED SEPARATELY FROM THE HYDRATION. A read-only caller (the status surface) hydrates and
+    // must NOT release — otherwise `cello status` appends leaves, advances the session root, writes
+    // transcript rows and rings the doorbell, which makes a diagnostic command the thing that
+    // delivers messages. One shared flag would also let that read CONSUME the release the next real
+    // ingest was going to perform, which is the stall above, reintroduced.
+    if (opts?.release === false) return;
+    if (this.#heldReleased.has(key)) return;
+    this.#heldReleased.add(key);
+    if (this.#heldContent.get(key)?.size) {
+      const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+      if (counterparty) this.#releaseHeld(agentName, sessionId, counterparty);
+    }
+  }
+
+  #restoreHeldContent(agentName: string, sessionId: string): void {
+    if (!this.#db) return;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string; leaf_kind: string }>;
+    try {
+      rows = this.#db.prepare(
+        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin, leaf_kind
+           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
+      ).all(this.#requireAgentId(agentName), sessionId) as never;
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.restore.failed", {
+        agentName, sessionId,
+        impact: "verified content held before the restart is not in memory and cannot be released",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (rows.length === 0) return;
+    const key = this.#k(agentName, sessionId);
+    let held = this.#heldContent.get(key);
+    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
+    const tree = this.getSessionTree(agentName, sessionId);
+    const frontier = tree.size();
+    let restored = 0;
+    let superseded = 0;
+    let drifted = 0;
+    for (const row of rows) {
+      // ASK THE TREE WHAT IS AT THAT POSITION — do not infer it from the index.
+      //
+      // `canonical_seq` is the RELAY's sequence space; `frontier` is this tree's msg-leaf count.
+      // The two drift, on purpose and by documented cases: the relay counts CTRL leaves the tree
+      // never appends, and a first message whose relay submit failed leaves the tree one ahead.
+      // Under drift `canonical_seq < frontier` is TRUE for a frame the tree has never held, and
+      // deleting on that comparison destroys verified content while reporting it as tidy-up —
+      // the exact failure this unit exists to end, reintroduced on the recovery path.
+      const occupant = tree.hashAt(row.canonical_seq);
+      if (occupant === row.content_hash_hex) {
+        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        superseded++;
+        continue;
+      }
+      if (row.canonical_seq < frontier) {
+        // The position is taken by DIFFERENT content. The frame cannot be appended (that would
+        // rewrite a committed leaf) and must not be deleted (it is verified content nobody else
+        // holds), so it goes to the annex that exists for exactly this — content that arrived for
+        // a chain that can no longer carry it — and only then does the row go.
+        const annexed = this.recordSealedAnnex(
+          agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob),
+          // DOD-M12B-INDEX-1: our own held send is attributed to US, never to the counterparty.
+          row.origin === "sent"
+            ? this.#ownPubkeyHex(agentName)
+            : this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null,
+        );
+        this.#logger.error("session.content.held.position_drifted", {
+          agentName, sessionId, canonicalSeq: row.canonical_seq, frontier,
+          contentHash: row.content_hash_hex, occupant, annexed,
+          correlationId: row.correlation_id ?? undefined,
+          impact: annexed
+            ? "the relay's position for this frame is occupied by different content — it cannot join the chain and is readable only from the annex"
+            : "the relay's position for this frame is occupied by different content AND the annex write failed — the durable row is kept rather than destroyed",
+        });
+        if (annexed) this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        drifted++;
+        continue;
+      }
+      held.set(row.canonical_seq, {
+        content: new Uint8Array(row.content_blob),
+        ...(row.original_blob ? { originalContent: new Uint8Array(row.original_blob) } : {}),
+        contentHashHex: row.content_hash_hex,
+        ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
+        ...(row.screened_out ? { screenedOut: true } : {}),
+        ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
+        ...(row.leaf_kind === "doc" ? { kind: "doc" as const } : {}),
+      });
+      restored++;
+    }
+    if (held.size === 0) this.#heldContent.delete(key);
+    this.#logger.info("session.content.held.restored", {
+      agentName, sessionId, restored, superseded, drifted, frontier,
+      canonicalSeqs: [...held.keys()].sort((a, b) => a - b),
+      // The flow ids of the frames that came back, so a restored message ties to the
+      // `session.content.held` that opened its flow before the restart.
+      correlationIds: rows.map((r) => r.correlation_id).filter((c): c is string => c !== null),
+    });
+  }
+
+  /**
    * DOD-MSG-4: drain held out-of-order content in canonical order. After a leaf is appended, any
    * held entry whose canonical sequence equals the new next-expected index is now in order — append
    * it, then check again (a single fill can release a run of consecutive held messages).
    */
   #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): number {
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-STRAND-1: hydrate before scanning. Restoring eagerly at session-node creation put
+    // it behind writes that can fail — one failed `sessions` row upsert and the frames stayed on
+    // disk, invisible, which is the same outcome as losing them.
+    this.#ensureHeldRestored(agentName, sessionId);
     const held = this.#heldContent.get(key);
     if (!held) return 0;
     let released = 0;
@@ -5229,9 +6128,39 @@ export class SessionNodeManager {
       const entry = held.get(nextExpected);
       if (!entry) break;
       held.delete(nextExpected);
-      // A screened-out (terminal-blocked) held entry leafs at its canonical index but is NEVER
-      // buffered for the agent; a normal held entry buffers + leafs (code-review HIGH-1).
-      if (entry.screenedOut) {
+      // DOD-M12B-STRAND-1: released content leaves the durable store in the same breath. A row
+      // that outlives its release would re-append the same content on the next boot — growing the
+      // tree and changing a root that has already been signed.
+      this.#deleteHeldContent(agentName, sessionId, nextExpected);
+      // DOD-M12B-INDEX-1: OUR OWN held message. It leafs at its canonical index and is transcribed
+      // as SENT — never routed down the received path, which would attribute our words to the
+      // counterparty in the sealed record and hand them back to our own agent as inbound.
+      if (entry.origin === "sent") {
+        // The KIND the leaf was placed with, not a hardcoded "msg" — a document leaf that had to
+        // wait for its position must come back as a document leaf, or the two sides disagree about
+        // what the chain contains.
+        this.appendSessionLeaf(agentName, sessionId, entry.kind ?? "msg", entry.contentHashHex, entry.correlationId);
+        // A DOCUMENT frame takes a leaf and NO transcript row — matching what the immediate-append
+        // path does for one. Writing one would put raw CBOR into the operator's transcript as
+        // something they said, which is the same attribution failure as releasing it inbound.
+        if (entry.kind === "doc") {
+          released++;
+          this.#logger.info("session.content.released", {
+            sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
+          });
+          if (held.size === 0) { this.#heldContent.delete(key); break; }
+          continue;
+        }
+        // OBSERVED, not assumed — the received path already does this. The leaf commits either way,
+        // so a dropped transcript write means the operator's OWN message is missing from their own
+        // transcript with the chain saying it is there, and nothing anywhere said so.
+        if (!this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId)) {
+          this.#logger.error("session.content.released.transcript.failed", {
+            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
+            impact: "this side's own message is committed to the chain but missing from its transcript",
+          });
+        }
+      } else if (entry.screenedOut) {
         this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
       } else {
         this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);
@@ -5556,11 +6485,11 @@ export class SessionNodeManager {
   // the fragile dependency on that internal timing (review L4).
   async #registerContentHandler(agentName: string, sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
     try {
-      await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
+      await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream, remotePeerId) => {
         // `.catch` is not decoration: the handler builds its length-prefixed decoder before its own
         // try, and a throw there would otherwise become an unhandled rejection that takes the
         // daemon down for one malformed inbound stream.
-        void this.#handleContentStream(agentName, sessionId, stream).catch((err: unknown) => {
+        void this.#handleContentStream(agentName, sessionId, stream, remotePeerId).catch((err: unknown) => {
           this.#logger.warn("session.content.stream.handler.failed", {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
@@ -5794,7 +6723,7 @@ export class SessionNodeManager {
     return null;
   }
 
-  async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
+  async #handleContentStream(agentName: string, sessionId: string, stream: Stream, remotePeerId?: string): Promise<void> {
     // CLOSING THIS STREAM IS WHAT KEEPS THE SESSION ALIVE PAST ITS 33RD MESSAGE.
     //
     // Every content frame and every delivery ACK opens a fresh /cello/content/1.0.0 stream on the
@@ -5831,6 +6760,41 @@ export class SessionNodeManager {
         if (ackHash instanceof Uint8Array && level === "persisted") {
           this.#resolveAwaitingAck(agentName, sessionId, ackHash);
         }
+        return;
+      }
+
+      // DOD-M12B-ABANDON-NOTIFY-1: the counterparty force-abandoned. Handled here, on the same
+      // authenticated stream the delivery acknowledgement rides, and AFTER the session-id check
+      // below cannot be skipped — the frame names its session and the handler is bound to one.
+      if (frame["type"] === "session_abandoned_notice") {
+        // PINNED TO THE COUNTERPARTY. This frame ENDS a conversation, so the stream being
+        // authenticated is not enough — a session node is a promoted standing receiver, and a
+        // standing receiver accepts everyone. libp2p's gater runs at connection establishment and
+        // does not close connections that already exist, so a peer that dialled this node earlier
+        // still holds a live connection after `setAllowedPeer` narrows it. Without this check that
+        // peer could hang up a session it is not party to.
+        //
+        // `remotePeerId` is the Noise-authenticated transport identity, which the handler was
+        // throwing away. Absent means we cannot prove who is speaking, and an unprovable claim to
+        // end a session is refused.
+        const expected = this.#activeNodes.get(this.#k(agentName, sessionId))?.counterpartySessionPeerId;
+        if (!remotePeerId || !expected || remotePeerId !== expected) {
+          this.#logger.warn("session.content.peer_mismatch", {
+            sessionId, frameType: "session_abandoned_notice",
+            remotePeerId: remotePeerId ?? "(absent)", expected: expected ?? "(unknown)",
+          });
+          return;
+        }
+        // REQUIRED and equal — absence is not a pass. The frame names its session and the handler
+        // is bound to one; treating a missing field as agreement is how a guard stops guarding.
+        const claimed = frame["session_id"];
+        if (typeof claimed !== "string" || claimed !== sessionId) {
+          this.#logger.warn("session.content.session_mismatch", {
+            sessionId, claimedSessionId: typeof claimed === "string" ? claimed : "(absent)",
+          });
+          return;
+        }
+        void this.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
         return;
       }
 
@@ -6606,6 +7570,61 @@ export class SessionNodeManager {
   }
 
   /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
+  /**
+   * DOD-M12B-STRAND-1 — move a terminal session's held frames to the annex.
+   *
+   * A held frame is content this agent RECEIVED and VERIFIED. When its session ends it can never
+   * join that chain (appending behind a committed root is not an option, and ingest refuses a
+   * terminal session outright), but it is still the operator's mail and no other copy exists —
+   * the sender was never acknowledged for it. `sealed_session_annex` is where M12-P17 already puts
+   * content that arrives for an ended session; this is the same content arriving slightly earlier.
+   *
+   * ANNEX FIRST, DELETE SECOND, per row. A crash between them costs a duplicate the annex's
+   * INSERT OR IGNORE absorbs; the other order costs the message. A row whose annex write fails is
+   * KEPT — the retention sweep will find it again, and a leftover row is cheaper than a lost one.
+   */
+  #annexHeldContentOnTerminal(agentName: string, sessionId: string, status: "sealed" | "abandoned"): void {
+    if (!this.#db) return;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; content_hash_hex: string; held_at: number; origin: string }>;
+    try {
+      rows = this.#db.prepare(
+        `SELECT canonical_seq, content_blob, content_hash_hex, held_at, origin
+           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
+      ).all(this.#requireAgentId(agentName), sessionId) as never;
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.annex.scan.failed", {
+        agentName, sessionId, status,
+        impact: "held frames for a terminal session were not moved to the annex and remain unreadable",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (rows.length === 0) return;
+    const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null;
+    let annexed = 0;
+    let kept = 0;
+    for (const row of rows) {
+      // DOD-M12B-INDEX-1: ATTRIBUTION. A `sent` row is our own message. Stamping the counterparty's
+      // pubkey on it would put our words in their mouth in the one record that survives the
+      // session — the same failure the release path was changed to avoid, on the drain it did not
+      // touch. `#ownPubkeyHex` is null only when the identity cannot be resolved, and a null sender
+      // reads as "unattributed", which is true, rather than as a false attribution.
+      const sender = row.origin === "sent" ? this.#ownPubkeyHex(agentName) : counterparty;
+      if (this.recordSealedAnnex(agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob), sender)) {
+        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        annexed++;
+      } else {
+        kept++;
+      }
+    }
+    this.#logger.warn("session.content.held.annexed", {
+      agentName, sessionId, status, annexed, kept,
+      // The consumer of `held_at`: how long the oldest frame waited before its session ended.
+      oldestHeldMs: Date.now() - Math.min(...rows.map((r) => r.held_at)),
+      impact: "these messages arrived and verified but never joined the chain — they are readable from the annex, not the transcript",
+    });
+  }
+
   #updateSessionStatus(
     agentName: string,
     sessionId: string,
@@ -6638,6 +7657,14 @@ export class SessionNodeManager {
       // is still, on disk, drainable. 'interrupted' and 'seal_interrupted_pending' are deliberately
       // NOT terminal — both can still complete, and reaping them would destroy live content.
       if (status === "sealed" || status === "abandoned") {
+        // DOD-M12B-STRAND-1: held frames outlive the chain that could have carried them.
+        //
+        // Once a session is terminal, `ingestReceivedContent` refuses it — and #releaseHeld is only
+        // reachable from ingest — so no code path that exists can ever release a held frame again.
+        // Left alone the rows sit on disk, unreachable by any surface, while the teardown alarm
+        // reports `lost: 0`: a success message for content that has just become permanently
+        // unreadable. The annex is the store built for exactly this shape.
+        this.#annexHeldContentOnTerminal(agentName, sessionId, status);
         try {
           this.#onSessionTerminal?.(sessionId, status);
         } catch (hookErr: unknown) {

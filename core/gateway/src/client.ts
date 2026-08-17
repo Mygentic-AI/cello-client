@@ -40,6 +40,10 @@ export interface LocalSidecarGatewayClientOptions {
   logger?: GatewayLogger;
 }
 
+/** DOD-M12B-SHUTDOWN-1: how long a socket close may block the daemon's teardown before we stop
+ *  waiting and destroy it. Generous for a local unix socket; the point is that it is finite. */
+const GATEWAY_CLOSE_DEADLINE_MS = 2_000;
+
 export class LocalSidecarGatewayClient implements SecurityGatewayClient {
   /**
    * `enforcing` — and it stays `enforcing` even when the socket is down, because a client whose
@@ -94,7 +98,21 @@ export class LocalSidecarGatewayClient implements SecurityGatewayClient {
     this.#closed = true;
     const sock = this.#socket;
     this.#socket = null;
-    if (sock) await new Promise<void>((resolve) => { sock.end(() => resolve()); });
+    // DOD-M12B-SHUTDOWN-1: BOUNDED. `sock.end(cb)` fires its callback only on a clean FIN
+    // round-trip — a half-open socket, a sidecar that stopped reading, or a peer that never
+    // answers leaves this awaiting forever. It sits inside the daemon's teardown, ahead of the
+    // sidecar's own SIGTERM, so a stall here is a daemon that acknowledged `cello logout` and
+    // then never exits: measured 2026-08-17 as still alive 30+ seconds later, needing a signal.
+    // Destroying the socket after the deadline costs nothing that matters — we are closing it.
+    if (sock) {
+      await new Promise<void>((resolve) => {
+        const done = (): void => { clearTimeout(timer); resolve(); };
+        const timer = setTimeout(() => { try { sock.destroy(); } catch { /* already gone */ } resolve(); }, GATEWAY_CLOSE_DEADLINE_MS);
+        timer.unref?.();
+        sock.once("error", done);
+        sock.end(done);
+      });
+    }
     // Any still-pending calls fail closed rather than hang on a closing client.
     for (const [, p] of this.#pending) {
       clearTimeout(p.timer);

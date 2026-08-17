@@ -339,8 +339,14 @@ class CelloNodeImpl implements CelloNode {
     );
 
     if (!openConn) {
+      // DOD-M12B-REDIAL-1: `no_connection` is DISTINCT from `connection_lost`, and the difference
+      // decides whether re-dialling can help. This is the one condition a dial fixes — there is no
+      // connection at all. `connection_lost` is `mapStreamError`'s catch-all default, so it also
+      // covers a stream that failed on a perfectly healthy connection (the per-protocol stream cap,
+      // DOD-M12B-ACK-1), where a dial fixes nothing and only shows the counterparty a connection
+      // request caused by a defect on this side.
       throw {
-        reason: "connection_lost",
+        reason: "no_connection",
         peerId: peerIdStr,
         message: `No open connection to peer ${peerIdStr}`,
       };

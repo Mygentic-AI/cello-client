@@ -307,9 +307,26 @@ export interface ProtocolNotSupportedError {
 
 /**
  * Thrown when the connection to the remote peer has been lost.
+ *
+ * DOD-M12B-REDIAL-1: this is `mapStreamError`'s CATCH-ALL, so it also covers a stream that failed
+ * on a perfectly healthy connection. Do not treat it as "there is no connection" — that is
+ * `no_connection` below, and the difference decides whether re-dialling can help.
  */
 export interface ConnectionLostError {
   reason: "connection_lost";
+  peerId: string;
+  message: string;
+}
+
+/**
+ * Thrown when there is NO open connection to the peer at all — the one condition a re-dial fixes.
+ *
+ * Kept distinct from `connection_lost` on purpose. Dialling in response to a stream-level failure
+ * on a live connection cannot fix it, and shows the counterparty a connection request caused by a
+ * defect on this side — which is the notification-storm shape DOD-M12B-REDIAL-1 exists to avoid.
+ */
+export interface NoConnectionError {
+  reason: "no_connection";
   peerId: string;
   message: string;
 }

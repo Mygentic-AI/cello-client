@@ -36,6 +36,7 @@ import type {
   AgentState,
   InterruptedSessionInfo,
   ActiveSessionInfo,
+  SealReadinessView,
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
@@ -1097,9 +1098,15 @@ async function startDaemonHoldingLock(
           // session is unsealable for good.
           if (sendResult.ok || sendResult.durable) {
             const rejectHashHex = Buffer.from(rejectHash).toString("hex");
-            const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", rejectHashHex, randomUUID());
-            sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", rejectBytes, randomUUID());
-            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex, queued: !sendResult.ok });
+            // DOD-M12B-INDEX-1: at the relay's position, not the tail. This is the riskiest append
+            // in the codebase for that — the seal is initiated a few lines below, so a leaf at the
+            // wrong index does not merely stall the far side, it seals a tree the counterparty can
+            // never agree with.
+            const placed = sessionNodeManager.placeOwnLeaf(agentName, sessionId, rejectHashHex, rejectBytes, sendResult.sequenceNumber, randomUUID());
+            if (placed.placed) {
+              sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placed.leafIndex, "sent", rejectBytes, randomUUID());
+            }
+            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: placed.placed ? placed.leafIndex : placed.heldAt, committed: placed.placed, queued: !sendResult.ok });
           } else {
             // Not queued anywhere — the rejection is gone. We still seal (we are closing regardless),
             // and the counterparty simply never learns why, so say that plainly rather than at warn.
@@ -1297,17 +1304,31 @@ async function startDaemonHoldingLock(
         //
         // The dedup guard deliberately STAYS SET: a queued reply is coming, and re-sending on the
         // next arrival would mint a second greeting at a second sequence.
-        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
-        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, queuedLeaf, "sent", contentBytes, randomUUID());
+        // DOD-M12B-INDEX-1: the queued reply owns the position the relay witnessed for it, and
+        // that is where its leaf goes.
+        const placedQueued = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+        if (placedQueued.placed) {
+          sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedQueued.leafIndex, "sent", contentBytes, randomUUID());
+        }
         logger.info("session.away.response.deferred", {
-          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf,
+          agentName, sessionId, kind, isKnown,
+          sequenceNumber: placedQueued.placed ? placedQueued.leafIndex : placedQueued.heldAt,
+          committed: placedQueued.placed,
           reason: sendResult.reason, cause: sendResult.cause,
         });
         return;
       }
-      const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
-      sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
-      logger.info("session.away.response.sent", { agentName, sessionId, kind, isKnown, sequenceNumber: leafIndex });
+      // DOD-M12B-INDEX-1: the away responder fires while inbound is still arriving, so it is the
+      // path most likely to have a gap open under it — exactly where a tail append does damage.
+      const placedReply = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+      if (placedReply.placed) {
+        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedReply.leafIndex, "sent", contentBytes, randomUUID());
+      }
+      logger.info("session.away.response.sent", {
+        agentName, sessionId, kind, isKnown,
+        sequenceNumber: placedReply.placed ? placedReply.leafIndex : placedReply.heldAt,
+        committed: placedReply.placed,
+      });
     } catch (err: unknown) {
       // Reviewer MEDIUM fix: same as above — an unexpected throw must not permanently lock out
       // future retries for the rest of this away period.
@@ -1938,6 +1959,29 @@ async function startDaemonHoldingLock(
   // unbounded and confuse. The list is also capped; the full, queryable history is `cello sessions`
   // / cello_list_sessions (with filter + limit flags).
   const STATUS_RESUMABLE_CAP = 10;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — ask the seal gate for ONE session, and never let the answer take the
+   * status response with it.
+   *
+   * This runs per session on every `cello status` and every `cello_status`, and it touches the
+   * database. An unguarded throw here rejects the whole response, after which the CLI finds the
+   * singleton lock still held and prints `daemon: "broken_shutdown"` — telling the operator their
+   * healthy daemon has failed to stop, over one session row it could not read. There is a
+   * documented precedent in this codebase for exactly that shape.
+   *
+   * A failure yields `unknown`, never `ready`: "we could not check" must not read as "safe to
+   * close", because a close on a short chain is terminal.
+   */
+  function probeSealReadiness(agentName: string, sessionId: string): SealReadinessView {
+    try {
+      return sessionNodeManager.sealReadinessView(agentName, sessionId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("session.seal.readiness.probe.failed", { agentName, sessionId, error: message });
+      return { state: "unknown", reason: `probe_failed: ${message}` };
+    }
+  }
+
   function buildInterruptedSessions(): InterruptedSessionInfo[] {
     return sessionNodeManager
       .getSessionsByStatus("interrupted")
@@ -1952,6 +1996,12 @@ async function startDaemonHoldingLock(
         // DOD-SESSION-NAME-1 (AC-A11): an interrupted session is one you may want to resume or seal
         // — the name is how you tell which one it was.
         sessionName: row.session_name ?? null,
+        // DOD-M12B-SEAL-STUCK-1: the same answer the active list carries, for the same reason —
+        // an interrupted session can seal, so it can also be blocked from sealing by a gap, and
+        // that is knowable here instead of only after a failed close. A plain property, never a
+        // spread: a spread bypasses excess-property checking, which is how `frontierMismatch`
+        // below came to typecheck while no renderer could read it.
+        sealReadiness: probeSealReadiness(row.agent_name, row.session_id),
         // DOD-FRONTIER-STRAND-1 AC3: if a seal exchange has already proved the two sides disagree on
         // how many messages this session holds, SAY SO HERE. Otherwise a stranded session is listed
         // exactly like a healthy paused one, and the only way to learn it can never seal is to
@@ -2011,13 +2061,19 @@ async function startDaemonHoldingLock(
   // was invisible to the operator.
   function buildActiveSessions(): ActiveSessionInfo[] {
     reapDeadHalfOpenSessions(); // CC-5/F21: drop provably-dead half-open sessions before surfacing active ones
-    return sessionNodeManager.getSessionsByStatus("active").map((row) => ({
-      sessionId: row.session_id,
-      agentName: row.agent_name,
-      counterpartyPubkey: row.counterparty_pubkey,
-      liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
-      sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
-    }));
+    return sessionNodeManager.getSessionsByStatus("active").map((row) => {
+      // DOD-M12B-SEAL-STUCK-1: ask the SAME gate the close path asks, so the surface and the
+      // refusal can never disagree. Computed here rather than cached because the answer changes
+      // the moment a gap fills, and a stale "stuck" is its own lie.
+      return {
+        sessionId: row.session_id,
+        agentName: row.agent_name,
+        counterpartyPubkey: row.counterparty_pubkey,
+        liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
+        sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
+        sealReadiness: probeSealReadiness(row.agent_name, row.session_id),
+      };
+    });
   }
 
   /**
@@ -3941,14 +3997,21 @@ async function startDaemonHoldingLock(
         // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
         // successful send. See the comment at the call site for why this is delivery-critical and
         // not audit bookkeeping.
-        appendLeaf: (agent, sessionId, contentHash, correlationId) => {
-          sessionNodeManager.appendSessionLeaf(
+        appendLeaf: (agent, sessionId, contentHash, frameBytes, correlationId, assignedSeq) => {
+          // DOD-M12B-INDEX-1: a document leaf takes a position in the CONVERSATION's sequence space
+          // (deliberate — f75ea09), so it obeys the same discipline a message does — including
+          // being HELD when the position is ahead of the tail, which is why the real frame bytes
+          // have to travel with it.
+          const placed = sessionNodeManager.placeOwnLeaf(
             agent,
             sessionId,
-            "doc",
             Buffer.from(contentHash).toString("hex"),
+            frameBytes,
+            assignedSeq,
             correlationId,
+            "doc",
           );
+          return { placed: placed.placed, leafIndex: placed.placed ? placed.leafIndex : null };
         },
     });
     documentTransports.set(agentName, transport);
@@ -4175,6 +4238,22 @@ async function startDaemonHoldingLock(
 
   async function stop(reason: string): Promise<void> {
     clearInterval(reconcileSweepTimer);
+    // DOD-M12B-SHUTDOWN-1: clearing the timer only stops the NEXT tick. The pass already running
+    // walks every agent, and each step dials a peer and opens a session — which is why a daemon
+    // reported down, with its socket already removed, was still logging `document.reconcile.sweep`
+    // 30 seconds later and had to be signalled to exit. This is what stops the pass in flight, and
+    // it also blocks `onReachable`, so a session tearing down during shutdown cannot hand the
+    // sweeper a fresh reason to dial on the way out.
+    // `?.` is a TYPE requirement, not a runtime one: TypeScript discards the narrowing of a
+    // captured `let` inside a hoisted function declaration, though it keeps it in the arrow a few
+    // lines up. The scheduler is in fact always wired by the time this can run — the IPC socket,
+    // the only route to `stop` besides the returned handle, opens after it.
+    reconcileScheduler?.stop();
+    // DOD-M12B-SHUTDOWN-1: the scheduler is one of FOUR callers of initiateReconcile. `nudgeSeats`
+    // and the two invite notices reach it directly, and every document verb is still served while
+    // the rest of this function runs — the IPC server is the last thing stopped. Refusing at the
+    // choke point is what actually closes "no new outbound work".
+    documentLayer?.stopReconciling();
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check

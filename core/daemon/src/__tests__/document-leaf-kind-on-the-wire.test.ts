@@ -51,7 +51,9 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     const deps = {
       agentName: "A",
       logger: silentLogger(),
-      appendLeaf: () => {},
+      // DOD-M12B-INDEX-1: the hook now reports whether the leaf actually made it into the chain —
+    // a held one has not, and `document.frame.sent` must not read the same for both.
+    appendLeaf: () => ({ placed: true, leafIndex: 0 }),
       lookupPeer: async () => ({ ok: true, online: true }) as never,
       sealSession: async () => {},
       activeSessionsWith: () => ["session-1"],

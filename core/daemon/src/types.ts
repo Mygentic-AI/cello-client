@@ -201,6 +201,38 @@ export interface DaemonStatusResponse {
   active_sessions: ActiveSessionInfo[];
 }
 
+
+/**
+ * DOD-M12B-SEAL-STUCK-1 — whether a session can be sealed, as an operator surface.
+ *
+ * THREE STATES, because there are three answers and collapsing them is how this milestone's
+ * defects keep happening.
+ *
+ * `blocked` carries the two numbers separately, and they are NOT interchangeable:
+ *   - `heldBehindGap` — messages this side RECEIVED and verified, waiting for an earlier position.
+ *     Durable since DOD-M12B-STRAND-1, so this half survives a restart.
+ *   - `awaitingArrival` — positions the relay witnessed for which nothing has arrived at all.
+ *     Memory-only, so this half does NOT survive a restart, which is why `unknown` exists.
+ *   - `oldestHeldMs` separates "stuck since this morning" from "in flight 40 ms ago". Without it a
+ *     healthy mid-conversation window — the relay witnesses a counterparty leaf a moment before the
+ *     content arrives — reads exactly like a permanently stranded session, and a warning on
+ *     everything is a warning on nothing.
+ *
+ * `unknown` is NOT a soft `ready`. It is returned when this process cannot answer: the witness
+ * state that would show a never-arrived position is memory-only, so for a session that carries
+ * leaves from before this daemon started, "no gap recorded" means "not recorded", not "no gap".
+ * Reporting `ready` there would invite a close, and a short chain gets `leaf_count_mismatch` back —
+ * which is terminal, and the notarized receipt is gone for good.
+ *
+ * A `blocked` answer can still clear on its own: the close path drains parked relay content and
+ * re-checks before it refuses, which this read does not do. So this surface answers "right now",
+ * and a close may succeed against a session shown here as blocked.
+ */
+export type SealReadinessView =
+  | { state: "ready" }
+  | { state: "blocked"; awaitingArrival: number; heldBehindGap: number; oldestHeldMs: number | null }
+  | { state: "unknown"; reason: string };
+
 /** One active session's status row (see DaemonStatusResponse.active_sessions). */
 export interface ActiveSessionInfo {
   sessionId: string;
@@ -213,6 +245,15 @@ export interface ActiveSessionInfo {
   liveness: "alive" | "impaired" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — whether this session can be sealed. See SealReadinessView.
+   *
+   * A chain with a gap cannot be co-signed, so the close refuses — correctly. But until this field
+   * existed the condition was only discoverable by ATTEMPTING a close on each session and reading
+   * the refusal, so 25 unsealable sessions accumulated on one daemon with every surface calling
+   * them ordinary active sessions, while each held a slot against the per-sender cap.
+   */
+  sealReadiness: SealReadinessView;
   /** DOD-FRONTIER-STRAND-1 AC3 — see SessionListEntry.frontierMismatch. Declared here because
    *  buildInterruptedSessions returns THIS type; it typechecked only because TS exempts spread
    *  properties from excess-property checking, so a renderer typed as this could not read it. */
@@ -499,6 +540,19 @@ export interface InterruptedSessionInfo {
   interruptedAt: string;
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — whether this session can be sealed. See SealReadinessView.
+   *
+   * An interrupted session can seal (that is what seal-interrupted is for), so it can also be
+   * BLOCKED from sealing by a gap. `frontierMismatch` beside this reports a different, later
+   * condition: the two sides have already exchanged and disagreed. This one is the gap on OUR side,
+   * knowable before any exchange, and it is the more common of the two.
+   *
+   * A PLAIN PROPERTY, not optional — matching the active list. The optional form was built with a
+   * spread, which bypasses excess-property checking, and that is exactly how `frontierMismatch`
+   * four lines down came to typecheck while no renderer could read it.
+   */
+  sealReadiness: SealReadinessView;
 }
 
 /**

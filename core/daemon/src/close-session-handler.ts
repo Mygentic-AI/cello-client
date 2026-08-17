@@ -14,6 +14,14 @@
  * that is the entire difference from a closure over 73 shared locals.
  */
 import { randomUUID } from "node:crypto";
+
+/**
+ * DOD-M12B-ABANDON-NOTIFY-1 — how long the courtesy notice may delay a force-abandon.
+ *
+ * Force-abandon is the operator's escape hatch out of a session that can never seal, and it must
+ * always return. Telling the counterparty is worth a moment; it is not worth the escape hatch.
+ */
+const ABANDON_NOTICE_DEADLINE_MS = 3_000;
 import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
@@ -408,11 +416,52 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // on both would put the same paragraph on the ninety routine force-abandons that cost nothing
       // and the one that cost a receipt, which buries the only occurrence that matters.
       const mayHaveSealed = record.status === "interrupted" || record.status === "seal_interrupted_pending";
+      // ONE id for the close and every line the notice emits, so they can be joined. Minting a
+      // fresh one inside the notice call meant its sent/failed/skipped lines belonged to no flow.
+      const correlationId = randomUUID();
+      // DOD-M12B-ABANDON-NOTIFY-1: TELL THEM FIRST, while the session node still exists — the
+      // abandon tears it down, and after that there is no stream to tell them on. Awaited so the
+      // answer can be honest about whether they were reached, but it can only ever return: it never
+      // throws and never blocks the abandon, which is the operator's escape hatch and must not
+      // depend on the counterparty being reachable.
+      //
+      // Without this the other side keeps its half live, keeps retrying delivery into it, and keeps
+      // trying to re-establish — which is what produced the 2026-08-17 storm, where the operator saw
+      // connection requests from agents nobody was driving.
+      // DELIBERATELY FAIL-OPEN, and this is the one place in the milestone where that is right:
+      // force-abandon is the operator's escape hatch out of a session that can never seal, and it
+      // must not become conditional on a courtesy. The notice already handles its own failures; this
+      // catches the unexpected — an absent method, a throw from the transport layer — so that no
+      // fault in telling the counterparty can prevent the operator from ending their own session.
+      let notice: { told: boolean; reason: string } = { told: false, reason: "not_attempted" };
+      try {
+        // A HARD DEADLINE, not just a catch. The catch covers a throw; it does not cover a hang,
+        // and `stream.close()` waits for the write buffer to drain with no timeout anywhere in the
+        // chain — so a half-dead connection could sit here indefinitely on the one call that must
+        // always return. Force-abandon is the escape hatch; it does not get to be slow either.
+        notice = await Promise.race([
+          sessionNodeManager.notifyCounterpartyAbandon(record.agent_name, sessionId, correlationId),
+          new Promise<{ told: boolean; reason: string }>((resolve) => {
+            const t = setTimeout(() => resolve({ told: false, reason: "notice_timeout" }), ABANDON_NOTICE_DEADLINE_MS);
+            t.unref?.();
+          }),
+        ]);
+      } catch (err: unknown) {
+        logger.warn("session.abandon.notice.threw", {
+          agentName: record.agent_name, sessionId, correlationId,
+          error: err instanceof Error ? err.message : String(err),
+          impact: "the counterparty was not told and may keep calling; the abandon itself proceeds",
+        });
+      }
+      const told = notice.told;
       await sessionNodeManager.abandonSession(record.agent_name, sessionId);
       logger.info("session.force_abandoned", {
         agentName: record.agent_name,
         sessionId,
         priorStatus: record.status,
+        counterpartyNotified: told,
+        counterpartyNoticeReason: notice.reason,
+        correlationId,
         // Makes the destructive case findable in a log instead of reconstructable by hand, which is
         // how the 2026-08-06 incident had to be traced.
         mayHaveForfeitedSeal: mayHaveSealed,
@@ -421,7 +470,14 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         ok: true,
         status: "abandoned",
         reason: "force_abandoned",
+        counterparty_notified: told,
+        counterparty_notice_reason: notice.reason,
         guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.` +
+          (told
+            ? ` The notice was sent — a counterparty running a current client will stop calling this session. There is no acknowledgement for it, so if connection attempts keep arriving they are on an older build that does not understand it.`
+            : notice.reason === "no_local_node"
+              ? ` They were NOT told: this side had already torn the session down, so there was nothing to send the notice on. Their half stays open and they may go on retrying delivery and re-dialling until they give up. If connection attempts keep arriving from them, that is why — it is not a network fault.`
+              : ` They were NOT told (${notice.reason}), so their half stays open: they may go on retrying delivery and re-dialling this session until they give up. If connection attempts keep arriving from them, that is why.`) +
           (mayHaveSealed
             ? ` This session had reached a seal attempt (prior status: ${record.status}), so if the counterparty did notarize it, this side's half is now PERMANENTLY forfeited and cannot be recovered from here. Their copy, if it exists, is the only remaining one — ask them for their sealed_root and record it with the operator.`
             : ""),
@@ -447,7 +503,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     const sealable = record.status === "active" || record.status === "interrupted";
     let readiness = sealable
       ? sessionNodeManager.sealReadiness(record.agent_name, sessionId)
-      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0 };
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0 };
     // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
     // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
     // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
@@ -472,17 +528,28 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         agentName: record.agent_name, sessionId,
         treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
         heldCount: readiness.heldCount, missingLeaves: readiness.missingLeaves,
+        heldOwn: readiness.heldOwn, heldReceived: readiness.heldReceived,
       });
+      // DOD-M12B-INDEX-1: SAY WHOSE MESSAGES ARE WAITING. Our own held sends block the seal exactly
+      // as received ones do, but calling them "received message(s) waiting behind a gap" tells the
+      // operator to wait for content that is already in hand — and the relay pull this gate performs
+      // first can never resolve it. They retry, get the identical refusal, and reach for force:true:
+      // the receipt-less exit this gate exists to prevent.
+      const waiting =
+        (readiness.heldReceived > 0 ? `, and ${readiness.heldReceived} received message(s) are waiting behind a gap` : "") +
+        (readiness.heldOwn > 0 ? `, and ${readiness.heldOwn} of YOUR OWN message(s) are waiting for their place in the record (they were delivered — the counterparty has them)` : "");
       return {
         ok: false,
         reason: "session_incomplete",
         missing_leaves: readiness.missingLeaves,
         held_messages: readiness.heldCount,
+        held_own: readiness.heldOwn,
+        held_received: readiness.heldReceived,
         guidance:
           `This side of the conversation is incomplete, so sealing now would produce a chain the counterparty cannot co-sign — and that refusal is terminal, leaving a force-abandon with no notarized receipt as the only way out. ` +
           `You hold ${readiness.treeSize} message(s); the relay has witnessed ${readiness.highWaterSeq + 1}` +
-          (readiness.heldCount > 0 ? `, and ${readiness.heldCount} received message(s) are waiting behind a gap` : "") +
-          `. The daemon just pulled from the relay and the gap is still there, so the content is not available yet — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
+          waiting +
+          `. Everything here is waiting on an earlier message from the counterparty that has not arrived; the daemon just pulled from the relay and the gap is still there, so wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
       };
     }
 

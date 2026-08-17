@@ -449,16 +449,31 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // A LOST message gets no leaf — that would commit a sequence no content will ever fill, and
       // the two roots could then never seal.
       if (sendResult.durable) {
-        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
-        sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
-        advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
-        logger.info("session.content.queued.committed", {
-          sessionId, sequenceNumber: queuedLeaf, contentHash: contentHashHex, correlationId,
+        // DOD-M12B-INDEX-1: at the position the relay assigned, not at whatever the tail is. When
+        // this side has a gap the two differ, and committing at the tail puts our leaf at someone
+        // else's index — which parts the two roots and makes the next seal terminal.
+        const placed = sessionNodeManager.placeOwnLeaf(
+          record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+        );
+        // `sequence_number` is a LEAF INDEX or nothing. Reporting the relay's number when no leaf
+        // exists hands the caller a value that matches no leaf on this side, and anything that
+        // feeds it to a cursor or a `--since-seq` read is then wrong.
+        const queuedLeaf = placed.placed ? placed.leafIndex : -1;
+        if (placed.placed) {
+          sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
+          advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
+        }
+        logger.info(placed.placed ? "session.content.queued.committed" : "session.content.queued.held", {
+          sessionId, sequenceNumber: queuedLeaf, heldAt: placed.placed ? undefined : placed.heldAt,
+          contentHash: contentHashHex, correlationId,
         });
         return {
           ok: false,
           reason: sendResult.reason,
           queued: true,
+          // Carried on BOTH paths: without it a caller cannot tell "queued and in the record" from
+          // "queued and not in the record yet".
+          ...(placed.placed ? {} : { held: true }),
           sequence_number: queuedLeaf,
           guidance: sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.",
         };
@@ -480,7 +495,49 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // part of the daemon-owned tree: the relay witness (R1) already assigned it a sequence before
     // direct delivery was even attempted, so a parked message occupies the SAME leaf position it
     // would have taken if delivered live. Append once, for both outcomes.
-    const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
+    // DOD-M12B-INDEX-1: the relay assigned this message a position before delivery was attempted,
+    // and the leaf goes THERE. Appending at the tail is only right while this side has no gap; the
+    // first gap puts our own leaf at a position that belongs to a message of theirs we have not
+    // seen, which parts the two roots permanently. When the position is ahead of the tail the leaf
+    // is held — the bytes are already on the wire, so only the record waits, exactly as it does for
+    // a message we receive out of order.
+    const placement = sessionNodeManager.placeOwnLeaf(
+      record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+    );
+    if (!placement.placed) {
+      // NOT IN THE RECORD YET, and the caller is told so rather than handed a plain success.
+      // `sequence_number` stays -1 because no leaf exists: `held_at` carries the relay's position
+      // separately, so nothing mistakes a relay number for a leaf index.
+      return {
+        ok: true,
+        sequence_number: -1,
+        held: true,
+        held_at: placement.heldAt,
+        // The screening verdict must survive this return, or an agent whose message was ALTERED is
+        // never told — the one thing a redact verdict exists to surface.
+        ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+        guidance: "The message was delivered — the counterparty has it. Its place in the record is waiting on an earlier message from them that has not arrived yet, so it is not in your transcript until that gap fills. Nothing to do, and do not resend: a resend takes a second position in the record.",
+      };
+    }
+    if (placement.diverged) {
+      // THE OPERATOR HEARS ABOUT IT. Their message is in their own transcript, but this side's tree
+      // is permanently ahead of the relay's counter, so the two can no longer agree on a root and
+      // this session will never produce a notarized receipt. Returning the ordinary success here —
+      // which is what the first build did — reports a healthy send on a conversation that has
+      // silently lost the one thing the protocol exists to produce.
+      logger.error("session.content.sent.diverged", {
+        sessionId, agentName: record.agent_name, sequenceNumber: placement.leafIndex, correlationId,
+        impact: "delivered and recorded locally, but this session can no longer be sealed bilaterally",
+      });
+      return {
+        ok: true,
+        sequence_number: placement.leafIndex,
+        diverged: true,
+        ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+        guidance: `The message was delivered and is in your transcript. But this session's record has drifted out of step with the relay's ordering, so it can no longer be sealed with the counterparty — there will be no notarized receipt for it. Keep talking if you want to; when you are finished, cello_close_session ${sessionId} { force: true } is the only way it can end. cello_transcript ${sessionId} is the record you keep.`,
+      };
+    }
+    const leafIndex = placement.leafIndex;
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
     // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
@@ -490,7 +547,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
-    void newRootHex;
     // CC-1 (2026-07-07): operator engagement promotes the counterparty to a known contact. A
     // committed reply — past the read-before-write gate, content now on the wire AND in the tree —
     // IS the operator choosing to trust this sender; the inbound-accept path deliberately no longer

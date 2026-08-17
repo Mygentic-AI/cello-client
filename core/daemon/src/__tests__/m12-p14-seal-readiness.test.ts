@@ -22,8 +22,14 @@ const AGENT = "alice";
 const SESSION = "cd".repeat(32);
 
 type Readiness = ReturnType<typeof readiness>;
-function readiness(over: Partial<{ ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number }> = {}) {
-  return { ready: true, treeSize: 2, highWaterSeq: 1, heldCount: 0, missingLeaves: 0, ...over };
+function readiness(
+  over: Partial<{ ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number; heldOwn: number; heldReceived: number }> = {},
+) {
+  const base = { ready: true, treeSize: 2, highWaterSeq: 1, heldCount: 0, missingLeaves: 0, heldOwn: 0, ...over };
+  // DOD-M12B-INDEX-1: `heldReceived` defaults to "all of them", which is what `heldCount` meant
+  // before the split — so a case that does not care about the sender keeps its old meaning instead
+  // of silently becoming zero and dropping the clause it asserts on.
+  return { ...base, heldReceived: over.heldReceived ?? base.heldCount - base.heldOwn };
 }
 
 function harness(sealReady: Readiness, status = "interrupted") {
@@ -35,6 +41,9 @@ function harness(sealReady: Readiness, status = "interrupted") {
   const sessionNodeManager = {
     getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status }),
     sealReadiness: () => sealReady,
+    // DOD-M12B-ABANDON-NOTIFY-1: force-abandon now tells the counterparty first. Modelled as
+    // "could not reach them", which is the case the guidance has to be honest about.
+    notifyCounterpartyAbandon: async () => ({ told: false, reason: "no_local_node" as const }),
     abandonSession: async () => { abandoned += 1; return true; },
     submitSealLeaf: async () => ({ ok: false as const, reason: "relay_unavailable" }),
     getSealCertificate: () => undefined,

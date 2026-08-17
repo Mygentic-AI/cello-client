@@ -377,14 +377,14 @@ describe("AC-007: Yamux stream isolation — closing one stream doesn't affect a
   }, 20_000);
 });
 
-// ─── AC-008: connection_lost when peer stops ─────────────────────────────
+// ─── AC-008: no_connection when peer stops ───────────────────────────────
 
-describe("AC-008: connection_lost after remote peer stops", () => {
+describe("AC-008: no_connection after remote peer stops", () => {
   let scope = createTestScope();
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
 
-  it("newStream after remote stops throws connection_lost or node_stopped, local node stays healthy", async () => {
+  it("newStream after remote stops throws no_connection or protocol_not_supported, local node stays healthy", async () => {
     const { node: nodeA } = await makeStartedNode();
     const { node: nodeB } = await makeStartedNode();
     scope.addCleanup(async () => { try { await nodeA.stop(); } catch {} });
@@ -402,7 +402,7 @@ describe("AC-008: connection_lost after remote peer stops", () => {
       { timeout: 3000 }
     ).catch(() => {
       // If waitFor times out the connection may still be tracked — the subsequent
-      // newStream call will fail with connection_lost regardless, which is what we test.
+      // newStream call fails either way, which is what we test.
     });
 
     let caughtError: unknown;
@@ -414,9 +414,14 @@ describe("AC-008: connection_lost after remote peer stops", () => {
 
     expect(caughtError).toBeDefined();
     const reason = (caughtError as { reason: string }).reason;
-    // Either connection_lost (connection removed) or protocol_not_supported (connection
-    // is still tracked but stream open fails). Both are valid outcomes.
-    expect(["connection_lost", "protocol_not_supported"]).toContain(reason);
+    // Either `no_connection` (the connection was removed) or `protocol_not_supported` (it is still
+    // tracked and the stream open fails). Both are valid outcomes of a peer that stopped.
+    //
+    // DOD-M12B-REDIAL-1 renamed the first: `no_connection` means there is no connection at all,
+    // which is the one condition a re-dial fixes. `connection_lost` remains the transport's
+    // catch-all for a stream that failed on a connection that is still there, and the send path
+    // must NOT dial for that — see the note on the type.
+    expect(["no_connection", "protocol_not_supported"]).toContain(reason);
 
     // A's own node remains healthy
     expect(nodeA.getPeerId().length).toBeGreaterThan(0);
