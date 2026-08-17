@@ -197,8 +197,14 @@ export async function pullSealCertificate(
     impact: "a seal this side never received the push for is now local and provable",
   });
 
-  // Marks the row sealed and tears the node down — the same terminal transition the push path makes,
-  // so a pulled seal and a pushed one leave the daemon in identical states.
+  // STATUS FIRST AND SYNCHRONOUS, teardown second — the same terminal transition the push path
+  // makes, so a pulled seal and a pushed one leave the daemon in identical states.
+  //
+  // The comment here used to credit `destroySessionNode` with marking the row. It does not when the
+  // session has no live node — it returns early at `if (!entry) return` and writes the status below
+  // that guard — and THIS path is precisely the no-node case: a daemon pulls a certificate exactly
+  // when it was down or disconnected while the seal happened.
+  sessionNodeManager.markSealed(agentName, sessionIdHex);
   void sessionNodeManager.destroySessionNode(agentName, sessionIdHex, "sealed");
 
   return { ok: true, rootHex };

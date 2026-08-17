@@ -238,7 +238,12 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           pendingSealWaiters.delete(sealKey(agentName, sidHex));
           waiter({ rootHex, legibility });
         }
-        // Mark the session sealed + tear the node down (idempotent — safe if already gone).
+        // STATUS FIRST AND SYNCHRONOUS, teardown second. The comment here used to read "mark the
+        // session sealed + tear the node down (idempotent — safe if already gone)" — it asserted the
+        // property the code lacked, which is why the gap survived. `destroySessionNode` returns
+        // early at `if (!entry) return` and writes the status BELOW that guard, so for a session
+        // with no live node the receipt landed and the row never moved.
+        sessionNodeManager.markSealed(agentName, sidHex);
         void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
       })();
     });
@@ -427,6 +432,11 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           // The seal is valid, but no receipt is retrievable — a directory that predates cascade-2.
           logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
         }
+        // STATUS FIRST — and on THIS path the node is gone by construction. A unilateral seal is
+        // what an interrupted session escalates to, and every producer of `interrupted` deletes the
+        // `#activeNodes` entry, so `destroySessionNode` alone would return before the status write
+        // every single time.
+        sessionNodeManager.markSealed(agentName, sidHex);
         void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
         waiter({ ok: true, sealedRootHex: rootHex, legibility });
       })();
@@ -551,6 +561,8 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });
       }
     }
+    // STATUS FIRST — same reason as the two sites above.
+    sessionNodeManager.markSealed(agentName, sidHex);
     void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
   }
 

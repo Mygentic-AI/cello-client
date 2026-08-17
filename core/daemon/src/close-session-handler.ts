@@ -321,6 +321,14 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     sessionId: string,
     escalation: { reportedRootHex: string; sequenceNumber: number },
     correlationId: string,
+    /**
+     * Refuse locally when the carry cannot possibly verify, instead of spending 30 s to be told
+     * nothing. ON for the INTERRUPTED path only, and deliberately so: that path is new, and it is
+     * the one the restart-seal resolver drives automatically for every orphan. The ACTIVE path's
+     * behaviour is left exactly as it was — it has shipped and been exercised for milestones, and
+     * a pre-flight refusal there could turn a seal that works today into one that does not.
+     */
+    opts: { refuseOnUnusableCarry: boolean } = { refuseOnUnusableCarry: false },
   ): Promise<
     | { ok: true; sealed_root: string; seal_type: "unilateral"; legibility?: unknown }
     | { ok: false; reason: string; retry_after_seconds?: number; guidance: string }
@@ -344,6 +352,39 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       relay_timestamp: l.relayTimestamp,
       relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
     }));
+    // REFUSE LOCALLY FOR A LOCALLY-KNOWABLE FAILURE, rather than spending 30 s to be told nothing.
+    //
+    // Every directory-side refusal — `unilateral_leaves_unavailable`, `unilateral_chain_noncontiguous`,
+    // `unilateral_own_leaf_unwitnessed`, `unilateral_receipt_invalid`, `unilateral_root_unverifiable`,
+    // `unilateral_seal_leaf_invalid`, and the already-sealed dedup — is a bare `return` that sends
+    // no frame. All seven reach the caller as `seal_unilateral_timeout`, which names our own wait:
+    // the one thing that was working. That is this milestone's founding error-fidelity defect,
+    // reproduced, and the restart-seal resolver now hits it automatically for every orphan.
+    //
+    // Two of the causes are checkable here, from the carry we are about to send, and they are the
+    // dominant ones. The directory still re-checks everything — this refuses earlier and by name,
+    // it does not become the authority.
+    if (opts.refuseOnUnusableCarry && seal_leaves.length === 0) {
+      pendingUnilateralWaiters.delete(sessionId);
+      return {
+        ok: false,
+        reason: "seal_carry_empty",
+        guidance:
+          "This side holds no relay-witnessed leaves for the session, so there is nothing the directory could rebuild the record from. That usually means the relay dropped the session (it releases one 24 hours after the last message) before it was closed. cello_transcript still shows what was said; a notarized receipt is no longer obtainable.",
+      };
+    }
+    const sequences = seal_leaves.map((l) => l.sequence_number).sort((a, b) => a - b);
+    const contiguousFromOne = sequences.every((n, i) => n === i + 1);
+    if (opts.refuseOnUnusableCarry && !contiguousFromOne) {
+      pendingUnilateralWaiters.delete(sessionId);
+      return {
+        ok: false,
+        reason: "seal_carry_noncontiguous",
+        guidance:
+          `The record this side holds has a gap: the relay assigned sequences ${sequences.join(", ")}, and a unilateral seal requires an unbroken chain from 1. A message the relay witnessed never reached this daemon. Try again once it arrives (cello_receive drains what the relay still holds); if it never does, only a force-abandon can end the session, and that produces no receipt.`,
+      };
+    }
+
     const sent = await sendOver(record.agent_name, {
       type: "seal_unilateral",
       session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
@@ -769,7 +810,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             : null;
         if (!escalation) return result;
 
-        const uni = await escalateToUnilateralSeal(record, sessionId, escalation, correlationId);
+        const uni = await escalateToUnilateralSeal(record, sessionId, escalation, correlationId, {
+          refuseOnUnusableCarry: true,
+        });
         if (uni.ok) return uni; // A REAL RECEIPT — the whole point of this line.
 
         // BEST-EFFORT, and the commitment STANDS. Turning a successful commitment into a reported

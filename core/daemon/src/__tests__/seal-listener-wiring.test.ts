@@ -63,6 +63,7 @@ function harness() {
     getSessionTree: vi.fn(() => ({ size: () => 0 })),
     getSealCertificate: vi.fn(() => null),
     recordSealCertificateEnsuringRow: vi.fn(),
+    markSealed: vi.fn(() => true),
     destroySessionNode: vi.fn(),
   };
 

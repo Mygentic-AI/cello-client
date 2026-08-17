@@ -57,8 +57,12 @@ export interface RestartSealResolverDeps {
   /**
    * Record DURABLY that this session was given up on, so the next boot does not start over.
    * Without it a machine restarting ~6 times a day re-attempts a hopeless session forever.
+   *
+   * REQUIRED, not optional. There is exactly one composition root, so optionality buys nothing and
+   * costs the compiler's ability to catch a wiring that was never done — and the whole
+   * justification for the two new columns is that this call happens.
    */
-  markGaveUp?: (agentName: string, sessionId: string, reason: string) => void;
+  markGaveUp: (agentName: string, sessionId: string, reason: string) => void;
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => ScheduledTask;
   /** Gap between two seal attempts. */
@@ -96,9 +100,17 @@ export interface RestartSealResolverDeps {
  */
 const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([
   "session_abandoned",
-  "leaf_count_mismatch",
   "seal_interrupted_rejected_by_counterparty",
   "session_already_sealed",
+  // OUR OWN verification finding a genuine divergence between the two trees. Distinct from the
+  // counterparty's `leaf_count_mismatch`, which never reaches here as a top-level reason — it
+  // arrives as `detail.rejection_reason` under the rejection above. Naming the bare string here
+  // was inert: the close cannot produce it.
+  "seal_interrupted_leaf_count_mismatch",
+  "session_not_found",
+  // The relay released the session (it drops one 24 h after the last message), so there is nothing
+  // left for any directory to rebuild the record from. No amount of retrying brings it back.
+  "seal_carry_empty",
   // Not protocol outcomes — a wiring or caller fault. Retrying re-runs the same bug.
   "session_not_closeable",
   "close_handler_missing",
@@ -200,8 +212,12 @@ export class RestartSealResolver {
     // AWAIT what is already in flight. Severing signaling under a half-finished seal-interrupted
     // exchange leaves the counterparty holding a commitment we never acknowledged: their session
     // advances to `seal_interrupted_pending` and ours stays `interrupted`, permanently divergent
-    // and produced automatically on every shutdown. The attempt is already bounded by
-    // `attemptTimeoutMs`, so this cannot hold a shutdown open indefinitely.
+    // and produced automatically on every shutdown.
+    //
+    // WHAT IS AWAITED IS THE BOUNDED RACE, NOT THE CLOSE. Returning the raw `sealSession` promise
+    // would hang shutdown forever on a close that never settles — and shutdown holds the SQLCipher
+    // write lock, so "forever" means a daemon that cannot be restarted. `attemptTimeoutMs` bounds
+    // this wait because the raced promise is what is stored.
     return this.#inFlight ? this.#inFlight.then(() => undefined, () => undefined) : Promise.resolve();
   }
 
@@ -248,7 +264,6 @@ export class RestartSealResolver {
     let attemptTimer: ScheduledTask | null = null;
     try {
       const attempt = this.#deps.sealSession(item.orphan.agentName, item.orphan.sessionId);
-      this.#inFlight = attempt;
       // A close that never settles must not wedge the queue silently.
       const timeout = new Promise<SealOutcome>((resolve) => {
         attemptTimer = this.#schedule(
@@ -256,7 +271,14 @@ export class RestartSealResolver {
           this.#attemptTimeoutMs,
         );
       });
-      outcome = await Promise.race([attempt, timeout]);
+      // The RACE is what stop() awaits — see stop(). Storing the raw attempt here would make a
+      // hung close a hung shutdown; storing the race makes the wait bounded by attemptTimeoutMs.
+      const raced = Promise.race([attempt, timeout]);
+      this.#inFlight = raced;
+      // A rejected `attempt` still settles the race, and #inFlight is only ever awaited with both
+      // handlers attached (stop()), so this cannot surface as an unhandled rejection.
+      attempt.catch(() => { /* handled below via the race */ });
+      outcome = await raced;
     } catch (err: unknown) {
       outcome = { ok: false, reason: err instanceof Error ? err.message : String(err) };
     } finally {
@@ -287,7 +309,7 @@ export class RestartSealResolver {
       // DURABLE, so the next boot does not start the same five attempts over. A machine restarting
       // ~6 times a day would otherwise re-try a hopeless session forever, which is the burst the
       // stagger exists to prevent, merely spread out.
-      try { this.#deps.markGaveUp?.(item.orphan.agentName, item.orphan.sessionId, outcome.reason); }
+      try { this.#deps.markGaveUp(item.orphan.agentName, item.orphan.sessionId, outcome.reason); }
       catch (err: unknown) {
         this.#deps.logger.warn("session.restart_seal.mark_gave_up.failed", {
           sessionId: item.orphan.sessionId,

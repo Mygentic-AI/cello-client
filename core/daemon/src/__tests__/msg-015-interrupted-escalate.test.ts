@@ -33,6 +33,19 @@ import type { Logger } from "../types.js";
 const AGENT = "alice";
 const SESSION = "7a".repeat(32);
 const ROOT = "ab".repeat(32);
+/** A real relay-witnessed carry: sequences 1..3, contiguous, every leaf relay-receipted. The
+ *  escalation refuses locally on an empty or gappy carry, so a stub of `[]` would prove nothing
+ *  except that the refusal fires. */
+const CARRY = [1, 2, 3].map((n) => ({
+  sequenceNumber: n,
+  leafKind: n === 3 ? 0x02 : 0x00,
+  senderPubkeyHex: "11".repeat(32),
+  structure2Cbor: new Uint8Array([n]),
+  structure1Cbor: new Uint8Array([n, n]),
+  relayId: "relay-1",
+  relayTimestamp: 1_700_000_000_000 + n,
+  relaySignatureHex: "cc".repeat(64),
+}));
 const SEALED_ROOT = "cd".repeat(32);
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
@@ -42,6 +55,8 @@ function harness(opts: {
   flow: { ok: true; sessionId: string; status: string } | { ok: false; reason: string; guidance: string };
   /** What the directory answers the `seal_unilateral` request with. Absent → never answers. */
   directory?: { ok: true; sealedRootHex: string } | { ok: false; reason: string; remainingSeconds?: number };
+  /** Override the relay-witnessed carry (empty / gappy cases). */
+  carry?: typeof CARRY;
 }) {
   const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
   const sentFrames: Array<Record<string, unknown>> = [];
@@ -63,7 +78,7 @@ function harness(opts: {
     sessionNodeManager: {
       getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "interrupted" }),
       submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 4, reportedRootHex: ROOT }),
-      getSealCarry: () => [],
+      getSealCarry: () => (opts.carry ?? CARRY),
       getSealCertificate: () => null,
       resolveAgentId: () => "aid",
       setSessionName: () => {},
@@ -114,6 +129,54 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: an interrupted close can earn a recei
     expect(res.sealed_root, "a receipt, not a mutually signed record nobody notarized").toBe(SEALED_ROOT);
     expect(res.seal_type).toBe("unilateral");
     expect(res.status, "it must no longer answer with the stuck status").not.toBe("seal_interrupted_pending");
+
+    // WHAT THE FRAME CARRIES, not merely that one was sent. Asserting only `type` let a version of
+    // this test pass with an all-zero root, sequence 0 and an empty leaf chain — a request the
+    // directory refuses on three separate grounds. The root and sequence must be the ones
+    // `submitSealLeaf` computed, and the carry must be forwarded verbatim, because the directory
+    // rebuilds and re-verifies the tree from exactly these bytes.
+    const frame = h.unilateralFrames()[0]!;
+    expect(Buffer.from(frame["reported_root"] as Uint8Array).toString("hex")).toBe(ROOT);
+    expect(frame["reported_seq"]).toBe(4);
+    const leaves = frame["seal_leaves"] as Array<Record<string, unknown>>;
+    expect(leaves.map((l) => l["sequence_number"])).toEqual([1, 2, 3]);
+    expect(leaves.map((l) => l["leaf_kind"])).toEqual([0x00, 0x00, 0x02]);
+    expect(leaves[0]!["relay_id"], "the relay receipt is the seq-pinning teeth — it must survive the hop").toBe("relay-1");
+    expect(Buffer.from(leaves[0]!["relay_signature"] as Uint8Array).toString("hex")).toBe("cc".repeat(64));
+  });
+
+  it("refuses LOCALLY, by name, when this side holds no relay-witnessed leaves", async () => {
+    // The directory refuses an empty carry with a bare `return` and no frame, so the caller waits
+    // 30 s and reports `seal_unilateral_timeout` — the name of our own wait, which is the one thing
+    // that was working. Six other directory refusals collapse into that same label. This is the
+    // dominant cause and it is knowable here.
+    const h = harness({
+      flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      carry: [],
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { seal_pending_reason?: string };
+
+    expect(h.unilateralFrames().length, "nothing should be sent when we already know it will be refused").toBe(0);
+    expect(res.seal_pending_reason, "the reason must name the cause, not our timeout").toBe("seal_carry_empty");
+  });
+
+  it("refuses LOCALLY, by name, when the chain this side holds has a gap", async () => {
+    // A unilateral seal requires an unbroken 1..N. A message the relay witnessed but never
+    // delivered to us leaves a hole, and the directory's contiguity check is what catches a short
+    // chain when the absent counterparty cannot object. Saying so here saves 30 s and names it.
+    const h = harness({
+      flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      carry: CARRY.filter((l) => l.sequenceNumber !== 2),
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { seal_pending_reason?: string; guidance?: string };
+
+    expect(h.unilateralFrames().length).toBe(0);
+    expect(res.seal_pending_reason).toBe("seal_carry_noncontiguous");
+    expect(String(res.guidance), "and it must say WHICH sequences it has").toMatch(/1, 3/);
   });
 
   it("carries the directory's countdown as a NUMBER when the grace has not elapsed", async () => {

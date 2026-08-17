@@ -3737,6 +3737,29 @@ export class SessionNodeManager {
    * persisted); in that case we no-op rather than throw — the cert still flows through the
    * live return path. The legibility content is identical regardless of delivery timing.
    */
+  /**
+   * DOD-M12B-INTERRUPTED-ESCALATE-1 — flip a session to `sealed`, synchronously, without needing a
+   * live node.
+   *
+   * **`destroySessionNode(…, "sealed")` cannot be relied on to do this.** It returns early at
+   * `if (!entry) return`, and the status write lives 26 lines BELOW that guard — so it flips the
+   * status only for a session that still has an `#activeNodes` entry. An interrupted session has
+   * none by construction: every producer of that status deletes the entry. Before this method, a
+   * unilateral seal on an interrupted session stored the notarized root and the certificate and
+   * left the row saying `interrupted` — the receipt landed and nothing that represents it moved.
+   * `cello_sessions` still showed it stuck, `cello_close_session` still refused it by name, and the
+   * restart-seal resolver re-selected it on the next boot to run the whole ceremony again against a
+   * session that already held a receipt.
+   *
+   * STATUS FIRST AND SYNCHRONOUS, teardown second — the order `abandonSession` uses and the one
+   * `retireSession` documents. The flip is the load-bearing half; the teardown makes memory agree
+   * with it. `#updateSessionStatus` also runs the terminal disposition hooks (held content is
+   * annexed, not stranded), which the early return skipped entirely.
+   */
+  markSealed(agentName: string, sessionId: string): boolean {
+    return this.#updateSessionStatus(agentName, sessionId, "sealed");
+  }
+
   recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void {
     if (!this.#db) return;
     this.#db
@@ -4739,6 +4762,27 @@ export class SessionNodeManager {
     // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
     // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
     // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
+    // DOD-M12B-INTERRUPTED-ESCALATE-1 — THE MARK MUST SURVIVE A RESTART, or one automatic retry
+    // permanently forfeits the receipt.
+    //
+    // `#responderSealSubmitted` is in memory. A session whose close was in flight when the daemon
+    // stopped already has our SEAL ctrl leaf in the relay log — and on the next boot the mark is
+    // empty, so the restart-seal resolver's automatic close would submit a SECOND one. The
+    // directory requires exactly one ctrl leaf (`ctrlLeaves.length !== 1 → unilateral_seal_leaf_invalid`)
+    // and the carry is durable, so every future attempt would carry both and be refused forever.
+    //
+    // The durable evidence already exists and was simply not consulted: our own ctrl leaf is in
+    // `session_seal_leaves`. Recover the escalation values from it instead of submitting again.
+    if (!this.#responderSealSubmitted.has(sealKey)) {
+      const durable = this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
+      if (durable) {
+        this.#logger.info("session.seal.leaf.already_submitted.recovered", {
+          sessionId, agentName, sequenceNumber: durable.sequenceNumber,
+          impact: "our SEAL ctrl leaf is already in the relay log from a previous run; submitting a second would make this session unsealable forever",
+        });
+        this.#responderSealSubmitted.set(sealKey, durable);
+      }
+    }
     if (this.#responderSealSubmitted.has(sealKey)) {
       // M8B FINDING-1: carry the FIRST submit's reported root/sequence so a retry close can
       // still escalate to a unilateral seal. A null value means that submit is still in
@@ -5608,6 +5652,45 @@ export class SessionNodeManager {
   /** DOD-M12B-INDEX-1 — this agent's own K_local pubkey, for attributing its own held content.
    *  Null when it cannot be resolved: an UNATTRIBUTED annex row is true, a falsely attributed one
    *  is not, and this is the record that outlives the session. */
+  /**
+   * DOD-M12B-INTERRUPTED-ESCALATE-1 — our own SEAL ctrl leaf, if a previous run already posted one.
+   *
+   * Returns the two values a unilateral escalation runs on, rebuilt from durable state:
+   * the ctrl leaf's relay-assigned sequence, and the root the tree WOULD have with that leaf
+   * appended. The content hash cannot be recomputed — the seal payload embeds a `close_timestamp`
+   * — so it is read out of the signed Structure 1 the store already holds.
+   *
+   * Null when there is no own ctrl leaf, which is the ordinary first-close case.
+   */
+  #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | null {
+    const ownPubkey = this.#ownPubkeyHex(agentName);
+    if (!ownPubkey) return null;
+    let own: SealCarryLeaf | undefined;
+    try {
+      own = this.getSealCarry(ownPubkey, sessionId)
+        .find((l) => l.leafKind === LEAF_KIND_CTRL && l.senderPubkeyHex === ownPubkey);
+    } catch { return null; }
+    if (!own) return null;
+    try {
+      // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
+      const fields = decode(own.structure1Cbor) as unknown[];
+      const contentHash = fields[1];
+      if (!(contentHash instanceof Uint8Array)) return null;
+      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      return {
+        reportedRootHex: this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex),
+        sequenceNumber: own.sequenceNumber,
+      };
+    } catch (err: unknown) {
+      this.#logger.warn("session.seal.leaf.recover.failed", {
+        sessionId, agentName,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "cannot tell whether a SEAL ctrl leaf was already posted; the close will refuse rather than risk a second one",
+      });
+      return null;
+    }
+  }
+
   #ownPubkeyHex(agentName: string): string | null {
     if (!this.#db) return null;
     try {

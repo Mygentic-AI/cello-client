@@ -88,8 +88,10 @@ function makeResolver(opts: {
   const { logger, events } = makeLogger();
   const clock = makeClock();
   const attempts: string[] = [];
+  const gaveUp: Array<{ agentName: string; sessionId: string; reason: string }> = [];
   const resolver = new RestartSealResolver({
     logger,
+    markGaveUp: (agentName, sessionId, reason) => { gaveUp.push({ agentName, sessionId, reason }); },
     listRestartOrphans: () => opts.orphans,
     sealSession: async (agentName, sessionId) => {
       attempts.push(`${agentName}:${sessionId}`);
@@ -103,7 +105,7 @@ function makeResolver(opts: {
     ...(opts.maxAttemptsPerSession !== undefined ? { maxAttemptsPerSession: opts.maxAttemptsPerSession } : {}),
     ...(opts.attemptTimeoutMs !== undefined ? { attemptTimeoutMs: opts.attemptTimeoutMs } : {}),
   });
-  return { resolver, clock, attempts, events, named: (e: string) => events.filter((x) => x.event === e) };
+  return { resolver, clock, attempts, events, gaveUp, named: (e: string) => events.filter((x) => x.event === e) };
 }
 
 const OK: SealOutcome = { ok: true };
@@ -165,6 +167,12 @@ describe("DOD-M12B-RESTART-SEAL-1: a restart-orphaned session seals itself", () 
     const gave = h.named("session.restart_seal.gave_up");
     expect(gave.length, "giving up silently is the same as never trying").toBe(1);
     expect(gave[0]!.ctx["attempts"]).toBe(3);
+    // DURABLE, or the next boot starts the same three attempts over. A machine restarting ~6 times
+    // a day would re-run a hopeless session's whole budget forever, which is the burst the stagger
+    // exists to prevent, merely spread out.
+    expect(h.gaveUp, "the give-up must be recorded durably, not only logged").toEqual([
+      { agentName: "alice", sessionId: "aa", reason: "seal_unilateral_send_failed" },
+    ]);
     expect(String(gave[0]!.ctx["guidance"]), "and it must say what the operator can still do").toMatch(/force/i);
     expect(h.clock.pendingCount(), "nothing may still be scheduled after giving up").toBe(0);
   });
@@ -183,6 +191,7 @@ describe("DOD-M12B-RESTART-SEAL-1: a restart-orphaned session seals itself", () 
     expect(h.attempts.length, "one attempt — a no is a no").toBe(1);
     const gave = h.named("session.restart_seal.gave_up");
     expect(gave[0]!.ctx["stoppedBecause"], "and it must say WHY it stopped, not just that it did").toBe("refusal_is_terminal");
+    expect(h.gaveUp.map((g) => g.reason), "a terminal refusal is recorded durably too").toEqual(["seal_interrupted_rejected_by_counterparty"]);
   });
 
   it("a refusal that MIGHT clear is still retried — the terminal list must not swallow the recoverable", async () => {
@@ -277,6 +286,7 @@ describe("DOD-M12B-RESTART-SEAL-1: a restart-orphaned session seals itself", () 
     const attempts: number[] = [];
     const resolver = new RestartSealResolver({
       logger,
+      markGaveUp: () => {},
       listRestartOrphans: () => [ORPHAN("aa"), ORPHAN("bb")],
       sealSession: async () => { attempts.push(clock.now()); return { ok: false, reason: "seal_unilateral_timeout" }; },
       now: clock.now,
