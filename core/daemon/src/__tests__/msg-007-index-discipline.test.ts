@@ -126,21 +126,29 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     expect(snm.getSessionTree(AGENT, SID).size()).toBe(1);
   }, 60_000);
 
-  it("a position BEHIND the tree is refused loudly, never written over a committed leaf", async () => {
+  it("a position BEHIND the tree keeps the message and names the divergence, never overwrites a leaf", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg007e-" });
     const { snm } = fx;
     await fx.createSession(SID, AGENT);
     fx.seedReceived(AGENT, SID, "already committed at 0");
     fx.seedReceived(AGENT, SID, "already committed at 1");
 
-    // The relay handing back a position this tree has already passed is not something that should
-    // happen for a message we just submitted. Appending anyway would commit our leaf at the wrong
-    // index; overwriting would rewrite a leaf a root has already been computed over. Neither.
-    const ours = new TextEncoder().encode("impossible position");
+    // This side is AHEAD of the relay's counter — which happens by design, because a message whose
+    // relay submit failed still appends unwitnessed. From then on every ack comes back behind our
+    // frontier and the two roots can never agree again; the seal was lost at that unwitnessed
+    // append, not here. So the choice is between a transcript missing every later message and one
+    // that is complete but skewed, and the operator's own words are worth more than a tidiness the
+    // roots cannot recover. What is never done is writing OVER the assigned slot.
+    const ours = new TextEncoder().encode("after the skew");
     const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 0, "corr-send");
-    expect(placed.placed).toBe(false);
-    expect(snm.getSessionTree(AGENT, SID).size(), "a committed leaf must not be disturbed").toBe(2);
+    expect(placed.placed, "the message must stay in this side's own record").toBe(true);
+    expect(placed.placed && placed.diverged, "and it must be reported as diverged, not as an ordinary success").toBe(true);
+    expect(placed.placed && placed.leafIndex, "appended at the tail — never over the committed leaf at 0").toBe(2);
+    expect(snm.getSessionTree(AGENT, SID).leaves()[0]!.hashHex, "leaf 0 must be untouched")
+      .not.toBe(hx(msgLeafHash(ours)));
+
     const complaint = fx.eventsNamed("session.tree.position_behind_frontier");
-    expect(complaint.length, "an impossible position must be named, not absorbed").toBe(1);
+    expect(complaint.length, "a divergence must be named, not absorbed").toBe(1);
+    expect(complaint[0]!.level, "the two sides can no longer agree on a root — that is an error").toBe("error");
   }, 60_000);
 });

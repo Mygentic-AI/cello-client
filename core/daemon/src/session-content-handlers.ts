@@ -455,18 +455,25 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         const placed = sessionNodeManager.placeOwnLeaf(
           record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
         );
-        const queuedLeaf = placed.placed ? placed.leafIndex : (sendResult.sequenceNumber ?? -1);
+        // `sequence_number` is a LEAF INDEX or nothing. Reporting the relay's number when no leaf
+        // exists hands the caller a value that matches no leaf on this side, and anything that
+        // feeds it to a cursor or a `--since-seq` read is then wrong.
+        const queuedLeaf = placed.placed ? placed.leafIndex : -1;
         if (placed.placed) {
           sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
           advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
         }
-        logger.info("session.content.queued.committed", {
-          sessionId, sequenceNumber: queuedLeaf, committed: placed.placed, contentHash: contentHashHex, correlationId,
+        logger.info(placed.placed ? "session.content.queued.committed" : "session.content.queued.held", {
+          sessionId, sequenceNumber: queuedLeaf, heldAt: placed.placed ? undefined : placed.heldAt,
+          contentHash: contentHashHex, correlationId,
         });
         return {
           ok: false,
           reason: sendResult.reason,
           queued: true,
+          // Carried on BOTH paths: without it a caller cannot tell "queued and in the record" from
+          // "queued and not in the record yet".
+          ...(placed.placed ? {} : { held: true }),
           sequence_number: queuedLeaf,
           guidance: sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.",
         };
@@ -498,17 +505,21 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
     );
     if (!placement.placed) {
+      // NOT IN THE RECORD YET, and the caller is told so rather than handed a plain success.
+      // `sequence_number` stays -1 because no leaf exists: `held_at` carries the relay's position
+      // separately, so nothing mistakes a relay number for a leaf index.
       return {
         ok: true,
-        sequence_number: placement.heldAt ?? -1,
+        sequence_number: -1,
         held: true,
-        guidance: placement.heldAt === null
-          ? "The message was delivered, but the relay gave it a position this side has already passed, so it could not be recorded. Do not resend — check the daemon log for session.tree.position_behind_frontier."
-          : "The message was delivered. Its place in the record is waiting on an earlier message that has not arrived yet, so it is not in the transcript until that gap fills. Nothing to do — do not resend.",
+        held_at: placement.heldAt,
+        // The screening verdict must survive this return, or an agent whose message was ALTERED is
+        // never told — the one thing a redact verdict exists to surface.
+        ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+        guidance: "The message was delivered — the counterparty has it. Its place in the record is waiting on an earlier message from them that has not arrived yet, so it is not in your transcript until that gap fills. Nothing to do, and do not resend: a resend takes a second position in the record.",
       };
     }
     const leafIndex = placement.leafIndex;
-    const newRootHex = sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId);
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
     // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
@@ -518,7 +529,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
-    void newRootHex;
     // CC-1 (2026-07-07): operator engagement promotes the counterparty to a known contact. A
     // committed reply — past the read-before-write gate, content now on the wire AND in the tree —
     // IS the operator choosing to trust this sender; the inbound-accept path deliberately no longer

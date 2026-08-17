@@ -447,7 +447,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     const sealable = record.status === "active" || record.status === "interrupted";
     let readiness = sealable
       ? sessionNodeManager.sealReadiness(record.agent_name, sessionId)
-      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0 };
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0 };
     // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
     // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
     // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
@@ -472,17 +472,28 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         agentName: record.agent_name, sessionId,
         treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
         heldCount: readiness.heldCount, missingLeaves: readiness.missingLeaves,
+        heldOwn: readiness.heldOwn, heldReceived: readiness.heldReceived,
       });
+      // DOD-M12B-INDEX-1: SAY WHOSE MESSAGES ARE WAITING. Our own held sends block the seal exactly
+      // as received ones do, but calling them "received message(s) waiting behind a gap" tells the
+      // operator to wait for content that is already in hand — and the relay pull this gate performs
+      // first can never resolve it. They retry, get the identical refusal, and reach for force:true:
+      // the receipt-less exit this gate exists to prevent.
+      const waiting =
+        (readiness.heldReceived > 0 ? `, and ${readiness.heldReceived} received message(s) are waiting behind a gap` : "") +
+        (readiness.heldOwn > 0 ? `, and ${readiness.heldOwn} of YOUR OWN message(s) are waiting for their place in the record (they were delivered — the counterparty has them)` : "");
       return {
         ok: false,
         reason: "session_incomplete",
         missing_leaves: readiness.missingLeaves,
         held_messages: readiness.heldCount,
+        held_own: readiness.heldOwn,
+        held_received: readiness.heldReceived,
         guidance:
           `This side of the conversation is incomplete, so sealing now would produce a chain the counterparty cannot co-sign — and that refusal is terminal, leaving a force-abandon with no notarized receipt as the only way out. ` +
           `You hold ${readiness.treeSize} message(s); the relay has witnessed ${readiness.highWaterSeq + 1}` +
-          (readiness.heldCount > 0 ? `, and ${readiness.heldCount} received message(s) are waiting behind a gap` : "") +
-          `. The daemon just pulled from the relay and the gap is still there, so the content is not available yet — wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
+          waiting +
+          `. Everything here is waiting on an earlier message from the counterparty that has not arrived; the daemon just pulled from the relay and the gap is still there, so wait a moment and close again. If it does not resolve, cello_transcript ${sessionId} shows what did arrive, and cello_close_session ${sessionId} { force: true } abandons it terminally (no receipt).`,
       };
     }
 

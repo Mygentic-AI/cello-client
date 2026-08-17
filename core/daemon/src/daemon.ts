@@ -1098,9 +1098,15 @@ async function startDaemonHoldingLock(
           // session is unsealable for good.
           if (sendResult.ok || sendResult.durable) {
             const rejectHashHex = Buffer.from(rejectHash).toString("hex");
-            const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", rejectHashHex, randomUUID());
-            sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", rejectBytes, randomUUID());
-            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: leafIndex, queued: !sendResult.ok });
+            // DOD-M12B-INDEX-1: at the relay's position, not the tail. This is the riskiest append
+            // in the codebase for that — the seal is initiated a few lines below, so a leaf at the
+            // wrong index does not merely stall the far side, it seals a tree the counterparty can
+            // never agree with.
+            const placed = sessionNodeManager.placeOwnLeaf(agentName, sessionId, rejectHashHex, rejectBytes, sendResult.sequenceNumber, randomUUID());
+            if (placed.placed) {
+              sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placed.leafIndex, "sent", rejectBytes, randomUUID());
+            }
+            logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: placed.placed ? placed.leafIndex : placed.heldAt, committed: placed.placed, queued: !sendResult.ok });
           } else {
             // Not queued anywhere — the rejection is gone. We still seal (we are closing regardless),
             // and the counterparty simply never learns why, so say that plainly rather than at warn.
@@ -1298,17 +1304,31 @@ async function startDaemonHoldingLock(
         //
         // The dedup guard deliberately STAYS SET: a queued reply is coming, and re-sending on the
         // next arrival would mint a second greeting at a second sequence.
-        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
-        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, queuedLeaf, "sent", contentBytes, randomUUID());
+        // DOD-M12B-INDEX-1: the queued reply owns the position the relay witnessed for it, and
+        // that is where its leaf goes.
+        const placedQueued = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+        if (placedQueued.placed) {
+          sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedQueued.leafIndex, "sent", contentBytes, randomUUID());
+        }
         logger.info("session.away.response.deferred", {
-          agentName, sessionId, kind, isKnown, sequenceNumber: queuedLeaf,
+          agentName, sessionId, kind, isKnown,
+          sequenceNumber: placedQueued.placed ? placedQueued.leafIndex : placedQueued.heldAt,
+          committed: placedQueued.placed,
           reason: sendResult.reason, cause: sendResult.cause,
         });
         return;
       }
-      const { leafIndex } = sessionNodeManager.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, randomUUID());
-      sessionNodeManager.recordTranscriptMessage(agentName, sessionId, leafIndex, "sent", contentBytes, randomUUID());
-      logger.info("session.away.response.sent", { agentName, sessionId, kind, isKnown, sequenceNumber: leafIndex });
+      // DOD-M12B-INDEX-1: the away responder fires while inbound is still arriving, so it is the
+      // path most likely to have a gap open under it — exactly where a tail append does damage.
+      const placedReply = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+      if (placedReply.placed) {
+        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedReply.leafIndex, "sent", contentBytes, randomUUID());
+      }
+      logger.info("session.away.response.sent", {
+        agentName, sessionId, kind, isKnown,
+        sequenceNumber: placedReply.placed ? placedReply.leafIndex : placedReply.heldAt,
+        committed: placedReply.placed,
+      });
     } catch (err: unknown) {
       // Reviewer MEDIUM fix: same as above — an unexpected throw must not permanently lock out
       // future retries for the rest of this away period.
@@ -3977,13 +3997,17 @@ async function startDaemonHoldingLock(
         // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
         // successful send. See the comment at the call site for why this is delivery-critical and
         // not audit bookkeeping.
-        appendLeaf: (agent, sessionId, contentHash, correlationId) => {
-          sessionNodeManager.appendSessionLeaf(
+        appendLeaf: (agent, sessionId, contentHash, correlationId, assignedSeq) => {
+          // DOD-M12B-INDEX-1: a document leaf takes a position in the CONVERSATION's sequence space
+          // (deliberate — f75ea09), so it obeys the same discipline a message does.
+          sessionNodeManager.placeOwnLeaf(
             agent,
             sessionId,
-            "doc",
             Buffer.from(contentHash).toString("hex"),
+            contentHash,
+            assignedSeq,
             correlationId,
+            "doc",
           );
         },
     });

@@ -45,7 +45,10 @@ export interface DocumentTransportDeps {
    * audit record: the tree is the sequence space both sides count in, so a sender that skips it
    * falls one behind per frame and the peer silently drops what it has already consumed.
    */
-  appendLeaf(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId: string): void;
+  /** DOD-M12B-INDEX-1: `assignedSeq` is the relay's position for this frame — the leaf goes THERE,
+   *  not at the tail. A document leaf rides the same session sequence counter a message does, so it
+   *  is subject to exactly the same divergence. Undefined when no relay answered. */
+  appendLeaf(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId: string, assignedSeq?: number): void;
   /** The agent this worker delivers for. One worker per attended agent. */
   agentName: string;
   /** `runDiscoveryLookup`, supplied by the composition root — it lives in a closure there. */
@@ -75,9 +78,11 @@ export interface DocumentTransportDeps {
     /** The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below. */
     leafKind?: number,
   ): Promise<
-    | { ok: true; delivered: true; relayRefusal?: string }
-    | { ok: true; delivered: false; parked: true; relayRefusal?: string }
-    | { ok: false; reason: string; error: string }
+    // DOD-M12B-INDEX-1: `sequenceNumber` is the relay's position for this frame, carried so the
+    // leaf can be placed there rather than at the tail. Absent when no relay answered.
+    | { ok: true; delivered: true; relayRefusal?: string; sequenceNumber?: number }
+    | { ok: true; delivered: false; parked: true; relayRefusal?: string; sequenceNumber?: number }
+    | { ok: false; reason: string; error: string; sequenceNumber?: number }
   >;
   logger: Logger;
 }
@@ -260,7 +265,7 @@ export function createDocumentDeliveryTransport(
       // document frame in a fresh session arrives and everything after it does not. Adding one
       // ordinary message before the exchange moved the failure earlier, which is what named the
       // cause.
-      deps.appendLeaf(deps.agentName, session.sessionId, hash, correlationId);
+      deps.appendLeaf(deps.agentName, session.sessionId, hash, correlationId, sent.sequenceNumber);
       deps.logger.info("document.frame.sent", {
         documentId,
         sessionId: session.sessionId,
