@@ -460,6 +460,9 @@ export class SessionNodeManager {
   // DOD-M12B-ACK-1: WHY a session is impaired and what became of the content. Separate from the
   // state above because the state is what surfaces print and this is what they must explain.
   #impairmentCause = new Map<string, SessionImpairment>();
+  // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
+  // process; the Map is the working copy from then on.
+  #heldRestored = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -1056,6 +1059,38 @@ export class SessionNodeManager {
         created_at INTEGER NOT NULL,
         -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
         PRIMARY KEY (agent_id, session_id, leaf_index)
+      )
+    `);
+
+    // DOD-M12B-STRAND-1 — content we RECEIVED and VERIFIED but cannot append yet.
+    //
+    // Held content used to live only in `#heldContent`, a Map that died with the session node. The
+    // teardown path said so itself: "the content is unrecoverable by the time we are here."
+    // Measured on one daemon in one morning: 367 held, 8 released, **24 destroyed**. Each
+    // destruction is permanent and one-sided — the sender was never acknowledged, so it believes
+    // the message is merely pending, while the only copy the receiver will ever see is gone and
+    // every later message in that session is stuck behind a gap nothing can fill.
+    //
+    // `canonical_seq` is the RELAY's position, not a local counter, and it is part of the key: that
+    // is what lets a frame come back after a restart and land at its OWN index rather than the next
+    // free slot. Appending it anywhere else would change the root the seal signs over.
+    //
+    // Keyed on agent_id, never agent_name — agent_name is a mutable display label (see the repo
+    // guide). `content_blob` is the SCREENED copy that gets delivered; `original_blob` is the peer's
+    // raw bytes, which the release path needs because classification reads byte 0 and the screened
+    // copy is no longer a CBOR map header for a document frame.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS held_content (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        canonical_seq INTEGER NOT NULL,
+        content_blob BLOB NOT NULL,
+        original_blob BLOB,
+        content_hash_hex TEXT NOT NULL,
+        screened_out INTEGER NOT NULL DEFAULT 0,
+        correlation_id TEXT,
+        held_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id, canonical_seq)
       )
     `);
 
@@ -3131,22 +3166,56 @@ export class SessionNodeManager {
     // destroyed with the session three seconds later. The sender then re-sent that envelope 90
     // times against a ceiling of 5, and every surface reported the delivery as merely pending.
     //
-    // This is a LOSS REPORT, not a fix — the content is unrecoverable by the time we are here. The
-    // fix is upstream, in not tearing a session down while an answer is still owed on it.
+    // DOD-M12B-STRAND-1 — THIS IS NO LONGER AN EPITAPH. Dropping the Map now drops a CACHE: the
+    // frames are rows in `held_content`, and #restoreHeldContent brings them back the next time
+    // this session gets a node. `session.content.held.discarded` is kept, at WARN rather than
+    // ERROR, and only for what it now means — a gap is still open on a session going away, which
+    // is worth an alarm even though nothing is lost.
+    //
+    // It fires ONLY when the durable rows are confirmed present. A hold whose persist failed is a
+    // genuine loss and must not be reported with the same event as a survivor, so it gets its own
+    // error naming the count that is actually gone. The check is a COUNT against the store rather
+    // than a belief about the write that ran earlier.
     const strandedHolds = this.#heldContent.get(key);
     if (strandedHolds && strandedHolds.size > 0) {
-      this.#logger.error("session.content.held.discarded", {
+      const canonicalSeqs = [...strandedHolds.keys()].sort((a, b) => a - b);
+      let durable = 0;
+      try {
+        const row = this.#db?.prepare(
+          "SELECT COUNT(*) AS n FROM held_content WHERE agent_id = ? AND session_id = ?",
+        ).get(this.#requireAgentId(agentName), sessionId) as { n: number } | undefined;
+        durable = row?.n ?? 0;
+      } catch {
+        durable = 0;
+      }
+      const lost = strandedHolds.size - durable;
+      this.#logger.warn("session.content.held.discarded", {
         agentName,
         sessionId,
         count: strandedHolds.size,
-        canonicalSeqs: [...strandedHolds.keys()].sort((a, b) => a - b),
+        durable,
+        canonicalSeqs,
         // NULL when the tree was not cached at teardown. Honest, and cheap — reloading the leaf
         // table to fill in a diagnostic field is not worth a disk read on every teardown, let
         // alone the cache resurrection it caused.
         treeSize: treeSizeBeforeEviction,
       });
+      if (lost > 0) {
+        this.#logger.error("session.content.held.lost", {
+          agentName,
+          sessionId,
+          lost,
+          held: strandedHolds.size,
+          impact: "verified content was NOT written to held_content and is destroyed by this teardown — the sender was never acknowledged and believes it is still pending",
+        });
+      }
     }
     this.#heldContent.delete(key);
+    // DOD-M12B-STRAND-1: the hydration guard goes with the cache it guards. Without this, a session
+    // torn down and given a node again inside ONE process would never re-read its durable holds —
+    // the frames would sit in the table, unreleasable, which is indistinguishable from the loss
+    // this unit exists to stop.
+    this.#heldRestored.delete(key);
     this.#highWaterSeq.delete(key);
   }
 
@@ -4901,6 +4970,7 @@ export class SessionNodeManager {
       : this.#witnessedSeq.get(key)?.get(contentHashHex);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
+      this.#ensureHeldRestored(agentName, sessionId);
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
       // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
@@ -4912,6 +4982,9 @@ export class SessionNodeManager {
       // doorbell, and `cello_receive` handing an agent raw CBOR as though a person typed it.
       // The in-order path has always passed these bytes; only the held path dropped them.
       held.set(canonicalSeq, { content: deliverContent, originalContent: content, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
+      // DOD-M12B-STRAND-1: and to disk, before we answer. The in-memory Map is the working copy;
+      // this row is the one that survives the teardown that used to destroy it.
+      this.#persistHeldContent(agentName, sessionId, canonicalSeq, deliverContent, content, contentHashHex, terminalBlock === true, correlationId);
       this.#logger.info("session.content.held", {
         sessionId,
         canonicalSeq,
@@ -5215,12 +5288,135 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-STRAND-1 — write one held frame to the durable store.
+   *
+   * FAILS LOUD. Everywhere else in this class a best-effort write is defensible; here it is not.
+   * The caller is about to answer `held: true` and deliberately withhold the `persisted` ACK, so
+   * the sender will hold its copy and retry — but only until it gives up. If this row never lands
+   * and the daemon then goes down, the content is destroyed exactly as it was before this unit,
+   * and a swallowed error would make that look identical to a success.
+   */
+  #persistHeldContent(
+    agentName: string,
+    sessionId: string,
+    canonicalSeq: number,
+    deliverContent: Uint8Array,
+    originalContent: Uint8Array,
+    contentHashHex: string,
+    screenedOut: boolean,
+    correlationId?: string,
+  ): void {
+    if (!this.#db) return;
+    try {
+      this.#db.prepare(
+        `INSERT OR REPLACE INTO held_content
+           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        this.#requireAgentId(agentName), sessionId, canonicalSeq,
+        Buffer.from(deliverContent), Buffer.from(originalContent), contentHashHex,
+        screenedOut ? 1 : 0, correlationId ?? null, Date.now(),
+      );
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.persist.failed", {
+        agentName, sessionId, canonicalSeq, contentHash: contentHashHex,
+        impact: "this frame is held IN MEMORY ONLY and will be destroyed if the daemon restarts",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** DOD-M12B-STRAND-1 — drop one held frame from the durable store, on release or on a refusal
+   *  that supersedes it. A row that outlives its release re-appends on the next boot. */
+  #deleteHeldContent(agentName: string, sessionId: string, canonicalSeq: number): void {
+    if (!this.#db) return;
+    try {
+      this.#db.prepare(
+        "DELETE FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
+      ).run(this.#requireAgentId(agentName), sessionId, canonicalSeq);
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.delete.failed", {
+        agentName, sessionId, canonicalSeq,
+        impact: "the released frame's durable row survives and will be re-appended on the next boot",
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * DOD-M12B-STRAND-1 — restore this session's held frames into memory.
+   *
+   * Called when a session node is (re)created, which is the moment the session becomes able to
+   * append again. Loading at daemon boot instead would be wrong for the same reason the old code
+   * was wrong: a frame is only releasable against a tree, and the tree is loaded per session.
+   *
+   * Frames already behind the tree's frontier are DROPPED, not re-appended — a restart that
+   * re-applied content already in the tree would change the root a seal signs over. They are
+   * logged, because a hold that turns out to be redundant is worth seeing.
+   */
+  #ensureHeldRestored(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#heldRestored.has(key)) return;
+    this.#heldRestored.add(key);
+    this.#restoreHeldContent(agentName, sessionId);
+  }
+
+  #restoreHeldContent(agentName: string, sessionId: string): void {
+    if (!this.#db) return;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null }>;
+    try {
+      rows = this.#db.prepare(
+        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id
+           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
+      ).all(this.#requireAgentId(agentName), sessionId) as never;
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.restore.failed", {
+        agentName, sessionId,
+        impact: "verified content held before the restart is not in memory and cannot be released",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (rows.length === 0) return;
+    const key = this.#k(agentName, sessionId);
+    let held = this.#heldContent.get(key);
+    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
+    const frontier = this.getSessionTree(agentName, sessionId).size();
+    let restored = 0;
+    let superseded = 0;
+    for (const row of rows) {
+      if (row.canonical_seq < frontier) {
+        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        superseded++;
+        continue;
+      }
+      held.set(row.canonical_seq, {
+        content: new Uint8Array(row.content_blob),
+        ...(row.original_blob ? { originalContent: new Uint8Array(row.original_blob) } : {}),
+        contentHashHex: row.content_hash_hex,
+        ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
+        ...(row.screened_out ? { screenedOut: true } : {}),
+      });
+      restored++;
+    }
+    if (held.size === 0) this.#heldContent.delete(key);
+    this.#logger.info("session.content.held.restored", {
+      agentName, sessionId, restored, superseded, frontier,
+      canonicalSeqs: [...held.keys()].sort((a, b) => a - b),
+    });
+  }
+
+  /**
    * DOD-MSG-4: drain held out-of-order content in canonical order. After a leaf is appended, any
    * held entry whose canonical sequence equals the new next-expected index is now in order — append
    * it, then check again (a single fill can release a run of consecutive held messages).
    */
   #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): number {
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-STRAND-1: hydrate before scanning. Restoring eagerly at session-node creation put
+    // it behind writes that can fail — one failed `sessions` row upsert and the frames stayed on
+    // disk, invisible, which is the same outcome as losing them.
+    this.#ensureHeldRestored(agentName, sessionId);
     const held = this.#heldContent.get(key);
     if (!held) return 0;
     let released = 0;
@@ -5229,6 +5425,10 @@ export class SessionNodeManager {
       const entry = held.get(nextExpected);
       if (!entry) break;
       held.delete(nextExpected);
+      // DOD-M12B-STRAND-1: released content leaves the durable store in the same breath. A row
+      // that outlives its release would re-append the same content on the next boot — growing the
+      // tree and changing a root that has already been signed.
+      this.#deleteHeldContent(agentName, sessionId, nextExpected);
       // A screened-out (terminal-blocked) held entry leafs at its canonical index but is NEVER
       // buffered for the agent; a normal held entry buffers + leafs (code-review HIGH-1).
       if (entry.screenedOut) {
