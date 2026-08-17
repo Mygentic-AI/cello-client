@@ -5528,6 +5528,88 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — tell the counterparty we have hung up. Best effort, never blocking.
+   *
+   * A force-abandon marks the session terminal HERE and did nothing else, so the other side kept
+   * its half live, kept retrying delivery into it, and kept trying to re-establish — forever,
+   * because nothing would ever answer. That is what produced the 2026-08-17 notification storm:
+   * surviving halves calling continuously while the operator saw connection requests from agents
+   * nobody was driving.
+   *
+   * BEST EFFORT, and every caller must treat it that way. A peer that is offline cannot be told, so
+   * this is an improvement on silence rather than a guarantee — and it must never delay or fail the
+   * abandon, which is the operator's escape hatch out of a session that can never seal.
+   */
+  async notifyCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<boolean> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) {
+      this.#logger.debug("session.abandon.notice.skipped", {
+        agentName, sessionId, reason: "no_active_node", correlationId,
+        impact: "the counterparty was not told and may keep calling until it gives up",
+      });
+      return false;
+    }
+    let stream: Stream | undefined;
+    try {
+      stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      const frame = encodeCbor({
+        type: "session_abandoned",
+        session_id: sessionId,
+        correlation_id: correlationId,
+      }) as Uint8Array;
+      stream.send(lp.encode.single(frame));
+      await stream.close();
+      this.#logger.info("session.abandon.notice.sent", { agentName, sessionId, correlationId });
+      return true;
+    } catch (err: unknown) {
+      if (stream !== undefined) {
+        try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
+      this.#logger.warn("session.abandon.notice.failed", {
+        agentName, sessionId, correlationId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "the counterparty was not told and may keep calling until it gives up",
+      });
+      return false;
+    }
+  }
+
+  /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — the receiving half: our counterparty has abandoned, so retire.
+   *
+   * RETIRING IS NOT DELETING. The counterparty walking away forfeits the notarized receipt; it must
+   * not also cost the operator the record of what was actually said. The transcript and the tree
+   * stay exactly as they are.
+   *
+   * Only an `active` or `interrupted` session moves. A SEALED session has a notarized receipt and
+   * must never be turned into an abandoned one by a late or duplicated notice — that would destroy
+   * the artifact this protocol exists to produce. An unknown session is refused rather than
+   * created: an authenticated stream proves who is speaking, not that a session exists.
+   */
+  retireOnCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): boolean {
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) {
+      this.#logger.warn("session.abandon.notice.unknown_session", { agentName, sessionId, correlationId });
+      return false;
+    }
+    if (record.status !== "active" && record.status !== "interrupted") {
+      this.#logger.debug("session.abandon.notice.ignored", {
+        agentName, sessionId, status: record.status, correlationId,
+        reason: "session already terminal",
+      });
+      return false;
+    }
+    const flipped = this.#updateSessionStatus(agentName, sessionId, "abandoned");
+    if (!flipped) return false;
+    this.#logger.warn("session.counterparty.abandoned", {
+      agentName, sessionId, priorStatus: record.status, correlationId,
+      impact: "the counterparty ended this session without a bilateral seal — there is no notarized receipt, and the transcript on this side is the only remaining record",
+    });
+    void this.destroySessionNode(agentName, sessionId, "error");
+    return true;
+  }
+
+  /**
    * DOD-M12B-REDIAL-1 — open a content stream, re-dialling once if the connection has gone.
    *
    * `newStream` never dials. It looks for an already-open connection filed under the recorded peer
@@ -6515,6 +6597,19 @@ export class SessionNodeManager {
         if (ackHash instanceof Uint8Array && level === "persisted") {
           this.#resolveAwaitingAck(agentName, sessionId, ackHash);
         }
+        return;
+      }
+
+      // DOD-M12B-ABANDON-NOTIFY-1: the counterparty force-abandoned. Handled here, on the same
+      // authenticated stream the delivery acknowledgement rides, and AFTER the session-id check
+      // below cannot be skipped — the frame names its session and the handler is bound to one.
+      if (frame["type"] === "session_abandoned") {
+        const claimed = frame["session_id"];
+        if (typeof claimed === "string" && claimed !== sessionId) {
+          this.#logger.warn("session.content.session_mismatch", { sessionId, claimedSessionId: claimed });
+          return;
+        }
+        this.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
         return;
       }
 
