@@ -323,8 +323,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     correlationId: string,
     /**
      * Refuse locally when the carry cannot possibly verify, instead of spending 30 s to be told
-     * nothing. ON for the INTERRUPTED path only, and deliberately so: that path is new, and it is
-     * the one the restart-seal resolver drives automatically for every orphan. The ACTIVE path's
+     * nothing. ON for the two paths `submitAndEscalate` drives — the interrupted close and the
+     * `seal_interrupted_pending` close — and deliberately OFF for the ACTIVE one. Those two are new
+     * and are what the restart-seal resolver drives automatically for every orphan. The ACTIVE path's
      * behaviour is left exactly as it was — it has shipped and been exercised for milestones, and
      * a pre-flight refusal there could turn a seal that works today into one that does not.
      */
@@ -335,7 +336,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   > => {
     let resolveUni!: (r: UnilateralResult) => void;
     const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
-    pendingUnilateralWaiters.set(sessionId, resolveUni);
+    pendingUnilateralWaiters.set(sealKey(record.agent_name, sessionId), resolveUni);
     // FED-OPTIONB-SEAL-001 (Option B): carry the full leaf chain (both parties) + the relay receipts so
     // the directory rebuilds + verifies the tree OFFLINE — no directory→relay getSealLeaves dial. The
     // store is keyed by the agent's K_local pubkey (the same key the relay client recorded under).
@@ -365,7 +366,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // dominant ones. The directory still re-checks everything — this refuses earlier and by name,
     // it does not become the authority.
     if (opts.refuseOnUnusableCarry && seal_leaves.length === 0) {
-      pendingUnilateralWaiters.delete(sessionId);
+      pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
       return {
         ok: false,
         reason: "seal_carry_empty",
@@ -376,7 +377,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     const sequences = seal_leaves.map((l) => l.sequence_number).sort((a, b) => a - b);
     const contiguousFromOne = sequences.every((n, i) => n === i + 1);
     if (opts.refuseOnUnusableCarry && !contiguousFromOne) {
-      pendingUnilateralWaiters.delete(sessionId);
+      pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
       return {
         ok: false,
         reason: "seal_carry_noncontiguous",
@@ -390,9 +391,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // in flight across a restart could post a second before the durable recovery shipped. The
     // directory refuses them with `unilateral_seal_leaf_invalid`, silently, so each one currently
     // burns five resolver attempts and 30 s apiece before being reported as a directory timeout.
+    // TOTAL ctrl leaves, which is the predicate the DIRECTORY applies — `ctrlLeaves.length !== 1`,
+    // regardless of who authored them. Counting only OUR OWN missed the case that matters most on
+    // the responder side: our leaf plus the counterparty's is TWO, the relay reads that as both
+    // parties having posted and starts a full BILATERAL seal (which is the better outcome), while
+    // this side fires a unilateral request the directory then refuses — silently — so the close
+    // waits out its timeout and reports one. Refusing by name says what is actually happening.
+    const allCtrl = sealCarry.filter((l) => l.leafKind === 0x02);
+    if (opts.refuseOnUnusableCarry && allCtrl.length > 1 && new Set(allCtrl.map((l) => l.senderPubkeyHex)).size > 1) {
+      pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+      return {
+        ok: false,
+        reason: "seal_carry_bilateral_in_progress",
+        guidance:
+          "Both parties have posted their SEAL leaf, so the relay has what it needs to notarize this BILATERALLY — a better receipt than a unilateral one, and asking for a unilateral seal now would be refused. Wait for the seal to land (cello_sessions shows the status) and read the receipt with cello_sealed_receipt.",
+      };
+    }
+
     const ownCtrl = sealCarry.filter((l) => l.leafKind === 0x02 && l.senderPubkeyHex === sealAgentPubkeyHex);
     if (opts.refuseOnUnusableCarry && ownCtrl.length > 1) {
-      pendingUnilateralWaiters.delete(sessionId);
+      pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
       return {
         ok: false,
         reason: "seal_carry_duplicate_own_ctrl_leaf",
@@ -409,7 +427,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       seal_leaves,
     });
     if (!sent.ok) {
-      pendingUnilateralWaiters.delete(sessionId);
+      pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
       return {
         ok: false,
         reason: "seal_unilateral_send_failed",
@@ -422,7 +440,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     });
     const uniResult = await Promise.race([uniP, uniTimeoutP]);
     clearTimeout(uniTimer);
-    pendingUnilateralWaiters.delete(sessionId);
+    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
     if (uniResult.ok) {
       logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
       crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
@@ -476,7 +494,12 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   ): Promise<
     | { ok: true; sealed_root: string; seal_type: "unilateral"; legibility?: unknown }
     | { ok: false; reason: string; retry_after_seconds?: number; guidance: string }
-    | null
+    /** No root/sequence to escalate with, AND WHY. `reason` is `submitSealLeaf`'s own — never a
+     *  label invented here. Seven distinct conditions produce this, most of them transient and
+     *  LOCAL (`standing_receiver_unavailable` right after a boot, `relay_unavailable`, a dial that
+     *  failed, our own database refusing a read). Collapsing them into one relay-shaped sentence
+     *  told the operator a receipt was permanently gone when they only needed to start the agent. */
+    | { escalated: false; reason: string }
   > => {
     const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
     if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
@@ -499,7 +522,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       : typeof submitted.reportedRootHex === "string" && typeof submitted.sequenceNumber === "number"
         ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
         : null;
-    if (!escalation) return null;
+    if (!escalation) return { escalated: false, reason: submitted.ok ? "submit_returned_no_root" : submitted.reason };
 
     return await escalateToUnilateralSeal(record, sessionId, escalation, correlationId, {
       refuseOnUnusableCarry: true,
@@ -850,7 +873,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         if (!mayEscalate) return result;
 
         const uni = await submitAndEscalate(record, sessionId, correlationId);
-        if (uni === null) return result;
+        if ("escalated" in uni) return result;
         if (uni.ok) return uni; // A REAL RECEIPT — the whole point of this line.
 
         // BEST-EFFORT, and the commitment STANDS. Turning a successful commitment into a reported
@@ -1097,28 +1120,36 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // SEAL ctrl leaf, and the responder never posts one — `inbound-seal-request.ts` persists its
     // commitment, acks, and stops. Measured: 26 sessions idle in this status for 0.5 to 10.5 days.
     //
-    // The commitment it holds is exactly what makes escalating safe: both sides signed the same
-    // root. And re-entering here cannot post a second ctrl leaf, because `submitSealLeaf` now
-    // recovers the one a previous run posted from the durable carry rather than posting again.
+    // WHY THIS IS SAFE, stated accurately — the obvious answer is the wrong one. It is NOT that
+    // "both sides signed the same root": the escalation reports the tree root WITH the SEAL ctrl
+    // leaf appended, which is by construction not the committed root, and a responder-side row
+    // never even receives the initiator's leaf. It is safe because **the directory rebuilds the
+    // tree from relay-witnessed leaves and verifies their signatures** — it never consults the
+    // commitment. The commitment is what makes it legitimate to ASK, not what makes it verifiable.
+    // And re-entering cannot post a second ctrl leaf, because `submitSealLeaf` recovers the one a
+    // previous run posted from the durable carry rather than posting again.
     if (record.status === "seal_interrupted_pending") {
+      // The AC-011 check at the top of the handler already refuses a concurrent attempt on this
+      // same key, for every status — so no second check is needed here, only the add/release pair
+      // that makes THIS attempt visible to it.
       const key = sealKey(record.agent_name, sessionId);
-      if (sealInterruptedInProgress.has(key)) {
-        return {
-          ok: false,
-          reason: "seal_interrupted_in_progress",
-          guidance: "A seal attempt is already in progress for this session. Wait for it to complete before retrying.",
-        };
-      }
       sealInterruptedInProgress.add(key);
       const correlationId = randomUUID();
       try {
         const uni = await submitAndEscalate(record, sessionId, correlationId);
-        if (uni === null) {
+        if ("escalated" in uni) {
+          // NAME THE CAUSE `submitSealLeaf` GAVE, never a label invented here. Most of these are
+          // transient and local — `standing_receiver_unavailable` is simply "the agent is not
+          // started yet", which a freshly booted daemon reports for every session. The genuinely
+          // permanent case (the relay released the session) has its own reason,
+          // `seal_carry_empty`, raised inside the escalation where it is actually known.
           return {
             ok: false,
-            reason: "seal_carry_empty",
+            reason: uni.reason,
             guidance:
-              "This session holds a bilateral commitment but no relay-witnessed leaves to notarize it from — the relay released the session (it drops one 24 hours after the last message) before anyone asked. cello_transcript still shows the conversation; a notarized receipt is no longer obtainable.",
+              `This session holds a bilateral commitment, but this side could not post the SEAL leaf that a notarization is requested with: ${uni.reason}. ` +
+              `That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). ` +
+              `The conversation is intact either way; retry cello_close_session once the daemon reports healthy.`,
           };
         }
         if (uni.ok) return uni;

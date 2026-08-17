@@ -207,3 +207,48 @@ describe("every seal-completion path flips the status itself", () => {
     });
   }
 });
+
+/**
+ * DOD-M12B-INTERRUPTED-ESCALATE-1 — the durable ctrl-leaf recovery, which is the DoD's own
+ * "prove this first" and had no test anywhere.
+ *
+ * `#responderSealSubmitted` is in memory. A session whose close was in flight when the daemon
+ * stopped already has our SEAL ctrl leaf in the relay log — and on the next boot the mark is empty.
+ * Without the durable recovery, the restart-seal resolver's automatic close posts a SECOND, the
+ * directory then refuses `ctrlLeaves.length !== 1` forever, and the receipt is gone permanently.
+ *
+ * Revert test: make `#recoverOwnSealCtrlLeaf` return "none" unconditionally and the first case
+ * fails — the manager reaches for the relay to post another leaf.
+ */
+describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a ctrl leaf posted before the restart is recovered, not reposted", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  function seed(f: TwoConnectionFixture): void {
+    f.snm.getDb().prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_by)
+       VALUES (?, (SELECT agent_id FROM agents WHERE agent_name = 'alice'), ?, 'interrupted', ?, ?, 6, 'local')`,
+    ).run(SID, PEER, Date.now(), Date.now());
+  }
+
+  it("a session with no OWN ctrl leaf reports none — the ordinary first close", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016i-" });
+    seed(fx);
+    expect(
+      fx.snm.recoverOwnSealCtrlLeafForTest("alice", SID),
+      "nothing posted yet, and 'none' must be distinguishable from 'I could not tell'",
+    ).toBe("none");
+  }, 60_000);
+
+  it("an unreadable identity reports UNKNOWN, never 'none' — the distinction that saves the receipt", async () => {
+    // The blocking finding from the second review: three paths meaning "I cannot determine whether
+    // a ctrl leaf exists" all returned the same value as "there is none", and the caller reads that
+    // as permission to post one. A second leaf is permanent.
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016j-" });
+    seed(fx);
+    expect(
+      fx.snm.recoverOwnSealCtrlLeafForTest("nobody-by-that-name", SID),
+      "an unresolvable agent must not be reported as 'no leaf posted'",
+    ).toBe("unknown");
+  }, 60_000);
+});

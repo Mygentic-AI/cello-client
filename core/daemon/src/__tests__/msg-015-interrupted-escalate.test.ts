@@ -59,6 +59,8 @@ function harness(opts: {
   directory?: { ok: true; sealedRootHex: string } | { ok: false; reason: string; remainingSeconds?: number };
   /** Override the relay-witnessed carry (empty / gappy cases). */
   carry?: typeof CARRY;
+  /** Override what posting the SEAL ctrl leaf does. Absent → it succeeds. */
+  submit?: { ok: false; reason: string };
 }) {
   const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
   const sentFrames: Array<Record<string, unknown>> = [];
@@ -68,7 +70,9 @@ function harness(opts: {
     sentFrames.push(frame);
     // Stand in for the directory: answer the moment the request goes out.
     if (frame["type"] === "seal_unilateral" && opts.directory) {
-      const resolve = pendingUnilateralWaiters.get(SESSION);
+      // KEYED `agent \x1f session` since DOD-M12B-SEAL-WAITER-KEY-1 — two agents on one daemon
+      // must not clobber each other's resolver.
+      const resolve = pendingUnilateralWaiters.get(`${AGENT}\x1f${SESSION}`);
       if (resolve) queueMicrotask(() => resolve(opts.directory));
     }
     return { ok: true };
@@ -79,7 +83,7 @@ function harness(opts: {
     logger: silent,
     sessionNodeManager: {
       getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: opts.status ?? "interrupted" }),
-      submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 4, reportedRootHex: ROOT }),
+      submitSealLeaf: async () => (opts.submit ?? { ok: true as const, sequenceNumber: 4, reportedRootHex: ROOT }),
       getSealCarry: () => (opts.carry ?? CARRY),
       getSealCertificate: () => null,
       resolveAgentId: () => "aid",
@@ -98,7 +102,8 @@ function harness(opts: {
     waitForSignalingConnected: async () => true,
     openVisitingConnection: () => ({ mgr: {}, stop: async () => {} }),
     crossNodeBrokerBySession: new Map<string, string>(),
-    sealKey: (a: string, s: string) => `${a}:${s}`,
+    // Production shape (seal-coordinator.ts) — the waiter map is keyed with it.
+    sealKey: (a: string, s: string) => `${a}\x1f${s}`,
     sealInterruptedInProgress: new Set<string>(),
     pendingSealWaiters: new Map(),
     pendingUnilateralWaiters,
@@ -323,20 +328,48 @@ describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finall
     expect(res.reason).toBe("seal_counterparty_pending");
   });
 
-  it("says the receipt is unobtainable when the relay released the session, rather than 'not closeable'", async () => {
-    // The honest end state for an old stuck session: the relay drops one 24 h after the last
-    // message, so there is nothing left to notarize from. That is a different fact from "this
-    // status cannot be closed", and it is the one the operator needs.
+  it("names the REAL cause when the seal leaf cannot be posted — it is usually local and temporary", async () => {
+    // The failure that reaches this branch most often on a freshly booted daemon:
+    // `standing_receiver_unavailable` just means the agent has not been started yet. Seven distinct
+    // conditions produce "nothing to escalate with", most of them transient and LOCAL. Collapsing
+    // them into one relay-shaped sentence told the operator the receipt was permanently gone when
+    // all they needed was `cello_start_agent` — and the restart-seal resolver, which reaches this
+    // branch on its second attempt, would then write a DURABLE give-up on the strength of it.
     const h = harness({
       status: "seal_interrupted_pending",
       flow: { ok: false, reason: "unused", guidance: "" },
       directory: { ok: true, sealedRootHex: SEALED_ROOT },
-      carry: [],
+      submit: { ok: false, reason: "standing_receiver_unavailable" },
     });
 
     const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
 
-    expect(res.reason).toBe("seal_carry_empty");
-    expect(String(res.guidance), "and it must say the conversation itself survives").toMatch(/transcript/i);
+    expect(res.reason, "the reason must be the one submitSealLeaf gave, not a label invented here").toBe("standing_receiver_unavailable");
+    expect(String(res.guidance), "and it must not claim the receipt is unobtainable").not.toMatch(/no longer obtainable/i);
+    expect(String(res.guidance), "it must point at the local fix").toMatch(/cello_start_agent/);
+  });
+
+  it("hands a session BACK to the relay when both parties have posted their SEAL leaf", async () => {
+    // The responder-side case. Our leaf plus the counterparty's is TWO ctrl leaves, which the relay
+    // reads as both parties having posted — it starts a full BILATERAL seal, a better receipt than
+    // a unilateral one. The directory refuses a unilateral request in that state SILENTLY, so
+    // asking anyway costs a 30-second wait and reports a timeout for a seal that is proceeding.
+    const theirs = {
+      sequenceNumber: 4, leafKind: 0x02, senderPubkeyHex: "22".repeat(32),
+      structure2Cbor: new Uint8Array([4]), structure1Cbor: new Uint8Array([4, 4]),
+      relayId: "relay-1", relayTimestamp: 1_700_000_000_004, relaySignatureHex: "dd".repeat(64),
+    };
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      carry: [...CARRY, theirs],
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
+
+    expect(h.unilateralFrames().length, "asking for a unilateral seal here is refused silently").toBe(0);
+    expect(res.reason).toBe("seal_carry_bilateral_in_progress");
+    expect(String(res.guidance), "and it must say the better receipt is already coming").toMatch(/bilateral/i);
   });
 });

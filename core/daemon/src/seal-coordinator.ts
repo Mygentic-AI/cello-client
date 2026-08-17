@@ -267,6 +267,13 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
   // bilateral close (not cryptographic parity: this cert is directory-attested, see FINDING-5). undefined
   // when the directory shipped none (a pre-cascade-2 directory): the seal still completes, but no
   // retrievable receipt is produced (the pre-fix behavior).
+  // KEYED `agent\x1f session`, like `sealInterruptedInProgress` — NOT by session id alone.
+  //
+  // Two agents on one daemon is a supported topology (and the one the operator actually runs), and
+  // the away-path one-shot escalation can overlap a manual close. Keyed by session id, whichever
+  // registered second CLOBBERED the first's resolver: the loser waited out the full 30 s and
+  // reported `seal_unilateral_timeout` for a seal that SUCCEEDED — the operator is then told the
+  // directory could not verify their root, for a session that is notarized.
   const pendingUnilateralWaiters = new Map<string, (r: UnilateralResult) => void>();
 
   // SESSION-002: per-agent listener for the unilateral certificate. Verifies the FROST
@@ -282,11 +289,11 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       if (ftype !== "seal_unilateral_confirmed" && ftype !== "seal_unilateral_too_early") return;
       const sidHex = frameValueToHex(frame["session_id"]);
       if (!sidHex) return;
-      const waiter = pendingUnilateralWaiters.get(sidHex);
+      const waiter = pendingUnilateralWaiters.get(sealKey(agentName, sidHex));
       if (!waiter) return;
 
       if (ftype === "seal_unilateral_too_early") {
-        pendingUnilateralWaiters.delete(sidHex);
+        pendingUnilateralWaiters.delete(sealKey(agentName, sidHex));
         // F20: thread the directory's remaining_seconds through so the close guidance can
         // say when the unilateral seal becomes available.
         const rs = frame["remaining_seconds"];
@@ -311,7 +318,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         if (!sessionId || !sealedRoot || !frostSig || leafCount === null || closeTs === null ||
             (sigType !== "frost" && sigType !== "single")) {
           logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: "malformed_certificate" });
-          pendingUnilateralWaiters.delete(sidHex);
+          pendingUnilateralWaiters.delete(sealKey(agentName, sidHex));
           waiter({ ok: false, reason: "malformed_certificate" });
           return;
         }
@@ -319,7 +326,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           { persistence: getPersistence(agentName), agentPubkeyHex, logger },
           { sessionId, sealedRoot, leafCount, closeTimestamp: closeTs, frostSignature: frostSig, signatureType: sigType },
         );
-        pendingUnilateralWaiters.delete(sidHex);
+        pendingUnilateralWaiters.delete(sealKey(agentName, sidHex));
         if (!result.ok) {
           // SI-003: do NOT mark sealed when the certificate signature does not verify.
           logger.warn("session.unilateral.certificate.invalid", { sessionId: sidHex, reason: result.reason, signatureType: sigType });

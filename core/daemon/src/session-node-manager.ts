@@ -5671,6 +5671,14 @@ export class SessionNodeManager {
    *
    * Null when there is no own ctrl leaf, which is the ordinary first-close case.
    */
+  /**
+   * Test seam for `#recoverOwnSealCtrlLeaf`. The distinction it draws — "there is none" versus
+   * "I could not tell" — is the whole safety property, and it had no coverage at any level.
+   */
+  recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
+    return this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
+  }
+
   #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
     const ownPubkey = this.#ownPubkeyHex(agentName);
     // "I CANNOT TELL" IS NOT "THERE IS NONE". Returning the absent answer here would let the caller

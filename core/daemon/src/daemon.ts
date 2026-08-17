@@ -1200,7 +1200,7 @@ async function startDaemonHoldingLock(
 
               let resolveUni!: (r: { ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }) => void;
               const uniP = new Promise<{ ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }>((r) => { resolveUni = r; });
-              pendingUnilateralWaiters.set(sessionId, resolveUni);
+              pendingUnilateralWaiters.set(sealKey(agentName, sessionId), resolveUni);
 
               const sent = await sendOver(agentName, {
                 type: "seal_unilateral",
@@ -1210,7 +1210,7 @@ async function startDaemonHoldingLock(
                 seal_leaves,
               });
               if (!sent.ok) {
-                pendingUnilateralWaiters.delete(sessionId);
+                pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
                 logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: "send_failed" });
                 return;
               }
@@ -1221,7 +1221,7 @@ async function startDaemonHoldingLock(
               });
               const uniResult = await Promise.race([uniP, uniTimeoutP]);
               clearTimeout(uniTimer);
-              pendingUnilateralWaiters.delete(sessionId);
+              pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
 
               if (uniResult.ok) {
                 logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: uniResult.sealedRootHex, sealType: "unilateral" });
