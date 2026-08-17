@@ -114,6 +114,7 @@ import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
 import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply } from "./away-detection.js";
+import { createDeliveryOpenRegistry } from "./delivery-open-registry.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
 
@@ -1357,6 +1358,14 @@ async function startDaemonHoldingLock(
   let reconcileScheduler: ReconcileScheduler | undefined;
   let documentOwnerKeyForHook: ((agentName: string) => string | null) | undefined;
 
+  // DOD-M12B-DELIVERY-QUIET-1: which peers this daemon's document delivery worker is mid-dial to.
+  // Read by BOTH reachability triggers and by the doorbell below. See delivery-open-registry.ts for
+  // why this records an intent keyed on the peer rather than the session id — the short version is
+  // that the directory mints the id and pushes the assignment to the counterparty before the opener
+  // ever sees it, so on a one-daemon pair the inbound doorbell fires first and a session-id
+  // registry is always too late.
+  const deliveryOpens = createDeliveryOpenRegistry();
+
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
     sessionId: string,
@@ -1366,8 +1375,25 @@ async function startDaemonHoldingLock(
     // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
     // offered-name drop below so a terminal state's own doorbell still shows the name.
     const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
+    // DOD-M12B-DELIVERY-QUIET-1: this session came up because OUR OWN delivery worker dialled this
+    // peer, so its creation is our outbound act reflected back — not news about the peer, not a
+    // conversation, and not something to buzz a phone about. Scoped to `created` on purpose: a
+    // session going DOWN is news whoever opened it, and it is the operator's only signal that a
+    // conversation was cut off.
+    const causedByOurDelivery =
+      state === "created" && counterpartyPubkey !== null && deliveryOpens.isDeliveryOpening(agentName, counterpartyPubkey);
+    if (causedByOurDelivery) {
+      // Suppression is LOGGED. A doorbell that silently stops ringing is the next defect, and the
+      // measured storm was so hard to read precisely because nothing named its cause.
+      logger.info("session.doorbell.suppressed_delivery", {
+        agentName, sessionId, state,
+        impact: "document delivery opened this session — no doorbell, no phone push, no backoff reset",
+      });
+      return;
+    }
     // SYNC-P5 (R39): a session coming up IS the party-became-reachable signal — every shared
     // document gets a reconcile attempt, and the scheduler's backoff resets (they just answered).
+    // Sound ONLY when the peer caused it, which is what the guard above establishes.
     if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && state === "created") {
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId !== null) {
@@ -3156,6 +3182,17 @@ async function startDaemonHoldingLock(
     // on session-up and the initiator waited out a sweep interval.
     onSessionOpened: (agentName, counterpartyPubkey) => {
       if (!reconcileScheduler || !documentOwnerKeyForHook) return;
+      // DOD-M12B-DELIVERY-QUIET-1: the INITIATOR half of the same circularity. This hook fires
+      // inside openSessionAs, which the delivery worker's adapter brackets with begin/release — so
+      // the intent is still in flight here and the check needs no plumbing of its own. Resetting
+      // the backoff on a session WE opened to deliver a frame wipes a refusal the peer may have
+      // given seconds ago and immediately sweeps every document, which opens more sessions.
+      if (deliveryOpens.isDeliveryOpening(agentName, counterpartyPubkey)) {
+        logger.debug("document.reconcile.reachable_trigger_skipped", {
+          agentName, reason: "session_opened_by_document_delivery",
+        });
+        return;
+      }
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId === null) return;
       void reconcileScheduler
@@ -3405,6 +3442,27 @@ async function startDaemonHoldingLock(
       dispatchSessionStateChangedWithTelegram(agentName, sessionId, state, counterpartyPubkey);
     }
 
+    return { ok: true };
+  });
+
+  // DOD-M12B-DELIVERY-QUIET-1: drive the delivery-open intent directly, so the doorbell exemption
+  // is testable without standing up a document, a peer daemon and a real directory negotiation.
+  // The registry's begin() hands back a closure, so the releases are held here by key.
+  const testDeliveryReleases = new Map<string, () => void>();
+  handlers.set("__test_delivery_open_begin", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const peerPubkey = params?.peerPubkey as string | undefined;
+    if (!agentName || !peerPubkey) return { error: "missing_params", guidance: "Provide agentName and peerPubkey." };
+    testDeliveryReleases.set(`${agentName} ${peerPubkey.toLowerCase()}`, deliveryOpens.begin(agentName, peerPubkey));
+    return { ok: true };
+  });
+  handlers.set("__test_delivery_open_end", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const peerPubkey = params?.peerPubkey as string | undefined;
+    if (!agentName || !peerPubkey) return { error: "missing_params", guidance: "Provide agentName and peerPubkey." };
+    const key = `${agentName} ${peerPubkey.toLowerCase()}`;
+    testDeliveryReleases.get(key)?.();
+    testDeliveryReleases.delete(key);
     return { ok: true };
   });
 
@@ -3753,15 +3811,26 @@ async function startDaemonHoldingLock(
             .map((row) => row.session_id)
             .reverse(),
         openSession: async (agent, peerAgentId, correlationId) => {
-          // The same path `cello_initiate_session` takes, now callable without an IPC connection.
-          const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
-            ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
-          };
-          if (res.ok !== true || typeof res.sessionId !== "string") {
-            return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+          // DOD-M12B-DELIVERY-QUIET-1: THIS is the only place the delivery worker opens a session,
+          // so bracketing it is what makes "who opened this" knowable everywhere else. The window
+          // must cover the whole open — the inbound doorbell on a co-resident pair fires DURING
+          // negotiation, and the initiator-side reachability hook fires just before this returns.
+          // Released in `finally`: a throw that left the intent registered would silence this
+          // peer's doorbell for the life of the process, which is a worse outage than the storm.
+          const releaseDeliveryOpen = deliveryOpens.begin(agent, peerAgentId);
+          try {
+            // The same path `cello_initiate_session` takes, now callable without an IPC connection.
+            const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
+              ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
+            };
+            if (res.ok !== true || typeof res.sessionId !== "string") {
+              return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+            }
+            logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
+            return { ok: true, sessionId: res.sessionId };
+          } finally {
+            releaseDeliveryOpen();
           }
-          logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
-          return { ok: true, sessionId: res.sessionId };
         },
         sealSession: async (agent, sessionId, correlationId) => {
           // §16.4: the autonomous session still carries the seal — the ceremony goes to zero, the
