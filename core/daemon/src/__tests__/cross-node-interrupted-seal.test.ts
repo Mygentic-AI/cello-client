@@ -59,6 +59,10 @@ function harness(opts: {
   const sessionNodeManager = {
     getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: opts.status }),
     submitSealLeaf,
+    // DOD-M12B-INTERRUPTED-ESCALATE-1: the interrupted close now escalates to a unilateral seal,
+    // which carries the leaf chain to the directory. No leaves in these stubs — the assertions here
+    // are about WHICH calls happen, not what the directory verifies.
+    getSealCarry: () => [],
     getSealCertificate: () => null,
     resolveAgentId: () => "aid",
     setSessionName: () => {},
@@ -85,6 +89,7 @@ function harness(opts: {
     resolveConsortiumRoster: async () => [
       { nodeId: BROKER, peerId: "12D3KooWBroker", multiaddr: "/ip4/10.10.1.25/tcp/4000" },
     ],
+    unilateralTimeoutMs: 10,
     // The real shape the flow returns: a bilateral commitment, NOT a sealed root. The flow cannot
     // produce one — the daemon holds no threshold signer.
     handleSealInterruptedFlow: async () => ({ ok: true, sessionId: SESSION, status: "seal_interrupted_pending" }),
@@ -202,6 +207,7 @@ describe("an interrupted close asks the relay to notarize, not just the counterp
       sessionNodeManager: {
         getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "interrupted" }),
         submitSealLeaf,
+        getSealCarry: () => [],
         getSealCertificate: () => null,
         resolveAgentId: () => "aid",
         setSessionName: () => {},
@@ -221,6 +227,7 @@ describe("an interrupted close asks the relay to notarize, not just the counterp
       pendingSealWaiters: new Map(),
       pendingUnilateralWaiters: new Map(),
       resolveConsortiumRoster: async () => [],
+      unilateralTimeoutMs: 10,
       // The counterparty refused — there is no agreed record to notarize.
       handleSealInterruptedFlow: async () => ({ ok: false, reason: "seal_interrupted_rejected_by_counterparty", guidance: "" }),
       handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),

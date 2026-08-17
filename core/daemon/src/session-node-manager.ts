@@ -1097,6 +1097,11 @@ export class SessionNodeManager {
       // that has talked three times can never talk again. NULL means "not recorded" and is treated
       // as the counterparty's, because the safe default for an anti-abuse bound is to count it.
       "ALTER TABLE sessions ADD COLUMN interrupted_by TEXT",
+      // DOD-M12B-RESTART-SEAL-1: when automatic sealing exhausted this session, and why. Durable
+      // because the resolver's attempt budget is in memory — without it a machine that restarts
+      // several times a day re-runs the whole budget against a hopeless session on every boot.
+      "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_at INTEGER",
+      "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_reason TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -3642,9 +3647,21 @@ export class SessionNodeManager {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
+        // `message_count > 0` — a never-messaged interrupted session is a dead HANDSHAKE, which
+        // `classifySession` deliberately hides in the "failed" bucket so it does not clutter
+        // status. Sealing one spends a directory ceremony to obtain a receipt over nothing, and
+        // then moves it into the operator's CLOSED list, making the clutter visible. The whole
+        // justification for this work is "3,576 messages produced nothing" — zero messages is
+        // nothing to produce.
+        //
+        // `restart_seal_gave_up_at IS NULL` — a session we have already exhausted. Without it a
+        // machine restarting ~6 times a day re-runs five ceremonies against a hopeless session on
+        // every boot, forever.
         `SELECT s.session_id AS session_id, s.message_count AS message_count, a.agent_name AS agent_name
          FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
          WHERE s.status = 'interrupted' AND s.interrupted_by = 'local' AND a.state != 'retired'
+           AND s.message_count > 0
+           AND s.restart_seal_gave_up_at IS NULL
          ORDER BY s.updated_at ASC`,
       )
       .all() as unknown as Array<{ session_id: string; message_count: number; agent_name: string }>;
@@ -3653,6 +3670,21 @@ export class SessionNodeManager {
       sessionId: r.session_id,
       messageCount: r.message_count ?? 0,
     }));
+  }
+
+  /**
+   * DOD-M12B-RESTART-SEAL-1 — record that automatic sealing has exhausted this session.
+   *
+   * Durable on purpose. The resolver's attempt budget is in memory, so without this the budget
+   * resets on every boot and a session that can never seal costs five directory ceremonies a day
+   * for the life of the machine. Clearing the column (or a manual `cello_close_session`) is what
+   * puts a session back in scope.
+   */
+  markRestartSealGaveUp(agentName: string, sessionId: string, reason: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET restart_seal_gave_up_at = ?, restart_seal_gave_up_reason = ? WHERE agent_id = ? AND session_id = ?")
+      .run(Date.now(), reason, this.#requireAgentId(agentName), sessionId);
   }
 
   /**

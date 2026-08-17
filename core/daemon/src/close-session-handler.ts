@@ -10,6 +10,14 @@
  * SI-001: there is NO auto-seal on a session_interrupted receipt. The operator must close
  * explicitly. A daemon that sealed on its own would notarize a conversation nobody chose to end.
  *
+ * SI-001 IS NARROWER THAN IT READS, and the boundary matters (DOD-M12B-RESTART-SEAL-1, 2026-08-17).
+ * It governs a LIVE interruption — the relay says the counterparty vanished while the operator is at
+ * the keyboard and may still want to wait. `restart-seal-resolver.ts` seals a different population:
+ * sessions OUR OWN stop destroyed (`interrupted_by = 'local'`), which cannot be resumed because the
+ * transport keypairs died with the process. There the only alternative is force-abandon, which
+ * forfeits the receipt — so the choice is seal-or-abandon, not seal-or-resume. Nothing the
+ * counterparty caused is auto-sealed, and SI-001 holds unchanged for it.
+ *
  * This was on my DO-NOT-CUT list. It has fifteen dependencies — a long list, but a KNOWN one, and
  * that is the entire difference from a closure over 73 shared locals.
  */
@@ -83,6 +91,13 @@ export interface CloseSessionDeps {
   pendingUnilateralWaiters: Map<string, (r: UnilateralResult) => void>;
   /** The verified consortium roster, re-resolved at ceremony time. */
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
+  /**
+   * DOD-M12B-INTERRUPTED-ESCALATE-1: how long to wait for the directory's answer to a
+   * `seal_unilateral` request. Default 30_000. Injectable because this wait now sits on the
+   * INTERRUPTED close path too, and a suite that exercises it should not spend half a minute per
+   * case discovering that a stub never answers.
+   */
+  unilateralTimeoutMs?: number;
   // ── the two seal-initiation flows (seal-flows.ts) ──
   handleSealInterruptedFlow: (sessionId: string, record: SessionRecord, correlationId: string, merkleRootAtInterruption: string, via?: SignalingManager) => Promise<SealFlowResult>;
   handleActiveSealFlow: (sessionId: string, record: SessionRecord, correlationId: string) => Promise<ActiveSealResult>;
@@ -98,6 +113,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
     recoverParkedContent,
   } = deps;
+  const UNILATERAL_TIMEOUT_MS = deps.unilateralTimeoutMs ?? 30_000;
 
   /**
    * How long the seal path waits to learn where the counterparty is homed.
@@ -285,6 +301,108 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   };
 
   handlers.set("cello_close_session", closeSession);
+
+  /**
+   * DOD-M12B-INTERRUPTED-ESCALATE-1 — ask the directory to notarize with the counterparty absent.
+   *
+   * Extracted from the ACTIVE branch so the INTERRUPTED branch can reach it too. It could not
+   * before: every exit from the interrupted branch is a `return`, so the active block below it —
+   * the only place this code lived — was structurally unreachable for an interrupted session. The
+   * result was that an interrupted session could never obtain a receipt, **even when a human closed
+   * it by hand**: it reached `seal_interrupted_pending`, a mutually signed record nobody was ever
+   * asked to notarize, and stopped there. 26 sessions sat in that state for up to 10.5 days.
+   *
+   * The directory enforces the delivery-grace gate and answers `seal_unilateral_too_early` with the
+   * time remaining, which is returned as `retry_after_seconds` so a caller that can wait does not
+   * have to be a human reading a sentence.
+   */
+  const escalateToUnilateralSeal = async (
+    record: SessionRecord,
+    sessionId: string,
+    escalation: { reportedRootHex: string; sequenceNumber: number },
+    correlationId: string,
+  ): Promise<
+    | { ok: true; sealed_root: string; seal_type: "unilateral"; legibility?: unknown }
+    | { ok: false; reason: string; retry_after_seconds?: number; guidance: string }
+  > => {
+    let resolveUni!: (r: UnilateralResult) => void;
+    const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
+    pendingUnilateralWaiters.set(sessionId, resolveUni);
+    // FED-OPTIONB-SEAL-001 (Option B): carry the full leaf chain (both parties) + the relay receipts so
+    // the directory rebuilds + verifies the tree OFFLINE — no directory→relay getSealLeaves dial. The
+    // store is keyed by the agent's K_local pubkey (the same key the relay client recorded under).
+    const sealAgentKp = getKeyProvider(record.agent_name);
+    const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
+    const sealCarry = sealAgentPubkeyHex ? sessionNodeManager.getSealCarry(sealAgentPubkeyHex, sessionId) : [];
+    const seal_leaves = sealCarry.map((l) => ({
+      sequence_number: l.sequenceNumber,
+      leaf_kind: l.leafKind,
+      structure2_cbor: l.structure2Cbor,
+      structure1_cbor: l.structure1Cbor,
+      // Relay receipt (present only for the present party's OWN leaves — the seq-pinning teeth).
+      relay_id: l.relayId,
+      relay_timestamp: l.relayTimestamp,
+      relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
+    }));
+    const sent = await sendOver(record.agent_name, {
+      type: "seal_unilateral",
+      session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
+      reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
+      reported_seq: escalation.sequenceNumber,
+      seal_leaves,
+    });
+    if (!sent.ok) {
+      pendingUnilateralWaiters.delete(sessionId);
+      return {
+        ok: false,
+        reason: "seal_unilateral_send_failed",
+        guidance: "The unilateral seal request could not be sent to the directory. Check the directory connection (cello status) and retry cello_close_session.",
+      };
+    }
+    let uniTimer!: ReturnType<typeof setTimeout>;
+    const uniTimeoutP = new Promise<UnilateralResult>((r) => {
+      uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), UNILATERAL_TIMEOUT_MS);
+    });
+    const uniResult = await Promise.race([uniP, uniTimeoutP]);
+    clearTimeout(uniTimer);
+    pendingUnilateralWaiters.delete(sessionId);
+    if (uniResult.ok) {
+      logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
+      crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
+      // M8B FINDING-3 (cascade-2): return the legibility certificate inline — same shape as the
+      // bilateral close (AC-006) — so the operator gets the receipt on the surface that proves
+      // the seal, not just a bare root. It is also persisted for cello_get_sealed_receipt.
+      return {
+        ok: true,
+        sealed_root: uniResult.sealedRootHex,
+        seal_type: "unilateral",
+        ...(uniResult.legibility !== undefined ? { legibility: uniResult.legibility } : {}),
+      };
+    }
+    if (uniResult.reason === "seal_unilateral_too_early") {
+      // F20: tell the operator WHEN the unilateral seal becomes available, not just "later".
+      const when =
+        typeof uniResult.remainingSeconds === "number"
+          ? `A unilateral seal becomes available in ~${uniResult.remainingSeconds}s. `
+          : "";
+      return {
+        ok: false,
+        reason: "seal_counterparty_pending",
+        // DOD-M12B-RESTART-SEAL-1: the deadline as a NUMBER, not only inside the sentence. The
+        // directory tells us exactly when this becomes allowed and, until now, the only consumer of
+        // that fact was English prose asking a human to come back in eleven minutes.
+        ...(typeof uniResult.remainingSeconds === "number"
+          ? { retry_after_seconds: uniResult.remainingSeconds }
+          : {}),
+        guidance: `Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. ${when}Retry cello_close_session after the grace period, or once the counterparty closes.`,
+      };
+    }
+    return {
+      ok: false,
+      reason: uniResult.reason,
+      guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_sessions) before retrying cello_close_session.",
+    };
+  };
 
   const runClose = async (params: Record<string, unknown> | undefined, connectionId: string): Promise<unknown> => {
     const connState = getConnState(connectionId);
@@ -611,8 +729,24 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // No waiter is registered and nothing is awaited: the counterparty may not close for hours, and
       // blocking a close on that would be a worse lie than returning the honest pending status. When
       // their leaf does land, the already-wired session_sealed listener records the certificate.
-      const notarize = async (result: SealFlowResult): Promise<SealFlowResult> => {
-        if (!result.ok) return result;
+      //
+      // DOD-M12B-INTERRUPTED-ESCALATE-1: submitting the leaf was never enough, and this is where
+      // the receipt actually gets earned. The relay notarizes only once BOTH parties have posted a
+      // SEAL ctrl leaf, and the responder never posts one — `inbound-seal-request.ts` persists its
+      // commitment, acks, and stops. So waiting for the relay round here is waiting for something
+      // that cannot happen. The escalation asks the directory to notarize with the counterparty
+      // ABSENT, which is precisely what a unilateral seal is for.
+      const notarize = async (result: SealFlowResult): Promise<unknown> => {
+        // WHEN IT IS ALLOWED TO ESCALATE, and this is a trust decision, not a retry policy:
+        //   result.ok                                  — both sides signed the same root. Agreed.
+        //   seal_interrupted_counterparty_unavailable  — they never answered. The exact case the
+        //                                                unilateral seal exists for.
+        // NEVER after `seal_interrupted_rejected_by_counterparty`. A rejection means the two trees
+        // DISAGREE (leaf_count_mismatch, a diverging index). Notarizing our own root over their
+        // stated objection is the one thing a trust layer must not do, however stuck the session is.
+        const mayEscalate = result.ok || result.reason === "seal_interrupted_counterparty_unavailable";
+        if (!mayEscalate) return result;
+
         const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
         if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
           logger.info("session.interrupted.seal.leaf.submitted", {
@@ -625,7 +759,35 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
               "both sides hold a signed commitment, but no notarization was requested — this session has no receipt and cannot get one once the relay drops it",
           });
         }
-        return result;
+
+        // The root and sequence the directory verifies against. `responder_seal_already_submitted`
+        // carries them from the FIRST submit, so a repeat close can still escalate (M8B FINDING-1).
+        const escalation = submitted.ok
+          ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
+          : typeof submitted.reportedRootHex === "string" && typeof submitted.sequenceNumber === "number"
+            ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
+            : null;
+        if (!escalation) return result;
+
+        const uni = await escalateToUnilateralSeal(record, sessionId, escalation, correlationId);
+        if (uni.ok) return uni; // A REAL RECEIPT — the whole point of this line.
+
+        // BEST-EFFORT, and the commitment STANDS. Turning a successful commitment into a reported
+        // failure is exactly what sends an operator to `force: true`, which permanently forfeits the
+        // half they still hold — the comment above says so and it is still true. What changes is
+        // that the answer now says a receipt is OUTSTANDING rather than implying one exists, and
+        // carries the directory's own countdown so a caller that can wait does not have to guess.
+        logger.info("session.interrupted.seal.escalation.pending", {
+          agentName: record.agent_name, sessionId, reason: uni.reason, correlationId,
+          ...(uni.retry_after_seconds !== undefined ? { retryAfterSeconds: uni.retry_after_seconds } : {}),
+        });
+        return {
+          ...(result as Record<string, unknown>),
+          seal_receipt: "outstanding",
+          seal_pending_reason: uni.reason,
+          ...(uni.retry_after_seconds !== undefined ? { retry_after_seconds: uni.retry_after_seconds } : {}),
+          guidance: uni.guidance,
+        };
       };
 
       try {
@@ -647,7 +809,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         sealBrokerConn = await openSealBrokerConnection(
           record.agent_name, sessionId, correlationId, { counterpartyPubkeyHex: counterparty },
         );
-        if (!sealBrokerConn) return first;
+        // Escalate even here: discovery found nowhere to dial, which is the STRONGEST case for a
+        // unilateral seal, not a reason to give up on the receipt.
+        if (!sealBrokerConn) return await notarize(first);
         logger.info("session.seal.broker.retry_after_discovery", { agentName: record.agent_name, sessionId, correlationId });
         // OVER THE VISITING CONNECTION. Dialling their node is only half of it — the request must
         // be SENT there too. Sent on the home stream it reaches our own node, which holds no stream
@@ -833,87 +997,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         }
 
         // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
-        // seal — submit a seal_unilateral request carrying our reported_root (the content-hash
-        // root the directory rebuilds from the relay chain and verifies). The directory enforces
-        // the delivery-grace gate; if grace has not elapsed it replies seal_unilateral_too_early.
-        let resolveUni!: (r: UnilateralResult) => void;
-        const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
-        pendingUnilateralWaiters.set(sessionId, resolveUni);
-        // FED-OPTIONB-SEAL-001 (Option B): carry the full leaf chain (both parties) + the relay receipts so
-        // the directory rebuilds + verifies the tree OFFLINE — no directory→relay getSealLeaves dial. The
-        // store is keyed by the agent's K_local pubkey (the same key the relay client recorded under).
-        const sealAgentKp = getKeyProvider(record.agent_name);
-        const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
-        const sealCarry = sealAgentPubkeyHex ? sessionNodeManager.getSealCarry(sealAgentPubkeyHex, sessionId) : [];
-        const seal_leaves = sealCarry.map((l) => ({
-          sequence_number: l.sequenceNumber,
-          leaf_kind: l.leafKind,
-          structure2_cbor: l.structure2Cbor,
-          structure1_cbor: l.structure1Cbor,
-          // Relay receipt (present only for the present party's OWN leaves — the seq-pinning teeth).
-          relay_id: l.relayId,
-          relay_timestamp: l.relayTimestamp,
-          relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
-        }));
-        const sent = await sendOver(record.agent_name, {
-          type: "seal_unilateral",
-          session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
-          reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
-          reported_seq: escalation.sequenceNumber,
-          seal_leaves,
-        });
-        if (!sent.ok) {
-          pendingUnilateralWaiters.delete(sessionId);
-          return {
-            ok: false,
-            reason: "seal_unilateral_send_failed",
-            guidance: "The unilateral seal request could not be sent to the directory. Check the directory connection (cello status) and retry cello_close_session.",
-          };
-        }
-        let uniTimer!: ReturnType<typeof setTimeout>;
-        const uniTimeoutP = new Promise<UnilateralResult>((r) => {
-          uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), 30_000);
-        });
-        const uniResult = await Promise.race([uniP, uniTimeoutP]);
-        clearTimeout(uniTimer);
-        pendingUnilateralWaiters.delete(sessionId);
-        if (uniResult.ok) {
-          logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
-          crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
-          // M8B FINDING-3 (cascade-2): return the legibility certificate inline — same shape as the
-          // bilateral close (AC-006) — so the operator gets the receipt on the surface that proves
-          // the seal, not just a bare root. It is also persisted (above) for cello_get_sealed_receipt.
-          return {
-            ok: true,
-            sealed_root: uniResult.sealedRootHex,
-            seal_type: "unilateral",
-            ...(uniResult.legibility !== undefined ? { legibility: uniResult.legibility } : {}),
-          };
-        }
-        if (uniResult.reason === "seal_unilateral_too_early") {
-          // F20: tell the operator WHEN the unilateral seal becomes available, not just "later".
-          const when =
-            typeof uniResult.remainingSeconds === "number"
-              ? `A unilateral seal becomes available in ~${uniResult.remainingSeconds}s. `
-              : "";
-          return {
-            ok: false,
-            reason: "seal_counterparty_pending",
-            // DOD-M12B-RESTART-SEAL-1: the deadline as a NUMBER, not only inside the sentence.
-            // The directory tells us exactly when this becomes allowed and, until now, the only
-            // consumer of that fact was English prose asking a human to come back in eleven
-            // minutes. A caller that can wait — the restart-seal resolver — needs it as data.
-            ...(typeof uniResult.remainingSeconds === "number"
-              ? { retry_after_seconds: uniResult.remainingSeconds }
-              : {}),
-            guidance: `Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. ${when}Retry cello_close_session after the grace period, or once the counterparty closes.`,
-          };
-        }
-        return {
-          ok: false,
-          reason: uniResult.reason,
-          guidance: "The unilateral seal did not complete (the directory could not verify the reported root, or the certificate failed verification). Confirm your messages reached the relay (cello_sessions) before retrying cello_close_session.",
-        };
+        // seal. The body now lives in escalateToUnilateralSeal so the INTERRUPTED branch can reach
+        // it too — it never could, and that is why an interrupted session could not get a receipt.
+        return await escalateToUnilateralSeal(record, sessionId, escalation, correlationId);
       } finally {
         // Fix #1: release the transient broker seal-connection (best-effort; the seal result stands).
         if (sealBrokerConn) {

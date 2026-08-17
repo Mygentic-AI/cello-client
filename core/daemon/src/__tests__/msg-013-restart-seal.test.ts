@@ -83,6 +83,7 @@ function makeResolver(opts: {
   maxAttemptsPerSession?: number;
   staggerMs?: number;
   initialDelayMs?: number;
+  attemptTimeoutMs?: number;
 }) {
   const { logger, events } = makeLogger();
   const clock = makeClock();
@@ -100,6 +101,7 @@ function makeResolver(opts: {
     initialDelayMs: opts.initialDelayMs ?? 0,
     ...(opts.staggerMs !== undefined ? { staggerMs: opts.staggerMs } : {}),
     ...(opts.maxAttemptsPerSession !== undefined ? { maxAttemptsPerSession: opts.maxAttemptsPerSession } : {}),
+    ...(opts.attemptTimeoutMs !== undefined ? { attemptTimeoutMs: opts.attemptTimeoutMs } : {}),
   });
   return { resolver, clock, attempts, events, named: (e: string) => events.filter((x) => x.event === e) };
 }
@@ -167,6 +169,39 @@ describe("DOD-M12B-RESTART-SEAL-1: a restart-orphaned session seals itself", () 
     expect(h.clock.pendingCount(), "nothing may still be scheduled after giving up").toBe(0);
   });
 
+  it("a refusal the COUNTERPARTY authored costs one attempt, not five — asking again is badgering", async () => {
+    // Measured: `seal_interrupted_rejected_by_counterparty` fired 18 times. They declined. A
+    // machine that comes back four more times over fifteen minutes is not being persistent.
+    const h = makeResolver({
+      orphans: [ORPHAN("aa")],
+      seal: async () => ({ ok: false, reason: "seal_interrupted_rejected_by_counterparty" }),
+      maxAttemptsPerSession: 5,
+    });
+    h.resolver.start();
+    await h.clock.advance(60 * 60 * 1000);
+
+    expect(h.attempts.length, "one attempt — a no is a no").toBe(1);
+    const gave = h.named("session.restart_seal.gave_up");
+    expect(gave[0]!.ctx["stoppedBecause"], "and it must say WHY it stopped, not just that it did").toBe("refusal_is_terminal");
+  });
+
+  it("a refusal that MIGHT clear is still retried — the terminal list must not swallow the recoverable", async () => {
+    // The counterweight. `session_incomplete` means a gap, and the close's own guidance says a relay
+    // pull may fill it; `seal_unilateral_timeout` (50 occurrences, the largest single blocker) is a
+    // directory that did not answer in time. Marking either terminal would strand every session it
+    // touches on the first try.
+    for (const reason of ["session_incomplete", "seal_unilateral_timeout"]) {
+      const h = makeResolver({
+        orphans: [ORPHAN("aa")],
+        seal: async () => ({ ok: false, reason }),
+        maxAttemptsPerSession: 3,
+      });
+      h.resolver.start();
+      await h.clock.advance(60 * 60 * 1000);
+      expect(h.attempts.length, `${reason} must be retried, not given up on`).toBe(3);
+    }
+  });
+
   it("stop() halts it — a shutdown must not start new seal work, and a scheduled retry must not fire", async () => {
     // DOD-M12B-SHUTDOWN-1's rule: a shutdown that keeps starting new outbound work is not draining.
     // A seal is a directory ceremony, which is the most outbound thing this daemon does.
@@ -230,6 +265,58 @@ describe("DOD-M12B-RESTART-SEAL-1: a restart-orphaned session seals itself", () 
     expect(h.attempts.length).toBe(0);
     expect(h.events.length, "a clean boot must be silent here").toBe(0);
     expect(h.clock.pendingCount(), "and must leave no timer behind").toBe(0);
+  });
+
+  it("the PRODUCTION defaults are the documented ones — deleting one must not be silent", async () => {
+    // Every other case here overrides the knobs, so the shipped values were exercised by nothing:
+    // set DEFAULT_INITIAL_DELAY_MS to 0, or DEFAULT_MAX_ATTEMPTS to 1, and the whole suite stayed
+    // green while production behaviour changed. This constructs the resolver with NO overrides
+    // except the clock, and pins the three numbers by the behaviour they produce.
+    const { logger } = makeLogger();
+    const clock = makeClock();
+    const attempts: number[] = [];
+    const resolver = new RestartSealResolver({
+      logger,
+      listRestartOrphans: () => [ORPHAN("aa"), ORPHAN("bb")],
+      sealSession: async () => { attempts.push(clock.now()); return { ok: false, reason: "seal_unilateral_timeout" }; },
+      now: clock.now,
+      schedule: clock.schedule,
+    });
+    const t0 = clock.now();
+    resolver.start();
+
+    await clock.advance(29_000);
+    expect(attempts.length, "DEFAULT_INITIAL_DELAY_MS must be 30 s — a seal needs the directory").toBe(0);
+    await clock.advance(2_000);
+    expect(attempts.length).toBe(1);
+    expect(attempts[0]! - t0).toBe(30_000);
+
+    // DEFAULT_STAGGER_MS: the second orphan follows 5 s later, not immediately.
+    await clock.advance(3_000);  // t0+34 s: one second short of the 5 s stagger
+    expect(attempts.length, "DEFAULT_STAGGER_MS must be 5 s — hundreds of orphans must not become hundreds of ceremonies").toBe(1);
+    await clock.advance(2_000);
+    expect(attempts.length).toBe(2);
+
+    // DEFAULT_MAX_ATTEMPTS: five per session, ten across the two, then nothing more ever.
+    await clock.advance(24 * 60 * 60 * 1000);
+    expect(attempts.length, "DEFAULT_MAX_ATTEMPTS must be 5 per session").toBe(10);
+    expect(clock.pendingCount(), "and it must leave no timer behind when it is done").toBe(0);
+  });
+
+  it("an attempt that never settles does not wedge the queue silently", async () => {
+    // Without a ceiling, `#running` stays true with no timer armed and no log line: the resolver
+    // stalls holding a full queue, and nothing anywhere says so.
+    const h = makeResolver({
+      orphans: [ORPHAN("aa")],
+      seal: () => new Promise<SealOutcome>(() => { /* never settles */ }),
+      maxAttemptsPerSession: 2,
+    });
+    h.resolver.start();
+    await h.clock.advance(60 * 60 * 1000);
+
+    const gave = h.named("session.restart_seal.gave_up");
+    expect(gave.length, "a hung close must still reach a reported end").toBe(1);
+    expect(gave[0]!.ctx["reason"]).toBe("restart_seal_attempt_timeout");
   });
 
   it("a session that seals is never retried, and start() twice does not double-enqueue", async () => {

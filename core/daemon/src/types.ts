@@ -362,6 +362,13 @@ export interface DaemonConfig {
    */
   restartSealInitialDelayMs?: number;
   /**
+   * DOD-M12B-RESTART-SEAL-1: gap between two restart-seal attempts, in ms. Default 5_000 — a seal
+   * is a directory ceremony and a machine holding hundreds of orphans must not answer a restart
+   * with hundreds of simultaneous ones. Tests set it small so every queued row lands inside the
+   * assertion window; without that a scope test passes because of the stagger, not the guard.
+   */
+  restartSealStaggerMs?: number;
+  /**
    * Low-level dialer backing the transport selector in
    * production environments (dev/staging/production). Wraps a CelloNode (direct +
    * relay circuit dial) and the daemon relay registry. Required for production

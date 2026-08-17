@@ -35,7 +35,15 @@ export interface RestartOrphan {
  */
 export type SealOutcome =
   | { ok: true }
-  | { ok: false; reason: string; retryAfterSeconds?: number };
+  | {
+      ok: false;
+      reason: string;
+      retryAfterSeconds?: number;
+      /** The close path's own guidance. Carried, never replaced — see the give-up log. */
+      guidance?: string;
+      /** Everything the close computed about WHY, so `reason` stops being the only fact. */
+      detail?: Record<string, unknown>;
+    };
 
 export interface ScheduledTask {
   cancel: () => void;
@@ -46,6 +54,11 @@ export interface RestartSealResolverDeps {
   /** Sessions with status 'interrupted' AND interrupted_by 'local'. Nothing else is eligible. */
   listRestartOrphans: () => RestartOrphan[];
   sealSession: (agentName: string, sessionId: string) => Promise<SealOutcome>;
+  /**
+   * Record DURABLY that this session was given up on, so the next boot does not start over.
+   * Without it a machine restarting ~6 times a day re-attempts a hopeless session forever.
+   */
+  markGaveUp?: (agentName: string, sessionId: string, reason: string) => void;
   now?: () => number;
   schedule?: (fn: () => void, ms: number) => ScheduledTask;
   /** Gap between two seal attempts. */
@@ -58,7 +71,39 @@ export interface RestartSealResolverDeps {
   initialDelayMs?: number;
   /** Hard ceiling on attempts for one session before it is reported as needing a manual decision. */
   maxAttemptsPerSession?: number;
+  /**
+   * Ceiling on ONE seal attempt. A close that never settles would otherwise leave `#running` true
+   * with no timer armed and no log line — the resolver stalls, holding a full queue, silently.
+   */
+  attemptTimeoutMs?: number;
 }
+
+/**
+ * Refusals no retry can ever help, so they cost ONE attempt and not fifteen minutes.
+ *
+ * Measured 2026-08-17 across 443 submitted seal leaves and 183 completed seals — 59% of seals that
+ * start never finish, and these are the reasons where trying again is not persistence:
+ *
+ *   session_abandoned                          10× — terminal by definition; the receipt is gone.
+ *   leaf_count_mismatch                         4× — the two trees genuinely disagree.
+ *   seal_interrupted_rejected_by_counterparty  18× — they said NO. Asking again is worse than
+ *                                                    noise: it is a machine badgering a peer who
+ *                                                    already declined.
+ *
+ * `session_incomplete` and `seal_unilateral_timeout` are deliberately NOT here. The first can be
+ * fixed by a relay pull filling the gap — the close's own guidance says so — and the second is a
+ * directory that did not answer in time, which the next attempt may well get.
+ */
+const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([
+  "session_abandoned",
+  "leaf_count_mismatch",
+  "seal_interrupted_rejected_by_counterparty",
+  "session_already_sealed",
+  // Not protocol outcomes — a wiring or caller fault. Retrying re-runs the same bug.
+  "session_not_closeable",
+  "close_handler_missing",
+  "missing_params",
+]);
 
 const DEFAULT_STAGGER_MS = 5_000;
 /** Long enough for the directory handshake started moments earlier to have landed. */
@@ -66,6 +111,8 @@ const DEFAULT_INITIAL_DELAY_MS = 30_000;
 const DEFAULT_MAX_ATTEMPTS = 5;
 /** Backoff for a failure the directory gave no deadline for. Doubles, so a bounded run spans ~1 h. */
 const BASE_BACKOFF_MS = 60_000;
+/** Generous: a close does discovery, a broker dial, a relay submit and a directory round. */
+const DEFAULT_ATTEMPT_TIMEOUT_MS = 120_000;
 
 interface QueueItem {
   orphan: RestartOrphan;
@@ -87,6 +134,10 @@ export class RestartSealResolver {
   readonly #staggerMs: number;
   readonly #maxAttempts: number;
   readonly #initialDelayMs: number;
+  readonly #attemptTimeoutMs: number;
+  /** Resolves when no attempt is in flight — awaited by stop() so a shutdown does not cut a
+   *  ceremony in half and leave the two sides permanently divergent. */
+  #inFlight: Promise<unknown> | null = null;
 
   readonly #queue = new Map<string, QueueItem>();
   #timer: ScheduledTask | null = null;
@@ -101,6 +152,7 @@ export class RestartSealResolver {
     this.#staggerMs = deps.staggerMs ?? DEFAULT_STAGGER_MS;
     this.#maxAttempts = deps.maxAttemptsPerSession ?? DEFAULT_MAX_ATTEMPTS;
     this.#initialDelayMs = deps.initialDelayMs ?? DEFAULT_INITIAL_DELAY_MS;
+    this.#attemptTimeoutMs = deps.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
   }
 
   /** Enqueue every restart orphan and begin working through them. Idempotent. */
@@ -140,11 +192,17 @@ export class RestartSealResolver {
    * draining (DOD-M12B-SHUTDOWN-1) — and the flag, not the cancelled timer, is what an attempt
    * already in flight checks when it lands.
    */
-  stop(): void {
+  stop(): Promise<void> {
     this.#stopped = true;
     this.#timer?.cancel();
     this.#timer = null;
     this.#queue.clear();
+    // AWAIT what is already in flight. Severing signaling under a half-finished seal-interrupted
+    // exchange leaves the counterparty holding a commitment we never acknowledged: their session
+    // advances to `seal_interrupted_pending` and ours stays `interrupted`, permanently divergent
+    // and produced automatically on every shutdown. The attempt is already bounded by
+    // `attemptTimeoutMs`, so this cannot hold a shutdown open indefinitely.
+    return this.#inFlight ? this.#inFlight.then(() => undefined, () => undefined) : Promise.resolve();
   }
 
   /** Arm the next pass only while there is still work. An empty queue must leave NO timer behind —
@@ -187,11 +245,23 @@ export class RestartSealResolver {
     this.#running = true;
 
     let outcome: SealOutcome;
+    let attemptTimer: ScheduledTask | null = null;
     try {
-      outcome = await this.#deps.sealSession(item.orphan.agentName, item.orphan.sessionId);
+      const attempt = this.#deps.sealSession(item.orphan.agentName, item.orphan.sessionId);
+      this.#inFlight = attempt;
+      // A close that never settles must not wedge the queue silently.
+      const timeout = new Promise<SealOutcome>((resolve) => {
+        attemptTimer = this.#schedule(
+          () => resolve({ ok: false, reason: "restart_seal_attempt_timeout" }),
+          this.#attemptTimeoutMs,
+        );
+      });
+      outcome = await Promise.race([attempt, timeout]);
     } catch (err: unknown) {
       outcome = { ok: false, reason: err instanceof Error ? err.message : String(err) };
     } finally {
+      (attemptTimer as ScheduledTask | null)?.cancel();
+      this.#inFlight = null;
       this.#running = false;
     }
 
@@ -211,16 +281,39 @@ export class RestartSealResolver {
       return;
     }
 
-    if (item.attempts >= this.#maxAttempts) {
+    const terminal = TERMINAL_SEAL_REFUSALS.has(outcome.reason);
+    if (terminal || item.attempts >= this.#maxAttempts) {
       this.#queue.delete(key);
+      // DURABLE, so the next boot does not start the same five attempts over. A machine restarting
+      // ~6 times a day would otherwise re-try a hopeless session forever, which is the burst the
+      // stagger exists to prevent, merely spread out.
+      try { this.#deps.markGaveUp?.(item.orphan.agentName, item.orphan.sessionId, outcome.reason); }
+      catch (err: unknown) {
+        this.#deps.logger.warn("session.restart_seal.mark_gave_up.failed", {
+          sessionId: item.orphan.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+          impact: "this session will be re-attempted on every future boot",
+        });
+      }
       this.#deps.logger.warn("session.restart_seal.gave_up", {
         agentName: item.orphan.agentName,
         sessionId: item.orphan.sessionId,
         attempts: item.attempts,
         reason: outcome.reason,
+        // WHY it stopped, not just that it did. "We stopped because they refused" and "we stopped
+        // because we ran out of tries" are different facts and lead to different operator actions.
+        stoppedBecause: terminal ? "refusal_is_terminal" : "attempts_exhausted",
+        // The detail the close COMPUTED and used to drop one function later: which of the six
+        // causes behind `seal_interrupted_rejected_by_counterparty` this was, and the leaf counts
+        // that identify a frontier strand.
+        ...(outcome.detail ? { detail: outcome.detail } : {}),
+        // THE CLOSE'S OWN GUIDANCE WINS. A fixed string here told the operator to force-abandon —
+        // and for `session_already_sealed` the close handler says in capitals NOT to, because
+        // forcing there permanently forfeits a half that is still recoverable.
         guidance:
-          "This session could not be sealed automatically and is still interrupted. Close it with " +
-          "cello_close_session, or force-abandon it — which ends it WITHOUT a notarized receipt.",
+          outcome.guidance ??
+          ("This session could not be sealed automatically and is still interrupted. Close it with " +
+           "cello_close_session, or force-abandon it — which ends it WITHOUT a notarized receipt."),
       });
       this.#armIfWork();
       return;

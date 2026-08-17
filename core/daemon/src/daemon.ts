@@ -4288,7 +4288,7 @@ async function startDaemonHoldingLock(
     // this daemon does, and DOD-M12B-SHUTDOWN-1's rule is that a shutdown which keeps starting new
     // outbound work is not draining. Above the `daemon.stopped` log with the other cancels, because
     // this is "stop making new work", not "tear down transports".
-    restartSealResolver?.stop();
+    await restartSealResolver?.stop();
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // DOD-LOGOUT-EXIT-1: what the teardown actually DID, carried to onStopped so the binary can
     // exit non-zero on a dirty stop. Without it a shutdown that threw halfway — sessions never
@@ -4406,19 +4406,42 @@ async function startDaemonHoldingLock(
     ...(config.restartSealInitialDelayMs !== undefined
       ? { initialDelayMs: config.restartSealInitialDelayMs }
       : {}),
+    ...(config.restartSealStaggerMs !== undefined ? { staggerMs: config.restartSealStaggerMs } : {}),
     sealSession: async (agentName, sessionId) => {
       const close = handlers.get("cello_close_session");
       if (!close) return { ok: false, reason: "close_handler_missing" };
       const res = (await close({ session_id: sessionId, agent: agentName }, `restart-seal-${sessionId}`)) as
-        | { ok?: boolean; reason?: string; retry_after_seconds?: number }
+        | Record<string, unknown>
         | undefined;
-      if (res?.ok === true) return { ok: true };
+
+      // SUCCESS IS A RECEIPT, NOT AN `ok`. The interrupted close answers `ok: true` for a bilateral
+      // COMMITMENT that nobody has notarized — `seal_interrupted_pending`, the status this resolver
+      // exists to stop producing. Reading `ok` as success logged "resolved" for 137 sessions that
+      // got no receipt at all. `sealed_root` is present only when a notarization actually happened.
+      if (typeof res?.["sealed_root"] === "string" && (res["sealed_root"] as string).length > 0) {
+        return { ok: true };
+      }
+      // Everything the close computed about WHY, carried instead of collapsed. `reason` is an exit
+      // point — `seal_interrupted_rejected_by_counterparty` alone stands for six distinct causes,
+      // and the close already put the discriminating detail on the response.
+      const detail: Record<string, unknown> = {};
+      for (const k of ["rejection_reason", "your_leaf_count", "their_leaf_count", "diverging_leaf_index",
+                       "seal_pending_reason", "seal_receipt", "missing_leaves", "held_messages", "status"]) {
+        if (res?.[k] !== undefined) detail[k] = res[k];
+      }
+      const retry = res?.["retry_after_seconds"];
       return {
         ok: false,
-        reason: res?.reason ?? "close_returned_nothing",
-        ...(typeof res?.retry_after_seconds === "number" ? { retryAfterSeconds: res.retry_after_seconds } : {}),
+        reason: (typeof res?.["seal_pending_reason"] === "string" ? res["seal_pending_reason"] as string : undefined)
+          ?? (typeof res?.["reason"] === "string" ? res["reason"] as string : undefined)
+          ?? "close_returned_no_receipt",
+        ...(typeof retry === "number" ? { retryAfterSeconds: retry } : {}),
+        ...(typeof res?.["guidance"] === "string" ? { guidance: res["guidance"] as string } : {}),
+        ...(Object.keys(detail).length > 0 ? { detail } : {}),
       };
     },
+    markGaveUp: (agentName, sessionId, reason) =>
+      sessionNodeManager.markRestartSealGaveUp(agentName, sessionId, reason),
   });
   restartSealResolver.start();
 
