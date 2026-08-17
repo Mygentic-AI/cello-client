@@ -782,6 +782,18 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // structurally unreachable under normal configuration; override via the env var for
         // tests or operators who need a shorter window.
         const bilateralTimeoutMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
+        // DOD-M12B-CLOSE-SILENT-WAIT-1: SAY SO BEFORE THE SILENCE, not after it.
+        //
+        // This call is about to block for up to eleven minutes and return nothing. Measured
+        // 2026-08-17: seal leaf submitted 16:48:55, ceremony completed 17:00:01 — and the operator
+        // saw a frozen command for all of it. They concluded it was broken and force-abandoned
+        // seventeen sessions, which forfeits the exact receipt this wait is earning. The log is what
+        // a second window can read while the first is blocked, so it has to carry both facts: how
+        // long this can legitimately take, and what forcing costs.
+        logger.warn("session.seal.awaiting_counterparty", {
+          sessionId, agentName: record.agent_name, deadlineMs: bilateralTimeoutMs, correlationId,
+          impact: `this close will not answer for up to ${Math.round(bilateralTimeoutMs / 60_000)} minutes while it waits for the counterparty, then it escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
+        });
         let timer!: ReturnType<typeof setTimeout>;
         const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
         const sealedCompletion = await Promise.race([sealedP, timeoutP]);

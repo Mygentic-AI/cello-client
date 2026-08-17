@@ -124,6 +124,13 @@ export interface DaemonHandle {
   stop(reason: string): Promise<void>;
   getStatus(): DaemonStatusResponse;
   /**
+   * DOD-M12B-CLOSE-SILENT-WAIT-1 test hook: put a session into the state a normal close sits in for
+   * up to eleven minutes. Marks the real waiter map the status surface reads and emits the same
+   * start-of-wait line, so a test cannot pass against a flag production never sets.
+   * Not part of the production API surface.
+   */
+  markSealInFlightForTest(agentName: string, sessionId: string): void;
+  /**
    * AC-016 test hook: exposes the session node manager so integration tests can
    * call registerRelayStream directly and verify the composition root is wired.
    * Not part of the production API surface.
@@ -2072,6 +2079,12 @@ async function startDaemonHoldingLock(
         liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
         sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
         sealReadiness: probeSealReadiness(row.agent_name, row.session_id),
+        // DOD-M12B-CLOSE-SILENT-WAIT-1: both flows, because either can be the one blocking the
+        // operator's command — `pendingSealWaiters` is the active close, `sealInterruptedInProgress`
+        // the interrupted one.
+        sealing:
+          pendingSealWaiters.has(sealKey(row.agent_name, row.session_id)) ||
+          sealInterruptedInProgress.has(sealKey(row.agent_name, row.session_id)),
       };
     });
   }
@@ -4384,6 +4397,20 @@ async function startDaemonHoldingLock(
   const getHandlers = (): Map<string, IpcHandler> => handlers;
 
   return {
+    /**
+     * DOD-M12B-CLOSE-SILENT-WAIT-1 test seam: put a session into the state a normal close sits in
+     * for up to eleven minutes, and emit the same start-of-wait line the close emits. Marks the
+     * REAL waiter map the status surface reads, so a test cannot pass against a flag production
+     * never sets.
+     */
+    markSealInFlightForTest(agentName: string, sessionId: string): void {
+      const deadlineMs = Number(process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"]) || 660_000;
+      pendingSealWaiters.set(sealKey(agentName, sessionId), () => {});
+      logger.warn("session.seal.awaiting_counterparty", {
+        sessionId, agentName, deadlineMs,
+        impact: `this close will not answer for up to ${Math.round(deadlineMs / 60_000)} minutes while it waits for the counterparty, then it escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
+      });
+    },
     stop, getStatus, getSessionNodeManager, getTransportSelector, getAutoNatService, getTypeRegistry,
     getHandlers,
   };

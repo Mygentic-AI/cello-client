@@ -107,6 +107,10 @@ export interface TwoConnectionFixture {
   /** Drive the real inbound-content path, so the delivery buffer and the doorbell both fire. */
   ingestReceived(agent: string, sessionId: string, text: string, correlationId?: string): Promise<unknown>;
   eventsNamed(event: string): CapturedEvent[];
+  /** DOD-M12B-CLOSE-SILENT-WAIT-1: put a session into the state a normal close sits in for up to
+   *  eleven minutes, without waiting eleven minutes. Marks the real waiter map the status surface
+   *  reads, and emits the same start-of-wait log the close emits. */
+  markSealInFlightForTest(agent: string, sessionId: string): void;
   cleanup(): Promise<void>;
 }
 
@@ -195,6 +199,9 @@ export async function startTwoConnectionFixture(
     async ingestReceived(agent, sessionId, text, correlationId = "fixture-inbound") {
       const bytes = new TextEncoder().encode(text);
       return handle.getSessionNodeManager().ingestReceivedContent(agent, sessionId, bytes, msgLeafHash(bytes), correlationId);
+    },
+    markSealInFlightForTest(agent, sessionId) {
+      handle.markSealInFlightForTest(agent, sessionId);
     },
     eventsNamed(event) {
       return events.filter((e) => e.event === event);
