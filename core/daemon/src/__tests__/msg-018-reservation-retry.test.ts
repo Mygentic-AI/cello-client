@@ -180,6 +180,37 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
   let cleanup: (() => Promise<void>) | null = null;
   afterEach(async () => { if (cleanup) await cleanup(); cleanup = null; });
 
+  it("a circuit address WITHOUT the relay id still records the relay — the candidate is the floor", async () => {
+    // The held address is libp2p's string, not ours. If a transport ever reports it without
+    // `/p2p/<relayId>/p2p-circuit`, reading only it yields undefined — and an undefined relayPeerId
+    // makes the watchdog treat a healthy reservation as ABSENT and rebuild it, which would be a
+    // regression on the single-relay case that works today. The candidate string is ours and always
+    // carries the id.
+    class IdlessCircuitNode extends ReservationNode {
+      override listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/4001/p2p-circuit"]; }
+      override getConnections(): Array<{ peerId: string; encryption: string | undefined }> {
+        return [{ peerId: "12D3KooWRelay", encryption: "noise" }];
+      }
+    }
+    const { logger } = makeLogger();
+    const factory: ISessionNodeFactory = {
+      async createNode(c: SessionNodeConfig): Promise<CelloNode> {
+        const wantsRelay = (c.circuitRelayListenAddrs?.length ?? 0) > 0;
+        return (wantsRelay ? new IdlessCircuitNode(true) : new ReservationNode(false)) as unknown as CelloNode;
+      },
+    };
+    const { snm, dir } = await makeManager({ factory, logger, retryMs: 30 });
+    cleanup = async () => { await snm.gracefulShutdown(); await rm(dir, { recursive: true, force: true }); };
+
+    await snm.ensureStandingReceiverForAgent("alice");
+    await new Promise((r) => setTimeout(r, 200));
+
+    expect(
+      snm.getStandingReceiverReachability("alice"),
+      "it HAS a circuit address — an unparseable one must not read as no reservation at all",
+    ).toBe("reserved");
+  }, 30_000);
+
   it("the wait GROWS between attempts — a fixed interval is what churns a scarce relay", async () => {
     // THE CLAUSE THAT PROTECTS THE SCARCE RESOURCE, and it was the one with no assertion: replacing
     // the doubling with a flat `now + retryMs` left every other case green. A reservation is held by

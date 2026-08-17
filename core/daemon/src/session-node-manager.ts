@@ -7895,9 +7895,19 @@ export class SessionNodeManager {
     // finds it false on every tick forever, and rebuilds on the 30-second grid — churning the very
     // reservations this unit exists to conserve. Dormant while the pool is size 1; the pool is
     // designed to be larger.
+    // PREFER the held address, FALL BACK to the candidate — strictly better than either alone.
+    // The held address is authoritative about which relay actually granted, but it is libp2p's
+    // string, not ours: if a transport ever reports the circuit address without the relay's peer id
+    // in `/p2p/<id>/p2p-circuit` form, reading only it would yield UNDEFINED, and an undefined
+    // relayPeerId makes the watchdog treat a perfectly healthy reservation as absent and rebuild it.
+    // That would be a regression on the single-relay case that works today. The candidate string is
+    // ours and always carries the id, so it is the safe floor.
     const heldCircuitAddr = node.listenAddresses().find((a) => a.includes("/p2p-circuit"));
+    const CIRCUIT_RELAY_ID = /\/p2p\/([^/]+)\/p2p-circuit/;
     const reservedRelayPeerId =
-      circuitAddrs > 0 ? heldCircuitAddr?.match(/\/p2p\/([^/]+)\/p2p-circuit/)?.[1] : undefined;
+      circuitAddrs > 0
+        ? (heldCircuitAddr?.match(CIRCUIT_RELAY_ID)?.[1] ?? reservations.addrs[0]?.match(CIRCUIT_RELAY_ID)?.[1])
+        : undefined;
     this.#standingReceivers.set(agentName, {
       node,
       gater,
