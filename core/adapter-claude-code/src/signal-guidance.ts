@@ -38,4 +38,22 @@ export const SIGNAL_ERROR =
   "  signal: \"wrap\"\n" +
   "    This is your final message. You intend to close the session after\n" +
   "    sending. No reply is expected or needed.\n\n" +
-  "Example: cello_send({ cello_session_id: \"…\", content: \"…\", signal: \"over\" })";
+  "Example: cello_send({ cello_session_id: \"…\", content: \"…\", signal: \"over\" })\n" +
+  "     or: cello_send({ cello_session_id: \"…\", content: \"…\", signal: \"standby\", est_minutes: 10 })";
+
+/**
+ * Returned as `guidance` alongside `reason: "missing_est_minutes"`.
+ *
+ * Lives here rather than inline at the call site because it is the refusal you land on by TAKING
+ * the `standby` remedy above — the two are one path, and a caller who follows the first message into
+ * the second must not find the second written to a different standard. `10` is a real number rather
+ * than a `<placeholder>` for the same reason the marker prose shows a real call: whatever a refusal
+ * displays is what gets pasted back.
+ */
+export const EST_MINUTES_ERROR =
+  "Missing the required `est_minutes` parameter, which `signal: \"standby\"` needs.\n\n" +
+  "`est_minutes` is a PARAMETER of cello_send, a positive number of minutes until the follow-up\n" +
+  "message you are promising. Re-send the same call with both parameters set, for example:\n\n" +
+  "  cello_send({ cello_session_id: \"…\", content: \"…\", signal: \"standby\", est_minutes: 10 })\n\n" +
+  "If you are not going away to do work, you do not want standby — use signal: \"over\" instead and\n" +
+  "go straight to cello_receive.";

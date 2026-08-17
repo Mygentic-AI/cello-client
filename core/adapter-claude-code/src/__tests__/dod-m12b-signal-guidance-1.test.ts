@@ -25,9 +25,9 @@
  */
 
 import { setupV3Tests, describe, it, expect } from "@claude-flow/testing";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { SIGNAL_ERROR, SIGNAL_VALUES } from "../signal-guidance.js";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
+import { SIGNAL_ERROR, SIGNAL_VALUES, EST_MINUTES_ERROR } from "../signal-guidance.js";
 
 setupV3Tests();
 
@@ -68,16 +68,113 @@ describe("DOD-M12B-SIGNAL-GUIDANCE-1: the missing_signal refusal names the param
   });
 });
 
+describe("DOD-M12B-SIGNAL-GUIDANCE-1: the NEXT refusal on the same path", () => {
+  // Taking the `standby` remedy lands here. A caller who follows the first message into the second
+  // must not find the second written to a lower standard — that is how a two-step dead end forms.
+  it("names est_minutes as a parameter and shows a real number, not a placeholder to paste", () => {
+    expect(EST_MINUTES_ERROR).toMatch(/est_minutes/);
+    expect(EST_MINUTES_ERROR).toMatch(/parameter/i);
+    expect(EST_MINUTES_ERROR).not.toContain("[[");
+    expect(EST_MINUTES_ERROR).not.toMatch(/<number>|<n>|<minutes>/i);
+    expect(EST_MINUTES_ERROR).toMatch(/est_minutes:\s*\d+/);
+  });
+
+  it("names the way OUT — a caller who did not mean standby is told what to use instead", () => {
+    expect(EST_MINUTES_ERROR).toMatch(/signal:\s*"over"/);
+  });
+});
+
 describe("DOD-M12B-SIGNAL-GUIDANCE-1: the shim is wired to the shared constants", () => {
   const SHIM_SRC = join(import.meta.dirname, "..", "bin", "cello-mcp.ts");
   const source = readFileSync(SHIM_SRC, "utf8");
 
-  it("cello-mcp.ts returns the shared SIGNAL_ERROR rather than a second copy of the prose", () => {
-    expect(source).toMatch(/reason:\s*"missing_signal",\s*guidance:\s*SIGNAL_ERROR/);
+  /**
+   * SCOPE LIMIT, stated rather than left for a green suite to imply. These are SOURCE-TEXT
+   * assertions — the repo's established approach for this bin, because it is a side-effecting
+   * entrypoint that connects to the daemon on import and cannot be driven in-process. They pin the
+   * WIRING, not the handler's return value. An implementation that imported these constants,
+   * satisfied every check below, and then returned a different string would pass. Reading the
+   * handler confirms it does not; that is a gap in the proof, not a live defect.
+   */
+  it("cello-mcp.ts returns the shared constants rather than second copies of the prose", () => {
+    // Two independent containment checks, deliberately NOT one regex spanning both keys: a regex
+    // like /reason:.*guidance:/ goes red on a behaviour-preserving key reorder or a rewrap, which
+    // pins formatting rather than behaviour.
+    expect(source).toContain("guidance: SIGNAL_ERROR");
+    expect(source).toContain("guidance: EST_MINUTES_ERROR");
     expect(source).not.toContain("Missing signal token");
+    // The old inline est_minutes prose must not survive alongside the shared one.
+    expect(source).not.toContain("requires est_minutes (a positive number");
   });
 
   it("the accepted enum is built from SIGNAL_VALUES, so guidance and schema cannot drift apart", () => {
     expect(source).toContain("z.enum(SIGNAL_VALUES)");
+    // ...and no hand-written copy of the same list survives beside it, which is how the textual
+    // assertion above gets satisfied while the drift is quietly reopened.
+    expect(source).not.toMatch(/z\.enum\(\s*\[\s*"over"/);
+  });
+
+  it("every parameter the example names is a real parameter of the tool", () => {
+    // Clause 5 closed VALUE drift. This closes NAME drift: `cello_session_id` and `content` are
+    // free-floating prose inside the guidance, so renaming either would turn the worked example
+    // into a second dead end with the whole suite still green — the exact class this unit exists
+    // to close, closed for one half only.
+    const named = new Set(
+      [...SIGNAL_ERROR.matchAll(/cello_send\(\{([^}]*)\}\)/g)]
+        .flatMap((m) => [...m[1].matchAll(/(\w+)\s*:/g)].map((k) => k[1])),
+    );
+    expect(named.size).toBeGreaterThan(0);
+    // The zod shape is declared inline in the bin, so the schema keys are read from its source.
+    const shape = source.slice(source.indexOf('server.tool("cello_send"'));
+    for (const key of named) {
+      expect(shape, `guidance names \`${key}\`, which is not a parameter of cello_send`)
+        .toMatch(new RegExp(`\\n\\s*${key}:\\s*z\\.`));
+    }
+  });
+});
+
+/**
+ * THE OMISSION AUDIT — the half a grep for wrong phrasing structurally cannot find.
+ *
+ * The unit review of this line found two documentation surfaces still teaching the refused call:
+ * `core/adapter-claude-code/SKILL.md`, which SHIPS INSIDE the @cello-protocol/connect tarball, and
+ * `.claude/commands/cello-chat.md`, a loaded skill whose own description advertises troubleshooting.
+ * Neither contained a wrong string. Both were missing a right one — so searching for "must end
+ * with", "append the token" and "[[OVER]]" could never have surfaced them, and did not.
+ *
+ * Fixing the seven call sites fixes today. This test is what stops the eighth: a doc that shows an
+ * agent how to call cello_send and omits the required parameter is teaching it to fail, however
+ * correct every word on the page is.
+ */
+describe("DOD-M12B-SIGNAL-GUIDANCE-1: no doc teaches the call that gets refused", () => {
+  const REPO = join(import.meta.dirname, "..", "..", "..", "..");
+  const SKIP = new Set(["node_modules", "dist", ".git", "coverage", ".turbo"]);
+
+  function markdownFiles(dir: string, out: string[] = []): string[] {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (SKIP.has(entry.name)) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) markdownFiles(full, out);
+      else if (entry.name.endsWith(".md")) out.push(full);
+    }
+    return out;
+  }
+
+  it("every documented cello_send call names the signal parameter", () => {
+    const offenders: string[] = [];
+    for (const file of markdownFiles(REPO)) {
+      const lines = readFileSync(file, "utf8").split("\n");
+      lines.forEach((line, i) => {
+        // Only a CALL — prose that merely mentions cello_send is not teaching a call shape.
+        if (!line.includes("cello_send({")) return;
+        if (/\bsignal\b/.test(line)) return;
+        offenders.push(`${relative(REPO, file)}:${i + 1}  ${line.trim()}`);
+      });
+    }
+    expect(
+      offenders,
+      "these documented calls omit the required `signal` parameter, so an agent copying them is " +
+      "refused:\n" + offenders.join("\n"),
+    ).toEqual([]);
   });
 });

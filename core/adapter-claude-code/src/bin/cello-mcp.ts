@@ -13,7 +13,7 @@ import { createWriteStream, mkdirSync } from "node:fs";
 import { IpcProxy } from "../ipc-proxy.js";
 import { buildChannelParams } from "../channel-params.js";
 import { summarizeInboundFrame } from "../frame-trace.js";
-import { SIGNAL_ERROR, SIGNAL_VALUES } from "../signal-guidance.js";
+import { SIGNAL_ERROR, SIGNAL_VALUES, EST_MINUTES_ERROR } from "../signal-guidance.js";
 
 // --version flag — exit cleanly with the package version.
 // Must precede TTY detection so `cello-mcp --version` works in any context.
@@ -497,7 +497,7 @@ server.tool("cello_send", "Send a message in an active session. REQUIRED: every 
     return jsonText({ ok: false, reason: "missing_signal", guidance: SIGNAL_ERROR });
   }
   if (signal === "standby" && (est_minutes === undefined || !Number.isFinite(est_minutes) || est_minutes <= 0)) {
-    return jsonText({ ok: false, reason: "missing_est_minutes", guidance: "signal \"standby\" requires est_minutes (a positive number of minutes until your follow-up message)." });
+    return jsonText({ ok: false, reason: "missing_est_minutes", guidance: EST_MINUTES_ERROR });
   }
   const token =
     signal === "over" ? "[[OVER]]" :

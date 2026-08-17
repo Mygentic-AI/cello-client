@@ -116,7 +116,7 @@ cello_use_agent({ name: "alice" })              # selects the agent; auto-starts
 cello_initiate_session({ target_pubkey: "<their pubkey>" })
 → { ok: true, sessionId: "..." }
 
-cello_send({ cello_session_id: "<cello_session_id>", content: "hello" })
+cello_send({ cello_session_id: "<cello_session_id>", content: "hello", signal: "over" })
 cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
 → { content: "hello back", ... }
 ```
