@@ -26,6 +26,7 @@
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
+import { encode } from "cbor-x";
 import { join } from "node:path";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
@@ -217,12 +218,16 @@ describe("every seal-completion path flips the status itself", () => {
  * Without the durable recovery, the restart-seal resolver's automatic close posts a SECOND, the
  * directory then refuses `ctrlLeaves.length !== 1` forever, and the receipt is gone permanently.
  *
- * Revert test: make `#recoverOwnSealCtrlLeaf` return "none" unconditionally and the first case
- * fails — the manager reaches for the relay to post another leaf.
+ * Revert test: make `#recoverOwnSealCtrlLeaf` return "none" unconditionally and the RECOVERY case
+ * fails — a leaf that is on disk is reported absent, and the caller posts a second.
  */
 describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a ctrl leaf posted before the restart is recovered, not reposted", () => {
   let fx: TwoConnectionFixture | null = null;
   afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  async function ownPubkeyHex(f: TwoConnectionFixture): Promise<string> {
+    return (f.snm.getDb().prepare("SELECT k_local_pubkey FROM agents WHERE agent_name = 'alice'").get() as { k_local_pubkey: string }).k_local_pubkey;
+  }
 
   function seed(f: TwoConnectionFixture): void {
     f.snm.getDb().prepare(
@@ -230,6 +235,35 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a ctrl leaf posted before the restart
        VALUES (?, (SELECT agent_id FROM agents WHERE agent_name = 'alice'), ?, 'interrupted', ?, ?, 6, 'local')`,
     ).run(SID, PEER, Date.now(), Date.now());
   }
+
+  it("RECOVERS the root and sequence from a ctrl leaf a previous run posted — the answer that saves the receipt", async () => {
+    // The third answer, and the only one whose failure is permanent: if this returns "none" for a
+    // session that DOES hold our ctrl leaf, the caller posts a second, the directory then refuses
+    // `ctrlLeaves.length !== 1` forever, and the receipt is gone. It had no test at any level.
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016k-" });
+    seed(fx);
+    const own = await ownPubkeyHex(fx);
+    // The leaf store is created lazily; this call is what makes its table exist.
+    fx.snm.getSealCarry(own, SID);
+    // Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp] —
+    // the content hash at index 1 is what the root is rebuilt from, and it cannot be recomputed
+    // because the seal payload embeds a close_timestamp.
+    const contentHash = new Uint8Array(32).fill(0xa7);
+    fx.snm.getDb().prepare(
+      `INSERT INTO session_seal_leaves (agent_pubkey, session_id, sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, stored_at)
+       VALUES (?, ?, 7, 2, ?, ?, ?, 0)`,
+    ).run(own, SID, own, Buffer.from(encode([7])), Buffer.from(encode([1, contentHash, new Uint8Array(32), new Uint8Array(16), 0, 0])));
+
+    const got = fx.snm.recoverOwnSealCtrlLeafForTest("alice", SID);
+    expect(got, "a ctrl leaf we posted before the restart must be FOUND, not reported absent").not.toBe("none");
+    expect(got).not.toBe("unknown");
+    const rec = got as { reportedRootHex: string; sequenceNumber: number };
+    expect(rec.sequenceNumber, "the relay-assigned position comes back with it").toBe(7);
+    expect(
+      rec.reportedRootHex,
+      "and the root is the tree WITH that leaf appended — the value the escalation reports",
+    ).toBe(fx.snm.getSessionTree("alice", SID).rootWithAppendedHex(Buffer.from(contentHash).toString("hex")));
+  }, 60_000);
 
   it("a session with no OWN ctrl leaf reports none — the ordinary first close", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg016i-" });

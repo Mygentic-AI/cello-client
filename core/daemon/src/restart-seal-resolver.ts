@@ -94,6 +94,10 @@ export interface RestartSealResolverDeps {
  *                                                    noise: it is a machine badgering a peer who
  *                                                    already declined.
  *
+ * `seal_carry_bilateral_in_progress` is deliberately NOT here either: it means the relay has what
+ * it needs to seal BILATERALLY, so the right move is to come back and find the session already
+ * sealed — which then answers `session_already_sealed`, which IS terminal.
+ *
  * `session_incomplete` and `seal_unilateral_timeout` are deliberately NOT here. The first can be
  * fixed by a relay pull filling the gap — the close's own guidance says so — and the second is a
  * directory that did not answer in time, which the next attempt may well get.

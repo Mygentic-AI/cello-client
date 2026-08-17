@@ -62,7 +62,7 @@ function harness(sealReady: Readiness, status = "interrupted") {
     resolveCurrentAgent: () => AGENT,
     NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
     sealInterruptedInProgress: new Set<string>(),
-    sealKey: (a: string, s: string) => `${a}:${s}`,
+    sealKey: (a: string, s: string) => `${a}\x1f${s}`, // production shape (seal-coordinator.ts)
     signalingFor: () => ({ status: "connected" }) as never,
     handleSealInterruptedFlow: async () => { sealFlowCalls += 1; return { ok: true, status: "sealed" }; },
     handleActiveSealFlow: async () => { sealFlowCalls += 1; return { ok: true, status: "sealed" }; },

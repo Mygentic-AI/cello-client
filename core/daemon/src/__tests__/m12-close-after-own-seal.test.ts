@@ -73,7 +73,7 @@ function harness(opts: {
     waitForSignalingConnected: async () => true,
     openVisitingConnection: () => ({ mgr: {}, stop: async () => {} }),
     crossNodeBrokerBySession: new Map<string, string>(),
-    sealKey: (a: string, s: string) => `${a}:${s}`,
+    sealKey: (a: string, s: string) => `${a}\x1f${s}`, // production shape (seal-coordinator.ts)
     sealInterruptedInProgress: new Set<string>(),
     pendingSealWaiters: new Map(),
     pendingUnilateralWaiters: new Map(),

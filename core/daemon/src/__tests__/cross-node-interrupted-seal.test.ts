@@ -82,7 +82,7 @@ function harness(opts: {
     waitForSignalingConnected: async () => opts.connects !== false,
     openVisitingConnection,
     crossNodeBrokerBySession,
-    sealKey: (a: string, s: string) => `${a}:${s}`,
+    sealKey: (a: string, s: string) => `${a}\x1f${s}`, // production shape (seal-coordinator.ts)
     sealInterruptedInProgress: new Set<string>(),
     pendingSealWaiters: new Map(),
     pendingUnilateralWaiters: new Map(),
@@ -222,7 +222,7 @@ describe("an interrupted close asks the relay to notarize, not just the counterp
       waitForSignalingConnected: async () => true,
       openVisitingConnection: () => ({ mgr: {}, stop: async () => {} }),
       crossNodeBrokerBySession: new Map<string, string>(),
-      sealKey: (a: string, s: string) => `${a}:${s}`,
+      sealKey: (a: string, s: string) => `${a}\x1f${s}`, // production shape (seal-coordinator.ts)
       sealInterruptedInProgress: new Set<string>(),
       pendingSealWaiters: new Map(),
       pendingUnilateralWaiters: new Map(),
@@ -303,7 +303,7 @@ function discoveryHarness(opts: {
     openVisitingConnection,
     runDiscoveryLookup,
     crossNodeBrokerBySession,
-    sealKey: (a: string, s: string) => `${a}:${s}`,
+    sealKey: (a: string, s: string) => `${a}\x1f${s}`, // production shape (seal-coordinator.ts)
     sealInterruptedInProgress: new Set<string>(),
     pendingSealWaiters: new Map(),
     pendingUnilateralWaiters: new Map(),

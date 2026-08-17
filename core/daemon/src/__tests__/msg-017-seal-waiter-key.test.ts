@@ -15,6 +15,12 @@
  *
  * Revert test: key the map by `sessionId` again and the first case fails — resolving one agent's
  * waiter answers the other agent's close, or nobody's.
+ *
+ * WHAT THIS FILE DOES NOT COVER, said out loud because a reader would look here for it: both cases
+ * resolve the waiter directly out of the map, so the LISTENER's half of the re-key is bypassed.
+ * That half is covered by `seal-unilateral-retry.test.ts`, which drives a real
+ * `seal_unilateral_confirmed` frame through the production key — had the listener been left on the
+ * session id alone, that suite would time out red.
  */
 import { describe, it, expect, vi } from "vitest";
 import { registerCloseSessionHandler } from "../close-session-handler.js";

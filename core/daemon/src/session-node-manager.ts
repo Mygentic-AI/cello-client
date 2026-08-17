@@ -5662,6 +5662,15 @@ export class SessionNodeManager {
    *  Null when it cannot be resolved: an UNATTRIBUTED annex row is true, a falsely attributed one
    *  is not, and this is the record that outlives the session. */
   /**
+   * Test seam for `#recoverOwnSealCtrlLeaf` (documented on the method itself, below). The
+   * distinction it draws — "there is none" versus "I could not tell" — is the whole safety
+   * property, and it had no coverage at any level.
+   */
+  recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
+    return this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
+  }
+
+  /**
    * DOD-M12B-INTERRUPTED-ESCALATE-1 — our own SEAL ctrl leaf, if a previous run already posted one.
    *
    * Returns the two values a unilateral escalation runs on, rebuilt from durable state:
@@ -5671,14 +5680,6 @@ export class SessionNodeManager {
    *
    * Null when there is no own ctrl leaf, which is the ordinary first-close case.
    */
-  /**
-   * Test seam for `#recoverOwnSealCtrlLeaf`. The distinction it draws — "there is none" versus
-   * "I could not tell" — is the whole safety property, and it had no coverage at any level.
-   */
-  recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
-    return this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
-  }
-
   #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
     const ownPubkey = this.#ownPubkeyHex(agentName);
     // "I CANNOT TELL" IS NOT "THERE IS NONE". Returning the absent answer here would let the caller
