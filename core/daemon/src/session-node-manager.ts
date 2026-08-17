@@ -3860,8 +3860,14 @@ export class SessionNodeManager {
     // resolves the awaiting timer; on failure (counterparty offline) the hash is already
     // witnessed above, so the caller / TTF path parks the SEALED content to the relay
     // store-and-forward backstop and the recipient recovers it at the witnessed sequence (2b).
+    // Held outside the try so the catch can retire a stream that was opened and then failed to
+    // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
+    // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
+    // connection). See the note on #handleContentStream's finally.
+    let sendStream: Stream | undefined;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      sendStream = stream;
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
       // receiver's `persisted` ACK can come back fast (in-process / low-latency
       // transports), so registering the awaiting entry after send would let the ACK
@@ -3908,6 +3914,9 @@ export class SessionNodeManager {
       await stream.close();
       return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
+      if (sendStream !== undefined) {
+        try { sendStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
       // The send failed after (possibly) arming the awaiting tracking — drop it so a
       // never-delivered frame does not later fire a spurious TTF park.
       this.#untrackAwaitingAck(agentName, sessionId, contentHash);
@@ -5189,6 +5198,11 @@ export class SessionNodeManager {
   async #sendDeliveryAck(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId?: string): Promise<void> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
+    // Held outside the try so the catch can retire a stream that was opened and then failed to
+    // write. Without it every failure leaks the OUTBOUND half of the stream the receiver-side
+    // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
+    // connection). See the note on #handleContentStream's finally.
+    let ackStream: Stream | undefined;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
       const frame = encodeCbor({
@@ -5198,6 +5212,7 @@ export class SessionNodeManager {
         level: "persisted",
         correlation_id: correlationId,
       }) as Uint8Array;
+      ackStream = stream;
       stream.send(lp.encode.single(frame));
       // The receiver-side counterpart to the sender's content.delivery.acked: B has acknowledged
       // this content `persisted`, so the sender stops retrying/parking. Emitted for BOTH a normally
@@ -5216,6 +5231,9 @@ export class SessionNodeManager {
         error: err instanceof Error ? err.message : String(err),
         correlationId,
       });
+      if (ackStream !== undefined) {
+        try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
     }
   }
 
@@ -5509,6 +5527,25 @@ export class SessionNodeManager {
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
     const iter = (lp.decode(stream) as AsyncIterable<unknown>)[Symbol.asyncIterator]() as AsyncIterator<Uint8Array>;
     try {
+      // THE 33RD FRAME USED TO KILL THE SESSION, and this `finally` is why it no longer does.
+      //
+      // Every content frame and every delivery ACK opens a fresh /cello/content/1.0.0 stream on the
+      // one muxed connection the session holds. libp2p caps INBOUND streams per protocol per
+      // connection at 32 (DEFAULT_MAX_INBOUND_STREAMS — nothing here passes maxInboundStreams), and
+      // it enforces the cap AFTER multistream-select has answered. So the 33rd stream negotiates
+      // fine, is reset an instant later, and the SENDER's next `stream.send(...)` throws
+      // "Cannot write to a stream that is closed" — an error that names the exit point and not one
+      // thing about the cause.
+      //
+      // Reading one frame and returning left every stream half-closed: the sender closes its write
+      // end, we never close ours, so the stream stays in `connection.streams` for the life of the
+      // connection. The count only ever goes up, which is why the session never recovered —
+      // measured on a live daemon as 115 failures over 3.5 hours, with EXACTLY 32 successful
+      // streams before the first one on both affected sessions (M12B Entry 10).
+      //
+      // Closing our write end is what retires the stream: with the sender's end already closed the
+      // stream transitions to closed and the muxer drops it. Order does not matter — whichever
+      // side closes second triggers the transition.
       const result = await iter.next();
       if (result.done || result.value === undefined) return;
       const bytes = result.value instanceof Uint8Array ? result.value
@@ -5601,6 +5638,16 @@ export class SessionNodeManager {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
+    } finally {
+      // `close()` waits only for OUR write buffer, which is empty here, so this cannot stall the
+      // handler; it runs on every exit above, and there are several early returns. If it throws,
+      // the stream is already unusable and `abort` retires it with a reset rather than leaving it
+      // to occupy a slot — a leaked slot is the whole defect.
+      try {
+        await stream.close();
+      } catch (err: unknown) {
+        try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
     }
   }
 
