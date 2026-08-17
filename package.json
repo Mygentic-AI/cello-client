@@ -7,7 +7,7 @@
   },
   "scripts": {
     "build": "tsc --build",
-    "typecheck": "tsc --build",
+    "typecheck": "tsc --build && tsc -p core/daemon/tsconfig.test.json --noEmit",
     "lint": "eslint core/*/src",
     "test": "vitest run --passWithNoTests --pool-options.threads.maxThreads=1 --pool-options.threads.minThreads=1"
   },

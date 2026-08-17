@@ -1,0 +1,40 @@
+{
+  // DOD-M12B-TESTS-NOT-TYPECHECKED-1 — a FOOTHOLD, deliberately not the whole thing.
+  //
+  // Every package excludes `src/__tests__` from `tsc --build`, so a test asserting on a field that
+  // does not exist, or calling a method that was removed, is invisible to the gate — it fails only
+  // if vitest happens to execute that line. That is the hollow-test shape every review in this
+  // milestone has hunted, institutionalised. It already let a defect ship: `msg-018` called
+  // `ensureStandingReceiverForAgent` with two arguments against a one-parameter signature and
+  // `pnpm run typecheck` reported exit 0.
+  //
+  // Switching it on repo-wide surfaces **339** errors in the daemon's existing tests alone — mostly
+  // deliberate partial fakes that need `as unknown as` casts, which is a real cleanup and not this
+  // unit. So this covers the files added by the interrupted-session work plus the shared helpers,
+  // which is where the defect shipped and where a regression would land next. Widening it is
+  // `DOD-M12B-TESTS-NOT-TYPECHECKED-1`; add files here as they are cleaned.
+  //
+  // `files` rather than `include`, because `exclude` in the base config filters `include` and would
+  // drop every one of these.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src"
+  ],
+  "files": [
+    "src/__tests__/msg-013-restart-seal.test.ts",
+    "src/__tests__/msg-014-restart-seal-wired.test.ts",
+    "src/__tests__/msg-015-interrupted-escalate.test.ts",
+    "src/__tests__/msg-016-sealed-status-lands.test.ts",
+    "src/__tests__/msg-017-seal-waiter-key.test.ts",
+    "src/__tests__/msg-018-reservation-retry.test.ts",
+    "src/__tests__/helpers/encrypted-db.ts",
+    "src/__tests__/helpers/hold-singleton-lock.ts",
+    "src/__tests__/helpers/park-relay.ts",
+    "src/__tests__/helpers/seed-agents.ts",
+    "src/__tests__/helpers/spawn-real-daemon.ts",
+    "src/__tests__/helpers/two-connection-fixture.ts"
+  ]
+}
