@@ -4217,9 +4217,16 @@ async function startDaemonHoldingLock(
     // 30 seconds later and had to be signalled to exit. This is what stops the pass in flight, and
     // it also blocks `onReachable`, so a session tearing down during shutdown cannot hand the
     // sweeper a fresh reason to dial on the way out.
-    // Optional because a stop() can land before the composition root finished wiring — a daemon
-    // that fails during startup still runs this path, and there is nothing to sweep in that case.
+    // `?.` is a TYPE requirement, not a runtime one: TypeScript discards the narrowing of a
+    // captured `let` inside a hoisted function declaration, though it keeps it in the arrow a few
+    // lines up. The scheduler is in fact always wired by the time this can run — the IPC socket,
+    // the only route to `stop` besides the returned handle, opens after it.
     reconcileScheduler?.stop();
+    // DOD-M12B-SHUTDOWN-1: the scheduler is one of FOUR callers of initiateReconcile. `nudgeSeats`
+    // and the two invite notices reach it directly, and every document verb is still served while
+    // the rest of this function runs — the IPC server is the last thing stopped. Refusing at the
+    // choke point is what actually closes "no new outbound work".
+    documentLayer?.stopReconciling();
     // M8C-TGDOOR-1: stop the single long-lived getUpdates poller (no-op if never started) — bump
     // the generation so the running loop's while-condition fails on its next check.
     stopTelegramPoller(); // M8C-TGDOOR-1: invalidate the poll loop; it exits on its next generation check

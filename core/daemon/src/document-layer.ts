@@ -151,6 +151,18 @@ export interface DocumentLayerDeps {
 }
 
 export interface DocumentLayer {
+  /**
+   * DOD-M12B-SHUTDOWN-1 — refuse every further outbound reconcile, whichever caller asks.
+   *
+   * The reconcile scheduler is only one of four routes to `initiateReconcile`; `nudgeSeats` and the
+   * two invite notices reach it directly, and every document verb is still served while the daemon
+   * tears down, because the IPC server is the last thing stopped. Gating the scheduler alone left
+   * three paths dialling peers and opening sessions on the way out.
+   *
+   * Idempotent and one-way. The reconcile exchange is idempotent (R40), so a refused reconcile is
+   * deferred to the next process, never lost.
+   */
+  stopReconciling(): void;
   store: DocumentStore;
   /** The file projection, or null when no workspace root was configured. */
   writePath: DocumentWritePath | null;
@@ -1068,11 +1080,19 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   };
 
   /** SYNC-P3 — step 1: send our position for these documents to a peer. */
+  // DOD-M12B-SHUTDOWN-1: THE CHOKE POINT for outbound reconciles. The scheduler is only one of the
+  // four callers — `nudgeSeats` and the two invite notices reach here directly, outside it — so
+  // gating the scheduler alone left three paths still dialling on the way out. `cello_doc_write`,
+  // `cello_doc_publish` and `cello_doc_invite` are all still SERVED during shutdown, because the
+  // IPC server is the last thing stopped, so this is not a theoretical window.
+  let reconcileStopped = false;
+
   const initiateReconcile = async (
     ownerAgentId: string,
     peerAgentId: string,
     documentIds: readonly string[],
   ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+    if (reconcileStopped) return { ok: false, reason: "daemon_shutting_down" };
     const reads = reconcileReads(ownerAgentId);
     const blocks = documentIds.map((id) => buildReconcileBlock(reads, id));
     const sent = await deps.sendFrame(
@@ -1199,6 +1219,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   });
 
   return {
+    /** DOD-M12B-SHUTDOWN-1 — see the interface. One-way, idempotent, and the single place that
+     *  closes the whole class rather than one of the four callers. */
+    stopReconciling(): void { reconcileStopped = true; },
     amendments,
     verifySignature,
     holdersFor,

@@ -36,20 +36,22 @@ const PEER = "peer-agent-id";
 
 /** A scheduler wired to one peer with one document always due, and a counter on the one call that
  *  reaches the network. `initiateReconcile` is what dials and opens a session. */
-function makeScheduler(logger: Logger) {
+function makeScheduler(logger: Logger, opts: { parties?: string[]; onDial?: (peer: string) => void } = {}) {
   let now = 1_000_000;
   const calls: string[] = [];
+  const parties = opts.parties ?? [PEER];
   const scheduler = new ReconcileScheduler({
     now: () => now,
     logger,
     sweepTargets: (ownerAgentId) => {
       calls.push(`sweepTargets:${ownerAgentId}`);
-      return new Map([[PEER, ["doc-1"]]]);
+      return new Map(parties.map((p) => [p, ["doc-1"]]));
     },
     // Never "believed current", so the sweep always has real work to do.
     partySync: () => ({ sync: "diverged" as const, lastSyncedAtMs: null }),
-    initiateReconcile: async (_owner, _peer, documentIds) => {
-      calls.push(`initiateReconcile:${documentIds.join(",")}`);
+    initiateReconcile: async (_owner, peerAgentId, documentIds) => {
+      calls.push(`initiateReconcile:${peerAgentId}:${documentIds.join(",")}`);
+      opts.onDial?.(peerAgentId);
       return { ok: true as const };
     },
   });
@@ -65,7 +67,7 @@ describe("DOD-M12B-SHUTDOWN-1: shutdown stops starting new outbound work", () =>
     // could pass against a scheduler that never worked at all.
     const before = await scheduler.sweep(OWNER);
     expect(before.attempted, "the fixture must actually attempt a reconcile while running").toBe(1);
-    expect(calls).toContain("initiateReconcile:doc-1");
+    expect(calls).toContain(`initiateReconcile:${PEER}:doc-1`);
 
     scheduler.stop();
     calls.length = 0;
@@ -85,6 +87,29 @@ describe("DOD-M12B-SHUTDOWN-1: shutdown stops starting new outbound work", () =>
     const result = await scheduler.sweep(OWNER);
     expect(result.attempted).toBe(0);
     expect(calls).toEqual([]);
+  });
+
+  it("a pass ALREADY RUNNING stops at the next party, not at the next agent", async () => {
+    const { logger } = makeLogger();
+    // Two parties for one agent. `stop()` lands while the first is being dialled — the real shape,
+    // since shutdown arrives mid-pass, not between passes. A guard at the sweep's ENTRY only would
+    // let the second party be dialled anyway, and on a single-agent daemon (the measured case) that
+    // is the entire pass.
+    let scheduler: ReconcileScheduler;
+    const dialled: string[] = [];
+    const made = makeScheduler(logger, {
+      parties: ["peer-one", "peer-two"],
+      onDial: (peer) => { dialled.push(peer); if (peer === "peer-one") scheduler.stop(); },
+    });
+    scheduler = made.scheduler;
+
+    const result = await scheduler.sweep(OWNER);
+    expect(dialled, "no party after the stop may be dialled").toEqual(["peer-one"]);
+    // `attempted` is the assertion that discriminates. Without the guard in the PARTY loop the
+    // sweep walks on: it marks peer-two in flight, counts it, and runs its bookkeeping — the dial
+    // is only stopped one level down, inside the batch loop. A pass told to stop must stop, not
+    // keep processing parties quietly and report having attempted them.
+    expect(result.attempted, "a stopped pass must not go on processing the parties behind it").toBe(1);
   });
 
   it("the reachability trigger cannot restart sweeping after shutdown", async () => {

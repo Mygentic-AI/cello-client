@@ -103,6 +103,15 @@ const CONTENT_MAX_INBOUND_STREAMS = 512;
 const CONTENT_STREAM_LINGER_MS = 30_000;
 
 /**
+ * DOD-M12B-SHUTDOWN-1 — how long one teardown step may block the daemon's exit.
+ *
+ * Chosen against the surface that complains: `cello logout` gives up and reports the daemon still
+ * running after 5 s, so a step that can burn longer than that guarantees the message the operator
+ * saw. Two steps at 2 s each stay inside it.
+ */
+const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
+
+/**
  * DOD-M12B-ACK-1 — why a session is impaired, and what became of the content that revealed it.
  *
  * `cause` separates "your own message did not reach them" (`direct_send`) from "our acknowledgement
@@ -3252,6 +3261,35 @@ export class SessionNodeManager {
    * Called from the SIGTERM / cello logout path (AC-009).
    * SQLite writes complete before this method returns.
    */
+  /**
+   * DOD-M12B-SHUTDOWN-1 — wait for a teardown step, but never forever.
+   *
+   * Every step of shutdown used to be an unbounded `await` on libp2p. That is what makes "the
+   * daemon acknowledged the request but is still running" possible: nothing on the daemon side
+   * emits a word while it hangs, so the operator's own message ("it may be stuck closing sessions
+   * or its database") was a guess. Past the deadline the step is ABANDONED and SAID — the resources
+   * it was closing are reclaimed by the OS on exit, and an exit is worth more than a tidy one.
+   */
+  async #boundedTeardown(work: Promise<unknown>, step: string, count: number): Promise<void> {
+    if (count === 0) return;
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), SHUTDOWN_STEP_DEADLINE_MS);
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([work.then(() => "done" as const), deadline]);
+    if (timer) clearTimeout(timer);
+    if (outcome === "timeout") {
+      this.#logger.error("session.shutdown.step.timeout", {
+        step, count, waitedMs: Date.now() - started,
+        impact: "this teardown step did not finish and was abandoned so the daemon can exit; the OS reclaims what it held",
+      });
+    } else {
+      this.#logger.debug("session.shutdown.step.done", { step, count, tookMs: Date.now() - started });
+    }
+  }
+
   async gracefulShutdown(): Promise<void> {
     // DOD-NAT-REACHABILITY-1: stop the reservation watchdog before anything is torn
     // down — a tick landing mid-shutdown would try to rebuild a receiver we are in
@@ -3325,27 +3363,39 @@ export class SessionNodeManager {
         }),
       );
     }
-    await Promise.all(stopPromises);
+    // DOD-M12B-SHUTDOWN-1: BOUNDED. `node.stop()` awaits libp2p's own teardown, which has no
+    // deadline of its own — one connection that will not close holds this, and this holds the whole
+    // daemon. Measured 2026-08-17: `cello logout` acknowledged, then the process was still alive
+    // 30+ seconds later and needed a signal. An abandoned stop costs a socket the OS reclaims when
+    // we exit; an unbounded wait costs the exit itself.
+    await this.#boundedTeardown(Promise.all(stopPromises), "session_nodes", stopPromises.length);
     this.#activeNodes.clear();
     // Evict in-memory per-session caches (trees reload from SQLite; received-content
     // plaintext must not survive shutdown in memory).
     this.#trees.clear();
     this.#receivedContent.clear();
 
-    // Stop ALL per-agent standing receivers (DOD-LOOP-1).
-    for (const [agentName, sr] of this.#standingReceivers) {
-      sr.autoNat.stop();
-      try {
-        await sr.node.stop();
-      } catch (err: unknown) {
-        this.#logger.error("session.node.stop.failed", {
-          sessionId: "standing_receiver_shutdown",
-          agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
-          error: err instanceof Error ? err.message : String(err),
-          correlationId: "n/a",
-        });
-      }
-    }
+    // Stop ALL per-agent standing receivers (DOD-LOOP-1). In PARALLEL and BOUNDED: this was a
+    // sequential await per agent with no deadline, so five agents meant five chances for one stuck
+    // libp2p teardown to hold the exit — and it sits between the operator being told the daemon is
+    // stopping and the process actually going.
+    await this.#boundedTeardown(
+      Promise.all([...this.#standingReceivers].map(async ([agentName, sr]) => {
+        sr.autoNat.stop();
+        try {
+          await sr.node.stop();
+        } catch (err: unknown) {
+          this.#logger.error("session.node.stop.failed", {
+            sessionId: "standing_receiver_shutdown",
+            agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
+            error: err instanceof Error ? err.message : String(err),
+            correlationId: "n/a",
+          });
+        }
+      })),
+      "standing_receivers",
+      this.#standingReceivers.size,
+    );
     this.#standingReceivers.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown

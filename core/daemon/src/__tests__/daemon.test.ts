@@ -84,6 +84,16 @@ describe("daemon", () => {
     expect(stopEvent).toBeDefined();
     expect(stopEvent!.context.pid).toBe(process.pid);
     expect(stopEvent!.context.reason).toBe("test_stop");
+
+    // DOD-M12B-SHUTDOWN-1: the sweeper is TOLD to stop, here, by the real daemon.
+    //
+    // The scheduler's own tests build a ReconcileScheduler by hand, so deleting the one line in
+    // `stop()` that calls it would leave the daemon dialling peers on its way out with a passing
+    // "shutdown drain" suite sitting beside it. This is the assertion that makes the wiring real.
+    expect(
+      logEvents.find((e) => e.event === "document.reconcile.stopped"),
+      "daemon.stop() must stop the reconcile sweeper, not merely clear its timer",
+    ).toBeDefined();
   });
 
   it("creates lock file with correct content", async () => {

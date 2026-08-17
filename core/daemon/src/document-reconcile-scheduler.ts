@@ -107,9 +107,13 @@ export class ReconcileScheduler {
    * seconds still logging `document.reconcile.sweep`, dialling on its way out. It took a signal to
    * exit. A shutdown that keeps starting new outbound work is not draining.
    *
-   * Guarded at the top of every entry point rather than inside the loop, so `sweepTargets` — a
-   * database read — is not run either. Never un-set: a reachability trigger firing from a session
-   * tearing down during shutdown must not be able to restart the sweeper on the way out.
+   * Guarded at the top of the two entry points that START work — `sweep` and `onReachable` — so
+   * `sweepTargets`, a database read, is not run either, AND inside the sweep's own party loop so a
+   * pass already running stops at the next party rather than finishing its round. `noteRefusal`
+   * deliberately still runs: it records an outcome and starts nothing.
+   *
+   * Never un-set: a reachability trigger firing from a session tearing down during shutdown must
+   * not be able to restart the sweeper on the way out.
    */
   stop(): void {
     if (this.#stopped) return;
@@ -186,6 +190,12 @@ export class ReconcileScheduler {
     if (this.#stopped) return result;
     const now = this.#d.now();
     for (const [peerAgentId, docs] of this.#d.sweepTargets(ownerAgentId)) {
+      // DOD-M12B-SHUTDOWN-1: INSIDE the loop, not only at the entry. A guard on entry alone stops
+      // the NEXT agent while the one being swept goes on dialling every remaining party — which on
+      // a single-agent daemon, the measured case, buys nothing at all. Each of those dials can
+      // create a session node AFTER gracefulShutdown has already flipped active rows to interrupted
+      // and snapshotted the node list, leaving a row nothing will clear and a node nobody stops.
+      if (this.#stopped) break;
       if (docs.length === 0) continue;
       const s = this.#stateFor(this.#key(ownerAgentId, peerAgentId));
       if (s.inFlightUntilMs !== null) {
@@ -242,6 +252,9 @@ export class ReconcileScheduler {
     let allOk = true;
     try {
       for (let i = 0; i < docs.length; i += RECONCILE_BATCH_CAP) {
+        // DOD-M12B-SHUTDOWN-1: between batches too — one party can carry many documents, and each
+        // batch is another dial.
+        if (this.#stopped) break;
         const batch = docs.slice(i, i + RECONCILE_BATCH_CAP);
         const sent = await this.#d.initiateReconcile(ownerAgentId, peerAgentId, batch);
         if (!sent.ok) {
