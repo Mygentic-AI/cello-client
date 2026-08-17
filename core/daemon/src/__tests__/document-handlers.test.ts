@@ -1623,6 +1623,34 @@ describe("ENDINGS AS ENTRIES — close and kill travel like everything else and 
     expect(after.get(fC.owner) ?? []).not.toContain(documentId);
   });
 
+  it("sweepTargets: a REMOVED holder's own copy contributes NOTHING — it has no one left to reconcile with", async () => {
+    // Measured in production 2026-08-17: a holder that had been removed kept sweeping the document
+    // it was removed from, four times a minute, forever. Its peers answered `terminal: true` —
+    // "there is nothing further to reconcile" — 105 times, and it asked again after every one.
+    //
+    // The removal is forward-only: the copy stays readable, but edits no longer flow in either
+    // direction, so there is by definition nothing to exchange. The sweep asked anyway because it
+    // derived its targets from the OTHER seats and never checked whether the OWNER still held one.
+    //
+    // This matters far beyond wasted dials: every attempt opens a session and pushes ack frames,
+    // and each frame consumes a relay canonical position. That is what drives the receiving tree
+    // behind the relay counter and strands real conversation behind the ordering gap.
+    const { fA, fC, documentId } = await threeSeated();
+    expect(fC.layer.sweepTargets(fC.owner).size).toBeGreaterThan(0);
+
+    const removed = await fA.call("cello_doc_remove", {
+      document_id: documentId, holder_pubkey: fC.owner,
+    });
+    expect(removed.ok, JSON.stringify(removed)).toBe(true);
+    routeAll(fA, fC);
+    await until(() => fC.layer.amendments.chain(fC.owner, documentId).length >= 4);
+
+    // C now derives itself out of the seats. Nothing it can send can change that, so it must stop
+    // asking — for every peer, not merely for the one that removed it.
+    const targets = fC.layer.sweepTargets(fC.owner);
+    for (const [, docs] of targets) expect(docs).not.toContain(documentId);
+  });
+
   it("sweepTargets: an underivable chain contributes NOTHING — the sweep never guesses at seats", async () => {
     const { fA, fB, documentId } = await threeSeated();
     fA.layer.store.rawDb
