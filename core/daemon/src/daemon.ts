@@ -38,9 +38,11 @@ import type {
   ActiveSessionInfo,
   SealReadinessView,
   DirectorySignalingState,
+  SessionRecord,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { RestartSealResolver } from "./restart-seal-resolver.js";
+import { escalateToUnilateralSeal as runUnilateralEscalation } from "./seal-escalation.js";
 import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
@@ -1185,48 +1187,29 @@ async function startDaemonHoldingLock(
                 return;
               }
 
-              const sealAgentKp = keyProviders.get(agentName);
-              const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
-              const sealCarry = sealAgentPubkeyHex ? sessionNodeManager.getSealCarry(sealAgentPubkeyHex, sessionId) : [];
-              const seal_leaves = sealCarry.map((l) => ({
-                sequence_number: l.sequenceNumber,
-                leaf_kind: l.leafKind,
-                structure2_cbor: l.structure2Cbor,
-                structure1_cbor: l.structure1Cbor,
-                relay_id: l.relayId,
-                relay_timestamp: l.relayTimestamp,
-                relay_signature: l.relaySignatureHex ? new Uint8Array(Buffer.from(l.relaySignatureHex, "hex")) : undefined,
-              }));
-
-              let resolveUni!: (r: { ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }) => void;
-              const uniP = new Promise<{ ok: true; sealedRootHex: string; legibility?: unknown } | { ok: false; reason: string; remainingSeconds?: number }>((r) => { resolveUni = r; });
-              pendingUnilateralWaiters.set(sealKey(agentName, sessionId), resolveUni);
-
-              const sent = await sendOver(agentName, {
-                type: "seal_unilateral",
-                session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
-                reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
-                reported_seq: escalation.sequenceNumber,
-                seal_leaves,
-              });
-              if (!sent.ok) {
-                pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
-                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: "send_failed" });
-                return;
-              }
-
-              let uniTimer!: ReturnType<typeof setTimeout>;
-              const uniTimeoutP = new Promise<{ ok: false; reason: string }>((r) => {
-                uniTimer = setTimeout(() => r({ ok: false, reason: "seal_unilateral_timeout" }), 30_000);
-              });
-              const uniResult = await Promise.race([uniP, uniTimeoutP]);
-              clearTimeout(uniTimer);
-              pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
-
-              if (uniResult.ok) {
-                logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: uniResult.sealedRootHex, sealType: "unilateral" });
+              // DOD-M12B-SEAL-ESCALATE-DUP-1: THE SHARED ESCALATION, not a second copy.
+              //
+              // This used to be a line-for-line duplicate with its own hardcoded 30 s timeout, and
+              // it missed every refusal the other one gained: an empty carry, a gappy chain, two of
+              // our own ctrl leaves (permanently unsealable), and a bilateral seal already running.
+              // It spent the full timeout on each and then reported `seal_unilateral_timeout` — the
+              // label that names our own wait. Sharing the body is what stops that drifting again.
+              const uni = await runUnilateralEscalation(
+                {
+                  logger, sessionNodeManager, sendOver, pendingUnilateralWaiters, sealKey,
+                  getKeyProvider: (a) => keyProviders.get(a),
+                  timeoutMs: 30_000,
+                },
+                { agent_name: agentName, session_id: sessionId } as SessionRecord,
+                sessionId,
+                escalation,
+                correlationId,
+                { refuseOnUnusableCarry: true },
+              );
+              if (uni.ok) {
+                logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: uni.sealed_root, sealType: "unilateral" });
               } else {
-                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: uniResult.reason });
+                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: uni.reason });
               }
             } finally {
               sealInterruptedInProgress.delete(sealKey(agentName, sessionId));
