@@ -404,7 +404,10 @@ export class SessionNodeManager {
   // session node's onPeerConnect ('alive') / onPeerDisconnect ('gone'). This is
   // the liveness authority for direct sessions — the unilateral-seal gate reads
   // it (relay sessions query the relay instead). NEVER the directory (SI-002).
-  #sessionLiveness = new Map<string, "alive" | "gone">();
+  // DOD-M12B-ACK-1 adds 'impaired': connection up, our writes on it failing. It sits BELOW
+  // 'alive' and never above 'gone' — see #markSessionImpaired for why the seal gate must not
+  // see it as a dead counterparty.
+  #sessionLiveness = new Map<string, "alive" | "impaired" | "gone">();
   // M7-UPGRADE-002: sessions whose content integrity could NOT be verified (a content_hash
   // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
   // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
@@ -2622,9 +2625,61 @@ export class SessionNodeManager {
   /**
    * M7-SESSION-003: read the direct-path counterparty liveness for a session.
    * 'unknown' when no session node observation has occurred yet.
+   *
+   * DOD-M12B-ACK-1: 'impaired' is DAEMON-LOCAL and deliberately not on the relay's
+   * SessionLiveness wire type — the relay answers a different question (does it hold the
+   * recipient's standing connection) and its three states are a deployed bilateral contract.
    */
-  getSessionLiveness(agentName: string, sessionId: string): "alive" | "gone" | "unknown" {
+  getSessionLiveness(agentName: string, sessionId: string): "alive" | "impaired" | "gone" | "unknown" {
     return this.#sessionLiveness.get(this.#k(agentName, sessionId)) ?? "unknown";
+  }
+
+  /**
+   * DOD-M12B-ACK-1 — the connection is up and delivery on it is not working.
+   *
+   * Liveness is otherwise driven ONLY by libp2p peer-connect/peer-disconnect, so it answers "is
+   * there a connection object?" while every surface printing it is read as "can I talk to them?".
+   * When a write fails on a connection libp2p still considers open, those two diverge and the
+   * operator is told the conversation is healthy. Measured 2026-08-17: one session reported
+   * `alive` for 70 minutes after every write had started failing, another never stopped.
+   *
+   * ONLY downgrades from 'alive'. 'gone' is the stronger and more actionable statement — the
+   * counterparty's connection dropped, no reply can arrive, and the unilateral-seal gate reads
+   * it — so a failed write must never soften it. 'unknown' already claims nothing.
+   */
+  #markSessionImpaired(agentName: string, sessionId: string, reason: string, correlationId?: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#sessionLiveness.get(key) !== "alive") return;
+    this.#sessionLiveness.set(key, "impaired");
+    this.#logger.warn("session.liveness.changed", {
+      sessionId,
+      transportPath: "direct",
+      liveness: "impaired",
+      observedBy: "direct_send",
+      reason,
+      correlationId,
+    });
+  }
+
+  /**
+   * DOD-M12B-ACK-1 — a delivery landed, so the impairment is over.
+   *
+   * Without this an `impaired` flag is a one-way door: one bad write would make a session report
+   * a broken conversation for the rest of its life, which is the same class of lie in the other
+   * direction. Only clears 'impaired' — it never manufactures 'alive' out of 'gone' or 'unknown',
+   * because a successful write says nothing about a connection libp2p has already declared dead.
+   */
+  #clearSessionImpairment(agentName: string, sessionId: string, correlationId?: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#sessionLiveness.get(key) !== "impaired") return;
+    this.#sessionLiveness.set(key, "alive");
+    this.#logger.info("session.liveness.changed", {
+      sessionId,
+      transportPath: "direct",
+      liveness: "alive",
+      observedBy: "direct_send",
+      correlationId,
+    });
   }
 
   /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
@@ -3912,8 +3967,10 @@ export class SessionNodeManager {
       // A close that failed for a benign reason costs a redundant park, which the receiver dedups
       // on the content hash. A false delivered costs the message.
       await stream.close();
+      this.#clearSessionImpairment(agentName, sessionId, correlationId);
       return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
+      this.#markSessionImpaired(agentName, sessionId, err instanceof Error ? err.message : String(err), correlationId);
       if (sendStream !== undefined) {
         try { sendStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -5231,6 +5288,9 @@ export class SessionNodeManager {
         error: err instanceof Error ? err.message : String(err),
         correlationId,
       });
+      // The ACK travels the same direct path as our own content, so a failure here is the same
+      // evidence: writes to this counterparty are not landing.
+      this.#markSessionImpaired(agentName, sessionId, err instanceof Error ? err.message : String(err), correlationId);
       if (ackStream !== undefined) {
         try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }

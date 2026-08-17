@@ -965,6 +965,26 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
           };
         }
+        // DOD-M12B-ACK-1: the same rule one step short of 'gone'. A session whose writes are
+        // failing looks EXACTLY like a quiet-but-healthy one from here — nothing arrives, and the
+        // old answer said "nothing arrived", so an operator waited. Measured 2026-08-17: one
+        // session reported healthy for 70 minutes while every message it sent was parking.
+        // Distinct from 'gone' on purpose: the connection is up, content may still arrive FROM
+        // them, and the session must not be steered toward a seal on this evidence.
+        if (liveness === "impaired") {
+          logger.info("session.receive.empty", {
+            sessionId, agentName, connectionId, timeoutMs, attendance,
+            liveness, correlationId: receiveCorrelationId,
+          });
+          return {
+            ok: true,
+            content: null,
+            attendance: attendingNow(agentName),
+            reason: "delivery_impaired",
+            liveness: "impaired",
+            guidance: "Nothing arrived, AND your own last send did not reach the counterparty on the direct path (liveness: impaired) — it was parked for the relay to hand over instead. Their connection is still up, so content may still arrive and this can clear on its own. Do not resend the same message: a park is not a loss, and resending takes a second position in the record. Check `cello status` for this session before assuming the counterparty is ignoring you.",
+          };
+        }
         logger.info("session.receive.empty", {
           sessionId, agentName, connectionId, timeoutMs, attendance,
           liveness, correlationId: receiveCorrelationId,

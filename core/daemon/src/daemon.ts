@@ -1982,7 +1982,12 @@ async function startDaemonHoldingLock(
     for (const row of candidates) {
       if (agentName !== undefined && row.agent_name !== agentName) continue;
       if (now - row.created_at <= HALF_OPEN_TTL_MS) continue; // too young — may just be setting up
-      if (sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id) === "alive") continue; // live
+      // DOD-M12B-ACK-1: 'impaired' counts as live HERE. This reaper's question is "did the
+      // counterparty ever establish?", and impaired means it did — the connection is up, only
+      // delivery on it is failing. Reaping on impaired would abandon exactly the sessions this
+      // milestone exists to repair.
+      const liveness = sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id);
+      if (liveness === "alive" || liveness === "impaired") continue; // live
       if (sessionNodeManager.countReceivedMessages(row.agent_name, row.session_id) > 0) continue; // counterparty spoke
       // Non-awaited: abandonSession flips the DB status synchronously (before its first await), so THIS
       // read reflects it; the async node teardown finishes in the background. CC-10 reviewer LOW: only

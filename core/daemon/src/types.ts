@@ -206,8 +206,11 @@ export interface ActiveSessionInfo {
   sessionId: string;
   agentName: string;
   counterpartyPubkey: string;
-  /** Direct-path counterparty liveness; 'unknown' before any session-node observation. */
-  liveness: "alive" | "gone" | "unknown";
+  /** Direct-path counterparty liveness; 'unknown' before any session-node observation.
+   *  DOD-M12B-ACK-1: 'impaired' means the connection is up and our writes on it are failing —
+   *  distinct from 'gone' (the connection dropped), which feeds the unilateral-seal gate. It is
+   *  daemon-local and is NOT the relay's SessionLiveness wire type. */
+  liveness: "alive" | "impaired" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
   /** DOD-FRONTIER-STRAND-1 AC3 — see SessionListEntry.frontierMismatch. Declared here because
