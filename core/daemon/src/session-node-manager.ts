@@ -7612,6 +7612,14 @@ export class SessionNodeManager {
       const sender = row.origin === "sent" ? this.#ownPubkeyHex(agentName) : counterparty;
       if (this.recordSealedAnnex(agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob), sender)) {
         this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        // AND OUT OF THE IN-MEMORY MAP. Measured live 2026-08-17 on daemon 0.0.170: this frame is
+        // now safe in the annex and its durable row is gone — but teardown still found it in the
+        // map, counted `held_content` for the session, got 0, and fired
+        // `session.content.held.lost`: "verified content was destroyed". Ten frames were annexed
+        // and the same ten were reported destroyed, in the same second. A false alarm on the most
+        // serious event in the system is worse than no alarm, because the next investigation goes
+        // looking for content that was never lost.
+        this.#heldContent.get(this.#k(agentName, sessionId))?.delete(row.canonical_seq);
         annexed++;
       } else {
         kept++;

@@ -182,6 +182,39 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     await mgr2.gracefulShutdown();
   }, 60_000);
 
+  it("a frame moved to the annex is NOT then reported as destroyed", async () => {
+    const dbPath = join(tempDir, "s7.db");
+    const c1 = new TextEncoder().encode("annexed, not lost");
+    const h1 = msgLeafHash(c1);
+
+    const { logger, events } = makeLogger();
+    const mgr = await makeManager(logger, dbPath);
+    await seedAgents(mgr.getDb(), [AGENT]);
+    await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
+    mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
+    await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+
+    // Ending the session moves the held frame to the annex and deletes its durable row. Teardown
+    // then finds it still in the in-memory map, counts held_content, gets zero — and, before this
+    // fix, announced that verified content had been destroyed. Measured live on daemon 0.0.170:
+    // ten frames annexed and the same ten reported destroyed, in the same second. A false alarm on
+    // the most serious event in the system sends the next investigation after content that is safe.
+    await mgr.abandonSession(AGENT, sid);
+    await mgr.destroySessionNode(AGENT, sid, "error");
+
+    expect(events.some((e) => e.event === "session.content.held.annexed"), "the frame must be annexed").toBe(true);
+    expect(
+      events.filter((e) => e.event === "session.content.held.lost"),
+      "an annexed frame is not a destroyed one",
+    ).toEqual([]);
+
+    const annex = mgr.getDb()
+      .prepare("SELECT content FROM sealed_session_annex WHERE session_id = ?")
+      .get(sid) as { content: Buffer } | undefined;
+    expect(Buffer.from(annex!.content).toString(), "and it is genuinely readable").toBe("annexed, not lost");
+    await mgr.gracefulShutdown();
+  }, 60_000);
+
   it("a hold whose content the tree ALREADY HOLDS at that position is dropped, never re-appended", async () => {
     const dbPath = join(tempDir, "s3.db");
     const c0 = new TextEncoder().encode("p0");
