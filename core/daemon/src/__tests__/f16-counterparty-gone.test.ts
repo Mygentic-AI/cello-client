@@ -218,6 +218,67 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     }
   }, 60_000);
 
+  /**
+   * DOD-M12B-ACK-1. The receive surface is where the 70-minute lie was actually TOLD: an impaired
+   * session looked exactly like a quiet-but-healthy one, so the answer was "nothing arrived, keep
+   * waiting, do not resend your last message" while every send was parking.
+   *
+   * The guidance must also not over-claim. Its first draft asserted the message "was parked for the
+   * relay to hand over" and that the caller must not resend — false when the park was refused and
+   * the durable enqueue dropped, in which case cello_send has already said "send it again". Two
+   * surfaces giving an agent opposite instructions about the same message is worse than either.
+   */
+  it("DOD-M12B-ACK-1: a session whose sends are failing returns delivery_impaired, and says only what is known", async () => {
+    const { A, clientA, clientB } = await establishSession();
+    try {
+      // One real failed send over a real connection — the fault is injected after the stream opens,
+      // so libp2p fires no disconnect and the old code left this session reporting `alive`.
+      A.getSessionNodeManager().injectSendFault(1);
+      const sent = (await clientA.send("cello_send", {
+        session_id: SID_HEX, content: "does not land", signal: "over",
+      })) as Record<string, unknown>;
+      expect(sent, "the send must resolve one way or the other, not hang").toBeDefined();
+
+      expect(A.getSessionNodeManager().getSessionLiveness("alice", SID_HEX)).toBe("impaired");
+
+      const recv = (await clientA.send("cello_receive", { session_id: SID_HEX, timeout_ms: 200 })) as Record<string, unknown>;
+      expect(recv.reason, `a receive on an impaired session must say so (got ${JSON.stringify(recv)})`).toBe("delivery_impaired");
+      expect(recv.liveness).toBe("impaired");
+      // NOT the dead-session answer: the connection is up, content may still arrive, and nothing
+      // here justifies steering the operator toward sealing.
+      expect(String(recv.guidance)).not.toMatch(/close.session/);
+      // It reports the send failure, and it does not tell the caller to keep waiting quietly.
+      expect(String(recv.guidance)).toMatch(/impaired/);
+
+      // Whatever it says about resending must match what actually happened to the message. The
+      // impairment record is the only thing that knows, so the guidance is checked against IT
+      // rather than against a fixed sentence.
+      const impairment = A.getSessionNodeManager().getSessionImpairment("alice", SID_HEX);
+      expect(impairment, "an impaired session must record WHY").not.toBeNull();
+      expect(impairment!.cause).toBe("direct_send");
+      if (impairment!.retained === "lost") {
+        expect(String(recv.guidance)).toMatch(/send it again/i);
+        expect(String(recv.guidance)).not.toMatch(/do NOT resend/);
+      } else if (impairment!.retained === "parked" || impairment!.retained === "durable") {
+        expect(String(recv.guidance)).toMatch(/do NOT resend/);
+      } else {
+        // Unknown retention: the guidance must make NO claim about resending in either direction.
+        expect(String(recv.guidance)).not.toMatch(/resend|send it again/i);
+      }
+
+      // Both status surfaces carry the new state, or an operator has no way to see it.
+      const status = (await clientA.send("status", {})) as Record<string, unknown>;
+      const active = status.active_sessions as Array<Record<string, unknown>> | undefined;
+      expect(active!.find((s) => s.sessionId === SID_HEX)!.liveness).toBe("impaired");
+      const mcpStatus = (await clientA.send("cello_status", {})) as Record<string, unknown>;
+      const mcpActive = mcpStatus.active_sessions as Array<Record<string, unknown>> | undefined;
+      expect(mcpActive!.find((s) => s.sessionId === SID_HEX)!.liveness).toBe("impaired");
+    } finally {
+      clientA.close();
+      clientB.close();
+    }
+  }, 60_000);
+
   it("regression: alive-but-quiet session still returns the normal null timeout", async () => {
     const { A, clientA, clientB } = await establishSession();
     try {

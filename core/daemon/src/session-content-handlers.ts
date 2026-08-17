@@ -965,6 +965,44 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
           };
         }
+        // DOD-M12B-ACK-1: the same rule one step short of 'gone'. A session whose writes are
+        // failing looks EXACTLY like a quiet-but-healthy one from here — nothing arrives, and the
+        // old answer said "nothing arrived", so an operator waited. Measured 2026-08-17: one
+        // session reported healthy for 70 minutes while every message it sent was parking.
+        // Distinct from 'gone' on purpose: the connection is up, content may still arrive FROM
+        // them, and the session must not be steered toward a seal on this evidence.
+        if (liveness === "impaired") {
+          const impairment = sessionNodeManager.getSessionImpairment(agentName, sessionId);
+          logger.info("session.receive.empty", {
+            sessionId, agentName, connectionId, timeoutMs, attendance,
+            liveness, impairmentCause: impairment?.cause, impairmentRetained: impairment?.retained,
+            correlationId: receiveCorrelationId,
+          });
+          // EVERY CLAUSE BELOW IS SOMETHING WE ACTUALLY KNOW. The first version of this branch
+          // asserted that the message "was parked for the relay to hand over" and that the caller
+          // must not resend — and both are false in real cases: a refused park whose durable
+          // enqueue was dropped is GONE, and `cello_send` already told the caller to send it again.
+          // A receive that contradicts that, later, while the agent is waiting, is worse than
+          // silence. The failing write can also be an ACK we owed THEM, in which case the caller
+          // sent nothing at all and has no last message to reason about.
+          const what = impairment?.cause === "delivery_ack"
+            ? "Our acknowledgement to the counterparty could not be sent (liveness: impaired) — this is about a receipt we owe them, not about anything you sent."
+            : "Your own last send did not reach the counterparty on the direct path (liveness: impaired).";
+          const whatNext =
+            impairment?.retained === "parked" ? " That message went to the relay to hand over instead — do NOT resend it: it is not lost, and a resend takes a second position in the record."
+            : impairment?.retained === "durable" ? " That message is queued locally and will be re-sent automatically — do NOT resend it: an identical resend is not separately queued."
+            : impairment?.retained === "lost" ? " That message could NOT be queued and is lost — send it again. (cello_send said the same when it failed.)"
+            : "";
+          return {
+            ok: true,
+            content: null,
+            attendance: attendingNow(agentName),
+            reason: "delivery_impaired",
+            liveness: "impaired",
+            ...(impairment ? { impairment } : {}),
+            guidance: `Nothing arrived. ${what}${whatNext} Their connection is still up, so content may still arrive and this can clear on its own — call cello_status for this session rather than assuming the counterparty is ignoring you.`,
+          };
+        }
         logger.info("session.receive.empty", {
           sessionId, agentName, connectionId, timeoutMs, attendance,
           liveness, correlationId: receiveCorrelationId,

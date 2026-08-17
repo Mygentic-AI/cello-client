@@ -240,6 +240,23 @@ export interface CelloNode {
   hasDirectConnectionTo(peerId: string): boolean;
 
   /**
+   * DOD-M12B-ACK-1: how many streams for `protocolId` are currently live on the connections to
+   * `peerId`, split by direction.
+   *
+   * libp2p caps streams PER PROTOCOL PER CONNECTION — 32 inbound, 64 outbound by default — and
+   * enforces the cap after protocol negotiation has already succeeded, so a handler that forgets
+   * to close its streams produces `Cannot write to a stream that is closed` on the far side and
+   * nothing anywhere names the cap. Establishing that took a 6,451-record log measurement. This
+   * exists so the two failure logs can carry the number instead, and so a test can assert that a
+   * slot was RELEASED rather than that some particular count of messages happened to fit.
+   *
+   * Returns zeroes when there is no connection to the peer — "no streams" is the truthful answer
+   * to "how many streams are open", and a diagnostic must never throw on the failure path it
+   * exists to describe.
+   */
+  countProtocolStreams(peerId: string, protocolId: string): { inbound: number; outbound: number };
+
+  /**
    * DOD-RELAY-KEEPALIVE-1: the connection-monitor policy this node is actually running.
    *
    * Answerable at runtime on purpose. The policy decides whether a slow ping costs the whole

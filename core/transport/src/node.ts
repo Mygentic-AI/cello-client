@@ -382,6 +382,27 @@ class CelloNodeImpl implements CelloNode {
     this.#connectionMonitorPolicy = policy;
   }
 
+  /** DOD-M12B-ACK-1: live stream count for one protocol on the connections to a peer. See the
+   *  interface doc — this is what lets a cap-exhaustion failure name its cause. */
+  countProtocolStreams(peerIdStr: string, protocolId: string): { inbound: number; outbound: number } {
+    let peerId;
+    try {
+      peerId = peerIdFromString(peerIdStr);
+    } catch {
+      return { inbound: 0, outbound: 0 };
+    }
+    let inbound = 0;
+    let outbound = 0;
+    for (const conn of this.#libp2p.getConnections(peerId)) {
+      for (const stream of conn.streams) {
+        if (stream.protocol !== protocolId) continue;
+        if (stream.direction === "inbound") inbound++;
+        else outbound++;
+      }
+    }
+    return { inbound, outbound };
+  }
+
   hasDirectConnectionTo(peerIdStr: string): boolean {
     let peerId;
     try {
