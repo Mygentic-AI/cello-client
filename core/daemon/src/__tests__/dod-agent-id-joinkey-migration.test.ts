@@ -274,15 +274,15 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
        VALUES ('id-a','alice',x'00','pub-a','created',1,1)`,
     ).run();
     migrated.exec("INSERT INTO contacts (agent_name, pubkey, added_at) VALUES ('alice','p',1)");
-    // Replay the manager's FULL init migration sequence, in order: the join-key re-key, then the
-    // DOD-TIER-1 contacts ADD COLUMN. `initialize()` runs both, so a faithful legacy replay must too —
-    // otherwise `migrated` lacks the tier metadata that a fresh init now creates. This keeps the
-    // fresh==migrated invariant honest against BOTH migrations, not just the re-key.
-    migrateSessionTablesToAgentId(migrated, makeLogger().logger);
-    migrateContactsAddTierMetadata(migrated, makeLogger().logger);
-    // Replay the inline sessions ALTER migrations that initialize() applies incrementally.
-    // Each is idempotent (duplicate column → swallowed), so adding a new column here keeps
-    // fresh==migrated honest without touching the locked LEGACY_DDL.
+    // REPLAY THE ORDER `initialize()` ACTUALLY USES: the inline sessions ALTERs FIRST, then the
+    // join-key re-key, then the DOD-TIER-1 contacts ADD COLUMN.
+    //
+    // This used to run the ALTERs LAST, which is not what the daemon does — and that ordering hid a
+    // real defect: the re-key rebuilds `sessions` from a pinned DDL and carries only the columns
+    // present in BOTH tables, so a column the ALTERs add but the pinned DDL omits is DROPPED on the
+    // one boot where a legacy database migrates. Replaying the ALTERs afterwards put the column
+    // back and the comparison passed. `read_at` was missing from the pinned DDL for exactly this
+    // reason and nothing caught it.
     for (const ddl of [
       "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
@@ -296,6 +296,8 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
     ]) {
       try { migrated.exec(ddl); } catch { /* duplicate column — already applied */ }
     }
+    migrateSessionTablesToAgentId(migrated, makeLogger().logger);
+    migrateContactsAddTierMetadata(migrated, makeLogger().logger);
     new RetryQueue(migrated, makeLogger().logger);
 
     for (const t of SEVEN) {

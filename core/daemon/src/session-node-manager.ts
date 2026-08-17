@@ -3183,16 +3183,26 @@ export class SessionNodeManager {
     const strandedHolds = this.#heldContent.get(key);
     if (strandedHolds && strandedHolds.size > 0) {
       const canonicalSeqs = [...strandedHolds.keys()].sort((a, b) => a - b);
-      let durable = 0;
+      // NULL means "we could not find out", and it must never render as "destroyed". The bare
+      // catch this replaces coerced a failed COUNT to 0, which then claimed every held frame had
+      // been lost — asserting a cause it had not established. It is not hypothetical:
+      // #requireAgentId THROWS for a retired agent, on this exact path, so retiring an agent with
+      // an open hold fabricated a data-loss alarm pointing at the persistence layer while the real
+      // fault was name resolution.
+      let durable: number | null = null;
       try {
         const row = this.#db?.prepare(
           "SELECT COUNT(*) AS n FROM held_content WHERE agent_id = ? AND session_id = ?",
         ).get(this.#requireAgentId(agentName), sessionId) as { n: number } | undefined;
         durable = row?.n ?? 0;
-      } catch {
-        durable = 0;
+      } catch (err: unknown) {
+        this.#logger.warn("session.content.held.durable_count.failed", {
+          agentName, sessionId,
+          impact: "cannot say whether the held frames are durable — reported as unknown, NOT as lost",
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
-      const lost = strandedHolds.size - durable;
+      const lost = durable === null ? null : strandedHolds.size - durable;
       this.#logger.warn("session.content.held.discarded", {
         agentName,
         sessionId,
@@ -3204,7 +3214,7 @@ export class SessionNodeManager {
         // alone the cache resurrection it caused.
         treeSize: treeSizeBeforeEviction,
       });
-      if (lost > 0) {
+      if (lost !== null && lost > 0) {
         this.#logger.error("session.content.held.lost", {
           agentName,
           sessionId,
@@ -5299,11 +5309,11 @@ export class SessionNodeManager {
   /**
    * DOD-M12B-STRAND-1 — write one held frame to the durable store.
    *
-   * FAILS LOUD. Everywhere else in this class a best-effort write is defensible; here it is not.
-   * The caller is about to answer `held: true` and deliberately withhold the `persisted` ACK, so
-   * the sender will hold its copy and retry — but only until it gives up. If this row never lands
-   * and the daemon then goes down, the content is destroyed exactly as it was before this unit,
-   * and a swallowed error would make that look identical to a success.
+   * LOGS LOUD, does not refuse. The caller answers `held: true` either way, and that is correct:
+   * held content is never `persisted`-acked, so the sender keeps its copy and retries whether or
+   * not this row lands. What a failure costs is the restart case — the frame is memory-only again,
+   * exactly as it was before this unit — so it is reported at ERROR here and counted again by the
+   * teardown alarm, and never allowed to look like a success.
    */
   #persistHeldContent(
     agentName: string,
@@ -5317,6 +5327,19 @@ export class SessionNodeManager {
   ): void {
     if (!this.#db) return;
     try {
+      // A position may legitimately be re-written by a redelivery of the SAME frame. Different
+      // content at the same relay position means the relay contradicted itself, and destroying the
+      // first copy silently is not an option for verified content.
+      const existing = this.#db.prepare(
+        "SELECT content_hash_hex FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
+      ).get(this.#requireAgentId(agentName), sessionId, canonicalSeq) as { content_hash_hex: string } | undefined;
+      if (existing && existing.content_hash_hex !== contentHashHex) {
+        this.#logger.error("session.content.held.position_conflict", {
+          agentName, sessionId, canonicalSeq, correlationId,
+          existingContentHash: existing.content_hash_hex, incomingContentHash: contentHashHex,
+          impact: "two different frames claim one canonical position — the earlier held copy is being replaced",
+        });
+      }
       this.#db.prepare(
         `INSERT OR REPLACE INTO held_content
            (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at)
@@ -5328,7 +5351,7 @@ export class SessionNodeManager {
       );
     } catch (err: unknown) {
       this.#logger.error("session.content.held.persist.failed", {
-        agentName, sessionId, canonicalSeq, contentHash: contentHashHex,
+        agentName, sessionId, canonicalSeq, contentHash: contentHashHex, correlationId,
         impact: "this frame is held IN MEMORY ONLY and will be destroyed if the daemon restarts",
         error: err instanceof Error ? err.message : String(err),
       });
@@ -5359,15 +5382,30 @@ export class SessionNodeManager {
    * append again. Loading at daemon boot instead would be wrong for the same reason the old code
    * was wrong: a frame is only releasable against a tree, and the tree is loaded per session.
    *
-   * Frames already behind the tree's frontier are DROPPED, not re-appended — a restart that
-   * re-applied content already in the tree would change the root a seal signs over. They are
-   * logged, because a hold that turns out to be redundant is worth seeing.
+   * A frame whose content the tree ALREADY HOLDS at that position is dropped — re-appending it
+   * would change the root a seal signs over. That test is `hashAt`, not `canonical_seq < frontier`:
+   * the two counters are different spaces and this file documents them drifting, so the index
+   * comparison alone would destroy a frame the tree never held. See the drift branch below.
    */
   #ensureHeldRestored(agentName: string, sessionId: string): void {
     const key = this.#k(agentName, sessionId);
     if (this.#heldRestored.has(key)) return;
+    // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
+    // away instead of recursing.
     this.#heldRestored.add(key);
     this.#restoreHeldContent(agentName, sessionId);
+    // A RESTORED FRAME MAY ALREADY BE IN ORDER, and nothing else would ever notice.
+    //
+    // #releaseHeld has one caller: the tail of a successful inbound ingest. Every other way the tree
+    // grows — an outbound send leaf, a queued or rejected leaf — advances the frontier without
+    // draining. While holds died with the session node that cost seconds; now the hold is durable,
+    // so the stall is durable too: the counterparty's message sits on disk at exactly the next slot,
+    // is never delivered, and `sealReadiness` counts it, so the session cannot close either.
+    // Undeliverable AND unsealable, forever, from one restart.
+    if (this.#heldContent.get(key)?.size) {
+      const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+      if (counterparty) this.#releaseHeld(agentName, sessionId, counterparty);
+    }
   }
 
   #restoreHeldContent(agentName: string, sessionId: string): void {
@@ -5390,13 +5428,45 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     let held = this.#heldContent.get(key);
     if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    const frontier = this.getSessionTree(agentName, sessionId).size();
+    const tree = this.getSessionTree(agentName, sessionId);
+    const frontier = tree.size();
     let restored = 0;
     let superseded = 0;
+    let drifted = 0;
     for (const row of rows) {
-      if (row.canonical_seq < frontier) {
+      // ASK THE TREE WHAT IS AT THAT POSITION — do not infer it from the index.
+      //
+      // `canonical_seq` is the RELAY's sequence space; `frontier` is this tree's msg-leaf count.
+      // The two drift, on purpose and by documented cases: the relay counts CTRL leaves the tree
+      // never appends, and a first message whose relay submit failed leaves the tree one ahead.
+      // Under drift `canonical_seq < frontier` is TRUE for a frame the tree has never held, and
+      // deleting on that comparison destroys verified content while reporting it as tidy-up —
+      // the exact failure this unit exists to end, reintroduced on the recovery path.
+      const occupant = tree.hashAt(row.canonical_seq);
+      if (occupant === row.content_hash_hex) {
         this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
         superseded++;
+        continue;
+      }
+      if (row.canonical_seq < frontier) {
+        // The position is taken by DIFFERENT content. The frame cannot be appended (that would
+        // rewrite a committed leaf) and must not be deleted (it is verified content nobody else
+        // holds), so it goes to the annex that exists for exactly this — content that arrived for
+        // a chain that can no longer carry it — and only then does the row go.
+        const annexed = this.recordSealedAnnex(
+          agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob),
+          this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null,
+        );
+        this.#logger.error("session.content.held.position_drifted", {
+          agentName, sessionId, canonicalSeq: row.canonical_seq, frontier,
+          contentHash: row.content_hash_hex, occupant, annexed,
+          correlationId: row.correlation_id ?? undefined,
+          impact: annexed
+            ? "the relay's position for this frame is occupied by different content — it cannot join the chain and is readable only from the annex"
+            : "the relay's position for this frame is occupied by different content AND the annex write failed — the durable row is kept rather than destroyed",
+        });
+        if (annexed) this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        drifted++;
         continue;
       }
       held.set(row.canonical_seq, {
@@ -5410,8 +5480,11 @@ export class SessionNodeManager {
     }
     if (held.size === 0) this.#heldContent.delete(key);
     this.#logger.info("session.content.held.restored", {
-      agentName, sessionId, restored, superseded, frontier,
+      agentName, sessionId, restored, superseded, drifted, frontier,
       canonicalSeqs: [...held.keys()].sort((a, b) => a - b),
+      // The flow ids of the frames that came back, so a restored message ties to the
+      // `session.content.held` that opened its flow before the restart.
+      correlationIds: rows.map((r) => r.correlation_id).filter((c): c is string => c !== null),
     });
   }
 
@@ -6815,6 +6888,55 @@ export class SessionNodeManager {
   }
 
   /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
+  /**
+   * DOD-M12B-STRAND-1 — move a terminal session's held frames to the annex.
+   *
+   * A held frame is content this agent RECEIVED and VERIFIED. When its session ends it can never
+   * join that chain (appending behind a committed root is not an option, and ingest refuses a
+   * terminal session outright), but it is still the operator's mail and no other copy exists —
+   * the sender was never acknowledged for it. `sealed_session_annex` is where M12-P17 already puts
+   * content that arrives for an ended session; this is the same content arriving slightly earlier.
+   *
+   * ANNEX FIRST, DELETE SECOND, per row. A crash between them costs a duplicate the annex's
+   * INSERT OR IGNORE absorbs; the other order costs the message. A row whose annex write fails is
+   * KEPT — the retention sweep will find it again, and a leftover row is cheaper than a lost one.
+   */
+  #annexHeldContentOnTerminal(agentName: string, sessionId: string, status: "sealed" | "abandoned"): void {
+    if (!this.#db) return;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; content_hash_hex: string; held_at: number }>;
+    try {
+      rows = this.#db.prepare(
+        `SELECT canonical_seq, content_blob, content_hash_hex, held_at
+           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
+      ).all(this.#requireAgentId(agentName), sessionId) as never;
+    } catch (err: unknown) {
+      this.#logger.error("session.content.held.annex.scan.failed", {
+        agentName, sessionId, status,
+        impact: "held frames for a terminal session were not moved to the annex and remain unreadable",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (rows.length === 0) return;
+    const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null;
+    let annexed = 0;
+    let kept = 0;
+    for (const row of rows) {
+      if (this.recordSealedAnnex(agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob), counterparty)) {
+        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
+        annexed++;
+      } else {
+        kept++;
+      }
+    }
+    this.#logger.warn("session.content.held.annexed", {
+      agentName, sessionId, status, annexed, kept,
+      // The consumer of `held_at`: how long the oldest frame waited before its session ended.
+      oldestHeldMs: Date.now() - Math.min(...rows.map((r) => r.held_at)),
+      impact: "these messages arrived and verified but never joined the chain — they are readable from the annex, not the transcript",
+    });
+  }
+
   #updateSessionStatus(
     agentName: string,
     sessionId: string,
@@ -6847,6 +6969,14 @@ export class SessionNodeManager {
       // is still, on disk, drainable. 'interrupted' and 'seal_interrupted_pending' are deliberately
       // NOT terminal — both can still complete, and reaping them would destroy live content.
       if (status === "sealed" || status === "abandoned") {
+        // DOD-M12B-STRAND-1: held frames outlive the chain that could have carried them.
+        //
+        // Once a session is terminal, `ingestReceivedContent` refuses it — and #releaseHeld is only
+        // reachable from ingest — so no code path that exists can ever release a held frame again.
+        // Left alone the rows sit on disk, unreachable by any surface, while the teardown alarm
+        // reports `lost: 0`: a success message for content that has just become permanently
+        // unreadable. The annex is the store built for exactly this shape.
+        this.#annexHeldContentOnTerminal(agentName, sessionId, status);
         try {
           this.#onSessionTerminal?.(sessionId, status);
         } catch (hookErr: unknown) {

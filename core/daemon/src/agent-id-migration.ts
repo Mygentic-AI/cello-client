@@ -59,6 +59,20 @@ interface RekeyTarget {
   readonly backfill: "strict" | "nullable";
 }
 
+/**
+ * EVERY COLUMN THE INLINE ALTERs ADD MUST APPEAR IN THE createSql BELOW.
+ *
+ * `initialize()` runs the ALTERs first and this rebuild second, and the rebuild carries only the
+ * INTERSECTION of the old and new column sets. A column the ALTERs add and a createSql omits is
+ * therefore DELETED on the one boot where a legacy database upgrades — silently, unrecoverably,
+ * on an operator's machine. `sessions.read_at` was missing for exactly that reason: every dismissal
+ * flag would have been dropped, after which `getEndedUnread` (which filters on `read_at IS NULL`)
+ * throws `no such column` for the rest of that process.
+ *
+ * The parity test guards this, but only because it replays the ALTERs BEFORE the re-key, in the
+ * order `initialize()` uses. Replaying them afterwards puts the column back and the comparison
+ * passes over the top of the loss — which is how this survived.
+ */
 const REKEY_TARGETS: readonly RekeyTarget[] = [
   {
     table: "sessions",
@@ -79,6 +93,7 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         sealed_root_hex TEXT,
         counterparty_primary_pubkey TEXT,
         session_name TEXT,
+        read_at INTEGER,
         PRIMARY KEY (agent_id, session_id)
       )`,
     indexSql: () => [],

@@ -104,17 +104,21 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       expect(first.events.some((e) => e.event === "session.content.held")).toBe(true);
       expect(mgr.getSessionTree(AGENT, sid).size()).toBe(0);
 
-      // The daemon goes down while the gap is still open — the exact shape that destroyed 24
-      // verified messages on one morning.
+      // The session node is DESTROYED while the gap is still open — the exact shape that destroyed
+      // 24 verified messages on one morning. Driven explicitly rather than via gracefulShutdown,
+      // which clears its caches directly and never touches the hold map, so the teardown report
+      // this asserts on could not fire either way.
+      await mgr.destroySessionNode(AGENT, sid, "error");
+      const discarded = first.events.filter((e) => e.event === "session.content.held.discarded");
+      expect(discarded.length, "the teardown must still report that a gap was open").toBe(1);
+      // It reports SURVIVAL, not loss. `durable` is a COUNT against the store, not a belief.
+      expect(discarded[0]!.context["durable"]).toBe(1);
+      expect(
+        first.events.filter((e) => e.event === "session.content.held.lost"),
+        "the content was persisted, so nothing may report it destroyed",
+      ).toEqual([]);
       await mgr.gracefulShutdown();
     }
-
-    // The loss report must NOT have fired: nothing was lost, so claiming a loss would be its own
-    // lie. `session.content.held.discarded` is reserved for content that is actually gone.
-    expect(
-      first.events.filter((e) => e.event === "session.content.held.discarded"),
-      "content was persisted, so nothing may report it destroyed",
-    ).toEqual([]);
 
     // A NEW daemon process on the same database — the held frame must still be there.
     const second = makeLogger();
@@ -178,9 +182,96 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     await mgr2.gracefulShutdown();
   }, 60_000);
 
-  it("a hold already behind the tree's frontier is dropped on restore, never re-appended", async () => {
+  it("a hold whose content the tree ALREADY HOLDS at that position is dropped, never re-appended", async () => {
     const dbPath = join(tempDir, "s3.db");
     const c0 = new TextEncoder().encode("p0");
+    const c1 = new TextEncoder().encode("p1");
+    const h0 = msgLeafHash(c0), h1 = msgLeafHash(c1);
+
+    const first = makeLogger();
+    {
+      const mgr = await makeManager(first.logger, dbPath);
+      await seedAgents(mgr.getDb(), [AGENT]);
+      await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
+      // Hold p1 at seq 1, then fill seq 0 so p1 is released and lands at index 1 — after which the
+      // tree genuinely holds that content at that position.
+      mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
+      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+      mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
+      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
+      expect(mgr.getSessionTree(AGENT, sid).size()).toBe(2);
+      // Put the row back by hand: a real daemon reaches this state by crashing between the append
+      // and the delete, and that window is exactly what the restore must be safe against.
+      mgr.getDb().prepare(
+        `INSERT OR REPLACE INTO held_content (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at)
+         VALUES ((SELECT agent_id FROM sessions WHERE session_id = ?), ?, 1, ?, ?, ?, 0, 'corr-1', ?)`,
+      ).run(sid, sid, Buffer.from(c1), Buffer.from(c1), hx(h1), Date.now());
+      await mgr.gracefulShutdown();
+    }
+
+    const second = makeLogger();
+    const mgr2 = await makeManager(second.logger, dbPath);
+    await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
+    const next = new TextEncoder().encode("p2");
+    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2");
+    expect(mgr2.getSessionTree(AGENT, sid).size(), "the duplicate must not re-append").toBe(3);
+    const restored = second.events.find((e) => e.event === "session.content.held.restored");
+    expect(restored).toBeDefined();
+    expect(restored!.context["superseded"], "the tree holds this exact content here — the row is redundant").toBe(1);
+    expect(restored!.context["drifted"]).toBe(0);
+    await mgr2.gracefulShutdown();
+  }, 60_000);
+
+  it("a hold whose position is occupied by DIFFERENT content is annexed, never silently deleted", async () => {
+    const dbPath = join(tempDir, "s5.db");
+    const held = new TextEncoder().encode("mine, and nobody else has a copy");
+    const heldHash = msgLeafHash(held);
+
+    const first = makeLogger();
+    {
+      const mgr = await makeManager(first.logger, dbPath);
+      await seedAgents(mgr.getDb(), [AGENT]);
+      await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
+      mgr.recordWitnessedSequence(AGENT, sid, hx(heldHash), 1);
+      await mgr.ingestReceivedContent(AGENT, sid, held, heldHash, "corr-1");
+      // The tree grows past position 1 with OTHER content. The relay's sequence space and this
+      // tree's leaf-index space drift — the relay counts ctrl leaves the tree never appends — so
+      // "canonical_seq < frontier" is true here for a frame the tree has never held. Judging on the
+      // index alone would destroy it and file the destruction as tidy-up.
+      mgr.appendSessionLeaf(AGENT, sid, "msg", "aa".repeat(32), "seed");
+      mgr.appendSessionLeaf(AGENT, sid, "msg", "bb".repeat(32), "seed");
+      await mgr.gracefulShutdown();
+    }
+
+    const second = makeLogger();
+    const mgr2 = await makeManager(second.logger, dbPath);
+    await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
+    const next = new TextEncoder().encode("p9");
+    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2");
+
+    const drift = second.events.find((e) => e.event === "session.content.held.position_drifted");
+    expect(drift, "a frame that cannot join the chain must be named, not counted as tidy-up").toBeDefined();
+    expect(drift!.level, "losing the ability to deliver verified content is an error, not a note").toBe("error");
+    expect(drift!.context["annexed"]).toBe(true);
+
+    // THE CONTENT STILL EXISTS. That is the whole invariant: it cannot join this chain, but it is
+    // not destroyed to resolve an ordering problem.
+    const annex = mgr2.getDb()
+      .prepare("SELECT content FROM sealed_session_annex WHERE session_id = ? AND content_hash = ?")
+      .get(sid, hx(heldHash)) as { content: Buffer } | undefined;
+    expect(annex, "the frame must be readable from the annex").toBeDefined();
+    expect(Buffer.from(annex!.content).toString()).toBe("mine, and nobody else has a copy");
+    await mgr2.gracefulShutdown();
+  }, 60_000);
+
+  it("a document frame survives the round trip as the peer's RAW bytes, not the screened copy", async () => {
+    const dbPath = join(tempDir, "s6.db");
+    // Classification reads byte 0, and the screened copy is no longer a CBOR map header for a
+    // document frame — so a restore that dropped `original_blob` would release a document frame
+    // into the conversation path: transcript, doorbell, and an agent handed raw CBOR.
+    const raw = new Uint8Array([0xa2, 0x01, 0x02, 0x03, 0x04, 0x05]);
+    const rawHash = msgLeafHash(raw);
+    const c0 = new TextEncoder().encode("first");
     const h0 = msgLeafHash(c0);
 
     const first = makeLogger();
@@ -188,29 +279,20 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       const mgr = await makeManager(first.logger, dbPath);
       await seedAgents(mgr.getDb(), [AGENT]);
       await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
-      // Hold seq 1, then let the tree grow past it by two leaves. A redelivery that arrives while
-      // its own position is already filled is exactly the shape that produced this milestone.
-      mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 1);
-      await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
-      expect(first.events.some((e) => e.event === "session.content.held")).toBe(true);
-      mgr.appendSessionLeaf(AGENT, sid, "msg", "aa".repeat(32), "seed");
-      mgr.appendSessionLeaf(AGENT, sid, "msg", "bb".repeat(32), "seed");
-      expect(mgr.getSessionTree(AGENT, sid).size()).toBe(2);
+      mgr.recordWitnessedSequence(AGENT, sid, hx(rawHash), 1);
+      await mgr.ingestReceivedContent(AGENT, sid, raw, rawHash, "corr-1");
       await mgr.gracefulShutdown();
     }
 
-    // On restart the held frame's position is already occupied. Re-appending it would grow the
-    // tree and change the root a seal signs over, so it is dropped — and said so.
     const second = makeLogger();
     const mgr2 = await makeManager(second.logger, dbPath);
     await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
-    const next = new TextEncoder().encode("p1");
-    await mgr2.ingestReceivedContent(AGENT, sid, next, msgLeafHash(next), "corr-2");
-    expect(mgr2.getSessionTree(AGENT, sid).size(), "the survivor must not re-append behind the frontier").toBe(3);
-    const restored = second.events.find((e) => e.event === "session.content.held.restored");
-    expect(restored, "a superseded hold is still worth announcing").toBeDefined();
-    expect(restored!.context["restored"]).toBe(0);
-    expect(restored!.context["superseded"]).toBe(1);
+    mgr2.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
+    await mgr2.ingestReceivedContent(AGENT, sid, c0, h0, "corr-2");
+    expect(mgr2.getSessionTree(AGENT, sid).size()).toBe(2);
+    // The leaf binds the hash of the RAW bytes — if the restore had lost them, the released leaf
+    // would bind the screened copy's hash instead and the two parties' roots would part.
+    expect(mgr2.getSessionTree(AGENT, sid).leaves().map((l) => l.hashHex)).toEqual([hx(h0), hx(rawHash)]);
     await mgr2.gracefulShutdown();
   }, 60_000);
 
@@ -230,6 +312,13 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
       mgr.recordWitnessedSequence(AGENT, sid, hx(h0), 0);
       await mgr.ingestReceivedContent(AGENT, sid, c0, h0, "corr-1");
       expect(mgr.getSessionTree(AGENT, sid).size(), "both landed, nothing is held").toBe(2);
+      // ASSERT ON THE STORE, IN THIS PROCESS. Asserting only that the restarted tree looks right
+      // proves nothing about the row: the second manager never reads a row that is behind its
+      // frontier, so deleting the DELETE and leaving the row behind would look identical.
+      const remaining = mgr.getDb()
+        .prepare("SELECT COUNT(*) AS n FROM held_content WHERE session_id = ?")
+        .get(sid) as { n: number };
+      expect(remaining.n, "a released frame's durable row must be gone the moment it is released").toBe(0);
       await mgr.gracefulShutdown();
     }
 
