@@ -490,7 +490,7 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent" }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -1098,6 +1098,11 @@ export class SessionNodeManager {
         screened_out INTEGER NOT NULL DEFAULT 0,
         correlation_id TEXT,
         held_at INTEGER NOT NULL,
+        -- DOD-M12B-INDEX-1: 'received' (default) or 'sent'. A held frame of OUR OWN must be
+        -- released down the sent path — appended and transcribed as sent — never down the received
+        -- path, which would put our words in the counterparty's mouth in the sealed record and hand
+        -- them back to our own agent through cello_receive as though they had just arrived.
+        origin TEXT NOT NULL DEFAULT 'received',
         PRIMARY KEY (agent_id, session_id, canonical_seq)
       )
     `);
@@ -4034,7 +4039,14 @@ export class SessionNodeManager {
      * document exclusions were dead while every document leaf arrived here as a message.
      */
     leafKind: number = LEAF_KIND_MSG,
-  ): Promise<{ ok: true; delivered: true } | { ok: true; delivered: false; parked: true } | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string }> {
+  ): Promise<
+    // DOD-M12B-INDEX-1: `sequenceNumber` is the position the relay assigned this message, carried
+    // out so the caller can place its leaf THERE rather than at whatever the tail happens to be.
+    // Absent when no ordering authority answered — the documented relay-degraded case.
+    | { ok: true; delivered: true; sequenceNumber?: number }
+    | { ok: true; delivered: false; parked: true; sequenceNumber?: number }
+    | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string; sequenceNumber?: number }
+  > {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
       // M12-P13: no node, so nothing was witnessed and nothing was queued — the caller must NOT
@@ -4058,6 +4070,8 @@ export class SessionNodeManager {
     // the leaf_deliver witness stream / arrival order.
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
+    // DOD-M12B-INDEX-1: the relay's answer to "where does this message go", carried to the caller.
+    let assignedSeq: number | undefined;
     // DOD-MP-SESSION-RETIRE-1 — the relay's answer SURVIVES to the caller even when the direct send
     // then succeeds. `relay_session_gone` is deliberately not terminal (it also fires for perfectly
     // live sessions whenever the relay restarts, because the relay stores sessions in memory), so
@@ -4075,6 +4089,7 @@ export class SessionNodeManager {
         if (witnessed.ok) {
           orderingS1 = witnessed.structure1_cbor;
           orderingS2 = witnessed.structure2_cbor;
+          assignedSeq = witnessed.sequence_number;
           this.#logger.info("session.relay.hash.submitted", {
             sessionId,
             sequenceNumber: witnessed.sequence_number,
@@ -4218,7 +4233,7 @@ export class SessionNodeManager {
       // on the content hash. A false delivered costs the message.
       await stream.close();
       this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
-      return { ok: true, delivered: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+      return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
       this.#markSessionImpaired(agentName, sessionId, { cause: "direct_send", error: err instanceof Error ? err.message : String(err), correlationId });
       if (sendStream !== undefined) {
@@ -4258,7 +4273,7 @@ export class SessionNodeManager {
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
-        return { ok: true, delivered: false, parked: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+        return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
       // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
@@ -4341,6 +4356,9 @@ export class SessionNodeManager {
         ok: false,
         reason: "session_stream_unavailable",
         error: errMsg,
+        // Carried on the failure path too: a DURABLY QUEUED message still owns the position the
+        // relay witnessed for it before delivery was attempted, and its leaf must go there.
+        ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }),
         // M12-P13: the machine-readable half of the distinction below. M12-P12 shipped it in the
         // guidance SENTENCE only, so the callers that have to ACT on it — commit the leaf for a
         // queued message, never for a lost one — would have had to substring-match English. None
@@ -5380,6 +5398,76 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-INDEX-1 — commit THIS agent's own leaf at the position the relay assigned it.
+   *
+   * The receiver has always enforced "leaf index === canonical position": content witnessed ahead
+   * of the next expected leaf is held, not appended out of order. The sender never did. It had the
+   * position in hand — the relay answers about 4 ms before the append — and called a push-only
+   * append that puts the leaf at the tail whatever the tail happens to be. While its own tree has
+   * no gap the two agree and nothing shows; the first gap puts its leaf at someone else's index,
+   * parts its root from the counterparty's, and the next seal gets `leaf_count_mismatch`, which is
+   * terminal.
+   *
+   * DELIVERY IS NOT DEFERRED BY THIS. The caller has already put the bytes on the wire; only the
+   * leaf waits for its slot, exactly as a received message does. Holding our own send is only
+   * affordable because holds are durable (DOD-M12B-STRAND-1) — before that it would have risked
+   * losing the message outright.
+   *
+   * `assignedSeq` absent means no ordering authority answered. That is the documented degradation
+   * and it appends in arrival order as before: with no position there is no discipline to enforce,
+   * and refusing would take messaging down whenever the relay is unreachable.
+   */
+  placeOwnLeaf(
+    agentName: string,
+    sessionId: string,
+    contentHashHex: string,
+    sentBytes: Uint8Array,
+    assignedSeq: number | undefined,
+    correlationId?: string,
+  ): { placed: true; leafIndex: number } | { placed: false; heldAt: number | null } {
+    // Hydrate before reading the frontier: a durable hold this process has not read back yet would
+    // make the tree look further along than it is.
+    this.#ensureHeldRestored(agentName, sessionId);
+    const nextExpected = this.getSessionTree(agentName, sessionId).size();
+
+    if (assignedSeq === undefined) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+      return { placed: true, leafIndex };
+    }
+
+    if (assignedSeq === nextExpected) {
+      const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId);
+      return { placed: true, leafIndex };
+    }
+
+    if (assignedSeq < nextExpected) {
+      // The relay handed back a position this tree has already passed, for a message we have only
+      // just submitted. Appending puts our leaf at the wrong index; writing over the slot rewrites
+      // a leaf a root has already been computed over. Neither is acceptable, so the leaf is not
+      // placed and the anomaly is named — this is the counter-conflation this milestone exists to
+      // stop, seen from the one side that can still refuse it.
+      this.#logger.error("session.tree.position_behind_frontier", {
+        agentName, sessionId, assignedSeq, nextExpected, contentHash: contentHashHex, correlationId,
+        impact: "this message has no place in the chain — it was delivered but is NOT in the record",
+      });
+      return { placed: false, heldAt: null };
+    }
+
+    // Ahead of the tail: hold it, exactly as the receiver holds theirs, and let #releaseHeld put it
+    // in at its own index when the gap fills.
+    const key = this.#k(agentName, sessionId);
+    let held = this.#heldContent.get(key);
+    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
+    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent" });
+    this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent");
+    this.#logger.info("session.content.held", {
+      sessionId, canonicalSeq: assignedSeq, nextExpected, gap: assignedSeq - nextExpected,
+      origin: "sent", correlationId,
+    });
+    return { placed: false, heldAt: assignedSeq };
+  }
+
+  /**
    * DOD-M12B-STRAND-1 — write one held frame to the durable store.
    *
    * LOGS LOUD, does not refuse. The caller answers `held: true` either way, and that is correct:
@@ -5397,6 +5485,7 @@ export class SessionNodeManager {
     contentHashHex: string,
     screenedOut: boolean,
     correlationId?: string,
+    origin: "received" | "sent" = "received",
   ): void {
     if (!this.#db) return;
     try {
@@ -5415,12 +5504,12 @@ export class SessionNodeManager {
       }
       this.#db.prepare(
         `INSERT OR REPLACE INTO held_content
-           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at, origin)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         this.#requireAgentId(agentName), sessionId, canonicalSeq,
         Buffer.from(deliverContent), Buffer.from(originalContent), contentHashHex,
-        screenedOut ? 1 : 0, correlationId ?? null, Date.now(),
+        screenedOut ? 1 : 0, correlationId ?? null, Date.now(), origin,
       );
     } catch (err: unknown) {
       this.#logger.error("session.content.held.persist.failed", {
@@ -5493,10 +5582,10 @@ export class SessionNodeManager {
 
   #restoreHeldContent(agentName: string, sessionId: string): void {
     if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null }>;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string }>;
     try {
       rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id
+        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin
            FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
       ).all(this.#requireAgentId(agentName), sessionId) as never;
     } catch (err: unknown) {
@@ -5558,6 +5647,7 @@ export class SessionNodeManager {
         contentHashHex: row.content_hash_hex,
         ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
         ...(row.screened_out ? { screenedOut: true } : {}),
+        ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
       });
       restored++;
     }
@@ -5594,9 +5684,13 @@ export class SessionNodeManager {
       // that outlives its release would re-append the same content on the next boot — growing the
       // tree and changing a root that has already been signed.
       this.#deleteHeldContent(agentName, sessionId, nextExpected);
-      // A screened-out (terminal-blocked) held entry leafs at its canonical index but is NEVER
-      // buffered for the agent; a normal held entry buffers + leafs (code-review HIGH-1).
-      if (entry.screenedOut) {
+      // DOD-M12B-INDEX-1: OUR OWN held message. It leafs at its canonical index and is transcribed
+      // as SENT — never routed down the received path, which would attribute our words to the
+      // counterparty in the sealed record and hand them back to our own agent as inbound.
+      if (entry.origin === "sent") {
+        this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
+        this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId);
+      } else if (entry.screenedOut) {
         this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
       } else {
         this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);

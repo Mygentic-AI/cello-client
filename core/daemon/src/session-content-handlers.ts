@@ -449,11 +449,19 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // A LOST message gets no leaf — that would commit a sequence no content will ever fill, and
       // the two roots could then never seal.
       if (sendResult.durable) {
-        const { leafIndex: queuedLeaf } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
-        sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
-        advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
+        // DOD-M12B-INDEX-1: at the position the relay assigned, not at whatever the tail is. When
+        // this side has a gap the two differ, and committing at the tail puts our leaf at someone
+        // else's index — which parts the two roots and makes the next seal terminal.
+        const placed = sessionNodeManager.placeOwnLeaf(
+          record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+        );
+        const queuedLeaf = placed.placed ? placed.leafIndex : (sendResult.sequenceNumber ?? -1);
+        if (placed.placed) {
+          sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
+          advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
+        }
         logger.info("session.content.queued.committed", {
-          sessionId, sequenceNumber: queuedLeaf, contentHash: contentHashHex, correlationId,
+          sessionId, sequenceNumber: queuedLeaf, committed: placed.placed, contentHash: contentHashHex, correlationId,
         });
         return {
           ok: false,
@@ -480,7 +488,27 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // part of the daemon-owned tree: the relay witness (R1) already assigned it a sequence before
     // direct delivery was even attempted, so a parked message occupies the SAME leaf position it
     // would have taken if delivered live. Append once, for both outcomes.
-    const { leafIndex, newRootHex } = sessionNodeManager.appendSessionLeaf(record.agent_name, sessionId, "msg", contentHashHex, correlationId);
+    // DOD-M12B-INDEX-1: the relay assigned this message a position before delivery was attempted,
+    // and the leaf goes THERE. Appending at the tail is only right while this side has no gap; the
+    // first gap puts our own leaf at a position that belongs to a message of theirs we have not
+    // seen, which parts the two roots permanently. When the position is ahead of the tail the leaf
+    // is held — the bytes are already on the wire, so only the record waits, exactly as it does for
+    // a message we receive out of order.
+    const placement = sessionNodeManager.placeOwnLeaf(
+      record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+    );
+    if (!placement.placed) {
+      return {
+        ok: true,
+        sequence_number: placement.heldAt ?? -1,
+        held: true,
+        guidance: placement.heldAt === null
+          ? "The message was delivered, but the relay gave it a position this side has already passed, so it could not be recorded. Do not resend — check the daemon log for session.tree.position_behind_frontier."
+          : "The message was delivered. Its place in the record is waiting on an earlier message that has not arrived yet, so it is not in the transcript until that gap fills. Nothing to do — do not resend.",
+      };
+    }
+    const leafIndex = placement.leafIndex;
+    const newRootHex = sessionNodeManager.getSessionTreeRootHex(record.agent_name, sessionId);
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).
     // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
