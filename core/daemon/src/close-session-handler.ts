@@ -461,6 +461,51 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     };
   };
 
+  /**
+   * Post this side's SEAL ctrl leaf (or recover the one a previous run already posted) and ask the
+   * directory to notarize. `null` means there was nothing to escalate with — the caller keeps its
+   * own result rather than inventing a failure.
+   *
+   * SHARED so a third copy cannot appear. It has two callers: the interrupted close, and the
+   * `seal_interrupted_pending` close that used to be refused outright.
+   */
+  const submitAndEscalate = async (
+    record: SessionRecord,
+    sessionId: string,
+    correlationId: string,
+  ): Promise<
+    | { ok: true; sealed_root: string; seal_type: "unilateral"; legibility?: unknown }
+    | { ok: false; reason: string; retry_after_seconds?: number; guidance: string }
+    | null
+  > => {
+    const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
+    if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
+      logger.info("session.interrupted.seal.leaf.submitted", {
+        agentName: record.agent_name, sessionId, correlationId,
+      });
+    } else {
+      logger.warn("session.interrupted.seal.leaf.submit_failed", {
+        agentName: record.agent_name, sessionId, reason: submitted.reason, correlationId,
+        impact:
+          "both sides hold a signed commitment, but no notarization was requested — this session has no receipt and cannot get one once the relay drops it",
+      });
+    }
+
+    // The root and sequence the directory verifies against. `responder_seal_already_submitted`
+    // carries them from the FIRST submit — from THIS process's memory, or recovered from the
+    // durable carry after a restart — so a repeat close can still escalate (M8B FINDING-1).
+    const escalation = submitted.ok
+      ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
+      : typeof submitted.reportedRootHex === "string" && typeof submitted.sequenceNumber === "number"
+        ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
+        : null;
+    if (!escalation) return null;
+
+    return await escalateToUnilateralSeal(record, sessionId, escalation, correlationId, {
+      refuseOnUnusableCarry: true,
+    });
+  };
+
   const runClose = async (params: Record<string, unknown> | undefined, connectionId: string): Promise<unknown> => {
     const connState = getConnState(connectionId);
     // CC-3 / M8C-AUTOSTART-1 F18: explicit { agent } > this connection's current > sole online agent.
@@ -804,31 +849,8 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         const mayEscalate = result.ok || result.reason === "seal_interrupted_counterparty_unavailable";
         if (!mayEscalate) return result;
 
-        const submitted = await sessionNodeManager.submitSealLeaf(record.agent_name, sessionId, correlationId);
-        if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
-          logger.info("session.interrupted.seal.leaf.submitted", {
-            agentName: record.agent_name, sessionId, correlationId,
-          });
-        } else {
-          logger.warn("session.interrupted.seal.leaf.submit_failed", {
-            agentName: record.agent_name, sessionId, reason: submitted.reason, correlationId,
-            impact:
-              "both sides hold a signed commitment, but no notarization was requested — this session has no receipt and cannot get one once the relay drops it",
-          });
-        }
-
-        // The root and sequence the directory verifies against. `responder_seal_already_submitted`
-        // carries them from the FIRST submit, so a repeat close can still escalate (M8B FINDING-1).
-        const escalation = submitted.ok
-          ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
-          : typeof submitted.reportedRootHex === "string" && typeof submitted.sequenceNumber === "number"
-            ? { reportedRootHex: submitted.reportedRootHex, sequenceNumber: submitted.sequenceNumber }
-            : null;
-        if (!escalation) return result;
-
-        const uni = await escalateToUnilateralSeal(record, sessionId, escalation, correlationId, {
-          refuseOnUnusableCarry: true,
-        });
+        const uni = await submitAndEscalate(record, sessionId, correlationId);
+        if (uni === null) return result;
         if (uni.ok) return uni; // A REAL RECEIPT — the whole point of this line.
 
         // BEST-EFFORT, and the commitment STANDS. Turning a successful commitment into a reported
@@ -1069,11 +1091,53 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       }
     }
 
-    // Any other status (e.g. seal_interrupted_pending) — nothing to do.
+    // DOD-M12B-PENDING-EXIT-1 — `seal_interrupted_pending` had NO exit, and the refusal below told
+    // the operator it was "awaiting FROST notarization". It was not awaiting anything: nobody ever
+    // requests that notarization. The relay stamps a chain only once BOTH parties have posted a
+    // SEAL ctrl leaf, and the responder never posts one — `inbound-seal-request.ts` persists its
+    // commitment, acks, and stops. Measured: 26 sessions idle in this status for 0.5 to 10.5 days.
+    //
+    // The commitment it holds is exactly what makes escalating safe: both sides signed the same
+    // root. And re-entering here cannot post a second ctrl leaf, because `submitSealLeaf` now
+    // recovers the one a previous run posted from the durable carry rather than posting again.
+    if (record.status === "seal_interrupted_pending") {
+      const key = sealKey(record.agent_name, sessionId);
+      if (sealInterruptedInProgress.has(key)) {
+        return {
+          ok: false,
+          reason: "seal_interrupted_in_progress",
+          guidance: "A seal attempt is already in progress for this session. Wait for it to complete before retrying.",
+        };
+      }
+      sealInterruptedInProgress.add(key);
+      const correlationId = randomUUID();
+      try {
+        const uni = await submitAndEscalate(record, sessionId, correlationId);
+        if (uni === null) {
+          return {
+            ok: false,
+            reason: "seal_carry_empty",
+            guidance:
+              "This session holds a bilateral commitment but no relay-witnessed leaves to notarize it from — the relay released the session (it drops one 24 hours after the last message) before anyone asked. cello_transcript still shows the conversation; a notarized receipt is no longer obtainable.",
+          };
+        }
+        if (uni.ok) return uni;
+        return {
+          ok: false,
+          reason: uni.reason,
+          ...(uni.retry_after_seconds !== undefined ? { retry_after_seconds: uni.retry_after_seconds } : {}),
+          guidance: uni.guidance,
+        };
+      } finally {
+        sealInterruptedInProgress.delete(key);
+      }
+    }
+
+    // Any other status — nothing to do.
     return {
       ok: false,
       reason: "session_not_closeable",
-      guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_sessions; a seal_interrupted_pending session is awaiting FROST notarization.`,
+      guidance: `Session is in status '${record.status}', which cannot be closed via cello_close_session. Check cello_sessions.`,
     };
   };
 }

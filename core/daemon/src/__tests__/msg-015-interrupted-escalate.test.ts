@@ -51,6 +51,8 @@ const SEALED_ROOT = "cd".repeat(32);
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
 function harness(opts: {
+  /** The session's status. Defaults to the interrupted case. */
+  status?: string;
   /** What the bilateral commitment exchange did. */
   flow: { ok: true; sessionId: string; status: string } | { ok: false; reason: string; guidance: string };
   /** What the directory answers the `seal_unilateral` request with. Absent → never answers. */
@@ -76,7 +78,7 @@ function harness(opts: {
     handlers,
     logger: silent,
     sessionNodeManager: {
-      getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "interrupted" }),
+      getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: opts.status ?? "interrupted" }),
       submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 4, reportedRootHex: ROOT }),
       getSealCarry: () => (opts.carry ?? CARRY),
       getSealCertificate: () => null,
@@ -272,5 +274,69 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: an interrupted close can earn a recei
     expect(res.seal_pending_reason).toBe("seal_unilateral_timeout");
     expect(res.seal_receipt).toBe("outstanding");
     expect(res.sealed_root, "and no receipt may be claimed").toBeUndefined();
+  });
+});
+
+/**
+ * DOD-M12B-PENDING-EXIT-1 — `seal_interrupted_pending` had no exit at all.
+ *
+ * `cello_close_session` refused that status by name with `session_not_closeable` and told the
+ * operator it was *"awaiting FROST notarization"*. It was not awaiting anything: nobody ever
+ * requests that notarization, because the relay stamps a chain only once BOTH parties have posted a
+ * SEAL ctrl leaf and the responder never posts one. **Measured: 26 sessions idle in this status for
+ * 0.5 to 10.5 days.**
+ *
+ * Escalating is safe precisely because of what the status MEANS — both sides signed the same root —
+ * and re-entering cannot post a second ctrl leaf, because `submitSealLeaf` recovers the one a
+ * previous run posted from the durable carry.
+ *
+ * Revert test: restore the `session_not_closeable` refusal for this status and the first case fails.
+ */
+describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finally end", () => {
+  it("escalates instead of refusing, and returns a receipt", async () => {
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as {
+      ok: boolean; reason?: string; sealed_root?: string; seal_type?: string;
+    };
+
+    expect(res.reason, "the refusal that gave 26 sessions nowhere to go must be gone").not.toBe("session_not_closeable");
+    expect(h.unilateralFrames().length, "it must actually ask the directory").toBe(1);
+    expect(res.sealed_root).toBe(SEALED_ROOT);
+    expect(res.seal_type).toBe("unilateral");
+  });
+
+  it("carries the directory's countdown here too, so an automatic caller can wait", async () => {
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: false, reason: "seal_unilateral_too_early", remainingSeconds: 300 },
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { retry_after_seconds?: number; reason?: string };
+
+    expect(res.retry_after_seconds).toBe(300);
+    expect(res.reason).toBe("seal_counterparty_pending");
+  });
+
+  it("says the receipt is unobtainable when the relay released the session, rather than 'not closeable'", async () => {
+    // The honest end state for an old stuck session: the relay drops one 24 h after the last
+    // message, so there is nothing left to notarize from. That is a different fact from "this
+    // status cannot be closed", and it is the one the operator needs.
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      carry: [],
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
+
+    expect(res.reason).toBe("seal_carry_empty");
+    expect(String(res.guidance), "and it must say the conversation itself survives").toMatch(/transcript/i);
   });
 });
