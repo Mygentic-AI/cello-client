@@ -113,7 +113,7 @@ import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply } from "./away-detection.js";
+import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
 import { createDeliveryOpenRegistry } from "./delivery-open-registry.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
@@ -1052,6 +1052,12 @@ async function startDaemonHoldingLock(
           logger.info("session.away.mutual.skipped", {
             agentName,
             sessionId,
+            // DOD-M12B-AWAY-MARK-1: WHICH branch matched. The marker is in-band and therefore
+            // typeable, so prefixing every message with it skips the one-shot auto-close for free —
+            // the cost of that attack fell from "reproduce the exact away wording" to "type 15
+            // characters". This field is what makes a peer doing it on every message visible;
+            // without it the line reads as routine machine-to-machine traffic.
+            matched: isAutoReplyMarked(text) ? "marker" : "legacy_exact",
             impact:
               "no away reply and no one-shot seal — two away agents must not notarize a conversation nobody had",
           });
@@ -1236,10 +1242,8 @@ async function startDaemonHoldingLock(
       // CONFIGURED away message is indistinguishable from a person" go away, which is the half
       // exact-text matching could not reach by construction. markAsAutoReply is idempotent, so the
       // system defaults (already marked at their source) do not pick up a second token.
-      const awayText = markAsAutoReply(
-        sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
-          ?? (isKnown ? systemDefault : STRANGER_TEXT),
-      );
+      const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
+        ?? (isKnown ? systemDefault : STRANGER_TEXT);
       const draftBytes = new TextEncoder().encode(awayText);
       // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
       // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn
@@ -1256,9 +1260,18 @@ async function startDaemonHoldingLock(
         logger.error("session.away.response.redact_without_content", { agentName, sessionId, kind });
         return;
       }
-      const contentBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
+      // DOD-M12B-AWAY-MARK-1: mark AFTER screening, never before. A redact verdict REPLACES the
+      // bytes, and marking the draft would let that replacement silently strip the marker — an away
+      // reply back on the wire indistinguishable from a person, with no log line saying so. Marking
+      // here also means the gateway screens the operator's actual disclosure rather than a daemon
+      // token bolted to the front of it. markAsAutoReply is idempotent and the system defaults are
+      // marked at their source, so nothing gains a second token.
+      const screenedBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
         ? new Uint8Array(awayVerdict.content)
         : draftBytes;
+      const contentBytes = new TextEncoder().encode(
+        markAsAutoReply(new TextDecoder().decode(screenedBytes)),
+      );
       const contentHash = wireContentHash(contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok && !sendResult.durable) {

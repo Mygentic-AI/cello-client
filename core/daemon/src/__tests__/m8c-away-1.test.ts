@@ -371,7 +371,15 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(150);
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")[0];
-    expect(sent?.text).toBe("[redacted away]"); // the ALTERED bytes — the draft never went on the wire
+    // The ALTERED bytes — the draft never went on the wire. DOD-M12B-AWAY-MARK-1 moved the
+    // auto-reply marking to AFTER screening, so the sent text is the redactor's output with the
+    // marker in front of it. Both facts are asserted, because the ordering matters in both
+    // directions: marking BEFORE screening let a redact verdict silently strip the marker (an away
+    // reply back on the wire indistinguishable from a person), and dropping the redaction here
+    // would put the pre-redaction draft on the wire, which is what this test was written for.
+    expect(sent?.text).toBe(markAsAutoReply("[redacted away]"));
+    expect(sent?.text).toContain("[redacted away]");
+    expect(sent?.text).not.toContain("Hey - reach me on Signal");
   });
 
   it("A3: an inbound session request while ATTENDED gets NO auto-ack", async () => {

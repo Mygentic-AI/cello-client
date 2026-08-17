@@ -77,7 +77,14 @@ describe("DOD-M12B-AWAY-MARK-1: every away auto-reply carries the marker", () =>
     expect(isOwnAwayAutoReply(markAsAutoReply(custom))).toBe(true);
   });
 
-  it("an OLDER peer's unmarked default text is still recognised — mutual-seal protection survives", () => {
+  it("an OLDER peer's unmarked default text is still recognised BY US (one direction only)", () => {
+    // DIRECTION MATTERS AND IS ASSERTED HERE ONLY ONE WAY, deliberately. old→new works: their
+    // unmarked body still matches our legacy branch. new→old does NOT for the one-shot: their build
+    // does `text === ONESHOT_BODY` and our prefix defeats it. The offer text survives even there
+    // (their check is endsWith(OFFER_SUFFIX), which a prefix does not disturb).
+    // Cost of the regression, traced: they fail to recognise our reply and send their own away ack;
+    // we recognise their legacy body and return silently. ONE extra away leaf per session, no
+    // runaway, and no seal — the mutual-seal OUTCOME survives even where recognition does not.
     // The pre-marker wording, verbatim. DOD-AWAY-MUTUAL-SEAL-1 depends on recognising this from a
     // peer that has not upgraded; dropping it would let two away agents notarize an empty session.
     const legacyOneShot =
@@ -192,5 +199,104 @@ describe("DOD-M12B-AWAY-MARK-1: the receiving side is told, and is never silence
     // The content arrives whole — marker included, nothing stripped, nothing hidden.
     expect(messages[0].content).toBe(spoofed);
     expect(messages[0].auto_reply).toBe(true);
+  });
+});
+
+describe("DOD-M12B-AWAY-MARK-1: the LIVE receive exit, not just the batch one", () => {
+  /**
+   * The batch (`since_seq`) exit and the live single-delivery exit are two separate returns, and
+   * only the batch one was covered. The live exit is the one an ATTENDED agent actually hits — the
+   * shape the defect was measured in — so its `auto_reply` block could have been deleted with the
+   * whole suite green.
+   */
+  let tempDir: string;
+  let handle: DaemonHandle | null;
+  let clients: IpcClient[];
+  const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+
+  beforeEach(async () => {
+    process.env["CELLO_ENV"] = "test";
+    tempDir = await mkdtemp(join(tmpdir(), "cello-away-live-"));
+    handle = null;
+    clients = [];
+  });
+
+  afterEach(async () => {
+    for (const c of clients) { try { c.close(); } catch { /* closed */ } }
+    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* stopped */ } }
+    await rm(tempDir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
+  });
+
+  /** A live `sessions` row, so cello_receive takes the LIVE loop instead of the transcript-only exit. */
+  function insertSessionRow(agent: string, session: string) {
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const row = db.prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'").get(agent) as { agent_id: string } | undefined;
+    if (!row) throw new Error(`test fixture bug: agent '${agent}' has no agents row`);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+    ).run(session, row.agent_id, "cphex", now, now);
+  }
+
+  it("a marked message delivered LIVE carries auto_reply and its guidance", async () => {
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    handle = await startDaemon({
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger,
+    });
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = SID64("l");
+    insertSessionRow("alice", s);
+    // The away offer AND a trailing [[OVER]] — the two guidance fields must coexist on this return,
+    // which is exactly the case a single `guidance` key would have silently collapsed.
+    const text = `${AWAY_AUTO_REPLY_TEXTS.offerFor("bob")} [[OVER]]`;
+    handle.getSessionNodeManager()
+      .recordTranscriptMessage("alice", s, 0, "received", new TextEncoder().encode(text), "seed");
+
+    const res = (await client.send("cello_receive", { session_id: s, timeout_ms: 2000 })) as Record<string, unknown>;
+    // The LIVE exit returns a single `content`, not a `messages` array — that difference is why
+    // covering only the batch exit left this one deletable with the suite green.
+    expect(res["messages"], "this must be the live exit, not the since_seq batch").toBeUndefined();
+    expect(res["content"]).toBe(text);
+    expect(res["auto_reply"]).toBe(true);
+    expect(String(res["auto_reply_guidance"] ?? "")).toMatch(/automatic/i);
+    // Both guidance fields coexist: the signal guidance still lands independently. A single
+    // `guidance` key would have silently collapsed one into the other.
+    expect(String(res["guidance"] ?? "")).toMatch(/expecting a reply/i);
+  });
+
+  it("the guidance never claims an UNMARKED message came from a person", async () => {
+    // The mark is produced by the SENDER's daemon, so its absence proves nothing — every
+    // un-upgraded peer sends unmarked away replies. Telling the reader otherwise hands it an
+    // authoritative false negative it did not have before the fix.
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    handle = await startDaemon({
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16, version: "0.0.1-test", logger,
+    });
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "mcp" });
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = SID64("m");
+    insertSessionRow("alice", s);
+    handle.getSessionNodeManager()
+      .recordTranscriptMessage("alice", s, 0, "received", new TextEncoder().encode(AWAY_AUTO_REPLY_TEXTS.oneShot), "seed");
+
+    const res = (await client.send("cello_receive", { session_id: s, timeout_ms: 2000 })) as Record<string, unknown>;
+    const guidance = String(res["auto_reply_guidance"] ?? "");
+    expect(guidance).not.toMatch(/the rest are not/i);
+    expect(guidance).toMatch(/absence means nothing|NOT evidence a person/i);
   });
 });
