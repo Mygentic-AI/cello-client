@@ -111,6 +111,12 @@ export interface InboundSessionDeps {
   sendAwayResponse: (agentName: string, sessionId: string, kind: "request" | "message") => Promise<void>;
   dispatchSessionStateChangedWithTelegram: (agentName: string, sessionId: string, state: string, counterpartyPubkey: string | null) => void;
   sendTelegramDoorbell: (agentName: string, sessionId: string, kind: "session_request" | "message_waiting" | "state_change", detail: string) => Promise<void>;
+  /**
+   * DOD-M12B-DELIVERY-QUIET-1: did a delivery worker on `openerPubkey`'s daemon dial the local
+   * agent `targetAgentName`? Here we are always the ACCEPTING side, so the opener is our
+   * counterparty — never this agent.
+   */
+  isDeliveryOpenToAgent: (openerPubkey: string, targetAgentName: string) => boolean;
 }
 
 /**
@@ -482,6 +488,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, sharedSignaling,
     handleInboundSealInterruptedRequest, reapDeadHalfOpenSessions,
     sendAwayResponse, dispatchSessionStateChangedWithTelegram, sendTelegramDoorbell,
+    isDeliveryOpenToAgent,
   } = deps;
 
   // ─── Seam 2: inbound session establishment (counterparty side) ─────────────
@@ -926,8 +933,21 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         "created",
         parsed.participantAPubkeyHex,
       );
+      // DOD-M12B-DELIVERY-QUIET-1: this push is a SIBLING of the dispatch above, not a statement
+      // inside it — so the suppression in `dispatchSessionStateChangedWithTelegram` does not reach
+      // it, and this is the one that actually buzzes a phone on a new session ("session requests
+      // ALWAYS ring — no coalescing"). Guarding only the other one silenced nothing an operator
+      // could feel. Same reversed arguments as the dispatch: we accepted, so the opener is them.
       // M8C-TGDOOR-1: session requests ALWAYS ring (DoD) — no coalescing, unlike message-waiting.
-      void sendTelegramDoorbell(agentName, parsed.sessionIdHex, "session_request", "New session request");
+      if (isDeliveryOpenToAgent(parsed.participantAPubkeyHex, agentName)) {
+        logger.info("session.doorbell.suppressed_delivery", {
+          agentName, sessionId: parsed.sessionIdHex, kind: "session_request",
+          opener: parsed.participantAPubkeyHex.slice(0, 16),
+          impact: "document delivery opened this session — no phone push",
+        });
+      } else {
+        void sendTelegramDoorbell(agentName, parsed.sessionIdHex, "session_request", "New session request");
+      }
       // M8C-AWAY-1: an unattended agent auto-acks a fresh inbound session request. Fire-and-forget
       // (sendAwayResponse never throws) — best-effort, must not delay/block acceptance completion.
       void sendAwayResponse(agentName, parsed.sessionIdHex, "request");

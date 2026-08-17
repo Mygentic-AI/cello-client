@@ -38,56 +38,57 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
-import { createDeliveryOpenRegistry } from "../delivery-open-registry.js";
+import { createDeliveryOpenRegistry, DELIVERY_OPEN_STALE_MS } from "../delivery-open-registry.js";
 
 const SID64 = (a: string) => a.repeat(64).slice(0, 64);
 const PEER = "cd".repeat(32);
+const US = "ef".repeat(32);
 
 describe("DOD-M12B-DELIVERY-QUIET-1: the delivery-open registry", () => {
   it("reports an open in flight only between begin and release", () => {
     const reg = createDeliveryOpenRegistry();
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(false);
-    const release = reg.begin("alice", PEER);
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(true);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(false);
+    const release = reg.begin(US, PEER);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(true);
     release();
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(false);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(false);
     expect(reg.inFlight()).toBe(0);
   });
 
   it("COUNTS — two documents delivering to one peer must not un-suppress each other", () => {
     const reg = createDeliveryOpenRegistry();
-    const releaseA = reg.begin("alice", PEER);
-    const releaseB = reg.begin("alice", PEER);
+    const releaseA = reg.begin(US, PEER);
+    const releaseB = reg.begin(US, PEER);
     releaseA();
     // A boolean cleared by whichever finished first would re-open the loop for the other.
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(true);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(true);
     releaseB();
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(false);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(false);
   });
 
   it("a double release cannot drive the count negative and wedge suppression on forever", () => {
     const reg = createDeliveryOpenRegistry();
-    const release = reg.begin("alice", PEER);
+    const release = reg.begin(US, PEER);
     release();
     release();
     expect(reg.inFlight()).toBe(0);
-    const second = reg.begin("alice", PEER);
-    expect(reg.isDeliveryOpening("alice", PEER)).toBe(true);
+    const second = reg.begin(US, PEER);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(true);
     second();
   });
 
-  it("is scoped per agent and per peer — one agent's delivery never silences another's", () => {
+  it("is scoped per opener and per target — one pair never silences another", () => {
     const reg = createDeliveryOpenRegistry();
-    const release = reg.begin("alice", PEER);
-    expect(reg.isDeliveryOpening("bob", PEER)).toBe(false);
-    expect(reg.isDeliveryOpening("alice", "ab".repeat(32))).toBe(false);
+    const release = reg.begin(US, PEER);
+    expect(reg.isDeliveryOpening("ab".repeat(32), PEER)).toBe(false);
+    expect(reg.isDeliveryOpening(US, "ab".repeat(32))).toBe(false);
     release();
   });
 
   it("compares pubkeys case-insensitively — the two sides do not agree on case", () => {
     const reg = createDeliveryOpenRegistry();
-    const release = reg.begin("alice", PEER.toUpperCase());
-    expect(reg.isDeliveryOpening("alice", PEER.toLowerCase())).toBe(true);
+    const release = reg.begin(US, PEER.toUpperCase());
+    expect(reg.isDeliveryOpening(US.toUpperCase(), PEER.toLowerCase())).toBe(true);
     release();
   });
 });
@@ -103,11 +104,10 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
     process.env["CELLO_ENV"] = "test";
     tempDir = await mkdtemp(join(tmpdir(), "cello-delivery-quiet-"));
     events = [];
-    const rec = (event: string) => (msg: string, context?: Record<string, unknown>) => {
-      events.push({ event: context?.["event"] as string ?? msg, context: context ?? {} });
-      void event;
+    const rec = () => (msg: string, context?: Record<string, unknown>) => {
+      events.push({ event: msg, context: context ?? {} });
     };
-    logger = { debug: rec("debug"), info: rec("info"), warn: rec("warn"), error: rec("error") };
+    logger = { debug: rec(), info: rec(), warn: rec(), error: rec() };
     handle = null;
     clients = [];
   });
@@ -140,55 +140,105 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
     return { client, notifications };
   }
 
-  const stateChanges = (notifications: Array<Record<string, unknown>>) =>
-    notifications.filter((n) => n["notification"] === "session_state_changed");
+  const stateChanges = (n: Array<Record<string, unknown>>) =>
+    n.filter((x) => x["notification"] === "session_state_changed");
+  const suppressed = () => events.filter((e) => e.event === "session.doorbell.suppressed_delivery");
 
-  it("a delivery-opened session dispatches NO doorbell", async () => {
-    const config = await setup("alice");
+  /**
+   * THE PRODUCTION TUPLE, and the reason every test below is written this way.
+   *
+   * `state === "created"` is emitted from exactly ONE place in production — the INBOUND accept in
+   * `inbound-sessions.ts` — and it names the LOCAL RECEIVING agent plus the INITIATOR's pubkey.
+   * The delivery worker that caused the dial is on the OTHER side of that pair.
+   *
+   * So a test must register the open as `alice → bob` and then emit the created event as
+   * `agentName: "bob", counterpartyPubkey: <alice>`. An earlier version of this file registered and
+   * emitted with the SAME agent first, which is a tuple production never produces: it exercised the
+   * guard's boolean logic, proved nothing about the wiring, and stayed green against a guard whose
+   * two halves compared different pairs and could never match.
+   */
+  async function beginDeliveryOpen(client: IpcClient, opener: string, target: string): Promise<string> {
+    const res = (await client.send("__test_delivery_open_begin", { openerAgent: opener, targetAgent: target })) as Record<string, unknown>;
+    const openerPubkey = res["openerPubkey"] as string;
+    expect(openerPubkey, "the opener must resolve to a real pubkey or the test proves nothing").toMatch(/^[0-9a-f]{64}$/);
+    return openerPubkey;
+  }
+
+  it("a delivery-opened session rings NOTHING on the side that accepts it", async () => {
+    const config = await setup("alice", "bob");
     handle = await startDaemon(config);
     const { client, notifications } = await connectWatching(config.socketPath);
-    await client.send("cello_use_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
 
-    await client.send("__test_delivery_open_begin", { agentName: "alice", peerPubkey: PEER });
+    // alice's delivery worker dials bob...
+    const alicePubkey = await beginDeliveryOpen(client, "alice", "bob");
+    // ...and bob is the side that accepts and would ring.
     await client.send("__test_emit_session_event", {
-      type: "created", agentName: "alice", sessionId: SID64("a"), counterpartyPubkey: PEER,
+      type: "created", agentName: "bob", sessionId: SID64("a"), counterpartyPubkey: alicePubkey,
     });
     await new Promise((r) => setTimeout(r, 50));
 
     expect(stateChanges(notifications)).toHaveLength(0);
-    // Suppression must be VISIBLE — a doorbell that silently does not ring is the next defect.
-    expect(events.some((e) => e.event === "session.doorbell.suppressed_delivery")).toBe(true);
+    // Suppression must be VISIBLE — a doorbell that silently does not ring is the next defect, and
+    // a log line that never fires is how the first version of this guard hid being unreachable.
+    expect(suppressed().length).toBeGreaterThan(0);
   });
 
   it("...and a PEER-opened session STILL rings — the falsification", async () => {
-    const config = await setup("alice");
+    const config = await setup("alice", "bob");
     handle = await startDaemon(config);
     const { client, notifications } = await connectWatching(config.socketPath);
-    await client.send("cello_use_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
 
-    // No delivery open in flight: this is a real counterparty dialling in.
+    // No delivery open in flight: a real counterparty dialling in.
     await client.send("__test_emit_session_event", {
-      type: "created", agentName: "alice", sessionId: SID64("b"), counterpartyPubkey: PEER,
+      type: "created", agentName: "bob", sessionId: SID64("b"), counterpartyPubkey: PEER,
     });
     await new Promise((r) => setTimeout(r, 50));
 
     expect(stateChanges(notifications).length).toBeGreaterThan(0);
-    expect(events.some((e) => e.event === "session.doorbell.suppressed_delivery")).toBe(false);
+    expect(suppressed()).toHaveLength(0);
   });
 
-  it("suppression is released — the NEXT peer-opened session rings again", async () => {
-    const config = await setup("alice");
+  it("the OPPOSITE direction does not suppress — alice dialling bob never mutes bob dialling alice", async () => {
+    // The bug this file exists to stop was an argument-order mistake, so the order is asserted
+    // directly: an open registered one way must not answer the question asked the other way.
+    const config = await setup("alice", "bob");
     handle = await startDaemon(config);
     const { client, notifications } = await connectWatching(config.socketPath);
+    await client.send("cello_start_agent", { name: "alice" });
     await client.send("cello_use_agent", { name: "alice" });
 
-    await client.send("__test_delivery_open_begin", { agentName: "alice", peerPubkey: PEER });
+    // alice's worker is dialling bob. Now BOB dials ALICE for real — alice must still be told.
+    await beginDeliveryOpen(client, "alice", "bob");
+    const bobPubkey = (await client.send("__test_delivery_open_begin", { openerAgent: "bob", targetAgent: "alice" })) as Record<string, unknown>;
+    await client.send("__test_delivery_open_end", { openerAgent: "bob", targetAgent: "alice" });
+
     await client.send("__test_emit_session_event", {
-      type: "created", agentName: "alice", sessionId: SID64("c"), counterpartyPubkey: PEER,
+      type: "created", agentName: "alice", sessionId: SID64("g"), counterpartyPubkey: bobPubkey["openerPubkey"] as string,
     });
-    await client.send("__test_delivery_open_end", { agentName: "alice", peerPubkey: PEER });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(stateChanges(notifications)).toHaveLength(1);
+    expect(suppressed()).toHaveLength(0);
+  });
+
+  it("suppression is released — the NEXT session from that peer rings again", async () => {
+    const config = await setup("alice", "bob");
+    handle = await startDaemon(config);
+    const { client, notifications } = await connectWatching(config.socketPath);
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
+
+    const alicePubkey = await beginDeliveryOpen(client, "alice", "bob");
     await client.send("__test_emit_session_event", {
-      type: "created", agentName: "alice", sessionId: SID64("d"), counterpartyPubkey: PEER,
+      type: "created", agentName: "bob", sessionId: SID64("c"), counterpartyPubkey: alicePubkey,
+    });
+    await client.send("__test_delivery_open_end", { openerAgent: "alice", targetAgent: "bob" });
+    await client.send("__test_emit_session_event", {
+      type: "created", agentName: "bob", sessionId: SID64("d"), counterpartyPubkey: alicePubkey,
     });
     await new Promise((r) => setTimeout(r, 50));
 
@@ -196,19 +246,19 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
     // one direction over.
     const rung = stateChanges(notifications);
     expect(rung).toHaveLength(1);
-    expect(String(JSON.stringify(rung[0]))).toContain(SID64("d"));
+    expect(JSON.stringify(rung[0])).toContain(SID64("d"));
   });
 
   it("only the peer being delivered to is quiet — another peer's session still rings", async () => {
-    const config = await setup("alice");
+    const config = await setup("alice", "bob");
     handle = await startDaemon(config);
     const { client, notifications } = await connectWatching(config.socketPath);
-    await client.send("cello_use_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
 
-    const other = "ab".repeat(32);
-    await client.send("__test_delivery_open_begin", { agentName: "alice", peerPubkey: PEER });
+    await beginDeliveryOpen(client, "alice", "bob");
     await client.send("__test_emit_session_event", {
-      type: "created", agentName: "alice", sessionId: SID64("e"), counterpartyPubkey: other,
+      type: "created", agentName: "bob", sessionId: SID64("e"), counterpartyPubkey: PEER,
     });
     await new Promise((r) => setTimeout(r, 50));
 
@@ -218,17 +268,36 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
   it("a NON-created state still dispatches while a delivery open is in flight", async () => {
     // The exemption is about "this session coming up is not news". A session going DOWN is news
     // whoever opened it, and it is the operator's only signal that a conversation was cut off.
-    const config = await setup("alice");
+    const config = await setup("alice", "bob");
     handle = await startDaemon(config);
     const { client, notifications } = await connectWatching(config.socketPath);
-    await client.send("cello_use_agent", { name: "alice" });
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
 
-    await client.send("__test_delivery_open_begin", { agentName: "alice", peerPubkey: PEER });
+    const alicePubkey = await beginDeliveryOpen(client, "alice", "bob");
     await client.send("__test_emit_session_event", {
-      type: "destroyed", state: "interrupted", agentName: "alice", sessionId: SID64("f"), counterpartyPubkey: PEER,
+      type: "destroyed", state: "interrupted", agentName: "bob", sessionId: SID64("f"), counterpartyPubkey: alicePubkey,
     });
     await new Promise((r) => setTimeout(r, 50));
 
     expect(stateChanges(notifications)).toHaveLength(1);
+  });
+
+  it("a STALE delivery open stops muting — a wedged dial must not silence a peer forever", async () => {
+    // openSessionAs carries no deadline, so without a staleness bound a dial that never settles
+    // would suppress that peer's doorbell for the life of the process.
+    const reg = createDeliveryOpenRegistry(() => 1_000_000);
+    reg.begin(US, PEER);
+    expect(reg.isDeliveryOpening(US, PEER)).toBe(true);
+    const later = createDeliveryOpenRegistry(() => 1_000_000);
+    later.begin(US, PEER);
+    expect(later.inFlight()).toBe(1);
+
+    let clock = 1_000_000;
+    const aging = createDeliveryOpenRegistry(() => clock);
+    aging.begin(US, PEER);
+    clock += DELIVERY_OPEN_STALE_MS + 1;
+    expect(aging.isDeliveryOpening(US, PEER)).toBe(false);
+    expect(aging.inFlight()).toBe(0);
   });
 });

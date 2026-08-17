@@ -1378,6 +1378,32 @@ async function startDaemonHoldingLock(
   // ever sees it, so on a one-daemon pair the inbound doorbell fires first and a session-id
   // registry is always too late.
   const deliveryOpens = createDeliveryOpenRegistry();
+  /**
+   * An agent's own pubkey, synchronously. The registry keys on PUBKEYS at both ends because that is
+   * the only pair the dialling side and the accepting side can both name — the accepting side never
+   * learns the dialler's local agent name, and the dialling side never learns ours.
+   */
+  const pubkeyOfAgent = (name: string): string => loadedAgents.find((a) => a.name === name)?.pubkey ?? "";
+  /**
+   * Is a delivery worker mid-dial from `openerPubkey` to `targetPubkey`?
+   *
+   * One predicate, passed to every consumer, so the doorbell, the phone and both reachability
+   * triggers cannot drift apart on the answer. An unresolvable agent yields "" and never matches,
+   * which fails OPEN — an unknown agent rings rather than being silently muted.
+   */
+  const isDeliveryOpenInFlight = (openerPubkey: string, targetPubkey: string): boolean =>
+    openerPubkey !== "" && targetPubkey !== "" && deliveryOpens.isDeliveryOpening(openerPubkey, targetPubkey);
+  /**
+   * The ACCEPTING side's question: "did a delivery worker on `openerPubkey`'s daemon dial the local
+   * agent `targetAgentName`?"
+   *
+   * A named predicate rather than a reversed call, because getting the order wrong here is exactly
+   * the defect this line was re-opened to fix: the accepting side naturally reaches for its own
+   * agent first, which compares the receiver's tuple against a registry holding the dialler's and
+   * silently never matches.
+   */
+  const isDeliveryOpenToAgent = (openerPubkey: string, targetAgentName: string): boolean =>
+    isDeliveryOpenInFlight(openerPubkey, pubkeyOfAgent(targetAgentName));
 
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
@@ -1385,25 +1411,29 @@ async function startDaemonHoldingLock(
     state: string,
     counterpartyPubkey: string | null,
   ): void {
-    // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
-    // offered-name drop below so a terminal state's own doorbell still shows the name.
-    const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
-    // DOD-M12B-DELIVERY-QUIET-1: this session came up because OUR OWN delivery worker dialled this
-    // peer, so its creation is our outbound act reflected back — not news about the peer, not a
-    // conversation, and not something to buzz a phone about. Scoped to `created` on purpose: a
-    // session going DOWN is news whoever opened it, and it is the operator's only signal that a
-    // conversation was cut off.
-    const causedByOurDelivery =
-      state === "created" && counterpartyPubkey !== null && deliveryOpens.isDeliveryOpening(agentName, counterpartyPubkey);
-    if (causedByOurDelivery) {
+    // DOD-M12B-DELIVERY-QUIET-1: this session came up because a DELIVERY WORKER dialled, so its
+    // creation is machine traffic — not news about the peer, not a conversation, and not something
+    // to buzz a phone about. Scoped to `created` on purpose: a session going DOWN is news whoever
+    // opened it, and it is the operator's only signal that a conversation was cut off.
+    //
+    // ARGUMENTS ARE REVERSED HERE, AND THAT IS THE POINT. This function runs on the side that
+    // ACCEPTED, so the opener is the COUNTERPARTY and the target is US. Asking
+    // `(agentName, counterpartyPubkey)` — our own agent first, like the initiator half does — is
+    // what made the first version of this guard unreachable in production: it compared the
+    // receiver's tuple against a registry holding the dialler's.
+    if (state === "created" && counterpartyPubkey !== null && isDeliveryOpenToAgent(counterpartyPubkey, agentName)) {
       // Suppression is LOGGED. A doorbell that silently stops ringing is the next defect, and the
       // measured storm was so hard to read precisely because nothing named its cause.
       logger.info("session.doorbell.suppressed_delivery", {
-        agentName, sessionId, state,
+        agentName, sessionId, state, opener: counterpartyPubkey.slice(0, 16),
         impact: "document delivery opened this session — no doorbell, no phone push, no backoff reset",
       });
       return;
     }
+    // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
+    // offered-name drop below so a terminal state's own doorbell still shows the name. Below the
+    // guard: on a suppressed event it was computed and thrown away.
+    const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
     // SYNC-P5 (R39): a session coming up IS the party-became-reachable signal — every shared
     // document gets a reconcile attempt, and the scheduler's backoff resets (they just answered).
     // Sound ONLY when the peer caused it, which is what the guard above establishes.
@@ -1823,6 +1853,7 @@ async function startDaemonHoldingLock(
     wirePerAgentSessionInbound,
     handleTrustSignalPickup,
     enqueueInboundSession,
+    recordRefusal,
     reapExpiredInboundSessions,
     inboundSessionQueues,
     inboundSessionWaiters,
@@ -1847,6 +1878,7 @@ async function startDaemonHoldingLock(
     sendAwayResponse,
     dispatchSessionStateChangedWithTelegram,
     sendTelegramDoorbell,
+    isDeliveryOpenToAgent,
   });
 
   if (!sharedSignaling) {
@@ -3200,7 +3232,8 @@ async function startDaemonHoldingLock(
       // the intent is still in flight here and the check needs no plumbing of its own. Resetting
       // the backoff on a session WE opened to deliver a frame wipes a refusal the peer may have
       // given seconds ago and immediately sweeps every document, which opens more sessions.
-      if (deliveryOpens.isDeliveryOpening(agentName, counterpartyPubkey)) {
+      // We are the OPENER here, so our own pubkey goes first — the mirror of the inbound half above.
+      if (isDeliveryOpenInFlight(pubkeyOfAgent(agentName), counterpartyPubkey)) {
         logger.debug("document.reconcile.reachable_trigger_skipped", {
           agentName, reason: "session_opened_by_document_delivery",
         });
@@ -3461,19 +3494,36 @@ async function startDaemonHoldingLock(
   // DOD-M12B-DELIVERY-QUIET-1: drive the delivery-open intent directly, so the doorbell exemption
   // is testable without standing up a document, a peer daemon and a real directory negotiation.
   // The registry's begin() hands back a closure, so the releases are held here by key.
+  // The hook takes AGENT NAMES and resolves both to pubkeys through `pubkeyOfAgent`, exactly as the
+  // real delivery adapter does. That is deliberate: the first version of this hook let a test
+  // register a tuple production never produces — an agent registered as the dialler and then
+  // emitted as the receiver of its own dial — so the suite proved the guard's boolean logic and
+  // nothing about the wiring, and stayed green against a guard that could never fire.
   const testDeliveryReleases = new Map<string, () => void>();
-  handlers.set("__test_delivery_open_begin", async (params, _connectionId) => {
+  // DOD-M12B-INBOX-TRUTH-1: seed a refusal, so the ended-unread return branch's lost
+  // `refused_session_requests` has a regression test. The field had none before or after the fix.
+  handlers.set("__test_record_refusal", async (params, _connectionId) => {
     const agentName = params?.agentName as string | undefined;
-    const peerPubkey = params?.peerPubkey as string | undefined;
-    if (!agentName || !peerPubkey) return { error: "missing_params", guidance: "Provide agentName and peerPubkey." };
-    testDeliveryReleases.set(`${agentName} ${peerPubkey.toLowerCase()}`, deliveryOpens.begin(agentName, peerPubkey));
+    const sessionId = params?.sessionId as string | undefined;
+    if (!agentName || !sessionId) return { error: "missing_params", guidance: "Provide agentName and sessionId." };
+    recordRefusal(agentName, sessionId, (params?.counterpartyPubkey as string) ?? "", (params?.reason as string) ?? "test");
     return { ok: true };
   });
+
+  handlers.set("__test_delivery_open_begin", async (params, _connectionId) => {
+    const openerAgent = params?.openerAgent as string | undefined;
+    const targetAgent = params?.targetAgent as string | undefined;
+    if (!openerAgent || !targetAgent) return { error: "missing_params", guidance: "Provide openerAgent and targetAgent (both agent NAMES)." };
+    const openerPubkey = pubkeyOfAgent(openerAgent);
+    const targetPubkey = pubkeyOfAgent(targetAgent);
+    testDeliveryReleases.set(`${openerAgent}>${targetAgent}`, deliveryOpens.begin(openerPubkey, targetPubkey));
+    return { ok: true, openerPubkey, targetPubkey };
+  });
   handlers.set("__test_delivery_open_end", async (params, _connectionId) => {
-    const agentName = params?.agentName as string | undefined;
-    const peerPubkey = params?.peerPubkey as string | undefined;
-    if (!agentName || !peerPubkey) return { error: "missing_params", guidance: "Provide agentName and peerPubkey." };
-    const key = `${agentName} ${peerPubkey.toLowerCase()}`;
+    const openerAgent = params?.openerAgent as string | undefined;
+    const targetAgent = params?.targetAgent as string | undefined;
+    if (!openerAgent || !targetAgent) return { error: "missing_params", guidance: "Provide openerAgent and targetAgent (both agent NAMES)." };
+    const key = `${openerAgent}>${targetAgent}`;
     testDeliveryReleases.get(key)?.();
     testDeliveryReleases.delete(key);
     return { ok: true };
@@ -3830,7 +3880,7 @@ async function startDaemonHoldingLock(
           // negotiation, and the initiator-side reachability hook fires just before this returns.
           // Released in `finally`: a throw that left the intent registered would silence this
           // peer's doorbell for the life of the process, which is a worse outage than the storm.
-          const releaseDeliveryOpen = deliveryOpens.begin(agent, peerAgentId);
+          const releaseDeliveryOpen = deliveryOpens.begin(pubkeyOfAgent(agent), peerAgentId);
           try {
             // The same path `cello_initiate_session` takes, now callable without an IPC connection.
             const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
