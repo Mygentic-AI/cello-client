@@ -54,7 +54,9 @@ function harness(opts: {
   /** The session's status. Defaults to the interrupted case. */
   status?: string;
   /** What the bilateral commitment exchange did. */
-  flow: { ok: true; sessionId: string; status: string } | { ok: false; reason: string; guidance: string };
+  flow:
+    | { ok: true; sessionId: string; status: string; ceremony?: string }
+    | { ok: false; reason: string; guidance: string };
   /** What the directory answers the `seal_unilateral` request with. Absent → never answers. */
   directory?: { ok: true; sealedRootHex: string } | { ok: false; reason: string; remainingSeconds?: number };
   /** Override the relay-witnessed carry (empty / gappy cases). */
@@ -371,5 +373,52 @@ describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finall
     expect(h.unilateralFrames().length, "asking for a unilateral seal here is refused silently").toBe(0);
     expect(res.reason).toBe("seal_carry_bilateral_in_progress");
     expect(String(res.guidance), "and it must say the better receipt is already coming").toMatch(/bilateral/i);
+  });
+});
+
+/**
+ * DOD-M12B-SEAL-BILATERAL-FIRST-1 — do not downgrade a bilateral seal that is already running.
+ *
+ * When the counterparty answers `session_seal_already_pending` with
+ * `pendingCeremony: "relay_bilateral"`, it is telling us it is on the RELAY bilateral ceremony and
+ * was waiting for our half. The flow submits that half and returns `ok: true` — correctly. But the
+ * caller then escalates milliseconds later and asks the directory to notarize with the counterparty
+ * **ABSENT**, for a counterparty that is demonstrably present and co-operating.
+ *
+ * The ACTIVE close gives a bilateral round eleven minutes before escalating. This path gave it none.
+ * And for any orphan older than the delivery grace — which every one of the measured 26 is — the
+ * escalation is allowed, so the receipt records the peer as `absent` when they were live. A
+ * bilateral receipt is the better artifact; taking a unilateral one instead is a downgrade we chose.
+ *
+ * Revert test: drop the ceremony check and the case fails — a `seal_unilateral` frame goes out.
+ */
+describe("DOD-M12B-SEAL-BILATERAL-FIRST-1: a running bilateral seal is not downgraded", () => {
+  it("does NOT escalate when the counterparty is already running the relay bilateral ceremony", async () => {
+    const h = harness({
+      flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending", ceremony: "relay_bilateral" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { ok: boolean; seal_receipt?: string; guidance?: string };
+
+    expect(
+      h.unilateralFrames().length,
+      "the counterparty is present and waiting — asking for an ABSENT-party seal downgrades the receipt",
+    ).toBe(0);
+    expect(res.ok, "our half is submitted and the ceremony is under way — that is not a failure").toBe(true);
+    expect(String(res.guidance), "and it must say the better receipt is coming").toMatch(/bilateral/i);
+  });
+
+  it("STILL escalates for an ordinary interrupted close — the guard must not swallow the normal path", async () => {
+    // The counterweight. Without it, keying on "did the flow succeed" would stop every escalation.
+    const h = harness({
+      flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { sealed_root?: string };
+
+    expect(h.unilateralFrames().length).toBe(1);
+    expect(res.sealed_root).toBe(SEALED_ROOT);
   });
 });

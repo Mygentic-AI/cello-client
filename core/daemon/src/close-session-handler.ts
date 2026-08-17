@@ -904,6 +904,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         const mayEscalate = result.ok || result.reason === "seal_interrupted_counterparty_unavailable";
         if (!mayEscalate) return result;
 
+        // DOD-M12B-SEAL-BILATERAL-FIRST-1 — a BILATERAL seal is already running; do not take the
+        // worse artifact instead. The counterparty answered that it is on the relay's bilateral
+        // ceremony and was waiting for our half, which the flow just submitted. Escalating now asks
+        // the directory to notarize with that counterparty marked ABSENT — for a peer that is
+        // demonstrably present. The ACTIVE close gives a bilateral round eleven minutes before it
+        // escalates; this path was giving it none, and for any orphan older than the delivery grace
+        // (every one of the measured 26) the escalation is allowed, so the downgrade was certain.
+        if (result.ok && result.ceremony === "relay_bilateral") {
+          logger.info("session.seal.bilateral.in_flight", {
+            agentName: record.agent_name, sessionId, correlationId,
+            impact: "our half is submitted and the relay has both parties' leaves; the bilateral receipt is the better artifact and is already coming",
+          });
+          return {
+            ...(result as Record<string, unknown>),
+            seal_receipt: "bilateral_in_flight",
+            guidance:
+              "The counterparty is running the relay's bilateral seal and was waiting for this side's half, which has now been submitted. That produces a BILATERAL receipt — a better artifact than the unilateral one a close would otherwise take, and it does not record the counterparty as absent. Watch for the seal to land (cello_sessions) and read it with cello_sealed_receipt.",
+          };
+        }
+
         const uni = await submitAndEscalate(record, sessionId, correlationId);
         if ("escalated" in uni) {
           // THE REASON IS IN HAND — do not drop it. `result.ok` is true here (the bilateral

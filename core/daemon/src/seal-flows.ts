@@ -32,7 +32,20 @@ export interface SealFailureDetail {
 }
 
 export type SealFlowResult =
-  | { ok: true; sessionId: string; status: "seal_interrupted_pending" }
+  | {
+      ok: true;
+      sessionId: string;
+      status: "seal_interrupted_pending";
+      /**
+       * DOD-M12B-SEAL-BILATERAL-FIRST-1: which ceremony this commitment belongs to, when we KNOW.
+       *
+       * `relay_bilateral` means the counterparty told us it is on the relay's bilateral ceremony and
+       * was waiting for our half — so a bilateral receipt is already coming, and asking the
+       * directory to notarize with that counterparty marked ABSENT would take the worse artifact.
+       * Absent means "an ordinary interrupted commitment", which escalates as usual.
+       */
+      ceremony?: "relay_bilateral";
+    }
   | ({ ok: false; reason: string; guidance: string } & SealFailureDetail);
 
 export type ActiveSealResult =
@@ -402,7 +415,10 @@ export function createSealFlows(deps: SealFlowDeps) {
         // the operator to retry forever (every retry re-hits the synchronous idempotency mark) while
         // forbidding the only real exit.
         if (submitted.ok || submitted.reason === "responder_seal_already_submitted") {
-          return { ok: true, sessionId, status: "seal_interrupted_pending" };
+          // CARRY THE CEREMONY. Without it the caller cannot tell this apart from an ordinary
+          // interrupted commitment and escalates milliseconds later — asking for an ABSENT-party
+          // seal against a counterparty that is demonstrably present and co-operating.
+          return { ok: true, sessionId, status: "seal_interrupted_pending", ceremony: "relay_bilateral" };
         }
         return {
           ok: false,
