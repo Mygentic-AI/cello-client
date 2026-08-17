@@ -151,15 +151,20 @@ describe("every seal-completion path flips the status itself", () => {
       expect(sealTeardowns.length, `${file} must still contain the seal teardown this pins`).toBeGreaterThan(0);
 
       for (const { i } of sealTeardowns) {
-        // markSealed must appear in the few lines immediately above — same block, before teardown.
-        const window = lines.slice(Math.max(0, i - 6), i).join("\n");
+        // A CALL, not a mention. `.toContain("markSealed")` would be satisfied by a comment saying
+        // "markSealed was removed on purpose" — which is precisely the change this is here to stop.
+        // Comment lines are stripped before the check for the same reason.
+        const window = lines
+          .slice(Math.max(0, i - 6), i)
+          .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
+          .join("\n");
         expect(
           window,
           `${file}:${i + 1} tears the node down as sealed without flipping the status first. ` +
           `destroySessionNode returns early at 'if (!entry) return' and writes the status below that ` +
           `guard, so for a session with no live node — every interrupted one — the receipt lands and ` +
           `the row never moves.`,
-        ).toContain("markSealed");
+        ).toContain(".markSealed(");
       }
     });
   }
