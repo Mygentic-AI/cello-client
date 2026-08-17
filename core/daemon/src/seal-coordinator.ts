@@ -243,7 +243,14 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // property the code lacked, which is why the gap survived. `destroySessionNode` returns
         // early at `if (!entry) return` and writes the status BELOW that guard, so for a session
         // with no live node the receipt landed and the row never moved.
-        sessionNodeManager.markSealed(agentName, sidHex);
+        try { sessionNodeManager.markSealed(agentName, sidHex); }
+        catch (err: unknown) {
+          logger.error("session.seal.status.write.threw", {
+            sessionId: sidHex, agentName,
+            error: err instanceof Error ? err.message : String(err),
+            impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
+          });
+        }
         void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
       })();
     });
@@ -432,13 +439,28 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           // The seal is valid, but no receipt is retrievable — a directory that predates cascade-2.
           logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
         }
-        // STATUS FIRST — and on THIS path the node is gone by construction. A unilateral seal is
-        // what an interrupted session escalates to, and every producer of `interrupted` deletes the
-        // `#activeNodes` entry, so `destroySessionNode` alone would return before the status write
-        // every single time.
-        sessionNodeManager.markSealed(agentName, sidHex);
-        void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
+        // THE WAITER IS ANSWERED FIRST. `markSealed` is SYNCHRONOUS and reaches `#requireAgentId`,
+        // which throws for a retired agent or a closed database — and a throw here would escape
+        // this frame, leave the waiter unresolved, and make the close sit out its full timeout and
+        // report `seal_unilateral_timeout` for a seal that COMPLETED and whose certificate is
+        // already on disk. That is the error-substitution defect this milestone was opened on,
+        // reproduced on the path that fixes it. The old line was an async `void`, whose throw
+        // became a discarded rejection and could not do this.
         waiter({ ok: true, sealedRootHex: rootHex, legibility });
+        // STATUS THEN TEARDOWN — and on THIS path the node is gone by construction. A unilateral
+        // seal is what an interrupted session escalates to, and every producer of `interrupted`
+        // deletes the `#activeNodes` entry, so `destroySessionNode` alone would return before the
+        // status write every single time.
+        try {
+          sessionNodeManager.markSealed(agentName, sidHex);
+        } catch (err: unknown) {
+          logger.error("session.seal.status.write.threw", {
+            sessionId: sidHex, agentName,
+            error: err instanceof Error ? err.message : String(err),
+            impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
+          });
+        }
+        void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
       })();
     });
   }
@@ -562,7 +584,14 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       }
     }
     // STATUS FIRST — same reason as the two sites above.
-    sessionNodeManager.markSealed(agentName, sidHex);
+    try { sessionNodeManager.markSealed(agentName, sidHex); }
+    catch (err: unknown) {
+      logger.error("session.seal.status.write.threw", {
+        sessionId: sidHex, agentName,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
+      });
+    }
     void sessionNodeManager.destroySessionNode(agentName, sidHex, "sealed");
   }
 

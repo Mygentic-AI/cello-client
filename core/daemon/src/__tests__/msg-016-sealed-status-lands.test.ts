@@ -25,7 +25,7 @@
  * path leaves every behavioural test above green, which is exactly how this defect shipped.
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
@@ -157,11 +157,30 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a sealed session's ROW says sealed", 
  * accident. This is deliberately crude and it has teeth: delete a `markSealed` call and it goes red.
  */
 describe("every seal-completion path flips the status itself", () => {
-  const FILES = ["seal-coordinator.ts", "seal-certificate-pull.ts"];
+  // SCANNED, NOT LISTED. A hand-maintained list is the anti-pattern this pin exists to avoid: a
+  // fifth seal site can be added in a file nobody remembers to add here, and the suite stays green.
+  // Every daemon source file is checked; anything genuinely exempt goes in EXEMPT with a reason.
+  const SRC_DIR = join(import.meta.dirname, "..");
+  const EXEMPT: Record<string, string> = {
+    // The teardown itself. It is the function whose early return causes the defect — it cannot
+    // call the wrapper that exists to work around it.
+    "session-node-manager.ts": "writes the status inline, below the #activeNodes guard this pins around",
+  };
+  const FILES = readdirSync(SRC_DIR)
+    .filter((f) => f.endsWith(".ts"))
+    .filter((f) => !(f in EXEMPT))
+    .filter((f) => {
+      const src = readFileSync(join(SRC_DIR, f), "utf-8");
+      return /destroySessionNode\([^)]*"sealed"/.test(src);
+    });
+
+  it("the scan finds the seal-completion files at all — an empty list would pin nothing", () => {
+    expect(FILES.length).toBeGreaterThan(0);
+  });
 
   for (const file of FILES) {
     it(`${file}: each destroySessionNode(..., "sealed") is preceded by markSealed`, () => {
-      const src = readFileSync(join(import.meta.dirname, "..", file), "utf-8");
+      const src = readFileSync(join(SRC_DIR, file), "utf-8");
       const lines = src.split("\n");
       const sealTeardowns = lines
         .map((l, i) => ({ l, i }))
@@ -174,7 +193,7 @@ describe("every seal-completion path flips the status itself", () => {
         // "markSealed was removed on purpose" — which is precisely the change this is here to stop.
         // Comment lines are stripped before the check for the same reason.
         const window = lines
-          .slice(Math.max(0, i - 6), i)
+          .slice(Math.max(0, i - 14), i)
           .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
           .join("\n");
         expect(

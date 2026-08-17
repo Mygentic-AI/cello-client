@@ -204,7 +204,14 @@ export async function pullSealCertificate(
   // session has no live node — it returns early at `if (!entry) return` and writes the status below
   // that guard — and THIS path is precisely the no-node case: a daemon pulls a certificate exactly
   // when it was down or disconnected while the seal happened.
-  sessionNodeManager.markSealed(agentName, sessionIdHex);
+  try { sessionNodeManager.markSealed(agentName, sessionIdHex); }
+  catch (err: unknown) {
+    logger.error("session.seal.status.write.threw", {
+      sessionId: sessionIdHex, agentName,
+      error: err instanceof Error ? err.message : String(err),
+      impact: "the certificate was pulled and verified, but this row still reads interrupted",
+    });
+  }
   void sessionNodeManager.destroySessionNode(agentName, sessionIdHex, "sealed");
 
   return { ok: true, rootHex };

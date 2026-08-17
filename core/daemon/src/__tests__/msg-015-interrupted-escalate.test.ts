@@ -87,7 +87,10 @@ function harness(opts: {
     getConnState: () => ({ currentAgent: AGENT }),
     resolveCurrentAgent: () => AGENT,
     NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
-    getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32) }),
+    // MUST match the carry's senderPubkeyHex — the duplicate-ctrl-leaf check asks "is this leaf
+    // OURS?", and a harness whose agent key differs from every leaf it stubs would answer no to
+    // everything and prove nothing.
+    getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32).fill(0x11) }),
     signalingFor: () => ({ status: "connected" }),
     sendOver,
     waitForSignalingConnected: async () => true,
@@ -198,6 +201,30 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: an interrupted close can earn a recei
     // an operator to force:true, which permanently forfeits the half they still hold.
     expect(res.ok, "a successful commitment must never be reported as a failure").toBe(true);
     expect(res.seal_receipt, "but it must not imply a receipt it does not have").toBe("outstanding");
+  });
+
+  it("refuses LOCALLY when the carry already holds TWO of our own SEAL ctrl leaves", async () => {
+    // The already-poisoned case, and these sessions exist right now: the one-shot submit mark has
+    // always been in memory, so any close in flight across a restart could post a second leaf
+    // before the durable recovery shipped. The directory refuses them with
+    // `unilateral_seal_leaf_invalid` — silently — so each currently costs five resolver attempts
+    // and 30 s apiece before surfacing as a directory timeout.
+    const poisoned = [...CARRY, {
+      sequenceNumber: 4, leafKind: 0x02, senderPubkeyHex: "11".repeat(32),
+      structure2Cbor: new Uint8Array([4]), structure1Cbor: new Uint8Array([4, 4]),
+      relayId: "relay-1", relayTimestamp: 1_700_000_000_004, relaySignatureHex: "cc".repeat(64),
+    }];
+    const h = harness({
+      flow: { ok: true, sessionId: SESSION, status: "seal_interrupted_pending" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      carry: poisoned,
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { seal_pending_reason?: string; guidance?: string };
+
+    expect(h.unilateralFrames().length, "no directory can notarize this; asking wastes 30 s to be told nothing").toBe(0);
+    expect(res.seal_pending_reason).toBe("seal_carry_duplicate_own_ctrl_leaf");
+    expect(String(res.guidance), "and it must say the conversation itself survives").toMatch(/transcript/i);
   });
 
   it("NEVER escalates after the counterparty REFUSED — that would notarize over their objection", async () => {

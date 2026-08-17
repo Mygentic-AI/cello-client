@@ -385,6 +385,22 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       };
     }
 
+    // A THIRD locally-knowable cause: a carry that already holds TWO of our SEAL ctrl leaves. Those
+    // sessions exist right now — the one-shot submit mark has always been in memory, so any close
+    // in flight across a restart could post a second before the durable recovery shipped. The
+    // directory refuses them with `unilateral_seal_leaf_invalid`, silently, so each one currently
+    // burns five resolver attempts and 30 s apiece before being reported as a directory timeout.
+    const ownCtrl = sealCarry.filter((l) => l.leafKind === 0x02 && l.senderPubkeyHex === sealAgentPubkeyHex);
+    if (opts.refuseOnUnusableCarry && ownCtrl.length > 1) {
+      pendingUnilateralWaiters.delete(sessionId);
+      return {
+        ok: false,
+        reason: "seal_carry_duplicate_own_ctrl_leaf",
+        guidance:
+          `This session's record holds ${ownCtrl.length} SEAL control leaves from this side where it may hold exactly one, so no directory can notarize it. That happens when a close was interrupted mid-flight and a later close posted a second leaf. The conversation itself is intact — cello_transcript shows it — but a notarized receipt is no longer obtainable, and only a force-abandon can end the session.`,
+      };
+    }
+
     const sent = await sendOver(record.agent_name, {
       type: "seal_unilateral",
       session_id: new Uint8Array(Buffer.from(sessionId, "hex")),

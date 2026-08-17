@@ -3757,27 +3757,9 @@ export class SessionNodeManager {
    * annexed, not stranded), which the early return skipped entirely.
    */
   markSealed(agentName: string, sessionId: string): boolean {
-    // `#updateSessionStatus` has NO status guard, so this method has to carry one. Two rows must
-    // not be overwritten:
-    //
-    //   'abandoned' — terminal, and terminal BY THE OPERATOR'S CHOICE. A force-abandon is the
-    //     documented way to give up a receipt. Silently resurrecting the session as `sealed`
-    //     because a certificate turned up afterwards would overturn that decision without asking.
-    //     The certificate is still stored by `recordSealCertificate`, so nothing is lost — it is
-    //     retrievable, and the row keeps saying what the operator did.
-    //   'sealed'    — already there. Re-writing it re-runs the terminal disposition hooks for no
-    //     reason (they are idempotent — a reap and an annex that find nothing — but a status write
-    //     that changes nothing should not report that it landed).
-    const current = this.getSessionRecord(agentName, sessionId)?.status;
-    if (current === "abandoned" || current === "sealed") {
-      this.#logger.info("session.seal.status.not_written", {
-        agentName, sessionId, currentStatus: current,
-        impact: current === "abandoned"
-          ? "a certificate arrived for a session the operator force-abandoned; it is stored and retrievable, but the row keeps saying abandoned"
-          : "already sealed — nothing to write",
-      });
-      return false;
-    }
+    // The terminal guard (abandoned/sealed must not be overwritten) lives in #updateSessionStatus,
+    // so it holds for destroySessionNode and retireSession too — not only for callers of this
+    // wrapper.
     return this.#updateSessionStatus(agentName, sessionId, "sealed");
   }
 
@@ -4796,7 +4778,13 @@ export class SessionNodeManager {
     // `session_seal_leaves`. Recover the escalation values from it instead of submitting again.
     if (!this.#responderSealSubmitted.has(sealKey)) {
       const durable = this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
-      if (durable) {
+      if (durable === "unknown") {
+        // REFUSE, do not submit. A second ctrl leaf makes the session unsealable forever, and the
+        // question "is one already there?" just failed to answer. Refusing costs this close; a
+        // second leaf costs the receipt permanently.
+        return { ok: false, reason: "seal_leaf_recovery_unavailable" };
+      }
+      if (durable !== "none") {
         this.#logger.info("session.seal.leaf.already_submitted.recovered", {
           sessionId, agentName, sequenceNumber: durable.sequenceNumber,
           impact: "our SEAL ctrl leaf is already in the relay log from a previous run; submitting a second would make this session unsealable forever",
@@ -5683,20 +5671,42 @@ export class SessionNodeManager {
    *
    * Null when there is no own ctrl leaf, which is the ordinary first-close case.
    */
-  #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | null {
+  #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
     const ownPubkey = this.#ownPubkeyHex(agentName);
-    if (!ownPubkey) return null;
+    // "I CANNOT TELL" IS NOT "THERE IS NONE". Returning the absent answer here would let the caller
+    // submit a second SEAL ctrl leaf — the exact permanent loss this method exists to prevent — on
+    // the strength of a lookup that failed. Every path that could not determine the answer says so.
+    if (!ownPubkey) {
+      this.#logger.warn("session.seal.leaf.recover.failed", {
+        sessionId, agentName, reason: "own_pubkey_unresolved",
+        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
+      });
+      return "unknown";
+    }
     let own: SealCarryLeaf | undefined;
     try {
       own = this.getSealCarry(ownPubkey, sessionId)
         .find((l) => l.leafKind === LEAF_KIND_CTRL && l.senderPubkeyHex === ownPubkey);
-    } catch { return null; }
-    if (!own) return null;
+    } catch (err: unknown) {
+      this.#logger.warn("session.seal.leaf.recover.failed", {
+        sessionId, agentName, reason: "carry_read_failed",
+        error: err instanceof Error ? err.message : String(err),
+        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
+      });
+      return "unknown";
+    }
+    if (!own) return "none";
     try {
       // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
       const fields = decode(own.structure1Cbor) as unknown[];
       const contentHash = fields[1];
-      if (!(contentHash instanceof Uint8Array)) return null;
+      if (!(contentHash instanceof Uint8Array)) {
+        this.#logger.warn("session.seal.leaf.recover.failed", {
+          sessionId, agentName, reason: "structure1_content_hash_missing",
+          impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
+        });
+        return "unknown";
+      }
       const contentHashHex = Buffer.from(contentHash).toString("hex");
       return {
         reportedRootHex: this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex),
@@ -5704,11 +5714,11 @@ export class SessionNodeManager {
       };
     } catch (err: unknown) {
       this.#logger.warn("session.seal.leaf.recover.failed", {
-        sessionId, agentName,
+        sessionId, agentName, reason: "structure1_decode_failed",
         error: err instanceof Error ? err.message : String(err),
-        impact: "cannot tell whether a SEAL ctrl leaf was already posted; the close will refuse rather than risk a second one",
+        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
       });
-      return null;
+      return "unknown";
     }
   }
 
@@ -7955,6 +7965,38 @@ export class SessionNodeManager {
     interruptedBy?: "local",
   ): boolean {
     if (!this.#db) return false;
+    // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
+    // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.
+    // Guarding only the wrapper asserts the invariant in a test while two other paths still break
+    // it.
+    //
+    //   abandoned → sealed  REFUSED. A force-abandon is the documented way to give up a receipt.
+    //     A certificate arriving afterwards must not silently overturn the operator's decision. The
+    //     certificate is still stored by recordSealCertificate and stays retrievable.
+    //   sealed → sealed     REFUSED. Nothing to write, and re-running the terminal disposition
+    //     hooks for a no-op should not be reported as a status that landed.
+    if (status === "sealed") {
+      const current = this.getSessionRecord(agentName, sessionId)?.status;
+      if (current === "abandoned" || current === "sealed") {
+        this.#logger.info("session.seal.status.not_written", {
+          agentName, sessionId, currentStatus: current,
+          impact: current === "abandoned"
+            ? "a certificate arrived for a session the operator force-abandoned; it is stored and retrievable, but the row keeps saying abandoned"
+            : "already sealed — nothing to write",
+        });
+        return false;
+      }
+      if (current === undefined) {
+        // ORDINARY, not an error. recordSealCertificate documents this case: the seal can arrive
+        // before the row is persisted. Falling through would emit `session.status.write.missed` at
+        // ERROR level for a shape the system expects.
+        this.#logger.info("session.seal.status.no_row", {
+          agentName, sessionId,
+          impact: "no session row yet — the certificate is still recorded and retrievable",
+        });
+        return false;
+      }
+    }
     const now = Date.now();
     try {
       const res = this.#db

@@ -111,6 +111,12 @@ const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([
   // The relay released the session (it drops one 24 h after the last message), so there is nothing
   // left for any directory to rebuild the record from. No amount of retrying brings it back.
   "seal_carry_empty",
+  // Two of our SEAL ctrl leaves in one durable carry. No directory can ever notarize it, and no
+  // retry changes the carry.
+  "seal_carry_duplicate_own_ctrl_leaf",
+  // The lookup that answers "is a ctrl leaf already posted?" failed. Refusing is correct — a second
+  // leaf is permanent — but retrying it five times cannot make the database readable.
+  "seal_leaf_recovery_unavailable",
   // Not protocol outcomes — a wiring or caller fault. Retrying re-runs the same bug.
   "session_not_closeable",
   "close_handler_missing",
@@ -218,6 +224,15 @@ export class RestartSealResolver {
     // would hang shutdown forever on a close that never settles — and shutdown holds the SQLCipher
     // write lock, so "forever" means a daemon that cannot be restarted. `attemptTimeoutMs` bounds
     // this wait because the raced promise is what is stored.
+    //
+    // THE RESIDUAL WINDOW IS ACCEPTED, NOT CLOSED, and it is stated here rather than implied.
+    // Once the timeout wins the race, `#inFlight` is cleared while the underlying close may still
+    // be running — so a `stop()` arriving after that point returns immediately and can still sever
+    // signaling under a half-finished exchange. That is the deliberate trade: a bounded shutdown is
+    // worth more than a guaranteed-clean one, because an unbounded wait here wedges the daemon
+    // permanently while the divergence it prevents is repairable by the next close. An attempt
+    // taking longer than `attemptTimeoutMs` is not pathological — the interrupted path can spend
+    // 30 s in the seal flow, 30 s in a retry after discovery, and 30 s in the escalation.
     return this.#inFlight ? this.#inFlight.then(() => undefined, () => undefined) : Promise.resolve();
   }
 
