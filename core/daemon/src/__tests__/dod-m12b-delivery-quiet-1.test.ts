@@ -300,4 +300,47 @@ describe("DOD-M12B-DELIVERY-QUIET-1: creation does not ring when delivery caused
     expect(aging.isDeliveryOpening(US, PEER)).toBe(false);
     expect(aging.inFlight()).toBe(0);
   });
+
+  /**
+   * THE BACKOFF HALF — the DoD names it first, and it is the actual storm driver.
+   *
+   * `onReachable` is not a nudge: it sets `failures = 0` and `nextAttemptMs = 0` and sweeps every
+   * shared document immediately. Suppressing the doorbell without suppressing this would leave the
+   * loop running silently — quieter, not fixed. Both directions are asserted, because a change that
+   * suppressed the trigger unconditionally would stop documents syncing when a peer comes back
+   * online, which is the whole point of R39 trigger 2.
+   */
+  it("a delivery-opened session does NOT fire the reachability trigger", async () => {
+    const config = await setup("alice", "bob");
+    handle = await startDaemon(config);
+    const { client } = await connectWatching(config.socketPath);
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
+
+    const alicePubkey = await beginDeliveryOpen(client, "alice", "bob");
+    await client.send("__test_emit_session_event", {
+      type: "created", agentName: "bob", sessionId: SID64("h"), counterpartyPubkey: alicePubkey,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(events.filter((e) => e.event === "document.reconcile.reachable_trigger_fired")).toHaveLength(0);
+    expect(suppressed().length).toBeGreaterThan(0);
+  });
+
+  it("...and a PEER-opened session DOES fire it — documents must still sync on reconnect", async () => {
+    const config = await setup("alice", "bob");
+    handle = await startDaemon(config);
+    const { client } = await connectWatching(config.socketPath);
+    await client.send("cello_start_agent", { name: "bob" });
+    await client.send("cello_use_agent", { name: "bob" });
+
+    await client.send("__test_emit_session_event", {
+      type: "created", agentName: "bob", sessionId: SID64("i"), counterpartyPubkey: PEER,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const fired = events.filter((e) => e.event === "document.reconcile.reachable_trigger_fired");
+    expect(fired).toHaveLength(1);
+    expect(fired[0].context["trigger"]).toBe("inbound_session_created");
+  });
 });

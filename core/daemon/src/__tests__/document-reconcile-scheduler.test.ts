@@ -202,3 +202,29 @@ describe("a REFUSAL is an answer, and it must slow the asking down", () => {
     expect(f.sent).toHaveLength(1);
   });
 });
+
+describe("DOD-M12B-DELIVERY-QUIET-1: what the reachability trigger actually does", () => {
+  /**
+   * The stakes behind exempting delivery-opened sessions, asserted here rather than inferred there.
+   *
+   * If `onReachable` were a mild nudge, suppressing it for machine-opened sessions would be
+   * over-engineering. It is not: it wipes the backoff outright and sweeps immediately. So a session
+   * the delivery worker itself opened re-opens the loop that a refusal had just closed — which is
+   * the circularity, in two lines.
+   */
+  it("onReachable WIPES a backoff a TERMINAL refusal just set, and sweeps at once", async () => {
+    const f = fixture();
+    f.scheduler.noteRefusal(OWNER, PEER, true);          // terminal → straight to the cap
+    f.clock.now += 1_000;                                 // nowhere near the cap
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    const before = f.sent.length;
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent.length, "onReachable did not wait out the cap — that is the behaviour being suppressed")
+      .toBeGreaterThan(before);
+
+    // ...and the backoff is gone afterwards, not merely bypassed once.
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+});
+

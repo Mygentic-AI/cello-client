@@ -1440,6 +1440,13 @@ async function startDaemonHoldingLock(
     if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && state === "created") {
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId !== null) {
+        // DOD-M12B-DELIVERY-QUIET-1: the trigger FIRING is logged, not only its failure. This is
+        // the storm driver — it zeroes the backoff and sweeps every shared document — and it was
+        // invisible in the log unless it threw, so 321 attempts in 85 minutes named no cause. It is
+        // also the only way either direction of the delivery exemption is observable.
+        logger.info("document.reconcile.reachable_trigger_fired", {
+          agentName, trigger: "inbound_session_created", peer: counterpartyPubkey.slice(0, 16),
+        });
         void reconcileScheduler
           .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
           .catch((err: unknown) => {
@@ -3241,6 +3248,9 @@ async function startDaemonHoldingLock(
       }
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId === null) return;
+      logger.info("document.reconcile.reachable_trigger_fired", {
+        agentName, trigger: "outbound_session_opened", peer: counterpartyPubkey.slice(0, 16),
+      });
       void reconcileScheduler
         .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
         .catch((err: unknown) => {
