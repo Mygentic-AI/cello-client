@@ -36,6 +36,7 @@ import type {
   AgentState,
   InterruptedSessionInfo,
   ActiveSessionInfo,
+  SealReadinessView,
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
@@ -1938,6 +1939,29 @@ async function startDaemonHoldingLock(
   // unbounded and confuse. The list is also capped; the full, queryable history is `cello sessions`
   // / cello_list_sessions (with filter + limit flags).
   const STATUS_RESUMABLE_CAP = 10;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — ask the seal gate for ONE session, and never let the answer take the
+   * status response with it.
+   *
+   * This runs per session on every `cello status` and every `cello_status`, and it touches the
+   * database. An unguarded throw here rejects the whole response, after which the CLI finds the
+   * singleton lock still held and prints `daemon: "broken_shutdown"` — telling the operator their
+   * healthy daemon has failed to stop, over one session row it could not read. There is a
+   * documented precedent in this codebase for exactly that shape.
+   *
+   * A failure yields `unknown`, never `ready`: "we could not check" must not read as "safe to
+   * close", because a close on a short chain is terminal.
+   */
+  function probeSealReadiness(agentName: string, sessionId: string): SealReadinessView {
+    try {
+      return sessionNodeManager.sealReadinessView(agentName, sessionId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn("session.seal.readiness.probe.failed", { agentName, sessionId, error: message });
+      return { state: "unknown", reason: `probe_failed: ${message}` };
+    }
+  }
+
   function buildInterruptedSessions(): InterruptedSessionInfo[] {
     return sessionNodeManager
       .getSessionsByStatus("interrupted")
@@ -1954,13 +1978,10 @@ async function startDaemonHoldingLock(
         sessionName: row.session_name ?? null,
         // DOD-M12B-SEAL-STUCK-1: the same answer the active list carries, for the same reason —
         // an interrupted session can seal, so it can also be blocked from sealing by a gap, and
-        // that is knowable here instead of only after a failed close.
-        ...(() => {
-          const readiness = sessionNodeManager.sealReadiness(row.agent_name, row.session_id);
-          return readiness.ready
-            ? {}
-            : { sealBlocked: { missingLeaves: readiness.missingLeaves, heldMessages: readiness.heldCount } };
-        })(),
+        // that is knowable here instead of only after a failed close. A plain property, never a
+        // spread: a spread bypasses excess-property checking, which is how `frontierMismatch`
+        // below came to typecheck while no renderer could read it.
+        sealReadiness: probeSealReadiness(row.agent_name, row.session_id),
         // DOD-FRONTIER-STRAND-1 AC3: if a seal exchange has already proved the two sides disagree on
         // how many messages this session holds, SAY SO HERE. Otherwise a stranded session is listed
         // exactly like a healthy paused one, and the only way to learn it can never seal is to
@@ -2024,16 +2045,13 @@ async function startDaemonHoldingLock(
       // DOD-M12B-SEAL-STUCK-1: ask the SAME gate the close path asks, so the surface and the
       // refusal can never disagree. Computed here rather than cached because the answer changes
       // the moment a gap fills, and a stale "stuck" is its own lie.
-      const readiness = sessionNodeManager.sealReadiness(row.agent_name, row.session_id);
       return {
         sessionId: row.session_id,
         agentName: row.agent_name,
         counterpartyPubkey: row.counterparty_pubkey,
         liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
         sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
-        sealBlocked: readiness.ready
-          ? null
-          : { missingLeaves: readiness.missingLeaves, heldMessages: readiness.heldCount },
+        sealReadiness: probeSealReadiness(row.agent_name, row.session_id),
       };
     });
   }

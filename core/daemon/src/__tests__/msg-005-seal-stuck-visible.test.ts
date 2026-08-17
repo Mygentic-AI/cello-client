@@ -12,147 +12,160 @@
  * defect turns straight into "this agent stops accepting sessions" with nothing on any surface
  * saying why.
  *
- * Revert test: drop `seal_blocked` from `buildActiveSessions` and the first case fails — a stuck
- * session becomes indistinguishable from a healthy one again.
+ * The three states are the point, and each is pinned below. `ready` and `blocked` are the obvious
+ * two; `unknown` exists because the witness state that reveals a never-arrived position is
+ * memory-only, so after a restart a genuinely stranded session would otherwise report itself
+ * healthy — the same lie, on the surface built to end it.
+ *
+ * Driven through the real IPC `status` call, not `getStatus()` directly, because an unrendered
+ * field is an invisible one and the CLI path is what the operator actually runs.
  */
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm, mkdir } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { FileKeyProvider, msgLeafHash } from "@cello-protocol/crypto";
-import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
-import { startDaemon } from "../daemon.js";
-import type { Logger, DaemonConfig } from "../types.js";
-import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
-import type { CelloNode } from "@cello-protocol/transport";
-import type { Stream } from "@libp2p/interface";
-
-interface LogEvent { level: string; event: string; context: Record<string, unknown> }
-
-function makeLogger(): { logger: Logger; events: LogEvent[] } {
-  const events: LogEvent[] = [];
-  const logger: Logger = {
-    debug(event, context) { events.push({ level: "debug", event, context: context ?? {} }); },
-    info(event, context) { events.push({ level: "info", event, context: context ?? {} }); },
-    warn(event, context) { events.push({ level: "warn", event, context: context ?? {} }); },
-    error(event, context) { events.push({ level: "error", event, context: context ?? {} }); },
-  };
-  return { logger, events };
-}
-
-/** Minimal fake node — content arrives via direct ingest; no stream is needed for the gate logic. */
-class FakeNode implements Partial<CelloNode> {
-  readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
-  async start(): Promise<void> {}
-  async stop(): Promise<void> {}
-  getPeerId(): string { return this.#peerId; }
-  listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
-  async dial(_addr: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, _h: unknown): Promise<void> {}
-  getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
-  onPeerConnect(_h: (p: string) => void): void {}
-  onPeerDisconnect(_h: (p: string) => void): void {}
-  getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
-  onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
-  async newStream(_peer: string, _proto: string): Promise<Stream> { throw new Error("unused"); }
-}
-
-class FixedFactory implements ISessionNodeFactory {
-  async createNode(_c: SessionNodeConfig): Promise<CelloNode> { return new FakeNode() as unknown as CelloNode; }
-}
+import { describe, it, expect, afterEach } from "vitest";
+import { startTwoConnectionFixture, msgLeafHash, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { SealReadinessView, DaemonStatusResponse } from "../types.js";
 
 describe("DOD-M12B-SEAL-STUCK-1: a session that cannot seal is visible without probing it", () => {
-  let tempDir: string;
-  let handle: Awaited<ReturnType<typeof startDaemon>> | null;
-
-  beforeEach(async () => { tempDir = await mkdtemp(join(tmpdir(), "cello-msg005-")); handle = null; });
-  afterEach(async () => {
-    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* stopped */ } }
-    await rm(tempDir, { recursive: true, force: true });
-  });
-
-  async function makeAgentDir(name: string): Promise<string> {
-    const dir = join(tempDir, "agents", name);
-    await mkdir(dir, { recursive: true });
-    const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
-  }
-
-  async function start(logger: Logger): Promise<Awaited<ReturnType<typeof startDaemon>>> {
-    const config: DaemonConfig = {
-      securityGateway: new PassthroughGatewayClient(),
-      celloDir: tempDir, socketPath: join(tempDir, "daemon.sock"), lockFilePath: join(tempDir, "daemon.lock"),
-      maxConnections: 16, version: "0.0.1-test", logger, sessionNodeFactory: new FixedFactory(),
-    };
-    const h = await startDaemon(config);
-    handle = h;
-    return h;
-  }
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
 
   const STUCK = "7a".repeat(32);
   const HEALTHY = "7b".repeat(32);
 
-  it("status marks the stuck session and leaves the healthy one alone", async () => {
-    await makeAgentDir("alice");
-    const { logger } = makeLogger();
-    const h = await start(logger);
-    const snm = h.getSessionNodeManager();
+  async function statusOf(f: TwoConnectionFixture): Promise<DaemonStatusResponse> {
+    const client = await f.connect();
+    return (await client.send("status", {})) as unknown as DaemonStatusResponse;
+  }
 
-    await snm.createSessionNode(STUCK, "alice", "bobpubkeyhex", "peer-1", "corr");
-    await snm.createSessionNode(HEALTHY, "alice", "bobpubkeyhex", "peer-2", "corr");
+  it("status distinguishes stuck from healthy, and reports the two counters as the different things they are", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg005-" });
+    const { snm } = fx;
+    await fx.createSession(STUCK, "alice");
+    await fx.createSession(HEALTHY, "alice");
 
-    // The stuck one: the relay witnessed position 1 and this side never received position 0, so
-    // the arriving frame is held behind a gap that nothing on this daemon can fill.
-    const c = new TextEncoder().encode("held behind a gap");
-    const hash = msgLeafHash(c);
-    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(hash).toString("hex"), 1);
-    await snm.ingestReceivedContent("alice", STUCK, c, hash, "corr");
+    // The stuck session, built so the two counters MUST differ — otherwise an implementation that
+    // swapped them, or reported one twice, would pass.
+    //   position 1 and 2: received, verified, held behind the gap at 0  → heldBehindGap = 2
+    //   position 3:       witnessed by the relay, never arrived         → awaitingArrival = 1
+    const held1 = new TextEncoder().encode("held at 1");
+    const held2 = new TextEncoder().encode("held at 2");
+    const never = new TextEncoder().encode("never arrived");
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held1)).toString("hex"), 1);
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held2)).toString("hex"), 2);
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(never)).toString("hex"), 3);
+    await snm.ingestReceivedContent("alice", STUCK, held1, msgLeafHash(held1), "corr");
+    await snm.ingestReceivedContent("alice", STUCK, held2, msgLeafHash(held2), "corr");
     expect(snm.sealReadiness("alice", STUCK).ready, "the fixture must actually be stuck").toBe(false);
 
-    // The healthy one: an ordinary in-order message.
-    const c2 = new TextEncoder().encode("ordinary");
-    await snm.ingestReceivedContent("alice", HEALTHY, c2, msgLeafHash(c2), "corr");
+    // The healthy session: an ordinary in-order message, witnessed and appended.
+    const ok = new TextEncoder().encode("ordinary");
+    snm.recordWitnessedSequence("alice", HEALTHY, Buffer.from(msgLeafHash(ok)).toString("hex"), 0);
+    await snm.ingestReceivedContent("alice", HEALTHY, ok, msgLeafHash(ok), "corr");
     expect(snm.sealReadiness("alice", HEALTHY).ready).toBe(true);
 
-    const status = h.getStatus();
-    const rows = status.active_sessions;
+    const rows = (await statusOf(fx)).active_sessions;
     const stuck = rows.find((r) => r.sessionId === STUCK);
     const healthy = rows.find((r) => r.sessionId === HEALTHY);
     expect(stuck, "the stuck session must be listed at all").toBeDefined();
     expect(healthy).toBeDefined();
 
-    // THE POINT: the two are distinguishable from the status surface alone, with the numbers that
-    // say WHY — not a bare flag the operator then has to go and interpret.
-    expect(stuck!.sealBlocked, "a session that can never close must say so on the surface that lists it").not.toBeNull();
-    expect(stuck!.sealBlocked!.heldMessages).toBe(1);
-    expect(healthy!.sealBlocked, "a healthy session must not be flagged — a warning on everything is a warning on nothing").toBeNull();
+    // toEqual on the whole object, with the two numbers different — the assertion a swap fails.
+    expect(stuck!.sealReadiness).toEqual({
+      state: "blocked",
+      awaitingArrival: 1,
+      heldBehindGap: 2,
+      oldestHeldMs: expect.any(Number) as unknown as number,
+    });
+    // The age is what separates "stuck since this morning" from "in flight 40 ms ago". A blocked
+    // session holding content must always be able to say how long it has been waiting.
+    const blocked = stuck!.sealReadiness as Extract<SealReadinessView, { state: "blocked" }>;
+    expect(blocked.oldestHeldMs).not.toBeNull();
+
+    // A warning on everything is a warning on nothing.
+    expect(healthy!.sealReadiness).toEqual({ state: "ready" });
+  }, 60_000);
+
+  it("an INTERRUPTED session carries the same answer — it can seal, so it can be blocked from sealing", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg005b-" });
+    const { snm } = fx;
+    await fx.createSession(STUCK, "alice");
+
+    const held = new TextEncoder().encode("held behind a gap");
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
+    // Give it a message so it survives the resumable-only filter, then interrupt it.
+    snm.getDb()
+      .prepare("UPDATE sessions SET status = 'interrupted', message_count = 1 WHERE session_id = ?")
+      .run(STUCK);
+
+    const rows = (await statusOf(fx)).interrupted_sessions;
+    const row = rows.find((r) => r.sessionId === STUCK);
+    expect(row, "an interrupted session must still be listed").toBeDefined();
+    expect(row!.sealReadiness).toEqual({
+      state: "blocked",
+      awaitingArrival: 0,
+      heldBehindGap: 1,
+      oldestHeldMs: expect.any(Number) as unknown as number,
+    });
+  }, 60_000);
+
+  it("a session whose ordering this process never watched reports UNKNOWN, never ready", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg005c-" });
+    const { snm } = fx;
+    await fx.createSession(STUCK, "alice");
+
+    // Leaves this process did not watch arrive — the shape of every session after a daemon restart.
+    // `#witnessedSeq` is memory-only, so a position the relay witnessed for content that never
+    // arrived leaves no trace at all: the counters read clean and the session looks closable.
+    // Closing it gets `leaf_count_mismatch`, which is terminal and costs the receipt for good.
+    fx.seedReceived("alice", STUCK, "from a previous process");
+    expect(snm.sealReadiness("alice", STUCK).ready, "the raw counters DO read clean — that is the trap").toBe(true);
+
+    const rows = (await statusOf(fx)).active_sessions;
+    const row = rows.find((r) => r.sessionId === STUCK);
+    expect(row!.sealReadiness).toEqual({
+      state: "unknown",
+      reason: "witness_state_predates_daemon_start",
+    });
+  }, 60_000);
+
+  it("reading status does NOT deliver messages — a diagnostic must not advance the chain", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg005d-" });
+    const { snm } = fx;
+    await fx.createSession(STUCK, "alice");
+
+    const held = new TextEncoder().encode("waiting its turn");
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
+    const before = snm.getSessionTree("alice", STUCK).size();
+
+    await statusOf(fx);
+
+    // The status path hydrates durable holds so its count is right, and stops there. If it also
+    // released, `cello status` would append leaves, advance the session root, write transcript rows
+    // and ring the doorbell — making the operator's diagnostic command the thing that delivers
+    // messages, and making whether they ran it change the leaf count a later close signs over.
+    expect(snm.getSessionTree("alice", STUCK).size(), "a read must not grow the tree").toBe(before);
+    expect(fx.eventsNamed("session.content.released"), "a read must not release held content").toEqual([]);
   }, 60_000);
 
   // A GUARD test, not a change test: it passes before this unit because DOD-M12B-STRAND-1 already
-  // made holds durable. It is here so that the property force-abandon now depends on — "the escape
-  // hatch costs the receipt, not the messages" — cannot be removed without something going red.
-  it("held content survives a force-abandon (guard on the durable-hold rows, which the escape hatch now relies on)", async () => {
-    await makeAgentDir("alice");
-    const { logger } = makeLogger();
-    const h = await start(logger);
-    const snm = h.getSessionNodeManager();
+  // made holds durable and moves them to the annex when a session goes terminal. It is here so that
+  // the property force-abandon now depends on — "the escape hatch costs the receipt, not the
+  // messages" — cannot be removed without something going red.
+  it("held content survives a force-abandon (guard on the annex hand-off the escape hatch relies on)", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg005e-" });
+    const { snm } = fx;
+    await fx.createSession(STUCK, "alice");
 
-    await snm.createSessionNode(STUCK, "alice", "bobpubkeyhex", "peer-1", "corr");
-    const c = new TextEncoder().encode("received, verified, never delivered");
-    const hash = msgLeafHash(c);
-    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(hash).toString("hex"), 1);
-    await snm.ingestReceivedContent("alice", STUCK, c, hash, "corr");
+    const held = new TextEncoder().encode("received, verified, never delivered");
+    snm.recordWitnessedSequence("alice", STUCK, Buffer.from(msgLeafHash(held)).toString("hex"), 1);
+    await snm.ingestReceivedContent("alice", STUCK, held, msgLeafHash(held), "corr");
 
-    // Force-abandon is the operator's way out of a session that can never seal. Before durable
-    // holds it also destroyed whatever was waiting behind the gap, which made the only exit a
-    // data-losing one. It must not any more.
     await snm.abandonSession("alice", STUCK);
 
     // The content moved, it did not vanish. Once a session is terminal nothing can ever release a
-    // held frame into its chain again — ingest refuses a terminal session, and the release path is
-    // only reachable from ingest — so leaving the row in `held_content` would be durable storage
-    // nothing can read. The annex is where content that outlived its chain is readable from.
+    // held frame into its chain again, so leaving the row in `held_content` would be durable
+    // storage nothing can read.
     const stillHeld = snm.getDb()
       .prepare("SELECT COUNT(*) AS n FROM held_content WHERE session_id = ?")
       .get(STUCK) as { n: number };

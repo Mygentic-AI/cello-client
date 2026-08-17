@@ -37,7 +37,7 @@ import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
-import type { Logger, SessionRecord } from "./types.js";
+import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
@@ -463,6 +463,14 @@ export class SessionNodeManager {
   // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
   // process; the Map is the working copy from then on.
   #heldRestored = new Set<string>();
+  // DOD-M12B-SEAL-STUCK-1: sessions whose post-restore release has been attempted. Separate from
+  // #heldRestored so a READ-ONLY probe can hydrate without performing (or consuming) the release.
+  #heldReleased = new Set<string>();
+  // DOD-M12B-SEAL-STUCK-1: sessions whose ordering state THIS PROCESS has observed — a relay
+  // witness recorded for it. `#witnessedSeq` is memory-only, so for a session that predates this
+  // daemon "no gap recorded" means "not recorded", not "no gap", and that difference decides
+  // whether we may tell an operator the session is safe to close.
+  #orderingObserved = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -3230,6 +3238,7 @@ export class SessionNodeManager {
     // the frames would sit in the table, unreleasable, which is indistinguishable from the loss
     // this unit exists to stop.
     this.#heldRestored.delete(key);
+    this.#heldReleased.delete(key);
     this.#highWaterSeq.delete(key);
   }
 
@@ -5094,6 +5103,9 @@ export class SessionNodeManager {
   recordWitnessedSequence(agentName: string, sessionId: string, contentHashHex: string, sequenceNumber: number): void {
     if (sequenceNumber < 0) return;
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-SEAL-STUCK-1: this process has now seen this session's ordering state, so an empty
+    // witness map for it means "no gap" rather than "never looked".
+    this.#orderingObserved.add(key);
     let map = this.#witnessedSeq.get(key);
     if (!map) { map = new Map(); this.#witnessedSeq.set(key, map); }
     map.set(contentHashHex, sequenceNumber);
@@ -5155,7 +5167,12 @@ export class SessionNodeManager {
     // READY, and this gate's whole purpose is to stop a short chain being signed — the counterparty
     // answers `leaf_count_mismatch`, which is TERMINAL and costs the receipt permanently. Failing
     // open here is the one outcome worse than refusing a healthy close.
-    this.#ensureHeldRestored(agentName, sessionId);
+    //
+    // Hydrate WITHOUT releasing: this is a read path now — the status surface asks it for every
+    // active session — and a read that appends leaves, advances the root and rings the doorbell is
+    // a diagnostic command that delivers messages. The release still runs on every path that was
+    // going to mutate anyway.
+    this.#ensureHeldRestored(agentName, sessionId, { release: false });
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
@@ -5176,6 +5193,62 @@ export class SessionNodeManager {
     // and it cannot go negative.
     const missingLeaves = this.#witnessedSeq.get(key)?.size ?? 0;
     return { ready: missingLeaves === 0 && heldCount === 0, treeSize, highWaterSeq, heldCount, missingLeaves };
+  }
+
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — the operator-facing answer to "can this session be closed?".
+   *
+   * THREE STATES, because there are three answers. `sealReadiness` above returns a boolean plus raw
+   * counters, and both of its counters are easy to misread on a surface:
+   *
+   *  - `missingLeaves` is `#witnessedSeq.size`, which is every position the relay witnessed that
+   *    this tree has not appended — and a HELD frame keeps its witness entry. So it INCLUDES the
+   *    held ones. Reporting it beside `heldCount` counts the same message twice and labels one copy
+   *    "never received" when it is sitting on our own disk. Split here into what each actually is.
+   *  - Neither counter survives a restart on its own: `#witnessedSeq` is memory-only. Held content
+   *    is durable since DOD-M12B-STRAND-1, but a position the relay witnessed for content that
+   *    never arrived leaves no trace. So for a session carrying leaves this process did not watch
+   *    arrive, "clean" is unknowable — and saying `ready` there invites a close that gets
+   *    `leaf_count_mismatch` back, which is terminal and costs the receipt for good.
+   */
+  sealReadinessView(agentName: string, sessionId: string): SealReadinessView {
+    const key = this.#k(agentName, sessionId);
+    const r = this.sealReadiness(agentName, sessionId);
+    if (!r.ready) {
+      const held = this.#heldContent.get(key);
+      const oldestHeldMs = this.#oldestHeldMs(agentName, sessionId);
+      return {
+        state: "blocked",
+        // The witness map counts held frames too, so subtract them rather than reporting both.
+        awaitingArrival: Math.max(0, r.missingLeaves - (held?.size ?? 0)),
+        heldBehindGap: r.heldCount,
+        oldestHeldMs,
+      };
+    }
+    if (r.treeSize > 0 && !this.#orderingObserved.has(key)) {
+      return {
+        state: "unknown",
+        reason: "witness_state_predates_daemon_start",
+      };
+    }
+    return { state: "ready" };
+  }
+
+  /** DOD-M12B-SEAL-STUCK-1 — how long the oldest held frame for this session has been waiting, or
+   *  null when nothing is held. This is what separates "stuck since this morning" from "in flight
+   *  40 ms ago", and without it a healthy mid-conversation window reads as a stranded session. */
+  #oldestHeldMs(agentName: string, sessionId: string): number | null {
+    if (!this.#db) return null;
+    try {
+      const row = this.#db.prepare(
+        "SELECT MIN(held_at) AS oldest FROM held_content WHERE agent_id = ? AND session_id = ?",
+      ).get(this.#requireAgentId(agentName), sessionId) as { oldest: number | null } | undefined;
+      if (!row || row.oldest === null) return null;
+      return Date.now() - row.oldest;
+    } catch {
+      // A diagnostic detail must not be able to break the surface it decorates.
+      return null;
+    }
   }
 
   /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
@@ -5387,13 +5460,14 @@ export class SessionNodeManager {
    * the two counters are different spaces and this file documents them drifting, so the index
    * comparison alone would destroy a frame the tree never held. See the drift branch below.
    */
-  #ensureHeldRestored(agentName: string, sessionId: string): void {
+  #ensureHeldRestored(agentName: string, sessionId: string, opts?: { release?: boolean }): void {
     const key = this.#k(agentName, sessionId);
-    if (this.#heldRestored.has(key)) return;
-    // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
-    // away instead of recursing.
-    this.#heldRestored.add(key);
-    this.#restoreHeldContent(agentName, sessionId);
+    if (!this.#heldRestored.has(key)) {
+      // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
+      // away instead of recursing.
+      this.#heldRestored.add(key);
+      this.#restoreHeldContent(agentName, sessionId);
+    }
     // A RESTORED FRAME MAY ALREADY BE IN ORDER, and nothing else would ever notice.
     //
     // #releaseHeld has one caller: the tail of a successful inbound ingest. Every other way the tree
@@ -5402,6 +5476,15 @@ export class SessionNodeManager {
     // so the stall is durable too: the counterparty's message sits on disk at exactly the next slot,
     // is never delivered, and `sealReadiness` counts it, so the session cannot close either.
     // Undeliverable AND unsealable, forever, from one restart.
+    //
+    // TRACKED SEPARATELY FROM THE HYDRATION. A read-only caller (the status surface) hydrates and
+    // must NOT release — otherwise `cello status` appends leaves, advances the session root, writes
+    // transcript rows and rings the doorbell, which makes a diagnostic command the thing that
+    // delivers messages. One shared flag would also let that read CONSUME the release the next real
+    // ingest was going to perform, which is the stall above, reintroduced.
+    if (opts?.release === false) return;
+    if (this.#heldReleased.has(key)) return;
+    this.#heldReleased.add(key);
     if (this.#heldContent.get(key)?.size) {
       const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
       if (counterparty) this.#releaseHeld(agentName, sessionId, counterparty);
