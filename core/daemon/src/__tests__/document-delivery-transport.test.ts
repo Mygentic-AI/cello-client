@@ -42,7 +42,9 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
     // after every successful send, and a document sender that skips it leaves its own tree behind
     // by one per frame — which starves its INBOUND, because the receive path holds anything whose
     // canonical sequence is ahead of its own tree size.
-    appendLeaf: () => {},
+    // DOD-M12B-INDEX-1: the hook now reports whether the leaf actually made it into the chain —
+    // a held one has not, and `document.frame.sent` must not read the same for both.
+    appendLeaf: () => ({ placed: true, leafIndex: 0 }),
     sendContent: async (_a, sessionId) => {
       sends.push({ sessionId });
       return { ok: true, delivered: true };

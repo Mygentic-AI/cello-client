@@ -14,6 +14,14 @@
  * that is the entire difference from a closure over 73 shared locals.
  */
 import { randomUUID } from "node:crypto";
+
+/**
+ * DOD-M12B-ABANDON-NOTIFY-1 — how long the courtesy notice may delay a force-abandon.
+ *
+ * Force-abandon is the operator's escape hatch out of a session that can never seal, and it must
+ * always return. Telling the counterparty is worth a moment; it is not worth the escape hatch.
+ */
+const ABANDON_NOTICE_DEADLINE_MS = 3_000;
 import { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { IpcHandler } from "./ipc-server.js";
@@ -408,6 +416,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // on both would put the same paragraph on the ninety routine force-abandons that cost nothing
       // and the one that cost a receipt, which buries the only occurrence that matters.
       const mayHaveSealed = record.status === "interrupted" || record.status === "seal_interrupted_pending";
+      // ONE id for the close and every line the notice emits, so they can be joined. Minting a
+      // fresh one inside the notice call meant its sent/failed/skipped lines belonged to no flow.
+      const correlationId = randomUUID();
       // DOD-M12B-ABANDON-NOTIFY-1: TELL THEM FIRST, while the session node still exists — the
       // abandon tears it down, and after that there is no stream to tell them on. Awaited so the
       // answer can be honest about whether they were reached, but it can only ever return: it never
@@ -422,22 +433,35 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // must not become conditional on a courtesy. The notice already handles its own failures; this
       // catches the unexpected — an absent method, a throw from the transport layer — so that no
       // fault in telling the counterparty can prevent the operator from ending their own session.
-      let told = false;
+      let notice: { told: boolean; reason: string } = { told: false, reason: "not_attempted" };
       try {
-        told = await sessionNodeManager.notifyCounterpartyAbandon(record.agent_name, sessionId, randomUUID());
+        // A HARD DEADLINE, not just a catch. The catch covers a throw; it does not cover a hang,
+        // and `stream.close()` waits for the write buffer to drain with no timeout anywhere in the
+        // chain — so a half-dead connection could sit here indefinitely on the one call that must
+        // always return. Force-abandon is the escape hatch; it does not get to be slow either.
+        notice = await Promise.race([
+          sessionNodeManager.notifyCounterpartyAbandon(record.agent_name, sessionId, correlationId),
+          new Promise<{ told: boolean; reason: string }>((resolve) => {
+            const t = setTimeout(() => resolve({ told: false, reason: "notice_timeout" }), ABANDON_NOTICE_DEADLINE_MS);
+            t.unref?.();
+          }),
+        ]);
       } catch (err: unknown) {
         logger.warn("session.abandon.notice.threw", {
-          agentName: record.agent_name, sessionId,
+          agentName: record.agent_name, sessionId, correlationId,
           error: err instanceof Error ? err.message : String(err),
           impact: "the counterparty was not told and may keep calling; the abandon itself proceeds",
         });
       }
+      const told = notice.told;
       await sessionNodeManager.abandonSession(record.agent_name, sessionId);
       logger.info("session.force_abandoned", {
         agentName: record.agent_name,
         sessionId,
         priorStatus: record.status,
         counterpartyNotified: told,
+        counterpartyNoticeReason: notice.reason,
+        correlationId,
         // Makes the destructive case findable in a log instead of reconstructable by hand, which is
         // how the 2026-08-06 incident had to be traced.
         mayHaveForfeitedSeal: mayHaveSealed,
@@ -447,10 +471,13 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         status: "abandoned",
         reason: "force_abandoned",
         counterparty_notified: told,
+        counterparty_notice_reason: notice.reason,
         guidance: `Session ${sessionId} was force-abandoned — marked terminal locally with no bilateral seal. Use force only for a half-open session that cannot be sealed; a normal close (no force) still attempts the seal so both parties get a notarized receipt.` +
           (told
-            ? ` The counterparty was told and will retire their half, so they will stop trying to reach you on it.`
-            : ` The counterparty could NOT be reached to be told, so their half stays open: they may go on retrying delivery and re-dialling this session until they give up. If connection attempts keep arriving from them, that is why.`) +
+            ? ` The notice was sent — a counterparty running a current client will stop calling this session. There is no acknowledgement for it, so if connection attempts keep arriving they are on an older build that does not understand it.`
+            : notice.reason === "no_local_node"
+              ? ` They were NOT told: this side had already torn the session down, so there was nothing to send the notice on. Their half stays open and they may go on retrying delivery and re-dialling until they give up. If connection attempts keep arriving from them, that is why — it is not a network fault.`
+              : ` They were NOT told (${notice.reason}), so their half stays open: they may go on retrying delivery and re-dialling this session until they give up. If connection attempts keep arriving from them, that is why.`) +
           (mayHaveSealed
             ? ` This session had reached a seal attempt (prior status: ${record.status}), so if the counterparty did notarize it, this side's half is now PERMANENTLY forfeited and cannot be recovered from here. Their copy, if it exists, is the only remaining one — ask them for their sealed_root and record it with the operator.`
             : ""),

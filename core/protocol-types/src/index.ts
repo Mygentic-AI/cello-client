@@ -55,7 +55,7 @@ export {
 export { computeGenesisPrevRoot, encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs, SEAL_RECEIPT_DISCLAIMER } from "./session.js";
 export type {
   SessionAssignment, SessionAssignmentFrost, SessionAssignmentSingle, ParticipantInfo, RelayEndpointInfo, SealPayload,
-  SessionAbandoned, SessionSealedSingle, SessionSealedFrost, SessionSealed, SealRejectionReason, SessionSealRejected, SealVerified,
+  SessionAbandoned, SessionAbandonedNotice, SessionSealedSingle, SessionSealedFrost, SessionSealed, SealRejectionReason, SessionSealRejected, SealVerified,
   AttestationMode, SealLegibility, SealLegibilityParticipant, SealLegibilityFinalMessage,
 } from "./session.js";
 

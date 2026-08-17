@@ -43,7 +43,7 @@ function harness(sealReady: Readiness, status = "interrupted") {
     sealReadiness: () => sealReady,
     // DOD-M12B-ABANDON-NOTIFY-1: force-abandon now tells the counterparty first. Modelled as
     // "could not reach them", which is the case the guidance has to be honest about.
-    notifyCounterpartyAbandon: async () => false,
+    notifyCounterpartyAbandon: async () => ({ told: false, reason: "no_local_node" as const }),
     abandonSession: async () => { abandoned += 1; return true; },
     submitSealLeaf: async () => ({ ok: false as const, reason: "relay_unavailable" }),
     getSealCertificate: () => undefined,

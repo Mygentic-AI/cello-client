@@ -94,6 +94,7 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         counterparty_primary_pubkey TEXT,
         session_name TEXT,
         read_at INTEGER,
+        counterparty_abandoned_at INTEGER,
         PRIMARY KEY (agent_id, session_id)
       )`,
     indexSql: () => [],

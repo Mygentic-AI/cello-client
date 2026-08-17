@@ -133,9 +133,33 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     expect(redial, "the re-dial must be visible — a silent recovery is unmeasurable").toBeDefined();
     expect(A.events.find((e) => e.event === "session.transport.redial.succeeded")).toBeDefined();
 
+    // IT ACTUALLY DIALLED. Without this the test passes against an implementation that merely
+    // retries — the injected fault is spent after one throw, so a bare `return attempt()` in the
+    // catch would deliver too and prove nothing about the mechanism this unit exists to add.
+    // `session.transport.connected` is emitted by the dial itself, once per successful dial.
+    const dials = A.events.filter((e) => e.event === "session.transport.connected");
+    expect(dials.length, "the recovery must go through a real dial, not just a second attempt").toBe(2);
+
     const arrived = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
     expect(arrived, "the message must actually reach the counterparty").not.toBeNull();
     expect(Buffer.from(arrived!.contentHex, "hex").toString()).toBe("after the blip");
+  }, 60_000);
+
+  it("a session this side never dialled has no address to dial back with, and says so", async () => {
+    const A = makeManager();
+    await A.manager.initialize();
+    await seedAgents(A.manager.getDb(), ["alice"]);
+    // The responder's half: it accepted a session it never dialled, so it holds no address for the
+    // counterparty. That is a real limitation of this fix and the operator should be able to see it
+    // rather than infer it from a message that parks.
+    const created = await A.manager.createSessionNode(SID, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-A");
+    expect(created.ok).toBe(true);
+
+    const content = new TextEncoder().encode("no way home");
+    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr");
+
+    expect(A.events.find((e) => e.event === "session.transport.redial.unavailable"), "the limitation must be named").toBeDefined();
+    expect(A.events.find((e) => e.event === "session.transport.redial.attempted"), "and nothing may be dialled").toBeUndefined();
   }, 60_000);
 
   it("a peer that is genuinely gone is not dialled once per send — the cooldown bounds a burst", async () => {

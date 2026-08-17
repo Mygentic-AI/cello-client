@@ -293,6 +293,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
       "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
       "ALTER TABLE sessions ADD COLUMN session_name TEXT",
       "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
+      "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
     ]) {
       try { migrated.exec(ddl); } catch { /* duplicate column — already applied */ }
     }

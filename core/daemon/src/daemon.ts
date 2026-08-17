@@ -3997,18 +3997,21 @@ async function startDaemonHoldingLock(
         // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
         // successful send. See the comment at the call site for why this is delivery-critical and
         // not audit bookkeeping.
-        appendLeaf: (agent, sessionId, contentHash, correlationId, assignedSeq) => {
+        appendLeaf: (agent, sessionId, contentHash, frameBytes, correlationId, assignedSeq) => {
           // DOD-M12B-INDEX-1: a document leaf takes a position in the CONVERSATION's sequence space
-          // (deliberate — f75ea09), so it obeys the same discipline a message does.
-          sessionNodeManager.placeOwnLeaf(
+          // (deliberate — f75ea09), so it obeys the same discipline a message does — including
+          // being HELD when the position is ahead of the tail, which is why the real frame bytes
+          // have to travel with it.
+          const placed = sessionNodeManager.placeOwnLeaf(
             agent,
             sessionId,
             Buffer.from(contentHash).toString("hex"),
-            contentHash,
+            frameBytes,
             assignedSeq,
             correlationId,
             "doc",
           );
+          return { placed: placed.placed, leafIndex: placed.placed ? placed.leafIndex : null };
         },
     });
     documentTransports.set(agentName, transport);

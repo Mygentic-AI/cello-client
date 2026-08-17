@@ -48,7 +48,7 @@ export interface DocumentTransportDeps {
   /** DOD-M12B-INDEX-1: `assignedSeq` is the relay's position for this frame — the leaf goes THERE,
    *  not at the tail. A document leaf rides the same session sequence counter a message does, so it
    *  is subject to exactly the same divergence. Undefined when no relay answered. */
-  appendLeaf(agentName: string, sessionId: string, contentHash: Uint8Array, correlationId: string, assignedSeq?: number): void;
+  appendLeaf(agentName: string, sessionId: string, contentHash: Uint8Array, frameBytes: Uint8Array, correlationId: string, assignedSeq?: number): { placed: boolean; leafIndex: number | null };
   /** The agent this worker delivers for. One worker per attended agent. */
   agentName: string;
   /** `runDiscoveryLookup`, supplied by the composition root — it lives in a closure there. */
@@ -265,9 +265,18 @@ export function createDocumentDeliveryTransport(
       // document frame in a fresh session arrives and everything after it does not. Adding one
       // ordinary message before the exchange moved the failure earlier, which is what named the
       // cause.
-      deps.appendLeaf(deps.agentName, session.sessionId, hash, correlationId, sent.sequenceNumber);
+      // THE FRAME BYTES, not the hash. When the leaf cannot be placed yet the bytes are held, and a
+      // hold is released by writing its content to the transcript — so handing this the hash would
+      // put 32 bytes of digest in the operator's transcript as a message they sent, and annex the
+      // same 32 bytes into the sealed record.
+      const placed = deps.appendLeaf(deps.agentName, session.sessionId, hash, bytes, correlationId, sent.sequenceNumber);
       deps.logger.info("document.frame.sent", {
         documentId,
+        // Whether the leaf is IN the chain yet. This hook is delivery-critical — a sender that skips
+        // its leaf falls one behind per frame and the peer silently drops what it has already
+        // consumed — so "sent" must not read the same when the leaf is merely held.
+        leafCommitted: placed.placed,
+        leafIndex: placed.leafIndex,
         sessionId: session.sessionId,
         sessionOpened: session.sessionOpened,
         bytes: bytes.length,

@@ -519,6 +519,24 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         guidance: "The message was delivered — the counterparty has it. Its place in the record is waiting on an earlier message from them that has not arrived yet, so it is not in your transcript until that gap fills. Nothing to do, and do not resend: a resend takes a second position in the record.",
       };
     }
+    if (placement.diverged) {
+      // THE OPERATOR HEARS ABOUT IT. Their message is in their own transcript, but this side's tree
+      // is permanently ahead of the relay's counter, so the two can no longer agree on a root and
+      // this session will never produce a notarized receipt. Returning the ordinary success here —
+      // which is what the first build did — reports a healthy send on a conversation that has
+      // silently lost the one thing the protocol exists to produce.
+      logger.error("session.content.sent.diverged", {
+        sessionId, agentName: record.agent_name, sequenceNumber: placement.leafIndex, correlationId,
+        impact: "delivered and recorded locally, but this session can no longer be sealed bilaterally",
+      });
+      return {
+        ok: true,
+        sequence_number: placement.leafIndex,
+        diverged: true,
+        ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
+        guidance: `The message was delivered and is in your transcript. But this session's record has drifted out of step with the relay's ordering, so it can no longer be sealed with the counterparty — there will be no notarized receipt for it. Keep talking if you want to; when you are finished, cello_close_session ${sessionId} { force: true } is the only way it can end. cello_transcript ${sessionId} is the record you keep.`,
+      };
+    }
     const leafIndex = placement.leafIndex;
     // DOD-LOG-1: persist the readable SENT plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart).

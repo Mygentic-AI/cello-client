@@ -282,6 +282,25 @@ export interface SessionAbandoned {
 }
 
 /**
+ * DOD-M12B-ABANDON-NOTIFY-1 — peer-to-peer notice: "I have force-abandoned this session."
+ *
+ * A DIFFERENT FRAME ON A DIFFERENT RAIL from `SessionAbandoned` above, and named so nobody reaches
+ * for the wrong decoder. That one is directory→client over signaling and carries 16 raw bytes; this
+ * one is peer→peer over `/cello/content/1.0.0` and carries the hex session id the content path uses
+ * throughout. Reusing the `session_abandoned` type string for both is what this name avoids.
+ *
+ * Purely advisory. It tells the receiver to stop calling — it does NOT end their session, because
+ * a party must not be able to deny its counterparty the unilateral seal by hanging up. The receiver
+ * pins it to the Noise-authenticated counterparty before acting.
+ */
+export interface SessionAbandonedNotice {
+  type: "session_abandoned_notice";
+  /** Hex session id, matching every other frame on the content stream. */
+  session_id: string;
+  correlation_id?: string;
+}
+
+/**
  * Legacy session_sealed frame (single-key directory signature). Refused by current clients.
  * @deprecated Use SessionSealedFrost.
  */

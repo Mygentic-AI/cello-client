@@ -36,6 +36,7 @@ import { randomUUID, createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
+import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
@@ -119,6 +120,23 @@ const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
  * operator says. It is cleared on a successful dial, so it never delays a live counterparty.
  */
 const REDIAL_COOLDOWN_MS = 15_000;
+
+/**
+ * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
+ *
+ * A REASON, not a boolean. The three causes are not interchangeable, and collapsing them made the
+ * operator's guidance blame the network for a session this side had already torn down — which is
+ * the most common case, since force-abandon is largely used on `interrupted` sessions and those
+ * have no node left to send on.
+ *
+ * `told: true` means the bytes left this node. There is no acknowledgement, so it is not proof the
+ * far side acted — a counterparty on an older client does not understand the frame and keeps
+ * calling. The guidance says so rather than promising they will stop.
+ */
+export interface AbandonNoticeResult {
+  told: boolean;
+  reason: "sent" | "no_local_node" | "send_failed";
+}
 
 /**
  * DOD-M12B-ACK-1 — why a session is impaired, and what became of the content that revealed it.
@@ -489,6 +507,11 @@ export class SessionNodeManager {
   // daemon "no gap recorded" means "not recorded", not "no gap", and that difference decides
   // whether we may tell an operator the session is safe to close.
   #orderingObserved = new Set<string>();
+  // DOD-M12B-INDEX-1: sessions whose tree and whose relay counter have provably parted. A diverged
+  // session can never produce a root the counterparty agrees with, so it must never be reported as
+  // safe to close — the close would be signed, refused as `leaf_count_mismatch`, and the receipt
+  // lost for good.
+  #diverged = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -508,7 +531,7 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent" }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -1010,6 +1033,10 @@ export class SessionNodeManager {
       // watermark: this records "operator acknowledged via dismiss", not "operator received via
       // cello_receive". NULL = not yet dismissed.
       "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
+      // DOD-M12B-ABANDON-NOTIFY-1: epoch-ms when the counterparty told us they force-abandoned.
+      // Deliberately NOT a status — the session stays sealable, so the operator can still take a
+      // unilateral receipt. It stops this side calling them, nothing more.
+      "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1140,6 +1167,8 @@ export class SessionNodeManager {
         -- path, which would put our words in the counterparty's mouth in the sealed record and hand
         -- them back to our own agent through cello_receive as though they had just arrived.
         origin TEXT NOT NULL DEFAULT 'received',
+        -- DOD-M12B-INDEX-1: 'msg' or 'doc'. A held document leaf must come back as a document leaf.
+        leaf_kind TEXT NOT NULL DEFAULT 'msg',
         PRIMARY KEY (agent_id, session_id, canonical_seq)
       )
     `);
@@ -1151,6 +1180,16 @@ export class SessionNodeManager {
     // nobody else holds a copy of. Loud in the log is not the same as visible.
     try {
       this.#db.exec("ALTER TABLE held_content ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
+    // DOD-M12B-INDEX-1: and the LEAF KIND. `#releaseHeld` used to append every held frame as "msg",
+    // so a document leaf that had to wait for its position came back as a conversation message —
+    // the distinction survived the immediate append and was destroyed by the hold, unrecoverably
+    // after a restart.
+    try {
+      this.#db.exec("ALTER TABLE held_content ADD COLUMN leaf_kind TEXT NOT NULL DEFAULT 'msg'");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!/duplicate column name/i.test(msg)) throw err;
@@ -2936,6 +2975,25 @@ export class SessionNodeManager {
     });
   }
 
+  /**
+   * DOD-M12B-ABANDON-NOTIFY-1 — drive the REAL inbound content handler with one framed message and
+   * a claimed peer identity.
+   *
+   * The handler is registered on a live libp2p node, so without this the only way to reach its
+   * branches is a full two-node transport fixture — which is why the session-abandoned branch and
+   * its peer pinning had no coverage at all. This feeds the same function the protocol handler
+   * calls, including the authentication check, rather than a copy of its logic.
+   */
+  async handleContentFrameForTest(agentName: string, sessionId: string, framedBytes: Uint8Array, remotePeerId?: string): Promise<void> {
+    const source = {
+      async *[Symbol.asyncIterator]() { yield framedBytes; },
+      close: async (): Promise<void> => {},
+      abort: (): void => {},
+      status: "closed",
+    } as unknown as Stream;
+    await this.#handleContentStream(agentName, sessionId, source, remotePeerId);
+  }
+
   /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
    *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
    *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
@@ -3293,6 +3351,9 @@ export class SessionNodeManager {
     // this unit exists to stop.
     this.#heldRestored.delete(key);
     this.#heldReleased.delete(key);
+    this.#diverged.delete(key);
+    this.#counterpartyAddrs.delete(key);
+    this.#redialNotBefore.delete(key);
     this.#highWaterSeq.delete(key);
   }
 
@@ -5360,6 +5421,12 @@ export class SessionNodeManager {
         oldestHeldMs,
       };
     }
+    if (this.#diverged.has(key)) {
+      // NOT `ready`. The tree is ahead of the relay's counter for good, so a close here signs a root
+      // the counterparty answers `leaf_count_mismatch` to — terminal, and the receipt is gone. The
+      // raw counters cannot see this: nothing is missing and nothing is held.
+      return { state: "unknown", reason: "record_diverged_from_relay" };
+    }
     if (r.treeSize > 0 && !this.#orderingObserved.has(key)) {
       return {
         state: "unknown",
@@ -5381,7 +5448,15 @@ export class SessionNodeManager {
         .prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?")
         .get(this.#requireAgentId(agentName)) as { k_local_pubkey: string } | undefined;
       return row?.k_local_pubkey ?? null;
-    } catch {
+    } catch (err: unknown) {
+      // An unattributed annex row is truthful; an unattributed row nobody knows about is not. This
+      // throws for a retired agent, and without a line here EVERY own held message would land in
+      // the record that outlives the session with no sender and no explanation.
+      this.#logger.warn("session.own_pubkey.unresolved", {
+        agentName,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "this agent's own held content will be annexed without a sender",
+      });
       return null;
     }
   }
@@ -5544,27 +5619,38 @@ export class SessionNodeManager {
    * this is an improvement on silence rather than a guarantee — and it must never delay or fail the
    * abandon, which is the operator's escape hatch out of a session that can never seal.
    */
-  async notifyCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<boolean> {
+  async notifyCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<AbandonNoticeResult> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
-      this.#logger.debug("session.abandon.notice.skipped", {
-        agentName, sessionId, reason: "no_active_node", correlationId,
-        impact: "the counterparty was not told and may keep calling until it gives up",
+      // NAMES ITS CAUSE, and it is not the network. An `interrupted` session has no node — the
+      // restart sweep and markInterrupted both tear it down — and `interrupted` is exactly the
+      // status force-abandon exists for. Reporting this as "could not be reached" sends the
+      // operator to debug a connection when the answer is in our own process. At INFO, not debug,
+      // because it is the common case and it changes what the operator is told.
+      this.#logger.info("session.abandon.notice.skipped", {
+        agentName, sessionId, reason: "no_local_node", correlationId,
+        impact: "this side had already torn the session down, so there was nothing to send on — the counterparty was not told",
       });
-      return false;
+      return { told: false, reason: "no_local_node" };
     }
     let stream: Stream | undefined;
     try {
-      stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      const frame = encodeCbor({
-        type: "session_abandoned",
+      // Through the RE-DIAL path, not a bare newStream. A session worth force-abandoning is very
+      // often one whose connection blipped — the peer is online and calling us, which is the whole
+      // complaint — so one demand-driven dial is the difference between telling them and not.
+      stream = await this.#openContentStream(agentName, sessionId, entry, correlationId);
+      // Typed against protocol-types so the shape cannot drift from the declaration the receiving
+      // side (and any second client implementation) reads.
+      const notice: SessionAbandonedNotice = {
+        type: "session_abandoned_notice",
         session_id: sessionId,
-        correlation_id: correlationId,
-      }) as Uint8Array;
+        ...(correlationId === undefined ? {} : { correlation_id: correlationId }),
+      };
+      const frame = encodeCbor(notice) as Uint8Array;
       stream.send(lp.encode.single(frame));
       await stream.close();
       this.#logger.info("session.abandon.notice.sent", { agentName, sessionId, correlationId });
-      return true;
+      return { told: true, reason: "sent" };
     } catch (err: unknown) {
       if (stream !== undefined) {
         try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
@@ -5574,7 +5660,7 @@ export class SessionNodeManager {
         error: err instanceof Error ? err.message : String(err),
         impact: "the counterparty was not told and may keep calling until it gives up",
       });
-      return false;
+      return { told: false, reason: "send_failed" };
     }
   }
 
@@ -5590,7 +5676,7 @@ export class SessionNodeManager {
    * the artifact this protocol exists to produce. An unknown session is refused rather than
    * created: an authenticated stream proves who is speaking, not that a session exists.
    */
-  retireOnCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): boolean {
+  async retireOnCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<boolean> {
     const record = this.getSessionRecord(agentName, sessionId);
     if (!record) {
       this.#logger.warn("session.abandon.notice.unknown_session", { agentName, sessionId, correlationId });
@@ -5603,14 +5689,67 @@ export class SessionNodeManager {
       });
       return false;
     }
-    const flipped = this.#updateSessionStatus(agentName, sessionId, "abandoned");
-    if (!flipped) return false;
+    // THE TRANSPORT IS RETIRED. THE SESSION IS NOT.
+    //
+    // The first build flipped the status to `abandoned`, and that was wrong twice over. It handed
+    // the abandoning party a button that DENIES US OUR RECEIPT: the unilateral seal exists for
+    // exactly this case — "the counterparty never co-closes" — and produces a notarized certificate
+    // after a grace period, but `cello_close_session` refuses an `abandoned` session outright. So
+    // one frame from them destroyed a recovery path that already existed, remotely and for free.
+    // Today the abandoner can only go silent, and going silent is what the unilateral seal was
+    // built to survive.
+    //
+    // What the DoD actually asks for is that we stop calling them. That is a transport concern:
+    // mark it, stop re-dialling, stop retrying delivery — and leave the session sealable.
+    const marked = this.#markCounterpartyAbandoned(agentName, sessionId);
+    if (!marked) return false;
+    // The addresses go, so the demand-driven re-dial has nothing to dial. This is the storm.
+    const key = this.#k(agentName, sessionId);
+    this.#counterpartyAddrs.delete(key);
     this.#logger.warn("session.counterparty.abandoned", {
       agentName, sessionId, priorStatus: record.status, correlationId,
-      impact: "the counterparty ended this session without a bilateral seal — there is no notarized receipt, and the transcript on this side is the only remaining record",
+      impact: "the counterparty ended this session on their side, so nothing more will arrive and replies cannot reach them — this side stops calling. The session is NOT terminal: a unilateral seal is still available, and the transcript is intact",
     });
-    void this.destroySessionNode(agentName, sessionId, "error");
+    // AWAITED, and `retireSessionNode` NOT `destroySessionNode`. The latter writes the status back
+    // — `error` maps to `interrupted` — a few hundred milliseconds later, which silently undid the
+    // whole unit; the former is the method that tears a node down without touching the status, and
+    // it is what the local force-abandon path already uses.
+    await this.retireSessionNode(agentName, sessionId);
     return true;
+  }
+
+  /** DOD-M12B-ABANDON-NOTIFY-1 — durable "they hung up" marker. Not a status: the session stays
+   *  sealable, which is the whole point of not making this terminal. */
+  #markCounterpartyAbandoned(agentName: string, sessionId: string): boolean {
+    if (!this.#db) return false;
+    try {
+      const res = this.#db
+        .prepare("UPDATE sessions SET counterparty_abandoned_at = ?, updated_at = ? WHERE agent_id = ? AND session_id = ? AND counterparty_abandoned_at IS NULL")
+        .run(Date.now(), Date.now(), this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
+      // No rows changed means it was already marked — a duplicated notice, which must not
+      // re-announce. "Did not throw" is not "landed"; the row count is the answer.
+      return Number(res?.changes ?? 0) > 0;
+    } catch (err: unknown) {
+      this.#logger.error("session.counterparty.abandoned.write.failed", {
+        agentName, sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "this side will go on trying to reach a counterparty that has hung up",
+      });
+      return false;
+    }
+  }
+
+  /** DOD-M12B-ABANDON-NOTIFY-1: has the counterparty told us they hung up? */
+  counterpartyAbandonedAt(agentName: string, sessionId: string): number | null {
+    if (!this.#db) return null;
+    try {
+      const row = this.#db
+        .prepare("SELECT counterparty_abandoned_at FROM sessions WHERE agent_id = ? AND session_id = ?")
+        .get(this.#requireAgentId(agentName), sessionId) as { counterparty_abandoned_at: number | null } | undefined;
+      return row?.counterparty_abandoned_at ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -5638,7 +5777,7 @@ export class SessionNodeManager {
     const attempt = async (): Promise<Stream> => {
       if (this.#connectionLossRemaining > 0) {
         this.#connectionLossRemaining -= 1;
-        throw { reason: "connection_lost", message: "injected connection loss" };
+        throw { reason: "no_connection", message: "injected connection loss" };
       }
       return entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
     };
@@ -5646,9 +5785,12 @@ export class SessionNodeManager {
       return await attempt();
     } catch (err: unknown) {
       const reason = (err as { reason?: string } | null)?.reason;
-      // ONLY for a missing connection. A stream that opens and then fails is a different defect
-      // (the inbound-stream cap, DOD-M12B-ACK-1) and re-dialling would not touch it.
-      if (reason !== "connection_lost") throw err;
+      // ONLY for a missing connection, and `no_connection` is the reason that means exactly that.
+      // NOT `connection_lost`, which is the transport's catch-all default and therefore also covers
+      // a stream that failed on a healthy connection — the per-protocol stream cap of
+      // DOD-M12B-ACK-1. Dialling there fixes nothing and shows the counterparty a connection
+      // request caused by a defect on this side, which is the storm this unit exists to avoid.
+      if (reason !== "no_connection") throw err;
 
       const key = this.#k(agentName, sessionId);
       const addrs = this.#counterpartyAddrs.get(key);
@@ -5749,6 +5891,7 @@ export class SessionNodeManager {
         agentName, sessionId, assignedSeq, nextExpected, contentHash: contentHashHex, correlationId,
         impact: "this side's tree is ahead of the relay's counter, so the two can no longer agree on a root — the message is kept in the local record and this session can no longer be sealed bilaterally",
       });
+      this.#diverged.add(this.#k(agentName, sessionId));
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
       return { placed: true, leafIndex, diverged: true };
     }
@@ -5758,8 +5901,8 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     let held = this.#heldContent.get(key);
     if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent" });
-    this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent");
+    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent", kind });
+    this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent", kind);
     this.#logger.info("session.content.held", {
       sessionId, canonicalSeq: assignedSeq, nextExpected, gap: assignedSeq - nextExpected,
       origin: "sent", correlationId,
@@ -5786,6 +5929,7 @@ export class SessionNodeManager {
     screenedOut: boolean,
     correlationId?: string,
     origin: "received" | "sent" = "received",
+    leafKind: WritableSessionTreeLeafKind = "msg",
   ): void {
     if (!this.#db) return;
     try {
@@ -5804,12 +5948,12 @@ export class SessionNodeManager {
       }
       this.#db.prepare(
         `INSERT OR REPLACE INTO held_content
-           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at, origin)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at, origin, leaf_kind)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         this.#requireAgentId(agentName), sessionId, canonicalSeq,
         Buffer.from(deliverContent), Buffer.from(originalContent), contentHashHex,
-        screenedOut ? 1 : 0, correlationId ?? null, Date.now(), origin,
+        screenedOut ? 1 : 0, correlationId ?? null, Date.now(), origin, leafKind,
       );
     } catch (err: unknown) {
       this.#logger.error("session.content.held.persist.failed", {
@@ -5882,10 +6026,10 @@ export class SessionNodeManager {
 
   #restoreHeldContent(agentName: string, sessionId: string): void {
     if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string }>;
+    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string; leaf_kind: string }>;
     try {
       rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin
+        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin, leaf_kind
            FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
       ).all(this.#requireAgentId(agentName), sessionId) as never;
     } catch (err: unknown) {
@@ -5951,6 +6095,7 @@ export class SessionNodeManager {
         ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
         ...(row.screened_out ? { screenedOut: true } : {}),
         ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
+        ...(row.leaf_kind === "doc" ? { kind: "doc" as const } : {}),
       });
       restored++;
     }
@@ -5991,7 +6136,21 @@ export class SessionNodeManager {
       // as SENT — never routed down the received path, which would attribute our words to the
       // counterparty in the sealed record and hand them back to our own agent as inbound.
       if (entry.origin === "sent") {
-        this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
+        // The KIND the leaf was placed with, not a hardcoded "msg" — a document leaf that had to
+        // wait for its position must come back as a document leaf, or the two sides disagree about
+        // what the chain contains.
+        this.appendSessionLeaf(agentName, sessionId, entry.kind ?? "msg", entry.contentHashHex, entry.correlationId);
+        // A DOCUMENT frame takes a leaf and NO transcript row — matching what the immediate-append
+        // path does for one. Writing one would put raw CBOR into the operator's transcript as
+        // something they said, which is the same attribution failure as releasing it inbound.
+        if (entry.kind === "doc") {
+          released++;
+          this.#logger.info("session.content.released", {
+            sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
+          });
+          if (held.size === 0) { this.#heldContent.delete(key); break; }
+          continue;
+        }
         // OBSERVED, not assumed — the received path already does this. The leaf commits either way,
         // so a dropped transcript write means the operator's OWN message is missing from their own
         // transcript with the chain saying it is there, and nothing anywhere said so.
@@ -6326,11 +6485,11 @@ export class SessionNodeManager {
   // the fragile dependency on that internal timing (review L4).
   async #registerContentHandler(agentName: string, sessionId: string, node: CelloNode, _counterpartyPubkey: string): Promise<void> {
     try {
-      await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream) => {
+      await node.handle(CELLO_CONTENT_PROTOCOL_ID, (stream, remotePeerId) => {
         // `.catch` is not decoration: the handler builds its length-prefixed decoder before its own
         // try, and a throw there would otherwise become an unhandled rejection that takes the
         // daemon down for one malformed inbound stream.
-        void this.#handleContentStream(agentName, sessionId, stream).catch((err: unknown) => {
+        void this.#handleContentStream(agentName, sessionId, stream, remotePeerId).catch((err: unknown) => {
           this.#logger.warn("session.content.stream.handler.failed", {
             sessionId,
             error: err instanceof Error ? err.message : String(err),
@@ -6564,7 +6723,7 @@ export class SessionNodeManager {
     return null;
   }
 
-  async #handleContentStream(agentName: string, sessionId: string, stream: Stream): Promise<void> {
+  async #handleContentStream(agentName: string, sessionId: string, stream: Stream, remotePeerId?: string): Promise<void> {
     // CLOSING THIS STREAM IS WHAT KEEPS THE SESSION ALIVE PAST ITS 33RD MESSAGE.
     //
     // Every content frame and every delivery ACK opens a fresh /cello/content/1.0.0 stream on the
@@ -6607,13 +6766,35 @@ export class SessionNodeManager {
       // DOD-M12B-ABANDON-NOTIFY-1: the counterparty force-abandoned. Handled here, on the same
       // authenticated stream the delivery acknowledgement rides, and AFTER the session-id check
       // below cannot be skipped — the frame names its session and the handler is bound to one.
-      if (frame["type"] === "session_abandoned") {
-        const claimed = frame["session_id"];
-        if (typeof claimed === "string" && claimed !== sessionId) {
-          this.#logger.warn("session.content.session_mismatch", { sessionId, claimedSessionId: claimed });
+      if (frame["type"] === "session_abandoned_notice") {
+        // PINNED TO THE COUNTERPARTY. This frame ENDS a conversation, so the stream being
+        // authenticated is not enough — a session node is a promoted standing receiver, and a
+        // standing receiver accepts everyone. libp2p's gater runs at connection establishment and
+        // does not close connections that already exist, so a peer that dialled this node earlier
+        // still holds a live connection after `setAllowedPeer` narrows it. Without this check that
+        // peer could hang up a session it is not party to.
+        //
+        // `remotePeerId` is the Noise-authenticated transport identity, which the handler was
+        // throwing away. Absent means we cannot prove who is speaking, and an unprovable claim to
+        // end a session is refused.
+        const expected = this.#activeNodes.get(this.#k(agentName, sessionId))?.counterpartySessionPeerId;
+        if (!remotePeerId || !expected || remotePeerId !== expected) {
+          this.#logger.warn("session.content.peer_mismatch", {
+            sessionId, frameType: "session_abandoned_notice",
+            remotePeerId: remotePeerId ?? "(absent)", expected: expected ?? "(unknown)",
+          });
           return;
         }
-        this.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
+        // REQUIRED and equal — absence is not a pass. The frame names its session and the handler
+        // is bound to one; treating a missing field as agreement is how a guard stops guarding.
+        const claimed = frame["session_id"];
+        if (typeof claimed !== "string" || claimed !== sessionId) {
+          this.#logger.warn("session.content.session_mismatch", {
+            sessionId, claimedSessionId: typeof claimed === "string" ? claimed : "(absent)",
+          });
+          return;
+        }
+        void this.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
         return;
       }
 
