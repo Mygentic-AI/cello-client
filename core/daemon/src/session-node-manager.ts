@@ -4191,7 +4191,11 @@ export class SessionNodeManager {
           assignedSeq = witnessed.sequence_number - 1;
           this.#logger.info("session.relay.hash.submitted", {
             sessionId,
-            sequenceNumber: witnessed.sequence_number,
+            // BOTH SPACES, NAMED. The relay's number is 1-based and the leaf index is 0-based, and
+            // reading one as the other is the defect this milestone exists to stop — so a log that
+            // carries only "sequenceNumber" invites exactly that mistake on the next investigation.
+            relaySequence: witnessed.sequence_number,
+            leafIndex: assignedSeq,
             correlationId,
           });
         } else if (isTerminalRelayRefusal(witnessed.reason)) {
