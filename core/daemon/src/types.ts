@@ -213,6 +213,18 @@ export interface ActiveSessionInfo {
   liveness: "alive" | "impaired" | "gone" | "unknown";
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — why this session cannot be sealed, or null when it can.
+   *
+   * A chain with a gap cannot be co-signed, so the close refuses — correctly. But until this field
+   * existed the condition was only discoverable by ATTEMPTING a close on each session and reading
+   * the refusal, so 25 unsealable sessions accumulated on one daemon with every surface calling
+   * them ordinary active sessions, while each held a slot against the per-sender cap.
+   *
+   * `missingLeaves` are positions the relay has witnessed and this side never received;
+   * `heldMessages` are frames received and verified that cannot be appended until those arrive.
+   */
+  sealBlocked: { missingLeaves: number; heldMessages: number } | null;
   /** DOD-FRONTIER-STRAND-1 AC3 — see SessionListEntry.frontierMismatch. Declared here because
    *  buildInterruptedSessions returns THIS type; it typechecked only because TS exempts spread
    *  properties from excess-property checking, so a renderer typed as this could not read it. */
@@ -499,6 +511,15 @@ export interface InterruptedSessionInfo {
   interruptedAt: string;
   /** DOD-SESSION-NAME-1: this agent's own label for the session; null when unnamed. */
   sessionName: string | null;
+  /**
+   * DOD-M12B-SEAL-STUCK-1 — why this session cannot be sealed, or null when it can.
+   *
+   * An interrupted session can seal (that is what seal-interrupted is for), so it can also be
+   * BLOCKED from sealing by a gap. `frontierMismatch` beside this reports a different, later
+   * condition: the two sides have already exchanged and disagreed. This one is the gap on OUR side,
+   * knowable before any exchange, and it is the more common of the two.
+   */
+  sealBlocked?: { missingLeaves: number; heldMessages: number };
 }
 
 /**

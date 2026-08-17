@@ -1952,6 +1952,15 @@ async function startDaemonHoldingLock(
         // DOD-SESSION-NAME-1 (AC-A11): an interrupted session is one you may want to resume or seal
         // — the name is how you tell which one it was.
         sessionName: row.session_name ?? null,
+        // DOD-M12B-SEAL-STUCK-1: the same answer the active list carries, for the same reason —
+        // an interrupted session can seal, so it can also be blocked from sealing by a gap, and
+        // that is knowable here instead of only after a failed close.
+        ...(() => {
+          const readiness = sessionNodeManager.sealReadiness(row.agent_name, row.session_id);
+          return readiness.ready
+            ? {}
+            : { sealBlocked: { missingLeaves: readiness.missingLeaves, heldMessages: readiness.heldCount } };
+        })(),
         // DOD-FRONTIER-STRAND-1 AC3: if a seal exchange has already proved the two sides disagree on
         // how many messages this session holds, SAY SO HERE. Otherwise a stranded session is listed
         // exactly like a healthy paused one, and the only way to learn it can never seal is to
@@ -2011,13 +2020,22 @@ async function startDaemonHoldingLock(
   // was invisible to the operator.
   function buildActiveSessions(): ActiveSessionInfo[] {
     reapDeadHalfOpenSessions(); // CC-5/F21: drop provably-dead half-open sessions before surfacing active ones
-    return sessionNodeManager.getSessionsByStatus("active").map((row) => ({
-      sessionId: row.session_id,
-      agentName: row.agent_name,
-      counterpartyPubkey: row.counterparty_pubkey,
-      liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
-      sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
-    }));
+    return sessionNodeManager.getSessionsByStatus("active").map((row) => {
+      // DOD-M12B-SEAL-STUCK-1: ask the SAME gate the close path asks, so the surface and the
+      // refusal can never disagree. Computed here rather than cached because the answer changes
+      // the moment a gap fills, and a stale "stuck" is its own lie.
+      const readiness = sessionNodeManager.sealReadiness(row.agent_name, row.session_id);
+      return {
+        sessionId: row.session_id,
+        agentName: row.agent_name,
+        counterpartyPubkey: row.counterparty_pubkey,
+        liveness: sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id),
+        sessionName: row.session_name ?? null, // DOD-SESSION-NAME-1 (AC-A11)
+        sealBlocked: readiness.ready
+          ? null
+          : { missingLeaves: readiness.missingLeaves, heldMessages: readiness.heldCount },
+      };
+    });
   }
 
   /**
