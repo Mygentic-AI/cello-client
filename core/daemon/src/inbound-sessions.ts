@@ -27,6 +27,16 @@ import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 
+/**
+ * DOD-CAP-SELF-HEAL-1 — how often the operator's own cap may raise an alarm about one counterparty.
+ *
+ * The peer controls the retry rate, so an alarm on every refusal hands them the daemon's ERROR log.
+ * Once per peer per window, with the suppressed count on the next one, keeps the signal without the
+ * volume. Volatile by design: a restart re-alarming once is the correct behaviour.
+ */
+const CAP_ALARM_COOLDOWN_MS = 10 * 60_000;
+const capAlarmLastFired = new Map<string, { at: number; suppressed: number }>();
+
 /** How long an un-accepted inbound session request stays claimable. */
 export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -673,6 +683,47 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           reason: bound.reason,
           correlationId,
         });
+        // DOD-CAP-SELF-HEAL-1 — TELL THE OPERATOR. Their own cap just refused someone and they are
+        // the only party who can clear it: an agent cannot self-heal against a limit it is never
+        // told it hit. Measured 2026-08-17: two of one operator's own agents could not open a
+        // session, and the only trace was the warn line above, which nobody was reading.
+        //
+        // NOT for a BLOCKED contact. Their cap is 0, so this fires on the very first knock — the
+        // kill switch working exactly as intended — and an ERROR telling the operator to un-block
+        // someone they blocked buries the one case this alarm exists for. Skipping it changes
+        // nothing outward: the refusal is byte-identical, so it is not a distinguishing oracle.
+        //
+        // ONCE PER PEER PER COOLDOWN. The peer controls the retry rate, so an unbounded alarm hands
+        // them the daemon's ERROR log. The suppressed count rides on the next one.
+        const capInfo = bound.reason === "abuse_bound_sessions_per_sender"
+          ? sessionNodeManager.capDiagnostics(agentName, parsed.participantAPubkeyHex)
+          : null;
+        if (capInfo && !capInfo.blocked) {
+          const capKey = `${agentName}\u0000${parsed.participantAPubkeyHex}`;
+          const now = Date.now();
+          const prior = capAlarmLastFired.get(capKey);
+          if (prior === undefined || now - prior.at >= CAP_ALARM_COOLDOWN_MS) {
+            const ids = sessionNodeManager.sessionsConsumingCap(agentName, parsed.participantAPubkeyHex);
+            logger.error("session.inbound.cap.reached", {
+              agentName,
+              counterpartyPubkey: parsed.participantAPubkeyHex,
+              cap: capInfo.cap,
+              counted: capInfo.counted,
+              tier: capInfo.tier,
+              mustClear: capInfo.mustClear,
+              suppressedSinceLastAlarm: prior?.suppressed ?? 0,
+              sessionsConsumingCap: ids,
+              correlationId,
+              impact:
+                `this agent is REFUSING new sessions from this counterparty, and only you can clear it. ` +
+                `${capInfo.counted} session(s) count against a cap of ${capInfo.cap}; most are FINISHED-BUT-UNSEALED, not open, so cello_sessions may show nothing live. ` +
+                `Close ${capInfo.mustClear} of them with cello_close_session (a session the counterparty never co-closes needs force:true, which forfeits its receipt), or add them as a contact to raise the cap.`,
+            });
+            capAlarmLastFired.set(capKey, { at: now, suppressed: 0 });
+          } else {
+            capAlarmLastFired.set(capKey, { at: prior.at, suppressed: prior.suppressed + 1 });
+          }
+        }
         // M12-P18: make it visible to OUR operator. A cap firing on your own daemon should not
         // require reading the log to discover. Measured: a per-sender cap refused a session and the
         // only trace was one warn line — the parked content for it then failed authentication 297

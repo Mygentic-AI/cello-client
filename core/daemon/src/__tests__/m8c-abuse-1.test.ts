@@ -446,6 +446,84 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(events.filter((e) => e.event === "session.half_open.reaped").map((e) => e.context["sessionId"])).toEqual([deadSid]);
   });
 
+  /**
+   * DOD-CAP-SELF-HEAL-1 — the operator's own cap firing must reach the operator.
+   *
+   * Measured 2026-08-17: two of one operator's own agents could not open a session, and the only
+   * trace was a single warn line nobody was reading. An agent cannot self-heal against a limit it
+   * is never told it hit, and the operator is the only party who can clear it.
+   *
+   * Outward silence is unchanged and deliberate — the refused peer still learns nothing, so a
+   * blocked party cannot tell blocking from throttling.
+   */
+  it("DOD-CAP-SELF-HEAL-1: a cap refusal raises an alarm the operator can act on", async () => {
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const strangerPubkey = "6d".repeat(32);
+    const bobId = resolveAgentId(snm.getDb(), "bob");
+    // Sessions the COUNTERPARTY interrupted, so they legitimately count — young enough that the
+    // half-open reaper leaves them alone, and carrying content so it could not take them anyway.
+    const now = Date.now();
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
+      snm.getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at, interrupted_by)
+         VALUES (?, ?, ?, 'interrupted', ?, ?, 12, ?, 'counterparty')`,
+      ).run(`7${i}`.padStart(2, "0").repeat(16), bobId, strangerPubkey, now, now, new Date(now).toISOString());
+    }
+
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 200 + b)),
+        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "stranger-peer-id",
+        counterparty_session_peer_id: "bob-session-peer-id",
+      },
+    });
+    await wait(200);
+
+    const alarm = events.filter((e) => e.event === "session.inbound.cap.reached");
+    expect(alarm.length, "the operator's own cap firing must be visible to them").toBe(1);
+    expect(alarm[0]!.level, "they are locked out until they act — that is an error, not a note").toBe("error");
+    expect(alarm[0]!.context["counterpartyPubkey"]).toBe(strangerPubkey);
+    expect(alarm[0]!.context["cap"]).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    // How many to close to get UNDER the cap, not how many exist — telling them to close all of
+    // them is telling them to do more than the job needs.
+    expect(alarm[0]!.context["mustClear"]).toBe(1);
+    // WHICH ones: "close one of them" with no list is not an instruction anyone can follow.
+    expect((alarm[0]!.context["sessionsConsumingCap"] as string[]).length).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+    // It must not send them looking for OPEN sessions — the rows that count are finished ones, and
+    // cello_sessions may show nothing live at all.
+    expect(String(alarm[0]!.context["impact"])).toMatch(/FINISHED-BUT-UNSEALED/);
+    // Joinable to the refusal it explains.
+    expect(alarm[0]!.context["correlationId"]).toBeDefined();
+
+    // A SECOND knock from the same peer must not write a second ERROR — the peer controls the retry
+    // rate, and an unbounded alarm hands them the daemon's error log.
+    injectRef.inject!({
+      type: "session_assignment",
+      assignment: {
+        session_id: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 220 + b)),
+        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
+        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
+        session_timestamp: 1_700_000_000_000,
+        signature_type: "frost",
+        initiator_session_peer_id: "stranger-peer-id",
+        counterparty_session_peer_id: "bob-session-peer-id",
+      },
+    });
+    await wait(200);
+    expect(events.filter((e) => e.event === "session.inbound.cap.reached").length, "one alarm per peer per window").toBe(1);
+  });
+
   it("CC-10/D18 guard: old interrupted sessions WITH received content still count — the accept-path reap must NOT free the D18 evasion attacker's slots", async () => {
     // D18's attack: send content, disconnect (→ interrupted), open a fresh session, repeat.
     // Those sessions have RECEIVED bytes on the victim's side, so the reap must skip them and

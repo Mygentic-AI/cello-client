@@ -138,10 +138,13 @@ const REDIAL_COOLDOWN_MS = 15_000;
  * NULL counts as the counterparty's. The column is new, so every pre-existing row is unlabelled,
  * and the safe default for an anti-abuse bound is to count rather than to excuse.
  */
+const CAP_COUNTS = (alias = ""): string => {
+  const p = alias ? `${alias}.` : "";
+  return `(${p}status = 'active'
+           OR (${p}status = 'interrupted' AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'))`;
+};
 const CAP_COUNT_SQL = (where: string): string =>
-  `SELECT COUNT(*) AS n FROM sessions WHERE ${where}
-     AND (status = 'active'
-          OR (status = 'interrupted' AND COALESCE(interrupted_by, 'counterparty') != 'local'))`;
+  `SELECT COUNT(*) AS n FROM sessions WHERE ${where} AND ${CAP_COUNTS()}`;
 
 /**
  * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
@@ -2135,7 +2138,7 @@ export class SessionNodeManager {
       .prepare(
         `SELECT COUNT(*) AS n FROM sessions s
          WHERE s.agent_id = ?
-           AND (s.status = 'active' OR (s.status = 'interrupted' AND COALESCE(s.interrupted_by, 'counterparty') != 'local'))
+           AND ${CAP_COUNTS("s")}
            AND NOT EXISTS (
              SELECT 1 FROM contacts c
              WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey
@@ -2159,15 +2162,10 @@ export class SessionNodeManager {
     const perSenderCap = this.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {
-      // INWARD VISIBILITY. The refused peer still learns nothing — that silence is deliberate, so a
-      // blocked party cannot tell blocking from throttling. But the OPERATOR whose own cap just
-      // fired was told nothing either, and they are the only party who can clear it: an agent
-      // cannot self-heal against a limit it is never told it hit. Measured 2026-08-17: two of one
-      // operator's own agents could not talk, and the only trace was a warn line nobody was reading.
-      this.#logger.error("session.inbound.cap.reached", {
-        agentName, counterpartyPubkey, tier, cap: perSenderCap, counted: perSender,
-        impact: `this agent is now REFUSING new sessions from this counterparty. Only you can clear it: close ${perSender} of your open sessions with them (cello_close_session), or add them as a contact to raise the cap.`,
-      });
+      // BYTE-IDENTICAL to every other refusal, deliberately — DOD-TIER-3. A BLOCKED sender and an
+      // over-cap UNKNOWN must be indistinguishable, or the refusal tells someone they are blocked.
+      // The operator's alarm needs numbers, so it asks for them SEPARATELY via capDiagnostics;
+      // hanging them off this object would put a distinguishing oracle in the return value.
       return { ok: false, reason: "abuse_bound_sessions_per_sender" };
     }
     // The global stranger cap is only for the UNKNOWN pool. A KNOWN+ sender is past it by trust;
@@ -3037,8 +3035,11 @@ export class SessionNodeManager {
 
   /** DOD-CAP-SELF-HEAL-1 test seam: the shutdown sweep's effect, without a shutdown. Mirrors the
    *  real UPDATE at gracefulShutdown so a test cannot pass against a label production never sets. */
-  markSessionsInterruptedByLocalShutdown(): void {
-    this.#db?.prepare("UPDATE sessions SET interrupted_by = 'local' WHERE status = 'interrupted'").run();
+  markSessionsInterruptedByLocalShutdownForTest(): void {
+    // SCOPED TO UNLABELLED ROWS. Unscoped, this would relabel rows already marked
+    // `counterparty` — one call excusing every interruption every attacker ever caused, on every
+    // agent. Production never relabels; nor does this.
+    this.#db?.prepare("UPDATE sessions SET interrupted_by = 'local' WHERE status = 'interrupted' AND interrupted_by IS NULL").run();
   }
 
   /** DOD-CAP-SELF-HEAL-1 test seam: the counterparty's stream closing, without a real peer. */
@@ -3228,7 +3229,10 @@ export class SessionNodeManager {
     // surface as interrupted so AC-010 recovery handles them at next login.
     // The session.node.destroyed log preserves the original reason for observability.
     const dbStatus = reason === "sealed" ? "sealed" : "interrupted";
-    this.#updateSessionStatus(agentName, sessionId, dbStatus);
+    // DOD-CAP-SELF-HEAL-1: OURS. Every caller of this with a non-sealed reason is a local teardown
+    // — the operator's kill switch (`cello_set_agent_offline`), an internal error, a node replaced.
+    // The counterparty did nothing, so they must not be charged a cap slot for it.
+    this.#updateSessionStatus(agentName, sessionId, dbStatus, dbStatus === "interrupted" ? "local" : undefined);
 
     this.#activeNodes.delete(this.#k(agentName, sessionId));
     // Evict the in-memory per-session caches on teardown. The tree is durable in
@@ -3757,9 +3761,20 @@ export class SessionNodeManager {
       // UPDATE only mutates a row that is still active.
       this.#db
         .prepare(
-          // DOD-CAP-SELF-HEAL-1: THEIRS. This is the counterparty's stream closing or their relay
-          // frame — the D18 disconnect-evasion move — so it keeps counting against their bound.
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ?, interrupted_by = 'counterparty' WHERE agent_id = ? AND session_id = ? AND status = 'active'",
+          // DOD-CAP-SELF-HEAL-1: labelled by SOURCE, because the two are not the same event.
+          //
+          //   relay_frame  — the relay telling us the counterparty went. THEIRS. The D18
+          //                  disconnect-evasion move, and it must keep counting.
+          //   stream_close — OUR witness stream to the relay ended. That fires on a relay restart,
+          //                  a relay fleet roll, or a local network blip. Claiming the counterparty
+          //                  did it means three relay deploys permanently refuse a peer who was
+          //                  never involved — and relay deploys are routine, so it ratchets faster
+          //                  than daemon restarts do.
+          //
+          // `relay_stream_close` is its own label and STILL COUNTS (the bound excuses only 'local'),
+          // because an attacker who can disturb our relay link must not get a free cap reset. It is
+          // recorded honestly rather than blamed on the wrong party.
+          `UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ?, interrupted_by = '${source === "relay_frame" ? "counterparty" : "relay_stream_close"}' WHERE agent_id = ? AND session_id = ? AND status = 'active'`,
         )
         .run(now, authoritativeCount, interruptedAt, this.#requireAgentId(agentName), sessionId);
     } catch (err: unknown) {
@@ -5796,6 +5811,43 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-CAP-SELF-HEAL-1 — the numbers behind a cap refusal, for the OPERATOR'S alarm only.
+   *
+   * Kept off `checkUnknownSenderAcceptanceBound`'s return on purpose. That refusal is byte-identical
+   * across tiers by design (DOD-TIER-3) so a blocked party cannot tell blocking from throttling;
+   * attaching the counts to it would put the oracle straight into the value the refusal path
+   * carries. This is a separate, purely local read, and nothing it returns crosses the wire.
+   */
+  capDiagnostics(agentName: string, counterpartyPubkey: string): { tier: number; cap: number; counted: number; mustClear: number; blocked: boolean } {
+    const tier = this.getTier(agentName, counterpartyPubkey);
+    const cap = this.resolveTierBound(agentName, tier, "max_sessions");
+    const counted = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
+    return {
+      tier, cap, counted,
+      // How many to close to get UNDER the cap — not how many exist. At 5 against a cap of 3 the
+      // answer is 3, and "close 5" tells the operator to do more than the job needs.
+      mustClear: Math.max(0, counted - cap + 1),
+      blocked: tier === TIER.BLOCKED,
+    };
+  }
+
+  /** DOD-CAP-SELF-HEAL-1: the sessions with this counterparty that are consuming cap slots, oldest
+   *  first. The operator is told to close some — this is WHICH, because "close three of them" with
+   *  no list is not an instruction they can follow. */
+  sessionsConsumingCap(agentName: string, counterpartyPubkey: string, limit = 10): string[] {
+    if (!this.#db) return [];
+    try {
+      const rows = this.#db.prepare(
+        `SELECT session_id FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ? AND ${CAP_COUNTS()}
+         ORDER BY updated_at ASC LIMIT ?`,
+      ).all(this.#requireAgentId(agentName), counterpartyPubkey, limit) as Array<{ session_id: string }>;
+      return rows.map((r) => r.session_id);
+    } catch {
+      return [];
+    }
+  }
+
   /** DOD-M12B-ABANDON-NOTIFY-1: has the counterparty told us they hung up? */
   counterpartyAbandonedAt(agentName: string, sessionId: string): number | null {
     if (!this.#db) return null;
@@ -7694,13 +7746,21 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     status: "active" | "sealed" | "interrupted" | "abandoned",
+    // DOD-CAP-SELF-HEAL-1: who caused an interruption, when this call is the one causing it.
+    // Omitting it leaves the column NULL, which the acceptance bound reads as the counterparty's —
+    // so a LOCAL teardown that forgets to say so is charged to the peer. That is exactly how the
+    // operator's own kill switch (`cello_set_agent_offline` → destroySessionNode) was locking out
+    // a counterparty who had done nothing.
+    interruptedBy?: "local",
   ): boolean {
     if (!this.#db) return false;
     const now = Date.now();
     try {
       const res = this.#db
         .prepare(
-          "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?",
+          interruptedBy === undefined
+            ? "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?"
+            : "UPDATE sessions SET status = ?, updated_at = ?, interrupted_by = 'local' WHERE agent_id = ? AND session_id = ?",
         )
         .run(status, now, this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
       // "Did not throw" is NOT "landed". An UPDATE whose WHERE matches no row — a wrong agent_id, a

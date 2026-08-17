@@ -26,8 +26,15 @@
  * survived three restarts can no longer be reached.
  */
 import { describe, it, expect, afterEach } from "vitest";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
-import { ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER } from "../session-node-manager.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
+import { startTwoConnectionFixture, FakeNode, FixedFactory, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { SessionNodeManager, ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER } from "../session-node-manager.js";
+import { seedAgents } from "./helpers/seed-agents.js";
+import type { Logger } from "../types.js";
+import type { CelloNode } from "@cello-protocol/transport";
 
 const PEER = "5e".repeat(32);
 const sid = (n: number): string => n.toString(16).padStart(2, "0").repeat(32);
@@ -51,13 +58,80 @@ describe("DOD-CAP-SELF-HEAL-1: the per-sender cap counts live sessions, not hist
     // More past conversations than the cap allows, every one of them ours to explain: this is what
     // a daemon restart leaves behind, and Andre's own two agents had five.
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER + 2; i++) seedRestartInterrupted(fx, sid(i));
-    snm.markSessionsInterruptedByLocalShutdown();
+    snm.markSessionsInterruptedByLocalShutdownForTest();
 
     const bound = snm.checkUnknownSenderAcceptanceBound("alice", PEER);
     expect(
       bound.ok,
       `a peer with ${ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER + 2} finished conversations must still be able to reach us`,
     ).toBe(true);
+  }, 60_000);
+
+  it("THE REAL SHUTDOWN labels its own sessions — not a seam that writes the label for it", async () => {
+    // Every other case here writes `interrupted_by` through a test seam, so deleting the label from
+    // the production sweeps would leave them all green while the measured bug returned in full.
+    // This drives the real gracefulShutdown and then reads the rows back from a SECOND process on
+    // the same database — the shutdown closes its own handle, which is exactly why the assertion
+    // has to happen from outside it.
+    const dir = await mkdtemp(join(tmpdir(), "cello-msg010e-"));
+    const dbPath = join(dir, "s.db");
+    try {
+      const logger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+      const first = new SessionNodeManager({
+        securityGateway: new PassthroughGatewayClient(), factory: new FixedFactory(new FakeNode() as unknown as CelloNode), logger, dbPath,
+      });
+      await first.initialize();
+      await seedAgents(first.getDb(), ["alice"]);
+      for (let i = 0; i < 2; i++) await first.createSessionNode(sid(i), "alice", PEER, "peer-id", "corr");
+      await first.gracefulShutdown();
+
+      const second = new SessionNodeManager({
+        securityGateway: new PassthroughGatewayClient(), factory: new FixedFactory(new FakeNode() as unknown as CelloNode), logger, dbPath,
+      });
+      await second.initialize();
+      const rows = second.getDb()
+        .prepare("SELECT status, interrupted_by FROM sessions WHERE counterparty_pubkey = ?")
+        .all(PEER) as Array<{ status: string; interrupted_by: string | null }>;
+      expect(rows.length).toBe(2);
+      for (const r of rows) {
+        expect(r.status).toBe("interrupted");
+        expect(r.interrupted_by, "our own shutdown must say it was ours").toBe("local");
+      }
+      // And the whole point: that peer is not locked out by our own stop.
+      expect(second.checkUnknownSenderAcceptanceBound("alice", PEER).ok).toBe(true);
+      await second.gracefulShutdown();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("an UNLABELLED row counts — the safe default for an anti-abuse bound is to count", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg010f-" });
+    const { snm } = fx;
+    // Every row on every database that predates this column is NULL. Reading those as excused would
+    // open D18 wide on exactly the rows that motivated the change, so the default has to be theirs.
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) seedRestartInterrupted(fx, sid(i));
+    const nulls = snm.getDb()
+      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE counterparty_pubkey = ? AND interrupted_by IS NULL")
+      .get(PEER) as { n: number };
+    expect(nulls.n, "the fixture must actually leave them unlabelled").toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
+
+    const bound = snm.checkUnknownSenderAcceptanceBound("alice", PEER);
+    expect(bound.ok, "an unattributable interruption must count, not be excused").toBe(false);
+  }, 60_000);
+
+  it("the operator's own kill switch is not charged to the counterparty", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg010g-" });
+    const { snm } = fx;
+    // cello_set_agent_offline tears sessions down with destroySessionNode. That is the operator
+    // pressing their own stop button — the most obviously local act there is — and it was being
+    // billed to the peer, who had done nothing.
+    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER + 1; i++) {
+      await fx.createSession(sid(i), "alice", PEER);
+      await snm.destroySessionNode("alice", sid(i), "interrupted");
+    }
+    const bound = snm.checkUnknownSenderAcceptanceBound("alice", PEER);
+    expect(bound.ok, "using your own kill switch must not lock out the person you were talking to").toBe(true);
   }, 60_000);
 
   it("D18 still holds — a counterparty that disconnects and reopens is still bounded", async () => {
@@ -87,26 +161,4 @@ describe("DOD-CAP-SELF-HEAL-1: the per-sender cap counts live sessions, not hist
     expect(bound.ok, "concurrent live sessions are exactly what this bound is for").toBe(false);
   }, 60_000);
 
-  it("the operator is told when their OWN cap refuses someone — they are the only one who can clear it", async () => {
-    fx = await startTwoConnectionFixture({ dirPrefix: "cello-msg010d-" });
-    const { snm } = fx;
-    for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
-      seedRestartInterrupted(fx, sid(i));
-      snm.markInterruptedByCounterpartyForTest("alice", sid(i));
-    }
-
-    const bound = snm.checkUnknownSenderAcceptanceBound("alice", PEER);
-    expect(bound.ok).toBe(false);
-
-    // OUTWARD silence stays — a refused peer must not learn whether it is blocked or merely
-    // over-cap. INWARD silence is the defect: an agent cannot self-heal against a limit it is
-    // never told it hit, and the operator is the only party who can clear it.
-    const alarm = fx.eventsNamed("session.inbound.cap.reached");
-    expect(alarm.length, "the operator's own cap firing must be visible to them").toBe(1);
-    expect(alarm[0]!.ctx["counterpartyPubkey"]).toBe(PEER);
-    expect(alarm[0]!.ctx["cap"]).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
-    expect(alarm[0]!.ctx["counted"]).toBe(ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER);
-    // And it must say what to DO — the whole point is that only they can act.
-    expect(String(alarm[0]!.ctx["impact"])).toMatch(/close/i);
-  }, 60_000);
 });
