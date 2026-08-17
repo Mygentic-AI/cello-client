@@ -589,15 +589,21 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         record.status === "interrupted"
       );
       if (tooOld || terminal) {
-        if (tooOld) {
+        // DOD-M12B-INBOX-TRUTH-1: TERMINAL WINS, and the order is the whole point. This branch used
+        // to test `tooOld` first, so a notice that was BOTH past its TTL and already sealed landed
+        // in `expiredSessionRequests` — the list whose guidance now opens "The NOTICE expired, not
+        // the session." On that one path the session really is over, so the reader would be told
+        // the opposite of the truth about a finished session. Reaping it as terminal instead keeps
+        // that list meaning exactly one thing: a live session whose notice was never claimed.
+        if (terminal) {
+          logger.debug("session.request.reaped_terminal", { agentName, sessionId: e.sessionIdHex, status: record?.status, alsoExpired: tooOld });
+        } else if (tooOld) {
           if (!expiredList) { expiredList = []; expiredSessionRequests.set(agentName, expiredList); }
           expiredList.push({ sessionIdHex: e.sessionIdHex, counterpartyPubkeyHex: e.counterpartyPubkeyHex, expiredAt: now });
           if (expiredList.length > EXPIRED_SESSION_REQUESTS_CAP) {
             expiredList.splice(0, expiredList.length - EXPIRED_SESSION_REQUESTS_CAP); // keep newest N
           }
           logger.info("session.request.expired", { agentName, sessionId: e.sessionIdHex, enqueuedAt: e.enqueuedAt });
-        } else {
-          logger.debug("session.request.reaped_terminal", { agentName, sessionId: e.sessionIdHex, status: record?.status });
         }
         // MONIKER-2 AC2b (review F1): the offer's display name expires with the offer.
         if (offeredMonikers.delete(offerKey(agentName, e.sessionIdHex))) {
@@ -1255,6 +1261,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     wirePerAgentSessionInbound,
     handleTrustSignalPickup,
     enqueueInboundSession,
+    recordRefusal,
     reapExpiredInboundSessions,
     inboundSessionQueues,
     inboundSessionWaiters,

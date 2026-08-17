@@ -136,10 +136,12 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       // M8C-TTL-1: expired requests stay VISIBLE (not silently dropped) — the operator can see
       // what they missed rather than a request just vanishing from the pending list.
       // DOD-M12B-INBOX-TRUTH-1: and they carry the same `accepted: true`, for a sharper reason.
-      // `reapExpiredInboundSessions` moves an entry here ONLY on the TTL branch, and only for a
-      // session whose record was NOT terminal — a terminal one is dropped silently instead. So
-      // every row here names a session that was live when its notice aged out. Read as "that
-      // session expired", it talks an operator into abandoning a session that is still open.
+      // `reapExpiredInboundSessions` reaps a TERMINAL session first and only then an expired one,
+      // so every row here names a session that was NOT terminal when its notice aged out. That
+      // ordering is load-bearing for the guidance below and was corrected in the same change: with
+      // `tooOld` tested first, a notice that was both expired AND sealed landed here, under prose
+      // that says the session may still be live. Read as "that session expired", this list talks an
+      // operator into abandoning a session that is still open — so it must only ever hold those.
       const expired = (expiredSessionRequests.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,

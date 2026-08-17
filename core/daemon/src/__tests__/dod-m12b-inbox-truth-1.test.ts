@@ -16,9 +16,15 @@
  * a session existed. They never did — one side was reading this field as a to-do list.
  *
  * `expired_session_requests` carries the SAME misreading and is fixed with it: the reaper moves an
- * entry there when the NOTICE passes its TTL unclaimed, and it only does so for a session whose
- * record was NOT terminal, so "expired" names a notice we stopped showing, never a session that
- * went away. An operator who reads it as "that session is gone" abandons a live session.
+ * entry there when the NOTICE passes its TTL unclaimed, so "expired" names a notice we stopped
+ * showing, never a session that went away. An operator who reads it as "that session is gone"
+ * abandons a live session.
+ *
+ * That claim was NOT true when this file was first written. The reaper tested `tooOld` before
+ * `terminal`, so a notice that was both past its TTL and already sealed landed in the expired list
+ * under prose saying the session may still be live — the guidance would have been wrong about a
+ * finished session. The reaper now reaps terminal first, and the last test below pins that overlap
+ * so the ordering cannot be flipped back without the prose going with it.
  *
  * The fix is additive — per-entry `accepted: true` plus guidance. The field NAMES are unchanged on
  * purpose: they are the wire surface the shim, the CLI and both skill files already speak, and a
@@ -171,5 +177,52 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
 
     const drained = (await client.send("cello_await_session", { timeout_ms: 500 })) as R;
     expect(drained["session_id"] ?? drained["sessionId"]).toBe(s);
+  });
+
+  it("a notice that is BOTH expired and SEALED is reaped as terminal, never listed as expired", async () => {
+    // The overlap the guidance depends on. `expired_session_requests` says the session may still be
+    // live; a sealed session must therefore never appear in it, or that sentence is a lie about a
+    // conversation that is over.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const s = SID64("t");
+    await client.send("__test_enqueue_inbound_session", {
+      agentName: "alice", sessionId: s, counterpartyPubkey: "cp",
+      enqueuedAtOverride: Date.now() - INBOUND_SESSION_TTL_MS - 1000,   // past TTL...
+    });
+    await client.send("__test_insert_session_row", { agentName: "alice", sessionId: s, status: "sealed" }); // ...AND sealed
+
+    const box = await inboxFor(client, "alice");
+    expect(box.pending_session_requests).toEqual([]);
+    expect(box.expired_session_requests.map((e) => e.session_id)).not.toContain(s);
+  });
+
+  it("the refused list survives the ended-unread branch — the two returns carry the same keys", async () => {
+    // The defect's SHAPE is "a field present on one return object and absent on its sibling", so
+    // this asserts the shape, not the instance: an agent that happens to have ended-unread history
+    // must not lose a surface an agent without it has. `refused_session_requests` was the field
+    // that went missing (M12-P18's cap visibility), and nothing covered it before or after.
+    const config = await setupWithAgents("alice");
+    handle = await startDaemon(config);
+    const client = await connect(config.socketPath);
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const snm = handle.getSessionNodeManager();
+    const refused = SID64("r");
+    const ended = SID64("x");
+    // An ended-unread row, which is what selects the OTHER return branch.
+    await client.send("__test_insert_session_row", { agentName: "alice", sessionId: ended, status: "sealed" });
+    snm.recordTranscriptMessage("alice", ended, 0, "received", new TextEncoder().encode("unread"), "seed");
+    await client.send("__test_record_refusal", {
+      agentName: "alice", sessionId: refused, counterpartyPubkey: "cp", reason: "sender_cap",
+    });
+
+    const box = (await inboxFor(client, "alice")) as unknown as Record<string, unknown>;
+    const refusedList = box["refused_session_requests"] as Array<{ session_id: string }> | undefined;
+    expect(box["ended_unread"], "this test must exercise the ended-unread return branch").toBeDefined();
+    expect(refusedList?.map((r) => r.session_id) ?? []).toContain(refused);
   });
 });
