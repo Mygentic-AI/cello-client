@@ -3677,8 +3677,11 @@ export class SessionNodeManager {
    *
    * Durable on purpose. The resolver's attempt budget is in memory, so without this the budget
    * resets on every boot and a session that can never seal costs five directory ceremonies a day
-   * for the life of the machine. Clearing the column (or a manual `cello_close_session`) is what
-   * puts a session back in scope.
+   * for the life of the machine.
+   *
+   * IT IS NOT A DEAD END FOR THE OPERATOR. The row keeps status `interrupted`, so a manual
+   * `cello_close_session` still works on it and — since DOD-M12B-INTERRUPTED-ESCALATE-1 — still
+   * escalates to a unilateral seal. This column only withdraws the session from AUTOMATIC retries.
    */
   markRestartSealGaveUp(agentName: string, sessionId: string, reason: string): void {
     if (!this.#db) return;
