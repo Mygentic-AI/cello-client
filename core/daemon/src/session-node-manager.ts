@@ -142,6 +142,14 @@ const REDIAL_COOLDOWN_MS = 15_000;
  * Two hours: comfortably longer than any churn worth attacking with, comfortably shorter than
  * "yesterday's conversation still blocks me".
  */
+/**
+ * DOD-M12B-RESERVATION-RETRY-1 — how many times to re-ask for a refused reservation before saying
+ * the agent is undialable and stopping. Bounded because a reservation is scarce and a fleet that
+ * retries forever is how a relay is exhausted. With the 5-minute base and doubling, five retries
+ * span about 2.5 hours.
+ */
+export const SR_RESERVATION_MAX_RETRIES = 5;
+
 export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_TTL_MS"]) || 2 * 60 * 60 * 1000;
 
 /**
@@ -500,6 +508,12 @@ export class SessionNodeManager {
   #srReservationTimeoutMs: number;
   /** DOD-NAT-REACHABILITY-1: watchdog for a SILENTLY lost reservation. */
   #srWatchdogIntervalMs: number;
+  #srReservationRetryMs: number;
+  /**
+   * DOD-M12B-RESERVATION-RETRY-1: per-agent re-attempt state for a receiver the relay refused a
+   * reservation to. `attempts` counts RETRIES, not the creation attempt.
+   */
+  readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
   /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
   #parkedDrainBackstopMs: number;
@@ -801,6 +815,13 @@ export class SessionNodeManager {
      */
     standingReceiverWatchdogIntervalMs?: number;
     /**
+     * DOD-M12B-RESERVATION-RETRY-1: base delay before re-attempting a circuit reservation the relay
+     * refused. Doubles per attempt. Default 5 minutes — deliberately NOT the watchdog's grid, because
+     * a reservation is a scarce resource the relay holds for its full TTL and churning attempts is
+     * how a fleet exhausts one.
+     */
+    standingReceiverReservationRetryMs?: number;
+    /**
      * DOD-PARK-DRAIN-1: how often the parked-mailbox BACKSTOP drain runs for an agent with a
      * healthy standing receiver. Rides the reservation watchdog's grid, so the effective period is
      * this value rounded up to a watchdog interval. Default 5 minutes: the trigger-driven drains do
@@ -825,6 +846,7 @@ export class SessionNodeManager {
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
+    this.#srReservationRetryMs = opts.standingReceiverReservationRetryMs ?? 5 * 60_000;
     this.#parkedDrainBackstopMs = opts.parkedDrainBackstopMs ?? 300_000;
     // REQUIRED, no fallback (INV-9, audit finding). This line used to read
     // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
@@ -7522,11 +7544,73 @@ export class SessionNodeManager {
    * already degraded and already loud (reservation.none / reservation.timeout);
    * rebuilding it on a timer would just thrash against relays we know are refusing.
    */
+  /**
+   * DOD-M12B-RESERVATION-RETRY-1 — ask again for a reservation the relay refused.
+   *
+   * The rebuild is the re-attempt: a circuit listener is fixed at node creation, so the only way to
+   * obtain a reservation is to build a new node asking for one.
+   */
+  #retryReservationIfDue(agentName: string): void {
+    const now = Date.now();
+    const state = this.#srReservationRetry.get(agentName) ?? { attempts: 0, nextAt: now + this.#srReservationRetryMs };
+    if (state.attempts === 0 && !this.#srReservationRetry.has(agentName)) {
+      // First sighting — schedule, do not fire. The creation attempt just happened.
+      this.#srReservationRetry.set(agentName, state);
+      return;
+    }
+    if (now < state.nextAt) return;
+
+    if (state.attempts >= SR_RESERVATION_MAX_RETRIES) {
+      if (state.attempts === SR_RESERVATION_MAX_RETRIES) {
+        state.attempts += 1; // mark as reported, so this fires exactly once
+        this.#srReservationRetry.set(agentName, state);
+        this.#logger.error("session.standing_receiver.reservation.gave_up", {
+          agentName,
+          attempts: SR_RESERVATION_MAX_RETRIES,
+          impact:
+            "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
+        });
+      }
+      return;
+    }
+
+    state.attempts += 1;
+    state.nextAt = now + this.#srReservationRetryMs * 2 ** (state.attempts - 1);
+    this.#srReservationRetry.set(agentName, state);
+    this.#logger.warn("session.standing_receiver.reservation.retry", {
+      agentName,
+      attempt: state.attempts,
+      maxAttempts: SR_RESERVATION_MAX_RETRIES,
+      impact: "this agent currently holds no circuit reservation, so a NAT'd peer cannot dial it",
+    });
+    void this.#rebuildStandingReceiver(agentName);
+  }
+
   #reservationWatchdogTick(): void {
     if (this.#shuttingDown) return;
     for (const [agentName, sr] of this.#standingReceivers) {
-      if (!sr.hasReservation || sr.relayPeerId === undefined) continue; // never had one — not a LOSS
       if (!this.#agentsWantingReceiver.has(agentName)) continue;        // agent went offline
+
+      // DOD-M12B-RESERVATION-RETRY-1 — NEVER HAD ONE IS NOT "NOTHING TO DO".
+      //
+      // This used to `continue` unconditionally, on the grounds that a receiver with no reservation
+      // is "already degraded and already loud". Measured over 17 days: `reservation.none` fired 481
+      // times and `relay.rejected` 2,215 — every one of the latter `relay_granted_no_reservation`,
+      // a relay out of slots completing the handshake and granting nothing. Nothing ever acted on
+      // the noise, and each of those receivers is a plain TCP node with no circuit address: behind
+      // NAT, dialable by NOBODY, for its whole life. That is the silent loss of inbound this file
+      // says three lines below it exists to kill.
+      //
+      // A relay out of slots at boot may have one minutes later, so re-attempt — on a BACKOFF and
+      // BOUNDED, never on this 30-second grid. A reservation is scarce: the relay holds it for its
+      // full TTL even after the client disconnects, and churning attempts across a fleet is how a
+      // relay is exhausted (`#startReceiverNode` records that hazard).
+      if (!sr.hasReservation || sr.relayPeerId === undefined) {
+        this.#retryReservationIfDue(agentName);
+        continue;
+      }
+      // It has one — any earlier retry budget is spent and irrelevant.
+      this.#srReservationRetry.delete(agentName);
 
       // Watch the CONNECTION to the relay, not the circuit address.
       //
