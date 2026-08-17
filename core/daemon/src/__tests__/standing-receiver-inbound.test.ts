@@ -122,6 +122,19 @@ describe("M8B F14 (daemon): inbound accept path ensures the standing receiver; d
       const mcpBobDeaf = (mcpStatusDeaf.agents as Array<Record<string, unknown>>).find((a) => a.name === "bob");
       expect(mcpBobDeaf, "cello_status must list agent bob").toBeDefined();
       expect(mcpBobDeaf!.standing_receiver_ready, "a deaf agent must be visible per-agent in cello_status (the MCP surface)").toBe(false);
+      // DOD-M12B-RESERVATION-RETRY-1: and REACHABILITY reaches the same surface. The getter had
+      // tests; the wiring did not — delete the two lines in daemon.ts that populate this and every
+      // assertion in msg-018 still passes, because they all call the manager directly. This is the
+      // half the operator actually reads, and the whole point of the field is that
+      // `standing_receiver_ready` alone is TRUE for a receiver no NAT'd peer can dial.
+      expect(
+        mcpBobDeaf!.standing_receiver_reachability,
+        "reachability must reach the MCP surface, not just exist on the manager",
+      ).toBe("absent");
+      expect(
+        bobDeaf!.standing_receiver_reachability,
+        "and the daemon status surface too — both are wired separately",
+      ).toBe("absent");
 
       // ── Fix 2: an inbound assignment must KICK creation, not just poll and drop.
       const awaitP = client.send("cello_await_session", { timeout_ms: 20_000 }) as Promise<Record<string, unknown>>;

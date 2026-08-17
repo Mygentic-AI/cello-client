@@ -229,6 +229,10 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     for (let i = 0; i < 120 && seen < 4; i++) {
       await new Promise((r) => setTimeout(r, 10));
       const n = events.filter((e) => e.event === "session.standing_receiver.reservation.retry").length;
+      // A poll that catches TWO retries at once would push the same timestamp twice and collapse a
+      // gap to zero — turning this red for a sampling stall rather than for the backoff. Say which
+      // it was, rather than letting a false red accuse the code.
+      expect(n - seen, "sampling too coarse to measure the gaps — rerun; this is not a backoff failure").toBeLessThanOrEqual(1);
       while (seen < n) { at.push(Date.now() - started); seen += 1; }
     }
     expect(at.length, "needs at least three retries to compare two gaps").toBeGreaterThanOrEqual(3);

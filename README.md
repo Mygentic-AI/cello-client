@@ -261,7 +261,9 @@ systemctl --user restart hermes-gateway
 ```
 
 Verify from a Hermes chat by calling the `cello_status` MCP tool — the bound
-agent should show online with `standing_receiver_ready`.
+agent should show online with `standing_receiver_ready`, and `standing_receiver_reachability` should
+read `reserved`. `standing_receiver_ready` on its own is true even for a receiver no relay would
+grant a circuit reservation to — behind NAT, that agent is dialable by nobody.
 
 ## Try it — connect to the CELLO demo agent
 

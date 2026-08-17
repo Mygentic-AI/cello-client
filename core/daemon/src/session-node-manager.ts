@@ -2336,7 +2336,10 @@ export class SessionNodeManager {
    *
    *   reserved    — holds a circuit reservation; a NAT'd peer can dial it.
    *   retrying    — no reservation yet, still re-asking on a backoff.
-   *   unreachable — the retry budget is spent. Only peers that can connect DIRECTLY will get in.
+   *   unreachable — no circuit reservation and the automatic re-attempts are spent, so only peers
+   *                 that can connect DIRECTLY will get in. It is not permanent: a directory
+   *                 reconnect carrying a DIFFERENT relay pool re-arms the budget, because a relay we
+   *                 have never tried is new information.
    *   absent      — no receiver at all (the agent is not online).
    */
   getStandingReceiverReachability(agentName: string): "reserved" | "retrying" | "unreachable" | "absent" {
@@ -3636,6 +3639,8 @@ export class SessionNodeManager {
       this.#standingReceivers.size,
     );
     this.#standingReceivers.clear();
+    this.#srReservationRetry.clear();
+    this.#srLastRejectionReason.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.
@@ -7449,7 +7454,22 @@ export class SessionNodeManager {
    * for a session handoff that (being unreachable) would never come.
    */
   setDirectoryRelayEndpoints(agentName: string, endpoints: Array<{ relayPeerId: string; relayAddrs: string[] }>): void {
+    // DOD-M12B-RESERVATION-RETRY-1: a DIFFERENT relay pool re-arms the retry budget; the same one
+    // does not. This fires on every signaling connect AND reconnect, so clearing unconditionally
+    // would reset the bound on a short grid and defeat the whole point of having one. But once the
+    // budget is spent, `getStandingReceiverReachability` reports `unreachable` for the rest of the
+    // online episode — including while this path is actively re-attempting against relays we have
+    // never tried. A new relay is new information; a repeat of the same list is not.
+    const previous = this.#directoryRelayEndpoints.get(agentName);
+    const poolChanged =
+      previous === undefined ||
+      previous.length !== endpoints.length ||
+      endpoints.some((e, i) => e.relayPeerId !== previous[i]?.relayPeerId);
     this.#directoryRelayEndpoints.set(agentName, endpoints);
+    if (poolChanged) {
+      this.#srReservationRetry.delete(agentName);
+      this.#srLastRejectionReason.delete(agentName);
+    }
     if (endpoints.length === 0 || this.#shuttingDown) return;
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) return; // not ensured yet — the coming ensure reads the map
@@ -7603,6 +7623,10 @@ export class SessionNodeManager {
           // can pin a slot it never uses, so its appearance is also the signal that this retry
           // budget needs tightening.
           ...(state.lastReason !== undefined ? { lastRejectionReason: state.lastReason } : {}),
+          // "No relay would grant" and "there was no relay to ask" are different facts and lead to
+          // different places — the first at relay capacity, the second at this agent's directory
+          // connection. Without this they are the same sentence.
+          reservationsRequested: (this.#directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
           impact:
             "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
         });

@@ -1409,7 +1409,11 @@ Trigger: /cello-bridge-setup, or "install the CELLO bridge".
    Omitting a flag on a re-run RESETS it to the default — it does not keep the old value.
 5. **Restart the gateway:** \`hermes gateway restart\`.
 6. **Verify.** Call the \`cello_status\` MCP tool and report the bound agent's state and
-   \`standing_receiver_ready\`. The bridge is live when the agent shows online.
+   \`standing_receiver_ready\` AND \`standing_receiver_reachability\`. The bridge is live when the
+   agent shows online AND reachability reads \`reserved\`. \`standing_receiver_ready\` alone is TRUE
+   even for a receiver no relay would give a circuit reservation to — which, behind NAT, nobody can
+   dial. \`retrying\` means it is still working on it; \`unreachable\` means only peers that can
+   connect directly will get in.
 
 ## How to operate CELLO (after setup)
 
