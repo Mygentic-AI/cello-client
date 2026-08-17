@@ -149,6 +149,35 @@ describe("DOD-M12B-STRAND-1: verified content that cannot yet be delivered is du
     await mgr2.gracefulShutdown();
   }, 60_000);
 
+  it("after a restart the seal gate still sees the gap — a durable hold must not read as an empty one", async () => {
+    const dbPath = join(tempDir, "s4.db");
+    const c1 = new TextEncoder().encode("q1");
+    const h1 = msgLeafHash(c1);
+
+    const first = makeLogger();
+    {
+      const mgr = await makeManager(first.logger, dbPath);
+      await seedAgents(mgr.getDb(), [AGENT]);
+      await mgr.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-1");
+      mgr.recordWitnessedSequence(AGENT, sid, hx(h1), 1);
+      await mgr.ingestReceivedContent(AGENT, sid, c1, h1, "corr-1");
+      expect(mgr.sealReadiness(AGENT, sid).ready, "a session with a gap is not sealable").toBe(false);
+      await mgr.gracefulShutdown();
+    }
+
+    // THE DANGEROUS DIRECTION. Holds are restored lazily, so a reader that consults the in-memory
+    // map before hydration counts zero — and `sealReadiness` reporting READY on a gapped session is
+    // the one outcome worse than refusing a healthy close: the counterparty answers
+    // leaf_count_mismatch, which is terminal, and the receipt is gone for good.
+    const second = makeLogger();
+    const mgr2 = await makeManager(second.logger, dbPath);
+    await mgr2.createSessionNode(sid, AGENT, "bobpubkey", "bob-peer-id", "corr-2");
+    const readiness = mgr2.sealReadiness(AGENT, sid);
+    expect(readiness.heldCount, "the durable hold must be counted before the gate judges").toBe(1);
+    expect(readiness.ready, "a restart must not make a gapped session look sealable").toBe(false);
+    await mgr2.gracefulShutdown();
+  }, 60_000);
+
   it("a hold already behind the tree's frontier is dropped on restore, never re-appended", async () => {
     const dbPath = join(tempDir, "s3.db");
     const c0 = new TextEncoder().encode("p0");

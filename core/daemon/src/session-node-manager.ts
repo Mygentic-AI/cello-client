@@ -1964,6 +1964,10 @@ export class SessionNodeManager {
    *  otherwise let multiple held chunks each individually pass the size gate while cumulatively
    *  exceeding it once #releaseHeld drains them. */
   #getHeldBytesTotal(agentName: string, sessionId: string): number {
+    // DOD-M12B-STRAND-1: hydrate first. Reading the Map before the durable holds are back
+    // under-counts, and this gate exists to stop several held chunks each passing the size cap
+    // individually while cumulatively exceeding it — an under-count is the bypass.
+    this.#ensureHeldRestored(agentName, sessionId);
     const held = this.#heldContent.get(this.#k(agentName, sessionId));
     if (!held) return 0;
     let total = 0;
@@ -5137,6 +5141,11 @@ export class SessionNodeManager {
     ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number;
   } {
     const key = this.#k(agentName, sessionId);
+    // DOD-M12B-STRAND-1: hydrate first. An under-counted `heldCount` reports a gapped session as
+    // READY, and this gate's whole purpose is to stop a short chain being signed — the counterparty
+    // answers `leaf_count_mismatch`, which is TERMINAL and costs the receipt permanently. Failing
+    // open here is the one outcome worse than refusing a healthy close.
+    this.#ensureHeldRestored(agentName, sessionId);
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
