@@ -122,6 +122,28 @@ const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
 const REDIAL_COOLDOWN_MS = 15_000;
 
 /**
+ * DOD-CAP-SELF-HEAL-1 — what counts against a per-sender acceptance bound.
+ *
+ * `active` always. `interrupted` ONLY when the counterparty caused it.
+ *
+ * D18 is why `interrupted` has to count at all: a peer can flip a session to `interrupted` for free
+ * by dropping its stream, then open a fresh one, indefinitely. Those are theirs and still count.
+ *
+ * What broke was charging them for OURS. A daemon restart flips every live session to
+ * `interrupted`, nothing resolves them, and the reaper correctly refuses to take any with received
+ * content — so the bound became all-time instead of concurrent. Measured 2026-08-17: two of one
+ * operator's own agents could not open a session, because one held five finished conversations with
+ * the other against a stranger cap of three.
+ *
+ * NULL counts as the counterparty's. The column is new, so every pre-existing row is unlabelled,
+ * and the safe default for an anti-abuse bound is to count rather than to excuse.
+ */
+const CAP_COUNT_SQL = (where: string): string =>
+  `SELECT COUNT(*) AS n FROM sessions WHERE ${where}
+     AND (status = 'active'
+          OR (status = 'interrupted' AND COALESCE(interrupted_by, 'counterparty') != 'local'))`;
+
+/**
  * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
  *
  * A REASON, not a boolean. The three causes are not interchangeable, and collapsing them made the
@@ -1037,6 +1059,13 @@ export class SessionNodeManager {
       // Deliberately NOT a status — the session stays sealable, so the operator can still take a
       // unilateral receipt. It stops this side calling them, nothing more.
       "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
+      // DOD-CAP-SELF-HEAL-1: WHO caused this session to be interrupted — 'counterparty' when their
+      // stream dropped, 'local' when OUR daemon stopped or started. Only theirs counts against the
+      // acceptance bound. Without this the bound is all-time rather than concurrent: every restart
+      // flips every live session to `interrupted`, nothing ever resolves them, and a pair of agents
+      // that has talked three times can never talk again. NULL means "not recorded" and is treated
+      // as the counterparty's, because the safe default for an anti-abuse bound is to count it.
+      "ALTER TABLE sessions ADD COLUMN interrupted_by TEXT",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1366,7 +1395,9 @@ export class SessionNodeManager {
         try {
           this.#db
             .prepare(
-              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE agent_id = ? AND session_id = ?",
+              // DOD-CAP-SELF-HEAL-1: OURS. This is the boot sweep finding sessions a previous
+              // process left `active`; the counterparty did nothing, so they are not charged for it.
+              "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?), interrupted_by = 'local' WHERE agent_id = ? AND session_id = ?",
             )
             .run(now, interruptedAt, row.agent_id, row.session_id);
           if (row.agent_name === null) {
@@ -2086,7 +2117,7 @@ export class SessionNodeManager {
   countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number {
     if (!this.#db) return 0;
     const row = this.#db
-      .prepare("SELECT COUNT(*) AS n FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ? AND status IN ('active', 'interrupted')")
+      .prepare(CAP_COUNT_SQL("agent_id = ? AND counterparty_pubkey = ?"))
       .get(this.#requireAgentId(agentName), counterpartyPubkey) as { n: number };
     return row.n;
   }
@@ -2103,7 +2134,8 @@ export class SessionNodeManager {
     const row = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM sessions s
-         WHERE s.agent_id = ? AND s.status IN ('active', 'interrupted')
+         WHERE s.agent_id = ?
+           AND (s.status = 'active' OR (s.status = 'interrupted' AND COALESCE(s.interrupted_by, 'counterparty') != 'local'))
            AND NOT EXISTS (
              SELECT 1 FROM contacts c
              WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey
@@ -2127,6 +2159,15 @@ export class SessionNodeManager {
     const perSenderCap = this.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {
+      // INWARD VISIBILITY. The refused peer still learns nothing — that silence is deliberate, so a
+      // blocked party cannot tell blocking from throttling. But the OPERATOR whose own cap just
+      // fired was told nothing either, and they are the only party who can clear it: an agent
+      // cannot self-heal against a limit it is never told it hit. Measured 2026-08-17: two of one
+      // operator's own agents could not talk, and the only trace was a warn line nobody was reading.
+      this.#logger.error("session.inbound.cap.reached", {
+        agentName, counterpartyPubkey, tier, cap: perSenderCap, counted: perSender,
+        impact: `this agent is now REFUSING new sessions from this counterparty. Only you can clear it: close ${perSender} of your open sessions with them (cello_close_session), or add them as a contact to raise the cap.`,
+      });
       return { ok: false, reason: "abuse_bound_sessions_per_sender" };
     }
     // The global stranger cap is only for the UNKNOWN pool. A KNOWN+ sender is past it by trust;
@@ -2994,6 +3035,19 @@ export class SessionNodeManager {
     await this.#handleContentStream(agentName, sessionId, source, remotePeerId);
   }
 
+  /** DOD-CAP-SELF-HEAL-1 test seam: the shutdown sweep's effect, without a shutdown. Mirrors the
+   *  real UPDATE at gracefulShutdown so a test cannot pass against a label production never sets. */
+  markSessionsInterruptedByLocalShutdown(): void {
+    this.#db?.prepare("UPDATE sessions SET interrupted_by = 'local' WHERE status = 'interrupted'").run();
+  }
+
+  /** DOD-CAP-SELF-HEAL-1 test seam: the counterparty's stream closing, without a real peer. */
+  markInterruptedByCounterpartyForTest(agentName: string, sessionId: string): void {
+    this.#db?.prepare(
+      "UPDATE sessions SET interrupted_by = 'counterparty' WHERE agent_id = ? AND session_id = ?",
+    ).run(this.#requireAgentId(agentName), sessionId);
+  }
+
   /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
    *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
    *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
@@ -3429,7 +3483,8 @@ export class SessionNodeManager {
       const interruptedAt = new Date(now).toISOString();
       try {
         this.#db.prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE status = 'active'",
+          // DOD-CAP-SELF-HEAL-1: OURS. Our own shutdown ended these, not the counterparty.
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?), interrupted_by = 'local' WHERE status = 'active'",
         ).run(now, interruptedAt);
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
@@ -3702,7 +3757,9 @@ export class SessionNodeManager {
       // UPDATE only mutates a row that is still active.
       this.#db
         .prepare(
-          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ? WHERE agent_id = ? AND session_id = ? AND status = 'active'",
+          // DOD-CAP-SELF-HEAL-1: THEIRS. This is the counterparty's stream closing or their relay
+          // frame — the D18 disconnect-evasion move — so it keeps counting against their bound.
+          "UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ?, interrupted_by = 'counterparty' WHERE agent_id = ? AND session_id = ? AND status = 'active'",
         )
         .run(now, authoritativeCount, interruptedAt, this.#requireAgentId(agentName), sessionId);
     } catch (err: unknown) {
