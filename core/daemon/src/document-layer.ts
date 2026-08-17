@@ -139,6 +139,15 @@ export interface DocumentLayerDeps {
      */
     leafKind?: number,
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * A PEER REFUSED OUR EXCHANGE. Wired to the scheduler so the refusal can slow the asking down.
+   *
+   * Without it the refusal is logged and dropped, and the sweep — which can only see whether the
+   * frame was SENT — retries at full speed forever. Optional so a layer built without a scheduler
+   * (every unit fixture) needs no wiring; the scheduler treats the signal as a DELAY, never a
+   * prohibition (R41).
+   */
+  onPeerRefusal?(ownerAgentId: string, peerAgentId: string, terminal: boolean): void;
 }
 
 export interface DocumentLayer {
@@ -501,7 +510,24 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       if (doc.status !== "active") continue;
       const derived = reconcileReads(ownerAgentId).deriveState(doc.documentId);
       if (!derived.ok || derived.state.ended !== null) continue;
-      for (const seat of [...derived.state.participants, ...derived.state.invited]) {
+      const seats = [...derived.state.participants, ...derived.state.invited];
+      // A HOLDER THAT NO LONGER HOLDS A SEAT HAS NOTHING TO EXCHANGE.
+      //
+      // Removal is forward-only: the copy and its history stay ours to read, but edits no longer
+      // publish outward and theirs no longer arrive. So there is, by derivation, nothing left to
+      // reconcile — and the peers say so, refusing with `terminal: true` and the words "there is
+      // nothing further to reconcile".
+      //
+      // Without this the sweep derived its targets from the OTHER seats and never asked whether we
+      // still occupied one, so a removed holder asked forever: measured 105 refusals against one
+      // document in 85 minutes, every one of them terminal, every one of them asked again.
+      //
+      // The cost is not the wasted dial. Each attempt opens a session and pushes ack frames, and
+      // every frame consumes a relay canonical position while the receiving tree does not advance
+      // with it. That is what drives a conversation's tree behind the relay counter and strands
+      // real messages behind an ordering gap that nothing fills.
+      if (!seats.includes(ownerAgentId)) continue;
+      for (const seat of seats) {
         if (seat === ownerAgentId) continue;
         const docs = targets.get(seat);
         if (docs) docs.push(doc.documentId);
@@ -795,6 +821,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       logger.warn("document.reconcile.refused_by_peer", {
         senderAgentId, reason: frame.refusal.reason, terminal: frame.refusal.terminal, correlationId,
       });
+      // ACTED ON, not merely surfaced. The comment above has always said "never to retry blindly",
+      // and until now nothing downstream could tell a refusal from a success.
+      deps.onPeerRefusal?.(ownerAgentId, senderAgentId, frame.refusal.terminal);
       return { ok: true };
     }
     for (const block of frame.documents) {
@@ -803,6 +832,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           documentId: block.document_id, senderAgentId,
           reason: block.refusal.reason, terminal: block.refusal.terminal, correlationId,
         });
+        deps.onPeerRefusal?.(ownerAgentId, senderAgentId, block.refusal.terminal);
       }
     }
     if (frame.exchange_version !== DOCUMENT_RECONCILE_EXCHANGE_VERSION) {

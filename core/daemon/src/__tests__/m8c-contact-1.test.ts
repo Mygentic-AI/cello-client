@@ -32,6 +32,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { Stream } from "@libp2p/interface";
+import { markAsAutoReply } from "../away-detection.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -295,8 +296,11 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: false });
+    // DOD-M12B-AWAY-MARK-1: the stranger ack is machine-generated like every other away reply, so
+    // it carries the marker. The MINIMAL-DISCLOSURE point of this assertion is untouched — the body
+    // is still exactly "Dispatched." and still tells a stranger nothing.
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe("Dispatched.");
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe(markAsAutoReply("Dispatched."));
 
     // CC-1 teeth: the stranger must STILL be unknown after knocking. The old code auto-added them
     // here — which then exempted them from the ABUSE-1 caps. An unattended knock grants no trust.
@@ -376,7 +380,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(knownEvent?.context).toMatchObject({ kind: "message", isKnown: true });
 
     const unknownSent = snm.readTranscript("alice", SID_UNKNOWN).messages.filter((m) => m.direction === "sent");
-    expect(unknownSent[0]?.text).toBe("Dispatched.");
+    expect(unknownSent[0]?.text).toBe(markAsAutoReply("Dispatched.")); // DOD-M12B-AWAY-MARK-1
     const knownSent = snm.readTranscript("alice", SID_KNOWN).messages.filter((m) => m.direction === "sent");
     expect(knownSent[0]?.text).toContain("message has been received");
   });

@@ -2334,10 +2334,21 @@ export class SessionNodeManager {
     }
 
     // Log observability event (session.node.created)
+    //
+    // `counterpartySessionPeerId` IS LOGGED because it is recorded here ONCE and never refreshed,
+    // while a standing receiver is rebuilt with a fresh libp2p keypair on every signaling reconnect
+    // and every lost reservation. If the peer rebuilds between advertising its endpoint and this
+    // handoff, we record an identity that no longer exists — and since `newStream` never dials, it
+    // only ever looks for an ALREADY-OPEN connection filed under exactly this string, so every send
+    // in this direction parks forever while the reverse direction works fine.
+    //
+    // Both sides of a local session log this event, so recording the id we will dial makes that
+    // mismatch a direct comparison in the log instead of an unfalsifiable hypothesis.
     this.#logger.info("session.node.created", {
       sessionId,
       agentName,
       sessionPeerId: peerId,
+      counterpartySessionPeerId: counterpartyPeerId,
       correlationId,
     });
 
@@ -2704,11 +2715,16 @@ export class SessionNodeManager {
       };
     }
 
-    // Log observability event
+    // Log observability event. `counterpartySessionPeerId` for the same reason as the initiator
+    // side: this is the identity every later send will look for an open connection under, it is
+    // never refreshed, and the peer's standing receiver may already have been rebuilt under a new
+    // one. The RESPONDER is the side that can go stale — only the initiator dials, so this is the
+    // half that inherits an id it never verified.
     this.#logger.info("session.node.created", {
       sessionId,
       agentName,
       sessionPeerId: peerId,
+      counterpartySessionPeerId: initiatorPeerId,
       correlationId,
     });
 
@@ -3902,6 +3918,23 @@ export class SessionNodeManager {
       // can be reported as "dispatched to relay" instead of a raw stream failure — the operator/
       // agent sees the truth (the message IS in flight, just not direct), not a false negative.
       const hashHex = Buffer.from(contentHash).toString("hex");
+      // NAME THE CAUSE. This catch used to discard `err` outright, so a park reported only its exit
+      // point — "dispatched to relay" — and never what went wrong. Measured 2026-08-17: 212 parks on
+      // one daemon, not one of them recording a reason, which is what made a one-way session look
+      // like a protocol mystery for a night.
+      //
+      // `counterpartySessionPeerId` is the load-bearing field. It is recorded ONCE at session
+      // establishment and never refreshed, while a standing receiver is rebuilt with a fresh keypair
+      // on every signaling reconnect — so if the two ever cross, every send goes one-way forever and
+      // nothing says so. With this line that becomes a single grep instead of a night.
+      this.#logger.warn("session.content.direct.send.failed", {
+        agentName,
+        sessionId,
+        contentHash: hashHex,
+        counterpartySessionPeerId: entry.counterpartySessionPeerId,
+        error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
       if (attempt.outcome === "parked") {
         return { ok: true, delivered: false, parked: true, ...(relayRefusal === undefined ? {} : { relayRefusal }) };

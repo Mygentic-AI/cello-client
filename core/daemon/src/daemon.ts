@@ -113,7 +113,8 @@ import { startRegistryPoll } from "./registry-poll.js";
 import { CONSENT_ACCEPTED } from "./consent-migration.js";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS } from "./away-detection.js";
+import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
+import { createDeliveryOpenRegistry } from "./delivery-open-registry.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
 
@@ -1051,6 +1052,12 @@ async function startDaemonHoldingLock(
           logger.info("session.away.mutual.skipped", {
             agentName,
             sessionId,
+            // DOD-M12B-AWAY-MARK-1: WHICH branch matched. The marker is in-band and therefore
+            // typeable, so prefixing every message with it skips the one-shot auto-close for free —
+            // the cost of that attack fell from "reproduce the exact away wording" to "type 15
+            // characters". This field is what makes a peer doing it on every message visible;
+            // without it the line reads as routine machine-to-machine traffic.
+            matched: isAutoReplyMarked(text) ? "marker" : "legacy_exact",
             impact:
               "no away reply and no one-shot seal — two away agents must not notarize a conversation nobody had",
           });
@@ -1075,7 +1082,9 @@ async function startDaemonHoldingLock(
           // Reviewer F2: token at the END — the daemon's own output must honor the
           // DOD-SIGNAL-TOKEN-1 append-at-end contract that DOD-WRAP-SUBSTRING-1 detection
           // is anchored on (a counterparty daemon's end-anchored detector must see this close).
-          const rejectText = "This inbox only accepts one message per visit. Closing. [[WRAP]]";
+          // DOD-M12B-AWAY-MARK-1: machine-generated, so it is marked — and the marker goes at the
+          // FRONT precisely so [[WRAP]] keeps the end position the counterparty's detector anchors on.
+          const rejectText = markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]");
           const rejectBytes = new TextEncoder().encode(rejectText);
           const rejectHash = wireContentHash(rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
@@ -1227,6 +1236,12 @@ async function startDaemonHoldingLock(
     try {
       // DOD-AWAY-TIER-1: resolve most-specific-first — per-contact away_message → per-tier away
       // (settings) → agent default (settings) → the system default (code, per kind). Total.
+      // DOD-M12B-AWAY-MARK-1: THE choke point. Every away reply this daemon sends passes through
+      // this one expression — the per-contact message, the per-tier message, the agent default, the
+      // system default and the stranger ack — so marking here is what makes "an operator's
+      // CONFIGURED away message is indistinguishable from a person" go away, which is the half
+      // exact-text matching could not reach by construction. markAsAutoReply is idempotent, so the
+      // system defaults (already marked at their source) do not pick up a second token.
       const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
         ?? (isKnown ? systemDefault : STRANGER_TEXT);
       const draftBytes = new TextEncoder().encode(awayText);
@@ -1245,9 +1260,18 @@ async function startDaemonHoldingLock(
         logger.error("session.away.response.redact_without_content", { agentName, sessionId, kind });
         return;
       }
-      const contentBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
+      // DOD-M12B-AWAY-MARK-1: mark AFTER screening, never before. A redact verdict REPLACES the
+      // bytes, and marking the draft would let that replacement silently strip the marker — an away
+      // reply back on the wire indistinguishable from a person, with no log line saying so. Marking
+      // here also means the gateway screens the operator's actual disclosure rather than a daemon
+      // token bolted to the front of it. markAsAutoReply is idempotent and the system defaults are
+      // marked at their source, so nothing gains a second token.
+      const screenedBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
         ? new Uint8Array(awayVerdict.content)
         : draftBytes;
+      const contentBytes = new TextEncoder().encode(
+        markAsAutoReply(new TextDecoder().decode(screenedBytes)),
+      );
       const contentHash = wireContentHash(contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
       if (!sendResult.ok && !sendResult.durable) {
@@ -1347,20 +1371,82 @@ async function startDaemonHoldingLock(
   let reconcileScheduler: ReconcileScheduler | undefined;
   let documentOwnerKeyForHook: ((agentName: string) => string | null) | undefined;
 
+  // DOD-M12B-DELIVERY-QUIET-1: which peers this daemon's document delivery worker is mid-dial to.
+  // Read by BOTH reachability triggers and by the doorbell below. See delivery-open-registry.ts for
+  // why this records an intent keyed on the peer rather than the session id — the short version is
+  // that the directory mints the id and pushes the assignment to the counterparty before the opener
+  // ever sees it, so on a one-daemon pair the inbound doorbell fires first and a session-id
+  // registry is always too late.
+  const deliveryOpens = createDeliveryOpenRegistry();
+  /**
+   * An agent's own pubkey, synchronously. The registry keys on PUBKEYS at both ends because that is
+   * the only pair the dialling side and the accepting side can both name — the accepting side never
+   * learns the dialler's local agent name, and the dialling side never learns ours.
+   */
+  const pubkeyOfAgent = (name: string): string => loadedAgents.find((a) => a.name === name)?.pubkey ?? "";
+  /**
+   * Is a delivery worker mid-dial from `openerPubkey` to `targetPubkey`?
+   *
+   * One predicate, passed to every consumer, so the doorbell, the phone and both reachability
+   * triggers cannot drift apart on the answer. An unresolvable agent yields "" and never matches,
+   * which fails OPEN — an unknown agent rings rather than being silently muted.
+   */
+  const isDeliveryOpenInFlight = (openerPubkey: string, targetPubkey: string): boolean =>
+    openerPubkey !== "" && targetPubkey !== "" && deliveryOpens.isDeliveryOpening(openerPubkey, targetPubkey);
+  /**
+   * The ACCEPTING side's question: "did a delivery worker on `openerPubkey`'s daemon dial the local
+   * agent `targetAgentName`?"
+   *
+   * A named predicate rather than a reversed call, because getting the order wrong here is exactly
+   * the defect this line was re-opened to fix: the accepting side naturally reaches for its own
+   * agent first, which compares the receiver's tuple against a registry holding the dialler's and
+   * silently never matches.
+   */
+  const isDeliveryOpenToAgent = (openerPubkey: string, targetAgentName: string): boolean =>
+    isDeliveryOpenInFlight(openerPubkey, pubkeyOfAgent(targetAgentName));
+
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
     sessionId: string,
     state: string,
     counterpartyPubkey: string | null,
   ): void {
+    // DOD-M12B-DELIVERY-QUIET-1: this session came up because a DELIVERY WORKER dialled, so its
+    // creation is machine traffic — not news about the peer, not a conversation, and not something
+    // to buzz a phone about. Scoped to `created` on purpose: a session going DOWN is news whoever
+    // opened it, and it is the operator's only signal that a conversation was cut off.
+    //
+    // ARGUMENTS ARE REVERSED HERE, AND THAT IS THE POINT. This function runs on the side that
+    // ACCEPTED, so the opener is the COUNTERPARTY and the target is US. Asking
+    // `(agentName, counterpartyPubkey)` — our own agent first, like the initiator half does — is
+    // what made the first version of this guard unreachable in production: it compared the
+    // receiver's tuple against a registry holding the dialler's.
+    if (state === "created" && counterpartyPubkey !== null && isDeliveryOpenToAgent(counterpartyPubkey, agentName)) {
+      // Suppression is LOGGED. A doorbell that silently stops ringing is the next defect, and the
+      // measured storm was so hard to read precisely because nothing named its cause.
+      logger.info("session.doorbell.suppressed_delivery", {
+        agentName, sessionId, state, opener: counterpartyPubkey.slice(0, 16),
+        impact: "document delivery opened this session — no doorbell, no phone push, no backoff reset",
+      });
+      return;
+    }
     // MONIKER-4 AC2: stamp who/whoKnown on the counterparty-bearing frame. Resolved BEFORE the
-    // offered-name drop below so a terminal state's own doorbell still shows the name.
+    // offered-name drop below so a terminal state's own doorbell still shows the name. Below the
+    // guard: on a suppressed event it was computed and thrown away.
     const who = counterpartyPubkey ? resolveWho(agentName, counterpartyPubkey, sessionId) : undefined;
     // SYNC-P5 (R39): a session coming up IS the party-became-reachable signal — every shared
     // document gets a reconcile attempt, and the scheduler's backoff resets (they just answered).
+    // Sound ONLY when the peer caused it, which is what the guard above establishes.
     if (reconcileScheduler && documentOwnerKeyForHook && counterpartyPubkey && state === "created") {
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId !== null) {
+        // DOD-M12B-DELIVERY-QUIET-1: the trigger FIRING is logged, not only its failure. This is
+        // the storm driver — it zeroes the backoff and sweeps every shared document — and it was
+        // invisible in the log unless it threw, so 321 attempts in 85 minutes named no cause. It is
+        // also the only way either direction of the delivery exemption is observable.
+        logger.info("document.reconcile.reachable_trigger_fired", {
+          agentName, trigger: "inbound_session_created", peer: counterpartyPubkey.slice(0, 16),
+        });
         void reconcileScheduler
           .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
           .catch((err: unknown) => {
@@ -1774,6 +1860,7 @@ async function startDaemonHoldingLock(
     wirePerAgentSessionInbound,
     handleTrustSignalPickup,
     enqueueInboundSession,
+    recordRefusal,
     reapExpiredInboundSessions,
     inboundSessionQueues,
     inboundSessionWaiters,
@@ -1798,6 +1885,7 @@ async function startDaemonHoldingLock(
     sendAwayResponse,
     dispatchSessionStateChangedWithTelegram,
     sendTelegramDoorbell,
+    isDeliveryOpenToAgent,
   });
 
   if (!sharedSignaling) {
@@ -3146,8 +3234,23 @@ async function startDaemonHoldingLock(
     // on session-up and the initiator waited out a sweep interval.
     onSessionOpened: (agentName, counterpartyPubkey) => {
       if (!reconcileScheduler || !documentOwnerKeyForHook) return;
+      // DOD-M12B-DELIVERY-QUIET-1: the INITIATOR half of the same circularity. This hook fires
+      // inside openSessionAs, which the delivery worker's adapter brackets with begin/release — so
+      // the intent is still in flight here and the check needs no plumbing of its own. Resetting
+      // the backoff on a session WE opened to deliver a frame wipes a refusal the peer may have
+      // given seconds ago and immediately sweeps every document, which opens more sessions.
+      // We are the OPENER here, so our own pubkey goes first — the mirror of the inbound half above.
+      if (isDeliveryOpenInFlight(pubkeyOfAgent(agentName), counterpartyPubkey)) {
+        logger.debug("document.reconcile.reachable_trigger_skipped", {
+          agentName, reason: "session_opened_by_document_delivery",
+        });
+        return;
+      }
       const ownerAgentId = documentOwnerKeyForHook(agentName);
       if (ownerAgentId === null) return;
+      logger.info("document.reconcile.reachable_trigger_fired", {
+        agentName, trigger: "outbound_session_opened", peer: counterpartyPubkey.slice(0, 16),
+      });
       void reconcileScheduler
         .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
         .catch((err: unknown) => {
@@ -3395,6 +3498,44 @@ async function startDaemonHoldingLock(
       dispatchSessionStateChangedWithTelegram(agentName, sessionId, state, counterpartyPubkey);
     }
 
+    return { ok: true };
+  });
+
+  // DOD-M12B-DELIVERY-QUIET-1: drive the delivery-open intent directly, so the doorbell exemption
+  // is testable without standing up a document, a peer daemon and a real directory negotiation.
+  // The registry's begin() hands back a closure, so the releases are held here by key.
+  // The hook takes AGENT NAMES and resolves both to pubkeys through `pubkeyOfAgent`, exactly as the
+  // real delivery adapter does. That is deliberate: the first version of this hook let a test
+  // register a tuple production never produces — an agent registered as the dialler and then
+  // emitted as the receiver of its own dial — so the suite proved the guard's boolean logic and
+  // nothing about the wiring, and stayed green against a guard that could never fire.
+  const testDeliveryReleases = new Map<string, () => void>();
+  // DOD-M12B-INBOX-TRUTH-1: seed a refusal, so the ended-unread return branch's lost
+  // `refused_session_requests` has a regression test. The field had none before or after the fix.
+  handlers.set("__test_record_refusal", async (params, _connectionId) => {
+    const agentName = params?.agentName as string | undefined;
+    const sessionId = params?.sessionId as string | undefined;
+    if (!agentName || !sessionId) return { error: "missing_params", guidance: "Provide agentName and sessionId." };
+    recordRefusal(agentName, sessionId, (params?.counterpartyPubkey as string) ?? "", (params?.reason as string) ?? "test");
+    return { ok: true };
+  });
+
+  handlers.set("__test_delivery_open_begin", async (params, _connectionId) => {
+    const openerAgent = params?.openerAgent as string | undefined;
+    const targetAgent = params?.targetAgent as string | undefined;
+    if (!openerAgent || !targetAgent) return { error: "missing_params", guidance: "Provide openerAgent and targetAgent (both agent NAMES)." };
+    const openerPubkey = pubkeyOfAgent(openerAgent);
+    const targetPubkey = pubkeyOfAgent(targetAgent);
+    testDeliveryReleases.set(`${openerAgent}>${targetAgent}`, deliveryOpens.begin(openerPubkey, targetPubkey));
+    return { ok: true, openerPubkey, targetPubkey };
+  });
+  handlers.set("__test_delivery_open_end", async (params, _connectionId) => {
+    const openerAgent = params?.openerAgent as string | undefined;
+    const targetAgent = params?.targetAgent as string | undefined;
+    if (!openerAgent || !targetAgent) return { error: "missing_params", guidance: "Provide openerAgent and targetAgent (both agent NAMES)." };
+    const key = `${openerAgent}>${targetAgent}`;
+    testDeliveryReleases.get(key)?.();
+    testDeliveryReleases.delete(key);
     return { ok: true };
   });
 
@@ -3658,6 +3799,10 @@ async function startDaemonHoldingLock(
       });
       return sent.ok ? { ok: true } : { ok: false, reason: sent.reason };
     },
+    // Read LAZILY: the scheduler is constructed after this layer (it consumes the layer's sweep
+    // targets), so the binding must be resolved at call time rather than captured here.
+    onPeerRefusal: (ownerAgentId, peerAgentId, terminal) =>
+      reconcileScheduler?.noteRefusal(ownerAgentId, peerAgentId, terminal),
     // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
     // how the surface tests passed while the feature did nothing: the test wired this seam to
     // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever
@@ -3739,15 +3884,26 @@ async function startDaemonHoldingLock(
             .map((row) => row.session_id)
             .reverse(),
         openSession: async (agent, peerAgentId, correlationId) => {
-          // The same path `cello_initiate_session` takes, now callable without an IPC connection.
-          const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
-            ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
-          };
-          if (res.ok !== true || typeof res.sessionId !== "string") {
-            return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+          // DOD-M12B-DELIVERY-QUIET-1: THIS is the only place the delivery worker opens a session,
+          // so bracketing it is what makes "who opened this" knowable everywhere else. The window
+          // must cover the whole open — the inbound doorbell on a co-resident pair fires DURING
+          // negotiation, and the initiator-side reachability hook fires just before this returns.
+          // Released in `finally`: a throw that left the intent registered would silence this
+          // peer's doorbell for the life of the process, which is a worse outage than the storm.
+          const releaseDeliveryOpen = deliveryOpens.begin(pubkeyOfAgent(agent), peerAgentId);
+          try {
+            // The same path `cello_initiate_session` takes, now callable without an IPC connection.
+            const res = (await openSessionFor(agent, { targetPubkey: peerAgentId })) as {
+              ok?: boolean; sessionId?: string; reason?: string; guidance?: string;
+            };
+            if (res.ok !== true || typeof res.sessionId !== "string") {
+              return { ok: false, reason: res.reason ?? "session_open_failed", guidance: res.guidance };
+            }
+            logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
+            return { ok: true, sessionId: res.sessionId };
+          } finally {
+            releaseDeliveryOpen();
           }
-          logger.info("document.delivery.session_opened", { agent, peerAgentId, sessionId: res.sessionId, correlationId });
-          return { ok: true, sessionId: res.sessionId };
         },
         sealSession: async (agent, sessionId, correlationId) => {
           // §16.4: the autonomous session still carries the seal — the ceremony goes to zero, the

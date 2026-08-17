@@ -34,6 +34,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { Stream } from "@libp2p/interface";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
+import { markAsAutoReply } from "../away-detection.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -322,8 +323,12 @@ describe("M8C-AWAY-1: away response", () => {
 
     // The RESOLVED custom text is what landed in the transcript — not the system default (bypass:
     // reverting the caller to the constant would send "session request has been received…" here).
+    // DOD-M12B-AWAY-MARK-1: a CONFIGURED away message is marked too, and this is the test that
+    // proves it — an operator's own wording was previously indistinguishable from a person by
+    // construction, because the detector could only match this daemon's default strings. Asserted
+    // through markAsAutoReply rather than a pasted literal so the resolved text stays exact.
     const { messages } = snm.readTranscript("bob", SID_HEX);
-    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe("Hey - reach me on Signal");
+    expect(messages.filter((m) => m.direction === "sent")[0]?.text).toBe(markAsAutoReply("Hey - reach me on Signal"));
     // Observability AC: contact.away.resolved fired with the matched level.
     expect(events.find((e) => e.event === "contact.away.resolved" && e.context.level === "contact")).toBeDefined();
   });
@@ -366,7 +371,15 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(150);
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")[0];
-    expect(sent?.text).toBe("[redacted away]"); // the ALTERED bytes — the draft never went on the wire
+    // The ALTERED bytes — the draft never went on the wire. DOD-M12B-AWAY-MARK-1 moved the
+    // auto-reply marking to AFTER screening, so the sent text is the redactor's output with the
+    // marker in front of it. Both facts are asserted, because the ordering matters in both
+    // directions: marking BEFORE screening let a redact verdict silently strip the marker (an away
+    // reply back on the wire indistinguishable from a person), and dropping the redaction here
+    // would put the pre-redaction draft on the wire, which is what this test was written for.
+    expect(sent?.text).toBe(markAsAutoReply("[redacted away]"));
+    expect(sent?.text).toContain("[redacted away]");
+    expect(sent?.text).not.toContain("Hey - reach me on Signal");
   });
 
   it("A3: an inbound session request while ATTENDED gets NO auto-ack", async () => {

@@ -111,10 +111,35 @@ cello_await_session({ timeout_ms: 60000 })
 
 Inbound sessions are **auto-accepted** by the standing receiver — there is no separate accept step. If `cello_await_session` times out, call `cello_sessions()`: the initiator may have created the session while you were waiting. A timeout is a normal answer, not an error.
 
+## Signal tokens — required on every send
+
+`cello_send` **refuses a message with no `signal`**. It is a PARAMETER, alongside `content` — not
+something you write into the message text. The signal declares what you are doing next, so the other
+agent knows whether to wait, go do something else, or close.
+
+```
+signal: "over"     — your turn is complete; you are entering read mode waiting for a reply.
+signal: "standby"  — your turn is NOT complete; you are going to do work and will follow up.
+                     Requires est_minutes.
+signal: "wrap"     — this is your final message; close the session after sending.
+```
+
+Two rules that follow from this and are not optional:
+
+- **Never write `[[OVER]]`, `[[STANDBY]]` or `[[WRAP]]` into `content`.** `cello_send` composes the
+  token itself from the parameter. Typing it in the body does NOT satisfy the check — the parameter
+  is still missing, you get the same refusal, and the receiver sees a duplicate token.
+- **After a send with `signal: "over"`, go straight to `cello_receive`.** Do not stop to ask the
+  operator whether to wait. The only send that is not followed by a receive is `signal: "wrap"`.
+
+When the counterparty's message carries `[[WRAP]]`, call `cello_close_session` immediately — no
+acknowledgement message, no asking for approval.
+
 ## Sending and receiving
 
 ```
-cello_send({ cello_session_id: "<hex>", content: "hello" })
+cello_send({ cello_session_id: "<hex>", content: "hello", signal: "over" })
+cello_send({ cello_session_id: "<hex>", content: "on it", signal: "standby", est_minutes: 10 })
 cello_receive({ cello_session_id: "<hex>", timeout_ms: 30000 })
 → { content: "hello back", sequence_number: 1 }
 ```
@@ -159,7 +184,7 @@ cello_status()                      — daemon + agent state
 ```
 cello_initiate_session({ target_pubkey, agent? })
 cello_await_session({ timeout_ms, agent? })
-cello_send({ cello_session_id, content, agent? })
+cello_send({ cello_session_id, content, signal, est_minutes?, agent? })  — signal is REQUIRED: "over" | "standby" | "wrap"
 cello_receive({ cello_session_id, timeout_ms?, since_seq?, agent? })
 cello_close_session({ cello_session_id, force?, session_name?, agent? })
 cello_name_session({ cello_session_id, session_name, agent? })  — label a session; null clears it

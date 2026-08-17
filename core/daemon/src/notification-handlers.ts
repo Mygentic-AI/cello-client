@@ -121,17 +121,49 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
 
     const agents = agentNames.map((agent) => {
       reapExpiredInboundSessions(agent); // M8C-TTL-1: expired ones surface below, not as "pending"
+      // DOD-M12B-INBOX-TRUTH-1: `accepted` is not decoration — it is the correction. Everything in
+      // this queue was accepted by the standing receiver BEFORE it was ever enqueued
+      // (`acceptInboundAssignment` → `enqueueInboundSession`, inbound-sessions.ts), so "pending"
+      // has only ever described the NOTICE. Read as "not yet accepted" — which is how the field
+      // name reads — it sends an agent hunting for an accept step that does not exist, and it cost
+      // hours on 2026-08-17 plus a wrong report that two sides disagreed a session existed.
+      // A boolean the caller can branch on comes first; the prose below is the explanation.
       const pending = (inboundSessionQueues.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
+        accepted: true,
       }));
       // M8C-TTL-1: expired requests stay VISIBLE (not silently dropped) — the operator can see
       // what they missed rather than a request just vanishing from the pending list.
+      // DOD-M12B-INBOX-TRUTH-1: and they carry the same `accepted: true`, for a sharper reason.
+      // `reapExpiredInboundSessions` reaps a TERMINAL session first and only then an expired one,
+      // so every row here names a session that was NOT terminal when its notice aged out. That
+      // ordering is load-bearing for the guidance below and was corrected in the same change: with
+      // `tooOld` tested first, a notice that was both expired AND sealed landed here, under prose
+      // that says the session may still be live. Read as "that session expired", this list talks an
+      // operator into abandoning a session that is still open — so it must only ever hold those.
       const expired = (expiredSessionRequests.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
         expired_at: e.expiredAt,
+        accepted: true,
       }));
+      const pendingGuidance = pending.length === 0 ? {} : {
+        pending_session_requests_guidance:
+          "These sessions are ALREADY ACCEPTED and live. The standing receiver accepted each one " +
+          "when it arrived — there is no separate accept step, and nothing is waiting on you to " +
+          "grant one. \"Pending\" describes the NOTICE, not the session: it means no " +
+          "cello_await_session call has claimed the notice yet. You can read the conversation with " +
+          "cello_receive and reply with cello_send right now. cello_await_session only drains the " +
+          "notice; it is not what makes the session usable.",
+      };
+      const expiredGuidance = expired.length === 0 ? {} : {
+        expired_session_requests_guidance:
+          "The NOTICE expired, not the session. Each of these was accepted when it arrived and was " +
+          "simply never claimed by cello_await_session before the notice aged out, so it stopped " +
+          "being listed as pending. The session itself may still be live — check cello_sessions " +
+          "before telling the operator it is gone, and read it with cello_receive if it is.",
+      };
       // M12-P18: sessions THIS agent turned away (cap/abuse bound). Local-only visibility so a cap
       // firing does not require reading the daemon log to discover — the failure mode that hid a
       // stranded 297-times-re-pulled message.
@@ -177,7 +209,14 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // stale. Hence the explicit terminal flags: a field a caller can branch on, ahead of prose
         // it may not read.
         return {
-          agent, pending_session_requests: pending, expired_session_requests: expired, unread,
+          agent, pending_session_requests: pending, expired_session_requests: expired,
+          ...pendingGuidance, ...expiredGuidance,
+          // DOD-M12B-INBOX-TRUTH-1 (found while fixing the above): `refused_session_requests` was
+          // present on the other return and absent here, so an agent that happened to have any
+          // ended-unread history stopped being told which sessions it had TURNED AWAY. That is the
+          // exact surface M12-P18 added so a cap firing did not require reading the daemon log.
+          ...(refused.length > 0 ? { refused_session_requests: refused } : {}),
+          unread,
           total_unread, rename_notices, ...documentSection(agent),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
@@ -221,7 +260,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent) };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

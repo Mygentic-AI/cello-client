@@ -132,6 +132,43 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(parkCalls).toBe(1);
   });
 
+  it("a park NAMES THE CAUSE of the direct-send failure — silence here hid a defect for a night", async () => {
+    // Measured 2026-08-17: 212 parks on one daemon, and not ONE of them recorded why the direct
+    // send failed. The catch that parks the content discarded the error entirely, so every surface
+    // said "dispatched to relay" — the exit point — and nothing anywhere said what went wrong.
+    //
+    // The project rule is that errors name their cause, not their exit point. This is the send
+    // path's version of it. The peer id we FAILED TO REACH is the load-bearing field: a session
+    // records its counterparty's peer id once at establishment and never refreshes it, so a stale
+    // id is invisible today and would be a one-line read here.
+    await makeAgentDir("alice");
+    const h = await start(new FakeNode({ newStreamFails: true }));
+    const snm = h.getSessionNodeManager();
+    snm.setContentParkHook(async () => ({ ok: true }));
+
+    const kp = generateKeypair();
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
+      relayPeerId: "12D3KooWFakeRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
+      keyProvider: kp,
+      senderPubkey: await kp.getPublicKey(),
+      sessionIdBytes: Buffer.from(SID, "hex"),
+    });
+
+    const content = new TextEncoder().encode("why did this park?");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    expect(res).toMatchObject({ ok: true, delivered: false, parked: true });
+
+    const failed = captured.filter((e) => e.event === "session.content.direct.send.failed");
+    expect(failed).toHaveLength(1);
+    // The peer we could not reach, and the reason we could not — both, or the event is decoration.
+    expect(failed[0]!.context).toMatchObject({
+      sessionId: SID,
+      counterpartySessionPeerId: "bob-peer-id",
+    });
+    expect(String(failed[0]!.context["error"] ?? "")).not.toHaveLength(0);
+  });
+
   it("sendContent: direct-stream failure + NO relay configured → unchanged {ok:false, reason:session_stream_unavailable} (regression lock)", async () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));

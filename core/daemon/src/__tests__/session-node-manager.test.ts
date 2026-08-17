@@ -605,8 +605,21 @@ describe("SessionNodeManager — unit tests", () => {
     );
     expect(createdEvent).toBeDefined();
 
-    // Only allowed context fields: sessionId, agentName, sessionPeerId, correlationId
-    const allowedFields = new Set(["sessionId", "agentName", "sessionPeerId", "correlationId"]);
+    // Only allowed context fields: sessionId, agentName, sessionPeerId,
+    // counterpartySessionPeerId, correlationId.
+    //
+    // `counterpartySessionPeerId` was DECLARED here deliberately rather than the assertion being
+    // relaxed to accommodate it. This invariant exists to keep SECRET KEY MATERIAL out of the
+    // event; a libp2p peer id is public network identity — the same class of value as
+    // `sessionPeerId`, which this list has always permitted — and the no-secrets assertion below
+    // still runs over it unchanged.
+    //
+    // It earns its place: the id is recorded once at establishment and never refreshed, so when a
+    // peer's standing receiver is rebuilt under a new keypair mid-negotiation, this is the only
+    // field that can show the two sides disagreeing about who to talk to.
+    const allowedFields = new Set([
+      "sessionId", "agentName", "sessionPeerId", "counterpartySessionPeerId", "correlationId",
+    ]);
     const actualFields = Object.keys(createdEvent!.context);
     for (const field of actualFields) {
       expect(allowedFields.has(field)).toBe(true);

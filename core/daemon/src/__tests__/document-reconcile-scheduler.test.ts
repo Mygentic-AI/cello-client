@@ -159,3 +159,72 @@ describe("onReachable (R39 trigger 2)", () => {
     expect(f.sent).toHaveLength(0);
   });
 });
+
+describe("a REFUSAL is an answer, and it must slow the asking down", () => {
+  // Measured 2026-08-17: 321 reconcile attempts against two documents in 85 minutes, refused
+  // every time, zero successes, ~4 dials a minute forever. The backoff never engaged because
+  // `allOk` reports whether the FRAME WAS SENT, not whether reconcile succeeded — so a peer
+  // answering "no, and never again" was indistinguishable from a peer answering fine.
+  //
+  // R41 holds: this DELAYS an exchange, it never forbids one. A terminal refusal goes straight
+  // to the cap rather than being retired, so nothing here can permanently forbid an exchange
+  // that a later entry might make admissible.
+  it("a NON-TERMINAL refusal backs the party off instead of retrying at full speed", async () => {
+    const f = fixture();
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+
+    f.scheduler.noteRefusal(OWNER, PEER, false);
+    f.clock.now += 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    // Past the first backoff step it is asked again — a refusal delays, it does not forbid.
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
+  it("a TERMINAL refusal goes straight to the cap — 'nothing further to reconcile' is not a retry", async () => {
+    const f = fixture();
+    f.scheduler.noteRefusal(OWNER, PEER, true);
+
+    // Just under the cap: still suppressed. This is the 105-refusals case.
+    f.clock.now += RECONCILE_BACKOFF_CAP_MS - 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    // Past the cap it asks once more. R41: delayed, never forbidden.
+    f.clock.now += 2_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
+  it("an explicit reachability signal still CLEARS a refusal backoff — R39's second trigger outranks it", async () => {
+    const f = fixture();
+    f.scheduler.noteRefusal(OWNER, PEER, true);
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent).toHaveLength(1);
+  });
+});
+
+describe("DOD-M12B-DELIVERY-QUIET-1: what the reachability trigger actually does", () => {
+  /**
+   * The stakes behind exempting delivery-opened sessions, asserted here rather than inferred there.
+   *
+   * If `onReachable` were a mild nudge, suppressing it for machine-opened sessions would be
+   * over-engineering. It is not: it wipes the backoff outright and sweeps immediately. So a session
+   * the delivery worker itself opened re-opens the loop that a refusal had just closed — which is
+   * the circularity, in two lines.
+   */
+  it("onReachable WIPES a backoff a TERMINAL refusal just set, and sweeps at once", async () => {
+    const f = fixture();
+    f.scheduler.noteRefusal(OWNER, PEER, true);          // terminal → straight to the cap
+    f.clock.now += 1_000;                                 // nowhere near the cap
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    const before = f.sent.length;
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent.length, "onReachable did not wait out the cap — that is the behaviour being suppressed")
+      .toBeGreaterThan(before);
+
+    // ...and the backoff is gone afterwards, not merely bypassed once.
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+});
+

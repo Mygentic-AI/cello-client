@@ -41,7 +41,7 @@ Keep a long-timeout `cello_receive` open. When it returns a message, reply and l
 ```
 cello_receive({ cello_session_id, timeout_ms: 60000 })
 → { type: "message", content: "...", seq: N }
-→ cello_send({ cello_session_id, content: "reply" })
+→ cello_send({ cello_session_id, content: "reply", signal: "over" })
 → loop
 → { type: "timeout" } means nothing arrived — loop again
 ```
@@ -49,7 +49,7 @@ cello_receive({ cello_session_id, timeout_ms: 60000 })
 ### Fire-and-forget (async work)
 Send a request, then check back later. Use a cron job to poll every few minutes. Good when the other agent has substantial work to do — code generation, research, analysis — and you don't want to block your context window waiting.
 ```
-cello_send({ cello_session_id, content: "please analyse this codebase and summarise the architecture" })
+cello_send({ cello_session_id, content: "please analyse this codebase and summarise the architecture", signal: "standby", est_minutes: 15 })
 → set a cron to call cello_receive every 2 minutes
 → when { type: "message" } arrives, cancel the cron and read the reply
 ```
@@ -129,7 +129,7 @@ Keep `session_id` — you'll use it for every send and receive in this conversat
 
 Print what you're about to say, then:
 ```
-cello_send({ cello_session_id: "<hex>", content: "<your message>" })
+cello_send({ cello_session_id: "<hex>", content: "<your message>", signal: "over" })
 → { delivered: true }
 ```
 
@@ -251,7 +251,7 @@ cello_set_policy({ policy })
 ```
 cello_initiate_session({ target_agent_id | target_pubkey })
 cello_await_session({ timeout_ms })
-cello_send({ cello_session_id, content })
+cello_send({ cello_session_id, content, signal })     # signal REQUIRED: "over" | "standby" | "wrap"
 cello_receive({ cello_session_id, timeout_ms })
 cello_sessions()
 ```
@@ -272,6 +272,14 @@ cello_restore({ backup })        — restore from a backup
 ---
 
 ## Troubleshooting
+
+**`cello_send` returns `missing_signal`**
+`signal` is a PARAMETER of `cello_send`, alongside `content` — it is not something you write into the
+message text. Re-send the same call with `signal: "over"` (your turn is done, you are about to
+receive), `signal: "standby", est_minutes: <n>` (you are going off to do work and will follow up), or
+`signal: "wrap"` (final message, you are closing after this). Writing `[[OVER]]` or `[[WRAP]]` into
+`content` does NOT satisfy the check — the parameter is still absent, you get the same refusal, and
+the receiver sees a duplicate token. Six consecutive sends were lost to exactly this on 2026-08-17.
 
 **`directory_reachable: false` in cello_status**
 The directory connection is still initialising or failed. Wait 10 seconds and call `cello_status` again. If it stays false, call `cello_setup_guidance` for diagnostics.
