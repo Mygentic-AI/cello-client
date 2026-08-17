@@ -122,6 +122,29 @@ const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
 const REDIAL_COOLDOWN_MS = 15_000;
 
 /**
+ * DOD-CAP-SELF-HEAL-1 — how long an interrupted session keeps consuming a cap slot.
+ *
+ * ATTRIBUTION ALONE DID NOT FIX THIS, and the reason is worth keeping. Recording who ended a
+ * session only works for sessions ended after the recording started: every row written before the
+ * column existed is unlabelled, and an unlabelled row counts. So the operator's actual backlog —
+ * five finished conversations that were blocking two of their own agents — was untouched by it.
+ * Attribution can never clear history, and history is what fills a cap.
+ *
+ * Age can. An interrupted session nobody has touched for hours is debris, not a live obligation,
+ * and that is true whether our restart or their disconnect produced it.
+ *
+ * D18 SURVIVES BECAUSE THE ATTACK IS A RATE. The disconnect-evasion peer has to drop and reopen
+ * faster than this window to gain anything, so everything it churns is recent and everything it
+ * churns still counts. What ages out is the thing that was never an attack: a conversation that
+ * finished. An attacker who waits out the window to gain one slot per window is not evading the
+ * bound, they are obeying a slower one — and the global anti-swarm cap still applies on top.
+ *
+ * Two hours: comfortably longer than any churn worth attacking with, comfortably shorter than
+ * "yesterday's conversation still blocks me".
+ */
+export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_TTL_MS"]) || 2 * 60 * 60 * 1000;
+
+/**
  * DOD-CAP-SELF-HEAL-1 — what counts against a per-sender acceptance bound.
  *
  * `active` always. `interrupted` ONLY when the counterparty caused it.
@@ -141,10 +164,15 @@ const REDIAL_COOLDOWN_MS = 15_000;
 const CAP_COUNTS = (alias = ""): string => {
   const p = alias ? `${alias}.` : "";
   return `(${p}status = 'active'
-           OR (${p}status = 'interrupted' AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'))`;
+           OR (${p}status = 'interrupted'
+               AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'
+               AND ${p}updated_at >= ?))`;
 };
 const CAP_COUNT_SQL = (where: string): string =>
   `SELECT COUNT(*) AS n FROM sessions WHERE ${where} AND ${CAP_COUNTS()}`;
+
+/** The cutoff an interrupted session must be newer than to still count. */
+const capStaleBefore = (): number => Date.now() - CAP_INTERRUPTED_TTL_MS;
 
 /**
  * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
@@ -2121,7 +2149,7 @@ export class SessionNodeManager {
     if (!this.#db) return 0;
     const row = this.#db
       .prepare(CAP_COUNT_SQL("agent_id = ? AND counterparty_pubkey = ?"))
-      .get(this.#requireAgentId(agentName), counterpartyPubkey) as { n: number };
+      .get(this.#requireAgentId(agentName), counterpartyPubkey, capStaleBefore()) as { n: number };
     return row.n;
   }
 
@@ -2145,7 +2173,7 @@ export class SessionNodeManager {
                AND c.tier >= ${TIER.KNOWN} AND c.tier <= ${TIER.VIP}
            )`,
       )
-      .get(this.#requireAgentId(agentName)) as { n: number };
+      .get(this.#requireAgentId(agentName), capStaleBefore()) as { n: number };
     return row.n;
   }
 
@@ -5841,7 +5869,7 @@ export class SessionNodeManager {
       const rows = this.#db.prepare(
         `SELECT session_id FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ? AND ${CAP_COUNTS()}
          ORDER BY updated_at ASC LIMIT ?`,
-      ).all(this.#requireAgentId(agentName), counterpartyPubkey, limit) as Array<{ session_id: string }>;
+      ).all(this.#requireAgentId(agentName), counterpartyPubkey, capStaleBefore(), limit) as Array<{ session_id: string }>;
       return rows.map((r) => r.session_id);
     } catch {
       return [];
