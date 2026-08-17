@@ -355,6 +355,13 @@ export interface DaemonConfig {
    */
   contentTtfMs?: number;
   /**
+   * DOD-M12B-RESTART-SEAL-1: how long after boot the restart-seal resolver waits before its first
+   * attempt, in ms. Default 30_000 — a seal is a directory ceremony and signaling is still being
+   * established when boot finishes, so attempting immediately spends an attempt on a connection
+   * that does not exist yet. Tests set it small to drive the resolver deterministically.
+   */
+  restartSealInitialDelayMs?: number;
+  /**
    * Low-level dialer backing the transport selector in
    * production environments (dev/staging/production). Wraps a CelloNode (direct +
    * relay circuit dial) and the daemon relay registry. Required for production

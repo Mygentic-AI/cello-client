@@ -3622,6 +3622,40 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-RESTART-SEAL-1 — the sessions OUR OWN stop orphaned, and only those.
+   *
+   * `interrupted_by` is the whole safety argument. `'local'` means the boot sweep, the shutdown
+   * sweep, or the operator's own kill switch ended this session — nobody else did, and it cannot be
+   * resumed because the transport keypairs died with the process. Those are the ones the resolver
+   * may seal on its own.
+   *
+   * Everything else is excluded and must stay excluded:
+   *   'counterparty'        — they hung up. SI-001: the operator may still want to wait.
+   *   'relay_stream_close'  — our relay witness link ended; the session itself may be fine.
+   *   NULL                  — written before the column existed, so the cause is UNKNOWN. An
+   *                           unknown cause is not a licence to notarize; it is the reason not to.
+   *
+   * Same INNER JOIN discipline as getSessionsByStatus: a retired agent's rows are kept for
+   * accountability and are not resumable, so they are not offered for sealing either.
+   */
+  listRestartOrphanedSessions(): Array<{ agentName: string; sessionId: string; messageCount: number }> {
+    if (!this.#db) return [];
+    const rows = this.#db
+      .prepare(
+        `SELECT s.session_id AS session_id, s.message_count AS message_count, a.agent_name AS agent_name
+         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
+         WHERE s.status = 'interrupted' AND s.interrupted_by = 'local' AND a.state != 'retired'
+         ORDER BY s.updated_at ASC`,
+      )
+      .all() as unknown as Array<{ session_id: string; message_count: number; agent_name: string }>;
+    return rows.map((r) => ({
+      agentName: r.agent_name,
+      sessionId: r.session_id,
+      messageCount: r.message_count ?? 0,
+    }));
+  }
+
+  /**
    * cello_list_sessions: every persisted session for one agent, regardless of
    * status (active, interrupted, sealed, seal_interrupted_pending). Ordered most
    * recently updated first so the live session surfaces at the top. This is the

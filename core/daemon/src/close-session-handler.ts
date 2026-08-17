@@ -899,6 +899,13 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           return {
             ok: false,
             reason: "seal_counterparty_pending",
+            // DOD-M12B-RESTART-SEAL-1: the deadline as a NUMBER, not only inside the sentence.
+            // The directory tells us exactly when this becomes allowed and, until now, the only
+            // consumer of that fact was English prose asking a human to come back in eleven
+            // minutes. A caller that can wait — the restart-seal resolver — needs it as data.
+            ...(typeof uniResult.remainingSeconds === "number"
+              ? { retry_after_seconds: uniResult.remainingSeconds }
+              : {}),
             guidance: `Your SEAL leaf is recorded, but the counterparty has not closed and the directory's delivery-grace window has not yet elapsed, so a unilateral seal is not yet allowed. ${when}Retry cello_close_session after the grace period, or once the counterparty closes.`,
           };
         }

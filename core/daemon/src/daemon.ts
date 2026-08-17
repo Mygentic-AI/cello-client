@@ -40,6 +40,7 @@ import type {
   DirectorySignalingState,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
+import { RestartSealResolver } from "./restart-seal-resolver.js";
 import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
@@ -374,6 +375,8 @@ async function startDaemonHoldingLock(
   // classification (INV-TYPE-CARRY). Absent pubkey = polling disabled, all types unclassified.
   const typeRegistry = new TypeRegistry();
   let stopRegistryPoll: (() => void) | undefined;
+  // DOD-M12B-RESTART-SEAL-1: assigned as the last act of boot, stopped in stop().
+  let restartSealResolver: RestartSealResolver | undefined;
   if (config.registryPubkey && config.registryPollScheduler) {
     const registryVersionStore = new DbRegistryVersionStore(sessionNodeManager.getDb(), logger);
     stopRegistryPoll = startRegistryPoll({
@@ -4281,6 +4284,11 @@ async function startDaemonHoldingLock(
     if (config.registryPollScheduler) {
       config.registryPollScheduler.cancel();
     }
+    // DOD-M12B-RESTART-SEAL-1: stop opening directory ceremonies. A seal is the most outbound thing
+    // this daemon does, and DOD-M12B-SHUTDOWN-1's rule is that a shutdown which keeps starting new
+    // outbound work is not draining. Above the `daemon.stopped` log with the other cancels, because
+    // this is "stop making new work", not "tear down transports".
+    restartSealResolver?.stop();
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // DOD-LOGOUT-EXIT-1: what the teardown actually DID, carried to onStopped so the binary can
     // exit non-zero on a dirty stop. Without it a shutdown that threw halfway — sessions never
@@ -4382,6 +4390,37 @@ async function startDaemonHoldingLock(
   // M8C-TGDOOR-1: cold-capable — start the poller if a token was already configured from a
   // prior run, without waiting for any agent to come online or any client to attach.
   startTelegramPollerIfConfigured();
+
+  // DOD-M12B-RESTART-SEAL-1: seal the sessions the LAST shutdown orphaned.
+  //
+  // 114 of 118 interrupted sessions on one operator's machine were flipped by our own shutdown
+  // sweep and then sat there, because nothing has ever moved a session out of `interrupted`. Their
+  // only exit was a force-abandon, which forfeits the notarized receipt.
+  //
+  // Started last, like the Telegram poller, and resolved LAZILY out of the live `handlers` map: the
+  // close handler is registered far earlier, but reading it inside the callback is what lets a test
+  // swap it after boot and prove this wiring exists rather than assume it.
+  restartSealResolver = new RestartSealResolver({
+    logger,
+    listRestartOrphans: () => sessionNodeManager.listRestartOrphanedSessions(),
+    ...(config.restartSealInitialDelayMs !== undefined
+      ? { initialDelayMs: config.restartSealInitialDelayMs }
+      : {}),
+    sealSession: async (agentName, sessionId) => {
+      const close = handlers.get("cello_close_session");
+      if (!close) return { ok: false, reason: "close_handler_missing" };
+      const res = (await close({ session_id: sessionId, agent: agentName }, `restart-seal-${sessionId}`)) as
+        | { ok?: boolean; reason?: string; retry_after_seconds?: number }
+        | undefined;
+      if (res?.ok === true) return { ok: true };
+      return {
+        ok: false,
+        reason: res?.reason ?? "close_returned_nothing",
+        ...(typeof res?.retry_after_seconds === "number" ? { retryAfterSeconds: res.retry_after_seconds } : {}),
+      };
+    },
+  });
+  restartSealResolver.start();
 
   /**
    * The live handler map.
