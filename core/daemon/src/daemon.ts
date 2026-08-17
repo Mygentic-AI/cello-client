@@ -3658,6 +3658,10 @@ async function startDaemonHoldingLock(
       });
       return sent.ok ? { ok: true } : { ok: false, reason: sent.reason };
     },
+    // Read LAZILY: the scheduler is constructed after this layer (it consumes the layer's sweep
+    // targets), so the binding must be resolved at call time rather than captured here.
+    onPeerRefusal: (ownerAgentId, peerAgentId, terminal) =>
+      reconcileScheduler?.noteRefusal(ownerAgentId, peerAgentId, terminal),
     // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
     // how the surface tests passed while the feature did nothing: the test wired this seam to
     // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever

@@ -139,6 +139,15 @@ export interface DocumentLayerDeps {
      */
     leafKind?: number,
   ): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * A PEER REFUSED OUR EXCHANGE. Wired to the scheduler so the refusal can slow the asking down.
+   *
+   * Without it the refusal is logged and dropped, and the sweep — which can only see whether the
+   * frame was SENT — retries at full speed forever. Optional so a layer built without a scheduler
+   * (every unit fixture) needs no wiring; the scheduler treats the signal as a DELAY, never a
+   * prohibition (R41).
+   */
+  onPeerRefusal?(ownerAgentId: string, peerAgentId: string, terminal: boolean): void;
 }
 
 export interface DocumentLayer {
@@ -812,6 +821,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       logger.warn("document.reconcile.refused_by_peer", {
         senderAgentId, reason: frame.refusal.reason, terminal: frame.refusal.terminal, correlationId,
       });
+      // ACTED ON, not merely surfaced. The comment above has always said "never to retry blindly",
+      // and until now nothing downstream could tell a refusal from a success.
+      deps.onPeerRefusal?.(ownerAgentId, senderAgentId, frame.refusal.terminal);
       return { ok: true };
     }
     for (const block of frame.documents) {
@@ -820,6 +832,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           documentId: block.document_id, senderAgentId,
           reason: block.refusal.reason, terminal: block.refusal.terminal, correlationId,
         });
+        deps.onPeerRefusal?.(ownerAgentId, senderAgentId, block.refusal.terminal);
       }
     }
     if (frame.exchange_version !== DOCUMENT_RECONCILE_EXCHANGE_VERSION) {

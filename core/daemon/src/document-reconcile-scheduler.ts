@@ -123,6 +123,35 @@ export class ReconcileScheduler {
     await this.#attempt(ownerAgentId, peerAgentId, docs, s);
   }
 
+  /**
+   * A PEER ANSWERED "NO". That is an answer, and it must slow the asking down.
+   *
+   * `#attempt` can only see whether the FRAME WAS SENT — the refusal arrives later, on its own
+   * inbound frame, and until now it was logged and dropped. So a peer refusing every exchange was
+   * indistinguishable from a peer answering fine: `failures` reset to 0, `nextAttemptMs` to now,
+   * and the sweep asked again immediately. Measured 321 attempts against two documents in 85
+   * minutes, refused every time, zero successes.
+   *
+   * R41 IS PRESERVED: this DELAYS an exchange, it never forbids one. A terminal refusal jumps
+   * straight to the cap rather than retiring the party, because "terminal" is one holder's current
+   * derivation — a later entry can make the same exchange admissible again, and scheduling state
+   * must never be the thing that forbids it. `onReachable` still clears it outright.
+   */
+  noteRefusal(ownerAgentId: string, peerAgentId: string, terminal: boolean): void {
+    const s = this.#stateFor(this.#key(ownerAgentId, peerAgentId));
+    const now = this.#d.now();
+    const base = this.#d.backoffBaseMs ?? RECONCILE_BACKOFF_BASE_MS;
+    if (terminal) {
+      s.nextAttemptMs = now + RECONCILE_BACKOFF_CAP_MS;
+    } else {
+      s.failures += 1;
+      s.nextAttemptMs = now + Math.min(base * 2 ** (s.failures - 1), RECONCILE_BACKOFF_CAP_MS);
+    }
+    this.#d.logger.info("document.reconcile.refusal_backoff", {
+      peerAgentId, terminal, failures: s.failures, nextAttemptInMs: s.nextAttemptMs - now,
+    });
+  }
+
   /** R39's third trigger — one bounded pass for one owner. */
   async sweep(ownerAgentId: string): Promise<SweepResult> {
     const result: SweepResult = {
