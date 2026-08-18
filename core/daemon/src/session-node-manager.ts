@@ -476,6 +476,15 @@ export const REVIVAL_BOUND_SWEEP_MS = 60 * 60 * 1000;
  */
 export const REVIVE_START_TIMEOUT_MS = 10_000;
 
+/** DOD-M12B-SESSION-SEED-1: per-relay deadline when a revived node asks for a circuit reservation.
+ *  Three seconds — a relay that has a slot answers well inside it, and one that does not never
+ *  answers at all (measured: 10,002ms and still waiting). */
+export const REVIVE_RESERVATION_TIMEOUT_MS = 3_000;
+
+/** How many relays a revival will ask before settling for a plain node. Two: the worst case is then
+ *  ~6s to a usable session, against a measured "never" for the unbounded form. */
+export const REVIVE_RESERVATION_CANDIDATES = 2;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -611,6 +620,9 @@ export class SessionNodeManager {
    * why restart is `RESTART-SEAL-1`'s case (resolve with a receipt) and not a revival case.
    */
   #sessionSeeds = new Map<string, SessionRevivalIdentity>();
+
+  /** DOD-M12B-SESSION-SEED-1: see setRetryDrainHook — fired when a session is revived. */
+  #retryDrainHook: ((agentName: string, sessionId: string) => void) | null = null;
 
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
@@ -3377,6 +3389,49 @@ export class SessionNodeManager {
     // DAEMON-004: register the content stream handler for the inbound session.
     await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the inbound session node's peer events too.
+    /**
+     * DOD-M12B-RESPONDER-ADDR-1 — LEARN THE INITIATOR'S ADDRESS, because we will need it and this is
+     * the only moment we have it.
+     *
+     * MEASURED LIVE 2026-08-18. After an interruption the responder's re-dial reported
+     * `session.transport.redial.unavailable` — *"this side holds no address for the counterparty, so
+     * every send parks until they re-establish"* — and every reply it tried to send failed. The
+     * initiator can always come back because it kept the addresses it dialled; the responder dialled
+     * nothing, so it kept nothing.
+     *
+     * In plain terms that meant: whoever ANSWERED a conversation could not restart it. Their replies
+     * went nowhere until the other side spoke first.
+     *
+     * The live connection has known the address all along — the responder is holding it right now,
+     * because the initiator just dialled in on it. `#counterpartyAddrs` is the same store the
+     * initiator fills from its signed relay assignment, and `#evictSessionCaches` hands both to the
+     * revival record on the way down, so this needs no separate lifetime.
+     */
+    const inboundAddrs = node
+      .getConnections()
+      .filter((c) => c.peerId === initiatorPeerId && typeof c.remoteAddr === "string")
+      .map((c) => c.remoteAddr as string);
+    if (inboundAddrs.length > 0) {
+      this.#counterpartyAddrs.set(this.#k(agentName, sessionId), [...new Set(inboundAddrs)]);
+      this.#logger.info("session.counterparty.addr.learned", {
+        agentName,
+        sessionId,
+        addrs: inboundAddrs.length,
+        source: "inbound_connection",
+        impact: "this side can now re-dial after an interruption instead of parking every reply",
+      });
+    } else {
+      // ABSENT IS NOT FINE. Without an address this session is one-way after any break, and the
+      // operator would only discover it by sending and being told the message was lost.
+      this.#logger.warn("session.counterparty.addr.unavailable", {
+        agentName,
+        sessionId,
+        initiatorPeerId,
+        impact: "no address was observable on the inbound connection, so replies will park after an "
+          + "interruption until the initiator re-establishes",
+      });
+    }
+
     this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, initiatorPeerId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
@@ -8496,6 +8551,90 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-SESSION-SEED-1 — build a revived session node that is REACHABLE, without ever hanging.
+   *
+   * MEASURED 2026-08-18, live, three ways:
+   *   - handed 2 relay addrs at once, no deadline:  `start()` never completes (10,002ms and counting)
+   *   - handed none:                                `start()` in 1ms, but NOBODY can dial the node —
+   *                                                 the counterparty's re-dial fails
+   *                                                 `counterparty_dial_failed` and every message in
+   *                                                 both directions has to go the relay park route
+   *   - this:                                       one candidate at a time, each raced against its
+   *                                                 own deadline, plain node as the floor
+   *
+   * The middle option is what shipped for one test run and it made the session half-dead: revived,
+   * `active`, and unreachable. The first is what shipped before that and it hung. Neither is a
+   * choice between "fast" and "reliable" — the per-candidate race is how `#startReceiverNode` has
+   * always done it, and it is the shape that works in production every day.
+   *
+   * A FAILED CANDIDATE IS STOPPED, AND AWAITED, before the next is tried. The receiver path fires
+   * its teardown unawaited to avoid a stuck libp2p stop blocking receiver creation, and that is why
+   * it must mint a seed per candidate — two nodes can be briefly live. Here the identity is FIXED
+   * (it is the whole point), so two live nodes would mean two nodes on one advertised peer id. The
+   * await is what makes reusing the seed safe.
+   *
+   * The floor is a plain node: a session that is usable over the relay park route beats no session.
+   */
+  async #buildRevivedNode(
+    sessionId: string,
+    gater: SessionConnectionGater,
+    seed: Uint8Array,
+    candidateAddrs: string[],
+    agentName: string,
+  ): Promise<CelloNode> {
+    for (const circuitAddr of candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES)) {
+      const candidate = await this.#factory.createNode({
+        sessionId,
+        connectionGater: gater,
+        nodeType: "session",
+        inboundReachable: true,
+        transportPrivateKey: seed,
+        circuitRelayListenAddrs: [circuitAddr],
+      });
+      const started = await Promise.race([
+        candidate.start().then(() => true as const),
+        new Promise<false>((res) => setTimeout(() => res(false), REVIVE_RESERVATION_TIMEOUT_MS).unref?.()),
+      ]).catch(() => false as const);
+
+      if (started && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+        this.#logger.info("session.revive.reservation.granted", { agentName, sessionId });
+        return candidate;
+      }
+      // Started but granted nothing, or never started. Either way this node is not the one, and it
+      // must be gone before the next attempt reuses its identity.
+      this.#logger.info("session.revive.reservation.declined", {
+        agentName,
+        sessionId,
+        started,
+        impact: "trying the next relay; if none grant, the session comes up reachable only via the relay park route",
+      });
+      try { await candidate.stop(); } catch { /* best-effort: it may never have started */ }
+    }
+
+    // THE FLOOR. No reservation, so the counterparty cannot dial us directly — but their messages
+    // park at the relay and drain, which is how every message in the 2026-08-18 test arrived. A
+    // session usable one way beats a session that never comes back.
+    const plain = await this.#factory.createNode({
+      sessionId,
+      connectionGater: gater,
+      nodeType: "session",
+      inboundReachable: true,
+      transportPrivateKey: seed,
+    });
+    await plain.start();
+    if (candidateAddrs.length > 0) {
+      this.#logger.warn("session.revive.reservation.none", {
+        agentName,
+        sessionId,
+        candidates: candidateAddrs.length,
+        impact: "the revived session holds no circuit address — the counterparty cannot dial it, so "
+          + "delivery in both directions depends on relay store-and-forward until it is rebuilt",
+      });
+    }
+    return plain;
+  }
+
+  /**
    * DOD-M12B-SESSION-SEED-1 — bring an interrupted session back on the peer id it already has.
    *
    * THE DEFECT THIS CLOSES. `markInterruptedWithDetails` and `destroySessionNode` stop the node and
@@ -8562,10 +8701,6 @@ export class SessionNodeManager {
     for (const relayPeerId of reservations.relayPeerIds) gater.setAllowedOutboundPeer(relayPeerId);
 
     let node: CelloNode;
-    // INSTRUMENTED 2026-08-18. The first version of this had a bare 10s cap and NO measurement, so
-    // when it fired all it could say was "timeout" — which is a description of our own deadline, not
-    // of anything that happened. The relay answers a TCP connect in ~1.1s, and the failing rebuild
-    // logged no relay activity at all, so the cap was capping something nobody had looked at.
     const t0 = Date.now();
     this.#logger.info("session.revive.node.building", {
       agentName,
@@ -8574,78 +8709,13 @@ export class SessionNodeManager {
       relayPeerIds: reservations.relayPeerIds.length,
     });
     try {
-      node = await this.#factory.createNode({
+      node = await this.#buildRevivedNode(sessionId, gater, identity.seed, reservations.addrs, agentName);
+      this.#logger.info("session.revive.node.started", {
+        agentName,
         sessionId,
-        connectionGater: gater,
-        nodeType: "session",
-        transportPrivateKey: identity.seed,
-        // review HIGH-1: reachable, and holding a circuit reservation. A revived node that binds
-        // loopback preserves an identity nobody can dial — the counterparty's next message parks
-        // again and case B is only half delivered.
-        inboundReachable: true,
-        /**
-         * NO CIRCUIT-RELAY RESERVATION HERE, and this is a measured decision rather than an omission.
-         *
-         * MEASURED 2026-08-18, live, both ways:
-         *   with 2 relay addrs:  createNode 1ms, start() 10,002ms — NEVER completes
-         *   with none:           createNode 1ms, start() 1ms — session revived
-         *
-         * A relay reservation during `start()` is not slow, it does not finish. The relay answers a
-         * TCP connect in ~1.1s, so it is reachable; the reservation handshake inside libp2p's listen
-         * is what hangs, and it has no deadline of its own. A ten-second cap on top of that was
-         * capping a permanent stall, which is why it was wrong to add one before measuring.
-         *
-         * WHAT WE GIVE UP, stated plainly: this node holds no circuit address, so the counterparty
-         * cannot DIAL it directly. That is survivable and observed working — their messages park at
-         * the relay and drain to us, which is how every message in this morning's test arrived. What
-         * we get back is that the session is usable IMMEDIATELY instead of never.
-         *
-         * The receiver rebuild path takes reservations properly — one candidate at a time, each
-         * raced against its own timeout — and a future unit should reuse that shape here rather than
-         * handing libp2p a list and hoping. Filed rather than guessed at.
-         */
-      });
-      /**
-       * BOUNDED — 2026-08-18, after an unbounded start hung a live `cello_receive` for over two
-       * minutes on a session whose message was already in the transcript.
-       *
-       * `node.start()` here waits on a circuit-relay RESERVATION, and a relay that does not answer
-       * has no deadline of its own. `#startReceiverNode` has always known this — it races each
-       * candidate against a timeout for exactly this reason — and the revival path was written
-       * without it.
-       *
-       * On timeout the node is stopped rather than abandoned: a half-started node holds our
-       * advertised identity, and leaving one running is the "nothing left open" rule broken by
-       * accident. The refusal is transient by name, because it is: the next send or read retries.
-       */
-      const tCreated = Date.now();
-      this.#logger.info("session.revive.node.created", { agentName, sessionId, createMs: tCreated - t0 });
-      await Promise.race([
-        node.start().then(() => {
-          this.#logger.info("session.revive.node.started", {
-            agentName,
-            sessionId,
-            startMs: Date.now() - tCreated,
-            listenAddrs: node.listenAddresses().length,
-            circuitListen: node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length,
-          });
-        }),
-        new Promise<never>((_res, rej) =>
-          setTimeout(() => rej(new Error("revive_node_start_timeout")), REVIVE_START_TIMEOUT_MS).unref?.(),
-        ),
-      ]).catch(async (err: unknown) => {
-        // WHICH HALF was slow, and what it had to work with. "timeout" alone names our deadline and
-        // nothing else — the defect this replaces.
-        this.#logger.error("session.revive.node.stalled", {
-          agentName,
-          sessionId,
-          elapsedMs: Date.now() - t0,
-          createMs: tCreated - t0,
-          circuitAddrs: reservations.addrs.length,
-          error: err instanceof Error ? err.message : String(err),
-        });
-        try { await node.stop(); } catch { /* best-effort: it never finished starting */ }
-        throw err;
+        startMs: Date.now() - t0,
+        listenAddrs: node.listenAddresses().length,
+        circuitListen: node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length,
       });
     } catch (err: unknown) {
       this.#logger.error("session.revive.node.failed", {
@@ -8672,6 +8742,35 @@ export class SessionNodeManager {
       this.#counterpartyAddrs.set(key, [...identity.counterpartyAddrs]);
     }
     const correlationId = randomUUID();
+    /**
+     * DOD-M12B-REVIVE-PARK-1 — RESTORE THE RELAY, or a revived session cannot park and every failed
+     * send is declared lost.
+     *
+     * This is the defect behind five identical live failures on 2026-08-18. `#parkContent` opens
+     * with `if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return "unconfigured"`,
+     * and a revived entry carried none of it — so the park was skipped and the send fell through to
+     * *"could NOT be queued for retry — it is lost. Send it again."* The relay was recorded on the
+     * session row the whole time, and store-and-forward would have delivered the message: the
+     * counterparty's own sends park through it successfully in the same minute.
+     *
+     * What it cost the operator: their reply was accepted, discarded, and they were told to retype
+     * it — which is how a transcript gets duplicates of a message that was never lost in the first
+     * place.
+     *
+     * Read from the row rather than carried in the revival record on purpose: the row is where the
+     * relay assignment is durable, and it is the same source `getPersistedRelayEndpoint` already
+     * serves the startup flush from — a path that exists precisely because in-memory entries are
+     * gone by then, which is exactly the situation a revival is in.
+     */
+    const persistedRelay = this.getPersistedRelayEndpoint(agentName, sessionId);
+    if (persistedRelay === null) {
+      this.#logger.warn("session.revive.relay.absent", {
+        agentName,
+        sessionId,
+        impact: "this session has no recorded relay, so a failed direct send cannot park — the "
+          + "message will be reported lost rather than delivered later",
+      });
+    }
     this.#activeNodes.set(key, {
       node,
       agentName,
@@ -8681,6 +8780,9 @@ export class SessionNodeManager {
       correlationId,
       counterpartySessionPeerId: identity.counterpartyPeerId,
       autoNat,
+      ...(persistedRelay
+        ? { relayPeerId: persistedRelay.relayPeerId, relayAddrs: persistedRelay.relayAddrs }
+        : {}),
     });
     await this.#registerContentHandler(agentName, sessionId, node, identity.counterpartyPubkey);
     /**
@@ -8722,6 +8824,21 @@ export class SessionNodeManager {
           "The session node was rebuilt but its status could not be written, so it was torn back " +
           "down rather than left live under an interrupted row. The daemon logged the cause.",
       };
+    }
+
+    // The messages that failed while this session was down were queued on a promise of "retried on
+    // reconnect". This is that reconnect — fire it before anyone is told the session is back.
+    if (this.#retryDrainHook !== null) {
+      try {
+        this.#retryDrainHook(agentName, sessionId);
+      } catch (err: unknown) {
+        this.#logger.warn("session.revive.retry_drain.failed", {
+          agentName,
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+          impact: "messages queued while this session was down are still queued",
+        });
+      }
     }
 
     const peerId = node.getPeerId();
@@ -8839,6 +8956,18 @@ export class SessionNodeManager {
     return { ok: true };
   }
 
+  /** DOD-M12B-REVIVE-PARK-1 test seam: the relay the live entry will park to. Not otherwise
+   *  observable — `#activeNodes` is private and the park's own refusal is silent about which of its
+   *  four preconditions was missing. */
+  getSessionRelayForTest(agentName: string, sessionId: string): { relayPeerId?: string; relayAddrs?: string[] } | null {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) return null;
+    return {
+      ...(entry.relayPeerId !== undefined ? { relayPeerId: entry.relayPeerId } : {}),
+      ...(entry.relayAddrs !== undefined ? { relayAddrs: entry.relayAddrs } : {}),
+    };
+  }
+
   /** DOD-M12B-SESSION-SEED-1 test seams: the counterparty addresses a re-dial depends on. Not
    *  otherwise observable — they are set from a signed relay assignment that a fixture cannot mint. */
   setCounterpartyAddrsForTest(agentName: string, sessionId: string, addrs: string[]): void {
@@ -8853,6 +8982,21 @@ export class SessionNodeManager {
    *  process restart does to it. The refusal that follows is the one an operator most needs named. */
   forgetSessionSeedForTest(agentName: string, sessionId: string): void {
     this.#sessionSeeds.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
+   * DOD-M12B-SESSION-SEED-1 — drain the direct-resend queue when a session comes back.
+   *
+   * `retryQueue.drainSession` had NO production caller. The send path enqueues into it on a failed
+   * delivery and tells the operator the message will be "retried on reconnect", and nothing ever
+   * reconnected it — the row sat there until the session went terminal and was reaped. Measured
+   * live 2026-08-18: two of the operator's messages went in, and the response told them both were
+   * lost and to send again, which is how a transcript gets duplicates.
+   *
+   * A revival IS the reconnect that sentence promised. This is the hook that makes it true.
+   */
+  setRetryDrainHook(fn: (agentName: string, sessionId: string) => void): void {
+    this.#retryDrainHook = fn;
   }
 
   /** DOD-M12B-SESSION-SEED-1 test seam: does this session still hold a revivable identity? */

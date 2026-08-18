@@ -371,10 +371,16 @@ class CelloNodeImpl implements CelloNode {
     return this.#libp2p.getProtocols();
   }
 
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> {
+  getConnections(): Array<{ peerId: string; encryption: string | undefined; remoteAddr?: string }> {
     return this.#libp2p.getConnections().map((c) => ({
       peerId: c.remotePeer.toString(),
       encryption: c.encryption,
+      // DOD-M12B-RESPONDER-ADDR-1: the address this peer is reachable at, which the RESPONDER
+      // otherwise never learns. It dialled nobody, so after an interruption it has nothing to dial
+      // back with — measured live 2026-08-18, `session.transport.redial.unavailable`, "this side
+      // holds no address for the counterparty". The connection has always known it; nothing exposed
+      // it. A relayed address (`/p2p-circuit`) is a valid dial target too, so both kinds are given.
+      remoteAddr: c.remoteAddr.toString(),
     }));
   }
 

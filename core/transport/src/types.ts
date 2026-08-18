@@ -228,7 +228,7 @@ export interface CelloNode {
    * Used by SI-001 test to verify connection-level encryption is Noise.
    * encryption is undefined when libp2p has not yet completed the security handshake.
    */
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }>;
+  getConnections(): Array<{ peerId: string; encryption: string | undefined; remoteAddr?: string }>;
 
   /**
    * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed

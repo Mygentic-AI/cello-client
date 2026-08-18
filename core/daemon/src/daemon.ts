@@ -1589,6 +1589,55 @@ async function startDaemonHoldingLock(
     retryQueue.reapTerminalSession(sessionId, terminalStatus);
   });
 
+  /**
+   * DOD-M12B-SESSION-SEED-1 — give `drainSession` the production caller it never had.
+   *
+   * The send path enqueues here on a failed delivery and tells the operator the message will be
+   * "retried on reconnect". Nothing ever reconnected it: the comment three lines above records that
+   * a direct-resend row is reachable only by `drainSession`, which had no caller, so rows sat until
+   * the session went terminal and were reaped unsent. Measured live 2026-08-18 — two of the
+   * operator's messages went in and both were reported lost, which is how a transcript gets
+   * duplicates.
+   *
+   * A REVIVAL IS THAT RECONNECT. Not awaited: the revival must not wait on delivery, and a resend
+   * that fails simply leaves the entry queued for the next one.
+   */
+  sessionNodeManager.setRetryDrainHook((agentName, sessionId) => {
+    void retryQueue
+      .drainSession(sessionId, async (contentBlob) => {
+        const res = await sessionNodeManager.sendContent(
+          agentName,
+          sessionId,
+          contentBlob,
+          wireContentHash(contentBlob),
+        );
+        // NAME THE CAUSE the send gave. A resend that failed for `session_terminal` and one that
+        // failed because the relay blinked lead to different places, and the queue's own log is the
+        // only surface either reaches.
+        return res.ok === true
+          ? { delivered: true as const }
+          : { delivered: false as const, error: res.reason ?? "send_failed" };
+      })
+      .then((delivered) => {
+        if (delivered > 0) {
+          logger.info("session.revive.retry_drain.delivered", {
+            agentName,
+            sessionId,
+            delivered,
+            impact: "messages the operator was told were lost have now been sent",
+          });
+        }
+      })
+      .catch((err: unknown) => {
+        logger.warn("session.revive.retry_drain.failed", {
+          agentName,
+          sessionId,
+          error: err instanceof Error ? err.message : String(err),
+          impact: "messages queued while this session was down remain queued",
+        });
+      });
+  });
+
   sessionNodeManager.setAwaitingAckHooks({
     onPersisted: (agentName, sessionId, contentHashHex) => {
       retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));

@@ -215,4 +215,40 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       "and it is discarded rather than parked",
     ).toEqual(addrs);
   }, 60_000);
+
+  it("MEASURED LIVE x5: a revived session can still PARK — otherwise every failed send is 'lost'", async () => {
+    /**
+     * THE DEFECT BEHIND FIVE IDENTICAL LIVE FAILURES, 2026-08-18. After an offline/online cycle the
+     * counterparty's reply came back:
+     *
+     *   {"ok":false,"reason":"session_stream_unavailable",
+     *    "guidance":"Direct delivery failed and the message could NOT be queued for retry — it is
+     *                lost. Send it again."}
+     *
+     * `#parkContent` opens with
+     *   `if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return "unconfigured"`
+     * and the revived entry carried no relay — so the park was skipped and the send fell through to
+     * the lost path. The relay was on the session ROW the whole time, and store-and-forward
+     * delivered the other side's messages through it in the same minute.
+     *
+     * The operator's reply was accepted, discarded, and they were told to retype it. That is how a
+     * transcript gets duplicates of a message that was never lost.
+     *
+     * Revert test (RUN): drop the `persistedRelay` spread from the revived entry and this fails.
+     */
+    const sid = "27".repeat(32);
+    await openSession(sid);
+    // What the relay assignment writes, and what every send afterwards depends on.
+    mgr!.getDb().prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ? WHERE session_id = ?")
+      .run("12D3KooWRelayForTest00000000000000000000000000", JSON.stringify(["/ip4/1.2.3.4/tcp/4001"]), sid);
+
+    await mgr!.destroySessionNode("alice", sid, "interrupted");
+    await mgr!.reviveSessionNode("alice", sid);
+
+    expect(
+      mgr!.getSessionRelayForTest("alice", sid),
+      "revived with no relay: the park is skipped and the operator is told their message is lost, " +
+      "while the relay that would have delivered it sits recorded on the row",
+    ).toEqual({ relayPeerId: "12D3KooWRelayForTest00000000000000000000000000", relayAddrs: ["/ip4/1.2.3.4/tcp/4001"] });
+  }, 60_000);
 });
