@@ -81,7 +81,7 @@ describe("AC-002 + SI-001: the session-request doorbell carries routing only", (
   });
 
   it("AC-002: the doorbell renders a non-empty body and carries the routing fields", () => {
-    const params = buildChannelParams(realSessionCreatedFrame());
+    const params = buildChannelParams(realSessionCreatedFrame(), "session_state_changed");
 
     // Claude Code needs `content` to render the <channel> tag body; without it the doorbell is
     // silently dropped and the agent never wakes (BUILD-JOURNAL Entry 43).
@@ -95,7 +95,7 @@ describe("AC-002 + SI-001: the session-request doorbell carries routing only", (
   });
 
   it("SI-001 TRIPWIRE: the doorbell's meta is EXACTLY the routing set — a new daemon field fails here", () => {
-    const params = buildChannelParams(realSessionCreatedFrame());
+    const params = buildChannelParams(realSessionCreatedFrame(), "session_state_changed");
 
     // If this fails because the daemon added a field: do NOT just add the key here. Ask first
     // whether that field is safe for an agent to read off a wake-up it did not ask for. `meta`
@@ -122,7 +122,7 @@ describe("AC-002 + SI-001: the session-request doorbell carries routing only", (
       content: "SECRET-MESSAGE-TEXT",
       // …and a non-scalar, e.g. the counterparty's multiaddrs.
       multiaddrs: ["/ip4/1.2.3.4/tcp/4001"],
-    });
+    }, "session_state_changed");
 
     // `content` is SYNTHESIZED here, never carried: the body is a fixed announcement.
     expect(params.content).not.toContain("SECRET-MESSAGE-TEXT");

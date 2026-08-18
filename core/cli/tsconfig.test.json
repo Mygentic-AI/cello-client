@@ -1,0 +1,35 @@
+{
+  // DOD-M12B-TESTS-NOT-TYPECHECKED-1 — this package's tests ARE type-checked.
+  //
+  // `tsconfig.json` excludes `src/__tests__` from `tsc --build`, so without this a test asserting on
+  // a field that does not exist, or calling a method that was removed, is invisible to the gate: it
+  // fails only if vitest happens to execute that line. That is the hollow-test shape, enforced by
+  // the build config. `files` rather than `include`, because the base `exclude` filters `include`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src"
+  ],
+  "files": [
+    "src/__tests__/cli-args.test.ts",
+    "src/__tests__/commands.test.ts",
+    "src/__tests__/dispatch-parity.test.ts",
+    "src/__tests__/dod-doc-cli-subverbs.test.ts",
+    "src/__tests__/dod-onboard-help-1-help.test.ts",
+    "src/__tests__/dod-onboard-help-1-sweep.test.ts",
+    "src/__tests__/hermes-channel-mode.test.ts",
+    "src/__tests__/hermes-install.test.ts",
+    "src/__tests__/hermes-wake-prompt.test.ts",
+    "src/__tests__/m10b-surface-1-consent-params.test.ts",
+    "src/__tests__/m10b-surface-1-list-consent.test.ts",
+    "src/__tests__/m8c-agent-param-1-cli.test.ts",
+    "src/__tests__/m8c-loginstart-1.test.ts",
+    "src/__tests__/m8d-receptionist-agent-1.test.ts",
+    "src/__tests__/m9b-surface-1-cli-confirm.test.ts",
+    "src/__tests__/parity-commands.test.ts",
+    "src/__tests__/registry-name-drift.test.ts",
+    "src/__tests__/registry.test.ts"
+  ]
+}

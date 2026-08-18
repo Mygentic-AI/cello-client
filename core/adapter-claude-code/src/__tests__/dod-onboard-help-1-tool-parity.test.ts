@@ -71,7 +71,9 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
   });
 
   it("every registered tool name exists in the vocabulary", () => {
-    const known = knownToolNames();
+    // A COPY: knownToolNames() returns a ReadonlySet, and mutating the shared one would leak this
+    // test's extra name into any other caller in the same run.
+    const known = new Set(knownToolNames());
     const strangers = registeredTools().filter((t) => !known.has(t));
     expect(
       strangers,
@@ -135,7 +137,9 @@ describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {
     // agent-facing prose — it carries no IPC wire names, which is the one thing that legitimately
     // names a tool that is not on the tool surface.
     expect(SHIPPED_DOCS.length, "no shipped .md found — this audit would be vacuous").toBeGreaterThan(0);
-    const known = knownToolNames();
+    // A COPY: knownToolNames() returns a ReadonlySet, and mutating the shared one would leak this
+    // test's extra name into any other caller in the same run.
+    const known = new Set(knownToolNames());
     // `cello_session_id` is a PARAMETER, not a tool — it carries the prefix only because Anthropic's
     // remote-devices bridge strips an argument named literally `session_id` (claude-code#77248), so
     // the bare name is unusable on the MCP surface. It is listed explicitly rather than pattern-

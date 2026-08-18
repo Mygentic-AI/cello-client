@@ -239,6 +239,9 @@ interface Verdict {
   retry_scheduled?: boolean;
   success?: boolean;
   error?: string | null;
+  /** AC13's connect() verdict. Declared because the assertions read it — and they pass, so the
+   *  Python side does return it; the type was simply behind the tests that use it. */
+  connected?: boolean;
   calls: Array<{ method: string; params: Record<string, unknown> }>;
 }
 
@@ -270,7 +273,9 @@ describe("DOD-HERMES-4 — the adapter owns inbound content and outbound deliver
 
   /** The mode-specific half of the platform hint, as the plugin would build it under `mode`. */
   function hintFor(mode: string | null): string {
-    const env = { ...process.env, PYTHONPATH: dir, PYTHONDONTWRITEBYTECODE: "1" };
+    // Typed as the process environment it actually is: spreading `process.env` into an object
+    // literal loses its index signature, so TS refuses a key it carries perfectly well at runtime.
+    const env: NodeJS.ProcessEnv = { ...process.env, PYTHONPATH: dir, PYTHONDONTWRITEBYTECODE: "1" };
     if (mode === null) delete env.CELLO_DELIVERY_MODE;
     else env.CELLO_DELIVERY_MODE = mode;
     return execFileSync(

@@ -20,7 +20,10 @@ describe("buildChannelParams — Claude Code channel contract", () => {
       { type: "some_future_type", agent: "alice" },
       {}, // no type at all
     ]) {
-      const { content } = buildChannelParams(frame);
+      // Resolved the way the real caller resolves it (`data.type ?? String(frame.notification)`);
+      // passing no type at all is a shape production cannot produce, so a test that did would be
+      // asserting on a branch nothing reaches.
+      const { content } = buildChannelParams(frame, String((frame as Record<string, unknown>).type ?? "cello_event"));
       expect(typeof content).toBe("string");
       expect(content.length).toBeGreaterThan(0);
     }
@@ -109,7 +112,7 @@ describe("buildChannelParams — Claude Code channel contract", () => {
   });
 
   it("drops keys with hyphens or other non-identifier characters (they'd be silently dropped by Claude Code anyway)", () => {
-    const { meta } = buildChannelParams({ type: "cello_message", "bad-key": "x", "ok_key": "y" }, "cello_message" as Record<string, unknown>);
+    const { meta } = buildChannelParams({ type: "cello_message", "bad-key": "x", "ok_key": "y" }, "cello_message");
     expect(meta).not.toHaveProperty("bad-key");
     expect(meta.ok_key).toBe("y");
   });
