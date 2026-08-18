@@ -304,7 +304,7 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
       // FIRST boot builds the schema, exactly as a real install does. Seeding into a hand-rolled
       // table would prove the sweep works against a shape production does not have.
       const first = await startDaemon(config);
-      await first.stop?.();
+      await first.stop("test: schema built");
 
       const db = openTestDb(join(tempDir, "sessions.db"));
       await seedAgents(db, ["alice"]);
@@ -328,7 +328,7 @@ describe("DOD-M12B-REVIVAL-BOUND-1: an unrevivable session reaches a terminal st
       }
       throw new Error("the daemon booted and never applied the revival bound — the wiring is dead");
     } finally {
-      await handle?.stop?.();
+      await handle?.stop("test: teardown");
       await rm(tempDir, { recursive: true, force: true });
     }
   }, 60_000);

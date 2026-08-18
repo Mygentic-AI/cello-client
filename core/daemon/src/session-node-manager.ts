@@ -32,7 +32,7 @@ import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUN
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
@@ -297,6 +297,37 @@ export interface SessionNodeConfig {
    * (no reservation, WARN) — it never fails node creation.
    */
   circuitRelayListenAddrs?: string[];
+  /**
+   * DOD-M12B-SESSION-SEED-1: the 32-byte Ed25519 seed this node's transport identity is derived
+   * from, so a node that is torn down can be rebuilt at the SAME peer id.
+   *
+   * Without it libp2p generates the key internally and the id is unrecoverable — which is why a
+   * laptop-close session cannot come back today: a rebuilt node could dial the counterparty, but
+   * the counterparty holds an id that no longer exists.
+   *
+   * PER SESSION, NEVER PER AGENT. Each standing receiver mints its own; at handoff the seed becomes
+   * that session's and the replacement receiver mints a fresh one. That preserves the recorded
+   * 2026-04-11 rationale for ephemeral ids (a passive observer must not be able to correlate one
+   * agent's sessions across days) while making the id stable WITHIN the one session an observer can
+   * already correlate by watching the connection.
+   */
+  transportPrivateKey?: Uint8Array;
+}
+
+/**
+ * DOD-M12B-SESSION-SEED-1 — everything needed to bring one session back, and nothing else.
+ *
+ * Deliberately minimal: a revival re-establishes the SAME session with the SAME two parties, so it
+ * needs our identity and theirs and no more. Anything else added here would be state that has to be
+ * destroyed on the same edge, and each addition is another way to leave something open.
+ */
+interface SessionRevivalIdentity {
+  /** The 32-byte Ed25519 seed our session node's peer id derives from. Zeroed on destruction. */
+  seed: Uint8Array;
+  /** The counterparty's SESSION-layer peer id — the gater's allowed peer, and our dial target. */
+  counterpartyPeerId: string;
+  /** Their agent pubkey, for the rebuilt content handler's authentication check. */
+  counterpartyPubkey: string;
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -304,6 +335,7 @@ export interface SessionNodeConfig {
 interface ActiveSessionEntry {
   node: CelloNode;
   agentName: string;
+
   /** DOD-LOOP-1: the bare session id (hex). The map key is composite (agentName, sessionId), so
    *  iteration/logging reads the real session id from here, not from the map key. */
   sessionId: string;
@@ -517,7 +549,31 @@ export class SessionNodeManager {
   // `hasReservation`: this receiver came up holding a /p2p-circuit address. The
   // watchdog uses it to tell "lost its reservation" (must recover) apart from
   // "never had one" (already degraded, and already loud) — see #reservationWatchdogTick.
-  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; relayPeerId?: string }>();
+  /**
+   * DOD-M12B-SESSION-SEED-1 — session id → the transport seed its node identity derives from.
+   *
+   * **DELIBERATELY NOT ON `ActiveSessionEntry`.** That entry is deleted the instant a session is
+   * interrupted (`markInterruptedWithDetails` and `destroySessionNode` both do it), which is exactly
+   * the moment the seed becomes necessary — storing it there would destroy it precisely when the
+   * session needs to come back. It has to outlive the NODE without outliving the SESSION.
+   *
+   * Andre's 2026-08-18 tenet is the lifetime rule: *"it should be possible to revive that session on
+   * those peer IDs. But after that, those peer IDs and that peer connection needs to be shut down."*
+   * So this map is cleared in the same step that writes a terminal status (`#updateSessionStatus`),
+   * not on a later sweep — and the bytes are zeroed before the reference is dropped, because a seed
+   * that stays readable in the heap is exactly the "left open" the tenet forbids.
+   *
+   * It holds the counterparty's session peer id alongside the seed, and not for convenience: that
+   * value lives ONLY on `ActiveSessionEntry` and is destroyed with it on interruption, so without a
+   * copy here we could rebuild our own identity and still not know who to let back in. Both halves
+   * of the revival have the same lifetime, so they are destroyed in one step.
+   *
+   * In memory only, never persisted. A daemon restart genuinely destroys these identities, which is
+   * why restart is `RESTART-SEAL-1`'s case (resolve with a receipt) and not a revival case.
+   */
+  #sessionSeeds = new Map<string, SessionRevivalIdentity>();
+
+  #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
   // M8B F14: agents that SHOULD have a standing receiver — marked by
   // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
@@ -2601,6 +2657,9 @@ export class SessionNodeManager {
     let node: CelloNode;
     let gater: SessionConnectionGater;
     let autoNat: NodeAutoNatService;
+    // DOD-M12B-SESSION-SEED-1: whichever branch below runs, the session ends up owning a seed.
+    // Promotion inherits the receiver's; a freshly-built node mints its own.
+    let seed: Uint8Array;
     if (reuseStandingReceiver) {
       const sr = this.#standingReceivers.get(agentName);
       if (!sr) {
@@ -2614,7 +2673,7 @@ export class SessionNodeManager {
           guidance: "The standing receiver node is initializing (completes within 200ms). Retry the session in a moment.",
         };
       }
-      ({ node, gater, autoNat } = sr);
+      ({ node, gater, autoNat, seed } = sr);
       gater.setAllowedPeer(counterpartyPeerId);
       // Hand this agent's standing receiver off to this session; a replacement is spun up below.
       this.#standingReceivers.delete(agentName);
@@ -2625,7 +2684,8 @@ export class SessionNodeManager {
         logger: this.#logger,
       });
       try {
-        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session" });
+        seed = randomBytes(32);
+        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session", transportPrivateKey: seed });
         await node.start();
       } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -2688,7 +2748,7 @@ export class SessionNodeManager {
     // Log observability event (session.node.created)
     //
     // `counterpartySessionPeerId` IS LOGGED because it is recorded here ONCE and never refreshed,
-    // while a standing receiver is rebuilt with a fresh libp2p keypair on every signaling reconnect
+    // while a standing receiver is rebuilt with a fresh libp2p keypair on a lost relay reservation
     // and every lost reservation. If the peer rebuilds between advertising its endpoint and this
     // handoff, we record an identity that no longer exists — and since `newStream` never dials, it
     // only ever looks for an ALREADY-OPEN connection filed under exactly this string, so every send
@@ -2715,6 +2775,7 @@ export class SessionNodeManager {
       counterpartySessionPeerId: counterpartyPeerId,
       autoNat,
     });
+    this.#rememberSessionSeed(agentName, sessionId, seed, counterpartyPeerId, counterpartyPubkey);
 
     // DAEMON-004: register the content stream handler so inbound content_frames
     // are cross-checked, appended to the daemon-owned tree, and buffered.
@@ -3206,7 +3267,7 @@ export class SessionNodeManager {
       };
     }
 
-    const { node, gater, autoNat } = inboundSr;
+    const { node, gater, autoNat, seed } = inboundSr;
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
     gater.setAllowedPeer(initiatorPeerId);
@@ -3220,6 +3281,11 @@ export class SessionNodeManager {
     // pointed at this initiator.
     if (!this.#insertSessionRow(sessionId, agentName, counterpartyPubkey, "active")) {
       this.#standingReceivers.delete(agentName);
+      // DOD-M12B-SESSION-SEED-1 (review F8): this abort happens BEFORE `#rememberSessionSeed`, so
+      // the identity is not being handed to a session — it is being discarded, and is zeroed like
+      // any other discard. (The two PROMOTION sites deliberately do not zero: there the same bytes
+      // become the session's.)
+      inboundSr.seed.fill(0);
       try {
         await node.stop();
       } catch (err: unknown) {
@@ -3267,6 +3333,7 @@ export class SessionNodeManager {
       counterpartySessionPeerId: initiatorPeerId,
       autoNat,
     });
+    this.#rememberSessionSeed(agentName, sessionId, seed, initiatorPeerId, counterpartyPubkey);
 
     // DAEMON-004: register the content stream handler for the inbound session.
     await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
@@ -3638,6 +3705,12 @@ export class SessionNodeManager {
     // plaintext must not survive shutdown in memory).
     this.#trees.clear();
     this.#receivedContent.clear();
+    // DOD-M12B-SESSION-SEED-1 (review F5): transport identities are key material and belong in the
+    // same sentence as the plaintext above. Shutdown marks every active row `interrupted` by direct
+    // SQL, so no `#updateSessionStatus` destroy fires for them — without this, every live session's
+    // seed survives the shutdown in memory for as long as the process lingers.
+    for (const identity of this.#sessionSeeds.values()) identity.seed.fill(0);
+    this.#sessionSeeds.clear();
 
     // Stop ALL per-agent standing receivers (DOD-LOOP-1). In PARALLEL and BOUNDED: this was a
     // sequential await per agent with no deadline, so five agents meant five chances for one stuck
@@ -3660,6 +3733,9 @@ export class SessionNodeManager {
       "standing_receivers",
       this.#standingReceivers.size,
     );
+    // Same reason: a receiver's seed is the identity it has already advertised in
+    // `session_offer_accept` for any session it is mid-handshake on.
+    for (const sr of this.#standingReceivers.values()) sr.seed.fill(0);
     this.#standingReceivers.clear();
     this.#srReservationRetry.clear();
     this.#srLastRejectionReason.clear();
@@ -4312,7 +4388,18 @@ export class SessionNodeManager {
         "UPDATE sessions SET status = 'seal_interrupted_pending', updated_at = ? WHERE agent_id = ? AND session_id = ? AND status IN ('active', 'interrupted')",
       )
       .run(now, this.#requireAgentId(opts.agentName), opts.sessionId);
-    return Number(result.changes) > 0;
+    const landed = Number(result.changes) > 0;
+    if (landed) {
+      // DOD-M12B-SESSION-SEED-1 (review F3): `seal_interrupted_pending` is NOT a state revival
+      // exists for, and the first build's comment wrongly grouped it with `interrupted`.
+      // `ingestReceivedContent` refuses it outright, and BOTH sweeps that could otherwise close a
+      // session — `listRestartOrphanedSessions` and `listExpiredUnrevivableSessions` — filter
+      // `status = 'interrupted'`, so a pending-seal session is unrevivable AND unswept. Keeping its
+      // identity meant holding it until the process exited. Entry 42's own measurement is that 59%
+      // of seals that start never finish, so that is the common path, not a corner.
+      this.#destroySessionSeed(opts.agentName, opts.sessionId);
+    }
+    return landed;
   }
 
   /**
@@ -4898,9 +4985,12 @@ export class SessionNodeManager {
       // like a protocol mystery for a night.
       //
       // `counterpartySessionPeerId` is the load-bearing field. It is recorded ONCE at session
-      // establishment and never refreshed, while a standing receiver is rebuilt with a fresh keypair
-      // on every signaling reconnect — so if the two ever cross, every send goes one-way forever and
-      // nothing says so. With this line that becomes a single grep instead of a night.
+      // establishment and never refreshed. (CORRECTED 2026-08-18: this used to say a standing
+      // receiver is rebuilt "on every signaling reconnect" — it is not. `ensureStandingReceiverForAgent`
+      // no-ops on a healthy receiver; the only rebuild triggers are a LOST RELAY RESERVATION and the
+      // one-shot upgrade when relay endpoints first arrive.) If the two ever cross, every send goes
+      // one-way forever and nothing says so. With this line that becomes a single grep instead of a
+      // night.
       this.#logger.warn("session.content.direct.send.failed", {
         agentName,
         sessionId,
@@ -7730,6 +7820,22 @@ export class SessionNodeManager {
       const sr = this.#standingReceivers.get(agentName);
       if (sr) {
         this.#standingReceivers.delete(agentName);
+        /**
+         * DOD-M12B-SESSION-SEED-1 (review F8): drop it zeroed, like every other seed.
+         *
+         * (review F7, DECIDED AGAINST — deliberately NOT reusing this seed for the replacement.)
+         * Reuse is attractive: this receiver's peer id may already be inside a `session_offer_accept`
+         * the counterparty is acting on, and a rebuild in that window is the documented "we record
+         * an identity that no longer exists… every send in this direction parks forever" defect. But
+         * a preserved identity would have to be handed to the candidate loop in
+         * `#startReceiverNode`, whose rejected candidates are stopped WITHOUT awaiting `start()` —
+         * so two nodes could be briefly live on one advertised peer id, which is review F1, a HIGH,
+         * and the reason each candidate now mints its own. Fixing F7 properly means bounding and
+         * awaiting the loser's teardown first, and an unawaited stop is precisely what the current
+         * code chose to avoid a stuck libp2p teardown blocking receiver creation. Filed as
+         * follow-on work rather than trading a MEDIUM fix for a HIGH regression.
+         */
+        sr.seed.fill(0);
         try {
           sr.autoNat.stop();
           await sr.node.stop();
@@ -8014,13 +8120,27 @@ export class SessionNodeManager {
     gater: SessionConnectionGater,
     candidateCircuitAddrs: string[],
     correlationId: string,
-  ): Promise<CelloNode> {
+  ): Promise<{ node: CelloNode; seed: Uint8Array }> {
     for (const circuitAddr of candidateCircuitAddrs) {
+      // DOD-M12B-SESSION-SEED-1: A SEED PER CANDIDATE, NOT ONE FOR THE LOOP.
+      //
+      // A rejected candidate is stopped with an unawaited `void …then(() => candidate.stop())`
+      // while its `start()` may still be in flight, so two candidate nodes can briefly be live at
+      // once. Sharing one seed would give both the SAME peer id — and the loser would then be a
+      // second live node under the identity we advertise in `session_offer_accept`, sharing this
+      // gater (so it admits dials) with no content handler registered. Inbound arriving there goes
+      // nowhere, and it is an open endpoint under our advertised id: the "connection a malicious
+      // agent can farm for" the tenet names. Before seeds existed the loser had its own random key
+      // and was harmless; introducing a shared seed is what would have made it dangerous.
+      //
+      // Nothing reads the seed before the winner is installed, so per-candidate costs nothing.
+      const candidateSeed = randomBytes(32);
       const candidate = await this.#factory.createNode({
         sessionId,
         connectionGater: gater,
         nodeType: "standing_receiver",
         circuitRelayListenAddrs: [circuitAddr],
+        transportPrivateKey: candidateSeed,
       });
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = Symbol("reservation_timeout");
@@ -8044,7 +8164,7 @@ export class SessionNodeManager {
       // completes the handshake and simply grants nothing, leaving a node that looks
       // started and is reachable by nobody.
       if (outcome === "started" && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
-        return candidate;
+        return { node: candidate, seed: candidateSeed };
       }
 
       const rejectionReason =
@@ -8068,13 +8188,15 @@ export class SessionNodeManager {
         .catch(() => { /* best-effort: the node never finished starting */ });
     }
 
+    const plainSeed = randomBytes(32);
     const plain = await this.#factory.createNode({
       sessionId,
       connectionGater: gater,
       nodeType: "standing_receiver",
+      transportPrivateKey: plainSeed,
     });
     await plain.start();
-    return plain;
+    return { node: plain, seed: plainSeed };
   }
 
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
@@ -8089,6 +8211,7 @@ export class SessionNodeManager {
       logger: this.#logger,
     });
 
+
     // DOD-NAT-REACHABILITY-1: reserve with the agent's known relays. The relay
     // peers are allowed OUTBOUND on the gater up front, so reservation refreshes
     // keep working after the receiver is claimed and setAllowedPeer() narrows
@@ -8099,8 +8222,21 @@ export class SessionNodeManager {
     }
 
     let node: CelloNode;
+    /**
+     * DOD-M12B-SESSION-SEED-1 — the transport identity of the receiver that actually survived.
+     *
+     * Minted per CANDIDATE inside `#startReceiverNode` and returned with the winner, not minted
+     * here: a rejected candidate is stopped without awaiting its `start()`, so two candidates can
+     * be briefly live, and one shared seed would put both on the same advertised peer id.
+     *
+     * FRESH EVERY TIME, which is the privacy property rather than an implementation detail. A
+     * receiver serves at most one session (it is promoted into the session at handoff and replaced),
+     * so no identifier is ever shared between two sessions and the 2026-04-11 rationale —
+     * unlinkability of an agent's sessions to a passive observer — survives intact.
+     */
+    let seed: Uint8Array;
     try {
-      node = await this.#startReceiverNode(agentName, sessionId, gater, reservations.addrs, correlationId);
+      ({ node, seed } = await this.#startReceiverNode(agentName, sessionId, gater, reservations.addrs, correlationId));
     } catch (err: unknown) {
       // extractErrorMessage, NOT String(err): the transport throws structured
       // plain objects ({ reason, message }), and String() destroys both into
@@ -8169,6 +8305,7 @@ export class SessionNodeManager {
       node,
       gater,
       autoNat,
+      seed,
       hasReservation: circuitAddrs > 0,
       ...(reservedRelayPeerId !== undefined ? { relayPeerId: reservedRelayPeerId } : {}),
     });
@@ -8213,6 +8350,180 @@ export class SessionNodeManager {
    * M8B F14: also called from the inbound accept path (ensure on demand). Marks the agent as
    * WANTING a receiver, which arms the teardown re-arm in destroySessionNode/retireSessionNode.
    */
+  /**
+   * DOD-M12B-SESSION-SEED-1 test seam: the seed the agent's current standing receiver holds.
+   *
+   * The property under test — "the receiver built behind a promoted one never reuses its seed" — is
+   * about an identity that by design never leaves the process, so there is no observable surface for
+   * it short of a live two-node dial. Reading it here is the narrowest way to pin it.
+   */
+  /** DOD-M12B-SESSION-SEED-1: record the identity this session must be able to return at. */
+  #rememberSessionSeed(
+    agentName: string,
+    sessionId: string,
+    seed: Uint8Array,
+    counterpartyPeerId: string,
+    counterpartyPubkey: string,
+  ): void {
+    const key = this.#k(agentName, sessionId);
+    // Defensive: unreachable today because `insertSessionRow` PK-conflicts on a repeat, but an
+    // overwrite that dropped a live seed un-zeroed would leave the one copy we are responsible for
+    // in the heap with nothing tracking it.
+    this.#sessionSeeds.get(key)?.seed.fill(0);
+    this.#sessionSeeds.set(key, { seed, counterpartyPeerId, counterpartyPubkey });
+  }
+
+  /**
+   * DOD-M12B-SESSION-SEED-1 — destroy a session's transport identity.
+   *
+   * Called from `#updateSessionStatus` on a terminal status, in the SAME step that writes it, so
+   * there is no window in which a session is closed on paper and still revivable in memory.
+   *
+   * **WHAT THE ZERO-FILL DOES AND DOES NOT DO** — checked against the derivation, not assumed.
+   * `createNode` hands the buffer to `generateKeyPairFromSeed`, and `@libp2p/crypto` COPIES it
+   * (`uint8arrayConcat([seed, publicKeyRaw])`, then `Uint8Array.from`). Two consequences:
+   *   - zeroing after the node has started is SAFE — the running node holds its own copy;
+   *   - it does NOT erase the key from the heap. An identical usable copy is the first 32 bytes of
+   *     `privateKey.raw` on the node object until that node is dropped.
+   * So this removes OUR long-lived copy — the one that would otherwise sit in a map for the life of
+   * the process, decoupled from any node — and that is worth doing. It is not a heap scrub, and
+   * the DoD already says the bound rather than secrecy is the control.
+   */
+  #destroySessionSeed(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    const identity = this.#sessionSeeds.get(key);
+    if (identity === undefined) return;
+    identity.seed.fill(0);
+    this.#sessionSeeds.delete(key);
+    this.#logger.debug("session.seed.destroyed", { agentName, sessionId });
+  }
+
+  /**
+   * DOD-M12B-SESSION-SEED-1 — bring an interrupted session back on the peer id it already has.
+   *
+   * THE DEFECT THIS CLOSES. `markInterruptedWithDetails` and `destroySessionNode` stop the node and
+   * delete it from `#activeNodes`, and until now **nothing anywhere recreated one**. A laptop-close
+   * session stayed stuck even though both processes were alive and both keypairs were still in
+   * memory — the trace on 2026-08-17 found no missing transport capability, just a missing edge.
+   *
+   * TWO THINGS HAVE TO HAPPEN, and doing only one leaves the session exactly as stuck:
+   *   1. the NODE comes back, at the same peer id, or the counterparty can never dial us again;
+   *   2. the STATUS comes back to `active`, or every send still refuses with `session_not_active`.
+   *
+   * **DEMAND-DRIVEN ONLY.** Nothing calls this on a timer. That is the `REDIAL-1` discipline and it
+   * is also Andre's tenet — a background rebuilder would hold a dialable endpoint open for a session
+   * nobody is using, which is the "open connection a malicious agent can farm for" in as many words.
+   *
+   * **TERMINAL IS TERMINAL.** A sealed or abandoned session had its seed zeroed in the same step
+   * that wrote its status, so there is nothing to come back on. This refuses by name rather than
+   * minting a fresh identity — a revival that quietly mints would hand one session a second peer id
+   * and break the invariant while appearing to work.
+   *
+   * Idempotent: a session that already has a live node returns ok without building a second one.
+   */
+  async reviveSessionNode(
+    agentName: string,
+    sessionId: string,
+  ): Promise<{ ok: true; peerId: string } | { ok: false; reason: string; guidance?: string }> {
+    const key = this.#k(agentName, sessionId);
+    const live = this.#activeNodes.get(key);
+    if (live) return { ok: true, peerId: live.node.getPeerId() };
+
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) return { ok: false, reason: "session_not_found" };
+    if (record.status === "sealed" || record.status === "abandoned" || record.status === "seal_interrupted_pending") {
+      return {
+        ok: false,
+        reason: "session_terminal",
+        guidance: `Session is '${record.status}'. A session that has ended cannot be revived; start a new one.`,
+      };
+    }
+
+    const identity = this.#sessionSeeds.get(key);
+    if (identity === undefined) {
+      // The honest case: the daemon restarted, so the keypair is genuinely gone. That is
+      // RESTART-SEAL-1's territory (resolve with a receipt), not a revival — and saying so is the
+      // difference between an operator waiting for a reconnect that cannot happen and one closing
+      // the session.
+      return {
+        ok: false,
+        reason: "session_identity_lost",
+        guidance:
+          "This session's transport identity did not survive a daemon restart, so it cannot be " +
+          "revived. It will be sealed automatically, or you can close it now to get its receipt.",
+      };
+    }
+
+    const gater = new SessionConnectionGater({
+      sessionId,
+      allowedPeerId: identity.counterpartyPeerId,
+      logger: this.#logger,
+    });
+    let node: CelloNode;
+    try {
+      node = await this.#factory.createNode({
+        sessionId,
+        connectionGater: gater,
+        nodeType: "session",
+        transportPrivateKey: identity.seed,
+      });
+      await node.start();
+    } catch (err: unknown) {
+      this.#logger.error("session.revive.node.failed", {
+        agentName,
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "the session stays interrupted; the next send will attempt this again",
+      });
+      return { ok: false, reason: "session_node_creation_failed" };
+    }
+
+    const autoNat = new NodeAutoNatService({
+      node,
+      logger: this.#logger,
+      nodeType: "session",
+      probers: this.#autoNatProbers(),
+    });
+    autoNat.emitInitialResult();
+
+    this.#activeNodes.set(key, {
+      node,
+      agentName,
+      sessionId,
+      counterpartyPubkey: identity.counterpartyPubkey,
+      gater,
+      correlationId: randomUUID(),
+      counterpartySessionPeerId: identity.counterpartyPeerId,
+      autoNat,
+    });
+    await this.#registerContentHandler(agentName, sessionId, node, identity.counterpartyPubkey);
+
+    // THE REVERSE EDGE. A transport event took this session out of `active` and nothing has ever
+    // put one back. Written after the node is live and its handler registered, so the row never
+    // claims `active` for a session that cannot yet receive.
+    this.#updateSessionStatus(agentName, sessionId, "active");
+
+    const peerId = node.getPeerId();
+    this.#logger.info("session.revived", {
+      agentName,
+      sessionId,
+      peerId,
+      // The whole claim of this line, in the log: the id did not change, so the counterparty's
+      // stored dial target is still correct and they do not need to be told anything.
+      identityPreserved: true,
+    });
+    return { ok: true, peerId };
+  }
+
+  /** DOD-M12B-SESSION-SEED-1 test seam: does this session still hold a revivable identity? */
+  hasSessionSeedForTest(agentName: string, sessionId: string): boolean {
+    return this.#sessionSeeds.has(this.#k(agentName, sessionId));
+  }
+
+  getStandingReceiverSeedForTest(agentName: string): Uint8Array | undefined {
+    return this.#standingReceivers.get(agentName)?.seed;
+  }
+
   async ensureStandingReceiverForAgent(agentName: string): Promise<void> {
     this.#agentsWantingReceiver.add(agentName);
     this.#startReservationWatchdog();
@@ -8243,7 +8554,11 @@ export class SessionNodeManager {
       if (this.#standingReceiverCreating.has(agentName)) this.#standingReceiverRemoving.add(agentName);
       return;
     }
+    const removed = this.#standingReceivers.get(agentName);
     this.#standingReceivers.delete(agentName);
+    // DOD-M12B-SESSION-SEED-1 (review F8): the operator took this agent offline — its advertised
+    // identity is not needed any more, and the tenet's rule is that nothing unneeded stays live.
+    removed?.seed.fill(0);
     // Best-effort teardown, but NOT silent: a standing receiver that failed to stop keeps a libp2p
     // node live on the network. For a removal/retire (a revocation-class action) that must be visible,
     // so the caller and the operator can see the leak rather than trust a false "torn down". autoNat is
@@ -8389,6 +8704,26 @@ export class SessionNodeManager {
     interruptedBy?: "local",
   ): boolean {
     if (!this.#db) return false;
+    /**
+     * DOD-M12B-SESSION-SEED-1 (review F2) — the identity dies on terminal INTENT, not on a
+     * successful UPDATE.
+     *
+     * The first build destroyed the seed only after the write landed. `#requireAgentId` THROWS for
+     * a retired agent, so every terminal write for a revoked agent's sessions fell into the catch
+     * and kept its transport identity for the life of the process — an identity whose agent has
+     * just been revoked in the directory, held with nothing reporting it, and REVIVAL-BOUND-1's
+     * sweep excludes retired agents so nothing else closed it either. The same held for a
+     * `session.status.write.missed` and for any DB error.
+     *
+     * Coupling a security teardown to a database write is backwards: the write can fail, and the
+     * failure is exactly when we least want a live key lying around. So it runs FIRST and
+     * unconditionally, and if the write then fails the session is one we can no longer revive —
+     * which is the safe direction, and is reported loudly below rather than inferred from the
+     * absence of a debug line.
+     */
+    if (status === "sealed" || status === "abandoned") {
+      this.#destroySessionSeed(agentName, sessionId);
+    }
     // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
     // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.
     // Guarding only the wrapper asserts the invariant in a test while two other paths still break
@@ -8453,7 +8788,11 @@ export class SessionNodeManager {
           sessionId,
           status,
           agentName,
-          impact: "no session row matched — the status was NOT changed and no disposition was run",
+          impact: (status === "sealed" || status === "abandoned")
+            ? "no session row matched — the status was NOT changed and no disposition was run, AND "
+              + "this session's transport identity has already been destroyed, so it can no longer "
+              + "be revived even though its row still says it is open"
+            : "no session row matched — the status was NOT changed and no disposition was run",
         });
         return false;
       }

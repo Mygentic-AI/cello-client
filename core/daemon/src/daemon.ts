@@ -204,6 +204,11 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
       // type; nodeType's remaining transport effect is the HOP gate (client
       // types never advertise circuit-relay HOP).
       nodeType: config.nodeType,
+      // DOD-M12B-SESSION-SEED-1: forward the caller's transport seed when it supplied one, so a
+      // rebuilt session node returns at the peer id the counterparty already holds. Omitted (rather
+      // than passed as undefined) when absent, keeping createNode's "generate a fresh key" default
+      // for every node that is not session-scoped.
+      ...(config.transportPrivateKey ? { transportPrivateKey: config.transportPrivateKey } : {}),
     });
   }
 }
