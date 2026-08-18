@@ -252,7 +252,10 @@ describe("AC-005: 1 corrupted signature leaves 2 valid (below threshold 3)", () 
     const sigHex = manifest.signatures[0].signature;
     const firstByte = parseInt(sigHex.slice(0, 2), 16);
     const corruptedByte = ((firstByte + 1) % 256).toString(16).padStart(2, "0");
-    manifest.signatures[0] = { officerIndex: 0, signature: corruptedByte + sigHex.slice(2) };
+    manifest.signatures = [
+      { officerIndex: 0, signature: corruptedByte + sigHex.slice(2) },
+      ...manifest.signatures.slice(1),
+    ];
 
     const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
     expect(result.ok).toBe(false);
@@ -315,7 +318,7 @@ describe("AC-008: out-of-bounds officerIndex is silently skipped", () => {
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
 
     // Add an out-of-bounds entry
-    manifest.signatures.push({ officerIndex: 99, signature: "f".repeat(128) });
+    manifest.signatures = [...manifest.signatures, { officerIndex: 99, signature: "f".repeat(128) }];
 
     // Should NOT throw — the out-of-bounds entry is silently skipped
     const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
@@ -326,7 +329,7 @@ describe("AC-008: out-of-bounds officerIndex is silently skipped", () => {
     const nodes = makeNodes();
     const manifest: ConsortiumManifestInput = { version: 1, not_before: "2026-01-01T00:00:00Z", expires: "2027-01-01T00:00:00Z", nodes, signatures: [] };
     manifest.signatures = signManifest(manifest, [0, 1, 2]);
-    manifest.signatures.push({ officerIndex: -1, signature: "f".repeat(128) });
+    manifest.signatures = [...manifest.signatures, { officerIndex: -1, signature: "f".repeat(128) }];
 
     const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
     expect(result).toEqual({ ok: true, signerCount: 3 });
@@ -342,7 +345,7 @@ describe("AC-009: malformed hex signature is silently handled", () => {
     manifest.signatures = signManifest(manifest, [1, 2]);
 
     // Add a malformed hex entry for officer 0
-    manifest.signatures.unshift({ officerIndex: 0, signature: "zzzz" + "f".repeat(124) });
+    manifest.signatures = [{ officerIndex: 0, signature: "zzzz" + "f".repeat(124) }, ...manifest.signatures];
 
     const result = verifyManifest(manifest, TEST_OFFICER_PUBKEYS, 3);
     expect(result.ok).toBe(false);

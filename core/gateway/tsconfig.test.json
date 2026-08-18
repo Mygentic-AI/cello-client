@@ -1,0 +1,39 @@
+{
+  // DOD-M12B-TESTS-NOT-TYPECHECKED-1 — this package's tests ARE type-checked.
+  //
+  // `tsconfig.json` excludes `src/__tests__` from `tsc --build`, so without this a test asserting on
+  // a field that does not exist, or calling a method that was removed, is invisible to the gate: it
+  // fails only if vitest happens to execute that line. That is the hollow-test shape, enforced by
+  // the build config. `files` rather than `include`, because the base `exclude` filters `include`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src"
+  ],
+  "files": [
+    "src/__tests__/cfg-001-config-store.test.ts",
+    "src/__tests__/feed-001-resend.test.ts",
+    "src/__tests__/gateway-sidecar.test.ts",
+    "src/__tests__/in-001-sanitize.test.ts",
+    "src/__tests__/in-001-step9-injection.test.ts",
+    "src/__tests__/in-002-installer.test.ts",
+    "src/__tests__/in-002-scanner-logic.test.ts",
+    "src/__tests__/in-003-language.test.ts",
+    "src/__tests__/in-screen-terminal.test.ts",
+    "src/__tests__/m10b-detect-subpath.test.ts",
+    "src/__tests__/m10b-scan-1-corpus-digest.test.ts",
+    "src/__tests__/m9b-affordance-provenance.test.ts",
+    "src/__tests__/m9b-env-1-no-bypass.test.ts",
+    "src/__tests__/m9b-pii-date-fp.test.ts",
+    "src/__tests__/m9b-store-1-artifact.test.ts",
+    "src/__tests__/m9b-store-1-bin-guard.test.ts",
+    "src/__tests__/m9b-store-1-encrypted.test.ts",
+    "src/__tests__/out-001-secrets.test.ts",
+    "src/__tests__/out-002-pii.test.ts",
+    "src/__tests__/out-003-exfil.test.ts",
+    "src/__tests__/out-004-rate-limit.test.ts",
+    "src/__tests__/rec-001-record-store.test.ts"
+  ]
+}

@@ -8,6 +8,7 @@
  * No crypto mocks.
  */
 
+import type { DirectoryNodeStub } from "../frost/types.js";
 import {
   setupV3Tests,
   createTestScope,
@@ -1120,10 +1121,14 @@ describe("SOVEREIGN-NODE INVARIANT: no directory nodes → refuse, never sign al
   beforeEach(() => { scope = createTestScope(); });
   afterEach(async () => { await scope.run(async () => {}); });
 
-  for (const [label, stubs] of [
+  // TYPED, not `as const`: the const assertion narrows the empty array to `readonly []`, which is
+  // not what the constructor takes — and the whole point of these two cases is that they are the
+  // two shapes a real caller can produce.
+  const noStubCases: Array<[string, DirectoryNodeStub[] | undefined]> = [
     ["undefined (what a null getNode() produces)", undefined],
     ["an empty array", []],
-  ] as const) {
+  ];
+  for (const [label, stubs] of noStubCases) {
     it(`refuses to produce a threshold signature with ${label}`, async () => {
       const agentPubkey = makeAgentPubkey(7);
       // Bootstrap legitimately (3 real nodes) so the LOCAL share exists and is valid — this proves

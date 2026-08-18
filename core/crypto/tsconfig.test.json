@@ -1,0 +1,29 @@
+{
+  // DOD-M12B-TESTS-NOT-TYPECHECKED-1 — this package's tests ARE type-checked.
+  //
+  // `tsconfig.json` excludes `src/__tests__` from `tsc --build`, so without this a test asserting on
+  // a field that does not exist, or calling a method that was removed, is invisible to the gate: it
+  // fails only if vitest happens to execute that line. That is the hollow-test shape, enforced by
+  // the build config. `files` rather than `include`, because the base `exclude` filters `include`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "src"
+  ],
+  "files": [
+    "src/__tests__/ae-peer-auth.test.ts",
+    "src/__tests__/checkpoint.test.ts",
+    "src/__tests__/content-seal.test.ts",
+    "src/__tests__/ed25519.test.ts",
+    "src/__tests__/frost-resharing.test.ts",
+    "src/__tests__/frost.test.ts",
+    "src/__tests__/hashing.test.ts",
+    "src/__tests__/index.test.ts",
+    "src/__tests__/manifest.test.ts",
+    "src/__tests__/merkle.test.ts",
+    "src/__tests__/ml-dsa.test.ts",
+    "src/__tests__/preauth-capability.test.ts"
+  ]
+}

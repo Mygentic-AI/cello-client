@@ -91,7 +91,7 @@ describe("DOD-M9B-ENV-1 — the environment is not a config surface", () => {
         const client = new LocalSidecarGatewayClient({ socketPath: join(dir, "gw.sock") });
         const verdict = await client.screenOutbound(
           new TextEncoder().encode("reach me at secret@leak.example"),
-          { agentName: "a", sessionId: "s" },
+          { direction: "outbound", agentName: "a", sessionId: "s" },
         );
         await client.close();
         // If the env whitelist still worked, this would pass silently as `allow`. It must not.
