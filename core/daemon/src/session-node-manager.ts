@@ -2855,47 +2855,24 @@ export class SessionNodeManager {
    * and leaves relayClient undefined — the session is NOT destroyed and the direct
    * content path keeps working (the relay-park/recovery path is MSG-001-3b's domain).
    */
-  async #connectSessionRelay(
-    sessionId: string,
-    node: CelloNode,
-    agentName: string,
-    relay: RelayConnectParams,
-    correlationId: string,
-  ): Promise<void> {
-    try {
-      // The session node's gater admits only the counterparty; the relay witness is a
-      // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
-      // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
-      this.#activeNodes.get(this.#k(agentName, sessionId))?.gater.setAllowedOutboundPeer(relay.relayPeerId);
-
-      // One relay client per (AGENT, RELAY NODE). The relay keys by agent pubkey, so the
-      // collision H1 addresses is per relay; CELLO is federated, so a different session for
-      // the same agent may be assigned a DIFFERENT relay — that needs its own client.
-      const clientKey = `${agentName}::${relay.relayPeerId}`;
-      let client = this.#relayClients.get(clientKey);
-      if (!client) {
-        // RELAYSIG-1: one shared receipt store (keyed by agent_pubkey, so a single instance serves all
-        // agents + relays). Lazy — the encrypted DB is open by the time sessions are active.
-        if (!this.#relayReceiptStore && this.#db) {
-          this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
-        }
-        // FED-OPTIONB-SEAL-001: one shared seal-leaf log (keyed by agent_pubkey), same lazy lifecycle.
-        if (!this.#sealLeafStore && this.#db) {
-          this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
-        }
-        client = new AgentRelayClient({
-          relayPeerId: relay.relayPeerId,
-          relayAddrs: relay.relayAddrs,
-          keyProvider: relay.keyProvider,
-          senderPubkey: relay.senderPubkey,
-          logger: this.#logger,
-          receiptStore: this.#relayReceiptStore ?? undefined,
-          sealLeafStore: this.#sealLeafStore ?? undefined,
-        });
-        this.#relayClients.set(clientKey, client);
-      }
-      const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
-      client.registerSession(sessionIdHexForRelay, node, (frame) => {
+  /**
+   * DOD-M12B-REVIVE-RELAY-1 — the relay witness leaf handler, shared by establishment and revival.
+   *
+   * Extracted because a REVIVED session must register the same handler. It was inline in
+   * `#connectSessionRelay`, so revival — which never called that at all — had no live inbound path:
+   * every message fell back to the five-minute mailbox poll, which is why a reconnected session took
+   * three minutes to deliver what a fresh one delivers in seconds, and why doorbells stopped firing.
+   *
+   * A revived session that behaves differently from a fresh one is the defect. This is one of the
+   * two halves of making them the same.
+   */
+  #relayLeafHandler(agentName: string, sessionId: string, correlationId: string) {
+    return (frame: {
+      sequence_number: number;
+      leaf_kind: number;
+      authored_by_us: boolean;
+      structure1_cbor: Uint8Array;
+    }): void => {
         // The counterparty's witnessed leaf arrived with its canonical sequence. The
         // plaintext is delivered separately over the direct content stream; this is the
         // ordering/witness signal. Full canonical-sequence reconciliation against the
@@ -2939,7 +2916,50 @@ export class SessionNodeManager {
         if (frame.leaf_kind === LEAF_KIND_CTRL && !frame.authored_by_us) {
           this.#maybeAutoAcknowledgeSeal(agentName, sessionId, correlationId);
         }
-      }, relay.assignment);
+    };
+  }
+
+  async #connectSessionRelay(
+    sessionId: string,
+    node: CelloNode,
+    agentName: string,
+    relay: RelayConnectParams,
+    correlationId: string,
+  ): Promise<void> {
+    try {
+      // The session node's gater admits only the counterparty; the relay witness is a
+      // third peer. Permit it OUTBOUND so the dial isn't denied — inbound stays
+      // counterparty-only (INV-5). The relay peer id comes from the signed assignment.
+      this.#activeNodes.get(this.#k(agentName, sessionId))?.gater.setAllowedOutboundPeer(relay.relayPeerId);
+
+      // One relay client per (AGENT, RELAY NODE). The relay keys by agent pubkey, so the
+      // collision H1 addresses is per relay; CELLO is federated, so a different session for
+      // the same agent may be assigned a DIFFERENT relay — that needs its own client.
+      const clientKey = `${agentName}::${relay.relayPeerId}`;
+      let client = this.#relayClients.get(clientKey);
+      if (!client) {
+        // RELAYSIG-1: one shared receipt store (keyed by agent_pubkey, so a single instance serves all
+        // agents + relays). Lazy — the encrypted DB is open by the time sessions are active.
+        if (!this.#relayReceiptStore && this.#db) {
+          this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+        }
+        // FED-OPTIONB-SEAL-001: one shared seal-leaf log (keyed by agent_pubkey), same lazy lifecycle.
+        if (!this.#sealLeafStore && this.#db) {
+          this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+        }
+        client = new AgentRelayClient({
+          relayPeerId: relay.relayPeerId,
+          relayAddrs: relay.relayAddrs,
+          keyProvider: relay.keyProvider,
+          senderPubkey: relay.senderPubkey,
+          logger: this.#logger,
+          receiptStore: this.#relayReceiptStore ?? undefined,
+          sealLeafStore: this.#sealLeafStore ?? undefined,
+        });
+        this.#relayClients.set(clientKey, client);
+      }
+      const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
+      client.registerSession(sessionIdHexForRelay, node, this.#relayLeafHandler(agentName, sessionId, correlationId), relay.assignment);
 
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {
@@ -8635,6 +8655,95 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M12B-REVIVE-RELAY-1 — reconnect the session's relay WITNESS, which revival never did.
+   *
+   * THE FIRST-PRINCIPLES DEFECT, and the one that explains every symptom chased separately before
+   * it. Establishment does five things: build the node, register the content handler, wire liveness,
+   * **connect the relay**, and dial the counterparty. Revival did the first three. A revived session
+   * was therefore not a session — it looked live, reported `active`, and had no live inbound path at
+   * all.
+   *
+   * MEASURED 2026-08-18 with two real agents: a message on a reconnected session took **three
+   * minutes**, against seconds on a fresh one, because only the five-minute mailbox backstop ever
+   * found it. Doorbells stopped firing for the same reason — the relay stream is what rings them.
+   * And `#parkContent` refuses without `entry.relayClient`, so sends could not park either.
+   *
+   * NO ASSIGNMENT IS PRESENTED, and that is by design rather than omission: `RelayConnectParams`
+   * documents the reconnect mode itself — *"absent … on the restart/persisted reconnect path (the
+   * relay already recorded the session at first establishment) — the client then just reconnects
+   * without re-recording."* A revival is exactly that path.
+   *
+   * Best-effort and non-fatal: a session that comes back without its witness is still better than
+   * one that does not come back, and the failure is named rather than silent.
+   */
+  async #reconnectRevivedSessionRelay(
+    agentName: string,
+    sessionId: string,
+    node: CelloNode,
+    gater: SessionConnectionGater,
+    correlationId: string,
+  ): Promise<void> {
+    const ep = this.getPersistedRelayEndpoint(agentName, sessionId);
+    if (!ep) {
+      this.#logger.warn("session.revive.relay.absent", {
+        agentName,
+        sessionId,
+        impact: "no relay is recorded for this session, so it comes back with no live inbound path — "
+          + "messages arrive only on the periodic mailbox poll and sends cannot park",
+      });
+      return;
+    }
+    try {
+      // The gater admits only the counterparty inbound; the relay is a third peer and must be
+      // permitted OUTBOUND or our own gate refuses the dial (INV-5 keeps inbound counterparty-only).
+      gater.setAllowedOutboundPeer(ep.relayPeerId);
+
+      const clientKey = `${agentName}::${ep.relayPeerId}`;
+      let client = this.#relayClients.get(clientKey);
+      if (!client) {
+        if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+        if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+        client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
+          receiptStore: this.#relayReceiptStore ?? undefined,
+          sealLeafStore: this.#sealLeafStore ?? undefined,
+        });
+        if (!client) {
+          this.#logger.warn("session.revive.relay.builder_absent", {
+            agentName,
+            sessionId,
+            impact: "no relay client could be built, so this revived session has no live inbound path",
+          });
+          return;
+        }
+        this.#relayClients.set(clientKey, client);
+      }
+
+      client.registerSession(sessionId, node, this.#relayLeafHandler(agentName, sessionId, correlationId));
+
+      const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+      if (entry) {
+        entry.relayClient = client;
+        entry.relaySessionIdBytes = Uint8Array.from(Buffer.from(sessionId, "hex"));
+        entry.relayClientKey = clientKey;
+      }
+      this.#logger.info("session.revive.relay.connected", {
+        agentName,
+        sessionId,
+        relayPeerId: ep.relayPeerId,
+        impact: "the revived session has its live inbound path back — messages arrive promptly "
+          + "instead of waiting for the periodic mailbox poll",
+      });
+    } catch (err: unknown) {
+      this.#logger.warn("session.revive.relay.failed", {
+        agentName,
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact: "the session is back but without its witness — delivery falls back to the periodic poll",
+      });
+    }
+  }
+
+  /**
    * DOD-M12B-SESSION-SEED-1 — bring an interrupted session back on the peer id it already has.
    *
    * THE DEFECT THIS CLOSES. `markInterruptedWithDetails` and `destroySessionNode` stop the node and
@@ -8803,6 +8912,10 @@ export class SessionNodeManager {
       correlationId,
       identity.counterpartyPeerId,
     );
+
+    // DOD-M12B-REVIVE-RELAY-1: the step revival skipped. Establishment connects the relay witness
+    // here; without it the session comes back with no live inbound path at all.
+    await this.#reconnectRevivedSessionRelay(agentName, sessionId, node, gater, correlationId);
 
     // THE REVERSE EDGE. A transport event took this session out of `active` and nothing has ever
     // put one back. Written after the node is live and its handler registered, so the row never

@@ -251,4 +251,40 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       "while the relay that would have delivered it sits recorded on the row",
     ).toEqual({ relayPeerId: "12D3KooWRelayForTest00000000000000000000000000", relayAddrs: ["/ip4/1.2.3.4/tcp/4001"] });
   }, 60_000);
+
+  /**
+   * DOD-M12B-REVIVE-RELAY-1 — THE PRINCIPLE, not just this instance.
+   *
+   * **A revived session must be indistinguishable from a fresh one.** Every symptom chased
+   * separately on 2026-08-18 — doorbells not firing, a three-minute delivery against seconds on a
+   * fresh session, sends that could not park — was one consequence of revival doing three of the
+   * five things establishment does. The missing one was the relay witness connection, which is the
+   * live inbound path; without it everything falls back to the five-minute mailbox poll.
+   *
+   * This asserts the parity at the source, because a behavioural test cannot see a step that was
+   * never taken — that is exactly how it shipped. If establishment gains a sixth step, this fails
+   * until revival takes it too.
+   *
+   * Revert test (RUN): remove the `#reconnectRevivedSessionRelay` call from `reviveSessionNode` and
+   * this fails naming it.
+   */
+  it("PARITY: revival takes every step establishment takes", async () => {
+    const { readFileSync } = await import("node:fs");
+    const src = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8");
+    const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+
+    const revive = code.slice(code.indexOf("async reviveSessionNode("), code.indexOf("async reviveIfNeededForSend("));
+
+    // The five steps establishment performs. Each one absent from a revival is a session that looks
+    // live and is not — which is the whole defect class this file exists for.
+    for (const [step, needle] of [
+      ["the node itself", "buildRevivedNode("],
+      ["the content handler, or nothing can receive", "registerContentHandler("],
+      ["liveness, or it can never be interrupted again", "wireSessionLiveness("],
+      ["the RELAY WITNESS, or there is no live inbound path at all", "reconnectRevivedSessionRelay("],
+      ["the status edge back to active, or every send refuses", 'updateSessionStatus(agentName, sessionId, "active")'],
+    ] as const) {
+      expect(revive.includes(needle), `revival no longer restores ${step}`).toBe(true);
+    }
+  }, 60_000);
 });
