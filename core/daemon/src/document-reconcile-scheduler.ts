@@ -12,12 +12,44 @@
  *     reachability signal RESETS backoff: the backoff modeled "they do not answer", and here
  *     they demonstrably just did.
  *  3. the periodic sweep — `sweep`, wired to a timer. Bounded per R43: batched per party (R16's
- *     cap is the exchange's own), suppressed for parties believed current (display cache only —
- *     R44 permits it precisely because a wrong suppression costs latency, never correctness),
- *     and backed off for parties that do not answer.
+ *     cap is the exchange's own), and — DOD-DOC-PUSH-NOT-POLL-1 — it speaks only for a party we
+ *     HOLD something for. A timer is not a reason to speak.
  *
  * R42: the in-flight mark is TIME-BOUNDED and released LOUDLY on expiry. An unbounded in-flight
  * mark is the stall this milestone already paid for twice.
+ *
+ * DOD-DOC-PUSH-NOT-POLL-1 (Andre, 2026-08-18) — WHAT THE TIMER MAY NO LONGER DO, and what it cost.
+ * The suppressor used to be a BELIEF with an expiry: a party was skipped only while every shared
+ * document read in_sync AND had been exchanged within ten minutes. Past the window it asked again
+ * whether or not anything had changed. Measured live: three agents, thirty documents, the freshest
+ * exchange days old, and one stale timestamp kept a whole party — fourteen documents — sweeping
+ * every 120 seconds forever. Each of those frames takes a position in the CONVERSATION's hash
+ * chain, so a quiet document spends a real conversation's sequence numbers: 34 positions on one
+ * live session, 2 of them actual messages, and the seal refused `session_incomplete`.
+ *
+ * The rule now: WE SPEAK WHEN WE HOLD SOMETHING THE PARTY HAS NOT CONFIRMED RECEIVING, and an
+ * unchanged holding is offered once, not on every tick. Nothing pending, no frame, no position.
+ *
+ * THE GATE IS ON THE DECISION, NOT ON THE FRAME'S CONTENTS (review F2). Once one document has
+ * justified speaking to a party, the frame carries every document shared with them: a block is
+ * POSITIONS ONLY, and the responder replies solely for a document where one side is actually
+ * ahead — so a quiet document rides along for bytes, never for a frame or a position. Narrowing
+ * the list would have dropped the pull for those documents and saved nothing.
+ *
+ * THE TRADE, STATED RATHER THAN HIDDEN: `pendingFor` can only see what we hold that they lack —
+ * never what they hold that we lack — so removing the expiry removes the timer-driven PULL. The
+ * pull moves onto the two triggers that are events rather than clocks: their publish nudges us
+ * (R39 trigger 1), and a session with them coming up sweeps everything (`onReachable`, which
+ * deliberately does NOT inherit the pending gate).
+ *
+ * THE THIRD TRADE, WHICH IS A REMOVAL CASE (review F4). A removed holder is in neither the
+ * participants nor the invited set of the remover's derived state, so the REMOVER never sweeps to
+ * them — there is no push and no nudge in that direction. Their primary notice is the parked frame
+ * the relay holds; when that is gone, the backstop was their own belief expiring and asking, which
+ * earned the terminal `document_reconcile_removed` answer. That backstop now waits for them to
+ * hold something pending — their next write, or their next session. This WIDENS a gap the M14B
+ * board already names (DOD-SYNC-P6, "R32's terminal-refusal delivery is not exercised by the
+ * enforcers"); it does not open a new one, and nothing here forbids the exchange.
  */
 
 import type { Logger } from "./types.js";
@@ -27,11 +59,6 @@ export const RECONCILE_INFLIGHT_BOUND_MS = 60_000;
 /** First back-off step for a party that did not answer; doubles per consecutive failure. */
 export const RECONCILE_BACKOFF_BASE_MS = 30_000;
 export const RECONCILE_BACKOFF_CAP_MS = 15 * 60_000;
-/**
- * A party whose every shared document reads in_sync, heard from within this window, is believed
- * current and skipped (R43). Past the window the sweep asks anyway — the cache is a belief.
- */
-export const RECONCILE_BELIEVED_CURRENT_MS = 10 * 60_000;
 /** R16's per-frame batching ceiling, honored by chunking a party's documents. */
 export const RECONCILE_BATCH_CAP = 32;
 
@@ -44,14 +71,14 @@ export interface ReconcileSchedulerDeps {
    */
   sweepTargets(ownerAgentId: string): Map<string, string[]>;
   /**
-   * Display-cache read (R44-safe): in_sync/behind/unseen plus when this party last exchanged.
-   * Used ONLY to suppress, never to forbid — an unseen or behind party is always fair game.
+   * DOD-DOC-PUSH-NOT-POLL-1 — WHAT we hold on this document that this party has not confirmed
+   * receiving, as a comparable fingerprint; `null` when there is nothing. Derived by the caller
+   * from the same comparison that answers "are they behind" on the list surface — two copies of
+   * that question is two daemons disagreeing about who needs an exchange.
+   *
+   * Compared, never interpreted: the scheduler only asks whether it changed since it last spoke.
    */
-  partySync(
-    ownerAgentId: string,
-    documentId: string,
-    partyAgentId: string,
-  ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null };
+  pendingFor(ownerAgentId: string, documentId: string, partyAgentId: string): string | null;
   initiateReconcile(
     ownerAgentId: string,
     peerAgentId: string,
@@ -63,27 +90,38 @@ export interface ReconcileSchedulerDeps {
    * ladder walks a fast-sweep test out of its window). Omitted = the production constants.
    */
   backoffBaseMs?: number;
-  /**
-   * Same test-pace escape for the believed-current window — see backoffBaseMs. CLAMPED to the
-   * production constant as a CEILING (review F5): the backoff has a cap and this did not, and an
-   * override longer than the production window would let one mis-set environment variable suppress
-   * sweeps for as long as it liked. R41 permits scheduling state to DELAY an exchange, never to
-   * forbid one, so the only direction this knob may move is shorter.
-   */
-  believedCurrentMs?: number;
 }
 
 interface PartyState {
   nextAttemptMs: number;
   failures: number;
   inFlightUntilMs: number | null;
+  /** The holding we last put on the wire for this party; `null` = we have not spoken yet. */
+  lastPendingSignature: string | null;
+  /** Times we have offered that holding unchanged; drives the same ladder as silence. */
+  repeats: number;
+  /**
+   * How long to stay quiet about an UNCHANGED holding. Deliberately NOT `nextAttemptMs`: that one
+   * is armed by a peer failing or refusing and may never be bypassed (REFUSAL-BACKOFF-1), while
+   * this one is armed only by us having nothing new to say — so a real change may step over it.
+   */
+  quietUntilMs: number;
 }
 
 export interface SweepResult {
   attempted: number;
+  /** Held back because this peer FAILED or REFUSED us. Look at the peer. */
   skippedBackoff: number;
   skippedInFlight: number;
-  skippedCurrent: number;
+  /**
+   * Held back because we had nothing NEW to say — we already offered this exact holding. Kept
+   * apart from `skippedBackoff` (review F5) because this unit exists to make sweep traffic
+   * diagnosable from these very logs, and one counter for two causes sends the reader to the
+   * wrong subsystem.
+   */
+  skippedQuiet: number;
+  /** Nothing pending at all: no frame was owed to this party. */
+  skippedNothingPending: number;
   failed: number;
 }
 
@@ -131,25 +169,69 @@ export class ReconcileScheduler {
   #stateFor(key: string): PartyState {
     let s = this.#state.get(key);
     if (!s) {
-      s = { nextAttemptMs: 0, failures: 0, inFlightUntilMs: null };
+      s = {
+        nextAttemptMs: 0,
+        failures: 0,
+        inFlightUntilMs: null,
+        lastPendingSignature: null,
+        repeats: 0,
+        quietUntilMs: 0,
+      };
       this.#state.set(key, s);
     }
     return s;
   }
 
   /**
+   * What we hold for this party that they have not confirmed, across the documents we share:
+   * `null` when there is nothing anywhere. One computation for both triggers, so an offer made by
+   * one is recognised as already-made by the other.
+   */
+  #holdingFor(
+    ownerAgentId: string,
+    peerAgentId: string,
+    docs: readonly string[],
+  ): string | null {
+    const parts: string[] = [];
+    for (const documentId of docs) {
+      const pending = this.#d.pendingFor(ownerAgentId, documentId, peerAgentId);
+      if (pending !== null) parts.push(`${documentId}=${pending}`);
+    }
+    return parts.length === 0 ? null : parts.join("\n");
+  }
+
+  /**
    * R39's second trigger: this party is demonstrably reachable RIGHT NOW — a session with them
    * just came up. Backoff is reset (it modeled silence; they answered) and the attempt fires
    * for every shared document, in R16-capped batches.
+   *
+   * DELIBERATELY EXEMPT FROM THE PENDING GATE (DOD-DOC-PUSH-NOT-POLL-1). The gate can only see
+   * what we hold that they lack; the exchange is the only thing that sees the other direction.
+   * Take the gate off the timer and this becomes where the PULL lives, so gating it here too
+   * would leave nothing that ever asks.
+   *
+   * It DOES record what it just offered (review F3). Nulling that instead cost one guaranteed
+   * duplicate frame per session establishment — the sweep tick minutes later would find no
+   * record of the offer, treat an unchanged holding as new, and spend another position in the
+   * conversation's hash chain. That is the exact currency this unit defends.
    */
   async onReachable(ownerAgentId: string, peerAgentId: string): Promise<void> {
     if (this.#stopped) return;
     const docs = this.#d.sweepTargets(ownerAgentId).get(peerAgentId);
     if (!docs || docs.length === 0) return;
     const s = this.#stateFor(this.#key(ownerAgentId, peerAgentId));
+    // They answered: silence is no longer the model, so both ladders start over.
     s.failures = 0;
+    s.repeats = 0;
     s.nextAttemptMs = 0;
-    await this.#attempt(ownerAgentId, peerAgentId, docs, s);
+    s.quietUntilMs = 0;
+    await this.#attempt(
+      ownerAgentId,
+      peerAgentId,
+      docs,
+      s,
+      this.#holdingFor(ownerAgentId, peerAgentId, docs),
+    );
   }
 
   /**
@@ -184,7 +266,8 @@ export class ReconcileScheduler {
   /** R39's third trigger — one bounded pass for one owner. */
   async sweep(ownerAgentId: string): Promise<SweepResult> {
     const result: SweepResult = {
-      attempted: 0, skippedBackoff: 0, skippedInFlight: 0, skippedCurrent: 0, failed: 0,
+      attempted: 0, skippedBackoff: 0, skippedInFlight: 0,
+      skippedQuiet: 0, skippedNothingPending: 0, failed: 0,
     };
     // DOD-M12B-SHUTDOWN-1: the in-flight pass stops HERE, not at the next timer tick.
     if (this.#stopped) return result;
@@ -215,27 +298,27 @@ export class ReconcileScheduler {
         result.skippedBackoff += 1;
         continue;
       }
-      // Believed current (R43): every shared document in_sync and heard from recently. The
-      // cache may be wrong — that costs one suppression window of latency, never correctness
-      // (R40: the next exchange recovers anything).
-      const believedWindow = Math.min(
-        this.#d.believedCurrentMs ?? RECONCILE_BELIEVED_CURRENT_MS,
-        RECONCILE_BELIEVED_CURRENT_MS,
-      );
-      const current = docs.every((documentId) => {
-        const view = this.#d.partySync(ownerAgentId, documentId, peerAgentId);
-        return (
-          view.sync === "in_sync" &&
-          view.lastSyncedAtMs !== null &&
-          now - view.lastSyncedAtMs < believedWindow
-        );
-      });
-      if (current) {
-        result.skippedCurrent += 1;
+      // DOD-DOC-PUSH-NOT-POLL-1 — the only reason to speak: we hold something they have not
+      // confirmed receiving. No holding, no frame and no sequence position, however long ago
+      // this party last exchanged.
+      const signature = this.#holdingFor(ownerAgentId, peerAgentId, docs);
+      if (signature === null) {
+        result.skippedNothingPending += 1;
+        continue;
+      }
+      // Offered already, and nothing has changed since. A real change steps over this — it is a
+      // trigger (R39), not noise — but the refusal/failure backoff checked ABOVE is never stepped
+      // over, which is what keeps DOD-SYNC-REFUSAL-BACKOFF-1 intact. The order of these two
+      // blocks is the guarantee; a test pins it.
+      if (signature === s.lastPendingSignature && now < s.quietUntilMs) {
+        result.skippedQuiet += 1;
         continue;
       }
       result.attempted += 1;
-      const ok = await this.#attempt(ownerAgentId, peerAgentId, docs, s);
+      // EVERY shared document rides the frame, not just the ones that justified it (review F2):
+      // a block carries positions only, and the responder answers solely where a side is ahead,
+      // so the quiet documents cost bytes rather than a frame — and keep their pull.
+      const ok = await this.#attempt(ownerAgentId, peerAgentId, docs, s, signature);
       if (!ok) result.failed += 1;
     }
     return result;
@@ -246,7 +329,10 @@ export class ReconcileScheduler {
     peerAgentId: string,
     docs: readonly string[],
     s: PartyState,
+    signature: string | null,
   ): Promise<boolean> {
+    // Read BEFORE the send: whether this round is a re-offer decides the cadence below.
+    const repeat = signature !== null && signature === s.lastPendingSignature;
     const started = this.#d.now();
     s.inFlightUntilMs = started + RECONCILE_INFLIGHT_BOUND_MS;
     let allOk = true;
@@ -274,12 +360,19 @@ export class ReconcileScheduler {
       s.inFlightUntilMs = null;
     }
     const now = this.#d.now();
+    const base = this.#d.backoffBaseMs ?? RECONCILE_BACKOFF_BASE_MS;
     if (allOk) {
       s.failures = 0;
-      s.nextAttemptMs = now; // the believed-current check is the steady-state suppressor
+      s.nextAttemptMs = now;
+      // THE SEND SUCCEEDING MEANS THE FRAME WENT OUT, NEVER THAT THE PARTY ACTED ON IT. An
+      // invitation nobody accepts stays pending forever, so without this the sweep re-offered the
+      // identical holding on every tick — one frame each, each one spending a position in the
+      // conversation's hash chain. Every re-offer doubles the silence, up to the same cap.
+      s.repeats = repeat ? s.repeats + 1 : 1;
+      s.lastPendingSignature = signature;
+      s.quietUntilMs = now + Math.min(base * 2 ** (s.repeats - 1), RECONCILE_BACKOFF_CAP_MS);
     } else {
       s.failures += 1;
-      const base = this.#d.backoffBaseMs ?? RECONCILE_BACKOFF_BASE_MS;
       s.nextAttemptMs = now + Math.min(base * 2 ** (s.failures - 1), RECONCILE_BACKOFF_CAP_MS);
     }
     return allOk;

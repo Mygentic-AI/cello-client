@@ -4149,17 +4149,13 @@ async function startDaemonHoldingLock(
     now: () => Date.now(),
     logger,
     sweepTargets: (ownerAgentId) => documentLayer.sweepTargets(ownerAgentId),
-    partySync: (ownerAgentId, documentId, partyAgentId) =>
-      documentLayer.partySync(ownerAgentId, documentId, partyAgentId),
+    pendingFor: (ownerAgentId, documentId, partyAgentId) =>
+      documentLayer.pendingFor(ownerAgentId, documentId, partyAgentId),
     initiateReconcile: (ownerAgentId, peerAgentId, documentIds) =>
       documentLayer.initiateReconcile(ownerAgentId, peerAgentId, documentIds),
     ...(Number.isFinite(Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"])) &&
     Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"]) >= 250
       ? { backoffBaseMs: Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"]) }
-      : {}),
-    ...(Number.isFinite(Number(process.env["CELLO_DOCUMENT_RECONCILE_CURRENT_MS"])) &&
-    Number(process.env["CELLO_DOCUMENT_RECONCILE_CURRENT_MS"]) >= 250
-      ? { believedCurrentMs: Number(process.env["CELLO_DOCUMENT_RECONCILE_CURRENT_MS"]) }
       : {}),
   });
   // Overridable for tests (the delivery tick precedent); floored so a misread env cannot busy-loop.

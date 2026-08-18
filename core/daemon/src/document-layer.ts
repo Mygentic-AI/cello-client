@@ -187,6 +187,11 @@ export interface DocumentLayer {
     documentId: string,
     partyAgentId: string,
   ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null; blockedBy?: string };
+  /**
+   * DOD-DOC-PUSH-NOT-POLL-1 — what we hold that this party has not confirmed receiving, as a
+   * comparable fingerprint; `null` when there is nothing. The sweep's ONLY reason to speak.
+   */
+  pendingFor(ownerAgentId: string, documentId: string, partyAgentId: string): string | null;
   /** SYNC-D8 — the ONE derivation of an agent's standing (R17 + removed/unknown), from the fold. */
   standingOf(
     ownerAgentId: string,
@@ -479,10 +484,52 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   };
 
   /**
-   * SYNC-R46 / spec §9 — one party's sync state, from the DISPLAY CACHE against our own
-   * positions. ONE implementation for the list surface and the sweep's believed-current
-   * suppression (R43) — two copies of "are they behind" is two daemons disagreeing about who
-   * needs an exchange. Never a correctness input (R44).
+   * DOD-DOC-PUSH-NOT-POLL-1 — WHAT WE HOLD THAT THIS PARTY HAS NOT CONFIRMED RECEIVING, as a
+   * fingerprint the scheduler compares and never interprets; `null` means nothing is pending.
+   *
+   * This is the SAME comparison that answers "are they behind" on the list surface, deliberately
+   * written once: two copies of it is two daemons disagreeing about who needs an exchange. The
+   * list projects it to a boolean; the sweep needs the VALUE, because it must tell an unchanged
+   * holding (already offered — go quiet) from a new one (a trigger — speak now).
+   *
+   * A party with no view row at all has confirmed nothing, so everything we hold is pending.
+   *
+   * NOT the retired `pendingContent` count (R47): that was an operator-facing number no ledger
+   * could make truthful. This never leaves the scheduler, and holds no authority — R41 stands,
+   * it may only delay an exchange.
+   */
+  const pendingAgainstView = (
+    ownerAgentId: string,
+    documentId: string,
+    view: { govSeqs: Record<string, number>; contentCounts: Record<string, number> } | null,
+  ): string | null => {
+    const parts: string[] = [];
+    for (const [author, mark] of amendments.watermarks(ownerAgentId, documentId)) {
+      if (mark.seq > (view?.govSeqs[author] ?? 0)) parts.push(`g:${author}:${mark.seq}`);
+    }
+    for (const [author, count] of store.envelopeCountsBySender(ownerAgentId, documentId)) {
+      if (count > (view?.contentCounts[author] ?? 0)) parts.push(`c:${author}:${count}`);
+    }
+    if (parts.length === 0) return null;
+    parts.sort();
+    return parts.join(",");
+  };
+
+  const pendingFor = (
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+  ): string | null =>
+    pendingAgainstView(
+      ownerAgentId,
+      documentId,
+      store.partyView(ownerAgentId, documentId, partyAgentId),
+    );
+
+  /**
+   * SYNC-R46 / spec §9 — one party's sync state for the LIST SURFACE, projected from `pendingFor`
+   * against our own positions. Never a correctness input (R44): the same comparison decides what
+   * the operator is shown and whether the sweep has anything to say, so the two cannot disagree.
    */
   const partySync = (
     ownerAgentId: string,
@@ -491,13 +538,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null; blockedBy?: string } => {
     const view = store.partyView(ownerAgentId, documentId, partyAgentId);
     if (!view) return { sync: "unseen", lastSyncedAtMs: null };
-    let behind = false;
-    for (const [author, mark] of amendments.watermarks(ownerAgentId, documentId)) {
-      if (mark.seq > (view.govSeqs[author] ?? 0)) behind = true;
-    }
-    for (const [author, count] of store.envelopeCountsBySender(ownerAgentId, documentId)) {
-      if (count > (view.contentCounts[author] ?? 0)) behind = true;
-    }
+    // The row we already hold — re-reading it here doubled the row reads on a surface that walks
+    // every party of every document (review F6).
+    const behind = pendingAgainstView(ownerAgentId, documentId, view) !== null;
     const blockedBy =
       view.refused.length === 0
         ? undefined
@@ -1228,6 +1271,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     isCurrentHolder,
     standingOf,
     partySync,
+    pendingFor,
     sweepTargets,
     initiateReconcile,
     governanceFrontierFor: (ownerAgentId: string, documentId: string) => {

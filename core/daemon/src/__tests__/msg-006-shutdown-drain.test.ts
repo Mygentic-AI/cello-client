@@ -47,8 +47,8 @@ function makeScheduler(logger: Logger, opts: { parties?: string[]; onDial?: (pee
       calls.push(`sweepTargets:${ownerAgentId}`);
       return new Map(parties.map((p) => [p, ["doc-1"]]));
     },
-    // Never "believed current", so the sweep always has real work to do.
-    partySync: () => ({ sync: "diverged" as const, lastSyncedAtMs: null }),
+    // Always something pending, so the sweep always has real work to do.
+    pendingFor: () => "c:author:1",
     initiateReconcile: async (_owner, peerAgentId, documentIds) => {
       calls.push(`initiateReconcile:${peerAgentId}:${documentIds.join(",")}`);
       opts.onDial?.(peerAgentId);
