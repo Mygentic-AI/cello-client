@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/daemon",
-  "version": "0.0.174",
+  "version": "0.0.175",
   "private": false,
   "type": "module",
   "engines": {
