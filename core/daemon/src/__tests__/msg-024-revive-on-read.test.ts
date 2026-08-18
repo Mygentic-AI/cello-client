@@ -161,24 +161,25 @@ describe("DOD-M12B-SESSION-SEED-1 (case B): reading revives, so inbound is not s
     ).toBe(true);
   });
 
-  it("a refusal NEVER costs the operator their history — the revival is opportunistic", async () => {
-    // The property the handler comment promises, and the one an operator would hit first. The
-    // bypass above returns `{ ok: false }` for every read of a sealed or abandoned session; this is
-    // what fails under it.
+  it("THE READ NEVER WAITS ON THE NETWORK — awaiting it hung a live receive for two minutes", async () => {
+    // 2026-08-18, live. The rebuild takes a circuit-relay reservation, and a relay that does not
+    // answer has no deadline. Awaiting it here meant `cello_receive` never returned on a session
+    // whose message was already verified and sitting in the transcript — and no `since_seq` catch-up
+    // could get past it either, because this ran first.
+    //
+    // Reading your own stored messages must never depend on the network. That is the rule this pins.
     const { readFileSync } = await import("node:fs");
     const code = readFileSync(join(import.meta.dirname, "..", "session-content-handlers.ts"), "utf-8")
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     const idx = code.indexOf("reviveIfNeededForRead(");
-    const following = code.slice(idx, idx + 400);
+    const line = code.slice(code.lastIndexOf("\n", idx) + 1, code.indexOf("\n", idx));
 
     expect(
-      following.includes("return { ok: false"),
-      "a refused revival must not short-circuit the read — reading stored history is always allowed",
+      line.includes("await "),
+      "the read is waiting on a node build again — an unresponsive relay makes cello_receive hang " +
+      "forever on a message that is already stored locally",
     ).toBe(false);
-    expect(
-      following.includes("revivalDeclined"),
-      "the refusal must be carried to the caller, not discarded — session_identity_lost is the one " +
-      "message that tells an operator to stop waiting and close for the receipt",
-    ).toBe(true);
+    expect(line.includes("void "), "it must still be kicked off, just not waited on").toBe(true);
   });
+
 });

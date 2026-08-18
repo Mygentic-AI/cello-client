@@ -458,6 +458,16 @@ export const REVIVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
  */
 export const REVIVAL_BOUND_SWEEP_MS = 60 * 60 * 1000;
 
+/**
+ * DOD-M12B-SESSION-SEED-1 — how long a revival may spend building its node before giving up.
+ *
+ * Ten seconds. The node takes a circuit-relay reservation, and an unresponsive relay would otherwise
+ * block forever — which is exactly what happened on 2026-08-18: a `cello_receive` hung past two
+ * minutes on a session whose message was already verified and stored. A revival is an optimisation
+ * over a local read; it is never worth waiting on.
+ */
+export const REVIVE_START_TIMEOUT_MS = 10_000;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -8544,7 +8554,28 @@ export class SessionNodeManager {
         inboundReachable: true,
         ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
       });
-      await node.start();
+      /**
+       * BOUNDED — 2026-08-18, after an unbounded start hung a live `cello_receive` for over two
+       * minutes on a session whose message was already in the transcript.
+       *
+       * `node.start()` here waits on a circuit-relay RESERVATION, and a relay that does not answer
+       * has no deadline of its own. `#startReceiverNode` has always known this — it races each
+       * candidate against a timeout for exactly this reason — and the revival path was written
+       * without it.
+       *
+       * On timeout the node is stopped rather than abandoned: a half-started node holds our
+       * advertised identity, and leaving one running is the "nothing left open" rule broken by
+       * accident. The refusal is transient by name, because it is: the next send or read retries.
+       */
+      await Promise.race([
+        node.start(),
+        new Promise<never>((_res, rej) =>
+          setTimeout(() => rej(new Error("revive_node_start_timeout")), REVIVE_START_TIMEOUT_MS).unref?.(),
+        ),
+      ]).catch(async (err: unknown) => {
+        try { await node.stop(); } catch { /* best-effort: it never finished starting */ }
+        throw err;
+      });
     } catch (err: unknown) {
       this.#logger.error("session.revive.node.failed", {
         agentName,
@@ -8829,6 +8860,34 @@ export class SessionNodeManager {
   /** CC-5/F21: count of RECEIVED messages on a session — the "did the counterparty ever speak"
    *  signal the dead-half-open reaper uses (message_count also counts our own auto-"Dispatched." ack,
    *  so it is NOT a reliable half-open discriminator). Mirrors #getReceivedBytesTotal. */
+  /**
+   * DOD-M12B-REAP-HELD-1 — did the counterparty EVER establish? Counted from every place their
+   * messages can be, not just the one.
+   *
+   * OBSERVED LIVE 2026-08-18: the half-open reaper abandoned session `d28db475…` — twenty leaves in
+   * the chain and sixteen more frames verified and held, ten of them from the counterparty — while
+   * the restart-seal resolver was actively trying to notarize it. The receipt was forfeited.
+   *
+   * `countReceivedMessages` asks the TRANSCRIPT, and **held content never reaches the transcript**;
+   * it sits in `held_content` until it can join the chain. So the very condition that holds content
+   * — an interrupted session — is the condition that makes the counterparty's messages invisible,
+   * and a fully-established conversation reads identically to an offer nobody ever answered.
+   *
+   * `origin = 'received'` is load-bearing. Our OWN held frames prove nothing about them, and
+   * counting those would make every session we ever spoke into un-reapable — which is exactly the
+   * clutter the reaper exists to clear. D18 also depends on the zero case staying zero: reaping only
+   * genuinely 0-received ghosts is what stops a stranger whose first handshakes died from being
+   * locked out by the acceptance bound forever.
+   */
+  countEstablishedReceived(agentName: string, sessionId: string): number {
+    if (!this.#db) return 0;
+    const agentId = this.#requireAgentId(agentName);
+    const held = this.#db
+      .prepare("SELECT COUNT(*) AS n FROM held_content WHERE agent_id = ? AND session_id = ? AND origin = 'received'")
+      .get(agentId, sessionId) as { n: number };
+    return this.countReceivedMessages(agentName, sessionId) + (held?.n ?? 0);
+  }
+
   countReceivedMessages(agentName: string, sessionId: string): number {
     if (!this.#db) return 0;
     const row = this.#db

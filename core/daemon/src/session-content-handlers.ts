@@ -689,17 +689,31 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
      * revival latency does not eat the read window — but its RESULT NEVER BLOCKS THE READ. Reading a
      * stored transcript is always allowed, including for a sealed session, where this refuses.
      */
-    let revivalDeclined: { reason: string; guidance?: string } | undefined;
+    /**
+     * DOD-M12B-SESSION-SEED-1 (case B) — return an interrupted session to `active` on a local read.
+     *
+     * **NOT AWAITED, and that is a correction made under live fire on 2026-08-18.** The first
+     * version awaited it. At the time the rebuild only opened a loopback port, so a stall was not
+     * credible — review asked that exact question and got that exact answer. The rebuild was then
+     * changed to take a circuit-relay reservation, so that a counterparty could dial us again, and
+     * nobody re-asked it. A relay that does not answer has no deadline. `cello_receive` hung for
+     * over two minutes on a session whose message was already verified and sitting in the
+     * transcript, and no `since_seq` catch-up could get past it either, because this ran first.
+     *
+     * **Reading your own stored messages must never depend on the network.** The revival is an
+     * optimisation on top of a local read — it makes the session sendable again and pulls anything
+     * parked — and both are worth nothing if the read cannot complete. So it runs alongside.
+     *
+     * WHY A READ MAY TRIGGER THIS AND AN INBOUND DIAL MAY NOT. Andre's tenet is about what a REMOTE
+     * party can cause — *"an open connection that a malicious agent can farm for."* Reviving because
+     * a peer dialled us would hand that lever to the peer. A read is the OPERATOR asking, on their
+     * own machine, for their own session.
+     *
+     * A refusal is no longer reported inline on this call; `session.revive.declined` names it in the
+     * log instead. That is the lesser evil against a read that never returns.
+     */
     if (record && record.status === "interrupted") {
-      const revival = await sessionNodeManager.reviveIfNeededForRead(agentName, sessionId);
-      if (!revival.ok) {
-        // review MEDIUM-4: this path produced the single most useful message in the feature and
-        // threw it away. `session_identity_lost` tells an operator their session cannot come back
-        // and should be closed for its receipt — and without this they got an ordinary-looking
-        // answer, nothing in the log, and kept waiting. The send path surfaced it and the read path
-        // did not, which is the same asymmetry case B exists to close, on the error channel.
-        revivalDeclined = { reason: revival.reason, ...(revival.guidance ? { guidance: revival.guidance } : {}) };
-      }
+      void sessionNodeManager.reviveIfNeededForRead(agentName, sessionId).catch(() => { /* logged inside */ });
     }
 
     // M8C-SINCESEQ-1: stateless catch-up. When since_seq is provided, return a BATCH of received
@@ -797,10 +811,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // guidance line second, and only when there is something to explain.
       const autoReplyCount = received.filter((m) => isAutoReplyMarked(m.text)).length;
       return {
-        // review MEDIUM-4: a revival that could not happen is reported, not swallowed. The most
-        // important case is `session_identity_lost` — it tells the operator that waiting for a
-        // reconnect is pointless and the session should be closed for its receipt.
-        ...(revivalDeclined ? { session_revival: revivalDeclined } : {}),
         ok: true,
         since_seq: sinceSeq,
         count: received.length,
@@ -827,10 +837,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // points the caller at the read that works.
     if (transcriptOnly) {
       return {
-        // review MEDIUM-4: a revival that could not happen is reported, not swallowed. The most
-        // important case is `session_identity_lost` — it tells the operator that waiting for a
-        // reconnect is pointless and the session should be closed for its receipt.
-        ...(revivalDeclined ? { session_revival: revivalDeclined } : {}),
         ok: false,
         reason: "session_not_live",
         attendance: attendingNow(agentName),
@@ -875,10 +881,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           unreadCount: terminal.unreadCount, correlationId: receiveCorrelationId,
         });
         return {
-          // review MEDIUM-4: a revival that could not happen is reported, not swallowed. The most
-          // important case is `session_identity_lost` — it tells the operator that waiting for a
-          // reconnect is pointless and the session should be closed for its receipt.
-          ...(revivalDeclined ? { session_revival: revivalDeclined } : {}),
           ok: true,
           type: "session_sealed",
           session_id: sessionId,
@@ -973,10 +975,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // alive in the shape it was measured in.
         const isAutoReply = isAutoReplyMarked(contentText);
         return {
-          // review MEDIUM-4: a revival that could not happen is reported, not swallowed. The most
-          // important case is `session_identity_lost` — it tells the operator that waiting for a
-          // reconnect is pointless and the session should be closed for its receipt.
-          ...(revivalDeclined ? { session_revival: revivalDeclined } : {}),
           ok: true,
           content: contentText,
           ...(isAutoReply ? { auto_reply: true, auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
@@ -1009,10 +1007,6 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             attendance: attendanceCount(agentName), correlationId: receiveCorrelationId,
           });
           return {
-            // review MEDIUM-4: a revival that could not happen is reported, not swallowed. The most
-            // important case is `session_identity_lost` — it tells the operator that waiting for a
-            // reconnect is pointless and the session should be closed for its receipt.
-            ...(revivalDeclined ? { session_revival: revivalDeclined } : {}),
             ok: true,
             content: null,
             reason: "content_undeliverable",
