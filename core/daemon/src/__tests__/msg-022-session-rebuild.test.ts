@@ -253,38 +253,105 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
   }, 60_000);
 
   /**
-   * DOD-M12B-REVIVE-RELAY-1 — THE PRINCIPLE, not just this instance.
+   * DOD-M12B-REVIVE-RELAY-1 — THE PRINCIPLE: a revived session must be indistinguishable from a
+   * fresh one.
    *
-   * **A revived session must be indistinguishable from a fresh one.** Every symptom chased
-   * separately on 2026-08-18 — doorbells not firing, a three-minute delivery against seconds on a
-   * fresh session, sends that could not park — was one consequence of revival doing three of the
-   * five things establishment does. The missing one was the relay witness connection, which is the
-   * live inbound path; without it everything falls back to the five-minute mailbox poll.
+   * Every symptom chased separately over six live rounds on 2026-08-18 — doorbells not firing, a
+   * three-minute delivery against seconds, sends that could not park — was one consequence of
+   * revival doing four of establishment's five steps.
    *
-   * This asserts the parity at the source, because a behavioural test cannot see a step that was
-   * never taken — that is exactly how it shipped. If establishment gains a sixth step, this fails
-   * until revival takes it too.
+   * REWRITTEN AFTER REVIEW. The first version matched five hardcoded strings against revival's own
+   * source and claimed *"if establishment gains a sixth step, this fails until revival takes it
+   * too."* That was false: it never read establishment at all. It also passed while the fifth step
+   * — `client.connect(node)` — was still missing, which is the exact defect the commit was named
+   * after.
    *
-   * Revert test (RUN): remove the `#reconnectRevivedSessionRelay` call from `reviveSessionNode` and
-   * this fails naming it.
+   * This derives the step list from ESTABLISHMENT instead, so it cannot go stale, and requires each
+   * step to appear in revival unless it is on a written exemption list with a reason.
    */
-  it("PARITY: revival takes every step establishment takes", async () => {
+  it("PARITY: every call establishment makes, revival makes too", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8");
     const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
-    const revive = code.slice(code.indexOf("async reviveSessionNode("), code.indexOf("async reviveIfNeededForSend("));
+    const region = (from: string, to: string): string => {
+      const a = code.indexOf(from);
+      const b = code.indexOf(to, a);
+      expect(a, `region start not found: ${from}`).toBeGreaterThan(-1);
+      expect(b, `region end not found: ${to}`).toBeGreaterThan(a);
+      return code.slice(a, b);
+    };
 
-    // The five steps establishment performs. Each one absent from a revival is a session that looks
-    // live and is not — which is the whole defect class this file exists for.
-    for (const [step, needle] of [
-      ["the node itself", "buildRevivedNode("],
-      ["the content handler, or nothing can receive", "registerContentHandler("],
-      ["liveness, or it can never be interrupted again", "wireSessionLiveness("],
-      ["the RELAY WITNESS, or there is no live inbound path at all", "reconnectRevivedSessionRelay("],
-      ["the status edge back to active, or every send refuses", 'updateSessionStatus(agentName, sessionId, "active")'],
-    ] as const) {
-      expect(revive.includes(needle), `revival no longer restores ${step}`).toBe(true);
-    }
+    // The RESPONDER's establishment path — the closest analogue to a revival, since it too adopts an
+    // existing node rather than dialling out to create one.
+    // BOUNDED AT THE NEXT METHOD, not at some later one — the first version ran to
+    // `#registerContentHandler` and swept `destroySessionNode`'s teardown calls in with it, then
+    // reported them as steps revival was skipping. A region that is too wide invents findings.
+    const establish = region("async acceptSession(", "async destroySessionNode(");
+    const revive = region("async reviveSessionNode(", "async reviveIfNeededForSend(");
+
+    /**
+     * Steps establishment takes that a revival legitimately does not, each with the reason. Anything
+     * NOT on this list must appear in both.
+     */
+    /** Establishment's step → revival's equivalent, where the same job has a different name. */
+    const EQUIVALENT = new Map<string, string>([
+      ["#connectSessionRelay", "#reconnectRevivedSessionRelay"],
+    ]);
+
+    const EXEMPT = new Map<string, string>([
+      ["#insertSessionRow", "the row already exists — a revival updates its status instead"],
+      ["#ensureStandingReceiver", "no receiver is consumed, so none needs replacing"],
+      ["#rememberSessionSeed", "the identity is what a revival RESTORES; it was recorded at establishment"],
+      ["#recordRelayAssignment", "the relay already recorded this session at first establishment"],
+      ["#maybeAutoAcknowledgeSeal", "reached from the relay leaf handler, which both paths register"],
+      // The inbound ACCEPTANCE accounting (D18): these decide whether to admit a NEW session from
+      // this sender. A revival admits nothing new — the session was already accepted — so repeating
+      // them would charge the counterparty a second time for one conversation.
+      ["#getUnreadReceivedCount", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
+      ["#getReceivedBytesTotal", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
+    ]);
+
+    const calls = new Set(
+      [...establish.matchAll(/this\.(#?[A-Za-z][A-Za-z0-9_]*)\(/g)].map((m) => `#${m[1]!.replace(/^#/, "")}`),
+    );
+
+    const takenByRevival = (c: string): boolean => {
+      const names = [c, ...(EQUIVALENT.has(c) ? [EQUIVALENT.get(c)!] : [])];
+      return names.some((n) => revive.includes(`${n.replace(/^#/, "this.#")}(`) || revive.includes(`${n.slice(1)}(`));
+    };
+    const missing = [...calls].filter((c) => !EXEMPT.has(c) && !takenByRevival(c));
+
+    expect(
+      missing,
+      "a revived session that skips any of these is not a session: it reports active while some " +
+      "part of it — inbound delivery, liveness, the content handler — was never wired. That is the " +
+      "defect class this whole file exists for, and it shipped past a green suite for two days.",
+    ).toEqual([]);
+  }, 60_000);
+
+  it("PARITY: the relay witness is CONNECTED, not merely registered", async () => {
+    // Review HIGH-2. `registerSession` files a handler in a Map — it opens no stream, no auth, no
+    // reader loop. Establishment ends with `await client.connect(node)`; the first revival did not,
+    // so it logged "live inbound path back" over a client whose stream was null and delivery fell
+    // straight back to the five-minute mailbox poll.
+    const { readFileSync } = await import("node:fs");
+    const code = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8")
+      .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    // BOUNDED BY THE NEXT METHOD. The first version used `indexOf("\n  }\n")`, which does not match
+    // this file's formatting — it returned -1, so `slice(a, -1)` scanned almost the whole file and
+    // found `client.connect(` in `#connectSessionRelay`. The test passed with the call reverted,
+    // which is the same hollowness it was written to fix.
+    const a = code.indexOf("async #reconnectRevivedSessionRelay(");
+    const b = code.indexOf("async reviveSessionNode(", a);
+    expect(a, "method not found").toBeGreaterThan(-1);
+    expect(b, "region end not found").toBeGreaterThan(a);
+    const body = code.slice(a, b);
+
+    expect(body.includes("registerSession("), "the handler must still be registered").toBe(true);
+    expect(
+      body.includes("client.connect("),
+      "registering without connecting is a session that reports a live inbound path and has none",
+    ).toBe(true);
   }, 60_000);
 });

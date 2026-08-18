@@ -1590,53 +1590,28 @@ async function startDaemonHoldingLock(
   });
 
   /**
-   * DOD-M12B-SESSION-SEED-1 — give `drainSession` the production caller it never had.
+   * DOD-M12B-SESSION-SEED-1 — the retry drain is DELIBERATELY NOT WIRED. Review HIGH-1.
    *
-   * The send path enqueues here on a failed delivery and tells the operator the message will be
-   * "retried on reconnect". Nothing ever reconnected it: the comment three lines above records that
-   * a direct-resend row is reachable only by `drainSession`, which had no caller, so rows sat until
-   * the session went terminal and were reaped unsent. Measured live 2026-08-18 — two of the
-   * operator's messages went in and both were reported lost, which is how a transcript gets
-   * duplicates.
+   * It was wired, and it was worse than the problem it solved. `retryQueue.enqueue` runs only on the
+   * `!sendResult.durable` branch — content that got NO local leaf and NO transcript row, because as
+   * that branch's own comment says, *"A LOST message gets no leaf — that would commit a sequence no
+   * content will ever fill."*
    *
-   * A REVIVAL IS THAT RECONNECT. Not awaited: the revival must not wait on delivery, and a resend
-   * that fails simply leaves the entry queued for the next one.
+   * The hook re-sent those rows with `sendContent`, which is wire-and-witness only: it consumes a
+   * canonical relay sequence and returns one, and the hook discarded it without calling
+   * `placeOwnLeaf` or writing the transcript. So the counterparty would silently receive the message
+   * while OUR tree kept a permanent hole at that sequence. Every later message would be held behind
+   * the gap with guidance blaming the counterparty for a message they already sent, the two roots
+   * would have parted, and the session could never seal.
+   *
+   * A stranded queue row is recoverable. A parted hash chain is not. So this stays unwired until the
+   * drain routes through the same commit path `cello_send` uses (place the leaf at the returned
+   * sequence, write the transcript, keep the row on failure) rather than calling `sendContent` raw.
+   *
+   * The operator-facing consequence of leaving it unwired is unchanged from before this milestone:
+   * a message that fails this way is reported lost and must be re-sent by hand. That is honest, and
+   * it is what the guidance already says.
    */
-  sessionNodeManager.setRetryDrainHook((agentName, sessionId) => {
-    void retryQueue
-      .drainSession(sessionId, async (contentBlob) => {
-        const res = await sessionNodeManager.sendContent(
-          agentName,
-          sessionId,
-          contentBlob,
-          wireContentHash(contentBlob),
-        );
-        // NAME THE CAUSE the send gave. A resend that failed for `session_terminal` and one that
-        // failed because the relay blinked lead to different places, and the queue's own log is the
-        // only surface either reaches.
-        return res.ok === true
-          ? { delivered: true as const }
-          : { delivered: false as const, error: res.reason ?? "send_failed" };
-      })
-      .then((delivered) => {
-        if (delivered > 0) {
-          logger.info("session.revive.retry_drain.delivered", {
-            agentName,
-            sessionId,
-            delivered,
-            impact: "messages the operator was told were lost have now been sent",
-          });
-        }
-      })
-      .catch((err: unknown) => {
-        logger.warn("session.revive.retry_drain.failed", {
-          agentName,
-          sessionId,
-          error: err instanceof Error ? err.message : String(err),
-          impact: "messages queued while this session was down remain queued",
-        });
-      });
-  });
 
   sessionNodeManager.setAwaitingAckHooks({
     onPersisted: (agentName, sessionId, contentHashHex) => {
