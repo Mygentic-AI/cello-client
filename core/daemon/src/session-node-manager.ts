@@ -383,6 +383,28 @@ const RECEIVED_BUFFER_CAP = 32;
 // M12-P18: how many refused session ids to retain per agent (drain-sweep matching, not security).
 type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
 
+/**
+ * DOD-M12B-REVIVAL-BOUND-1 — how long an interrupted session stays revivable before it is closed.
+ *
+ * 24 hours. The bound exists because of Andre's 2026-08-18 tenet — *"leave nothing open that is no
+ * longer needed"* — and its value is set by the case it must not break: a laptop closed for the
+ * night. A window shorter than a night's sleep would abandon exactly the sessions case A/B exist to
+ * rescue, which is why this is not zero and not an hour.
+ *
+ * It is deliberately a plain constant and not a setting. A per-operator knob here is a knob that
+ * turns the guarantee off, and the guarantee is the security property, not a preference.
+ */
+export const REVIVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * DOD-M12B-REVIVAL-BOUND-1 — how often the revival bound is applied.
+ *
+ * Hourly. The window is 24 hours, so the worst-case overshoot is ~4% of the bound, and the pass is
+ * one DB walk with no network in it. Boot-only was the first build and it is not a bound at all: a
+ * daemon left up for a week never applies it, and a long-lived daemon is the normal case.
+ */
+export const REVIVAL_BOUND_SWEEP_MS = 60 * 60 * 1000;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -3722,6 +3744,217 @@ export class SessionNodeManager {
       messageCount: r.message_count ?? 0,
     }));
   }
+
+  /**
+   * DOD-M12B-REVIVAL-BOUND-1 — interrupted sessions that can no longer be revived, and must close.
+   *
+   * Andre, 2026-08-18: *"after that, those peer IDs and that peer connection needs to be shut down.
+   * It is an open connection that a malicious agent can farm for."* The tenet is **leave nothing
+   * open that is no longer needed**, and the threat model is a daemon that has been reprogrammed —
+   * so the guarantee has to hold on the side that is not the attacker.
+   *
+   * WHAT IS OPEN. `ingestReceivedContent` refuses `sealed`, `seal_interrupted_pending` and
+   * `abandoned`, but deliberately ACCEPTS `interrupted` — that acceptance is the only reason
+   * recovery can work. Nothing else ever leaves `interrupted`, so it means accepts FOREVER.
+   *
+   * **THIS IS THE BACKSTOP, NOT THE COMPLEMENT.** The seal path gets first refusal on every
+   * local-cause session, because a session whose ending we can describe truthfully earns a
+   * notarized receipt. But "the seal path owns it" is not the same as "the seal path will finish
+   * it", and two populations fall through the gap between those:
+   *
+   *   - **The resolver gave up.** `markRestartSealGaveUp` writes only `restart_seal_gave_up_at`;
+   *     the status stays `interrupted`, and `listRestartOrphanedSessions` then excludes the row by
+   *     `restart_seal_gave_up_at IS NULL` so it is never retried. `TERMINAL_SEAL_REFUSALS` has ten
+   *     entries and the measured figure is that 59% of seals that start never finish, so this is
+   *     the common case, not a corner.
+   *   - **Zero-message local sessions.** The resolver requires `message_count > 0` — a dead
+   *     handshake is not worth a ceremony. It is still an open write surface.
+   *
+   * Excluding those left them permanently interrupted and permanently writable, which is the exact
+   * condition this line exists to end. And the population is about to become the majority: no row
+   * has ever carried `interrupted_by = 'local'` yet, and from the next shutdown onward every
+   * shutdown-orphaned session will. So the sweep takes a local-cause session once the seal path
+   * has either declined it or exhausted it — never before.
+   *
+   * **THE CLOCK MUST BE ONE THE COUNTERPARTY CANNOT MOVE.** The obvious fallback for a row with no
+   * `interrupted_at` is `updated_at` — and it is exactly wrong. `ingestReceivedContent` accepts
+   * content into an `interrupted` session (that acceptance is this whole line's premise), and a
+   * successful ingest runs `UPDATE sessions SET message_count = ?, updated_at = <now>`. So
+   * `updated_at` is a clock the reprogrammed peer holds: one message every 24 hours and the session
+   * never expires, forever. The fallback would have handed the attacker the off switch for the
+   * control built to stop them.
+   *
+   * Instead the missing timestamps are STAMPED ONCE, by `#stampMissingInterruptedAt` immediately
+   * before this query runs, and this query reads `interrupted_at` and nothing else. The stamp is
+   * written under `WHERE interrupted_at IS NULL`, so it is monotone — set once, never moved, by us
+   * and not by a peer. A legacy row therefore gets its full window starting from the first sweep
+   * that sees it, which is later than the true interruption but is the only bound that is sound.
+   *
+   * Same retired-agent INNER JOIN as the sibling query: a retired agent's rows are kept for
+   * accountability, are not resumable, and are not writable either.
+   *
+   * **THE TIME ARITHMETIC IS LOAD-BEARING, AND BOTH OBVIOUS FORMS OF IT ARE WRONG.** These two
+   * columns do not hold the same kind of value:
+   *
+   *   `interrupted_at`  TEXT,    an ISO-8601 string — `new Date(now).toISOString()`.
+   *   `updated_at`      INTEGER, epoch milliseconds.
+   *
+   * There are FOUR writers of `status = 'interrupted'`, not three. The fourth is
+   * `destroySessionNode` → `#updateSessionStatus(…, "interrupted", "local")`, which historically
+   * wrote `interrupted_by` and **no timestamp at all** — and it is the path that produced the two
+   * rows in Entry 41. It now stamps `interrupted_at` like the others, so NULL is a legacy state
+   * rather than one production keeps creating.
+   *
+   * So a bare `interrupted_at <= ?` against a numeric bound is **always false** — the column has
+   * TEXT affinity and the bound parameter has none, so SQLite applies TEXT affinity to the
+   * parameter and compares them as STRINGS (`'2026-08-18T05:32:04.183Z' <= 1755000000000` → 0).
+   * The query silently returns nothing forever and reads as "nothing has expired yet". And
+   * `CAST(interrupted_at AS
+   * INTEGER)` is worse than useless: SQLite casts by taking the leading digits, so
+   * `'2026-08-18T05:32:04Z'` becomes **2026**, which is older than any epoch bound. That form
+   * abandons every interrupted session on the next boot, immediately, whatever its age. It was
+   * written, and `session-001`/`cello-list-sessions` failed on it in the gate.
+   *
+   * `strftime('%s', …) * 1000` parses the ISO string properly and returns NULL for anything it
+   * cannot parse — so a malformed or differently-formatted value falls through the COALESCE to
+   * `updated_at` rather than being read as the year 2026.
+   */
+  listExpiredUnrevivableSessions(
+    nowMs: number,
+    windowMs: number,
+  ): Array<{ agentName: string; sessionId: string; cause: string | null }> {
+    if (!this.#db) {
+      // ABSENT IS NOT FINE. An empty array here is indistinguishable from "the store is clean",
+      // which is the state this line exists to end — so the one boot where the sweep could not
+      // read the store must not look like the boots where it read it and found nothing.
+      this.#logger.error("session.revival_bound.enumerate.failed", {
+        error: "db not initialized",
+        impact: "no interrupted session was checked against the revival window this boot; any that "
+          + "have expired are still accepting content",
+      });
+      return [];
+    }
+    const rows = this.#db
+      .prepare(
+        `SELECT s.session_id AS session_id, s.interrupted_by AS cause, a.agent_name AS agent_name
+         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
+         WHERE s.status = 'interrupted' AND a.state != 'retired'
+           AND (COALESCE(s.interrupted_by, '') != 'local'
+                OR s.restart_seal_gave_up_at IS NOT NULL
+                OR s.message_count = 0)
+           AND CAST(strftime('%s', s.interrupted_at) AS INTEGER) * 1000 <= ?
+         ORDER BY CAST(strftime('%s', s.interrupted_at) AS INTEGER) * 1000 ASC`,
+      )
+      .all(nowMs - windowMs) as unknown as Array<{ session_id: string; cause: string | null; agent_name: string }>;
+    return rows.map((r) => ({ agentName: r.agent_name, sessionId: r.session_id, cause: r.cause }));
+  }
+
+  /**
+   * DOD-M12B-REVIVAL-BOUND-1 — give every timestamp-less interrupted session a clock, once.
+   *
+   * A row with `interrupted_at IS NULL` has no bound that can be evaluated, and skipping such rows
+   * would exempt the oldest sessions in the store from the control permanently — the same "open
+   * forever" failure wearing a different NULL. The two rows measured in Entry 41 are exactly this
+   * shape, written by a `destroySessionNode` path that set the cause and no timestamp.
+   *
+   * **`WHERE interrupted_at IS NULL` is the security property, not an optimisation.** It makes the
+   * stamp write-once: this can run on every sweep forever and a row's clock still cannot be moved
+   * after the first one. That is what disqualifies `updated_at`, which a peer moves with every
+   * message it sends into the still-accepting session.
+   *
+   * The cost is honest and bounded: a legacy row's window starts at the first sweep that sees it
+   * rather than at its true interruption, so it survives up to one window longer than it should.
+   * A late close is recoverable; a clock the counterparty winds is not.
+   *
+   * @returns how many rows were stamped.
+   */
+  #stampMissingInterruptedAt(nowMs: number): number {
+    if (!this.#db) return 0;
+    try {
+      const res = this.#db
+        .prepare("UPDATE sessions SET interrupted_at = ? WHERE status = 'interrupted' AND interrupted_at IS NULL")
+        .run(new Date(nowMs).toISOString()) as unknown as { changes?: number | bigint };
+      const stamped = Number(res?.changes ?? 0);
+      if (stamped > 0) {
+        this.#logger.info("session.revival_bound.clock.stamped", {
+          stamped,
+          impact: "these sessions had no interruption timestamp; their revival window starts now",
+        });
+      }
+      return stamped;
+    } catch (err: unknown) {
+      this.#logger.error("session.revival_bound.clock.stamp.failed", {
+        error: err instanceof Error ? err.message : String(err),
+        impact: "sessions with no interruption timestamp cannot be evaluated and stay open",
+      });
+      return 0;
+    }
+  }
+
+  /**
+   * DOD-M12B-REVIVAL-BOUND-1 — close every session the revival window has expired.
+   *
+   * `abandonSession` is the right instrument and already exists: it flips the status FIRST and
+   * synchronously, annexes held content so the operator does not lose mail that has nowhere to go,
+   * and retires the node. It notarizes nothing, which is the point — we are closing a door, not
+   * asserting how it came to be open.
+   *
+   * One session's failure must not strand the rest, so each is caught and logged; the sweep runs at
+   * boot beside the restart-seal resolver and a throw there would take the daemon with it.
+   *
+   * @returns how many sessions actually flipped — not how many were attempted.
+   */
+  async closeExpiredUnrevivableSessions(nowMs: number, windowMs: number): Promise<number> {
+    // Stamp FIRST. A row with no clock cannot be evaluated by the query below, and this is the only
+    // thing that gives it one. Running it before every sweep is safe because the write is scoped to
+    // rows that have no timestamp yet.
+    this.#stampMissingInterruptedAt(nowMs);
+    const expired = this.listExpiredUnrevivableSessions(nowMs, windowMs);
+    let closed = 0;
+    for (const s of expired) {
+      try {
+        if (await this.abandonSession(s.agentName, s.sessionId)) {
+          closed += 1;
+          this.#logger.info("session.revival_bound.closed", {
+            agentName: s.agentName,
+            sessionId: s.sessionId,
+            // The cause we could NOT establish is the reason this ends without a receipt — log it
+            // so an operator asking "why no certificate?" gets the answer here.
+            interruptedBy: s.cause ?? "unknown",
+            windowMs,
+            // NAME THE FORFEIT. Until this sweep ran, `cello_close_session` (without `force`) still
+            // accepted this session — it takes `status IN ('active','interrupted')` — so the
+            // operator could have come back days later and obtained a real seal. `abandoned` is in
+            // TERMINAL_SEAL_REFUSALS, so after this they cannot. That is a deliberate trade (SI-001
+            // forbids auto-sealing a session nobody chose to end) and it costs something real, so
+            // it is stated rather than left implicit in a WHERE clause.
+            forfeited: "a seal was still obtainable by hand until now; it is not after this",
+          });
+        }
+      } catch (err) {
+        this.#logger.warn("session.revival_bound.close.failed", {
+          agentName: s.agentName,
+          sessionId: s.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // UNCONDITIONAL. A sweep that found nothing and a sweep that never really ran must not produce
+    // the same silence — this line is the only proof the control executed at all.
+    this.#logger.info("session.revival_bound.sweep", { expired: expired.length, closed, windowMs });
+    if (closed !== expired.length) {
+      // Not arithmetic for the reader to do: a session the security control failed to close is one
+      // that is still interrupted and still accepting content.
+      this.#logger.warn("session.revival_bound.sweep.incomplete", {
+        expired: expired.length,
+        closed,
+        failed: expired.length - closed,
+        impact: "these sessions are still interrupted and still accept content from any peer that dials them",
+      });
+    }
+    return closed;
+  }
+
 
   /**
    * DOD-M12B-RESTART-SEAL-1 — record that automatic sealing has exhausted this session.
@@ -8192,11 +8425,24 @@ export class SessionNodeManager {
     try {
       const res = this.#db
         .prepare(
-          interruptedBy === undefined
-            ? "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?"
-            : "UPDATE sessions SET status = ?, updated_at = ?, interrupted_by = 'local' WHERE agent_id = ? AND session_id = ?",
+          // DOD-M12B-REVIVAL-BOUND-1: this is the FOURTH writer of `status = 'interrupted'`, and
+          // until now the only one that wrote no `interrupted_at`. That is where Entry 41's two
+          // timestamp-less rows came from, and a row with no timestamp has no revival bound that
+          // can be evaluated. `COALESCE` matches the three sibling producers: the FIRST
+          // interruption is the clock, so re-entering the status cannot push the deadline out.
+          status === "interrupted"
+            ? (interruptedBy === undefined
+              ? "UPDATE sessions SET status = ?, updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?) WHERE agent_id = ? AND session_id = ?"
+              : "UPDATE sessions SET status = ?, updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?), interrupted_by = 'local' WHERE agent_id = ? AND session_id = ?")
+            : (interruptedBy === undefined
+              ? "UPDATE sessions SET status = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?"
+              : "UPDATE sessions SET status = ?, updated_at = ?, interrupted_by = 'local' WHERE agent_id = ? AND session_id = ?"),
         )
-        .run(status, now, this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
+        .run(
+          ...(status === "interrupted"
+            ? [status, now, new Date(now).toISOString(), this.#requireAgentId(agentName), sessionId]
+            : [status, now, this.#requireAgentId(agentName), sessionId]),
+        ) as unknown as { changes?: number | bigint };
       // "Did not throw" is NOT "landed". An UPDATE whose WHERE matches no row — a wrong agent_id, a
       // session_id with no row — succeeds silently and changes nothing. Reporting that as a written
       // status flip is what let a disposition hook delete a live session's content, so the row count
