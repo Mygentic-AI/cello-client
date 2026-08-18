@@ -205,9 +205,18 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
       const bytes = Uint8Array.from(Buffer.from(hex, "hex"));
       const started = Date.now();
       r.router.routeSync(AGENT, bytes, NOW, "c");
-      // The guarded path measures well under a millisecond and the regression this catches is a
-      // 5-10 SECOND stall, so the margin is ~300x — a GC pause cannot false-positive it.
-      expect(Date.now() - started).toBeLessThan(100);
+      // The guarded path measures well under a millisecond; the regression it catches is a 5-10
+      // SECOND stall. The bound is set from THAT, not from the happy-path cost.
+      //
+      // RAISED FROM 100ms after a CI failure at 106ms (2026-08-18, run 32136858673). The old
+      // comment claimed "~300x margin — a GC pause cannot false-positive it", and both halves were
+      // wrong: 100ms against a 5s regression is 50x, and a shared runner's scheduling pause or a
+      // cold JIT on the first loop iteration reaches 106ms without difficulty. Nothing in that
+      // build touched the decoder or the router.
+      //
+      // One second is still 5-10x BELOW the regression it must catch and ~1000x above the real
+      // cost, so it fails on the stall and cannot fail on a hiccup.
+      expect(Date.now() - started).toBeLessThan(1_000);
     }
   });
 
@@ -222,7 +231,7 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     ]) {
       const started = Date.now();
       expect(r.router.routeSync(AGENT, bytes, NOW, "c")).toEqual({ consumed: false });
-      expect(Date.now() - started).toBeLessThan(100);
+      expect(Date.now() - started).toBeLessThan(1_000);
     }
   });
 
@@ -244,7 +253,7 @@ describe("DocumentFrameRouter — hostile bytes never reach a CBOR decoder", () 
     // The length cap is what bounds the nesting depth, and it runs before anything else looks at
     // the frame. The decoder's per-container limit only reduces amplification.
     expect(r.router.routeSync(AGENT, huge, NOW, "c")).toEqual({ consumed: false });
-    expect(Date.now() - started).toBeLessThan(100);
+    expect(Date.now() - started).toBeLessThan(1_000);
   });
 
   it("the admitted header range stays inside the UTF-8 continuation bytes", async () => {
