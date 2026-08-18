@@ -41,7 +41,7 @@ import type {
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { RestartSealResolver } from "./restart-seal-resolver.js";
-import { escalateToUnilateralSeal as runUnilateralEscalation } from "./seal-escalation.js";
+import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
 import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
@@ -1197,7 +1197,7 @@ async function startDaemonHoldingLock(
                 {
                   logger, sessionNodeManager, sendOver, pendingUnilateralWaiters, sealKey,
                   getKeyProvider: (a) => keyProviders.get(a),
-                  timeoutMs: 30_000,
+                  timeoutMs: UNILATERAL_SEAL_TIMEOUT_MS,
                 },
                 agentName,
                 sessionId,
@@ -1208,7 +1208,13 @@ async function startDaemonHoldingLock(
               if (uni.ok) {
                 logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: uni.sealed_root, sealType: "unilateral" });
               } else {
-                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", { agentName, sessionId, reason: uni.reason });
+                // CARRY THE GUIDANCE. The four refusals this path just gained come with the
+                // sentence that tells an operator whether to retry or force-abandon — and the log
+                // is this path's ONLY surface, so dropping it leaves a nameable cause with no
+                // action attached. The old reasons had no guidance to lose; these do.
+                logger.warn("session.away.inbox.oneshot.seal_unilateral_failed", {
+                  agentName, sessionId, reason: uni.reason, guidance: uni.guidance,
+                });
               }
             } finally {
               sealInterruptedInProgress.delete(sealKey(agentName, sessionId));

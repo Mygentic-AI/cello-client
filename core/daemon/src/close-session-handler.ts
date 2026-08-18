@@ -40,7 +40,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { validateSessionName } from "./session-name.js";
 import type { SealFlowResult, ActiveSealResult } from "./seal-flows.js";
 import type { SealCompletion, UnilateralResult } from "./seal-coordinator.js";
-import { escalateToUnilateralSeal as runUnilateralEscalation } from "./seal-escalation.js";
+import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
@@ -114,7 +114,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
     recoverParkedContent,
   } = deps;
-  const UNILATERAL_TIMEOUT_MS = deps.unilateralTimeoutMs ?? 30_000;
+  const UNILATERAL_TIMEOUT_MS = deps.unilateralTimeoutMs ?? UNILATERAL_SEAL_TIMEOUT_MS;
 
   /**
    * How long the seal path waits to learn where the counterparty is homed.

@@ -13,6 +13,14 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { UnilateralResult } from "./seal-coordinator.js";
 import type { Logger } from "./types.js";
 
+/**
+ * How long to wait for the directory's answer to a `seal_unilateral` request.
+ *
+ * ONE number, because the two callers had their own copies of it and that is the same drift this
+ * module exists to end — the away path's was a hardcoded literal that no test could shorten.
+ */
+export const UNILATERAL_SEAL_TIMEOUT_MS = 30_000;
+
 export interface SealEscalationDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;

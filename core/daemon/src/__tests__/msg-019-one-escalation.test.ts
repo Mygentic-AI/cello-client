@@ -29,11 +29,23 @@ import { join } from "node:path";
 
 const SRC = join(import.meta.dirname, "..");
 
+/**
+ * Every daemon source file, RECURSIVELY — a fourth copy dropped in a new subdirectory would sail
+ * past a flat scan, and the property claimed here is "one implementation exists", not "one in this
+ * directory".
+ *
+ * `__tests__` is excluded, and not for tidiness: THIS FILE contains both literal strings inside its
+ * own `.includes(...)` arguments, so scanning itself would make the assertion self-defeating.
+ */
+function sources(): string[] {
+  return readdirSync(SRC, { recursive: true, encoding: "utf-8" })
+    .filter((f) => f.endsWith(".ts"))
+    .filter((f) => !f.split(/[/\\]/).includes("__tests__"));
+}
+
 describe("DOD-M12B-SEAL-ESCALATE-DUP-1: one escalation, not three", () => {
   it("exactly one file constructs a seal_unilateral frame", () => {
-    const builders = readdirSync(SRC)
-      .filter((f) => f.endsWith(".ts"))
-      .filter((f) => readFileSync(join(SRC, f), "utf-8").includes('type: "seal_unilateral"'));
+    const builders = sources().filter((f) => readFileSync(join(SRC, f), "utf-8").includes('type: "seal_unilateral"'));
 
     expect(
       builders,
@@ -46,9 +58,7 @@ describe("DOD-M12B-SEAL-ESCALATE-DUP-1: one escalation, not three", () => {
   it("the escalation module is the only thing that registers a unilateral waiter", () => {
     // A second registrant is how the two copies diverged in the first place, and it is also how the
     // agent-scoped key introduced by DOD-M12B-SEAL-WAITER-KEY-1 gets forgotten in one of them.
-    const registrants = readdirSync(SRC)
-      .filter((f) => f.endsWith(".ts"))
-      .filter((f) => readFileSync(join(SRC, f), "utf-8").includes("pendingUnilateralWaiters.set("));
+    const registrants = sources().filter((f) => readFileSync(join(SRC, f), "utf-8").includes("pendingUnilateralWaiters.set("));
 
     expect(registrants, "one place registers, one place resolves").toEqual(["seal-escalation.ts"]);
   });
