@@ -38,7 +38,6 @@ import type {
   ActiveSessionInfo,
   SealReadinessView,
   DirectorySignalingState,
-  SessionRecord,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { RestartSealResolver } from "./restart-seal-resolver.js";
@@ -1200,7 +1199,7 @@ async function startDaemonHoldingLock(
                   getKeyProvider: (a) => keyProviders.get(a),
                   timeoutMs: 30_000,
                 },
-                { agent_name: agentName, session_id: sessionId } as SessionRecord,
+                agentName,
                 sessionId,
                 escalation,
                 correlationId,

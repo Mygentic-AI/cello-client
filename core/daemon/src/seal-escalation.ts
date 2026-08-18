@@ -11,7 +11,7 @@
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { UnilateralResult } from "./seal-coordinator.js";
-import type { Logger, SessionRecord } from "./types.js";
+import type { Logger } from "./types.js";
 
 export interface SealEscalationDeps {
   logger: Logger;
@@ -42,7 +42,10 @@ export interface SealEscalationDeps {
  */
 export async function escalateToUnilateralSeal(
   deps: SealEscalationDeps,
-  record: SessionRecord,
+  /** AGENT NAME, not a SessionRecord. The away path holds no record and was passing a two-field
+   *  cast; only `agent_name` was ever read, so the cast bought nothing except a latent crash the
+   *  first time someone here reaches for a third field. */
+  agentName: string,
   sessionId: string,
   escalation: { reportedRootHex: string; sequenceNumber: number },
   correlationId: string,
@@ -63,18 +66,18 @@ export async function escalateToUnilateralSeal(
   const UNILATERAL_TIMEOUT_MS = deps.timeoutMs;
   let resolveUni!: (r: UnilateralResult) => void;
   const uniP = new Promise<UnilateralResult>((r) => { resolveUni = r; });
-  pendingUnilateralWaiters.set(sealKey(record.agent_name, sessionId), resolveUni);
+  pendingUnilateralWaiters.set(sealKey(agentName, sessionId), resolveUni);
   // FED-OPTIONB-SEAL-001 (Option B): carry the full leaf chain (both parties) + the relay receipts so
   // the directory rebuilds + verifies the tree OFFLINE — no directory→relay getSealLeaves dial. The
   // store is keyed by the agent's K_local pubkey (the same key the relay client recorded under).
-  const sealAgentKp = getKeyProvider(record.agent_name);
+  const sealAgentKp = getKeyProvider(agentName);
   const sealAgentPubkeyHex = sealAgentKp ? Buffer.from(await sealAgentKp.getPublicKey()).toString("hex") : "";
   // NAMED SEPARATELY, because without it this falls through to an empty carry and answers
   // `seal_carry_empty` — "the relay released the session, the receipt is no longer obtainable",
   // which is TERMINAL in the restart-seal resolver. A local agent that is not loaded would have
   // been written off as permanent relay-side loss, with a durable give-up row to match.
   if (!sealAgentPubkeyHex) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_agent_key_unavailable",
@@ -106,7 +109,7 @@ export async function escalateToUnilateralSeal(
   // dominant ones. The directory still re-checks everything — this refuses earlier and by name,
   // it does not become the authority.
   if (opts.refuseOnUnusableCarry && seal_leaves.length === 0) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_carry_empty",
@@ -117,7 +120,7 @@ export async function escalateToUnilateralSeal(
   const sequences = seal_leaves.map((l) => l.sequence_number).sort((a, b) => a - b);
   const contiguousFromOne = sequences.every((n, i) => n === i + 1);
   if (opts.refuseOnUnusableCarry && !contiguousFromOne) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_carry_noncontiguous",
@@ -138,7 +141,7 @@ export async function escalateToUnilateralSeal(
   // instead of giving up once with the truthful reason.
   const ownCtrl = sealCarry.filter((l) => l.leafKind === 0x02 && l.senderPubkeyHex === sealAgentPubkeyHex);
   if (opts.refuseOnUnusableCarry && ownCtrl.length > 1) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_carry_duplicate_own_ctrl_leaf",
@@ -165,7 +168,7 @@ export async function escalateToUnilateralSeal(
   // worse than the silence this replaces.
   const allCtrl = sealCarry.filter((l) => l.leafKind === 0x02);
   if (opts.refuseOnUnusableCarry && allCtrl.length > 1 && new Set(allCtrl.map((l) => l.senderPubkeyHex)).size > 1) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_carry_bilateral_in_progress",
@@ -174,7 +177,7 @@ export async function escalateToUnilateralSeal(
     };
   }
 
-  const sent = await sendOver(record.agent_name, {
+  const sent = await sendOver(agentName, {
     type: "seal_unilateral",
     session_id: new Uint8Array(Buffer.from(sessionId, "hex")),
     reported_root: new Uint8Array(Buffer.from(escalation.reportedRootHex, "hex")),
@@ -182,7 +185,7 @@ export async function escalateToUnilateralSeal(
     seal_leaves,
   });
   if (!sent.ok) {
-    pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+    pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
     return {
       ok: false,
       reason: "seal_unilateral_send_failed",
@@ -195,10 +198,10 @@ export async function escalateToUnilateralSeal(
   });
   const uniResult = await Promise.race([uniP, uniTimeoutP]);
   clearTimeout(uniTimer);
-  pendingUnilateralWaiters.delete(sealKey(record.agent_name, sessionId));
+  pendingUnilateralWaiters.delete(sealKey(agentName, sessionId));
   if (uniResult.ok) {
     logger.info("session.seal.completed", { sessionId, sealedRoot: uniResult.sealedRootHex, role: "unilateral", correlationId });
-    onSealed?.(record.agent_name, sessionId); // Fix #1 review: evict the broker entry on terminal seal success (a FAILED close keeps it so a retry can still reconnect).
+    onSealed?.(agentName, sessionId); // Fix #1 review: evict the broker entry on terminal seal success (a FAILED close keeps it so a retry can still reconnect).
     // M8B FINDING-3 (cascade-2): return the legibility certificate inline — same shape as the
     // bilateral close (AC-006) — so the operator gets the receipt on the surface that proves
     // the seal, not just a bare root. It is also persisted for cello_get_sealed_receipt.

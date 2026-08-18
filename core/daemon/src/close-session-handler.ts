@@ -321,7 +321,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         timeoutMs: UNILATERAL_TIMEOUT_MS,
         onSealed: (a, sid) => { crossNodeBrokerBySession.delete(`${a}:${sid}`); },
       },
-      record, sessionId, escalation, correlationId, opts,
+      record.agent_name, sessionId, escalation, correlationId, opts,
     );
 
   /**
