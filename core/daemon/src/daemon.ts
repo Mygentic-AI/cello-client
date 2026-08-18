@@ -2046,7 +2046,22 @@ async function startDaemonHoldingLock(
       // milestone exists to repair.
       const liveness = sessionNodeManager.getSessionLiveness(row.agent_name, row.session_id);
       if (liveness === "alive" || liveness === "impaired") continue; // live
-      if (sessionNodeManager.countReceivedMessages(row.agent_name, row.session_id) > 0) continue; // counterparty spoke
+      /**
+       * DOD-M12B-REAP-HELD-1 — count HELD frames too, or an interrupted conversation reads as a
+       * dead handshake.
+       *
+       * OBSERVED LIVE 2026-08-18: this line abandoned session `d28db475…` — twenty leaves in the
+       * chain plus sixteen verified frames still held, ten of them from the counterparty — while the
+       * restart-seal resolver was actively trying to notarize it. The receipt was forfeited and the
+       * held content annexed.
+       *
+       * `countReceivedMessages` asks the TRANSCRIPT, and held content never reaches the transcript;
+       * it waits in `held_content` until it can join the chain. So the very condition that holds
+       * content — an interrupted session — is the condition that hides the counterparty's messages
+       * from this test, and a real conversation becomes indistinguishable from an offer nobody
+       * answered. `countEstablishedReceived` asks both places.
+       */
+      if (sessionNodeManager.countEstablishedReceived(row.agent_name, row.session_id) > 0) continue; // counterparty spoke
       // Non-awaited: abandonSession flips the DB status synchronously (before its first await), so THIS
       // read reflects it; the async node teardown finishes in the background. CC-10 reviewer LOW: only
       // log "reaped" if the status flip actually wrote — a swallowed write failure already logs

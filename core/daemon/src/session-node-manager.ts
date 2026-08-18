@@ -349,6 +349,14 @@ interface SessionRevivalIdentity {
   counterpartyPeerId: string;
   /** Their agent pubkey, for the rebuilt content handler's authentication check. */
   counterpartyPubkey: string;
+  /**
+   * DOD-M12B-SESSION-SEED-1 — the counterparty's transport addresses, so a revived session can DIAL
+   * them. Measured live 2026-08-18: without this the rebuild succeeded in 1ms and the very next send
+   * failed and was LOST, because `#evictSessionCaches` clears `#counterpartyAddrs` on teardown and
+   * the re-dial then has nothing to dial. A revived node with no way to reach the other side is a
+   * session that is "active" and cannot speak.
+   */
+  counterpartyAddrs: string[];
 }
 
 // ─── Active session entry ─────────────────────────────────────────────────────
@@ -3612,6 +3620,15 @@ export class SessionNodeManager {
     this.#heldRestored.delete(key);
     this.#heldReleased.delete(key);
     this.#diverged.delete(key);
+    // DOD-M12B-SESSION-SEED-1: HAND THEM TO THE REVIVAL RECORD BEFORE DROPPING THEM. This eviction
+    // runs on every teardown, including the interruption a revival is meant to undo — so clearing
+    // the addresses here is what left a revived session unable to dial anyone. The revival record
+    // has exactly the right lifetime for them: it dies when the session reaches a terminal status.
+    const survivingAddrs = this.#counterpartyAddrs.get(key);
+    if (survivingAddrs && survivingAddrs.length > 0) {
+      const identity = this.#sessionSeeds.get(key);
+      if (identity) identity.counterpartyAddrs = [...survivingAddrs];
+    }
     this.#counterpartyAddrs.delete(key);
     this.#redialNotBefore.delete(key);
     this.#highWaterSeq.delete(key);
@@ -8447,7 +8464,10 @@ export class SessionNodeManager {
     // overwrite that dropped a live seed un-zeroed would leave the one copy we are responsible for
     // in the heap with nothing tracking it.
     this.#sessionSeeds.get(key)?.seed.fill(0);
-    this.#sessionSeeds.set(key, { seed, counterpartyPeerId, counterpartyPubkey });
+    // `counterpartyAddrs` starts empty: at creation the signed assignment has not necessarily
+    // arrived yet. It is filled by `#evictSessionCaches` on the way down, which is the last moment
+    // the live addresses exist.
+    this.#sessionSeeds.set(key, { seed, counterpartyPeerId, counterpartyPubkey, counterpartyAddrs: [] });
   }
 
   /**
@@ -8542,6 +8562,17 @@ export class SessionNodeManager {
     for (const relayPeerId of reservations.relayPeerIds) gater.setAllowedOutboundPeer(relayPeerId);
 
     let node: CelloNode;
+    // INSTRUMENTED 2026-08-18. The first version of this had a bare 10s cap and NO measurement, so
+    // when it fired all it could say was "timeout" — which is a description of our own deadline, not
+    // of anything that happened. The relay answers a TCP connect in ~1.1s, and the failing rebuild
+    // logged no relay activity at all, so the cap was capping something nobody had looked at.
+    const t0 = Date.now();
+    this.#logger.info("session.revive.node.building", {
+      agentName,
+      sessionId,
+      circuitAddrs: reservations.addrs.length,
+      relayPeerIds: reservations.relayPeerIds.length,
+    });
     try {
       node = await this.#factory.createNode({
         sessionId,
@@ -8552,7 +8583,27 @@ export class SessionNodeManager {
         // loopback preserves an identity nobody can dial — the counterparty's next message parks
         // again and case B is only half delivered.
         inboundReachable: true,
-        ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
+        /**
+         * NO CIRCUIT-RELAY RESERVATION HERE, and this is a measured decision rather than an omission.
+         *
+         * MEASURED 2026-08-18, live, both ways:
+         *   with 2 relay addrs:  createNode 1ms, start() 10,002ms — NEVER completes
+         *   with none:           createNode 1ms, start() 1ms — session revived
+         *
+         * A relay reservation during `start()` is not slow, it does not finish. The relay answers a
+         * TCP connect in ~1.1s, so it is reachable; the reservation handshake inside libp2p's listen
+         * is what hangs, and it has no deadline of its own. A ten-second cap on top of that was
+         * capping a permanent stall, which is why it was wrong to add one before measuring.
+         *
+         * WHAT WE GIVE UP, stated plainly: this node holds no circuit address, so the counterparty
+         * cannot DIAL it directly. That is survivable and observed working — their messages park at
+         * the relay and drain to us, which is how every message in this morning's test arrived. What
+         * we get back is that the session is usable IMMEDIATELY instead of never.
+         *
+         * The receiver rebuild path takes reservations properly — one candidate at a time, each
+         * raced against its own timeout — and a future unit should reuse that shape here rather than
+         * handing libp2p a list and hoping. Filed rather than guessed at.
+         */
       });
       /**
        * BOUNDED — 2026-08-18, after an unbounded start hung a live `cello_receive` for over two
@@ -8567,12 +8618,32 @@ export class SessionNodeManager {
        * advertised identity, and leaving one running is the "nothing left open" rule broken by
        * accident. The refusal is transient by name, because it is: the next send or read retries.
        */
+      const tCreated = Date.now();
+      this.#logger.info("session.revive.node.created", { agentName, sessionId, createMs: tCreated - t0 });
       await Promise.race([
-        node.start(),
+        node.start().then(() => {
+          this.#logger.info("session.revive.node.started", {
+            agentName,
+            sessionId,
+            startMs: Date.now() - tCreated,
+            listenAddrs: node.listenAddresses().length,
+            circuitListen: node.listenAddresses().filter((a) => a.includes("/p2p-circuit")).length,
+          });
+        }),
         new Promise<never>((_res, rej) =>
           setTimeout(() => rej(new Error("revive_node_start_timeout")), REVIVE_START_TIMEOUT_MS).unref?.(),
         ),
       ]).catch(async (err: unknown) => {
+        // WHICH HALF was slow, and what it had to work with. "timeout" alone names our deadline and
+        // nothing else — the defect this replaces.
+        this.#logger.error("session.revive.node.stalled", {
+          agentName,
+          sessionId,
+          elapsedMs: Date.now() - t0,
+          createMs: tCreated - t0,
+          circuitAddrs: reservations.addrs.length,
+          error: err instanceof Error ? err.message : String(err),
+        });
         try { await node.stop(); } catch { /* best-effort: it never finished starting */ }
         throw err;
       });
@@ -8594,6 +8665,12 @@ export class SessionNodeManager {
     });
     autoNat.emitInitialResult();
 
+    // DOD-M12B-SESSION-SEED-1: give the re-dial its addresses back BEFORE the session goes active,
+    // so the first send after a revival has somewhere to go. Without this the send fails instantly
+    // on a connection that was never made, and — measured live — is lost rather than parked.
+    if (identity.counterpartyAddrs.length > 0) {
+      this.#counterpartyAddrs.set(key, [...identity.counterpartyAddrs]);
+    }
     const correlationId = randomUUID();
     this.#activeNodes.set(key, {
       node,
@@ -8760,6 +8837,16 @@ export class SessionNodeManager {
     // backstop covers it, at a cost of at most one interval.)
     this.#fireParkedDrain(agentName, "session_revived");
     return { ok: true };
+  }
+
+  /** DOD-M12B-SESSION-SEED-1 test seams: the counterparty addresses a re-dial depends on. Not
+   *  otherwise observable — they are set from a signed relay assignment that a fixture cannot mint. */
+  setCounterpartyAddrsForTest(agentName: string, sessionId: string, addrs: string[]): void {
+    this.#counterpartyAddrs.set(this.#k(agentName, sessionId), [...addrs]);
+  }
+
+  getCounterpartyAddrsForTest(agentName: string, sessionId: string): string[] {
+    return this.#counterpartyAddrs.get(this.#k(agentName, sessionId)) ?? [];
   }
 
   /** DOD-M12B-SESSION-SEED-1 test seam: drop a seed WITHOUT zeroing or a status change — what a

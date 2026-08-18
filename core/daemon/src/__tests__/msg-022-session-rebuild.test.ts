@@ -179,4 +179,40 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
     expect(factory.built.length, "something rebuilt a node with nobody asking").toBe(builtAtInterrupt);
     expect(statusOf(sid), "and nothing moved the status on its own either").toBe("interrupted");
   });
+
+  it("MEASURED LIVE: a revived session keeps the addresses it needs to DIAL the counterparty", async () => {
+    /**
+     * 2026-08-18, live, with two real agents. The rebuild succeeded in 1ms and the very next send
+     * failed and was LOST — not parked, lost:
+     *
+     *   09:02:17.448  session.revived
+     *   09:02:17.449  session.content.direct.send.failed   error: "[object Object]"
+     *   09:02:17.449  session.content.send.failed          reason: session_stream_unavailable
+     *
+     * `#evictSessionCaches` clears `#counterpartyAddrs` on every teardown — including the
+     * interruption a revival exists to undo. So the node came back, went `active`, and had nowhere
+     * to send: the re-dial's own guard says it plainly, *"this side holds no address for the
+     * counterparty."* A session that is active and cannot speak is worse than one that admits it is
+     * broken, because the operator's message is accepted and then discarded.
+     *
+     * The addresses now ride in the revival record, which has exactly the right lifetime: it dies
+     * when the session reaches a terminal status.
+     */
+    const sid = "26".repeat(32);
+    await openSession(sid);
+    const addrs = ["/ip4/10.0.0.7/tcp/4001/p2p/12D3KooWCounterpartyAddressForTest0000000000"];
+    mgr!.setCounterpartyAddrsForTest("alice", sid, addrs);
+
+    // `destroySessionNode` is the path that runs `#evictSessionCaches`, which is where the addresses
+    // were being dropped. Driving the interruption through it is what makes this test the live case
+    // rather than a nearby one.
+    await mgr!.destroySessionNode("alice", sid, "interrupted");
+    await mgr!.reviveSessionNode("alice", sid);
+
+    expect(
+      mgr!.getCounterpartyAddrsForTest("alice", sid),
+      "revived with no way to dial them: the next send fails on a connection that was never made, " +
+      "and it is discarded rather than parked",
+    ).toEqual(addrs);
+  }, 60_000);
 });
