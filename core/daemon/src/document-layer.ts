@@ -484,12 +484,6 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   };
 
   /**
-   * SYNC-R46 / spec §9 — one party's sync state, from the DISPLAY CACHE against our own
-   * positions. ONE implementation for the list surface and the sweep's believed-current
-   * suppression (R43) — two copies of "are they behind" is two daemons disagreeing about who
-   * needs an exchange. Never a correctness input (R44).
-   */
-  /**
    * DOD-DOC-PUSH-NOT-POLL-1 — WHAT WE HOLD THAT THIS PARTY HAS NOT CONFIRMED RECEIVING, as a
    * fingerprint the scheduler compares and never interprets; `null` means nothing is pending.
    *
@@ -522,6 +516,11 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     return parts.join(",");
   };
 
+  /**
+   * SYNC-R46 / spec §9 — one party's sync state for the LIST SURFACE, projected from `pendingFor`
+   * against our own positions. Never a correctness input (R44): the same comparison decides what
+   * the operator is shown and whether the sweep has anything to say, so the two cannot disagree.
+   */
   const partySync = (
     ownerAgentId: string,
     documentId: string,
