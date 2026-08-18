@@ -158,7 +158,30 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       return { ok: false, reason: "session_not_owned", guidance: "This session belongs to a different agent. Call cello_use_agent to switch to the agent that owns it, then retry." };
     }
     if (record.status !== "active") {
-      return { ok: false, reason: "session_not_active", guidance: `Session is '${record.status}', not active. Content can only be sent on an active session. If it is interrupted, call cello_close_session to seal it.` };
+      /**
+       * DOD-M12B-SESSION-SEED-1 — THE DEMAND EDGE. Before this, an interrupted session refused here
+       * forever: a transport event could take a session out of `active` and no code path anywhere
+       * put one back, so a laptop close ended the conversation permanently even though both
+       * processes were alive and both peer ids still valid.
+       *
+       * The operator sending IS the demand, and it is the only trigger — nothing revives on a timer
+       * (the REDIAL-1 discipline, and Andre's tenet: a background rebuilder would hold a dialable
+       * endpoint open for a session nobody is using).
+       *
+       * A session that cannot be revived still refuses, and says WHY — `session_terminal` for one
+       * that has ended, `session_identity_lost` for one whose keypair died with a daemon restart.
+       * The second is the one an operator most needs named: it means waiting for a reconnect is
+       * pointless and the session should be closed for its receipt.
+       */
+      const revived = await sessionNodeManager.reviveIfNeededForSend(agentName, sessionId);
+      if (!revived.ok) {
+        return {
+          ok: false,
+          reason: revived.reason,
+          guidance: revived.guidance
+            ?? `Session is '${record.status}', not active. Content can only be sent on an active session.`,
+        };
+      }
     }
 
     // M8C-CURSOR-1: read-before-write gate. current_seq is the tree's highest leaf index

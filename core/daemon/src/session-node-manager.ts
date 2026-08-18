@@ -8515,6 +8515,45 @@ export class SessionNodeManager {
     return { ok: true, peerId };
   }
 
+  /**
+   * DOD-M12B-SESSION-SEED-1 — the DEMAND edge: a send on an interrupted session revives it.
+   *
+   * This is the only production caller of `reviveSessionNode`, and it is deliberately the send path
+   * rather than a timer. The `REDIAL-1` discipline and Andre's tenet say the same thing from two
+   * directions: nothing may re-open on its own, because a background rebuilder would hold a dialable
+   * endpoint open for a session nobody is using — the *"open connection a malicious agent can farm
+   * for"*. The operator sending is the demand; there is no other trigger.
+   *
+   * A no-op for the normal case. An `active` session with a live node returns immediately without
+   * touching it — this sits on the hot path of every send, and replacing a healthy node would be
+   * churn that changes the peer id for no reason.
+   */
+  async reviveIfNeededForSend(
+    agentName: string,
+    sessionId: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string; guidance?: string }> {
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) return { ok: false, reason: "session_not_found" };
+    // The overwhelmingly common case: nothing to do, and no node was disturbed to find that out.
+    if (record.status === "active" && this.#activeNodes.has(this.#k(agentName, sessionId))) return { ok: true };
+
+    const revived = await this.reviveSessionNode(agentName, sessionId);
+    if (!revived.ok) return revived;
+    this.#logger.info("session.revived.on_demand", {
+      agentName,
+      sessionId,
+      previousStatus: record.status,
+      trigger: "send",
+    });
+    return { ok: true };
+  }
+
+  /** DOD-M12B-SESSION-SEED-1 test seam: drop a seed WITHOUT zeroing or a status change — what a
+   *  process restart does to it. The refusal that follows is the one an operator most needs named. */
+  forgetSessionSeedForTest(agentName: string, sessionId: string): void {
+    this.#sessionSeeds.delete(this.#k(agentName, sessionId));
+  }
+
   /** DOD-M12B-SESSION-SEED-1 test seam: does this session still hold a revivable identity? */
   hasSessionSeedForTest(agentName: string, sessionId: string): boolean {
     return this.#sessionSeeds.has(this.#k(agentName, sessionId));

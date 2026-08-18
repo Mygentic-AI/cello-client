@@ -27,6 +27,7 @@
     "src/__tests__/msg-020-revival-bound.test.ts",
     "src/__tests__/msg-021-session-seed.test.ts",
     "src/__tests__/msg-022-session-rebuild.test.ts",
+    "src/__tests__/msg-023-revive-on-send.test.ts",
     "src/__tests__/msg-013-restart-seal.test.ts",
     "src/__tests__/msg-014-restart-seal-wired.test.ts",
     "src/__tests__/msg-015-interrupted-escalate.test.ts",
