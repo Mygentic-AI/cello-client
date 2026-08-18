@@ -498,12 +498,11 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
    * could make truthful. This never leaves the scheduler, and holds no authority — R41 stands,
    * it may only delay an exchange.
    */
-  const pendingFor = (
+  const pendingAgainstView = (
     ownerAgentId: string,
     documentId: string,
-    partyAgentId: string,
+    view: { govSeqs: Record<string, number>; contentCounts: Record<string, number> } | null,
   ): string | null => {
-    const view = store.partyView(ownerAgentId, documentId, partyAgentId);
     const parts: string[] = [];
     for (const [author, mark] of amendments.watermarks(ownerAgentId, documentId)) {
       if (mark.seq > (view?.govSeqs[author] ?? 0)) parts.push(`g:${author}:${mark.seq}`);
@@ -515,6 +514,17 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     parts.sort();
     return parts.join(",");
   };
+
+  const pendingFor = (
+    ownerAgentId: string,
+    documentId: string,
+    partyAgentId: string,
+  ): string | null =>
+    pendingAgainstView(
+      ownerAgentId,
+      documentId,
+      store.partyView(ownerAgentId, documentId, partyAgentId),
+    );
 
   /**
    * SYNC-R46 / spec §9 — one party's sync state for the LIST SURFACE, projected from `pendingFor`
@@ -528,7 +538,9 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
   ): { sync: "in_sync" | "behind" | "unseen"; lastSyncedAtMs: number | null; blockedBy?: string } => {
     const view = store.partyView(ownerAgentId, documentId, partyAgentId);
     if (!view) return { sync: "unseen", lastSyncedAtMs: null };
-    const behind = pendingFor(ownerAgentId, documentId, partyAgentId) !== null;
+    // The row we already hold — re-reading it here doubled the row reads on a surface that walks
+    // every party of every document (review F6).
+    const behind = pendingAgainstView(ownerAgentId, documentId, view) !== null;
     const blockedBy =
       view.refused.length === 0
         ? undefined

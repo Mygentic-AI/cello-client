@@ -199,7 +199,11 @@ describe("DOD-M12B-DELIVERY-QUIET-1: what the reachability trigger actually does
     expect(f.sent.length, "onReachable did not wait out the cap — that is the behaviour being suppressed")
       .toBeGreaterThan(before);
 
-    // ...and the backoff is gone afterwards, not merely bypassed once.
+    // ...and the REFUSAL backoff is gone afterwards, not merely bypassed once. What remains is
+    // the one quiet step onReachable's own offer just armed (DOD-DOC-PUSH-NOT-POLL-1) — 30
+    // seconds, not the refusal's fifteen minutes. The distinction is the point: the thing the
+    // machine-opened session must not be able to wipe is a peer saying no.
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS + 1;
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
   });
 });
@@ -239,7 +243,7 @@ describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
 
     f.clock.now += 1_000;
-    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedQuiet: 1 });
 
     f.clock.now += RECONCILE_BACKOFF_BASE_MS;
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
@@ -247,7 +251,7 @@ describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
     // ...and the ladder DOUBLES, so an offer nobody takes up goes quiet rather than settling
     // into a fixed drumbeat.
     f.clock.now += RECONCILE_BACKOFF_BASE_MS + 1;
-    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedQuiet: 1 });
     f.clock.now += RECONCILE_BACKOFF_BASE_MS;
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
   });
@@ -257,7 +261,7 @@ describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
     const f = fixture({ pendingFor: () => signature });
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
     f.clock.now += 1_000;
-    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedQuiet: 1 });
 
     signature = "c:author:2"; // we authored another entry
     f.clock.now += 1_000;
@@ -268,20 +272,27 @@ describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
     expect(f.sent).toHaveLength(2);
   });
 
-  it("the frame carries ONLY the documents with something pending", async () => {
+  it("ONE pending document justifies the frame, and the frame then carries them ALL", async () => {
+    // The gate is on the DECISION, not on the frame's contents. A block is positions only and the
+    // responder answers solely where a side is ahead, so a quiet document riding along costs
+    // bytes — never a frame, never a position — and keeps its pull. Narrowing the list would
+    // have bought nothing and cost that.
     const f = fixture({
       sweepTargets: () => new Map([[PEER, ["d1", "d2", "d3"]]]),
       pendingFor: (_o, documentId) => (documentId === "d2" ? "c:author:1" : null),
     });
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
     expect(f.sent).toHaveLength(1);
-    expect(f.sent[0]!.docs).toEqual(["d2"]);
+    expect(f.sent[0]!.docs).toEqual(["d1", "d2", "d3"]);
   });
 
-  it("onReachable still asks about EVERYTHING — reachability is where the pull lives now", async () => {
-    // Suppressing the timer removes the periodic PULL: `pendingFor` can only see what we hold
-    // that they lack, never what they hold that we lack. The pull moves onto a real event — a
-    // session with them coming up — and must not inherit the pending gate.
+  it("REGRESSION GUARD (not this unit's change): onReachable ignores the pending gate entirely", async () => {
+    // Named as a guard on purpose — it passes against the pre-change scheduler too, because
+    // onReachable never consulted the old suppressor either. It is here so that a later
+    // "why not gate this one as well?" has to delete an assertion to do it.
+    //
+    // The stake: `pendingFor` sees only what we hold that they lack. Take the gate off the timer
+    // and this is the one remaining place that can discover the other direction.
     const f = fixture({
       sweepTargets: () => new Map([[PEER, ["d1", "d2"]]]),
       pendingFor: () => null,
@@ -289,5 +300,44 @@ describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
     await f.scheduler.onReachable(OWNER, PEER);
     expect(f.sent).toHaveLength(1);
     expect(f.sent[0]!.docs).toEqual(["d1", "d2"]);
+  });
+
+  it("onReachable RESETS the quiet ladder — a party parked at the cap is asked at once", async () => {
+    // Covers onReachable's state resets, which had no test: delete all four lines and every other
+    // test still passed. Walk the ladder to the 15-minute cap, then let them become reachable.
+    const f = fixture({ pendingFor: () => "g:author:9" });
+    for (let i = 0; i < 12; i++) {
+      f.clock.now += RECONCILE_BACKOFF_CAP_MS + 1;
+      await f.scheduler.sweep(OWNER);
+    }
+    const parked = f.sent.length;
+    expect(parked, "the ladder never let the party speak at all").toBeGreaterThan(1);
+    // Deep in the ladder: a quarter of an hour of silence ahead of it.
+    f.clock.now += RECONCILE_BACKOFF_CAP_MS - 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedQuiet: 1 });
+
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent.length, "onReachable did not clear the quiet ladder").toBe(parked + 1);
+    // ...and it RECORDED what it offered, so the next tick does not re-offer the same holding.
+    // Nulling the record instead cost one duplicate frame at every session establishment.
+    f.clock.now += 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedQuiet: 1 });
+  });
+
+  it("a new pending change does NOT step over a REFUSAL backoff — only over the quiet one", async () => {
+    // The two deadlines are separate for exactly this reason, and nothing pinned it. An
+    // optimisation that computes the holding first, to skip the state lookup, reorders the two
+    // blocks and silently reopens the 321-refusals-in-85-minutes defect with every test green.
+    let signature = "c:author:1";
+    const f = fixture({ pendingFor: () => signature });
+    f.scheduler.noteRefusal(OWNER, PEER, true); // terminal → straight to the 15-minute cap
+
+    signature = "c:author:2"; // we authored something new; the peer still said no
+    f.clock.now += 1_000;
+    expect(
+      await f.scheduler.sweep(OWNER),
+      "a local edit stepped over a refusal backoff — that is the retry storm, re-armed",
+    ).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    expect(f.sent).toHaveLength(0);
   });
 });
