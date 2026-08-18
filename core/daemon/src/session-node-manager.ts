@@ -268,7 +268,14 @@ export type ParkedDrainReason =
    * content the counterparty parked while we had no node can finally be fetched. Reviving the node
    * without draining leaves the operator looking at a healthy session with no new mail.
    */
-  | "session_revived";
+  | "session_revived"
+  /**
+   * DOD-M12B-LEAF-TRIGGERS-FETCH-1: the relay told us a specific message exists — we hold its hash
+   * and its canonical sequence — and its plaintext never arrived on the direct path. Measured live
+   * 2026-08-18: the leaf landed in ONE second and the bytes took 102, because nothing connected the
+   * two facts.
+   */
+  | "witnessed_leaf_unresolved";
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -475,6 +482,18 @@ export const REVIVE_RESERVATION_TIMEOUT_MS = 3_000;
  *  ~6s to a usable session, against a measured "never" for the unbounded form. */
 export const REVIVE_RESERVATION_CANDIDATES = 2;
 
+/**
+ * DOD-M12B-LEAF-TRIGGERS-FETCH-1 — how long the DIRECT path gets before we go and fetch content the
+ * relay has already told us about.
+ *
+ * Two seconds. The witness leaf and the plaintext are separate deliveries, and on a healthy session
+ * the direct content normally lands within milliseconds of the leaf — so fetching the instant a leaf
+ * arrives would put a relay round trip on the hot path of every message in every session, which is a
+ * self-inflicted load problem. Waiting forever is what cost 102 seconds. Two seconds is far above
+ * the healthy direct latency and far below anything a person would notice.
+ */
+export const LEAF_FETCH_GRACE_MS = 2_000;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -613,6 +632,18 @@ export class SessionNodeManager {
 
   /** DOD-M12B-SESSION-SEED-1: see setRetryDrainHook — fired when a session is revived. */
   #retryDrainHook: ((agentName: string, sessionId: string) => void) | null = null;
+
+  /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: content hashes this session has actually resolved — ingested,
+   *  held, or authored by us. A witnessed leaf whose hash is in here needs no fetch. */
+  #resolvedContent = new Map<string, Set<string>>();
+
+  /** In-flight grace timers, keyed session+hash, so a redelivered leaf does not schedule a second
+   *  fetch for the same content — a slow relay must not be turned into a storm against itself. */
+  #leafFetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /** Test seam: collapse the grace window so a test does not have to wait two real seconds. The
+   *  window itself is covered by its own case. */
+  #leafFetchGraceMs = LEAF_FETCH_GRACE_MS;
 
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
@@ -6070,6 +6101,70 @@ export class SessionNodeManager {
     map.set(contentHashHex, sequenceNumber);
     const hw = this.#highWaterSeq.get(key) ?? -1;
     if (sequenceNumber > hw) this.#highWaterSeq.set(key, sequenceNumber);
+
+    /**
+     * DOD-M12B-LEAF-TRIGGERS-FETCH-1 — A LEAF WE CANNOT READ IS A FETCH ORDER.
+     *
+     * MEASURED LIVE 2026-08-18: the relay delivered this leaf one second after the counterparty
+     * sent. We had the hash and the sequence, the bytes were parked at that same relay, and the
+     * plaintext arrived 102 seconds later on a background sweep. Nothing connected the two facts —
+     * this method recorded the sequence and stopped.
+     *
+     * The witness leaf and the plaintext are separate deliveries: the leaf comes over the relay, the
+     * bytes over the direct content stream. After an interruption the two session nodes have no
+     * direct connection, so the bytes go to the park instead and only a timer ever finds them.
+     *
+     * The grace window is what keeps this off the hot path. On a healthy session the direct content
+     * lands within milliseconds of its leaf, so fetching immediately would mean a relay round trip
+     * for every message in every session. We give the direct path its two seconds first.
+     */
+    this.#scheduleLeafFetchIfUnresolved(agentName, sessionId, contentHashHex);
+  }
+
+  /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: this content is here — no fetch is owed for it, and any
+   *  pending one is cancelled. Called wherever content actually lands. */
+  #markContentResolved(agentName: string, sessionId: string, contentHashHex: string): void {
+    const key = this.#k(agentName, sessionId);
+    let set = this.#resolvedContent.get(key);
+    if (!set) { set = new Set(); this.#resolvedContent.set(key, set); }
+    set.add(contentHashHex);
+    const timerKey = `${key}::${contentHashHex}`;
+    const t = this.#leafFetchTimers.get(timerKey);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.#leafFetchTimers.delete(timerKey);
+    }
+  }
+
+  #scheduleLeafFetchIfUnresolved(agentName: string, sessionId: string, contentHashHex: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#resolvedContent.get(key)?.has(contentHashHex)) return;
+    const timerKey = `${key}::${contentHashHex}`;
+    // ONE fetch per content hash. The relay redelivers, and a redelivery carries the same sequence —
+    // scheduling per redelivery turns a slow relay into a storm against itself.
+    if (this.#leafFetchTimers.has(timerKey)) return;
+    const timer = setTimeout(() => {
+      this.#leafFetchTimers.delete(timerKey);
+      if (this.#resolvedContent.get(key)?.has(contentHashHex)) return; // the direct path won
+      if (this.#shuttingDown) return;
+      this.#logger.info("session.content.leaf_unresolved.fetch", {
+        agentName,
+        sessionId,
+        contentHash: contentHashHex,
+        graceMs: this.#leafFetchGraceMs,
+        impact: "the relay told us this message exists and its plaintext never arrived directly — "
+          + "fetching it now instead of waiting for the periodic sweep",
+      });
+      this.#fireParkedDrain(agentName, "witnessed_leaf_unresolved");
+    }, this.#leafFetchGraceMs);
+    timer.unref?.();
+    this.#leafFetchTimers.set(timerKey, timer);
+  }
+
+  /** DOD-M12B-LEAF-TRIGGERS-FETCH-1 test seams. */
+  setLeafFetchGraceMsForTest(ms: number): void { this.#leafFetchGraceMs = ms; }
+  markContentPresentForTest(agentName: string, sessionId: string, contentHashHex: string): void {
+    this.#markContentResolved(agentName, sessionId, contentHashHex);
   }
 
   /**
@@ -6425,6 +6520,11 @@ export class SessionNodeManager {
     // transcript. A later replay of the same hash is still caught by the dedup leaf-scan, which is
     // independent of the witness map.
     this.#witnessedSeq.get(recvKey)?.delete(contentHashHex);
+    // DOD-M12B-LEAF-TRIGGERS-FETCH-1: the bytes are here, so cancel any fetch the witness leaf
+    // scheduled. On a healthy session this is the branch that runs — the direct path beats the
+    // grace window and the relay is never asked, which is what keeps a fetch off the hot path of
+    // every message.
+    this.#markContentResolved(agentName, sessionId, contentHashHex);
     let buf = this.#receivedContent.get(recvKey);
     if (!buf) { buf = []; this.#receivedContent.set(recvKey, buf); }
     buf.push({ contentHex: Buffer.from(content).toString("hex"), senderPubkey, sequenceNumber: leafIndex });
