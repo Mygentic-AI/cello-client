@@ -39,6 +39,20 @@ import { CIRCUIT_RELAY_V2_HOP_PROTOCOL_ID } from "../protocols.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { CelloNode } from "../types.js";
 
+/**
+ * `waitFor` from `@claude-flow/testing` has no `message` option — passing one silently drops it, so
+ * a timeout here printed a generic failure and the sentence explaining WHAT never appeared. This
+ * makes it appear.
+ */
+async function waitForOrExplain(predicate: () => boolean, timeout: number, message: string): Promise<void> {
+  try {
+    await waitFor(predicate, { timeout });
+  } catch (err: unknown) {
+    throw new Error(`${message} (after ${timeout}ms)`, { cause: err });
+  }
+}
+
+
 setupV3Tests();
 
 const DCUTR_PROTOCOL_ID = "/libp2p/dcutr";
@@ -130,10 +144,7 @@ describe("T2: circuitRelayServer (HOP) is a service-node capability, not a clien
       listenAddresses: ["/ip4/127.0.0.1/tcp/0", `${relayAddr}/p2p-circuit`],
     });
     scope.addCleanup(async () => { try { await first.stop(); } catch { /* cleanup */ } });
-    await waitFor(() => first.listenAddresses().some((a) => a.includes("/p2p-circuit")), {
-      timeout: 10_000,
-      message: "first receiver never obtained its reservation",
-    });
+    await waitForOrExplain(() => first.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000, "first receiver never obtained its reservation");
 
     const second = await startNode({
       nodeType: "standing_receiver",
@@ -169,10 +180,7 @@ describe("T3: circuit-relay reservation and a CELLO stream over the limited rela
     scope.addCleanup(async () => { try { await receiver.stop(); } catch { /* cleanup */ } });
 
     // The reservation materialises as a /p2p-circuit entry in listenAddresses().
-    await waitFor(() => receiver.listenAddresses().some((a) => a.includes("/p2p-circuit")), {
-      timeout: 10_000,
-      message: "receiver never obtained a circuit-relay reservation",
-    });
+    await waitForOrExplain(() => receiver.listenAddresses().some((a) => a.includes("/p2p-circuit")), 10_000, "receiver never obtained a circuit-relay reservation");
     const circuitAddr = receiver.listenAddresses().find((a) => a.includes("/p2p-circuit"))!;
 
     const dialer = await startNode({ nodeType: "session" });

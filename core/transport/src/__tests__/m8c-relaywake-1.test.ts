@@ -13,9 +13,11 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { SignalingManager, type SignalingStream, type ConnectResult, type SignalingLogger } from "../signaling-manager.js";
+import { SignalingManager, type SignalingStream, type ConnectResult } from "../signaling-manager.js";
 
-function makeLogger(): SignalingLogger & { warnings: Array<{ event: string; context: Record<string, unknown> }> } {
+// Return type INFERRED: the literal carries a `debug` the SignalingLogger type does not declare, and
+// annotating it away would be claiming a shape this object does not have.
+function makeLogger() {
   const warnings: Array<{ event: string; context: Record<string, unknown> }> = [];
   return {
     warnings,
@@ -41,7 +43,7 @@ describe("M8C-RELAYWAKE-1: SignalingManager.onConnected", () => {
     const mgr = new SignalingManager({ connect, logger, onConnected: () => { calls++; } });
     await new Promise((r) => setTimeout(r, 30));
     expect(calls).toBeGreaterThanOrEqual(1);
-    await mgr.stop("test_cleanup");
+    await mgr.stop();
   });
 
   it("R2: fires AGAIN on a genuine reconnect after a dropped stream (the actual new behavior)", async () => {
@@ -73,7 +75,7 @@ describe("M8C-RELAYWAKE-1: SignalingManager.onConnected", () => {
     await new Promise((r) => setTimeout(r, 150));
     expect(calls).toBeGreaterThanOrEqual(2); // the FIRST connect, plus at least one real reconnect
     expect(attempt).toBeGreaterThanOrEqual(2); // connect() was genuinely called more than once
-    await mgr.stop("test_cleanup");
+    await mgr.stop();
   });
 
   it("R3: a throwing onConnected callback never breaks the connection (logged, not fatal)", async () => {
@@ -87,6 +89,6 @@ describe("M8C-RELAYWAKE-1: SignalingManager.onConnected", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(mgr.status).toBe("connected"); // the throw did not break the connection
     expect(logger.warnings.find((w) => w.event === "signaling.on_connected.callback_failed")).toBeDefined();
-    await mgr.stop("test_cleanup");
+    await mgr.stop();
   });
 });

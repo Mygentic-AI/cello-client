@@ -16,6 +16,7 @@
  *   SI-003: Nonce prevents replay — different nonces produce different TBS bytes
  */
 
+import type { OperationResult, OperationFailure } from "../signaling-manager.js";
 import { describe, it, expect } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { makeTestManifest, TEST_DIRECTORY_NODE_KEYPAIR, TEST_CONSORTIUM_ROOT_KEYS, TEST_CONSORTIUM_THRESHOLD } from "@cello-protocol/crypto";
@@ -33,6 +34,34 @@ import {
 } from "../index.js";
 import type { SignalingLogger, SignalingManagerConfig } from "../signaling-manager.js";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
+
+/**
+ * Assert a refusal and NARROW to it in one step.
+ *
+ * `OperationResult` is a union and only the failure arm carries `reason`/`guidance`. Reading them
+ * off the union asserted on properties the success arm does not have — which passes vacuously if
+ * the call ever starts succeeding, and is why the line beside one of these already reached for a
+ * `as { guidance: string }` cast.
+ */
+function expectFailure(r: OperationResult): OperationFailure {
+  expect(r.ok, `expected a refusal, got ${JSON.stringify(r)}`).toBe(false);
+  return r as OperationFailure;
+}
+
+
+// ─── Why every makeTestManifest() call below is double-cast ──────────────────────────────────────
+//
+// `makeTestManifest` DECLARES `ConsortiumManifestInput` — the loose signing shape, whose `nodes` are
+// `Record<string, unknown>` — while everything under test takes the structured `ConsortiumManifest`.
+// The values are already right: the fixture's own comment says `TestConsortiumNode` "structurally
+// matches ConsortiumNode from protocol-types". The two types simply cannot be assigned across,
+// because `ConsortiumManifestInput` carries an index signature and TypeScript refuses an interface
+// into one — which is also why the fixture cannot just return the narrower type.
+//
+// So the cast asserts exactly the fixture's own documented promise. Recorded once here rather than
+// left as bare `as` conversions that read like someone silencing the compiler; if that promise ever
+// stops holding, this is the paragraph that has to be re-argued.
+
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -70,7 +99,7 @@ function makeManagerConfig(overrides?: Partial<SignalingManagerConfig>): {
   const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
   const nodeId = "test-node-us-east-1";
 
-  const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+  const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
   const manifestProvider = new TestManifestProvider(manifest);
   const versionStore = new InMemoryManifestVersionStore();
   const verifier = new TestDirectoryChallengeVerifier();
@@ -155,7 +184,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
   const nodeId = "test-node-us-east-1";
 
   function makeVerifier() {
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     void provider.loadAndVerify([], 0); // sets #loaded so getCurrentManifest() returns it
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
@@ -206,7 +235,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
   });
 
   it("returns { valid: false, reason: 'key_not_in_manifest' } if manifest not loaded yet", () => {
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     // Do NOT call loadAndVerify — getCurrentManifest() returns null
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
@@ -235,7 +264,7 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     const manifest: ConsortiumManifest = makeTestManifest([
       makeTestNode(nodeIdA, pubA),
       makeTestNode(nodeIdB, pubB),
-    ]) as ConsortiumManifest;
+    ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     void provider.loadAndVerify([], 0);
     const verifier = new ManifestDirectoryChallengeVerifier(provider);
@@ -266,7 +295,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
@@ -309,7 +338,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
@@ -347,7 +376,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const knownNodeId = "test-node-us-east-1";
     const rogueNodeId = "rogue-node-not-in-manifest";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(knownNodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(knownNodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
@@ -417,7 +446,7 @@ describe("AC-004: SignalingManager.processStep5Frame — step-6 verification flo
     const publicKeyHex = TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex;
     const nodeId = "test-node-us-east-1";
 
-    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as ConsortiumManifest;
+    const manifest: ConsortiumManifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
     const manifestProvider = new TestManifestProvider(manifest);
     await manifestProvider.loadAndVerify([], 0);
     const realVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
@@ -490,7 +519,7 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
   it("loadAndVerify returns the supplied manifest", async () => {
     const manifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
-    ]) as ConsortiumManifest;
+    ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     const result = await provider.loadAndVerify([], 0);
     expect(result.nodes[0].nodeId).toBe("node-1");
@@ -499,7 +528,7 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
   it("getCurrentManifest returns null before loadAndVerify", () => {
     const manifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
-    ]) as ConsortiumManifest;
+    ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     expect(provider.getCurrentManifest()).toBeNull();
   });
@@ -507,7 +536,7 @@ describe("AC-002: TestManifestProvider — manifest loading and caching", () => 
   it("getCurrentManifest returns the manifest after loadAndVerify", async () => {
     const manifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
-    ]) as ConsortiumManifest;
+    ]) as unknown as ConsortiumManifest;
     const provider = new TestManifestProvider(manifest);
     await provider.loadAndVerify([], 0);
     expect(provider.getCurrentManifest()).toBe(manifest);
@@ -532,7 +561,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     const { manager, logger, versionStore } = makeManagerConfig();
     const newManifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
-    ], { version: 2 }) as ConsortiumManifest;
+    ], { version: 2 }) as unknown as ConsortiumManifest;
 
     await manager.handleManifestPollResponse(newManifest);
 
@@ -548,7 +577,7 @@ describe("AC-010: Manifest poll round-trip", () => {
 
     const oldManifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
-    ], { version: 3 }) as ConsortiumManifest;
+    ], { version: 3 }) as unknown as ConsortiumManifest;
 
     await manager.handleManifestPollResponse(oldManifest);
 
@@ -570,7 +599,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     const { manager, logger, versionStore } = makeManagerConfig();
     const forged: ConsortiumManifest = makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
-    ], { version: 2 }) as ConsortiumManifest;
+    ], { version: 2 }) as unknown as ConsortiumManifest;
     // A compromised/rogue directory serves a structurally-valid manifest signed by ATTACKER
     // keys (here: corrupted officer sigs). The daemon must re-verify and refuse to adopt.
     (forged as { signatures: Array<{ officerIndex: number; signature: string }> }).signatures =
@@ -587,7 +616,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     const { manager, logger, versionStore } = makeManagerConfig();
     const expired: ConsortiumManifest = makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
-    ], { version: 2, expires: "2020-01-01T00:00:00Z" }) as ConsortiumManifest;
+    ], { version: 2, expires: "2020-01-01T00:00:00Z" }) as unknown as ConsortiumManifest;
 
     await manager.handleManifestPollResponse(expired);
 
@@ -600,7 +629,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     const { manager, logger, versionStore } = makeManagerConfig();
     const future: ConsortiumManifest = makeTestManifest([
       makeTestNode("test-node-us-east-1", TEST_DIRECTORY_NODE_KEYPAIR.publicKeyHex),
-    ], { version: 2, notBefore: "2099-01-01T00:00:00Z" }) as ConsortiumManifest;
+    ], { version: 2, notBefore: "2099-01-01T00:00:00Z" }) as unknown as ConsortiumManifest;
 
     await manager.handleManifestPollResponse(future);
 
@@ -618,7 +647,7 @@ describe("AC-010: Manifest poll round-trip", () => {
       challengeVerifier: new TestDirectoryChallengeVerifier(),
       pollScheduler: new ImmediatePollScheduler(0),
       manifestVersionStore: store, // same store instance
-      manifestProvider: new TestManifestProvider(makeTestManifest([]) as ConsortiumManifest),
+      manifestProvider: new TestManifestProvider(makeTestManifest([]) as unknown as ConsortiumManifest),
       logger: makeLogger(),
       correlationId: "restart-test",
       rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -633,7 +662,7 @@ describe("AC-010: Manifest poll round-trip", () => {
     // Reject any manifest version <= 10
     const oldManifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("node", "00".repeat(32)),
-    ], { version: 9 }) as ConsortiumManifest;
+    ], { version: 9 }) as unknown as ConsortiumManifest;
     await manager2.handleManifestPollResponse(oldManifest);
     expect(await store.getLastSeenVersion()).toBe(10); // unchanged
   });
@@ -721,7 +750,7 @@ describe("TestDirectoryManifestStore", () => {
   it("getCurrentManifest returns the fixed manifest", () => {
     const manifest: ConsortiumManifest = makeTestManifest([
       makeTestNode("node-1", "00".repeat(32)),
-    ]) as ConsortiumManifest;
+    ]) as unknown as ConsortiumManifest;
     const store = new TestDirectoryManifestStore(manifest);
     expect(store.getCurrentManifest()).toBe(manifest);
   });
@@ -892,10 +921,9 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
       await delay(5);
       expect(manager.status).toBe("reconnecting");
 
-      const mcpResult = await manager.submitMcpOperation();
-      expect(mcpResult.ok).toBe(false);
+      const mcpResult = expectFailure(await manager.submitMcpOperation());
       expect(mcpResult.reason).toBe("signaling_reconnecting");
-      expect((mcpResult as { guidance: string }).guidance).toContain("reconnects automatically");
+      expect(mcpResult.guidance).toContain("reconnects automatically");
 
       let internalResolved = false;
       const internalPromise = manager.submitInternalOperation(async () => {
@@ -933,12 +961,10 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
       });
 
       await delay(5);
-      const r1 = await manager.submitMcpOperation();
-      const r2 = await manager.submitMcpOperation();
+      const r1 = expectFailure(await manager.submitMcpOperation());
+      const r2 = expectFailure(await manager.submitMcpOperation());
 
-      expect(r1.ok).toBe(false);
       expect(r1.reason).toBe("signaling_reconnecting");
-      expect(r2.ok).toBe(false);
       expect(r2.reason).toBe("signaling_reconnecting");
       expect(manager.queueDepth).toBe(0);
     });
@@ -999,8 +1025,7 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
       expect(r1).toEqual({ ok: false, reason: "signaling_lost", guidance: expect.stringContaining("lost its connection") });
       expect(r2).toEqual({ ok: false, reason: "signaling_lost", guidance: expect.stringContaining("lost its connection") });
 
-      const newMcp = await manager.submitMcpOperation();
-      expect(newMcp.ok).toBe(false);
+      const newMcp = expectFailure(await manager.submitMcpOperation());
       expect(newMcp.reason).toBe("signaling_lost");
     });
   });
@@ -1181,7 +1206,7 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
         logger,
         pollScheduler: new ImmediatePollScheduler(0),
         manifestProvider: new TestManifestProvider(
-          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as ConsortiumManifest,
+          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
         ),
         manifestVersionStore: new InMemoryManifestVersionStore(),
         rootKeys: TEST_CONSORTIUM_ROOT_KEYS,
@@ -1218,7 +1243,7 @@ describe("SignalingManager — lifecycle (SIGNAL-001)", () => {
         logger,
         pollScheduler: new ImmediatePollScheduler(20), // fires ~every 20ms via re-arm
         manifestProvider: new TestManifestProvider(
-          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as ConsortiumManifest,
+          makeTestManifest([makeTestNode("local", "00".repeat(32))]) as unknown as ConsortiumManifest,
         ),
         manifestVersionStore: new InMemoryManifestVersionStore(),
         rootKeys: TEST_CONSORTIUM_ROOT_KEYS,

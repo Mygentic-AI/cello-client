@@ -41,10 +41,15 @@ describe("readCappedContentFrame (MSG-001 transport cap)", () => {
     const payload = new Uint8Array(MAX_CONTENT_BYTES + 1).fill(9); // 1 byte over
     const res = await readCappedContentFrame(lpSource(payload) as never);
     expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.reason).toBe("content_too_large");
+    // NARROW on the reason before reading its fields. `size` and `cap` exist only on the
+    // `content_too_large` variant, so reading them off the union was asserting on properties the
+    // other two refusals do not have — it would have read `undefined` and still passed if the
+    // implementation ever returned `empty` or `decode_error` here.
+    if (!res.ok && res.reason === "content_too_large") {
       expect(res.size).toBe(MAX_CONTENT_BYTES + 1);
       expect(res.cap).toBe(MAX_CONTENT_BYTES);
+    } else {
+      expect.unreachable(`expected a content_too_large refusal, got ${JSON.stringify(res)}`);
     }
   });
 
