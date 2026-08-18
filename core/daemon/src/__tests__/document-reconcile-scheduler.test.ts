@@ -8,7 +8,6 @@ import {
   ReconcileScheduler,
   RECONCILE_BACKOFF_BASE_MS,
   RECONCILE_BACKOFF_CAP_MS,
-  RECONCILE_BELIEVED_CURRENT_MS,
   RECONCILE_INFLIGHT_BOUND_MS,
   RECONCILE_BATCH_CAP,
   type ReconcileSchedulerDeps,
@@ -33,7 +32,7 @@ function fixture(over: Partial<ReconcileSchedulerDeps> = {}) {
     now: () => clock.now,
     logger,
     sweepTargets: () => new Map([[PEER, ["d1"]]]),
-    partySync: () => ({ sync: "unseen", lastSyncedAtMs: null }),
+    pendingFor: () => "g:x:1",
     initiateReconcile: async (_o, peer, docs) => {
       sent.push({ peer, docs });
       return { ok: true };
@@ -44,40 +43,17 @@ function fixture(over: Partial<ReconcileSchedulerDeps> = {}) {
 }
 
 describe("the sweep (R39 trigger 3, R43 bounds)", () => {
-  it("attempts an unseen party, and suppresses one believed current", async () => {
+  it("attempts a party with something pending, and skips one with nothing", async () => {
     const f = fixture();
     expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
     expect(f.sent).toHaveLength(1);
 
-    const current = fixture({
-      partySync: () => ({ sync: "in_sync", lastSyncedAtMs: 1_700_000_000_000 - 1_000 }),
+    const quiet = fixture({ pendingFor: () => null });
+    expect(await quiet.scheduler.sweep(OWNER)).toMatchObject({
+      attempted: 0,
+      skippedNothingPending: 1,
     });
-    expect(await current.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedCurrent: 1 });
-    expect(current.sent).toHaveLength(0);
-  });
-
-  it("a belief EXPIRES — a quiet party is asked again past the window, cache or no cache", async () => {
-    const f = fixture({
-      partySync: () => ({
-        sync: "in_sync",
-        lastSyncedAtMs: 1_700_000_000_000 - RECONCILE_BELIEVED_CURRENT_MS - 1,
-      }),
-    });
-    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
-  });
-
-  it("a believed-current OVERRIDE can only shorten the window, never lengthen it (R41)", async () => {
-    // The knob exists so tests need not wait out production patience. Pointed the other way it
-    // would let one environment variable suppress sweeping for as long as it liked — scheduling
-    // state may DELAY an exchange, never forbid one. The production window is the ceiling.
-    const f = fixture({
-      believedCurrentMs: RECONCILE_BELIEVED_CURRENT_MS * 100,
-      partySync: () => ({
-        sync: "in_sync",
-        lastSyncedAtMs: 1_700_000_000_000 - RECONCILE_BELIEVED_CURRENT_MS - 1,
-      }),
-    });
-    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+    expect(quiet.sent).toHaveLength(0);
   });
 
   it("a party that does not answer is backed off, doubling to the cap — and a sweep inside the window skips", async () => {
@@ -228,3 +204,90 @@ describe("DOD-M12B-DELIVERY-QUIET-1: what the reachability trigger actually does
   });
 });
 
+
+describe("DOD-DOC-PUSH-NOT-POLL-1: the timer is not a reason to speak", () => {
+  /**
+   * Measured on the live store 2026-08-18: three agents, 30 documents between them, and the
+   * believed-current suppressor needed EVERY shared document to read in_sync AND to have been
+   * exchanged within ten minutes. One stale timestamp — the newest was days old — kept the whole
+   * party, all fourteen of its documents, sweeping every 120 seconds forever. Each of those
+   * frames took a position in the CONVERSATION's hash chain: 34 positions on one live session,
+   * 2 of them real messages, and the seal refused `session_incomplete`.
+   *
+   * The rule replacing it: we speak when we HOLD something the party has not confirmed
+   * receiving. Nothing pending, no frame, no position consumed.
+   */
+  it("a party with nothing pending is NEVER asked, however long it has been", async () => {
+    const f = fixture({ pendingFor: () => null });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({
+      attempted: 0,
+      skippedNothingPending: 1,
+    });
+    // The old belief EXPIRED here and the sweep asked again. Silence is no longer a reason.
+    f.clock.now += 24 * 60 * 60_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0 });
+    expect(f.sent, "a quiet party was asked anyway — the bare timer is still driving").toHaveLength(
+      0,
+    );
+  });
+
+  it("the SAME unchanged pending set is offered once, then backed off — not re-offered every tick", async () => {
+    // The send SUCCEEDS every time: the frame goes out, the party simply never acts on it (an
+    // invitation nobody accepted is the live case). `allOk` says the frame was sent, so the old
+    // code reset nextAttemptMs to now and asked again on the very next tick, forever.
+    const f = fixture({ pendingFor: () => "g:author:7" });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+
+    f.clock.now += 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+
+    // ...and the ladder DOUBLES, so an offer nobody takes up goes quiet rather than settling
+    // into a fixed drumbeat.
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS + 1;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+    f.clock.now += RECONCILE_BACKOFF_BASE_MS;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+  });
+
+  it("a NEW pending change is a trigger — it does not wait out the ladder", async () => {
+    let signature = "c:author:1";
+    const f = fixture({ pendingFor: () => signature });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+    f.clock.now += 1_000;
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 0, skippedBackoff: 1 });
+
+    signature = "c:author:2"; // we authored another entry
+    f.clock.now += 1_000;
+    expect(
+      await f.scheduler.sweep(OWNER),
+      "a real pending change was held behind the backoff a stale one had armed",
+    ).toMatchObject({ attempted: 1 });
+    expect(f.sent).toHaveLength(2);
+  });
+
+  it("the frame carries ONLY the documents with something pending", async () => {
+    const f = fixture({
+      sweepTargets: () => new Map([[PEER, ["d1", "d2", "d3"]]]),
+      pendingFor: (_o, documentId) => (documentId === "d2" ? "c:author:1" : null),
+    });
+    expect(await f.scheduler.sweep(OWNER)).toMatchObject({ attempted: 1 });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.docs).toEqual(["d2"]);
+  });
+
+  it("onReachable still asks about EVERYTHING — reachability is where the pull lives now", async () => {
+    // Suppressing the timer removes the periodic PULL: `pendingFor` can only see what we hold
+    // that they lack, never what they hold that we lack. The pull moves onto a real event — a
+    // session with them coming up — and must not inherit the pending gate.
+    const f = fixture({
+      sweepTargets: () => new Map([[PEER, ["d1", "d2"]]]),
+      pendingFor: () => null,
+    });
+    await f.scheduler.onReachable(OWNER, PEER);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.docs).toEqual(["d1", "d2"]);
+  });
+});
