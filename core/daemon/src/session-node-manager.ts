@@ -260,7 +260,15 @@ export interface RelayConnectParams {
  * stranding content until someone restarts the daemon. Drains are deduped and delete-on-confirm,
  * so an extra one costs a pull.
  */
-export type ParkedDrainReason = "standing_receiver_ready" | "periodic_backstop";
+export type ParkedDrainReason =
+  | "standing_receiver_ready"
+  | "periodic_backstop"
+  /**
+   * DOD-M12B-SESSION-SEED-1 (case B): a session that was interrupted has just been revived, so the
+   * content the counterparty parked while we had no node can finally be fetched. Reviving the node
+   * without draining leaves the operator looking at a healthy session with no new mail.
+   */
+  | "session_revived";
 
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
@@ -312,6 +320,19 @@ export interface SessionNodeConfig {
    * already correlate by watching the connection.
    */
   transportPrivateKey?: Uint8Array;
+  /**
+   * DOD-M12B-SESSION-SEED-1 (case B review HIGH-1): bind a ROUTABLE interface, not loopback.
+   *
+   * Ordinary session nodes dial OUT and need no inbound reachability, so the factory gives them
+   * `127.0.0.1`. But a session node that reached its role by PROMOTION inherited the standing
+   * receiver's `0.0.0.0` bind and its circuit-relay reservation — which is every session node in
+   * production. A REBUILT one does not inherit anything, so without this it comes back on loopback
+   * with no relay address: the peer id is preserved and the counterparty still cannot reach us,
+   * which is precisely the half of the promise revival exists to keep. Preserving the id only
+   * matters because the circuit address `/p2p/<relay>/p2p-circuit/p2p/<sessionPeerId>` embeds it —
+   * and that is the address that was not being taken.
+   */
+  inboundReachable?: boolean;
 }
 
 /**
@@ -8459,6 +8480,11 @@ export class SessionNodeManager {
       allowedPeerId: identity.counterpartyPeerId,
       logger: this.#logger,
     });
+    // The relay peers must be allowed OUTBOUND before the node starts, or the reservation the line
+    // below depends on is refused by our own gater — the same ordering the receiver builder uses.
+    const reservations = this.#reservationCircuitAddrs(agentName);
+    for (const relayPeerId of reservations.relayPeerIds) gater.setAllowedOutboundPeer(relayPeerId);
+
     let node: CelloNode;
     try {
       node = await this.#factory.createNode({
@@ -8466,6 +8492,11 @@ export class SessionNodeManager {
         connectionGater: gater,
         nodeType: "session",
         transportPrivateKey: identity.seed,
+        // review HIGH-1: reachable, and holding a circuit reservation. A revived node that binds
+        // loopback preserves an identity nobody can dial — the counterparty's next message parks
+        // again and case B is only half delivered.
+        inboundReachable: true,
+        ...(reservations.addrs.length > 0 ? { circuitRelayListenAddrs: reservations.addrs } : {}),
       });
       await node.start();
     } catch (err: unknown) {
@@ -8486,22 +8517,58 @@ export class SessionNodeManager {
     });
     autoNat.emitInitialResult();
 
+    const correlationId = randomUUID();
     this.#activeNodes.set(key, {
       node,
       agentName,
       sessionId,
       counterpartyPubkey: identity.counterpartyPubkey,
       gater,
-      correlationId: randomUUID(),
+      correlationId,
       counterpartySessionPeerId: identity.counterpartyPeerId,
       autoNat,
     });
     await this.#registerContentHandler(agentName, sessionId, node, identity.counterpartyPubkey);
+    /**
+     * review HIGH-2 — REWIRE LIVENESS, or this session can never be interrupted again.
+     *
+     * Both creation paths call this; the first build of the revival did not. Without it the revived
+     * session is pinned `active`: a later disconnect fires no transition, no `session_state_changed`
+     * reaches the MCP client, and the receive surface renders unknown liveness as healthy-and-quiet.
+     * So the SECOND laptop close would leave the operator staring at a session that reports fine and
+     * is dead — this milestone's founding defect, one revival later, and with no status change left
+     * to trigger the next revival either.
+     */
+    this.#wireSessionLiveness(
+      agentName,
+      sessionId,
+      node,
+      identity.counterpartyPubkey,
+      correlationId,
+      identity.counterpartyPeerId,
+    );
 
     // THE REVERSE EDGE. A transport event took this session out of `active` and nothing has ever
     // put one back. Written after the node is live and its handler registered, so the row never
     // claims `active` for a session that cannot yet receive.
-    this.#updateSessionStatus(agentName, sessionId, "active");
+    //
+    // review MEDIUM-3: the result is CHECKED. `#updateSessionStatus` returns false when the write
+    // matched no row or the DB errored — and reporting revival ok on a row that still says
+    // `interrupted` leaves a live, talking session where REVIVAL-BOUND-1's sweep can seal or abandon
+    // it. Failing here means tearing the node back down rather than running in that split state.
+    if (!this.#updateSessionStatus(agentName, sessionId, "active")) {
+      this.#activeNodes.delete(key);
+      try {
+        await node.stop();
+      } catch { /* best-effort: the status write already failed and is logged with its cause */ }
+      return {
+        ok: false,
+        reason: "session_status_write_failed",
+        guidance:
+          "The session node was rebuilt but its status could not be written, so it was torn back " +
+          "down rather than left live under an interrupted row. The daemon logged the cause.",
+      };
+    }
 
     const peerId = node.getPeerId();
     this.#logger.info("session.revived", {
@@ -8538,13 +8605,83 @@ export class SessionNodeManager {
     if (record.status === "active" && this.#activeNodes.has(this.#k(agentName, sessionId))) return { ok: true };
 
     const revived = await this.reviveSessionNode(agentName, sessionId);
-    if (!revived.ok) return revived;
+    if (!revived.ok) {
+      this.#logger.info("session.revive.declined", {
+        agentName,
+        sessionId,
+        previousStatus: record.status,
+        trigger: "send",
+        reason: revived.reason,
+      });
+      return revived;
+    }
     this.#logger.info("session.revived.on_demand", {
       agentName,
       sessionId,
       previousStatus: record.status,
       trigger: "send",
     });
+    return { ok: true };
+  }
+
+  /**
+   * DOD-M12B-SESSION-SEED-1 (case B) — the INBOUND half of the demand edge.
+   *
+   * `reviveIfNeededForSend` covers the operator waking first. Case B's triggers are symmetric — a
+   * wifi hop, a relay restart, a directory node cycling — so half the time the COUNTERPARTY wakes
+   * first. They send; we have no node yet, because revival is demand-driven and we have demanded
+   * nothing. Their content parks at the relay, which is the backstop working as designed.
+   *
+   * Then the operator comes back and READS, and until now that told them nothing: the receive
+   * handler reads the transcript and never gates on status, so it happily reports what is already
+   * stored while messages sit parked, waiting for a node that will not exist until the operator
+   * happens to SEND. An operator who only reads was stuck forever with a surface that looked fine.
+   *
+   * **WHY A READ MAY TRIGGER THIS AND AN INBOUND DIAL MAY NOT.** Andre's tenet is about what a
+   * REMOTE party can cause: *"an open connection that a malicious agent can farm for."* Reviving
+   * because a peer dialled us would hand that lever straight to the peer — a stranger could keep our
+   * endpoints open indefinitely by poking dead sessions. A read is the OPERATOR asking, on their own
+   * machine, for their own session: the same class of demand as a send, and the class the tenet
+   * allows. That distinction is the whole reason this is a separate entry point rather than a
+   * revival triggered from the inbound handler.
+   */
+  async reviveIfNeededForRead(
+    agentName: string,
+    sessionId: string,
+  ): Promise<{ ok: true } | { ok: false; reason: string; guidance?: string }> {
+    const record = this.getSessionRecord(agentName, sessionId);
+    if (!record) return { ok: false, reason: "session_not_found" };
+    if (record.status === "active" && this.#activeNodes.has(this.#k(agentName, sessionId))) return { ok: true };
+    // Reading the transcript of an ended session is normal and must keep working — the CALLER does
+    // not treat this refusal as an error, it just reads what is stored. What must not happen is the
+    // read bringing the session back: the receipt is issued and the identity is gone.
+    const revived = await this.reviveSessionNode(agentName, sessionId);
+    if (!revived.ok) {
+      // review MEDIUM-4: the absence of a success line was the only signal that a session could not
+      // come back. `session_identity_lost` is the one an operator most needs, and it was generated
+      // and destroyed one stack frame later with nothing written down.
+      this.#logger.info("session.revive.declined", {
+        agentName,
+        sessionId,
+        previousStatus: record.status,
+        trigger: "read",
+        reason: revived.reason,
+      });
+      return revived;
+    }
+
+    this.#logger.info("session.revived.on_demand", {
+      agentName,
+      sessionId,
+      previousStatus: record.status,
+      trigger: "read",
+    });
+    // Fetch what is waiting NOW. Review MEDIUM-5 corrected the claim this used to make: the drain
+    // runs off the AGENT's standing receiver, not the session node, and the 5-minute backstop would
+    // have delivered this content anyway. So this is an accelerator, not a rescue — worth having,
+    // and worth describing accurately. (The send path deliberately does not fire one: the same
+    // backstop covers it, at a cost of at most one interval.)
+    this.#fireParkedDrain(agentName, "session_revived");
     return { ok: true };
   }
 

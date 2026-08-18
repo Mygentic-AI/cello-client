@@ -184,7 +184,11 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
     // agent ever did). CELLO_LISTEN_ADDR / CELLO_ANNOUNCE_ADDRS remain as
     // overrides for publicly-hosted agents (M6 parity). Ephemeral session nodes
     // (which dial OUT and need no inbound reachability) stay on loopback.
-    const isReceiver = config.nodeType === "standing_receiver";
+    // DOD-M12B-SESSION-SEED-1 (case B review HIGH-1): `inboundReachable` is the REVIVED session
+    // node. Every production session node reached its role by promotion and so inherited the
+    // receiver's routable bind; a rebuilt one inherits nothing and would come back on loopback,
+    // preserving an identity nobody can dial.
+    const isReceiver = config.nodeType === "standing_receiver" || config.inboundReachable === true;
     const listenAddr = isReceiver
       ? (process.env["CELLO_LISTEN_ADDR"] ?? "/ip4/0.0.0.0/tcp/0")
       : "/ip4/127.0.0.1/tcp/0";
