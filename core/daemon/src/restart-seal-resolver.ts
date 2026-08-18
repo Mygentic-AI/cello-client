@@ -10,11 +10,17 @@
  * `seal_unilateral_too_early` it hands back exactly how long is left; that number becomes a
  * scheduled retry rather than a sentence asking a human to come back.
  *
- * SCOPE IS THE WHOLE SAFETY ARGUMENT. `listRestartOrphans` returns only sessions marked
- * `interrupted_by = 'local'` — ours. A session the COUNTERPARTY ended, or one lost with the relay
- * witness stream, is never touched here, so SI-001 ("no auto-seal on a session_interrupted receipt —
- * a daemon that sealed on its own would notarize a conversation nobody chose to end") keeps holding
- * for the live interruption it was written about.
+ * SCOPE IS THE WHOLE SAFETY ARGUMENT, and after DOD-M12B-PENDING-RESOLVE-1 it has TWO branches.
+ *
+ *   1. `interrupted` with `interrupted_by = 'local'` — OURS. Our own boot sweep, shutdown sweep or
+ *      kill switch ended it; nobody else did, and it cannot be resumed because the keypairs died
+ *      with the process.
+ *   2. `seal_interrupted_pending` — a seal commitment that nobody ever asked the directory to
+ *      notarize. **This population includes sessions the COUNTERPARTY asked to end**, which is why
+ *      the SI-001 boundary in `close-session-handler.ts` had to be restated rather than left as
+ *      "nothing the counterparty caused is auto-sealed". SI-001 forbids notarizing a conversation
+ *      NOBODY chose to end; here somebody always did — an initiator row carries the counterparty's
+ *      signed leaf, and a responder row exists because the counterparty sent a request to seal.
  *
  * Serial and staggered on purpose: a seal is a directory ceremony, and a machine holding hundreds of
  * orphans must not answer a restart with hundreds of simultaneous ceremonies.
@@ -26,6 +32,13 @@ export interface RestartOrphan {
   agentName: string;
   sessionId: string;
   messageCount: number;
+  /**
+   * DOD-M12B-PENDING-RESOLVE-1: which population this is. Two statuses now reach this queue and
+   * they need different words in a give-up: an `interrupted` session may legitimately be
+   * force-abandoned, and a `seal_interrupted_pending` one must not be, because forcing forfeits a
+   * signed commitment and the relay-witnessed leaves that are one request away from a receipt.
+   */
+  status: "interrupted" | "seal_interrupted_pending";
 }
 
 /**
@@ -51,7 +64,12 @@ export interface ScheduledTask {
 
 export interface RestartSealResolverDeps {
   logger: Logger;
-  /** Sessions with status 'interrupted' AND interrupted_by 'local'. Nothing else is eligible. */
+  /**
+   * DOD-M12B-PENDING-RESOLVE-1 — TWO populations, each with its own safety argument:
+   *   - `interrupted` AND `interrupted_by = 'local'` — our own stop ended it, so we may describe it.
+   *   - `seal_interrupted_pending` — a seal commitment nobody asked the directory to notarize.
+   * Nothing else is eligible.
+   */
   listRestartOrphans: () => RestartOrphan[];
   sealSession: (agentName: string, sessionId: string) => Promise<SealOutcome>;
   /**
@@ -102,6 +120,34 @@ export interface RestartSealResolverDeps {
  * fixed by a relay pull filling the gap — the close's own guidance says so — and the second is a
  * directory that did not answer in time, which the next attempt may well get.
  */
+/**
+ * DOD-M12B-PENDING-RESOLVE-1 (review F2) — refusals that mean "WE were not ready", not "this session
+ * is hopeless".
+ *
+ * Every one of these is a local precondition of OURS. The close handler says so itself:
+ * *"`standing_receiver_unavailable` is simply 'the agent is not started yet', which a freshly booted
+ * daemon reports for every session."* And a freshly booted daemon is the only time this resolver
+ * runs — the receiver is created when `cello_start_agent` reaches the daemon, which on a boot where
+ * no client has attached yet has not happened for any agent.
+ *
+ * Left in the ordinary budget they cost five attempts in ~15 minutes and then a DURABLE
+ * `restart_seal_gave_up_at`, which removes the session from the only queue that would ever look at
+ * it again. For the `seal_interrupted_pending` population that is materially worse than doing
+ * nothing: those rows hold signed commitments and relay-witnessed leaves that are ready to notarize,
+ * and the give-up reaches no operator surface at all — it is a warn line in `daemon.log`.
+ *
+ * So these retry on the same backoff but do NOT consume the attempt budget and can never be the
+ * reason for a permanent give-up. They are bounded instead by wall-clock (`#localPreconditionCap`),
+ * so a genuinely dead daemon still stops eventually rather than retrying forever.
+ */
+const LOCAL_PRECONDITION_REFUSALS: ReadonlySet<string> = new Set([
+  "standing_receiver_unavailable",
+  "no_persisted_relay_endpoint",
+  "relay_unavailable",
+  "directory_unreachable",
+  "transport_unavailable",
+]);
+
 const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([
   "session_abandoned",
   "seal_interrupted_rejected_by_counterparty",
@@ -323,7 +369,25 @@ export class RestartSealResolver {
     }
 
     const terminal = TERMINAL_SEAL_REFUSALS.has(outcome.reason);
-    if (terminal || item.attempts >= this.#maxAttempts) {
+    /**
+     * review F2 — a local precondition is not a verdict on the session.
+     *
+     * `attempts` is decremented back so this pass costs nothing from the budget: the session is
+     * retried on the same backoff, and only a refusal that says something about the SESSION can
+     * exhaust it. Without this, all 28 pending sessions were durably given up on ~15 minutes after
+     * every boot, and no future boot would ever enumerate them again.
+     */
+    const localPrecondition = !terminal && LOCAL_PRECONDITION_REFUSALS.has(outcome.reason);
+    if (localPrecondition) {
+      item.attempts = Math.max(0, item.attempts - 1);
+      this.#deps.logger.info("session.restart_seal.not_ready", {
+        agentName: item.orphan.agentName,
+        sessionId: item.orphan.sessionId,
+        reason: outcome.reason,
+        impact: "a local precondition, not a verdict on the session — retried without spending an attempt",
+      });
+    }
+    if (terminal || (!localPrecondition && item.attempts >= this.#maxAttempts)) {
       this.#queue.delete(key);
       // DURABLE, so the next boot does not start the same five attempts over. A machine restarting
       // ~6 times a day would otherwise re-try a hopeless session forever, which is the burst the
@@ -351,10 +415,18 @@ export class RestartSealResolver {
         // THE CLOSE'S OWN GUIDANCE WINS. A fixed string here told the operator to force-abandon —
         // and for `session_already_sealed` the close handler says in capitals NOT to, because
         // forcing there permanently forfeits a half that is still recoverable.
+        // review F4: the fallback must not tell a `seal_interrupted_pending` session it is
+        // "interrupted", nor point at force-abandon — forcing there forfeits a signed commitment and
+        // the relay-witnessed leaves that are ready to notarize.
         guidance:
           outcome.guidance ??
-          ("This session could not be sealed automatically and is still interrupted. Close it with " +
-           "cello_close_session, or force-abandon it — which ends it WITHOUT a notarized receipt."),
+          (item.orphan.status === "seal_interrupted_pending"
+            ? ("This session holds a seal commitment and could not be notarized automatically. The " +
+               "commitment and the full transcript are intact — retry cello_close_session once the " +
+               "agent is started and the daemon reports healthy. Do NOT force-abandon it: that ends " +
+               "it WITHOUT the receipt it is one request away from having.")
+            : ("This session could not be sealed automatically and is still interrupted. Close it with " +
+               "cello_close_session, or force-abandon it — which ends it WITHOUT a notarized receipt.")),
       });
       this.#armIfWork();
       return;

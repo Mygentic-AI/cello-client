@@ -10,13 +10,23 @@
  * SI-001: there is NO auto-seal on a session_interrupted receipt. The operator must close
  * explicitly. A daemon that sealed on its own would notarize a conversation nobody chose to end.
  *
- * SI-001 IS NARROWER THAN IT READS, and the boundary matters (DOD-M12B-RESTART-SEAL-1, 2026-08-17).
- * It governs a LIVE interruption — the relay says the counterparty vanished while the operator is at
- * the keyboard and may still want to wait. `restart-seal-resolver.ts` seals a different population:
- * sessions OUR OWN stop destroyed (`interrupted_by = 'local'`), which cannot be resumed because the
- * transport keypairs died with the process. There the only alternative is force-abandon, which
- * forfeits the receipt — so the choice is seal-or-abandon, not seal-or-resume. Nothing the
- * counterparty caused is auto-sealed, and SI-001 holds unchanged for it.
+ * SI-001 IS NARROWER THAN IT READS, and the boundary matters (DOD-M12B-RESTART-SEAL-1, 2026-08-17;
+ * RESTATED 2026-08-18 for DOD-M12B-PENDING-RESOLVE-1). SI-001 governs a LIVE interruption — the
+ * relay says the counterparty vanished while the operator is at the keyboard and may still want to
+ * wait. `restart-seal-resolver.ts` seals TWO different populations, and the test that licenses both
+ * is **somebody chose to end this**, not "we caused it":
+ *
+ *   1. `interrupted` with `interrupted_by = 'local'` — OUR OWN stop destroyed it, and it cannot be
+ *      resumed because the transport keypairs died with the process. The only alternative is
+ *      force-abandon, which forfeits the receipt: the choice is seal-or-abandon, not seal-or-resume.
+ *   2. `seal_interrupted_pending` — a seal commitment nobody asked the directory to notarize.
+ *
+ * **The old sentence here — "nothing the counterparty caused is auto-sealed" — is no longer true,
+ * and saying so plainly matters because this paragraph is what a future widening will cite.** A
+ * responder-side pending row is created by a request the COUNTERPARTY sent. What licenses it is not
+ * that we caused it but that they explicitly asked to seal; an initiator-side row is licensed by
+ * their signed leaf. Either way the conversation is one somebody chose to end, which is exactly what
+ * SI-001 protects against — and SI-001 itself holds unchanged for a live interruption.
  *
  * This was on my DO-NOT-CUT list. It has fifteen dependencies — a long list, but a KNOWN one, and
  * that is the entire difference from a closure over 73 shared locals.

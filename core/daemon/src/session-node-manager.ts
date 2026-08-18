@@ -3797,9 +3797,38 @@ export class SessionNodeManager {
   }
 
   /**
-   * DOD-M12B-RESTART-SEAL-1 — the sessions OUR OWN stop orphaned, and only those.
+   * DOD-M12B-RESTART-SEAL-1 / DOD-M12B-PENDING-RESOLVE-1 — sessions that need a receipt and have
+   * nobody asking for one. TWO populations, one queue, each with its own safety argument.
    *
-   * `interrupted_by` is the whole safety argument. `'local'` means the boot sweep, the shutdown
+   * **(2) `seal_interrupted_pending` — a seal commitment nobody notarized.** Measured 2026-08-18 on
+   * the live store: 28 sessions, aged 0.3 to 12.8 days, one of them 14 messages long, 26 holding
+   * relay-witnessed seal leaves, and **not one with a sealed root**.
+   *
+   * **HALF OF THEM ARE NOT BILATERAL, and the first version of this comment claimed they were.**
+   * Measured split: 14 initiator rows, each carrying the counterparty's signed leaf — and 14
+   * responder rows with `counterparty_leaf = NULL`. A responder row is written by
+   * `inbound-seal-request.ts` from an UNSIGNED `seal_interrupted_request` frame, before its ack is
+   * even sent, so an ordinary send failure produces a one-sided pending row.
+   *
+   * So the licence is NOT "both parties signed". It is **somebody chose to end this**, on two
+   * branches: an initiator row carries the counterparty's signature, and a responder row exists
+   * because the counterparty sent a request to seal. And what makes the result VERIFIABLE is
+   * neither — it is that the directory rebuilds the tree from relay-witnessed leaves and checks
+   * their signatures, never consulting the commitment at all. The commitment is what makes it
+   * legitimate to ASK. (`close-session-handler.ts` states this in full; the first draft of this
+   * header contradicted it 200 lines away.) `PENDING-EXIT-1` built their exit and it works — but only when an operator runs
+   * `cello_close_session` on that session by hand, having somehow deduced they should. Nothing
+   * enumerated them, because both sweeps filtered `status = 'interrupted'`. An exit nobody is told
+   * about is not an exit.
+   *
+   * `interrupted_by` is deliberately NOT consulted for that population. It answers "did WE cause
+   * this, and may we therefore describe it" — and that is the wrong question once a seal was
+   * requested or signed. **SI-001 is not weakened:** it forbids notarizing *"a conversation nobody
+   * chose to end"*, and every row here was chosen to be ended by one side or the other. The only
+   * thing missing is the request to notarize it.
+   *
+   * **(1) `interrupted` — sessions our own stop orphaned, and only those.** Here `interrupted_by` is
+   * the whole safety argument. `'local'` means the boot sweep, the shutdown
    * sweep, or the operator's own kill switch ended this session — nobody else did, and it cannot be
    * resumed because the transport keypairs died with the process. Those are the ones the resolver
    * may seal on its own.
@@ -3813,7 +3842,7 @@ export class SessionNodeManager {
    * Same INNER JOIN discipline as getSessionsByStatus: a retired agent's rows are kept for
    * accountability and are not resumable, so they are not offered for sealing either.
    */
-  listRestartOrphanedSessions(): Array<{ agentName: string; sessionId: string; messageCount: number }> {
+  listRestartOrphanedSessions(): Array<{ agentName: string; sessionId: string; messageCount: number; status: "interrupted" | "seal_interrupted_pending" }> {
     if (!this.#db) return [];
     const rows = this.#db
       .prepare(
@@ -3827,18 +3856,35 @@ export class SessionNodeManager {
         // `restart_seal_gave_up_at IS NULL` — a session we have already exhausted. Without it a
         // machine restarting ~6 times a day re-runs five ceremonies against a hopeless session on
         // every boot, forever.
-        `SELECT s.session_id AS session_id, s.message_count AS message_count, a.agent_name AS agent_name
+        `SELECT s.session_id AS session_id, s.message_count AS message_count, a.agent_name AS agent_name,
+                s.status AS status
          FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
-         WHERE s.status = 'interrupted' AND s.interrupted_by = 'local' AND a.state != 'retired'
+         WHERE a.state != 'retired'
+           AND (
+                 -- (1) OURS, and we can say so. SI-001 holds: an interrupted session with an
+                 -- unknown cause has no signatures behind it and must not be notarized.
+                 (s.status = 'interrupted' AND s.interrupted_by = 'local')
+                 -- (2) A seal commitment with nobody asking for it. review F5: the EXISTS is
+                 -- STRUCTURAL, not decoration. The header's licence is "a commitment was made", and
+                 -- a status check alone asserts that in prose while the query checks something
+                 -- else. Today status implies an artifact row by construction, which is exactly the
+                 -- kind of invariant that holds until someone adds a fourth writer.
+                 OR (s.status = 'seal_interrupted_pending'
+                     AND EXISTS (SELECT 1 FROM seal_interrupted_artifacts sa
+                                 WHERE sa.agent_id = s.agent_id AND sa.session_id = s.session_id))
+               )
            AND s.message_count > 0
            AND s.restart_seal_gave_up_at IS NULL
          ORDER BY s.updated_at ASC`,
       )
-      .all() as unknown as Array<{ session_id: string; message_count: number; agent_name: string }>;
+      .all() as unknown as Array<{ session_id: string; message_count: number; agent_name: string; status: string }>;
     return rows.map((r) => ({
       agentName: r.agent_name,
       sessionId: r.session_id,
       messageCount: r.message_count ?? 0,
+      // Carried so a give-up can say something TRUE about this session: the two populations need
+      // different words, and force-abandon is right for one and destructive for the other.
+      status: r.status === "seal_interrupted_pending" ? "seal_interrupted_pending" as const : "interrupted" as const,
     }));
   }
 

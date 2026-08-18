@@ -74,7 +74,10 @@ function makeClock() {
 }
 
 const ORPHAN = (sessionId: string, agentName = "alice"): RestartOrphan => ({
-  agentName, sessionId, messageCount: 4,
+  // DOD-M12B-PENDING-RESOLVE-1 added `status`: the resolver now serves two populations, and a
+  // give-up must not tell a pending session it is "interrupted" or point it at force-abandon.
+  // These cases are all the restart-orphan population, so `interrupted` is the right default here.
+  agentName, sessionId, messageCount: 4, status: "interrupted",
 });
 
 function makeResolver(opts: {
