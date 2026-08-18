@@ -602,7 +602,28 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         delivered: false,
         reason: "dispatched_to_relay",
         modified,
-        guidance: "The counterparty is not directly reachable right now, so this message was sealed and dispatched to relay store-and-forward. It will be delivered the next time the counterparty's daemon reconnects — no further action is needed.",
+        /**
+         * WHAT IS ACTUALLY TRUE, and the previous wording was neither.
+         *
+         * OBSERVED LIVE 2026-08-18. This exact response came back on a send that was delivered in
+         * **8 seconds**, and the counterparty's agent read it and correctly reported "no change" —
+         * because it is byte-identical to the response returned when the same send took THREE
+         * MINUTES. The sender had no way to tell a good outcome from a bad one, and the rational
+         * next move for anyone reading it is to send again, which produces a duplicate of a message
+         * that was never lost.
+         *
+         * The old text also asserted a cause it does not know: *"delivered the next time the
+         * counterparty's daemon reconnects."* The counterparty's daemon is frequently up the whole
+         * time — this path is taken because the two SESSION NODES hold no direct connection to each
+         * other, which is a different thing and points at a different party.
+         *
+         * So: say what happened, say what to expect, and claim nothing about their daemon.
+         */
+        guidance:
+          "Sent. This message went via the relay rather than a direct connection, so it is sealed, "
+          + "witnessed and on its way — the counterparty normally has it within seconds. "
+          + "`delivered: false` means it did not go over a direct link, NOT that it failed. "
+          + "No action is needed, and re-sending would duplicate it.",
         ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
       };
     }
