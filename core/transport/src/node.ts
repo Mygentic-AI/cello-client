@@ -371,10 +371,24 @@ class CelloNodeImpl implements CelloNode {
     return this.#libp2p.getProtocols();
   }
 
-  getConnections(): Array<{ peerId: string; encryption: string | undefined; remoteAddr?: string }> {
+  getConnections(): Array<{
+    peerId: string;
+    encryption: string | undefined;
+    remoteAddr?: string;
+    status: string;
+  }> {
     return this.#libp2p.getConnections().map((c) => ({
       peerId: c.remotePeer.toString(),
       encryption: c.encryption,
+      // DOD-M12-CONN-OBSERVE-1: the SOCKET status, which is not the muxer's. libp2p checks the two
+      // separately in `newStream` — muxer first — so a stream failing with
+      // `The connection muxer is "closed" and not "open"` returns before the socket is looked at,
+      // and the caller cannot tell a dead muxer on a live socket from a connection that is dead
+      // through. Those need different fixes: the first is repaired by evicting and redialling, the
+      // second by nothing on this side. Exposed because `dial()` resolves from the registry
+      // whenever a registered connection reads `open` here, which is what makes a plain redial a
+      // no-op against a dead muxer.
+      status: c.status,
       // DOD-M12B-RESPONDER-ADDR-1: the address this peer is reachable at, which the RESPONDER
       // otherwise never learns. It dialled nobody, so after an interruption it has nothing to dial
       // back with — measured live 2026-08-18, `session.transport.redial.unavailable`, "this side
@@ -382,6 +396,41 @@ class CelloNodeImpl implements CelloNode {
       // it. A relayed address (`/p2p-circuit`) is a valid dial target too, so both kinds are given.
       remoteAddr: c.remoteAddr.toString(),
     }));
+  }
+
+  /**
+   * DOD-M12-CONN-EVICT-1: drop every connection to a peer so the next dial must build a new one.
+   *
+   * `libp2p.dial()` does NOT always reach the network. `openConnection` calls
+   * `findExistingConnection`, which filters registered connections on `con.status === 'open'` and
+   * never inspects the muxer, and returns the first match. So when a connection's muxer dies while
+   * its socket still reads open, every redial resolves from the registry and hands the same dead
+   * object back — the repair runs, reports success, and changes nothing. Evicting is what makes the
+   * redial able to work at all.
+   *
+   * `{ force: true }` on the dial was the alternative and is worse: it opens a second connection
+   * but LEAVES the corpse registered, where `newStream`'s own `find(c => c.status === "open")` can
+   * select it again on the next call.
+   *
+   * Resolves quietly when no connection exists — callers reach this on a failure path where the
+   * connection may already be gone, and throwing there would turn a recoverable stale handle into
+   * a failure of the repair itself.
+   */
+  async hangUp(peerIdStr: string): Promise<void> {
+    let peerId;
+    try {
+      peerId = peerIdFromString(peerIdStr);
+    } catch {
+      // NAMED, not passed through. A caller handed us something that is not a peer id; letting
+      // libp2p's parse error escape would be logged as a connection problem, which is the exact
+      // cause-for-symptom substitution this milestone exists to remove.
+      throw {
+        reason: "invalid_peer_id",
+        peerId: peerIdStr,
+        message: `Invalid peer ID: ${peerIdStr}`,
+      };
+    }
+    await this.#libp2p.hangUp(peerId);
   }
 
   /** DOD-RELAY-KEEPALIVE-1: the connection-monitor policy this node was built with. */

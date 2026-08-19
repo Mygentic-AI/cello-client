@@ -63,8 +63,8 @@ class ReservationNode extends FakeNode {
   /** A granted reservation implies a LIVE connection to the relay. Without this the watchdog reads
    *  the reservation as lost on its very next tick and rebuilds forever — which is the fixture
    *  lying, not the code churning. */
-  override getConnections(): Array<{ peerId: string; encryption: string | undefined }> {
-    return this.granted ? [{ peerId: "12D3KooWRelay", encryption: "noise" }] : [];
+  override getConnections(): Array<{ peerId: string; encryption: string | undefined; status: string }> {
+    return this.granted ? [{ peerId: "12D3KooWRelay", encryption: "noise", status: "open" }] : [];
   }
 }
 
@@ -188,8 +188,8 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     // carries the id.
     class IdlessCircuitNode extends ReservationNode {
       override listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/4001/p2p-circuit"]; }
-      override getConnections(): Array<{ peerId: string; encryption: string | undefined }> {
-        return [{ peerId: "12D3KooWRelay", encryption: "noise" }];
+      override getConnections(): Array<{ peerId: string; encryption: string | undefined; status: string }> {
+        return [{ peerId: "12D3KooWRelay", encryption: "noise", status: "open" }];
       }
     }
     const { logger } = makeLogger();

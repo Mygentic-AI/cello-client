@@ -227,8 +227,31 @@ export interface CelloNode {
    * Returns basic info about all current connections.
    * Used by SI-001 test to verify connection-level encryption is Noise.
    * encryption is undefined when libp2p has not yet completed the security handshake.
+   *
+   * `status` is the SOCKET status ('open' | 'closing' | 'closed'), which is NOT the muxer's.
+   * libp2p checks the two separately when opening a stream, muxer first, so a connection can read
+   * `open` here while every stream on it fails. Callers diagnosing a stream failure need this to
+   * tell "dead muxer on a live socket" from "dead through" — see hangUp (DOD-M12-CONN-EVICT-1).
    */
-  getConnections(): Array<{ peerId: string; encryption: string | undefined; remoteAddr?: string }>;
+  getConnections(): Array<{
+    peerId: string;
+    encryption: string | undefined;
+    remoteAddr?: string;
+    status: string;
+  }>;
+
+  /**
+   * DOD-M12-CONN-EVICT-1: drop every connection to this peer.
+   *
+   * Needed because `dial()` resolves from libp2p's registry — it returns an existing connection
+   * whenever one is registered for the peer and its socket status reads `open`, without inspecting
+   * the muxer. A caller repairing a connection whose muxer has died must evict FIRST, or the dial
+   * returns the same dead object and the repair silently accomplishes nothing.
+   *
+   * Resolves when no connection exists (a repair path may find it already gone).
+   * Fails with { reason: 'invalid_peer_id' } if peerId does not parse.
+   */
+  hangUp(peerId: string): Promise<void>;
 
   /**
    * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed

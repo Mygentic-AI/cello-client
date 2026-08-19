@@ -41,7 +41,8 @@ export class FakeNode implements Partial<CelloNode> {
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
   async handle(_p: string, _h: unknown): Promise<void> {}
   getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
+  getConnections(): Array<{ peerId: string; encryption: string | undefined; status: string }> { return []; }
+  async hangUp(_peerId: string): Promise<void> {}
   onPeerConnect(_h: (p: string) => void): void {}
   onPeerDisconnect(_h: (p: string) => void): void {}
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
