@@ -80,6 +80,14 @@ export interface DocumentLayerDeps {
   db: DaemonDatabase;
   logger: Logger;
   /**
+   * DOD-DOC-SCREEN-CONTENT-1 — the semantic screen for document content, on the projected text.
+   * Threaded from the composition root to `DocumentInbound`; see its dep for why it lives there.
+   */
+  screenProjected?: (
+    text: string,
+    ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+  ) => Promise<{ block: boolean; reason?: string }>;
+  /**
    * The public key an agent id signs with, or null when this daemon cannot resolve one.
    *
    * REQUIRED. Returning null means "cannot verify", which both inbound paths treat as a refusal —
@@ -324,6 +332,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     gate,
     rejections,
     logger,
+    ...(deps.screenProjected ? { screenProjected: deps.screenProjected } : {}),
     verifySignature,
     liveDocFor: (ownerAgentId, documentId) => live.get(ownerAgentId, documentId),
     standingOf: (ownerAgentId, documentId, agentId) => standingOf(ownerAgentId, documentId, agentId),

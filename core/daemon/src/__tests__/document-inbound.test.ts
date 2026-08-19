@@ -72,6 +72,11 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
 function newFixture(
   opts: {
     verify?: () => boolean;
+    /** DOD-DOC-SCREEN-CONTENT-1 — the semantic screen seam, on the projected text. */
+    screenProjected?: (
+      text: string,
+      ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+    ) => Promise<{ block: boolean; reason?: string }>;
     currentHolders?: () => string[] | null;
     deriveAtFrontier?: (
       o: string,
@@ -140,6 +145,7 @@ function newFixture(
 
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
+    ...(opts.screenProjected ? { screenProjected: opts.screenProjected } : {}),
     // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
     // every older test in this file was written against.
     currentHolders: opts.currentHolders ?? (() => null),
@@ -829,5 +835,65 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
 
     expect(res).toMatchObject({ ok: false, reason: "document_stalled" });
     expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+});
+
+/**
+ * DOD-DOC-SCREEN-CONTENT-1 — the semantic screen runs on the PROJECTED TEXT, at the shadow.
+ *
+ * The whole reordering this unit exists for: the layer that judges meaning used to sit at the wire,
+ * where a document frame is a signed binary envelope and the text screener was decoding it as UTF-8
+ * and judging mojibake. The gate already applies the update to an inert shadow and computes the
+ * readable text; this is that text reaching the screener, and nothing else changing.
+ */
+describe("the semantic screen sees readable text, and refuses rather than rewrites", () => {
+  it("hands the screener the text the update WOULD produce — not the envelope bytes", async () => {
+    const seen: string[] = [];
+    const f = newFixture({
+      screenProjected: async (text) => { seen.push(text); return { block: false }; },
+    });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    // Readable prose, not CBOR. This is the assertion the whole unit turns on.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("peer text");
+  });
+
+  it("refuses a blocked envelope, holds its bytes, and answers the peer by name", async () => {
+    const f = newFixture({
+      screenProjected: async () => ({ block: true, reason: "inbound_injection_blocked" }),
+    });
+    const env = envelope();
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+
+    expect(res).toMatchObject({ ok: true, admitted: false, rejectionReason: "document_content_injection" });
+    // NOT REWRITTEN and NOT APPLIED — a rewritten replica is permanent divergence. The log holds
+    // the signed REJECTION (the 0x05 leaf), never the refused update.
+    expect(f.store.getEnvelopeLog(AGENT, DOC).filter((e) => e.kind === "update")).toHaveLength(0);
+    expect(f.live.getText("content").toString()).not.toContain("peer text");
+    // HELD, never discarded, so the peer's next link stays bridgeable.
+    expect(f.store.listQuarantined(AGENT, DOC)).toHaveLength(1);
+    // ANSWERED — the sender stops retrying rather than driving the document to stalled.
+    expect((res as { rejectionWire?: Uint8Array }).rejectionWire).toBeDefined();
+  });
+
+  it("admits when the screener allows — the seam is not a refusal in disguise", async () => {
+    const f = newFixture({ screenProjected: async () => ({ block: false }) });
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("admits when no screener is wired — Layer 2 degrades, it does not fail closed", async () => {
+    const res = await newFixture().inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("does not call the screener when the update inserts nothing", async () => {
+    // A deletion carries no new content. Screening it would spend a gateway round trip per
+    // keystroke-sized delete, and re-screening the WHOLE document would refuse a peer's edit for
+    // prose admitted days earlier.
+    let calls = 0;
+    const f = newFixture({ screenProjected: async () => { calls++; return { block: false }; } });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope({ update: update(PEER_CLIENT, "") })), NOW);
+    expect(calls).toBe(0);
   });
 });

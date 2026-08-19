@@ -3892,6 +3892,27 @@ async function startDaemonHoldingLock(
   const documentLayer = createDocumentLayer({
     db: sessionNodeManager.getDb(),
     logger,
+    // DOD-DOC-SCREEN-CONTENT-1 — the gateway, reached with TEXT for once.
+    //
+    // The same program that screens conversation messages, called from the document gate's shadow
+    // with the readable projected text instead of the signed binary envelope the wire carries. Only
+    // a TERMINAL block refuses: a transient one means the gateway is down, and holding a document
+    // edit hostage to that would break convergence for a layer that degrades by design. A `redact`
+    // verdict is deliberately NOT honoured — rewriting one holder's replica is permanent divergence
+    // both sides converge on and neither can see — so it is carried as a refusal only when the
+    // gateway itself calls it terminal.
+    screenProjected: async (text, ctx) => {
+      const verdict = await config.securityGateway.screenInbound(new TextEncoder().encode(text), {
+        direction: "inbound",
+        agentName: ctx.senderAgentId,
+        sessionId: ctx.documentId,
+        ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
+      });
+      const block = verdict.disposition === "block" && verdict.terminal === true;
+      return block
+        ? { block: true, ...(verdict.reason !== undefined ? { reason: verdict.reason } : {}) }
+        : { block: false };
+    },
     // M14-D5: a remote agent's id IS its K_local pubkey hex, so this needs no lookup — and a lookup
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,

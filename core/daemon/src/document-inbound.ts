@@ -76,6 +76,23 @@ export type InboundResult =
 
 export interface DocumentInboundDeps {
   store: DocumentStore;
+  /**
+   * DOD-DOC-SCREEN-CONTENT-1 — screen the PROJECTED TEXT, at the shadow.
+   *
+   * The gate already applies the update to an inert shadow copy and computes the readable
+   * before/after text. Until this seam existed, the only rule reading that text was a character
+   * denylist, while the layer that judges MEANING sat at the wire — where a document frame is a
+   * signed binary envelope and the text screener was decoding it as UTF-8 and judging mojibake.
+   *
+   * Optional because it is Layer 2 and Layer 2 degrades by design (no model → no verdict → admit).
+   * It returns BLOCK or nothing: a `redact` verdict cannot be honoured on a CRDT replica, so a
+   * rewrite-worthy finding either refuses or is carried as evidence — there is no third outcome,
+   * which is the contract this whole path is built on.
+   */
+  screenProjected?: (
+    text: string,
+    ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+  ) => Promise<{ block: boolean; reason?: string }>;
   engine: DocumentEngine;
   gate: DocumentGate;
   rejections: DocumentRejections;
@@ -569,6 +586,52 @@ export class DocumentInbound {
         // happened, driving the document to `stalled` early.
         ...(rejection.wire ? { rejectionWire: rejection.wire } : {}),
         rejectionReason: verdict.reason,
+        duplicate: false,
+      };
+    }
+
+    // 7a-bis. THE SEMANTIC SCREEN, on the text the update WOULD produce.
+    //
+    // Placed here and nowhere else for two reasons. The shadow is inert — nothing in it can reach
+    // the operator or their agent until the admit below — so this is the last moment the content is
+    // both READABLE and harmless. And the gate's `validate` is synchronous while the gateway is a
+    // separate program, so the call cannot live inside a rule.
+    //
+    // Only the INSERTED text is screened. A deletion carries no new content, and re-screening the
+    // whole document would refuse a peer's edit for prose that was already admitted days ago.
+    const semantic = this.#d.screenProjected && verdict.projectedDiff.inserted.length > 0
+      ? await this.#d.screenProjected(verdict.projectedDiff.inserted, {
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          ...(correlationId !== undefined ? { correlationId } : {}),
+        })
+      : null;
+    if (semantic?.block === true) {
+      // REFUSED, NOT REWRITTEN, and the bytes are HELD — the same treatment every other refusal
+      // gets, so the peer's chain stays bridgeable and they are told once, by name.
+      const rejection = await this.#d.rejections.reject(ownerAgentId, env.document_id, {
+        rejectedEnvelopeHash: envelopeHash,
+        quarantined: env.update,
+        reason: "document_content_injection",
+        ...(semantic.reason !== undefined ? { detail: semantic.reason } : {}),
+        senderAgentId: env.sender_agent_id,
+        rejectedDocPrevHash: env.doc_prev_hash,
+        sign: (tbs) => this.#d.sign(ownerAgentId, tbs),
+        nowMs,
+      });
+      this.#d.logger.warn("document.inbound.injection_refused", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        envelopeHash,
+        reason: semantic.reason,
+        correlationId,
+      });
+      return {
+        ok: true,
+        admitted: false,
+        envelopeHash,
+        ...(rejection.wire ? { rejectionWire: rejection.wire } : {}),
+        rejectionReason: "document_content_injection",
         duplicate: false,
       };
     }
