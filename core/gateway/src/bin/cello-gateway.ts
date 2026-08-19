@@ -125,11 +125,11 @@ async function main(): Promise<void> {
   // the gap survived as long as it did.
   const modelDir = process.env["CELLO_GATEWAY_MODEL_DIR"] || join(homedir(), ".cello", "gateway-model");
   const load = await loadInjectionClassifier(modelDir);
-  if (load.classifier) {
-    process.stderr.write(`cello-gateway: semantic injection screening ACTIVE (model at ${modelDir})\n`);
-  } else {
-    process.stderr.write(`cello-gateway: semantic injection screening OFF — ${load.reason}\n`);
-  }
+  // ON STDOUT, and specifically on the line the PARENT reads. Written to stderr this was drained
+  // into an in-memory tail that the spawner only ever surfaces when the spawn FAILS — so on a
+  // successful boot the answer to "is semantic screening on?" was captured and thrown away. That is
+  // the exact shape of the defect this whole unit exists to fix: a state nothing can report.
+  const layer2 = load.classifier ? "active" : `off:${load.reason ?? "unknown"}`;
   const inbound = new InboundScreener(
     load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {},
   );
@@ -223,7 +223,7 @@ async function main(): Promise<void> {
     // was false — the id reached `applied` and stopped there.
     process.stderr.write(`${JSON.stringify({ level: "info", event: "gateway.boot", correlationId: bootCorrelationId, socketPath })}\n`);
   }
-  process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine}\n`);
+  process.stdout.write(`${GATEWAY_READY_TOKEN} ${socketPath} regex-engine=${engine} layer2=${layer2.replace(/\s+/g, " ")}\n`);
 
   let stopping = false;
   const shutdown = (signal: string) => {

@@ -22,9 +22,11 @@ import { fileURLToPath } from "node:url";
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const REPO_ROOT = join(PKG_ROOT, "..", "..");
 const DAEMON_DIST = join(PKG_ROOT, "dist", "daemon.js");
+const DAEMON_BIN_DIST = join(PKG_ROOT, "dist", "bin", "cello-daemon.js");
 const GATEWAY_DIST = join(REPO_ROOT, "core", "gateway", "dist", "bin", "cello-gateway.js");
 
 let daemon = "";
+let daemonBin = "";
 let gateway = "";
 
 beforeAll(async () => {
@@ -32,7 +34,9 @@ beforeAll(async () => {
   // "the wiring is gone" if the assertion quietly passes.
   expect(existsSync(DAEMON_DIST), `${DAEMON_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(GATEWAY_DIST), `${GATEWAY_DIST} — run pnpm build`).toBe(true);
+  expect(existsSync(DAEMON_BIN_DIST), `${DAEMON_BIN_DIST} — run pnpm build`).toBe(true);
   daemon = await readFile(DAEMON_DIST, "utf8");
+  daemonBin = await readFile(DAEMON_BIN_DIST, "utf8");
   gateway = await readFile(GATEWAY_DIST, "utf8");
 });
 
@@ -63,15 +67,26 @@ describe("the shipped daemon wires the semantic screen into the document layer",
   });
 });
 
+describe("the shipped daemon logs whether semantic screening is running", () => {
+  it("emits security.gateway.layer2 at boot", () => {
+    // `mode: "enforcing"` says the gateway is REACHABLE, not that it judges meaning — and for every
+    // build before daemon 0.0.181 it judged none while reporting exactly that.
+    expect(daemonBin).toContain("security.gateway.layer2");
+    expect(daemonBin).toContain("sidecar.layer2");
+  });
+});
+
 describe("the shipped gateway constructs the injection scanner", () => {
   it("passes an injectionScanner to InboundScreener — the line whose absence turned Layer 2 off in every build", () => {
     expect(gateway).toContain("injectionScanner");
     expect(gateway).toContain("InboundScreener");
   });
 
-  it("announces which state semantic screening is in, at startup", () => {
-    // "Is it on?" must be answerable from a log line rather than by reading a composition root.
-    expect(gateway).toContain("semantic injection screening ACTIVE");
-    expect(gateway).toContain("semantic injection screening OFF");
+  it("reports its Layer 2 state on the READY line — where the parent reads, not into a discarded tail", () => {
+    // Written to stderr, this state was drained into a tail the spawner only surfaces when the
+    // spawn FAILS, so a successful boot threw the answer away. "Is it on?" must be answerable from
+    // a log line rather than by reading a composition root.
+    expect(gateway).toContain("layer2=");
+    expect(gateway).toContain("GATEWAY_READY");
   });
 });

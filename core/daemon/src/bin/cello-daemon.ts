@@ -100,6 +100,16 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
       },
     });
     logger.info("security.gateway.spawned", { pid: sidecar.pid ?? -1, socketPath, ...(correlationId !== undefined ? { correlationId } : {}) });
+    // WHETHER THE SEMANTIC LAYER IS RUNNING, in the daemon log, at every boot.
+    //
+    // `mode: "enforcing"` on the next line says the gateway is REACHABLE, not that it judges
+    // meaning — and for every shipped build before daemon 0.0.181 it judged none, while reporting
+    // exactly that. This is the line that makes the difference legible, and `off:` carries the
+    // reason so the answer to "why" is in the same place as the answer to "whether".
+    logger.info("security.gateway.layer2", {
+      state: sidecar.layer2,
+      ...(correlationId !== undefined ? { correlationId } : {}),
+    });
     sidecar.process.once("exit", (code, signal) => {
       // No auto-restart (M9B-D14). Every subsequent screen fails closed with a real cause; this
       // line is how the operator learns the screening process died rather than inferring it from

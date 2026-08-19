@@ -25,6 +25,15 @@ export interface SpawnGatewayOptions {
 }
 
 export interface SpawnedGateway {
+  /**
+   * What the child reported about Layer 2 on its ready line — `active`, or `off:<reason>`.
+   *
+   * Carried out of the child DELIBERATELY. It used to be written to the gateway's stderr, which is
+   * drained into a tail this module only surfaces when the spawn FAILS — so on a successful boot
+   * the state was captured and discarded, and "is semantic screening on?" had no answer anywhere.
+   * The parent logs this; that log line is the whole point.
+   */
+  readonly layer2: string;
   readonly socketPath: string;
   readonly pid: number | undefined;
   readonly process: ChildProcess;
@@ -56,6 +65,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
   });
 
   const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+  let layer2 = "unreported";
 
   // DRAIN the child's stderr and keep the tail. Two reasons, and the first one is the whole point:
   // every refusal the gateway can produce — a missing key file, a locked store, a leftover
@@ -87,11 +97,17 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
     }, readyTimeoutMs);
 
     const onStdout = (chunk: Buffer) => {
-      if (chunk.toString("utf8").includes(GATEWAY_READY_TOKEN)) {
+      const text = chunk.toString("utf8");
+      if (text.includes(GATEWAY_READY_TOKEN)) {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         child.stdout?.off("data", onStdout);
+        // ABSENT IS NOT FINE, and it is not "off" either: an older child that does not report at
+        // all is a different fact from one reporting Layer 2 disabled, and calling it `off` would
+        // invent a state nobody observed.
+        const m = /layer2=(\S+)/.exec(text);
+        layer2 = m?.[1] ?? "unreported";
         resolve();
       }
     };
@@ -109,6 +125,7 @@ export async function spawnGatewaySidecar(opts: SpawnGatewayOptions): Promise<Sp
   });
 
   return {
+    layer2,
     socketPath: opts.socketPath,
     pid: child.pid,
     process: child,

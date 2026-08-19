@@ -143,3 +143,41 @@ describe("installModel — unpinned digests are a decision, not a default", () =
     expect(res).toMatchObject({ installed: false, needsConsent: true });
   });
 });
+
+/**
+ * The state must reach the PARENT, not the void.
+ *
+ * The first cut wrote ACTIVE/OFF to the gateway's stderr, which `spawnGatewaySidecar` drains into a
+ * tail it only surfaces when the spawn FAILS. So on a successful boot the answer to "is semantic
+ * screening on?" was captured and thrown away — the exact shape of the defect this unit exists to
+ * fix, reproduced in its own fix. It rides the ready line now, and the daemon logs it.
+ */
+describe("the gateway reports its Layer 2 state to whoever started it", () => {
+  it("puts the state on the ready line, where the parent already reads", async () => {
+    const { spawnGatewaySidecar } = await import("../spawn.js");
+    const { randomBytes } = await import("node:crypto");
+    const { writeFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const pkgRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const dir = await mkdtemp(join(tmpdir(), "cello-sock-"));
+    const keyPath = join(dir, "store.key");
+    await writeFile(keyPath, randomBytes(32), { mode: 0o600 });
+    const sidecar = await spawnGatewaySidecar({
+      socketPath: join(dir, "g.sock"),
+      // The BUILT bin: this test runs from source, where the spawner's default entry does not exist.
+      entryPath: join(pkgRoot, "dist", "bin", "cello-gateway.js"),
+      env: {
+        CELLO_GATEWAY_MODEL_DIR: join(dir, "no-model-here"),
+        CELLO_GATEWAY_STORE_DB: join(dir, "gateway.db"),
+        CELLO_GATEWAY_STORE_KEY_FILE: keyPath,
+      },
+    });
+    try {
+      // No model on disk, so OFF — and the REASON travels with it, because "why" and "whether"
+      // belong in the same place.
+      expect(sidecar.layer2).toMatch(/^off:/);
+    } finally {
+      await sidecar.stop();
+    }
+  }, 30_000);
+});
