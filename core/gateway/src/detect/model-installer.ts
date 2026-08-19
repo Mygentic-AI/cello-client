@@ -59,6 +59,17 @@ export interface InstallOptions {
   dir: string;
   /** The operator's explicit consent to download ~568 MB. Without it, nothing is fetched. */
   consent: boolean;
+  /**
+   * DOD-DOC-SCREEN-CLASSIFIER-1. Every file in the manifest currently carries `sha256: null` — the
+   * digests were stripped by this environment's secret redaction and never restored out-of-band —
+   * so integrity rests on the committed SIZE and on the transport, and the manifest pins a moving
+   * `revision: "main"` rather than a commit. Installing 568 MB of executable model weights from a
+   * third-party mirror under those terms is a decision, so it must be TAKEN, not defaulted into.
+   *
+   * Defaults to refusing, which is the tightest value — the same posture the gateway's config store
+   * takes for every policy key. Set true only with that trade in view.
+   */
+  allowUnpinnedDigests?: boolean;
   /** Injectable fetch (defaults to global fetch) — tests pass a fake; production uses the network. */
   fetchImpl?: typeof fetch;
   onProgress?: (file: string, index: number, total: number) => void;
@@ -72,6 +83,19 @@ export interface InstallOptions {
 export async function installModel(opts: InstallOptions): Promise<InstallResult> {
   if (await isModelInstalled(opts.dir)) return { installed: true };
   if (!opts.consent) return { installed: false, needsConsent: true };
+
+  const unpinned = DEBERTA_MODEL.files.filter((f) => !f.sha256).map((f) => f.path);
+  if (unpinned.length > 0 && opts.allowUnpinnedDigests !== true) {
+    return {
+      installed: false,
+      error:
+        `refusing to install: ${unpinned.length} of ${DEBERTA_MODEL.files.length} model files carry no ` +
+        `pinned SHA-256 (${unpinned.slice(0, 3).join(", ")}${unpinned.length > 3 ? ", …" : ""}), and the ` +
+        `manifest pins revision "${DEBERTA_MODEL.revision}" rather than a commit. Size and HTTPS are the ` +
+        `only integrity left, which does not stop a compromised mirror swapping the weights. Restore the ` +
+        `digests, or pass allowUnpinnedDigests to take that risk deliberately.`,
+    };
+  }
 
   const doFetch = opts.fetchImpl ?? fetch;
   const total = DEBERTA_MODEL.files.length;

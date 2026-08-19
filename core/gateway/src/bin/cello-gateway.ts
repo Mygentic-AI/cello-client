@@ -21,6 +21,10 @@ import { GatewayConfigStore } from "../config/config-store.js";
 import { stderrStoreEventSink } from "../store/encrypted-db.js";
 import { GatewayRecordStore, type RecordDisposition } from "../records/record-store.js";
 import { createHash } from "node:crypto";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { InjectionScanner } from "../detect/injection-scanner.js";
+import { loadInjectionClassifier } from "../detect/injection-classifier-onnx.js";
 import type { ScreenVerdict } from "../types.js";
 
 /**
@@ -108,7 +112,27 @@ async function main(): Promise<void> {
     ? { maxPerWindow: rateMax, windowMs: rateWindowMs }
     : undefined;
   const outbound = new OutboundScreener({ piiWhitelist, autonomousOverride, ...(rateLimit ? { rateLimit } : {}) });
-  const inbound = new InboundScreener();
+  // DOD-DOC-SCREEN-CLASSIFIER-1 — Layer 2, wired at last.
+  //
+  // This line was `new InboundScreener()` with no arguments, so the scanner fell back to its null
+  // classifier, reported itself unavailable, and the semantic check short-circuited on every
+  // inbound frame in every shipped build — while the gateway announced mode `enforcing`. Layer 1
+  // (the deterministic sanitizer) and Layer 3 (the pattern matcher) were live throughout; the layer
+  // that judges MEANING was not, and nothing said so.
+  //
+  // The state is ANNOUNCED either way, on stderr, at startup. "Is semantic screening on?" must be
+  // answerable by reading a log line rather than by reading this file — that is the whole reason
+  // the gap survived as long as it did.
+  const modelDir = process.env["CELLO_GATEWAY_MODEL_DIR"] || join(homedir(), ".cello", "gateway-model");
+  const load = await loadInjectionClassifier(modelDir);
+  if (load.classifier) {
+    process.stderr.write(`cello-gateway: semantic injection screening ACTIVE (model at ${modelDir})\n`);
+  } else {
+    process.stderr.write(`cello-gateway: semantic injection screening OFF — ${load.reason}\n`);
+  }
+  const inbound = new InboundScreener(
+    load.classifier ? { injectionScanner: new InjectionScanner(load.classifier) } : {},
+  );
 
   // M9-REC-001 (INV-4): the gateway records what it did to EVERY message, hash-chained for
   // tamper-evidence, in the same encrypted store as the config (M9B-D9). The verdict's disposition
