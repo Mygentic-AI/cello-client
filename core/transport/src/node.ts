@@ -382,6 +382,7 @@ class CelloNodeImpl implements CelloNode {
     encryption: string | undefined;
     remoteAddr?: string;
     status: string;
+    muxerStatus?: string;
   }> {
     return this.#libp2p.getConnections().map((c) => ({
       peerId: c.remotePeer.toString(),
@@ -395,6 +396,22 @@ class CelloNodeImpl implements CelloNode {
       // whenever a registered connection reads `open` here, which is what makes a plain redial a
       // no-op against a dead muxer.
       status: c.status,
+      // DOD-M12-CONN-MUXER-OBSERVE-1: the OTHER state, and the one the failure actually lives in.
+      //
+      // `status` above is the socket. The muxer is the layer that carries data, it has its OWN
+      // status, and `newStream` checks the muxer FIRST — so a connection can read `status: "open"`
+      // while every stream on it fails with `The connection muxer is "closed" and not "open"`. That
+      // combination is the entire M12 Tier P5 defect, and until this field existed it was invisible:
+      // the error returns before the socket is examined, so neither value alone identifies it.
+      //
+      // READ OFF THE RUNTIME OBJECT, deliberately narrowly. libp2p does not put `muxer` on its
+      // public `Connection` type (verified in @libp2p/interface 3.2.2), but the implementation class
+      // carries it — `connection.js` guards on `this.muxer.status` to throw the very error above.
+      // Optional, and `undefined` when absent: if a future libp2p moves it, this must go MISSING
+      // rather than silently reporting "open" for a muxer nobody looked at, which would recreate
+      // exactly the blindness the field removes.
+      // OWED: drop the cast when libp2p exposes muxer state on the public type.
+      muxerStatus: (c as unknown as { muxer?: { status?: string } }).muxer?.status,
       // DOD-M12B-RESPONDER-ADDR-1: the address this peer is reachable at, which the RESPONDER
       // otherwise never learns. It dialled nobody, so after an interruption it has nothing to dial
       // back with — measured live 2026-08-18, `session.transport.redial.unavailable`, "this side

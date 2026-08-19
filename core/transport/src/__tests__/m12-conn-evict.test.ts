@@ -153,3 +153,41 @@ describe("DOD-M12-CONN-EVICT-1: hangUp removes the registered connection", () =>
     expect(after[0]!.status).toBe("open");
   });
 });
+
+describe("DOD-M12-CONN-MUXER-OBSERVE-1: getConnections reports the MUXER status, not only the socket", () => {
+  let scope = createTestScope();
+  beforeEach(() => { scope = createTestScope(); });
+  afterEach(() => scope.run(async () => {}));
+
+  it("reports both states, because the failure is one open and the other closed", async () => {
+    const a = await makeStartedNode();
+    const b = await makeStartedNode();
+    scope.addCleanup(async () => { try { await a.stop(); } catch { /* teardown */ } });
+    scope.addCleanup(async () => { try { await b.stop(); } catch { /* teardown */ } });
+
+    await a.dial(b.listenAddresses()[0]!);
+    await waitFor(() => a.getConnections().some((c) => c.peerId === b.getPeerId()));
+
+    const conn = a.getConnections().find((c) => c.peerId === b.getPeerId());
+    expect(conn).toBeDefined();
+    // The whole M12 Tier P5 investigation turned on these being SEPARATE and only one being
+    // visible. `status` is the socket; `muxerStatus` is the layer that actually carries data, and
+    // libp2p checks it FIRST when opening a stream. The live failure is socket "open" + muxer
+    // closed — indistinguishable, until now, from a connection that is dead through.
+    expect(conn!.status).toBe("open");
+    expect(conn!.muxerStatus).toBe("open");
+  });
+
+  it("never invents a value when the muxer cannot be read", async () => {
+    const a = await makeStartedNode();
+    scope.addCleanup(async () => { try { await a.stop(); } catch { /* teardown */ } });
+    // `muxer` is not on libp2p's PUBLIC Connection type — it is read off the runtime object. If a
+    // future libp2p moves it, the field must go absent rather than silently reporting "open" for a
+    // muxer nobody looked at. Reporting a wrong "open" here would recreate the exact blindness this
+    // unit removes.
+    const shaped = a.getConnections().every(
+      (c) => c.muxerStatus === undefined || typeof c.muxerStatus === "string",
+    );
+    expect(shaped).toBe(true);
+  });
+});

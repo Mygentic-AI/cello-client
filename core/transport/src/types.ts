@@ -238,6 +238,13 @@ export interface CelloNode {
     encryption: string | undefined;
     remoteAddr?: string;
     status: string;
+    /**
+     * The MUXER's status — a different thing from `status` above, and the one the M12 Tier P5
+     * failure lives in. A connection can read `status: "open"` while every stream on it fails,
+     * because `newStream` checks the muxer first. `undefined` when it cannot be read; never
+     * defaulted, because inventing "open" here would recreate the blindness it exists to remove.
+     */
+    muxerStatus?: string;
   }>;
 
   /**
