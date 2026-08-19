@@ -26,11 +26,16 @@ async function fakeModelDir(): Promise<string> {
 }
 
 describe("loadInjectionClassifier — never a silent null", () => {
-  it("says the model is absent, and names the command that installs it", async () => {
+  it("says the model is absent, and does NOT name a command that does not exist", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cello-empty-"));
     const load = await loadInjectionClassifier(dir);
     expect(load.classifier).toBeNull();
-    expect(load.reason).toContain("install-model");
+    expect(load.reason).toContain("OFF");
+    // The installer has no CLI caller yet. Pointing at `cello gateway install-model` would be the
+    // same defect this branch fixed in cello_doc_remove's description: guidance naming a verb
+    // nobody built. It names the environment variable an operator can actually set.
+    expect(load.reason).not.toContain("install-model");
+    expect(load.reason).toContain("CELLO_GATEWAY_MODEL_DIR");
   });
 
   it("says the runtime is missing, and distinguishes that from a missing model", async () => {
@@ -40,7 +45,7 @@ describe("loadInjectionClassifier — never a silent null", () => {
     // The two states need different answers: one is "download the weights", the other is "this
     // build cannot run them". Collapsing them sends the operator to the wrong fix.
     expect(load.reason).toContain("runtime");
-    expect(load.reason).not.toContain("install-model");
+    expect(load.reason).not.toContain("CELLO_GATEWAY_MODEL_DIR");
   });
 
   it("refuses a runtime that does not export what it expects, rather than guessing", async () => {
@@ -57,6 +62,28 @@ describe("loadInjectionClassifier — never a silent null", () => {
     );
     expect(load.classifier).toBeNull();
     expect(load.reason).toContain("corrupt onnx");
+  });
+});
+
+describe("the model never reaches the network", () => {
+  it("sets the library's global remote-model switch AND the per-call option", async () => {
+    // SI-001 / INV-1 is "no network call during inference". That rested on one option, on one call,
+    // in a library whose default is to fetch from the hub — and no test read the options object at
+    // all, so deleting it left every gateway test green.
+    const dir = await fakeModelDir();
+    const env: Record<string, unknown> = {};
+    let opts: Record<string, unknown> | undefined;
+    await loadInjectionClassifier(dir, () =>
+      Promise.resolve({
+        env,
+        pipeline: (_task: string, _model: string, o?: Record<string, unknown>) => {
+          opts = o;
+          return Promise.resolve(() => Promise.resolve([{ label: "SAFE", score: 1 }]));
+        },
+      }),
+    );
+    expect(env["allowRemoteModels"]).toBe(false);
+    expect(opts?.["local_files_only"]).toBe(true);
   });
 });
 

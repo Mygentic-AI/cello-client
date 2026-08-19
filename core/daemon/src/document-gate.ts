@@ -344,7 +344,7 @@ export class DocumentGate {
     const afterText = shadow.getText("content").toString();
     const afterKeys = new Map(Object.entries(shadow.getMap("data").toJSON() as Record<string, unknown>));
     const diff: ProjectedDiff = {
-      inserted: insertedText(beforeText, afterText),
+      inserted: insertedText(update),
       deletedChars: deletedCount(beforeText, afterText),
       changedKeys: [...new Set([...beforeKeys.keys(), ...afterKeys.keys()])].filter(
         (k) => JSON.stringify(beforeKeys.get(k)) !== JSON.stringify(afterKeys.get(k)),
@@ -480,12 +480,50 @@ export class DocumentGate {
   }
 }
 
-function insertedText(before: string, after: string): string {
-  if (after.length <= before.length) return "";
-  let from = 0;
-  while (from < before.length && before[from] === after[from]) from++;
-  const tail = before.length - from;
-  return after.slice(from, after.length - tail);
+/**
+ * Every string this update INSERTS, read from the update's own insert set.
+ *
+ * The previous implementation compared the projected text before and after and returned the span
+ * between a common prefix and a fixed-length tail. Measured, that both MISSES and OVER-INCLUDES,
+ * and screening consumes this value:
+ *
+ *   - a net-SHRINKING update returned `""` — so a peer deleting 500 characters while inserting a
+ *     200-character payload was screened by nothing at all;
+ *   - inserting one character at position 0 of a long document returned that document's own opening
+ *     prose and EXCLUDED a payload appended at the end;
+ *   - and it read `getText("content")` only, so for a `json` document — whose content lives in the
+ *     map root — it was permanently `""`. The gate's `append_only` rule already carries this exact
+ *     lesson in its own comment; the fix was applied there and not here.
+ *
+ * Reading the update's insert set answers the real question and is root- and type-agnostic, exactly
+ * as `countDeletions` is for the delete set. Order is not meaningful and is not relied on: the
+ * consumer scans for offending substrings, so a separator between runs is enough to stop two
+ * adjacent inserts fusing into a marker neither one contains.
+ */
+function insertedText(update: Uint8Array): string {
+  try {
+    const { structs } = Y.decodeUpdate(update);
+    const parts: string[] = [];
+    for (const st of structs) {
+      const content = (st as { content?: { str?: string; getContent?: () => unknown[] } }).content;
+      if (content === undefined) continue;
+      if (typeof content.str === "string") { parts.push(content.str); continue; }
+      // A map/array insert carries JS values rather than a string run. Anything a reader could read
+      // as text counts — a json document's content is exactly this shape.
+      if (typeof content.getContent === "function") {
+        for (const v of content.getContent()) {
+          if (typeof v === "string") parts.push(v);
+          else if (v !== null && typeof v === "object") parts.push(JSON.stringify(v));
+        }
+      }
+    }
+    return parts.join("\n");
+  } catch {
+    // Undecodable here means the malformed check upstream already refused it. Returning "" would
+    // silently skip screening, so this must never be the path a real update takes — and it is not:
+    // `Y.applyUpdate` has already succeeded on the shadow by the time this runs.
+    return "";
+  }
 }
 
 function deletedCount(before: string, after: string): number {

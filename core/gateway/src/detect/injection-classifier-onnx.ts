@@ -60,7 +60,12 @@ export async function loadInjectionClassifier(
   if (!(await isModelInstalled(modelDir))) {
     return {
       classifier: null,
-      reason: `no model at ${modelDir} — run 'cello gateway install-model' to enable semantic injection screening`,
+      // NAMES WHAT EXISTS. Pointing at a command nobody built is the same defect this branch fixed in
+    // cello_doc_remove's tool description; the installer has no CLI caller yet, so say so.
+    reason:
+      `no model at ${modelDir} — semantic injection screening is OFF. The weights are not fetched ` +
+      `by any command yet (DOD-DOC-SCREEN-CLASSIFIER-1 owes one); set CELLO_GATEWAY_MODEL_DIR to a ` +
+      `directory holding them to enable it`,
     };
   }
 
@@ -75,6 +80,16 @@ export async function loadInjectionClassifier(
       classifier: null,
       reason: `the model is installed but its runtime (${RUNTIME_MODULE}) is not: ${err instanceof Error ? err.message : String(err)}`,
     };
+  }
+
+  // THE GLOBAL SWITCH, not just the per-call option. "No network call during inference" (SI-001 /
+  // INV-1) rested entirely on `local_files_only` below — one option, on one call, in a library whose
+  // default is to fetch from the hub. `allowRemoteModels = false` is the library's own kill switch
+  // and it is what makes the property hold rather than a comment claiming it does.
+  const env = (mod as { env?: Record<string, unknown> }).env;
+  if (env && typeof env === "object") {
+    env["allowRemoteModels"] = false;
+    env["allowLocalModels"] = true;
   }
 
   const factory = (mod as { pipeline?: PipelineFactory }).pipeline;

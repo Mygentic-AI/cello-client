@@ -51,6 +51,9 @@ import { profileViolation } from "./document-profile.js";
 /** Named so a refusal can say which rule fired without the sender parsing prose (§16.7-6). */
 export const SCREEN_RULE_ID = "document_content_screen";
 
+/** Named separately so a refusal says WHICH screen refused — the gateway's, not this module's. */
+export const SEMANTIC_RULE_ID = "document_content_semantic_screen";
+
 /** Named separately so a refusal says whether the AGREED profile or the default floor refused. */
 export const PROFILE_RULE_ID = "document_content_profile";
 

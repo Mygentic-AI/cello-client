@@ -51,3 +51,16 @@ describe("M9-IN-002 InjectionScanner — verdict logic + degradation", () => {
     expect((await new InjectionScanner(stub(-0.2)).scan("x")).score).toBe(0);
   });
 });
+
+describe("a classifier fault degrades Layer 2 rather than jamming the inbound path", () => {
+  it("reports unavailable when the model throws, instead of propagating", async () => {
+    // An uncaught throw reaches the gateway's outer catch as `screen_error` — a block with no
+    // `terminal`, which the daemon reads as TRANSIENT and redelivers forever, on a condition that
+    // is permanent and identical on every retry. The production classifier throws deliberately on
+    // a label set it does not recognise, so this path is reachable.
+    const scanner = new InjectionScanner({
+      classify: () => Promise.reject(new Error("classifier returned no INJECTION or SAFE label")),
+    });
+    await expect(scanner.scan("anything")).resolves.toEqual({ available: false });
+  });
+});

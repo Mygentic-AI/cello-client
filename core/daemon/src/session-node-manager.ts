@@ -5845,12 +5845,19 @@ export class SessionNodeManager {
     // verdict means the content is NOT delivered to the agent: it is not held, not buffered, and
     // no leaf is appended — the message stays un-acked so the sender's TTF/park/retry redelivers
     // it once the gateway is reachable again (DB-001 fail-closed: hold, never expose ungated).
-    // DOD-DOC-SCREEN-CLASSIFY-1: a DOCUMENT frame skips the gateway's content screen. Every content
-    // step is inert or worse for one — the sanitizer's rewrites are deliberately discarded by the
-    // funnel below (rewriting a signed envelope destroys it), and language/injection judge a UTF-8
-    // decode of binary. What screens document CONTENT is the gate + screenText, in-process, on the
-    // projected readable text — a layer that cannot be "down", so nothing fail-closed is lost, and
-    // size is bounded twice on this path (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
+    // DOD-DOC-SCREEN-CLASSIFY-1: a DOCUMENT frame skips the gateway's content screen HERE, and is
+    // screened later on text instead of bytes. Every content step is inert or worse for one at this
+    // point — the sanitizer's rewrites are deliberately discarded by the funnel below (rewriting a
+    // signed envelope destroys it), and language/injection judge a UTF-8 decode of binary. Size stays
+    // bounded twice (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
+    //
+    // WHAT IS TRADED, stated plainly: the screen skipped here is fail-CLOSED (a gateway that is down
+    // returns a transient block, and the frame is held un-acked for redelivery). Its replacement —
+    // the gate's in-process rules, then the semantic screen at `document-inbound.ts` step 7a-bis —
+    // is fail-OPEN on that same condition, because holding document convergence hostage to an
+    // optional layer breaks a layer that degrades by design. That degradation is LOGGED BY NAME
+    // there (`document.inbound.screen.unavailable`); it is not silent, and it is not free.
+    //
     // Logged by name so the skip is visible rather than assumed.
     const isDocFrame = this.#isDocumentFrame?.(content) === true;
     if (isDocFrame) {

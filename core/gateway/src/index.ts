@@ -19,7 +19,7 @@ export type {
 // The composed inbound/outbound screens (the gateway runs these; M9-FEED-001 renders the verdict).
 export { OutboundScreener } from "./screen/outbound.js";
 export type { OutboundVerdict, OutboundScreenerOptions, OutboundScreenContext } from "./screen/outbound.js";
-export { InboundScreener } from "./screen/inbound.js";
+export { InboundScreener, INBOUND_INJECTION_BLOCKED } from "./screen/inbound.js";
 export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js";
 
 // The RE2 linear-time regex engine (native re2 preferred, re2-wasm fallback) + the injection

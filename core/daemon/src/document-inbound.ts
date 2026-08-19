@@ -41,6 +41,7 @@ import type { DocumentStore, DocumentProperties } from "./document-store.js";
 import type { DocumentEngine } from "./document-engine.js";
 import type { DocumentGate } from "./document-gate.js";
 import type { DocumentRejections } from "./document-rejection.js";
+import { SEMANTIC_RULE_ID } from "./document-screen.js";
 import type { Logger } from "./types.js";
 
 export type InboundResult =
@@ -91,7 +92,7 @@ export interface DocumentInboundDeps {
    */
   screenProjected?: (
     text: string,
-    ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+    ctx: { ownerAgentId: string; documentId: string; senderAgentId: string; correlationId?: string },
   ) => Promise<{ block: boolean; reason?: string }>;
   engine: DocumentEngine;
   gate: DocumentGate;
@@ -601,6 +602,7 @@ export class DocumentInbound {
     // whole document would refuse a peer's edit for prose that was already admitted days ago.
     const semantic = this.#d.screenProjected && verdict.projectedDiff.inserted.length > 0
       ? await this.#d.screenProjected(verdict.projectedDiff.inserted, {
+          ownerAgentId,
           documentId: env.document_id,
           senderAgentId: env.sender_agent_id,
           ...(correlationId !== undefined ? { correlationId } : {}),
@@ -611,8 +613,15 @@ export class DocumentInbound {
       // gets, so the peer's chain stays bridgeable and they are told once, by name.
       const rejection = await this.#d.rejections.reject(ownerAgentId, env.document_id, {
         rejectedEnvelopeHash: envelopeHash,
-        quarantined: env.update,
+        // COPIED, and copied BEFORE the awaits above. The caller's buffer may be a pooled network
+        // read; `reject()` copies too, but by then a gateway round trip and a signing call have
+        // both happened, and DOD-DOC-REJECT-1 would hash bytes that are no longer the ones refused
+        // — into a 0x05 leaf, silently. The gate's own quarantine copies for this reason.
+        quarantined: new Uint8Array(env.update),
         reason: "document_content_injection",
+        // WHICH screen refused. Dropping it leaves an operator unable to see what ruled, which is
+        // exactly what document-rejection.ts's header says a refusal must never do.
+        rule: SEMANTIC_RULE_ID,
         ...(semantic.reason !== undefined ? { detail: semantic.reason } : {}),
         senderAgentId: env.sender_agent_id,
         rejectedDocPrevHash: env.doc_prev_hash,

@@ -897,3 +897,90 @@ describe("the semantic screen sees readable text, and refuses rather than rewrit
     expect(calls).toBe(0);
   });
 });
+
+/**
+ * Review findings on the semantic screen (Entry 65) — the two proven bypasses.
+ *
+ * `projectedDiff.inserted` used to be a common-prefix / fixed-length-tail window over the projected
+ * TEXT ROOT. Measured, that both missed and over-included, and screening consumes it. These pin the
+ * shapes that got through.
+ */
+describe("what counts as INSERTED text — the shapes that used to slip past", () => {
+  it("screens a NET-SHRINKING update — deleting more than you insert is not a free pass", async () => {
+    // The old window returned "" whenever the document got shorter, so a peer deleting 500
+    // characters while inserting a payload was screened by nothing at all.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    // Seed a long document, then an update that removes most of it and adds a short payload.
+    const base = new Y.Doc();
+    base.clientID = PEER_CLIENT;
+    base.getText("content").insert(0, "x".repeat(400));
+    const seed = Y.encodeStateAsUpdate(base);
+    const first = envelope({ update: seed });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(first), NOW);
+    seen.length = 0;
+
+    const shrink = new Y.Doc();
+    shrink.clientID = PEER_CLIENT + 1;
+    Y.applyUpdate(shrink, seed);
+    shrink.getText("content").delete(0, 390);
+    shrink.getText("content").insert(shrink.getText("content").length, "PAYLOAD-HERE");
+    const delta = Y.diffUpdate(Y.encodeStateAsUpdate(shrink), Y.encodeStateVector(base));
+
+    const r2 = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ update: delta, doc_prev_hash: documentEnvelopeHash(first), sender_client_id: PEER_CLIENT + 1 }),
+      ),
+      NOW,
+    );
+    if (seen.length === 0) throw new Error(`second receive: ${JSON.stringify(r2)}`);
+    expect(seen.join(" ")).toContain("PAYLOAD-HERE");
+  });
+
+  it("screens text appended AFTER an edit at the front — one character no longer hides the rest", async () => {
+    // The old window anchored on a common prefix and a fixed tail, so inserting at position 0
+    // returned the document's own opening prose and EXCLUDED a payload added at the end.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    const d = new Y.Doc();
+    d.clientID = PEER_CLIENT;
+    d.getText("content").insert(0, "ordinary opening prose ".repeat(20));
+    const seed = Y.encodeStateAsUpdate(d);
+    const first = envelope({ update: seed });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(first), NOW);
+    seen.length = 0;
+
+    const two = new Y.Doc();
+    two.clientID = PEER_CLIENT + 2;
+    Y.applyUpdate(two, seed);
+    two.getText("content").insert(0, "X");
+    two.getText("content").insert(two.getText("content").length, "TAIL-PAYLOAD");
+    const delta = Y.diffUpdate(Y.encodeStateAsUpdate(two), Y.encodeStateVector(d));
+
+    await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ update: delta, doc_prev_hash: documentEnvelopeHash(first), sender_client_id: PEER_CLIENT + 2 }),
+      ),
+      NOW,
+    );
+    expect(seen.join(" ")).toContain("TAIL-PAYLOAD");
+  });
+
+  it("screens content written to the MAP root — a json document is not exempt", async () => {
+    // `inserted` read getText("content") only, so for a json document — whose content lives in the
+    // map root — it was permanently empty and NOTHING screened it, semantic or denylist.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    const d = new Y.Doc();
+    d.clientID = PEER_CLIENT;
+    d.getMap("data").set("note", "MAP-PAYLOAD");
+    await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ update: Y.encodeStateAsUpdate(d) })),
+      NOW,
+    );
+    expect(seen.join(" ")).toContain("MAP-PAYLOAD");
+  });
+});
