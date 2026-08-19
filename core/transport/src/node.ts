@@ -326,8 +326,14 @@ class CelloNodeImpl implements CelloNode {
     try {
       peerId = peerIdFromString(peerIdStr);
     } catch {
+      // `invalid_peer_id`, matching hangUp — NOT `connection_lost`, which it used to be. A string
+      // that does not parse is a configuration fault, and calling it a lost connection sends the
+      // caller into connection repair for it: the relay's evict-and-redial path now fires on
+      // `connection_lost`, so a typo'd directory peer id produced an eviction attempt and an
+      // operator-facing reading blaming a stale handle. Callers that genuinely want "the link is
+      // unusable" still get `connection_lost` from `no_connection` and `mapStreamError` below.
       throw {
-        reason: "connection_lost",
+        reason: "invalid_peer_id",
         peerId: peerIdStr,
         message: `Invalid peer ID: ${peerIdStr}`,
       };

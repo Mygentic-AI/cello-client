@@ -8310,7 +8310,14 @@ export class SessionNodeManager {
       // longer exists, which is exactly the silent unreachability we are hunting. The
       // live connection to the relay is the honest signal: no connection, no relay,
       // no reservation.
-      const stillConnected = sr.node.getConnections().some((c) => c.peerId === sr.relayPeerId);
+      //
+      // AND IT MUST BE OPEN. `getConnections()` returns libp2p's registry, which keeps a connection
+      // listed while it is closing and after its muxer has died — the state the whole M12 Tier P5
+      // investigation turned on. Without the status check a registered corpse reads as "still
+      // connected", the rebuild never fires, and the agent silently stops being reachable while
+      // this loop reports it healthy. The comment above claimed liveness; only this tests it.
+      const stillConnected = sr.node.getConnections()
+        .some((c) => c.peerId === sr.relayPeerId && c.status === "open");
       const stillAdvertising = sr.node.listenAddresses().some((a) => a.includes("/p2p-circuit"));
       if (stillConnected && stillAdvertising) continue;
 
