@@ -825,6 +825,13 @@ export class SessionNodeManager {
         correlationId?: string,
       ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string })
     | null = null;
+  /**
+   * DOD-DOC-SCREEN-CLASSIFY-1: the classify-only half of the hook above — is this a document
+   * frame, deciding nothing else. Injected together with it so the two cannot disagree about what
+   * a document frame is. Null means every frame takes the full inbound screen, exactly as before
+   * the document layer existed.
+   */
+  #isDocumentFrame: ((content: Uint8Array) => boolean) | null = null;
 
   // A send is NOT fire-and-forget. After a content_frame is delivered over the direct session
   // channel, the sender arms a TTF timer and waits for an unsigned, transport-authenticated
@@ -2603,8 +2610,10 @@ export class SessionNodeManager {
       senderPubkey: string,
       correlationId?: string,
     ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string },
+    classifyOnly?: (content: Uint8Array) => boolean,
   ): void {
     this.#onDocumentFrame = cb;
+    this.#isDocumentFrame = classifyOnly ?? null;
   }
 
   /**
@@ -5836,12 +5845,29 @@ export class SessionNodeManager {
     // verdict means the content is NOT delivered to the agent: it is not held, not buffered, and
     // no leaf is appended — the message stays un-acked so the sender's TTF/park/retry redelivers
     // it once the gateway is reachable again (DB-001 fail-closed: hold, never expose ungated).
-    const inboundVerdict = await this.#securityGateway.screenInbound(content, {
-      direction: "inbound",
-      agentName,
-      sessionId,
-      correlationId,
-    });
+    // DOD-DOC-SCREEN-CLASSIFY-1: a DOCUMENT frame skips the gateway's content screen. Every content
+    // step is inert or worse for one — the sanitizer's rewrites are deliberately discarded by the
+    // funnel below (rewriting a signed envelope destroys it), and language/injection judge a UTF-8
+    // decode of binary. What screens document CONTENT is the gate + screenText, in-process, on the
+    // projected readable text — a layer that cannot be "down", so nothing fail-closed is lost, and
+    // size is bounded twice on this path (MAX_DOCUMENT_FRAME_BYTES at classify, the gate's own cap).
+    // Logged by name so the skip is visible rather than assumed.
+    const isDocFrame = this.#isDocumentFrame?.(content) === true;
+    if (isDocFrame) {
+      this.#logger.info("session.content.screen.skipped_document_frame", {
+        sessionId,
+        agentName,
+        correlationId,
+      });
+    }
+    const inboundVerdict: Awaited<ReturnType<SecurityGatewayClient["screenInbound"]>> = isDocFrame
+      ? { disposition: "allow", content }
+      : await this.#securityGateway.screenInbound(content, {
+          direction: "inbound",
+          agentName,
+          sessionId,
+          correlationId,
+        });
     // M9 terminal-vs-transient split. A TERMINAL block (inboundVerdict.terminal) is a detector
     // rejecting the CONTENT itself — a confident non-allowlisted language (IN-003), a high-score
     // injection (IN-002), or an oversized payload (IN-001). The identical bytes would be rejected

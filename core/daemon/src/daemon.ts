@@ -91,6 +91,7 @@ import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
+import { isDocumentFrame } from "./document-frame-router.js";
 import { registerDocumentHandlers } from "./document-handlers.js";
 import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
@@ -3957,7 +3958,9 @@ async function startDaemonHoldingLock(
       return provider.sign(tbs);
     },
   });
-  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame);
+  // The classify-only half rides the same setter so the router and the ingest cannot disagree
+  // about what a document frame is (DOD-DOC-SCREEN-CLASSIFY-1).
+  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame, isDocumentFrame);
 
   // M14 / DOD-DOC-DELIVERY-2 — the outbound half, wired only now that INBOUND-2 is. The ordering
   // constraint on the DoD line is real and this is where it is honoured: a delivery worker with no

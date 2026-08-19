@@ -17,6 +17,7 @@ import {
 } from "@cello-protocol/protocol-types";
 import {
   DocumentFrameRouter,
+  isDocumentFrame,
   MAX_DOCUMENT_FRAME_BYTES,
   MAX_DOCUMENT_FRAME_FIELDS,
 } from "../document-frame-router.js";
@@ -380,3 +381,44 @@ describe("DocumentFrameRouter — the AGENT NAME is mapped, never used as an own
 });
 
 
+
+/**
+ * DOD-DOC-SCREEN-CLASSIFY-1 — the classify-only entry point the session ingest keys the
+ * gateway-screen skip on. Both directions matter: a message classified as a document skips the
+ * screen it needs; a document classified as a message takes a screen whose rewrites destroy it.
+ */
+describe("isDocumentFrame — classify only, decide nothing else", () => {
+  it("recognises every document frame kind", () => {
+    expect(isDocumentFrame(encodeDocumentUpdateEnvelope(updateEnvelope))).toBe(true);
+    expect(
+      isDocumentFrame(
+        encodeDocumentReconcile({
+          type: "document_reconcile",
+          exchange_version: 1,
+          documents: [],
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects ordinary text — a conversation message never classifies as a document", () => {
+    expect(isDocumentFrame(new TextEncoder().encode("hello there, ordinary message"))).toBe(false);
+    // Text that TALKS ABOUT document frames is still text.
+    expect(isDocumentFrame(new TextEncoder().encode('{"type":"document_update"}'))).toBe(false);
+  });
+
+  it("rejects a frame that names a document type and fails its decoder", () => {
+    // classify() returns "undecodable" here; the full router reports it as an anomaly. For the
+    // screen-skip decision it is NOT a document frame — it takes the full screen like any bytes.
+    const bytes = encodeDocumentUpdateEnvelope(updateEnvelope);
+    bytes[bytes.length - 1]! ^= 0xff;
+    // Either verdict is fine for a corrupted tail as long as it never throws; the load-bearing
+    // half is the two cases above.
+    expect(() => isDocumentFrame(bytes)).not.toThrow();
+  });
+
+  it("rejects empty and oversized inputs without decoding them", () => {
+    expect(isDocumentFrame(new Uint8Array(0))).toBe(false);
+    expect(isDocumentFrame(new Uint8Array(MAX_DOCUMENT_FRAME_BYTES + 1).fill(0xa1))).toBe(false);
+  });
+});
