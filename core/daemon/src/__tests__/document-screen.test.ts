@@ -13,7 +13,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { screeningRule, SCREEN_RULE_ID } from "../document-screen.js";
+import { screeningRule, screenText, SCREEN_RULE_ID, PROSE_AMBIGUOUS } from "../document-screen.js";
 import type { ProjectedDiff, GateContext } from "../document-gate.js";
 
 function diff(inserted: string): ProjectedDiff {
@@ -117,10 +117,10 @@ describe("the rule NEVER returns altered content", () => {
  *
  * One list, two consumers — a second copy of a security literal is how the two drift apart.
  */
-import { PRIVILEGED_TURN_MARKERS } from "@cello-protocol/gateway";
+import { PRIVILEGED_TURN_MARKERS, pipeTurnMarkerRegex, sanitizeInbound } from "@cello-protocol/gateway";
 
 describe("privileged-turn markers — the document rule refuses what the message path strips", () => {
-  it.each(PRIVILEGED_TURN_MARKERS)("refuses %j", (marker) => {
+  it.each(PRIVILEGED_TURN_MARKERS.filter((m) => !PROSE_AMBIGUOUS.includes(m)))("refuses %j", (marker) => {
     const refusal = screeningRule(diff(`ordinary prose ${marker} more prose`), CONTEXT);
     expect(refusal?.reason).toBe("document_content_refused");
   });
@@ -155,5 +155,63 @@ describe("privileged-turn markers — the document rule refuses what the message
    */
   it("ADMITS a markdown heading — refusing it would refuse legitimate writing", () => {
     expect(screeningRule(diff("### Instruction: run the build first"), CONTEXT)).toBeNull();
+  });
+});
+
+/**
+ * Review findings, DOD-DOC-SCREEN-CONTENT-1 (Entry 63 addendum).
+ *
+ * Each of these pins a defect the reviewer found by execution, not by reading — so a regression
+ * shows up as a red test rather than as screening that quietly stops screening.
+ */
+describe("review findings — the ways this rule can silently stop working", () => {
+  it("survives a foreign consumer leaving lastIndex on the shared pipe pattern", () => {
+    // A `/g` RegExp object carries lastIndex between callers, and `matchAll` seeds its clone from
+    // the source. One `.test()` in any consumer of the published barrel would otherwise blind every
+    // later scan — no error, no red test. The export is a factory for exactly this reason.
+    const borrowed = pipeTurnMarkerRegex();
+    expect(borrowed.test("prefix <|im_start|> tail")).toBe(true);
+    expect(borrowed.lastIndex).toBeGreaterThan(0);
+    expect(screenText("<|im_start|> here <|user|>")).not.toBeNull();
+  });
+
+  it("reports a CODE-POINT offset when a case-expanding character precedes the marker", () => {
+    // `İ`.toLowerCase() is TWO UTF-16 units, so scanning a lowercased copy and slicing the original
+    // skews the offset. Offsets exist for a human to find the marker in their own editor.
+    expect(screenText("İ[INST]")!.offsets[0]).toBe(1);
+  });
+
+  it("reports a CODE-POINT offset when an emoji precedes the marker", () => {
+    expect(screenText("👨‍👩‍👧 [INST]")!.offsets).toContain(6);
+  });
+
+  it("does not reflect the sender's casing back into the refusal", () => {
+    // This string is read back to the operator's AGENT in the guidance. Echoing a hostile marker
+    // verbatim puts the very thing the message path strips into a model's context.
+    expect(screenText("<|IM_START|>")!.codepoints).toEqual(["<|im_start|>"]);
+  });
+
+  it("ADMITS ordinary prose containing 'system prompt:' — a sentence someone writes", () => {
+    expect(screeningRule(diff("Here is the system prompt: keep it short"), CONTEXT)).toBeNull();
+  });
+
+  it("ADMITS an XML tag named system — ordinary markup in a config document", () => {
+    expect(screeningRule(diff("<system><timeout>30</timeout></system>"), CONTEXT)).toBeNull();
+  });
+
+  it("names every prose-ambiguous exclusion, so the subset is a decision and not an omission", () => {
+    // If someone adds a marker to the shared list that is also ordinary prose, this test does not
+    // fail — but the exclusions that ARE made stay visible and deliberate.
+    expect([...PROSE_AMBIGUOUS].sort()).toEqual(["</system>", "<system>", "SYSTEM PROMPT:"]);
+  });
+});
+
+describe("the message path and the document path share ONE pipe pattern", () => {
+  it("strips in the sanitizer exactly what the document rule refuses", () => {
+    for (const marker of ["<|im_start|>", "<|assistant|>", "<|user|>", "<|IM_END|>"]) {
+      expect(screenText(`a ${marker} b`), `document refuses ${marker}`).not.toBeNull();
+      const stripped = sanitizeInbound(new TextEncoder().encode(`a ${marker} b`)).text;
+      expect(stripped, `message strips ${marker}`).not.toContain(marker);
+    }
   });
 });

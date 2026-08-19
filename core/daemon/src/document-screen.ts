@@ -44,7 +44,7 @@
  * never agreed to cannot be used to smuggle a BIDI override.
  */
 
-import { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER } from "@cello-protocol/gateway";
+import { PRIVILEGED_TURN_MARKERS, pipeTurnMarkerRegex } from "@cello-protocol/gateway";
 import type { GateRule, ProjectedDiff, GateContext } from "./document-gate.js";
 import { profileViolation } from "./document-profile.js";
 
@@ -53,6 +53,16 @@ export const SCREEN_RULE_ID = "document_content_screen";
 
 /** Named separately so a refusal says whether the AGREED profile or the default floor refused. */
 export const PROFILE_RULE_ID = "document_content_profile";
+
+/**
+ * The one sentence every surface uses to say WHY, so the four call sites cannot describe the same
+ * rule differently. It names both halves: the earlier wording described only the invisible-character
+ * half, which reads as nonsense to an operator who was refused for `[INST]`.
+ */
+export const SCREEN_GUIDANCE =
+  "These are either invisible or direction-altering characters, which make what a reader SEES " +
+  "differ from what the document SAYS, or chat-template markers, which address a reader's model " +
+  "rather than the reader.";
 
 /**
  * Codepoints refused anywhere in inserted text.
@@ -93,11 +103,31 @@ const REFUSED_CODEPOINTS = new Set<number>([
  * pattern are ordinary markdown and ordinary prose in a technical document. Refusing those would
  * refuse legitimate writing, which is the false-positive class this whole rule exists to avoid.
  */
-const REFUSED_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS;
+/**
+ * The prose-ambiguous members of the shared list, excluded HERE and only here.
+ *
+ * A message gets these STRIPPED, which costs a reader a few characters. A document gets a hard
+ * REFUSAL, and these three are ordinary English and ordinary markup:
+ *   - `SYSTEM PROMPT:` — "Here is the system prompt: keep it short" is a sentence someone writes.
+ *   - `<system>` / `</system>` — a tag in any XML or config document.
+ * Refusing them would refuse legitimate writing, which is the false-positive class this whole rule
+ * exists to avoid, and the same objection that kept `### Instruction:` and `</s>` off the list.
+ * Excluded by name rather than by omission so the choice is visible and testable.
+ */
+export const PROSE_AMBIGUOUS: readonly string[] = ["SYSTEM PROMPT:", "<system>", "</system>"];
+
+const REFUSED_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS.filter(
+  (m) => !PROSE_AMBIGUOUS.includes(m),
+);
 
 /** `U+XXXX`, uppercase, at least four digits — the form a human reads and a machine can match. */
 function formatCodepoint(cp: number): string {
   return `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/** A literal is data, not a pattern — `[SYSTEM]` is a character class until it is escaped. */
+function escapeForRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -134,22 +164,26 @@ export function screenText(text: string): { codepoints: string[]; count: number;
   // Case-INSENSITIVE. `[CELLO Security Layer, Local]` is the same claim of provenance to a model as
   // the lowercase form, so a case-sensitive search leaves every marker bypassable by shift-key —
   // the sanitizer's own reasoning, which this path did not carry.
-  const haystack = text.toLowerCase();
+  //
+  // Matched on the ORIGINAL text with a case-insensitive pattern, never by scanning a lowercased
+  // copy: `toLowerCase` can change UTF-16 LENGTH (`İ` lowercases to two units), so an index into the
+  // copy does not address the original and the reported offset skews by one per such character.
+  // Offsets exist for a human to find the marker in their own editor — a wrong one is worse than none.
   for (const marker of REFUSED_MARKERS) {
-    const needle = marker.toLowerCase();
-    let at = haystack.indexOf(needle);
-    while (at !== -1) {
+    for (const m of text.matchAll(new RegExp(escapeForRegex(marker), "gi"))) {
       // The marker AS WRITTEN in the list, not as the sender cased it — the sender needs to know
       // which literal to stop emitting, and its casing is not the thing being refused.
       codepoints.add(marker);
-      offsets.push([...text.slice(0, at)].length);
-      at = haystack.indexOf(needle, at + needle.length);
+      offsets.push([...text.slice(0, m.index)].length);
     }
   }
   // Any pipe-delimited turn marker, not an enumerated four — a model family this build has never
   // heard of names its turns the same way, and enumerating them is a list that is always one short.
-  for (const m of text.matchAll(PIPE_TURN_MARKER)) {
-    codepoints.add(m[0]);
+  for (const m of text.matchAll(pipeTurnMarkerRegex())) {
+    // LOWERCASED, for the reason the literal branch names the list form: this string is read back to
+    // the operator's agent in the refusal guidance, and reflecting an attacker's exact casing puts
+    // the very marker the message path exists to strip into a model's context.
+    codepoints.add(m[0].toLowerCase());
     offsets.push([...text.slice(0, m.index)].length);
   }
   if (codepoints.size === 0) return null;
