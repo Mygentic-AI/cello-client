@@ -44,6 +44,7 @@
  * never agreed to cannot be used to smuggle a BIDI override.
  */
 
+import { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER } from "@cello-protocol/gateway";
 import type { GateRule, ProjectedDiff, GateContext } from "./document-gate.js";
 import { profileViolation } from "./document-profile.js";
 
@@ -76,12 +77,23 @@ const REFUSED_CODEPOINTS = new Set<number>([
 /**
  * Markers that address the READER'S MODEL rather than the reader.
  *
- * Matched as literal substrings, and deliberately not as a regex over "anything angle-bracketed":
- * a document about prompt engineering legitimately discusses these, and the audit caught exactly
- * that case being erased. Refusing is honest — the operator is told and can quote it differently —
- * where erasing changed the document's subject without saying so.
+ * THE LIST IS THE MESSAGE PATH'S LIST. Two copies of a security literal drift, and this one had
+ * drifted: four markers where the sanitizer strips ten, and matched case-sensitively where the
+ * sanitizer is deliberately case-insensitive ("bypassable by shift-key" is its own wording). So
+ * `[SYSTEM]`, `<<SYS>>`, `[INST]`, `SYSTEM PROMPT:` and `<|IM_START|>` reached an operator's agent
+ * through a shared document while being stripped out of every message. The affordance prefix is the
+ * sharpest: the sanitizer strips it so relayed text cannot forge local provenance, and a document
+ * carried it verbatim.
+ *
+ * Same list, different remedy — the message path strips, a signed CRDT replica cannot be rewritten,
+ * so this path REFUSES. Refusing is honest: a document about prompt formats is told which literal
+ * to quote differently, where erasing would change its subject without saying so.
+ *
+ * NOT taken from the sanitizer, deliberately: its `### Instruction:` heading family and its `</s>`
+ * pattern are ordinary markdown and ordinary prose in a technical document. Refusing those would
+ * refuse legitimate writing, which is the false-positive class this whole rule exists to avoid.
  */
-const REFUSED_MARKERS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>"];
+const REFUSED_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS;
 
 /** `U+XXXX`, uppercase, at least four digits — the form a human reads and a machine can match. */
 function formatCodepoint(cp: number): string {
@@ -119,13 +131,26 @@ export function screenText(text: string): { codepoints: string[]; count: number;
     }
     index++;
   }
+  // Case-INSENSITIVE. `[CELLO Security Layer, Local]` is the same claim of provenance to a model as
+  // the lowercase form, so a case-sensitive search leaves every marker bypassable by shift-key —
+  // the sanitizer's own reasoning, which this path did not carry.
+  const haystack = text.toLowerCase();
   for (const marker of REFUSED_MARKERS) {
-    let at = text.indexOf(marker);
+    const needle = marker.toLowerCase();
+    let at = haystack.indexOf(needle);
     while (at !== -1) {
+      // The marker AS WRITTEN in the list, not as the sender cased it — the sender needs to know
+      // which literal to stop emitting, and its casing is not the thing being refused.
       codepoints.add(marker);
       offsets.push([...text.slice(0, at)].length);
-      at = text.indexOf(marker, at + marker.length);
+      at = haystack.indexOf(needle, at + needle.length);
     }
+  }
+  // Any pipe-delimited turn marker, not an enumerated four — a model family this build has never
+  // heard of names its turns the same way, and enumerating them is a list that is always one short.
+  for (const m of text.matchAll(PIPE_TURN_MARKER)) {
+    codepoints.add(m[0]);
+    offsets.push([...text.slice(0, m.index)].length);
   }
   if (codepoints.size === 0) return null;
   offsets.sort((a, b) => a - b);

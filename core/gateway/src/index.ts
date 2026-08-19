@@ -28,6 +28,9 @@ export { initLinearRegex, linearRegexEngine, LinearRegex } from "./detect/linear
 export { compileInjectionPatterns, scanInjectionPatterns, injectionPatternsReady } from "./detect/injection-patterns.js";
 export { compileSecretRules, redactSecrets, secretRulesReady } from "./detect/secrets.js";
 export type { SecretFinding, SecretScanResult } from "./detect/secrets.js";
+// Shared with the document content rule — the message path strips these, the document path refuses
+// them, and neither may own a private copy of the list (DOD-DOC-SCREEN-CONTENT-1).
+export { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER } from "./detect/sanitize.js";
 export { screenInboundLanguage } from "./detect/language.js";
 export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "./detect/injection-scanner.js";

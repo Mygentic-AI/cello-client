@@ -165,7 +165,26 @@ function scoreEntropy(text: string): number {
 // the real thing. Stripped here, case-insensitively, the property holds: inbound text cannot carry
 // the marker. The `special_tokens` note that fires is itself the evidence someone tried.
 // Imported, not re-spelled — two copies of a security literal drift apart.
-const LITERAL_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>", AFFORDANCE_PREFIX];
+/**
+ * The privileged-turn markers, shared with the DOCUMENT content rule (DOD-DOC-SCREEN-CONTENT-1).
+ *
+ * Exported because the two paths must refuse the same set and cannot own separate copies. The
+ * message path STRIPS them; a document is a signed CRDT replica, so the document path REFUSES them
+ * instead — same list, different remedy. Traced 2026-08-19: the document rule had its own four
+ * literals, matched case-sensitively, so `[SYSTEM]`, `<<SYS>>`, `[INST]`, `SYSTEM PROMPT:` and
+ * `<|IM_START|>` reached an operator's agent through a shared document while being stripped from
+ * every message.
+ */
+export const PRIVILEGED_TURN_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>", AFFORDANCE_PREFIX] as const;
+
+/**
+ * Any pipe-delimited chat-template marker — `<|im_start|>`, `<|assistant|>`, `<|user|>`, whatever a
+ * model family names its turns. Shared for the same reason as the literals above: the document rule
+ * enumerated four of these by hand, so every other one passed.
+ */
+export const PIPE_TURN_MARKER = /<\|[a-z0-9_]+\|>/gi;
+
+const LITERAL_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS;
 function stripSpecialTokens(text: string): { text: string; removed: number } {
   let out = text;
   let removed = 0;
