@@ -85,7 +85,7 @@ export interface DocumentLayerDeps {
    */
   screenProjected?: (
     text: string,
-    ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+    ctx: { ownerAgentId: string; documentId: string; senderAgentId: string; correlationId?: string },
   ) => Promise<{ block: boolean; reason?: string }>;
   /**
    * The public key an agent id signs with, or null when this daemon cannot resolve one.
