@@ -60,7 +60,7 @@ import { projectDocumentText, parseJsonDocument, applyJsonToMap } from "./docume
 import { classifyRemovals } from "./document-write-guard.js";
 import { normalizeWatchPaths } from "./document-watch.js";
 import { profileViolation } from "./document-profile.js";
-import { screenText, SCREEN_RULE_ID } from "./document-screen.js";
+import { screenText, SCREEN_RULE_ID, SCREEN_GUIDANCE } from "./document-screen.js";
 
 /** Document types the notification/diff path understands. Anything else is stored, not diffed. */
 const DEFAULT_DOCUMENT_TYPE = "markdown";
@@ -279,6 +279,25 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       };
     }
     const startingText = typeof params?.starting_content === "string" ? params.starting_content : "";
+
+    // SCREENED LIKE ANY OTHER CONTENT. The starting content is the largest single payload of text
+    // this path ever carries and it does not travel as an update, so the gate — which validates
+    // update envelopes — never sees it. Unscreened, an inviter could seed the affordance prefix or a
+    // turn marker into the document body and it would land in the invitee's agent context and on
+    // their disk verbatim, while the same string in an ordinary edit is refused.
+    const seedFault = startingText.length > 0 ? screenText(startingText) : null;
+    if (seedFault) {
+      return {
+        ok: false,
+        reason: "document_content_refused",
+        guidance:
+          `The starting content contains ${seedFault.codepoints.join(", ")} ` +
+          `(${seedFault.count} occurrence(s), first at character ${seedFault.offsets[0]}). ` +
+          `${SCREEN_GUIDANCE} Nothing was created, so there is nothing to clean up — remove it and ` +
+          `propose again.`,
+        detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...seedFault }),
+      };
+    }
 
     // THE STARTING CONTENT IS A YJS UPDATE, not a string, and that is the whole reason it is on the
     // proposal at all (§16.3 step 1). Both sides apply THESE BYTES, so epoch zero is byte-identical
@@ -654,6 +673,31 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       createdAtMs: deps.now(),
     });
     if (outcome.envelope.starting_content) {
+      // SCREENED ON A SHADOW, BEFORE THE LIVE DOCUMENT. The proposer's own check is ergonomics — the
+      // adversary owns their daemon and can delete it — so the receiver decides for itself, and it
+      // decides on the projected TEXT rather than the update's bytes. This is the one document body
+      // that never arrives as an update, so nothing else in the inbound path would ever look at it.
+      const shadow = new Y.Doc();
+      Y.applyUpdate(shadow, outcome.envelope.starting_content);
+      const seedFault = screenText(projectDocumentText(shadow, outcome.envelope.document_type));
+      if (seedFault) {
+        logger.warn("document.proposal.starting_content_refused", {
+          documentId,
+          proposerAgentId: outcome.envelope.proposer_agent_id,
+          codepoints: seedFault.codepoints,
+          count: seedFault.count,
+        });
+        return {
+          ok: false,
+          reason: "document_content_refused",
+          guidance:
+            `This proposal's starting content contains ${seedFault.codepoints.join(", ")} ` +
+            `(${seedFault.count} occurrence(s), first at character ${seedFault.offsets[0]}). ` +
+            `${SCREEN_GUIDANCE} It was NOT accepted and nothing was written to disk — ask the ` +
+            `proposer to remove it and propose again.`,
+          detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...seedFault }),
+        };
+      }
       Y.applyUpdate(layer.live.get(who.ownerAgentId, documentId), outcome.envelope.starting_content);
     }
     const acceptFile = await materialize(who.ownerAgentId, documentId, outcome.envelope.document_type);
@@ -1827,13 +1871,17 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         }
         at++;
       }
-      // Markers are matched as substrings, exactly as the screen matches them.
+      // Markers match case-insensitively, exactly as the screen matches them. A case-sensitive
+      // search here does not admit anything — `screenText` below still refuses — but it loses the
+      // "your peer has already said no to this" answer and reports a first refusal instead.
+      const lowered = content.toLowerCase();
       for (const marker of [...adopted].filter((c) => !c.startsWith("U+"))) {
-        let idx = content.indexOf(marker);
+        const needle = marker.toLowerCase();
+        let idx = lowered.indexOf(needle);
         while (idx !== -1) {
           offenders.add(marker);
           offsets.push([...content.slice(0, idx)].length);
-          idx = content.indexOf(marker, idx + marker.length);
+          idx = lowered.indexOf(needle, idx + needle.length);
         }
       }
       if (offenders.size > 0) {
@@ -1859,8 +1907,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         guidance:
           `Your peer's screening will refuse ${screenFault.codepoints.join(", ")} ` +
           `(${screenFault.count} occurrence(s), first at character ${screenFault.offsets[0]}). ` +
-          `These are characters that make what a reader SEES differ from what the document SAYS, or ` +
-          `that address a reader's model rather than the reader. Remove them and write again — ` +
+          `${SCREEN_GUIDANCE} Remove them and write again — ` +
           `sending as-is costs a rejection round, and three of those stall the document.`,
         detail: JSON.stringify({ rule: SCREEN_RULE_ID, ...screenFault }),
       };

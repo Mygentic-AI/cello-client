@@ -294,4 +294,51 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       expect(mgr.getSessionNodePeerId("alice", SID)).toBeNull();
     });
   });
+
+  /**
+   * DOD-DOC-SCREEN-CLASSIFY-1 — a DOCUMENT frame skips the gateway content screen; everything else
+   * still takes it. Both directions asserted, because each failure mode is silent: skip a message
+   * and it bypasses screening it needs; screen a document frame and a blocking gateway holds
+   * document traffic whose real screen (the gate + screenText) is in-process and cannot be down.
+   */
+  it("document frame: skips the gateway screen and still routes to the document layer", async () => {
+    const gw = new CountingGateway("block"); // blocking — would refuse if consulted
+    const mgr = await setup(gw);
+    let routed = 0;
+    mgr.setOnDocumentFrame(
+      () => { routed++; return { consumed: true, kind: "reconcile", ok: true }; },
+      () => true, // classify: document
+    );
+    const frame = enc("stand-in-document-frame-bytes");
+    // The ingest cross-check is over the CONTENT, not the leaf kind — the kind is decided further
+    // down, by the router. Same hash a message would carry.
+    const res = await mgr.ingestReceivedContent("alice", SID, frame, msgLeafHash(frame));
+    expect(res.ok).toBe(true);
+    expect(gw.inbound).toBe(0); // the gateway was never consulted
+    expect(routed).toBe(1); // the document layer got the frame
+    expect(mgr.getSessionTree("alice", SID).size()).toBe(1); // the doc leaf was still taken
+    expect(mgr.takeReceivedContent("alice", SID)).toBeNull(); // never conversation content
+  });
+
+  it("message: still takes the full gateway screen when the classifier says not-a-document", async () => {
+    const gw = new CountingGateway("block");
+    const mgr = await setup(gw);
+    mgr.setOnDocumentFrame(
+      () => ({ consumed: false }),
+      () => false, // classify: not a document
+    );
+    const content = enc("ordinary message");
+    const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    expect(res.ok).toBe(false);
+    expect((res as { reason: string }).reason).toBe("test_block");
+    expect(gw.inbound).toBe(1);
+  });
+
+  it("no classifier injected: every frame takes the screen — the pre-document behaviour", async () => {
+    const gw = new CountingGateway("allow");
+    const mgr = await setup(gw);
+    const content = enc("any bytes at all");
+    await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
+    expect(gw.inbound).toBe(1);
+  });
 });

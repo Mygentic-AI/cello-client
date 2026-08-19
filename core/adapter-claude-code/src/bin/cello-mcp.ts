@@ -608,7 +608,7 @@ server.tool("cello_doc_invite", "Invite a third agent into a shared document you
   return jsonText(result);
 });
 
-server.tool("cello_doc_remove", "Remove a holder from a shared document you administer, or leave one yourself (pass your own pubkey). Forward-only by design: their existing copy and its full history remain theirs — removal only stops NEW edits flowing either way, and their next publish is refused with a reason naming the removal. Removing a fellow admin is refused: demote first under the all-other-admins rule.", {
+server.tool("cello_doc_remove", "Remove a holder from a shared document you administer, or leave one yourself (pass your own pubkey). Forward-only by design: their existing copy and its full history remain theirs — removal only stops NEW edits flowing either way, and their next publish is refused with a reason naming the removal. Removing a fellow admin is refused, and there is no demote verb to reach for — demotion needs every other admin's signature and that wire is not built; today an admin leaves only by removing themselves (their own pubkey).", {
   document_id: z.string().describe("The document — see cello_doc_list"),
   holder_pubkey: z.string().describe("The holder to remove (64-char hex agent id), or YOUR OWN to leave voluntarily"),
   agent: z.string().optional().describe("Agent to act as (defaults to the current agent)"),

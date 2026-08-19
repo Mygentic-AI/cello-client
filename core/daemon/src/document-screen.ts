@@ -44,14 +44,28 @@
  * never agreed to cannot be used to smuggle a BIDI override.
  */
 
+import { PRIVILEGED_TURN_MARKERS, pipeTurnMarkerRegex } from "@cello-protocol/gateway";
 import type { GateRule, ProjectedDiff, GateContext } from "./document-gate.js";
 import { profileViolation } from "./document-profile.js";
 
 /** Named so a refusal can say which rule fired without the sender parsing prose (§16.7-6). */
 export const SCREEN_RULE_ID = "document_content_screen";
 
+/** Named separately so a refusal says WHICH screen refused — the gateway's, not this module's. */
+export const SEMANTIC_RULE_ID = "document_content_semantic_screen";
+
 /** Named separately so a refusal says whether the AGREED profile or the default floor refused. */
 export const PROFILE_RULE_ID = "document_content_profile";
+
+/**
+ * The one sentence every surface uses to say WHY, so the four call sites cannot describe the same
+ * rule differently. It names both halves: the earlier wording described only the invisible-character
+ * half, which reads as nonsense to an operator who was refused for `[INST]`.
+ */
+export const SCREEN_GUIDANCE =
+  "These are either invisible or direction-altering characters, which make what a reader SEES " +
+  "differ from what the document SAYS, or chat-template markers, which address a reader's model " +
+  "rather than the reader.";
 
 /**
  * Codepoints refused anywhere in inserted text.
@@ -76,16 +90,47 @@ const REFUSED_CODEPOINTS = new Set<number>([
 /**
  * Markers that address the READER'S MODEL rather than the reader.
  *
- * Matched as literal substrings, and deliberately not as a regex over "anything angle-bracketed":
- * a document about prompt engineering legitimately discusses these, and the audit caught exactly
- * that case being erased. Refusing is honest — the operator is told and can quote it differently —
- * where erasing changed the document's subject without saying so.
+ * THE LIST IS THE MESSAGE PATH'S LIST. Two copies of a security literal drift, and this one had
+ * drifted: four markers where the sanitizer strips ten, and matched case-sensitively where the
+ * sanitizer is deliberately case-insensitive ("bypassable by shift-key" is its own wording). So
+ * `[SYSTEM]`, `<<SYS>>`, `[INST]`, `SYSTEM PROMPT:` and `<|IM_START|>` reached an operator's agent
+ * through a shared document while being stripped out of every message. The affordance prefix is the
+ * sharpest: the sanitizer strips it so relayed text cannot forge local provenance, and a document
+ * carried it verbatim.
+ *
+ * Same list, different remedy — the message path strips, a signed CRDT replica cannot be rewritten,
+ * so this path REFUSES. Refusing is honest: a document about prompt formats is told which literal
+ * to quote differently, where erasing would change its subject without saying so.
+ *
+ * NOT taken from the sanitizer, deliberately: its `### Instruction:` heading family and its `</s>`
+ * pattern are ordinary markdown and ordinary prose in a technical document. Refusing those would
+ * refuse legitimate writing, which is the false-positive class this whole rule exists to avoid.
  */
-const REFUSED_MARKERS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|system|>"];
+/**
+ * The prose-ambiguous members of the shared list, excluded HERE and only here.
+ *
+ * A message gets these STRIPPED, which costs a reader a few characters. A document gets a hard
+ * REFUSAL, and these three are ordinary English and ordinary markup:
+ *   - `SYSTEM PROMPT:` — "Here is the system prompt: keep it short" is a sentence someone writes.
+ *   - `<system>` / `</system>` — a tag in any XML or config document.
+ * Refusing them would refuse legitimate writing, which is the false-positive class this whole rule
+ * exists to avoid, and the same objection that kept `### Instruction:` and `</s>` off the list.
+ * Excluded by name rather than by omission so the choice is visible and testable.
+ */
+export const PROSE_AMBIGUOUS: readonly string[] = ["SYSTEM PROMPT:", "<system>", "</system>"];
+
+const REFUSED_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS.filter(
+  (m) => !PROSE_AMBIGUOUS.includes(m),
+);
 
 /** `U+XXXX`, uppercase, at least four digits — the form a human reads and a machine can match. */
 function formatCodepoint(cp: number): string {
   return `U+${cp.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/** A literal is data, not a pattern — `[SYSTEM]` is a character class until it is escaped. */
+function escapeForRegex(literal: string): string {
+  return literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -119,13 +164,30 @@ export function screenText(text: string): { codepoints: string[]; count: number;
     }
     index++;
   }
+  // Case-INSENSITIVE. `[CELLO Security Layer, Local]` is the same claim of provenance to a model as
+  // the lowercase form, so a case-sensitive search leaves every marker bypassable by shift-key —
+  // the sanitizer's own reasoning, which this path did not carry.
+  //
+  // Matched on the ORIGINAL text with a case-insensitive pattern, never by scanning a lowercased
+  // copy: `toLowerCase` can change UTF-16 LENGTH (`İ` lowercases to two units), so an index into the
+  // copy does not address the original and the reported offset skews by one per such character.
+  // Offsets exist for a human to find the marker in their own editor — a wrong one is worse than none.
   for (const marker of REFUSED_MARKERS) {
-    let at = text.indexOf(marker);
-    while (at !== -1) {
+    for (const m of text.matchAll(new RegExp(escapeForRegex(marker), "gi"))) {
+      // The marker AS WRITTEN in the list, not as the sender cased it — the sender needs to know
+      // which literal to stop emitting, and its casing is not the thing being refused.
       codepoints.add(marker);
-      offsets.push([...text.slice(0, at)].length);
-      at = text.indexOf(marker, at + marker.length);
+      offsets.push([...text.slice(0, m.index)].length);
     }
+  }
+  // Any pipe-delimited turn marker, not an enumerated four — a model family this build has never
+  // heard of names its turns the same way, and enumerating them is a list that is always one short.
+  for (const m of text.matchAll(pipeTurnMarkerRegex())) {
+    // LOWERCASED, for the reason the literal branch names the list form: this string is read back to
+    // the operator's agent in the refusal guidance, and reflecting an attacker's exact casing puts
+    // the very marker the message path exists to strip into a model's context.
+    codepoints.add(m[0].toLowerCase());
+    offsets.push([...text.slice(0, m.index)].length);
   }
   if (codepoints.size === 0) return null;
   offsets.sort((a, b) => a - b);

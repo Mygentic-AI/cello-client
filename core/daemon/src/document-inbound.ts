@@ -41,6 +41,7 @@ import type { DocumentStore, DocumentProperties } from "./document-store.js";
 import type { DocumentEngine } from "./document-engine.js";
 import type { DocumentGate } from "./document-gate.js";
 import type { DocumentRejections } from "./document-rejection.js";
+import { SEMANTIC_RULE_ID } from "./document-screen.js";
 import type { Logger } from "./types.js";
 
 export type InboundResult =
@@ -76,6 +77,23 @@ export type InboundResult =
 
 export interface DocumentInboundDeps {
   store: DocumentStore;
+  /**
+   * DOD-DOC-SCREEN-CONTENT-1 — screen the PROJECTED TEXT, at the shadow.
+   *
+   * The gate already applies the update to an inert shadow copy and computes the readable
+   * before/after text. Until this seam existed, the only rule reading that text was a character
+   * denylist, while the layer that judges MEANING sat at the wire — where a document frame is a
+   * signed binary envelope and the text screener was decoding it as UTF-8 and judging mojibake.
+   *
+   * Optional because it is Layer 2 and Layer 2 degrades by design (no model → no verdict → admit).
+   * It returns BLOCK or nothing: a `redact` verdict cannot be honoured on a CRDT replica, so a
+   * rewrite-worthy finding either refuses or is carried as evidence — there is no third outcome,
+   * which is the contract this whole path is built on.
+   */
+  screenProjected?: (
+    text: string,
+    ctx: { ownerAgentId: string; documentId: string; senderAgentId: string; correlationId?: string },
+  ) => Promise<{ block: boolean; reason?: string }>;
   engine: DocumentEngine;
   gate: DocumentGate;
   rejections: DocumentRejections;
@@ -569,6 +587,60 @@ export class DocumentInbound {
         // happened, driving the document to `stalled` early.
         ...(rejection.wire ? { rejectionWire: rejection.wire } : {}),
         rejectionReason: verdict.reason,
+        duplicate: false,
+      };
+    }
+
+    // 7a-bis. THE SEMANTIC SCREEN, on the text the update WOULD produce.
+    //
+    // Placed here and nowhere else for two reasons. The shadow is inert — nothing in it can reach
+    // the operator or their agent until the admit below — so this is the last moment the content is
+    // both READABLE and harmless. And the gate's `validate` is synchronous while the gateway is a
+    // separate program, so the call cannot live inside a rule.
+    //
+    // Only the INSERTED text is screened. A deletion carries no new content, and re-screening the
+    // whole document would refuse a peer's edit for prose that was already admitted days ago.
+    const semantic = this.#d.screenProjected && verdict.projectedDiff.inserted.length > 0
+      ? await this.#d.screenProjected(verdict.projectedDiff.inserted, {
+          ownerAgentId,
+          documentId: env.document_id,
+          senderAgentId: env.sender_agent_id,
+          ...(correlationId !== undefined ? { correlationId } : {}),
+        })
+      : null;
+    if (semantic?.block === true) {
+      // REFUSED, NOT REWRITTEN, and the bytes are HELD — the same treatment every other refusal
+      // gets, so the peer's chain stays bridgeable and they are told once, by name.
+      const rejection = await this.#d.rejections.reject(ownerAgentId, env.document_id, {
+        rejectedEnvelopeHash: envelopeHash,
+        // COPIED, and copied BEFORE the awaits above. The caller's buffer may be a pooled network
+        // read; `reject()` copies too, but by then a gateway round trip and a signing call have
+        // both happened, and DOD-DOC-REJECT-1 would hash bytes that are no longer the ones refused
+        // — into a 0x05 leaf, silently. The gate's own quarantine copies for this reason.
+        quarantined: new Uint8Array(env.update),
+        reason: "document_content_injection",
+        // WHICH screen refused. Dropping it leaves an operator unable to see what ruled, which is
+        // exactly what document-rejection.ts's header says a refusal must never do.
+        rule: SEMANTIC_RULE_ID,
+        ...(semantic.reason !== undefined ? { detail: semantic.reason } : {}),
+        senderAgentId: env.sender_agent_id,
+        rejectedDocPrevHash: env.doc_prev_hash,
+        sign: (tbs) => this.#d.sign(ownerAgentId, tbs),
+        nowMs,
+      });
+      this.#d.logger.warn("document.inbound.injection_refused", {
+        documentId: env.document_id,
+        senderAgentId: env.sender_agent_id,
+        envelopeHash,
+        reason: semantic.reason,
+        correlationId,
+      });
+      return {
+        ok: true,
+        admitted: false,
+        envelopeHash,
+        ...(rejection.wire ? { rejectionWire: rejection.wire } : {}),
+        rejectionReason: "document_content_injection",
         duplicate: false,
       };
     }

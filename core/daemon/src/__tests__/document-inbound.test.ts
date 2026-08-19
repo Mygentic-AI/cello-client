@@ -72,6 +72,11 @@ function envelope(over: Partial<DocumentUpdateEnvelope> = {}): DocumentUpdateEnv
 function newFixture(
   opts: {
     verify?: () => boolean;
+    /** DOD-DOC-SCREEN-CONTENT-1 — the semantic screen seam, on the projected text. */
+    screenProjected?: (
+      text: string,
+      ctx: { documentId: string; senderAgentId: string; correlationId?: string },
+    ) => Promise<{ block: boolean; reason?: string }>;
     currentHolders?: () => string[] | null;
     deriveAtFrontier?: (
       o: string,
@@ -140,6 +145,7 @@ function newFixture(
 
   const inbound = new DocumentInbound({
     store, engine, gate, rejections, logger,
+    ...(opts.screenProjected ? { screenProjected: opts.screenProjected } : {}),
     // Null = bilateral legacy (the row's peer column is the gate) — the pre-fan-out semantics
     // every older test in this file was written against.
     currentHolders: opts.currentHolders ?? (() => null),
@@ -829,5 +835,152 @@ describe("a TERMINAL refusal settles the sender's delivery instead of leaving it
 
     expect(res).toMatchObject({ ok: false, reason: "document_stalled" });
     expect((res as { terminal?: boolean }).terminal).toBeUndefined();
+  });
+});
+
+/**
+ * DOD-DOC-SCREEN-CONTENT-1 — the semantic screen runs on the PROJECTED TEXT, at the shadow.
+ *
+ * The whole reordering this unit exists for: the layer that judges meaning used to sit at the wire,
+ * where a document frame is a signed binary envelope and the text screener was decoding it as UTF-8
+ * and judging mojibake. The gate already applies the update to an inert shadow and computes the
+ * readable text; this is that text reaching the screener, and nothing else changing.
+ */
+describe("the semantic screen sees readable text, and refuses rather than rewrites", () => {
+  it("hands the screener the text the update WOULD produce — not the envelope bytes", async () => {
+    const seen: string[] = [];
+    const f = newFixture({
+      screenProjected: async (text) => { seen.push(text); return { block: false }; },
+    });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    // Readable prose, not CBOR. This is the assertion the whole unit turns on.
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("peer text");
+  });
+
+  it("refuses a blocked envelope, holds its bytes, and answers the peer by name", async () => {
+    const f = newFixture({
+      screenProjected: async () => ({ block: true, reason: "inbound_injection_blocked" }),
+    });
+    const env = envelope();
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(env), NOW);
+
+    expect(res).toMatchObject({ ok: true, admitted: false, rejectionReason: "document_content_injection" });
+    // NOT REWRITTEN and NOT APPLIED — a rewritten replica is permanent divergence. The log holds
+    // the signed REJECTION (the 0x05 leaf), never the refused update.
+    expect(f.store.getEnvelopeLog(AGENT, DOC).filter((e) => e.kind === "update")).toHaveLength(0);
+    expect(f.live.getText("content").toString()).not.toContain("peer text");
+    // HELD, never discarded, so the peer's next link stays bridgeable.
+    expect(f.store.listQuarantined(AGENT, DOC)).toHaveLength(1);
+    // ANSWERED — the sender stops retrying rather than driving the document to stalled.
+    expect((res as { rejectionWire?: Uint8Array }).rejectionWire).toBeDefined();
+  });
+
+  it("admits when the screener allows — the seam is not a refusal in disguise", async () => {
+    const f = newFixture({ screenProjected: async () => ({ block: false }) });
+    const res = await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("admits when no screener is wired — Layer 2 degrades, it does not fail closed", async () => {
+    const res = await newFixture().inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope()), NOW);
+    expect(res).toMatchObject({ ok: true, admitted: true });
+  });
+
+  it("does not call the screener when the update inserts nothing", async () => {
+    // A deletion carries no new content. Screening it would spend a gateway round trip per
+    // keystroke-sized delete, and re-screening the WHOLE document would refuse a peer's edit for
+    // prose admitted days earlier.
+    let calls = 0;
+    const f = newFixture({ screenProjected: async () => { calls++; return { block: false }; } });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(envelope({ update: update(PEER_CLIENT, "") })), NOW);
+    expect(calls).toBe(0);
+  });
+});
+
+/**
+ * Review findings on the semantic screen (Entry 65) — the two proven bypasses.
+ *
+ * `projectedDiff.inserted` used to be a common-prefix / fixed-length-tail window over the projected
+ * TEXT ROOT. Measured, that both missed and over-included, and screening consumes it. These pin the
+ * shapes that got through.
+ */
+describe("what counts as INSERTED text — the shapes that used to slip past", () => {
+  it("screens a NET-SHRINKING update — deleting more than you insert is not a free pass", async () => {
+    // The old window returned "" whenever the document got shorter, so a peer deleting 500
+    // characters while inserting a payload was screened by nothing at all.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    // Seed a long document, then an update that removes most of it and adds a short payload.
+    const base = new Y.Doc();
+    base.clientID = PEER_CLIENT;
+    base.getText("content").insert(0, "x".repeat(400));
+    const seed = Y.encodeStateAsUpdate(base);
+    const first = envelope({ update: seed });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(first), NOW);
+    seen.length = 0;
+
+    const shrink = new Y.Doc();
+    shrink.clientID = PEER_CLIENT + 1;
+    Y.applyUpdate(shrink, seed);
+    shrink.getText("content").delete(0, 390);
+    shrink.getText("content").insert(shrink.getText("content").length, "PAYLOAD-HERE");
+    const delta = Y.diffUpdate(Y.encodeStateAsUpdate(shrink), Y.encodeStateVector(base));
+
+    const r2 = await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ update: delta, doc_prev_hash: documentEnvelopeHash(first), sender_client_id: PEER_CLIENT + 1 }),
+      ),
+      NOW,
+    );
+    if (seen.length === 0) throw new Error(`second receive: ${JSON.stringify(r2)}`);
+    expect(seen.join(" ")).toContain("PAYLOAD-HERE");
+  });
+
+  it("screens text appended AFTER an edit at the front — one character no longer hides the rest", async () => {
+    // The old window anchored on a common prefix and a fixed tail, so inserting at position 0
+    // returned the document's own opening prose and EXCLUDED a payload added at the end.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    const d = new Y.Doc();
+    d.clientID = PEER_CLIENT;
+    d.getText("content").insert(0, "ordinary opening prose ".repeat(20));
+    const seed = Y.encodeStateAsUpdate(d);
+    const first = envelope({ update: seed });
+    await f.inbound.receive(AGENT, encodeDocumentUpdateEnvelope(first), NOW);
+    seen.length = 0;
+
+    const two = new Y.Doc();
+    two.clientID = PEER_CLIENT + 2;
+    Y.applyUpdate(two, seed);
+    two.getText("content").insert(0, "X");
+    two.getText("content").insert(two.getText("content").length, "TAIL-PAYLOAD");
+    const delta = Y.diffUpdate(Y.encodeStateAsUpdate(two), Y.encodeStateVector(d));
+
+    await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(
+        envelope({ update: delta, doc_prev_hash: documentEnvelopeHash(first), sender_client_id: PEER_CLIENT + 2 }),
+      ),
+      NOW,
+    );
+    expect(seen.join(" ")).toContain("TAIL-PAYLOAD");
+  });
+
+  it("screens content written to the MAP root — a json document is not exempt", async () => {
+    // `inserted` read getText("content") only, so for a json document — whose content lives in the
+    // map root — it was permanently empty and NOTHING screened it, semantic or denylist.
+    const seen: string[] = [];
+    const f = newFixture({ screenProjected: async (t) => { seen.push(t); return { block: false }; } });
+    const d = new Y.Doc();
+    d.clientID = PEER_CLIENT;
+    d.getMap("data").set("note", "MAP-PAYLOAD");
+    await f.inbound.receive(
+      AGENT,
+      encodeDocumentUpdateEnvelope(envelope({ update: Y.encodeStateAsUpdate(d) })),
+      NOW,
+    );
+    expect(seen.join(" ")).toContain("MAP-PAYLOAD");
   });
 });

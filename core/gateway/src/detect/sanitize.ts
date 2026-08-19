@@ -165,7 +165,37 @@ function scoreEntropy(text: string): number {
 // the real thing. Stripped here, case-insensitively, the property holds: inbound text cannot carry
 // the marker. The `special_tokens` note that fires is itself the evidence someone tried.
 // Imported, not re-spelled — two copies of a security literal drift apart.
-const LITERAL_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>", AFFORDANCE_PREFIX];
+/**
+ * The privileged-turn markers, shared with the DOCUMENT content rule (DOD-DOC-SCREEN-CONTENT-1).
+ *
+ * Exported because the two paths must refuse the same set and cannot own separate copies. The
+ * message path STRIPS them; a document is a signed CRDT replica, so the document path REFUSES them
+ * instead — same list, different remedy. Traced 2026-08-19: the document rule had its own four
+ * literals, matched case-sensitively, so `[SYSTEM]`, `<<SYS>>`, `[INST]`, `SYSTEM PROMPT:` and
+ * `<|IM_START|>` reached an operator's agent through a shared document while being stripped from
+ * every message.
+ */
+export const PRIVILEGED_TURN_MARKERS = ["[SYSTEM]", "[/SYSTEM]", "<<SYS>>", "<</SYS>>", "[INST]", "[/INST]", "SYSTEM PROMPT:", "<system>", "</system>", AFFORDANCE_PREFIX] as const;
+
+/**
+ * Any pipe-delimited chat-template marker — `<|im_start|>`, `<|assistant|>`, `<|user|>`, whatever a
+ * model family names its turns. Shared for the same reason as the literals above: the document rule
+ * enumerated four of these by hand, so every other one passed.
+ *
+ * A SOURCE STRING, not a `RegExp`. A shared `/g` regex object carries `lastIndex` between callers:
+ * one `.test()` anywhere seeds it, `matchAll` copies that seed into its clone, and every subsequent
+ * scan silently starts mid-string. Screening that quietly stops screening — no error, no red test —
+ * is the worst failure this module can have, and exporting a mutable object invites it across a
+ * published package boundary.
+ */
+export const PIPE_TURN_MARKER_SOURCE = "<\\|[a-z0-9_]+\\|>";
+
+/** A fresh matcher per call — see `PIPE_TURN_MARKER_SOURCE` for why this is not a shared object. */
+export function pipeTurnMarkerRegex(): RegExp {
+  return new RegExp(PIPE_TURN_MARKER_SOURCE, "gi");
+}
+
+const LITERAL_MARKERS: readonly string[] = PRIVILEGED_TURN_MARKERS;
 function stripSpecialTokens(text: string): { text: string; removed: number } {
   let out = text;
   let removed = 0;
@@ -175,7 +205,9 @@ function stripSpecialTokens(text: string): { text: string; removed: number } {
     const parts = out.split(new RegExp(lit.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi"));
     if (parts.length > 1) { removed += parts.length - 1; out = parts.join(" "); }
   }
-  out = out.replace(/<\|[a-z0-9_]+\|>/gi, () => { removed++; return " "; });
+  // THE SHARED PATTERN, not a second spelling of it. A hand-copied duplicate sat here twelve lines
+  // below the constant whose whole purpose is that two copies of a security literal drift apart.
+  out = out.replace(pipeTurnMarkerRegex(), () => { removed++; return " "; });
   out = out.replace(/###\s*(instruction|response|system|human|assistant)\b:?/gi, () => { removed++; return " "; });
   out = out.replace(/<\/?s>/gi, () => { removed++; return " "; });
   return { text: out, removed };

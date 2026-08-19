@@ -49,7 +49,10 @@ describe("M9-IN-002 model installer", () => {
 
   it("a wrong-sized download fails the install and removes the untrusted file (integrity baseline)", async () => {
     const fakeFetch = (async () => new Response("not the real model bytes")) as unknown as typeof fetch;
-    const r = await installModel({ dir, consent: true, fetchImpl: fakeFetch });
+    // allowUnpinnedDigests: this test is about the SIZE check, which sits downstream of the
+    // digest gate added by DOD-DOC-SCREEN-CLASSIFIER-1. Without it the install stops earlier and
+    // this assertion would pass for the wrong reason.
+    const r = await installModel({ dir, consent: true, allowUnpinnedDigests: true, fetchImpl: fakeFetch });
     expect(r.installed).toBe(false);
     expect(r.error).toMatch(/size mismatch/);
   });

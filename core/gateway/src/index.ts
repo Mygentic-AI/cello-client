@@ -19,7 +19,7 @@ export type {
 // The composed inbound/outbound screens (the gateway runs these; M9-FEED-001 renders the verdict).
 export { OutboundScreener } from "./screen/outbound.js";
 export type { OutboundVerdict, OutboundScreenerOptions, OutboundScreenContext } from "./screen/outbound.js";
-export { InboundScreener } from "./screen/inbound.js";
+export { InboundScreener, INBOUND_INJECTION_BLOCKED } from "./screen/inbound.js";
 export type { InboundVerdict, InboundScreenerOptions } from "./screen/inbound.js";
 
 // The RE2 linear-time regex engine (native re2 preferred, re2-wasm fallback) + the injection
@@ -28,6 +28,9 @@ export { initLinearRegex, linearRegexEngine, LinearRegex } from "./detect/linear
 export { compileInjectionPatterns, scanInjectionPatterns, injectionPatternsReady } from "./detect/injection-patterns.js";
 export { compileSecretRules, redactSecrets, secretRulesReady } from "./detect/secrets.js";
 export type { SecretFinding, SecretScanResult } from "./detect/secrets.js";
+// Shared with the document content rule — the message path strips these, the document path refuses
+// them, and neither may own a private copy of the list (DOD-DOC-SCREEN-CONTENT-1).
+export { PRIVILEGED_TURN_MARKERS, PIPE_TURN_MARKER_SOURCE, pipeTurnMarkerRegex, sanitizeInbound } from "./detect/sanitize.js";
 export { screenInboundLanguage } from "./detect/language.js";
 export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "./detect/injection-scanner.js";
@@ -35,6 +38,8 @@ export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect
 export { isModelInstalled, installModel, verifyModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
+export { loadInjectionClassifier } from "./detect/injection-classifier-onnx.js";
+export type { ClassifierLoad } from "./detect/injection-classifier-onnx.js";
 export { GatewayConfigStore } from "./config/config-store.js";
 export type { ConfigDirection, SetResult, ConfigVersionRow } from "./config/config-store.js";
 export { GatewayStoreError, stderrStoreEventSink, openEncryptedStoreDb } from "./store/encrypted-db.js";

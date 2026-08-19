@@ -558,3 +558,21 @@ function classify(content: Uint8Array): DocumentFrameKind | Unclassified {
     return "undecodable";
   }
 }
+
+/**
+ * DOD-DOC-SCREEN-CLASSIFY-1 — is this a document frame, and nothing else.
+ *
+ * The classify-only entry point the session ingest uses to decide whether the shared message
+ * screener's CONTENT steps apply. They are inert for a document frame — the frame is a signed CBOR
+ * envelope, so the sanitizer's rewrites are discarded by the funnel (see `#appendVerifiedContent`'s
+ * `originalContent` note) and the language/pattern checks judge a UTF-8 decode of binary. What
+ * actually screens document content is the gate + `screenText`, in-process, on the projected text.
+ *
+ * Reuses `classify` — a second copy of the discriminator rule is how the two callers drift. The
+ * header guard keeps the cost off conversation messages: no byte in `0xa0`–`0xb9` can begin valid
+ * UTF-8 text, so ordinary messages return false on the first byte.
+ */
+export function isDocumentFrame(content: Uint8Array): boolean {
+  const kind = classify(content);
+  return kind !== "unshaped" && kind !== "undecodable";
+}

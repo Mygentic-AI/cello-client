@@ -55,7 +55,22 @@ export class InjectionScanner {
 
   async scan(text: string): Promise<ScanResult> {
     if (!this.#classifier) return { available: false };
-    const { injectionProbability, label } = await this.#classifier.classify(text);
+    // A CLASSIFIER FAULT DEGRADES LAYER 2; it does not jam the path. The production classifier
+    // throws deliberately on a label set it does not recognise, and an uncaught throw here reaches
+    // the gateway's outer catch as `screen_error` — a block with no `terminal`, which the daemon
+    // reads as TRANSIENT and redelivers forever, on a condition that is permanent and identical on
+    // every retry. Unavailable-and-announced is the honest answer to a broken model.
+    let classified: { injectionProbability: number; label?: string };
+    try {
+      classified = await this.#classifier.classify(text);
+    } catch (err) {
+      process.stderr.write(
+        `cello-gateway: semantic injection scan FAILED, Layer 2 degraded for this message: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+      );
+      return { available: false };
+    }
+    const { injectionProbability, label } = classified;
     const score = Math.round(Math.max(0, Math.min(1, injectionProbability)) * 100);
     // The score governs the verdict (AC-003): a model `label` of SAFE with a high score still blocks.
     return { available: true, score, verdict: scoreToVerdict(score), label };

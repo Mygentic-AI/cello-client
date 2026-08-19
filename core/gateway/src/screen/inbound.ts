@@ -45,6 +45,14 @@ export interface InboundScreenerOptions {
   injectionScanner?: InjectionScanner;
 }
 
+/**
+ * The reason a SEMANTIC injection block carries. Exported because consumers must be able to tell it
+ * apart from this screener's other terminal blocks — the language allowlist and the size cap — which
+ * are correct for a message and wrong for a document (a shared document written in Japanese is
+ * ordinary use). Matching on the string in two places is how those get conflated.
+ */
+export const INBOUND_INJECTION_BLOCKED = "inbound_injection_blocked";
+
 const TEXT_ENCODER = new TextEncoder();
 
 export class InboundScreener {
@@ -125,7 +133,7 @@ export class InboundScreener {
             reason: `semantic injection score ${scan.score} ≥ block threshold`,
           }],
           terminal: true,
-          reason: "inbound_injection_blocked",
+          reason: INBOUND_INJECTION_BLOCKED,
           guidance:
             "This message was classified as a prompt-injection attempt and was not delivered.\n" +
             noOperatorOverride(

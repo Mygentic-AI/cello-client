@@ -91,6 +91,8 @@ import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
+import { isDocumentFrame } from "./document-frame-router.js";
+import { INBOUND_INJECTION_BLOCKED } from "@cello-protocol/gateway";
 import { registerDocumentHandlers } from "./document-handlers.js";
 import { wireContentHash } from "./wire-content-hash.js";
 import { DocumentPublish } from "./document-publish.js";
@@ -3891,6 +3893,62 @@ async function startDaemonHoldingLock(
   const documentLayer = createDocumentLayer({
     db: sessionNodeManager.getDb(),
     logger,
+    // DOD-DOC-SCREEN-CONTENT-1 — the gateway, reached with TEXT for once.
+    //
+    // The same program that screens conversation messages, called from the document gate's shadow
+    // with the readable projected text instead of the signed binary envelope the wire carries.
+    //
+    // ── WHICH VERDICTS REFUSE, AND WHY IT IS NOT "ALL OF THEM" ────────────────────────────────
+    //
+    // ONLY the injection verdict. The gateway runs its whole inbound composition, and two of its
+    // other terminal blocks must not refuse a document:
+    //
+    //   - the LANGUAGE ALLOWLIST (default: Latin only). A shared document written in Japanese,
+    //     Arabic or Russian is ordinary use, and every update would be refused — permanently, since
+    //     the same bytes are the same language on redelivery. The allowlist exists so a jailbreak
+    //     phrased in a low-resource language cannot dodge English-trained screening; refusing a
+    //     colleague's document outright is a far worse trade than that gap, and the character
+    //     denylist still runs on every script.
+    //   - the SIZE CAP, which is the sanitizer's per-message cap and not this path's limit. The
+    //     gate already bounds an update and the whole document by its own numbers.
+    //
+    // A REDACT verdict is never honoured: rewriting one holder's replica is permanent divergence
+    // both sides converge on and neither can see.
+    //
+    // A TRANSIENT block means the gateway is DOWN or its screener faulted. The update is admitted —
+    // holding document convergence hostage to an optional layer breaks a layer that degrades by
+    // design — but it is LOGGED BY NAME, because a weaker guarantee that looks identical to the
+    // stronger one at every surface is how this whole class of defect survives.
+    screenProjected: async (text, ctx) => {
+      const verdict = await config.securityGateway.screenInbound(new TextEncoder().encode(text), {
+        direction: "inbound",
+        agentName: ctx.ownerAgentId,
+        sessionId: ctx.documentId,
+        ...(ctx.correlationId !== undefined ? { correlationId: ctx.correlationId } : {}),
+      });
+      if (verdict.disposition !== "block") return { block: false };
+      if (verdict.terminal !== true) {
+        logger.warn("document.inbound.screen.unavailable", {
+          documentId: ctx.documentId,
+          senderAgentId: ctx.senderAgentId,
+          reason: verdict.reason,
+          consequence: "the update was admitted WITHOUT a semantic screen",
+          correlationId: ctx.correlationId,
+        });
+        return { block: false };
+      }
+      if (verdict.reason !== INBOUND_INJECTION_BLOCKED) {
+        logger.info("document.inbound.screen.not_applicable", {
+          documentId: ctx.documentId,
+          senderAgentId: ctx.senderAgentId,
+          reason: verdict.reason,
+          consequence: "a terminal block this path does not apply to documents — admitted",
+          correlationId: ctx.correlationId,
+        });
+        return { block: false };
+      }
+      return { block: true, reason: verdict.reason };
+    },
     // M14-D5: a remote agent's id IS its K_local pubkey hex, so this needs no lookup — and a lookup
     // on the critical path of every signature check is precisely what it must not have.
     publicKeyFor: agentPublicKeyFromId,
@@ -3957,7 +4015,9 @@ async function startDaemonHoldingLock(
       return provider.sign(tbs);
     },
   });
-  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame);
+  // The classify-only half rides the same setter so the router and the ingest cannot disagree
+  // about what a document frame is (DOD-DOC-SCREEN-CLASSIFY-1).
+  sessionNodeManager.setOnDocumentFrame(documentLayer.onDocumentFrame, isDocumentFrame);
 
   // M14 / DOD-DOC-DELIVERY-2 — the outbound half, wired only now that INBOUND-2 is. The ordering
   // constraint on the DoD line is real and this is where it is honoured: a delivery worker with no
