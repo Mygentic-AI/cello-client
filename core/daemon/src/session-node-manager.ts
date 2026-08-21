@@ -3746,7 +3746,24 @@ export class SessionNodeManager {
     // this unit exists to stop.
     this.#heldRestored.delete(key);
     this.#heldReleased.delete(key);
-    this.#diverged.delete(key);
+    // DOD-M15-DIVERGE-1: `#diverged` is NOT evicted here, and the omission is the point.
+    //
+    // It was, and that made the gate that reads it best-effort in exactly the population it targets.
+    // This eviction runs on EVERY teardown including `destroySessionNode` with a non-sealed reason,
+    // which writes status `interrupted` — one of the two statuses the seal gate is scoped to. So a
+    // session that diverged and was then torn down arrived at the gate with the fact already
+    // forgotten, and the read site cannot tell "not diverged" from "we forgot": both are
+    // `has() === false`, both read ready, and the close proceeds.
+    //
+    // Divergence is a fact about the DURABLE TREE, not about the live node — the tree keeps the
+    // misplaced leaf whether or not a node exists — so it does not belong to a cache keyed on node
+    // lifetime. It is cleared where it actually stops being true: `clearDivergedOnTerminal`, below.
+    //
+    // NOT YET DURABLE ACROSS A RESTART, stated here rather than left to be rediscovered — the same
+    // way `frontier-mismatch.ts` states its own trade. A daemon restart still empties this set, and
+    // unlike a frontier mismatch (re-detected by the very next close) divergence is only
+    // re-detected by the next send that gets an ack behind the frontier. Until it has a column, a
+    // restarted daemon can read a diverged session as ready. Tracked as `DOD-M15-DIVERGE-DURABLE-1`.
     // DOD-M12B-SESSION-SEED-1: HAND THEM TO THE REVIVAL RECORD BEFORE DROPPING THEM. This eviction
     // runs on every teardown, including the interruption a revival is meant to undo — so clearing
     // the addresses here is what left a revived session unable to dial anyone. The revival record
@@ -6251,6 +6268,16 @@ export class SessionNodeManager {
     /** DOD-M12B-INDEX-1: of `heldCount`, how many are THIS side's own sends versus the
      *  counterparty's. They block a seal identically and mean completely different things. */
     heldOwn: number; heldReceived: number;
+    /**
+     * DOD-M15-DIVERGE-1 — this tree and the relay's counter have PROVABLY parted.
+     *
+     * The other two counters both measure the same direction: positions the relay committed that
+     * this tree has not appended. This is the OPPOSITE direction — this tree holds a leaf at a
+     * position the relay assigned to something else — and it is the direction an injected or forged
+     * leaf appears in. Without it `ready` was asymmetric, and a diverged session read as perfectly
+     * sealable right up until the counterparty answered `leaf_count_mismatch`, which is terminal.
+     */
+    diverged: boolean;
   } {
     const key = this.#k(agentName, sessionId);
     // DOD-M12B-STRAND-1: hydrate first. An under-counted `heldCount` reports a gapped session as
@@ -6288,10 +6315,16 @@ export class SessionNodeManager {
     // which is how a close-retry loop ends at force-abandon and no receipt.
     let heldOwn = 0;
     for (const e of this.#heldContent.get(key)?.values() ?? []) if (e.origin === "sent") heldOwn++;
+    // DOD-M15-DIVERGE-1: the third term, and the one that closes the asymmetry. `#diverged` is set
+    // only where the parting is PROVEN — an ack came back behind our frontier — never where it is
+    // merely suspected, because a gate that refuses a healthy session forever is worse than the bug
+    // it guards: force-abandon, with no receipt, becomes the only exit.
+    const diverged = this.#diverged.has(key);
     return {
-      ready: missingLeaves === 0 && heldCount === 0,
+      ready: missingLeaves === 0 && heldCount === 0 && !diverged,
       treeSize, highWaterSeq, heldCount, missingLeaves,
       heldOwn, heldReceived: heldCount - heldOwn,
+      diverged,
     };
   }
 
@@ -6314,6 +6347,17 @@ export class SessionNodeManager {
   sealReadinessView(agentName: string, sessionId: string): SealReadinessView {
     const key = this.#k(agentName, sessionId);
     const r = this.sealReadiness(agentName, sessionId);
+    // DOD-M15-DIVERGE-1: READ THIS BEFORE THE `!ready` BRANCH, and the order is load-bearing.
+    // `diverged` is now a term in `ready`, so a diverged session reaches `!ready` — where it would
+    // report `blocked` with awaitingArrival and heldBehindGap both ZERO, replacing an accurate,
+    // specific answer with one that describes nothing and invites a retry that can never work.
+    // Divergence is permanent and has its own state; the gap cases below are the ones that resolve.
+    if (r.diverged) {
+      // NOT `ready`. The tree is ahead of the relay's counter for good, so a close here signs a root
+      // the counterparty answers `leaf_count_mismatch` to — terminal, and the receipt is gone. The
+      // raw counters cannot see this: nothing is missing and nothing is held.
+      return { state: "unknown", reason: "record_diverged_from_relay" };
+    }
     if (!r.ready) {
       const oldestHeldMs = this.#oldestHeldMs(agentName, sessionId);
       return {
@@ -6325,12 +6369,6 @@ export class SessionNodeManager {
         heldBehindGap: r.heldCount,
         oldestHeldMs,
       };
-    }
-    if (this.#diverged.has(key)) {
-      // NOT `ready`. The tree is ahead of the relay's counter for good, so a close here signs a root
-      // the counterparty answers `leaf_count_mismatch` to — terminal, and the receipt is gone. The
-      // raw counters cannot see this: nothing is missing and nothing is held.
-      return { state: "unknown", reason: "record_diverged_from_relay" };
     }
     if (r.treeSize > 0 && !this.#orderingObserved.has(key)) {
       return {
@@ -9579,6 +9617,12 @@ export class SessionNodeManager {
      */
     if (status === "sealed" || status === "abandoned") {
       this.#destroySessionSeed(agentName, sessionId);
+      // DOD-M15-DIVERGE-1: divergence stops being true HERE and only here. It used to be dropped by
+      // `#evictSessionCaches` on every node teardown — including the one that writes `interrupted`,
+      // which is a status the seal gate still acts on, so the fact was forgotten while it was still
+      // load-bearing. A terminal status is the one point at which no future close can be refused,
+      // so the flag has nothing left to protect.
+      this.#diverged.delete(this.#k(agentName, sessionId));
     }
     // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
     // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.

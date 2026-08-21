@@ -1144,6 +1144,28 @@ async function startDaemonHoldingLock(
           // not have ingested it yet when the seal request arrives over the signaling channel.
           // The relay path avoids this entirely — it posts a SEAL ctrl leaf and waits for the
           // counterparty to independently co-seal; no bilateral leaf-count comparison needed.
+          /**
+           * DOD-M15-DIVERGE-1 (review HIGH-3) — the gate has to hold on the path with no operator.
+           *
+           * `cello_close_session` refuses a diverged record, but this autonomous path never
+           * consulted `sealReadiness` at all: it read `placed.placed` and discarded
+           * `placed.diverged`, then initiated the seal directly. So "a diverged session is blocked
+           * from sealing" held for the close a human drives and not for the one that runs itself —
+           * which is the worse of the two, because the append two lines above is, by its own
+           * comment, "the riskiest append in the codebase" for exactly this reason.
+           *
+           * THE LOG IS THE SURFACE HERE, and that is not a weakening of Invariant 2. There is no
+           * caller to answer — nothing is awaiting a response on this path — so the log carries the
+           * whole warning rather than half of it.
+           */
+          const oneshotReadiness = sessionNodeManager.sealReadiness(agentName, sessionId);
+          if (oneshotReadiness.diverged) {
+            logger.warn("session.away.inbox.oneshot.seal_skipped_diverged", {
+              agentName, sessionId,
+              treeSize: oneshotReadiness.treeSize, highWaterSeq: oneshotReadiness.highWaterSeq,
+              impact: "this side's tree parted from the relay's ordering, so the seal was NOT initiated — the session stays closeable by hand, where the operator is told what parted and can compare counts with the counterparty before deciding",
+            });
+          } else {
           void (async () => {
             const correlationId = randomUUID();
             const sk = sealKey(agentName, sessionId);
@@ -1231,6 +1253,7 @@ async function startDaemonHoldingLock(
               sealInterruptedInProgress.delete(sealKey(agentName, sessionId));
             }
           })();
+          }
         }
       }
       return;

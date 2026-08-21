@@ -157,6 +157,12 @@ const TERMINAL_SEAL_REFUSALS: ReadonlySet<string> = new Set([
   // arrives as `detail.rejection_reason` under the rejection above. Naming the bare string here
   // was inert: the close cannot produce it.
   "seal_interrupted_leaf_count_mismatch",
+  // DOD-M15-DIVERGE-1: this side's tree parted from the relay's ordering. Nothing backfills or
+  // re-numbers a leaf, so the refusal is identical on every attempt — spending the retry budget on
+  // it only delays the durable `restart_seal_gave_up_at` it was always going to reach. The operator
+  // decides between comparing counts with the counterparty and force-abandoning; a resolver cannot
+  // do either.
+  "session_record_diverged",
   "session_not_found",
   // The relay released the session (it drops one 24 h after the last message), so there is nothing
   // left for any directory to rebuild the record from. No amount of retrying brings it back.

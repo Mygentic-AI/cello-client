@@ -57,7 +57,7 @@ function harness(opts: {
     // M12-P14: this suite is about what a close returns AFTER its own seal landed, so the chain is
     // complete by construction — report ready and leave the seal path under test unchanged. The
     // incomplete case has its own tests (m12-p14-seal-readiness).
-    sealReadiness: () => ({ ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0 }),
+    sealReadiness: () => ({ ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
   };
 
   registerCloseSessionHandler({
