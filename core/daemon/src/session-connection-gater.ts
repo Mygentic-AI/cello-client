@@ -96,6 +96,19 @@ export class SessionConnectionGater implements ConnectionGater {
     this.#allowedOutboundPeerIds.add(peerId);
   }
 
+  /**
+   * DOD-M15-FRAME-1: is this peer on the OUTBOUND allowlist?
+   *
+   * Read by the promotion-time eviction sweep, which disconnects peers that attached before the
+   * gate narrowed — libp2p does not re-run a gater against connections that already exist. Relay
+   * peers sit on this list because reservation refreshes ride them, and hanging one up would cost
+   * the agent its inbound reachability to remove a peer that cannot speak the content protocol
+   * anyway. Exposed as a question rather than by handing out the set, so the sweep cannot widen it.
+   */
+  isAllowedOutboundPeer(peerId: string): boolean {
+    return this.#allowedOutboundPeerIds.has(peerId);
+  }
+
   getSessionId(): string {
     return this.#sessionId;
   }

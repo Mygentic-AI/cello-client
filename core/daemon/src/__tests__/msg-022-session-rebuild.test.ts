@@ -303,13 +303,26 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       ["#insertSessionRow", "the row already exists — a revival updates its status instead"],
       ["#ensureStandingReceiver", "no receiver is consumed, so none needs replacing"],
       ["#rememberSessionSeed", "the identity is what a revival RESTORES; it was recorded at establishment"],
-      ["#recordRelayAssignment", "the relay already recorded this session at first establishment"],
-      ["#maybeAutoAcknowledgeSeal", "reached from the relay leaf handler, which both paths register"],
-      // The inbound ACCEPTANCE accounting (D18): these decide whether to admit a NEW session from
-      // this sender. A revival admits nothing new — the session was already accepted — so repeating
-      // them would charge the counterparty a second time for one conversation.
-      ["#getUnreadReceivedCount", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
-      ["#getReceivedBytesTotal", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
+      /**
+       * DOD-M15-FRAME-1 (review F5): FOUR EXEMPTIONS WERE DELETED HERE, found dead the moment the
+       * inverse check below was added — `#recordRelayAssignment`, `#maybeAutoAcknowledgeSeal`,
+       * `#getUnreadReceivedCount`, `#getReceivedBytesTotal`.
+       *
+       * Each carried a written reason for why revival need not repeat a step establishment makes.
+       * Establishment no longer makes any of them in this region: `recordRelayAssignment` has no
+       * call site left anywhere in the manager, and the other three moved outside
+       * `acceptSession`…`destroySessionNode`. So the list was explaining decisions about code that
+       * had gone — which reads as considered judgement and is really just residue, and it is the
+       * precise failure the one-directional check could not see.
+       */
+      // DOD-M15-FRAME-1. Establishment PROMOTES a standing receiver, which was built with
+      // `allowedPeerId: null` and therefore accepted everyone — so a stranger can be attached when
+      // the gate narrows, and libp2p does not re-run a gater against live connections. Revival has
+      // no such window: `reviveSessionNode` constructs a FRESH gater with the counterparty already
+      // set (`allowedPeerId: identity.counterpartyPeerId`) and hands it to a node built moments
+      // later, so there is no connection predating the narrowing and nothing to evict. Exempt
+      // because the hole cannot exist here, not because the sweep is optional.
+      ["#evictPeersOutsideGate", "establishment promotes an open receiver; revival builds a fresh node behind a gater that is narrow from birth, so no peer can predate the gate"],
     ]);
 
     const calls = new Set(
@@ -327,6 +340,22 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       "a revived session that skips any of these is not a session: it reports active while some " +
       "part of it — inbound delivery, liveness, the content handler — was never wired. That is the " +
       "defect class this whole file exists for, and it shipped past a green suite for two days.",
+    ).toEqual([]);
+
+    /**
+     * DOD-M15-FRAME-1 (review F5): THE EXEMPTIONS ARE CHECKED IN BOTH DIRECTIONS.
+     *
+     * The list above scans what establishment actually calls, which is the right inverse shape. But
+     * nothing asserted that every EXEMPT key is still one of those calls — so deleting a step from
+     * `acceptSession` left this test green with a dead exemption still carrying a written reason for
+     * something that no longer runs. A stale exemption is worse than no exemption: it reads as a
+     * considered decision about live code.
+     */
+    const staleExemptions = [...EXEMPT.keys()].filter((k) => !calls.has(k));
+    expect(
+      staleExemptions,
+      "an EXEMPT entry names a step establishment no longer makes — delete the exemption, or " +
+      "find out why the step disappeared",
     ).toEqual([]);
   }, 60_000);
 

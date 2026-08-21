@@ -49,7 +49,11 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
 }
 
 /** A sink that can receive a frame on its registered content handler. */
-interface FrameSink { invokeHandler(data: unknown): void }
+// DOD-M15-FRAME-1: the sender's peer id rides with the frame, because the real transport delivers
+// it — `node.ts` hands the handler `connection?.remotePeer?.toString()`, the Noise-authenticated
+// identity. The content protocol now pins every frame to the session's counterparty, so a fake that
+// delivers frames from nobody is testing a transport that does not exist.
+interface FrameSink { invokeHandler(data: unknown, fromPeerId: string): void }
 
 /**
  * A node whose newStream().send() delivers the framed bytes to its PEER's registered
@@ -57,7 +61,7 @@ interface FrameSink { invokeHandler(data: unknown): void }
  * delivery-ACK round-trip through the real lp/CBOR decode + handler dispatch path.
  */
 class WiredNode implements Partial<CelloNode>, FrameSink {
-  #handler: ((stream: Stream) => void) | null = null;
+  #handler: ((stream: Stream, remotePeerId?: string) => void) | null = null;
   peer: FrameSink | null = null;
   readonly #peerId = `wired-${Math.random().toString(36).slice(2)}`;
   async start(): Promise<void> {}
@@ -65,14 +69,14 @@ class WiredNode implements Partial<CelloNode>, FrameSink {
   getPeerId(): string { return this.#peerId; }
   listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, h: (stream: Stream) => void): Promise<void> { this.#handler = h; }
+  async handle(_p: string, h: (stream: Stream, remotePeerId?: string) => void): Promise<void> { this.#handler = h; }
   getProtocols(): string[] { return []; }
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
   onPeerConnect(_h: (p: string) => void): void {}
   onPeerDisconnect(_h: (p: string) => void): void {}
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
-  invokeHandler(data: unknown): void {
+  invokeHandler(data: unknown, fromPeerId: string): void {
     const h = this.#handler;
     if (!h) return;
     const chunks = [data];
@@ -86,11 +90,14 @@ class WiredNode implements Partial<CelloNode>, FrameSink {
         } };
       },
     } as unknown as Stream;
-    h(inbound);
+    h(inbound, fromPeerId);
   }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
     const peer = this.peer;
-    return { send(data: unknown) { peer?.invokeHandler(data); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;
+    // The RECEIVER sees the SENDER's peer id, which is what the transport binds and what the
+    // session's `counterpartySessionPeerId` was set to when the pair was cross-wired.
+    const fromPeerId = this.getPeerId();
+    return { send(data: unknown) { peer?.invokeHandler(data, fromPeerId); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;
   }
 }
 
@@ -187,12 +194,29 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
       lp.encode.single(CBOR_ENC.encode({ type: "content_delivery_ack", session_id: SID, content_hash: hash, level }));
 
     // A `received` ACK must NOT resolve the awaiting entry.
-    nodeA.invokeHandler(ackFrame("received"));
+    nodeA.invokeHandler(ackFrame("received"), "bob-peer");
     await new Promise((r) => setTimeout(r, 30));
     expect(a.events.some((e) => e.event === "content.delivery.acked")).toBe(false);
 
-    // The `persisted` ACK resolves it.
-    nodeA.invokeHandler(ackFrame("persisted"));
+    /**
+     * DOD-M15-FRAME-1: a `persisted` ACK from ANYONE ELSE must not resolve it either.
+     *
+     * This handler had no sender check and no session check at all — a shape test and a string
+     * compare. A stranger holding a pre-positioned connection to the standing receiver could forge
+     * one and cancel the park-on-undelivered timer, so the operator's message would silently vanish
+     * while every local surface reported it delivered. Asserted BEFORE the legitimate ACK below, so
+     * a regression cannot be masked by the real one arriving afterwards.
+     */
+    nodeA.invokeHandler(ackFrame("persisted"), "stranger-peer");
+    await new Promise((r) => setTimeout(r, 30));
+    expect(
+      a.events.some((e) => e.event === "content.delivery.acked"),
+      "a forged ACK from a non-counterparty must not resolve the delivery timer",
+    ).toBe(false);
+    expect(a.events.some((e) => e.event === "session.content.peer_mismatch")).toBe(true);
+
+    // The `persisted` ACK from the real counterparty resolves it.
+    nodeA.invokeHandler(ackFrame("persisted"), "bob-peer");
     expect(await waitFor(() => a.events.some((e) => e.event === "content.delivery.acked"))).toBe(true);
     const acked = a.events.find((e) => e.event === "content.delivery.acked");
     expect(acked?.context.level).toBe("persisted");
