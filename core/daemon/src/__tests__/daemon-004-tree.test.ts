@@ -30,11 +30,15 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { decode as cborDecode, Encoder } from "cbor-x";
-
-// DOD-M15-FRAME-1: matches the production encoder (`tagUint8Array: false`) so a hand-built frame
-// decodes to the same shapes the real wire produces — a Uint8Array must not arrive tagged.
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
+import { decode as cborDecode } from "cbor-x";
+// DOD-M15-FRAME-1 (review F6): the PRODUCTION encoder, imported rather than reconstructed. A local
+// `new Encoder({ tagUint8Array: false })` got the byte fields right and still differed — `useRecords`
+// defaults to true, so its frames went out as cbor-x record structures where production emits plain
+// CBOR maps. Harmless here, and exactly the drift a hand-rolled copy invites. Importing the real one
+// means the question cannot recur.
+import { encodeCbor, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
+import { generateKeypair } from "@cello-protocol/crypto";
+import { encodeStructure1 } from "../session-relay-client.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -141,7 +145,7 @@ class LoopbackFakeNode implements Partial<CelloNode> {
   deliverFrame(frame: Record<string, unknown>, fromPeerId: string): void {
     const handler = this.#handler;
     if (!handler) return;
-    const chunks = [lp.encode.single(CBOR_ENC.encode(frame))];
+    const chunks = [lp.encode.single(encodeCbor(frame))];
     const inbound = {
       [Symbol.asyncIterator]() {
         let i = 0;
@@ -472,6 +476,164 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const refused = events.find((e) => e.event === "session.content.session_mismatch");
       expect(refused).toBeDefined();
       expect(refused!.context.claimedSessionId).toBe("(absent)");
+    });
+
+    /**
+     * DOD-M15-FRAME-1 (review: the freeze had NO coverage and survived deletion with a green suite).
+     *
+     * The existing ordering tests all drive `recordOrderingRecord` — the PARK path, which by design
+     * discards `fatal` — so they assert the pre-fix behaviour and pass either way. These go through
+     * the LIVE path: a real `content_frame` carrying a real ordering record, delivered by a peer
+     * that passes the transport gate. That distinction is the whole point: in the session-open MITM
+     * the substituted party IS the peer we dialled, so the transport gate cannot see it and the
+     * signer comparison is what shows the substitution.
+     */
+    const kpRecord = async (
+      kp: ReturnType<typeof generateKeypair>,
+      content: Uint8Array,
+      seq: number,
+      opts: { corruptSig?: boolean } = {},
+    ) => {
+      const pubkey = await kp.getPublicKey();
+      const contentHash = msgLeafHash(content);
+      const structure1Cbor = encodeStructure1(contentHash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+      let sig = await kp.sign(structure1Cbor);
+      if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
+      const built = buildStructure2(seq, pubkey, contentHash, sig, new Uint8Array(32));
+      if (!built.ok) throw new Error("buildStructure2 failed");
+      return { structure1Cbor, structure2Cbor: encodeStructure2(built.structure2), contentHash };
+    };
+
+    const sessionWithCounterparty = async (kp: ReturnType<typeof generateKeypair>, db: string) => {
+      const node = new LoopbackFakeNode();
+      const mgr = await makeManager(logger, join(tempDir, db), node as unknown as CelloNode);
+      const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
+      await mgr.createSessionNode(sid, "alice", cpHex, "bob-peer-id", "corr-1");
+      return { node, mgr };
+    };
+
+    it("FREEZES the session when the ordering record is signed by a NON-counterparty key", async () => {
+      // The session-open MITM, at the one place it shows. M holds the session peer id we dialled —
+      // so the transport gate passes — but signs the leaf with M's own key, not B's.
+      const counterparty = generateKeypair();
+      const attacker = generateKeypair();
+      const { node, mgr } = await sessionWithCounterparty(counterparty, "mitm.db");
+
+      const content = new TextEncoder().encode("a message B never wrote");
+      const rec = await kpRecord(attacker, content, 1);
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: content, content_hash: rec.contentHash,
+        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(events.find((e) => e.event === "session.content.ordering.wrong_signer")).toBeDefined();
+      expect(events.find((e) => e.event === "session.content.identity.frozen"), "the check must ACT, not just fire").toBeDefined();
+      expect(events.find((e) => e.event === "session.content.received"), "nothing may be ingested").toBeUndefined();
+      expect(mgr.readTranscript("alice", sid).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+    });
+
+    it("FREEZES on a bad signature too — a supplied proof that fails is not an absent one", async () => {
+      const counterparty = generateKeypair();
+      const { node, mgr } = await sessionWithCounterparty(counterparty, "badsig-live.db");
+
+      const content = new TextEncoder().encode("forged");
+      const rec = await kpRecord(counterparty, content, 1, { corruptSig: true });
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: content, content_hash: rec.contentHash,
+        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(events.find((e) => e.event === "session.content.identity.frozen")).toBeDefined();
+      expect(mgr.getSessionTree("alice", sid).size()).toBe(0);
+    });
+
+    it("a frozen session is NOT revived by a read — the freeze must not undo itself", async () => {
+      /**
+       * The freeze tears the node down, and a teardown writes `interrupted` — which is the REVIVABLE
+       * status. Before this was pinned, the operator's very next read rebuilt the session behind a
+       * gater allowing the same peer and logged it as a success, so a security decision reversed
+       * itself silently while the log said no further content would be accepted.
+       */
+      const counterparty = generateKeypair();
+      const attacker = generateKeypair();
+      const { node, mgr } = await sessionWithCounterparty(counterparty, "frozen-revive.db");
+
+      const content = new TextEncoder().encode("mitm");
+      const rec = await kpRecord(attacker, content, 1);
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: content, content_hash: rec.contentHash,
+        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+      expect(events.find((e) => e.event === "session.content.identity.frozen"), "precondition").toBeDefined();
+
+      const revived = await mgr.reviveSessionNode("alice", sid, "corr-revive");
+      expect(revived.ok, "a frozen session must not come back on a read").toBe(false);
+      expect(revived.ok === false && revived.reason).toBe("session_frozen_identity_failure");
+      // Invariant 4: the refusal names what remains open, and does not send them to a dead end.
+      expect(revived.ok === false && String(revived.guidance)).toMatch(/cello_transcript/);
+      expect(revived.ok === false && String(revived.guidance)).toMatch(/cello_close_session/);
+    });
+
+    it("does NOT freeze when the counterparty cannot be resolved — 'could not tell' is not 'refuted'", async () => {
+      /**
+       * The false-positive guard, and the branch with the widest blast radius if it were wrong.
+       * `counterparty_unknown` means we cannot prove the signer either way; refusing there would
+       * strand sessions whose record we merely failed to read, rather than sessions under attack.
+       */
+      const kp = generateKeypair();
+      const node = new LoopbackFakeNode();
+      const mgr = await makeManager(logger, join(tempDir, "cp-unknown.db"), node as unknown as CelloNode);
+      // Session created with an EMPTY counterparty pubkey — resolvable session, unresolvable signer.
+      await mgr.createSessionNode(sid, "alice", "", "bob-peer-id", "corr-1");
+
+      const content = new TextEncoder().encode("unverifiable but not refuted");
+      const rec = await kpRecord(kp, content, 1);
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: content, content_hash: rec.contentHash,
+        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(events.find((e) => e.event === "session.content.ordering.wrong_signer"), "the check still runs").toBeDefined();
+      expect(events.find((e) => e.event === "session.content.identity.frozen"), "an unprovable signer must NOT freeze").toBeUndefined();
+      /**
+       * MEASURED, not assumed: the sequence is `ordering.wrong_signer` → `content.sender_unresolved`.
+       * The content does not ingest here — but that is the ingest path's OWN pre-existing guard
+       * refusing to attribute a message it cannot resolve a sender for, not this unit's freeze. The
+       * distinction is the whole point of the test: an unprovable signer must not be escalated into
+       * a session-ending decision by the code this unit added.
+       *
+       * It also means `counterparty_unknown` is barely reachable on the live path — a real session
+       * always carries a counterparty pubkey, and without one the ingest guard fires first. The soft
+       * branch is kept anyway, because a gate that depends on another guard running first is a gate
+       * with a hidden precondition.
+       */
+      expect(events.find((e) => e.event === "session.content.sender_unresolved")).toBeDefined();
+    });
+
+    it("a frame with NO ordering record still ingests, and SAYS it was unverified", async () => {
+      // The relay-degraded path: refusing here would make the relay a precondition for reading mail.
+      // But the weaker guarantee must not look identical to the stronger one in the log.
+      const counterparty = generateKeypair();
+      const { node } = await sessionWithCounterparty(counterparty, "no-record.db");
+
+      const content = new TextEncoder().encode("no ordering record");
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: content, content_hash: msgLeafHash(content),
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(events.find((e) => e.event === "session.content.received"), "relay-degraded delivery must still work").toBeDefined();
+      const absent = events.find((e) => e.event === "session.content.ordering.absent");
+      expect(absent, "and it must be visible that the signer was not verified for this message").toBeDefined();
     });
 
     it("a legitimate frame from the real counterparty is untouched — no new false positive", async () => {

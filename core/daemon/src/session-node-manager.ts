@@ -732,6 +732,12 @@ export class SessionNodeManager {
   // safe to close — the close would be signed, refused as `leaf_count_mismatch`, and the receipt
   // lost for good.
   #diverged = new Set<string>();
+  // DOD-M15-FRAME-1 (review F1): sessions frozen because a frame failed to verify against the
+  // expected counterparty. Consulted by `reviveSessionNode` — a teardown writes `interrupted`,
+  // which is the REVIVABLE status, so without this the next `cello_receive` silently rebuilt the
+  // session and re-admitted the same peer. NOT cleared by `#evictSessionCaches`: the freeze is a
+  // fact about the session, not about the node that was torn down to enforce it.
+  #frozenSessions = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -7751,9 +7757,31 @@ export class SessionNodeManager {
       });
       return;
     }
-    for (const { peerId } of connections) {
-      if (peerId === allowedPeerId) continue;
-      if (gater.isAllowedOutboundPeer(peerId)) continue;
+    const toEvict = connections
+      .map((c) => c.peerId)
+      .filter((peerId) => peerId !== allowedPeerId && !gater.isAllowedOutboundPeer(peerId));
+    /**
+     * CONCURRENT AND CAPPED, because the count is ATTACKER-CONTROLLED (review F4).
+     *
+     * This runs inside `acceptSession`, before the session row is written, and the standing receiver
+     * accepts everyone by design — so opening N connections to an agent's advertised receiver used
+     * to make every later session setup on that agent wait for N sequential graceful closes.
+     * `hangUp` is libp2p's graceful close and takes no timeout, so the wait was unbounded in both
+     * directions. Evicting an injection foothold must not itself become the way to stall an agent.
+     *
+     * The cap is a LOGGED truncation, never a silent one: what is left behind still cannot inject
+     * (the frame gate refuses it and now hangs it up on first contact), and the next promotion
+     * sweeps again — but an operator reading this needs to know the sweep did not finish.
+     */
+    const EVICT_CAP = 32;
+    const batch = toEvict.slice(0, EVICT_CAP);
+    if (toEvict.length > batch.length) {
+      this.#logger.warn("session.gate.evict.capped", {
+        sessionId, trigger, attached: toEvict.length, evicting: batch.length,
+        impact: "more peers were attached outside the gate than one promotion evicts; the rest keep their connections until a later sweep, and are refused and hung up by the frame gate if they speak",
+      });
+    }
+    await Promise.allSettled(batch.map(async (peerId) => {
       try {
         await node.hangUp(peerId);
         this.#logger.warn("session.gate.evicted", {
@@ -7761,12 +7789,12 @@ export class SessionNodeManager {
           impact: "a peer attached to this node before the session narrowed its gate was disconnected; libp2p does not re-run the gater against live connections, so it would otherwise have stayed attached when the content protocol activated",
         });
       } catch (err: unknown) {
-        // Best-effort: the frame gate still refuses anything this peer sends.
+        // Best-effort: the frame gate still refuses anything this peer sends, and now hangs it up.
         this.#logger.debug("session.gate.evict.failed", {
           sessionId, trigger, peerId, error: extractErrorMessage(err),
         });
       }
-    }
+    }));
   }
 
   /**
@@ -7800,10 +7828,18 @@ export class SessionNodeManager {
     reason: string,
     correlationId?: string,
   ): Promise<void> {
+    // Review F1: MARK BEFORE TEARING DOWN. `destroySessionNode` writes `interrupted`, which is the
+    // revivable status — if the mark landed after, a read racing the teardown could revive the
+    // session out from under the freeze.
+    this.#frozenSessions.add(this.#k(agentName, sessionId));
     this.#logger.error("session.content.identity.frozen", {
       agentName, sessionId, reason, correlationId,
       observation: "a frame failed to verify against the expected counterparty's key; the session was frozen defensively; cause undetermined",
-      impact: "the content was NOT ingested, NOT displayed and NOT attributed to anyone, and no further content will be accepted on this session",
+      // Review F1: this said "no further content will be accepted on this session", which was FALSE
+      // as shipped — the next read revived it. It is true now, and it says how it is true, because
+      // an operator who reads "frozen" and then watches the session work again learns to distrust
+      // the log rather than the session.
+      impact: "the content was NOT ingested, NOT displayed and NOT attributed to anyone; the session will not be revived by a read or a send, and only a close or a fresh session moves it now",
     });
     try {
       // `"error"` maps to DB status `interrupted`, which is the SAME row an ordinary
@@ -7894,9 +7930,17 @@ export class SessionNodeManager {
          * investigation, which found this check *"fires correctly, and its answer is thrown away."*
          * A rogue quorum of the directories holding shares for agent B can sign a false
          * SessionAssignment naming M's key as B's, and everything downstream is genuinely real —
-         * M signs with M's own valid key. Nothing is missing for A to notice. **This comparison is
-         * the one place the substitution shows**, because `counterparty_pubkey` comes from A's own
-         * request and is untouched by anything the directory returns.
+         * M signs with M's own valid key. Nothing is missing for A to notice. This comparison is
+         * where the substitution shows, because `counterparty_pubkey` comes from A's own request
+         * and is untouched by anything the directory returns.
+         *
+         * ⚠️ IT SHOWS ONLY WHEN THE RECORD IS PRESENT (review F3). An earlier version of this
+         * comment said this was "the one place the substitution shows", full stop — and that
+         * asserted a property the code does not have: M can decline to supply an ordering record
+         * and be ingested without ever reaching this line. The caller logs
+         * `session.content.ordering.absent` so the weaker case is at least visible, and closing it
+         * needs a check that does not depend on the sender's cooperation — the relay's independent
+         * copy, `DOD-M15-CORROBORATE-1`.
          *
          * The soft half stays soft deliberately: `counterparty_unknown` means we cannot prove the
          * signer either way, and refusing there would strand sessions whose record we failed to
@@ -7991,8 +8035,36 @@ export class SessionNodeManager {
         this.#logger.warn("session.content.peer_mismatch", {
           agentName, sessionId, frameType,
           remotePeerId: remotePeerId ?? "(absent)", expected: expectedPeer ?? "(unknown)",
-          impact: "a frame arrived on this session's content protocol from a peer that is not its counterparty; it was refused — not ingested, not attributed, not recorded",
+          impact: "a frame arrived on this session's content protocol from a peer that is not its counterparty; it was refused — not ingested, not attributed, not recorded — and the peer was disconnected",
         });
+        /**
+         * PEER-ENDING, NOT SESSION-ENDING — and the difference is a deliberate deviation from the
+         * DoD clause (review F2).
+         *
+         * The clause says the refusal is session-ending. Applied HERE that would be a worse hole
+         * than the one it closes: a pre-positioned stranger could kill any session on the machine
+         * with a single frame, trading an injection hole for a denial-of-service hole. The
+         * session-ending response belongs where the evidence is about the SESSION's counterparty —
+         * `#freezeOnIdentityFailure`, reached when a party that IS the peer we dialled signs with a
+         * key that is not theirs.
+         *
+         * Here the evidence is about the PEER: they are not party to this session at all. So the
+         * connection goes and the session is untouched. Without this the stranger stayed attached
+         * for the life of the session and the gate re-refused each frame forever — and the eviction
+         * sweep's own fallback ("the frame gate still refuses anything this peer sends") only closes
+         * the loop if the frame gate does something about the connection.
+         *
+         * Fire-and-forget: a hang-up that fails must not turn a successful refusal into a thrown
+         * handler, and the refusal above has already done the load-bearing work.
+         */
+        if (remotePeerId) {
+          const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+          void entry?.node.hangUp(remotePeerId).catch((err: unknown) => {
+            this.#logger.debug("session.content.peer_mismatch.hangup_failed", {
+              sessionId, peerId: remotePeerId, error: extractErrorMessage(err),
+            });
+          });
+        }
         return;
       }
       const claimedSessionId = frame["session_id"];
@@ -8082,6 +8154,26 @@ export class SessionNodeManager {
           return;
         }
         framedSeq = ordering.seq;
+      } else {
+        /**
+         * Review F3 — THE WEAKER GUARANTEE MUST NOT BE INDISTINGUISHABLE FROM THE STRONGER ONE.
+         *
+         * A frame with no ordering record is still ingested, and that is correct: it is the
+         * documented relay-degraded path, and refusing it would make the relay a precondition for
+         * reading mail. But it means the per-message signer check is **opt-in for the sender** — a
+         * party that passed the peer gate and wants to avoid the comparison simply omits the proof.
+         * Silently, until now: nothing recorded that a message arrived unverified, so the log looked
+         * identical to one where every message had been checked.
+         *
+         * Not fatal, and deliberately not: an absent record proves nothing about the signer, and
+         * refusing on an absence would strand every relay-degraded session. What closes the omission
+         * case is relay-side corroboration — `DOD-M15-CORROBORATE-1` — where the relay holds the
+         * sender's signed hash independently and never routes it through this daemon.
+         */
+        this.#logger.info("session.content.ordering.absent", {
+          agentName, sessionId, correlationId,
+          impact: "this frame carried no signed ordering record, so its SIGNER was not verified for this message — it was ingested on the strength of the authenticated transport alone",
+        });
       }
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
@@ -9203,6 +9295,37 @@ export class SessionNodeManager {
         ok: false,
         reason: "session_terminal",
         guidance: `Session is '${record.status}'. A session that has ended cannot be revived; start a new one.`,
+      };
+    }
+    /**
+     * DOD-M15-FRAME-1 (review F1) — A DEFENSIVE FREEZE MUST NOT UNDO ITSELF ON THE NEXT READ.
+     *
+     * `#freezeOnIdentityFailure` tears the node down, and a teardown writes status `interrupted`.
+     * `interrupted` is not terminal — it is the *revivable* status — so `reviveIfNeededForRead`
+     * fired on the operator's very next `cello_receive`, rebuilt a node behind a gater allowing the
+     * SAME counterparty peer, flipped the row back to `active`, and logged it as a success.
+     *
+     * The freeze therefore lasted until the next keystroke, while the log line said *"no further
+     * content will be accepted on this session"*. A security decision that silently reverses itself,
+     * with a message asserting the opposite, is a worse defect than the one the freeze was added to
+     * fix — and it is the class this milestone exists to remove, reintroduced by its own fix.
+     *
+     * Checked BEFORE the cap and after the terminal statuses, so the answer names the freeze rather
+     * than whatever else the session would have been refused for.
+     *
+     * In memory, and so lost on a daemon restart — the same bound as `DOD-M15-DIVERGE-DURABLE-1`
+     * and for the same reason. The durable column is `DOD-M15-FREEZE-STATUS-1`; the reversibility
+     * could not wait for it.
+     */
+    if (this.#frozenSessions.has(key)) {
+      return {
+        ok: false,
+        reason: "session_frozen_identity_failure",
+        guidance:
+          `This session was frozen because a message failed to verify against the expected counterparty's key. It is not revived automatically, and reading or sending will not clear it. ` +
+          `Cause undetermined — that signal looks the same whether someone was impersonating your counterparty or CELLO's own delivery mishandled a fallback, so it is recorded as an observation and nothing has been concluded about them. ` +
+          `Your transcript up to the freeze is intact: cello_transcript ${sessionId} reads it. ` +
+          `To end the session and keep what it earned, close it — cello_close_session ${sessionId}. To talk to them again, start a fresh session rather than reviving this one.`,
       };
     }
 
