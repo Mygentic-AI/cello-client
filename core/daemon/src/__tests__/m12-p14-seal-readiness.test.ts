@@ -23,9 +23,9 @@ const SESSION = "cd".repeat(32);
 
 type Readiness = ReturnType<typeof readiness>;
 function readiness(
-  over: Partial<{ ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number; heldOwn: number; heldReceived: number }> = {},
+  over: Partial<{ ready: boolean; treeSize: number; highWaterSeq: number; heldCount: number; missingLeaves: number; heldOwn: number; heldReceived: number; diverged: boolean }> = {},
 ) {
-  const base = { ready: true, treeSize: 2, highWaterSeq: 1, heldCount: 0, missingLeaves: 0, heldOwn: 0, ...over };
+  const base = { ready: true, treeSize: 2, highWaterSeq: 1, heldCount: 0, missingLeaves: 0, heldOwn: 0, diverged: false, ...over };
   // DOD-M12B-INDEX-1: `heldReceived` defaults to "all of them", which is what `heldCount` meant
   // before the split — so a case that does not care about the sender keeps its old meaning instead
   // of silently becoming zero and dropping the clause it asserts on.
@@ -141,6 +141,89 @@ describe("M12-P14: a close will not seal a chain it knows is incomplete", () => 
 });
 
 /**
+ * DOD-M15-DIVERGE-1 — a detection that reaches only a status string is not a control.
+ *
+ * `#diverged` is set when an ack comes back BEHIND our frontier, which proves this tree and the
+ * relay's counter can never agree on a root again. It was logged at ERROR and reached exactly one
+ * consumer: the text `cello status` prints. The close gate — the one place the fact would change an
+ * outcome — could not see it, so the operator learned only when the counterparty answered
+ * `leaf_count_mismatch`, which is terminal and costs the receipt for good.
+ *
+ * The trap these tests pin: the pre-existing refusal tells the operator to WAIT AND RETRY, which is
+ * correct for a session waiting on arrival and permanently wrong for a diverged one. Reusing that
+ * reason would substitute a transient explanation for a permanent condition.
+ */
+describe("DOD-M15-DIVERGE-1: a diverged record blocks the seal and says so in its own words", () => {
+  it("refuses a diverged session, with a reason of its own — not session_incomplete", async () => {
+    // Nothing is missing and nothing is held: the raw counters are clean. Only `diverged` is set,
+    // which is exactly the shape that used to sail through the gate.
+    const h = harness(readiness({ ready: false, diverged: true, treeSize: 3, highWaterSeq: 1 }));
+    const res = await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>;
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("session_record_diverged");
+    expect(res.reason).not.toBe("session_incomplete");
+    expect(h.sealFlow(), "a diverged chain must never be offered for co-signing").toBe(0);
+  });
+
+  it("does NOT tell the operator to wait and retry — the condition is permanent", async () => {
+    // The error-substitution guard. `session_incomplete` guidance says "wait a moment and close
+    // again" and "the daemon just pulled from the relay". Both are false here: no pull backfills a
+    // position the relay already assigned to something else, so a retry loop ends at force:true and
+    // no receipt — the outcome this whole gate exists to prevent.
+    const h = harness(readiness({ ready: false, diverged: true }));
+    const g = String((await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>).guidance);
+
+    expect(g).not.toMatch(/wait a moment and close again/);
+    expect(g).toMatch(/permanent|cannot be recovered|can never/i);
+  });
+
+  it("names the affordance — the operator is told what actually remains open to them", async () => {
+    // Invariant 4. A refusal without a next step is where operators and agents both stall, and the
+    // stall here has a terminal exit sitting right next to it.
+    const h = harness(readiness({ ready: false, diverged: true }));
+    const g = String((await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>).guidance);
+
+    expect(g).toMatch(/cello_transcript/);
+    expect(g).toMatch(/force: true|force:true/);
+    expect(g, "the cost of the escape hatch must be explicit").toMatch(/no notarized receipt|no receipt/i);
+  });
+
+  it("emits its own log event as well as answering the caller — the log line is not replaced", async () => {
+    // Invariant 2: loud means the LOG **and** the agent, never one instead of the other. A fix that
+    // moved the message out of the log into the response would satisfy the caller and destroy the
+    // forensic trail.
+    const h = harness(readiness({ ready: false, diverged: true }));
+    await h.close({ session_id: SESSION }, "conn");
+
+    const blocked = h.events.find((e) => e.event === "session.seal.blocked_diverged");
+    expect(blocked, "the refusal must be in the log too").toBeDefined();
+    expect(blocked!.context.sessionId).toBe(SESSION);
+  });
+
+  it("force:true still escapes a diverged session — the exit must not be gated on the thing it exists for", async () => {
+    // A diverged session is PRECISELY what force exists for. Gating it would strand it completely.
+    const h = harness(readiness({ ready: false, diverged: true }));
+    const res = await h.close({ session_id: SESSION, force: true }, "conn") as Record<string, unknown>;
+
+    expect(res.ok).toBe(true);
+    expect(res.status).toBe("abandoned");
+    expect(h.abandons()).toBe(1);
+  });
+
+  it("an ordinary incomplete session keeps its own reason — the new branch does not swallow the old one", async () => {
+    // The reverse substitution, which is just as bad: a session genuinely waiting on arrival must
+    // NOT be told its record diverged, because that one reads as unrecoverable and sends the
+    // operator straight to force:true.
+    const h = harness(readiness({ ready: false, missingLeaves: 1, treeSize: 2, highWaterSeq: 2 }));
+    const res = await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>;
+
+    expect(res.reason).toBe("session_incomplete");
+    expect(String(res.guidance)).toMatch(/wait a moment and close again/);
+  });
+});
+
+/**
  * The arithmetic itself, against a REAL SessionNodeManager.
  *
  * Review (blocking): every test above supplies a pre-built readiness object, so the body of
@@ -203,6 +286,54 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
     // Under the old subtraction this would have been 5. It is 1 — the one genuinely outstanding
     // witness — and it is driven by the witness map, not by the gap between the two spaces.
     expect(withWitness.missingLeaves).toBe(1);
+  });
+
+  it("DOD-M15-DIVERGE-1: an ack behind our frontier makes the session NOT ready", async () => {
+    // The symmetry clause, at the level that computes it. Before this unit, `ready` was
+    // `missingLeaves === 0 && heldCount === 0` — both of which measure the relay-has-that-we-lack
+    // direction. This is the opposite direction, and it is the one an injected or forged leaf
+    // appears in: our tree holds a position the relay assigned to something else.
+    await fx.createSession(SID, "alice");
+    fx.seedSent("alice", SID, "one");
+    fx.seedSent("alice", SID, "two");
+
+    // The relay answers with a position BEHIND our frontier — the documented shape after an
+    // unwitnessed append. Nothing is missing, nothing is held; only the direction is wrong.
+    const placed = fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+    expect(placed, "the fixture must actually diverge").toMatchObject({ placed: true, diverged: true });
+
+    const r = fx.snm.sealReadiness("alice", SID);
+    expect(r.diverged).toBe(true);
+    expect(r.missingLeaves, "nothing is missing — the old counters cannot see this").toBe(0);
+    expect(r.heldCount, "nothing is held either").toBe(0);
+    expect(r.ready, "and yet it must NOT be ready").toBe(false);
+  });
+
+  it("DOD-M15-DIVERGE-1: the status surface keeps its own distinct answer, not the blocked one", async () => {
+    // Regression guard on the fix itself. Folding `diverged` into `ready` makes a diverged session
+    // fall into `sealReadinessView`'s `!ready` branch, which reports `blocked` with
+    // awaitingArrival/heldBehindGap both zero — replacing an accurate, specific answer with a
+    // meaningless one. The diverged check has to be read BEFORE that branch.
+    await fx.createSession(SID, "alice");
+    fx.seedSent("alice", SID, "one");
+    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+
+    expect(fx.snm.sealReadinessView("alice", SID)).toEqual({
+      state: "unknown",
+      reason: "record_diverged_from_relay",
+    });
+  });
+
+  it("DOD-M15-DIVERGE-1: a healthy session is untouched — no new false positive", async () => {
+    // The fear this codebase states explicitly: a gate that refuses a healthy session forever is
+    // worse than the bug it guards, because force-abandon is then the only exit. In-order placement
+    // must stay ready.
+    await fx.createSession(SID, "alice");
+    const first = fx.snm.placeOwnLeaf("alice", SID, "dd".repeat(32), new TextEncoder().encode("in order"), 0);
+
+    expect(first).toMatchObject({ placed: true });
+    expect(first).not.toHaveProperty("diverged");
+    expect(fx.snm.sealReadiness("alice", SID)).toMatchObject({ ready: true, diverged: false });
   });
 
   it("never reports a negative or absurd count when the relay is behind the tree", async () => {

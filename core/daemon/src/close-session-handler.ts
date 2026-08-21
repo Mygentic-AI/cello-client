@@ -605,7 +605,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     const sealable = record.status === "active" || record.status === "interrupted";
     let readiness = sealable
       ? sessionNodeManager.sealReadiness(record.agent_name, sessionId)
-      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0 };
+      // DOD-M15-DIVERGE-1: `diverged: false` for the same reason every other field here is a
+      // no-op value — this branch is the NOT-sealable statuses, where readiness is never consulted
+      // and both gates below are skipped. It asserts nothing about the record; it keeps the shape.
+      : { ready: true, treeSize: 0, highWaterSeq: -1, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false };
     // Review HIGH-1: the guidance used to promise "the daemon pulls missing content automatically"
     // while nothing on this path pulled anything — autoRecoverForAgent fires on signaling reconnect,
     // seal-upgrade and agent start, none of which a close triggers. So the operator waited for an
@@ -624,6 +627,44 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           error: err instanceof Error ? err.message : String(err),
         });
       }
+    }
+    /**
+     * DOD-M15-DIVERGE-1 — a PERMANENT parting gets its own answer, before the transient one.
+     *
+     * `#diverged` is set when an ack came back behind this side's frontier, which proves the tree
+     * and the relay's counter can never agree on a root again. It was detected correctly, logged at
+     * ERROR, and reached exactly one consumer: the text `cello status` prints. This gate — the one
+     * place the fact changes an outcome — could not see it, so the operator learned only when the
+     * counterparty answered `leaf_count_mismatch`, by which point the receipt was gone.
+     *
+     * BRANCHED, NOT FOLDED INTO `session_incomplete`, and that is the whole point of the ordering.
+     * The refusal below tells the operator to "wait a moment and close again" and says the daemon
+     * just pulled from the relay — true and useful for a session waiting on arrival, and false for
+     * this one. Nothing backfills a position the relay already assigned to something else, so a
+     * retry loop on that guidance ends where every one of them ends: `force: true`, terminal, no
+     * receipt. Substituting a transient explanation for a permanent condition is the error class
+     * this whole milestone exists to remove; doing it inside its own fix would be the worst place.
+     *
+     * The ERROR log at the detection site STAYS. This is the second half of it, not a relocation:
+     * the log is the forensic record and this is the control. (M15-PROCEDURE §2b, Invariant 2.)
+     */
+    if (sealable && readiness.diverged) {
+      logger.warn("session.seal.blocked_diverged", {
+        agentName: record.agent_name, sessionId,
+        treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
+        impact: "this side's tree holds a leaf at a position the relay assigned to something else, so the two can never agree on a root — the session cannot be sealed bilaterally and no retry changes that",
+      });
+      return {
+        ok: false,
+        reason: "session_record_diverged",
+        tree_size: readiness.treeSize,
+        relay_high_water: readiness.highWaterSeq,
+        guidance:
+          `This session's record has permanently parted from the relay's. Your tree holds ${readiness.treeSize} message(s) at positions the relay assigned differently, so the two sides can never compute the same root and a seal here would be refused as leaf_count_mismatch — which is terminal. ` +
+          `This cannot be recovered: nothing in the protocol backfills or re-numbers a leaf, so waiting will not help and retrying this close will return exactly this answer. ` +
+          `Your messages are safe and readable — cello_transcript ${sessionId} shows the full record, and it stays available whatever you do next. ` +
+          `The only exit is cello_close_session ${sessionId} { force: true }, which ends the session with NO notarized receipt. That is the real cost here, and it was already paid when the records parted, not by the force call.`,
+      };
     }
     if (sealable && !readiness.ready) {
       logger.warn("session.seal.blocked_incomplete", {
