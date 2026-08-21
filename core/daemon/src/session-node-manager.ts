@@ -2756,6 +2756,7 @@ export class SessionNodeManager {
       }
       ({ node, gater, autoNat, seed } = sr);
       gater.setAllowedPeer(counterpartyPeerId);
+      await this.#evictPeersOutsideGate(node, gater, sessionId, counterpartyPeerId, "outbound_promotion");
       // Hand this agent's standing receiver off to this session; a replacement is spun up below.
       this.#standingReceivers.delete(agentName);
     } else {
@@ -3392,6 +3393,7 @@ export class SessionNodeManager {
 
     // AC-015: update gater BEFORE retrieving multiaddr / returning to caller
     gater.setAllowedPeer(initiatorPeerId);
+    await this.#evictPeersOutsideGate(node, gater, sessionId, initiatorPeerId, "inbound_promotion");
 
     const peerId = node.getPeerId();
     const addrs = node.listenAddresses();
@@ -7711,6 +7713,60 @@ export class SessionNodeManager {
     // false-positive shape this unit is careful to avoid. The live direct path is where the ordering
     // record IS the proof, and that is where `fatal` is consumed.
     return this.#recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
+  }
+
+  /**
+   * DOD-M15-FRAME-1 — NARROWING THE GATE DOES NOT EVICT ANYONE ALREADY INSIDE. This does.
+   *
+   * `setAllowedPeer` sets the allowlist libp2p consults **when a connection is established**. A
+   * standing receiver accepts everyone by design (`allowedPeerId: null`), so a stranger can attach
+   * before any session exists, hold the connection open, and still be attached when the receiver is
+   * promoted and the content protocol activates. Narrowing the gate changes nothing for them: the
+   * gater is not re-run against live connections.
+   *
+   * That is the foothold the whole injection path depends on — placed before the door narrows. The
+   * frame-level gate above refuses what they send; this closes the connection they send it on, so
+   * the stranger is not merely ineffective but gone, and is not sitting there for the next protocol
+   * to activate.
+   *
+   * BEST-EFFORT BY CONSTRUCTION, and it must stay that way. A failure to hang up one peer must not
+   * fail the session setup that is mid-flight — the frame gate is the load-bearing control and it
+   * does not depend on this succeeding. Relay peers are exempt: they are on the OUTBOUND allowlist
+   * because reservation refreshes ride them, and hanging one up would cost the agent its inbound
+   * reachability to remove a peer that cannot speak the content protocol anyway.
+   */
+  async #evictPeersOutsideGate(
+    node: CelloNode,
+    gater: SessionConnectionGater,
+    sessionId: string,
+    allowedPeerId: string,
+    trigger: string,
+  ): Promise<void> {
+    let connections: Array<{ peerId: string }>;
+    try {
+      connections = node.getConnections();
+    } catch (err: unknown) {
+      this.#logger.debug("session.gate.evict.unavailable", {
+        sessionId, trigger, error: extractErrorMessage(err),
+      });
+      return;
+    }
+    for (const { peerId } of connections) {
+      if (peerId === allowedPeerId) continue;
+      if (gater.isAllowedOutboundPeer(peerId)) continue;
+      try {
+        await node.hangUp(peerId);
+        this.#logger.warn("session.gate.evicted", {
+          sessionId, trigger, evictedPeerId: peerId, allowedPeerId,
+          impact: "a peer attached to this node before the session narrowed its gate was disconnected; libp2p does not re-run the gater against live connections, so it would otherwise have stayed attached when the content protocol activated",
+        });
+      } catch (err: unknown) {
+        // Best-effort: the frame gate still refuses anything this peer sends.
+        this.#logger.debug("session.gate.evict.failed", {
+          sessionId, trigger, peerId, error: extractErrorMessage(err),
+        });
+      }
+    }
   }
 
   /**

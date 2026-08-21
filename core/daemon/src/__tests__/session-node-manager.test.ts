@@ -534,6 +534,62 @@ describe("SessionNodeManager — unit tests", () => {
     expect(setAllowedIdx).toBeLessThan(listenAddrsIdx);
   });
 
+  // ── DOD-M15-FRAME-1: narrowing the gate must EVICT peers already inside ───
+
+  it("DOD-M15-FRAME-1: a peer attached before promotion is hung up when the gate narrows", async () => {
+    /**
+     * The foothold the injection path depends on. A standing receiver is built with
+     * `allowedPeerId: null` — it accepts everyone, by design, because the counterparty is unknown
+     * until a session exists. A stranger dials it, holds the connection open, and is STILL ATTACHED
+     * when the receiver is promoted into a session node and the content protocol activates, because
+     * libp2p's gater runs at connection establishment and is never re-run against live connections.
+     *
+     * `setAllowedPeer` alone does not close that connection. This asserts the sweep does.
+     */
+    const { logger, events } = makeLogger();
+    const hungUp: string[] = [];
+    let capturedGater: SessionConnectionGater | null = null;
+
+    const factory = {
+      async createNode(config: SessionNodeConfig): Promise<CelloNode> {
+        if (config.connectionGater instanceof SessionConnectionGater) capturedGater = config.connectionGater;
+        const node = new FakeCelloNode();
+        // A stranger and a relay are both attached before the gate narrows. The relay is on the
+        // OUTBOUND allowlist (reservation refreshes ride it) and must survive — evicting it would
+        // cost the agent its inbound reachability to remove a peer that cannot speak the content
+        // protocol anyway.
+        node.getConnections = () => [
+          { peerId: "stranger-peer", encryption: "noise" },
+          { peerId: "relay-peer", encryption: "noise" },
+          { peerId: "initiator-peer-1", encryption: "noise" },
+        ];
+        node.hangUp = async (peerId: string) => { hungUp.push(peerId); };
+        return node as unknown as CelloNode;
+      },
+    };
+
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(), factory,
+      logger, dbPath: join(tempDir, "test-evict.db"),
+    });
+    await manager.initialize();
+    await seedAgents(manager.getDb(), ["test-agent"]);
+    await manager.ensureStandingReceiverForAgent("test-agent");
+    expect(capturedGater).not.toBeNull();
+    capturedGater!.setAllowedOutboundPeer("relay-peer");
+
+    const result = await manager.acceptSession("evict-session-1", "test-agent", "pubkey-1", "initiator-peer-1", "corr-1");
+    expect(result.ok).toBe(true);
+
+    expect(hungUp, "the stranger that predated the gate must be disconnected").toContain("stranger-peer");
+    expect(hungUp, "the counterparty must NOT be evicted — it is who the gate narrowed TO").not.toContain("initiator-peer-1");
+    expect(hungUp, "a relay on the outbound allowlist must survive, or the agent loses inbound reachability").not.toContain("relay-peer");
+
+    const evicted = events.find((e) => e.event === "session.gate.evicted");
+    expect(evicted, "the eviction must be in the log — it is the only surface an inbound sweep has").toBeDefined();
+    expect(evicted!.context.evictedPeerId).toBe("stranger-peer");
+  });
+
   // ── AC-016: DirectoryConnectionGater rejects non-directory peer ───────────
 
   it("AC-016: DirectoryConnectionGater with empty provider denies all peers", () => {

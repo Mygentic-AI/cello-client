@@ -310,6 +310,14 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       // them would charge the counterparty a second time for one conversation.
       ["#getUnreadReceivedCount", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
       ["#getReceivedBytesTotal", "acceptance accounting for a NEW inbound session; a revival admits nothing new"],
+      // DOD-M15-FRAME-1. Establishment PROMOTES a standing receiver, which was built with
+      // `allowedPeerId: null` and therefore accepted everyone — so a stranger can be attached when
+      // the gate narrows, and libp2p does not re-run a gater against live connections. Revival has
+      // no such window: `reviveSessionNode` constructs a FRESH gater with the counterparty already
+      // set (`allowedPeerId: identity.counterpartyPeerId`) and hands it to a node built moments
+      // later, so there is no connection predating the narrowing and nothing to evict. Exempt
+      // because the hole cannot exist here, not because the sweep is optional.
+      ["#evictPeersOutsideGate", "establishment promotes an open receiver; revival builds a fresh node behind a gater that is narrow from birth, so no peer can predate the gate"],
     ]);
 
     const calls = new Set(
