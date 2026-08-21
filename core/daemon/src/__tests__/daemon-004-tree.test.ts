@@ -30,7 +30,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
-import { decode as cborDecode } from "cbor-x";
+import { decode as cborDecode, Encoder } from "cbor-x";
+
+// DOD-M15-FRAME-1: matches the production encoder (`tagUint8Array: false`) so a hand-built frame
+// decodes to the same shapes the real wire produces — a Uint8Array must not arrive tagged.
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -127,6 +131,30 @@ class LoopbackFakeNode implements Partial<CelloNode> {
   onPeerDisconnect(_h: (p: string) => void): void {}
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
+  /**
+   * DOD-M15-FRAME-1: deliver a HAND-BUILT frame straight to the registered handler.
+   *
+   * `sendContent` always populates `session_id`, so it can never produce the omission case an
+   * attacker constructs by hand — and that case is exactly what the old `&&` check let through.
+   * Testing it needs a way to put arbitrary bytes on the wire as a chosen peer.
+   */
+  deliverFrame(frame: Record<string, unknown>, fromPeerId: string): void {
+    const handler = this.#handler;
+    if (!handler) return;
+    const chunks = [lp.encode.single(CBOR_ENC.encode(frame))];
+    const inbound = {
+      [Symbol.asyncIterator]() {
+        let i = 0;
+        return { next(): Promise<IteratorResult<unknown>> {
+          return i < chunks.length
+            ? Promise.resolve({ value: chunks[i++], done: false })
+            : Promise.resolve({ value: undefined, done: true });
+        } };
+      },
+    } as unknown as Stream;
+    handler(inbound, fromPeerId);
+  }
+
   async newStream(_peer: string, _proto: string): Promise<Stream> {
     const handler = this.#handler;
     const deliverAs = this.deliverAs;
@@ -390,6 +418,76 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const buffered = mgr.takeReceivedContent("alice", sid);
     expect(buffered).not.toBeNull();
     expect(Buffer.from(buffered!.contentHex, "hex").toString()).toBe("loopback-hi");
+  });
+
+  /**
+   * DOD-M15-FRAME-1 — the injection path, refused.
+   *
+   * Walked as the sequence an operator would live through: a stranger reaches the standing
+   * receiver's open port, the encrypted handshake completes (proving they hold *some* key, not that
+   * they are anyone known), they hold the connection through promotion, and then speak the content
+   * protocol. Every frame below is one an attacker can actually construct — the point is that none
+   * of them lands in the transcript.
+   */
+  describe("DOD-M15-FRAME-1: a stranger cannot put words in the counterparty's mouth", () => {
+    it("refuses a content frame from a peer that is not this session's counterparty", async () => {
+      const node = new LoopbackFakeNode();
+      const mgr = await makeManager(logger, join(tempDir, "inject.db"), node as unknown as CelloNode);
+      await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+
+      // The frame is otherwise perfectly well-formed. Only the sender is wrong.
+      node.deliverAs = "stranger-peer-id";
+      const content = new TextEncoder().encode("a message alice never received");
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-x");
+      await new Promise((r) => setImmediate(r));
+
+      expect(events.find((e) => e.event === "session.content.received"), "nothing may be ingested").toBeUndefined();
+      expect(events.find((e) => e.event === "session.tree.appended"), "and nothing may reach the tree").toBeUndefined();
+      const refused = events.find((e) => e.event === "session.content.peer_mismatch");
+      expect(refused).toBeDefined();
+      expect(refused!.context.frameType).toBe("content_frame");
+      // The transcript is the artifact this protocol exists to produce. A stranger's text in it,
+      // filed as the counterparty's, is the one thing it must never contain.
+      expect(mgr.readTranscript("alice", sid).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+    });
+
+    it("refuses a frame that OMITS session_id — absence is not agreement", async () => {
+      /**
+       * The omission bypass, and the reason clause 3 is separate from clause 1. The old check read
+       * `typeof x === "string" && x !== sessionId`, so it fired only when the field was PRESENT and
+       * wrong. An attacker evading a mismatch check does not send a wrong value — it sends none.
+       * Driven through the real handler with a hand-built frame, because `sendContent` always sets
+       * the field and could never produce this.
+       */
+      const node = new LoopbackFakeNode();
+      const mgr = await makeManager(logger, join(tempDir, "omit.db"), node as unknown as CelloNode);
+      await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+
+      const content = new TextEncoder().encode("no session id on this one");
+      // Correct sender, correct everything — except the field simply is not there.
+      node.deliverFrame({ type: "content_frame", content_bytes: content, content_hash: msgLeafHash(content) }, "bob-peer-id");
+      await new Promise((r) => setImmediate(r));
+
+      expect(events.find((e) => e.event === "session.content.received")).toBeUndefined();
+      const refused = events.find((e) => e.event === "session.content.session_mismatch");
+      expect(refused).toBeDefined();
+      expect(refused!.context.claimedSessionId).toBe("(absent)");
+    });
+
+    it("a legitimate frame from the real counterparty is untouched — no new false positive", async () => {
+      // The gate must not be the thing that breaks messaging. Same fixture, correct sender.
+      const node = new LoopbackFakeNode();
+      const mgr = await makeManager(logger, join(tempDir, "ok.db"), node as unknown as CelloNode);
+      await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+
+      const content = new TextEncoder().encode("a real message");
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok");
+      await new Promise((r) => setImmediate(r));
+
+      expect(events.find((e) => e.event === "session.content.received")).toBeDefined();
+      expect(events.find((e) => e.event === "session.content.peer_mismatch")).toBeUndefined();
+      expect(events.find((e) => e.event === "session.content.session_mismatch")).toBeUndefined();
+    });
   });
 
   // ── medium finding: in-memory tree + received-content maps must be evicted on teardown ──
