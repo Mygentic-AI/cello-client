@@ -250,6 +250,16 @@ const CALL_FORMS: ReadonlyArray<{ re: RegExp; cli: (m: RegExpExecArray) => strin
     re: /cello_contact_set_moniker\s*\{\s*pubkey:\s*"([^"]*)",\s*moniker:\s*"([^"]*)"\s*\}/g,
     cli: (m) => `cello contact ${m[1]} set-moniker "${m[2]}"`,
   },
+  {
+    // DOD-M15-DIVERGE-1 (review LOW-8) — the object form does not survive translation on its own.
+    // `CLI_BY_MCP` rewrites the VERB, so a CLI operator was handed
+    // `cello close-session <id> { force: true }`, and the real flag is `--force`. A guidance string
+    // that renders to an untypeable command is the failure `toCliGuidance` exists to prevent, and
+    // it was already reachable from two other refusals before this one duplicated it — so the fix
+    // belongs here, where it corrects all three at once, rather than in any single branch's prose.
+    re: /cello_close_session\s+(\S+)\s*\{\s*force:\s*true\s*\}/g,
+    cli: (m) => `cello close-session ${m[1]} --force`,
+  },
 ];
 
 /**

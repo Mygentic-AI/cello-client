@@ -834,14 +834,31 @@ describe("M8C-AWAY-1: away response", () => {
       await wait(100); // auth handshake
       snm.patchRelayClientForTest("alice", SID_HEX, fakeRelayClient, SID_BYTES);
 
-      // First message: normal away ack — sets the dedup guard.
+      /**
+       * DOD-M15-DIVERGE-1: SUBMIT THE INBOUND HASHES TO THE RELAY BEFORE INGESTING THEM.
+       *
+       * The counterparty's daemon submits every message it sends, so in production the relay's
+       * counter has already advanced past an inbound message by the time this side appends it.
+       * This fixture ingested directly and never submitted, so the tree ran ahead of the relay's
+       * counter and every subsequent `placeOwnLeaf` came back BEHIND the frontier — the session was
+       * genuinely diverged (two `session.tree.position_behind_frontier` ERRORs, `assignedSeq 0 /
+       * nextExpected 1` then `assignedSeq 1 / nextExpected 3`) and then sealed anyway.
+       *
+       * That skew was an artifact of the fixture, not of the away path, and it made this test assert
+       * that a diverged tree completes a seal — the outcome `placeOwnLeaf`'s own comment calls the
+       * riskiest in the codebase. Submitting first restores the production shape and lets the test
+       * exercise the healthy path it has always claimed to.
+       */
+      const sid = Buffer.from(SID_HEX, "hex");
       const msg1 = new TextEncoder().encode("hello [[OVER]]");
+      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg1));
       await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
       await wait(100);
       expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
 
       // Second message: triggers the relay-mediated seal path.
       const msg2 = new TextEncoder().encode("hello again [[OVER]]");
+      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg2));
       await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
       await wait(100);
 
@@ -853,6 +870,11 @@ describe("M8C-AWAY-1: away response", () => {
       // seal_initiated on the relay path must be logged (not seal_initiate_failed).
       await wait(200);
       expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiated" && e.context.path === "relay")).toBeDefined();
+      // DOD-M15-DIVERGE-1: and it got there on a HEALTHY tree. Before the relay submits above, this
+      // session diverged twice and sealed regardless; the gate now skips a diverged one, so without
+      // this assertion a future fixture regression would read as "the seal path broke".
+      expect(events.find((e) => e.event === "session.tree.position_behind_frontier"), "the fixture must not skew the tree against the relay").toBeUndefined();
+      expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_skipped_diverged")).toBeUndefined();
       expect(events.find((e) => e.event === "session.away.inbox.oneshot.seal_initiate_failed")).toBeUndefined();
 
       // Inject session_sealed: the bilateral wait resolves and session.away.inbox.oneshot.sealed fires.

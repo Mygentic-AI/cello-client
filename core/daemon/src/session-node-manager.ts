@@ -3746,7 +3746,24 @@ export class SessionNodeManager {
     // this unit exists to stop.
     this.#heldRestored.delete(key);
     this.#heldReleased.delete(key);
-    this.#diverged.delete(key);
+    // DOD-M15-DIVERGE-1: `#diverged` is NOT evicted here, and the omission is the point.
+    //
+    // It was, and that made the gate that reads it best-effort in exactly the population it targets.
+    // This eviction runs on EVERY teardown including `destroySessionNode` with a non-sealed reason,
+    // which writes status `interrupted` — one of the two statuses the seal gate is scoped to. So a
+    // session that diverged and was then torn down arrived at the gate with the fact already
+    // forgotten, and the read site cannot tell "not diverged" from "we forgot": both are
+    // `has() === false`, both read ready, and the close proceeds.
+    //
+    // Divergence is a fact about the DURABLE TREE, not about the live node — the tree keeps the
+    // misplaced leaf whether or not a node exists — so it does not belong to a cache keyed on node
+    // lifetime. It is cleared where it actually stops being true: `clearDivergedOnTerminal`, below.
+    //
+    // NOT YET DURABLE ACROSS A RESTART, stated here rather than left to be rediscovered — the same
+    // way `frontier-mismatch.ts` states its own trade. A daemon restart still empties this set, and
+    // unlike a frontier mismatch (re-detected by the very next close) divergence is only
+    // re-detected by the next send that gets an ack behind the frontier. Until it has a column, a
+    // restarted daemon can read a diverged session as ready. Tracked as `DOD-M15-DIVERGE-DURABLE-1`.
     // DOD-M12B-SESSION-SEED-1: HAND THEM TO THE REVIVAL RECORD BEFORE DROPPING THEM. This eviction
     // runs on every teardown, including the interruption a revival is meant to undo — so clearing
     // the addresses here is what left a revived session unable to dial anyone. The revival record
@@ -9600,6 +9617,12 @@ export class SessionNodeManager {
      */
     if (status === "sealed" || status === "abandoned") {
       this.#destroySessionSeed(agentName, sessionId);
+      // DOD-M15-DIVERGE-1: divergence stops being true HERE and only here. It used to be dropped by
+      // `#evictSessionCaches` on every node teardown — including the one that writes `interrupted`,
+      // which is a status the seal gate still acts on, so the fact was forgotten while it was still
+      // load-bearing. A terminal status is the one point at which no future close can be refused,
+      // so the flag has nothing left to protect.
+      this.#diverged.delete(this.#k(agentName, sessionId));
     }
     // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
     // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.

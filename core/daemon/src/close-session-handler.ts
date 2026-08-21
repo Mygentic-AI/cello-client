@@ -615,7 +615,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     // event that would never happen, retried, got the same refusal, and reached for force:true — the
     // terminal receipt-less outcome this gate exists to prevent. Drain FIRST, then judge, which is
     // the sequence seal-upgrade.ts already documents: "Recover content -> consult the gate -> REFUSE".
-    if (sealable && !readiness.ready && recoverParkedContent) {
+    // Review LOW-10: skip the drain for a diverged record. `diverged` is now a term in `ready`, so
+    // without this a diverged session pays a relay round trip that cannot change the answer — the
+    // gap the drain fills is not the condition that refused it.
+    if (sealable && !readiness.ready && !readiness.diverged && recoverParkedContent) {
       try {
         await recoverParkedContent(record.agent_name, "close_readiness_gate");
         readiness = sessionNodeManager.sealReadiness(record.agent_name, sessionId);
@@ -652,18 +655,37 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       logger.warn("session.seal.blocked_diverged", {
         agentName: record.agent_name, sessionId,
         treeSize: readiness.treeSize, highWaterSeq: readiness.highWaterSeq,
-        impact: "this side's tree holds a leaf at a position the relay assigned to something else, so the two can never agree on a root — the session cannot be sealed bilaterally and no retry changes that",
+        // Review MEDIUM-5: the same four counters the sibling refusal carries. Without them a
+        // session that is BOTH diverged and gapped reported its gap on no surface at all — this
+        // branch preempts the incomplete one, and `sealReadinessView` short-circuits to `unknown`.
+        heldCount: readiness.heldCount, missingLeaves: readiness.missingLeaves,
+        heldOwn: readiness.heldOwn, heldReceived: readiness.heldReceived,
+        impact: "this side's tree holds a leaf at a position the relay assigned to something else; the relay's ordering is what gets notarized, so a bilateral seal may be refused and this side cannot tell in advance",
       });
       return {
         ok: false,
         reason: "session_record_diverged",
         tree_size: readiness.treeSize,
         relay_high_water: readiness.highWaterSeq,
+        held_messages: readiness.heldCount,
+        missing_leaves: readiness.missingLeaves,
+        held_own: readiness.heldOwn,
+        held_received: readiness.heldReceived,
+        // Review HIGH-1: SAY WHAT WAS MEASURED, NOT WHAT IS PREDICTED. The earlier wording asserted
+        // the counterparty would refuse with `leaf_count_mismatch` and that force was the only exit.
+        // Neither is established here. What is measured is that THIS tree parted from THE RELAY's
+        // counter. The bilateral check compares LEAF COUNT, not the root (`seal-flows.ts`:
+        // "Merkle-root agreement is NOT verified at this leaf-exchange layer"), and both sides
+        // append a behind-frontier leaf at the tail — so if the counterparty skewed the same way
+        // the counts still agree and the seal can succeed. Predicting their refusal was an
+        // over-claim, and offering force-abandon as "the only exit" pointed at the one irreversible
+        // action while the codebase's own mismatch handling leaves the session retryable.
         guidance:
-          `This session's record has permanently parted from the relay's. Your tree holds ${readiness.treeSize} message(s) at positions the relay assigned differently, so the two sides can never compute the same root and a seal here would be refused as leaf_count_mismatch — which is terminal. ` +
-          `This cannot be recovered: nothing in the protocol backfills or re-numbers a leaf, so waiting will not help and retrying this close will return exactly this answer. ` +
-          `Your messages are safe and readable — cello_transcript ${sessionId} shows the full record, and it stays available whatever you do next. ` +
-          `The only exit is cello_close_session ${sessionId} { force: true }, which ends the session with NO notarized receipt. That is the real cost here, and it was already paid when the records parted, not by the force call.`,
+          `This side's record no longer agrees with the relay's ordering — your tree holds ${readiness.treeSize} message(s) and the relay's counter is at ${readiness.highWaterSeq + 1}. ` +
+          `The relay's ordering is what gets notarized, so sealing now may be refused. It may also succeed: the bilateral check compares message COUNTS, not contents, so if the counterparty's record skewed the same way the counts still match. This side cannot tell which from here. ` +
+          `What is certain is that this will not resolve on its own — nothing backfills or re-numbers a leaf, so waiting does not change it. ` +
+          `Compare message counts with the counterparty before deciding; cello_transcript ${sessionId} shows your full record and it stays readable whatever you choose. ` +
+          `cello_close_session ${sessionId} { force: true } ends the session with NO notarized receipt and cannot be undone — the last resort, not the next step.`,
       };
     }
     if (sealable && !readiness.ready) {

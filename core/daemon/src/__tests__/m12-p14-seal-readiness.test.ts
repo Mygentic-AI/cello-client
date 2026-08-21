@@ -166,27 +166,43 @@ describe("DOD-M15-DIVERGE-1: a diverged record blocks the seal and says so in it
     expect(h.sealFlow(), "a diverged chain must never be offered for co-signing").toBe(0);
   });
 
-  it("does NOT tell the operator to wait and retry — the condition is permanent", async () => {
+  it("does NOT tell the operator to wait and retry — this does not resolve on its own", async () => {
     // The error-substitution guard. `session_incomplete` guidance says "wait a moment and close
     // again" and "the daemon just pulled from the relay". Both are false here: no pull backfills a
-    // position the relay already assigned to something else, so a retry loop ends at force:true and
-    // no receipt — the outcome this whole gate exists to prevent.
+    // position the relay already assigned to something else.
     const h = harness(readiness({ ready: false, diverged: true }));
     const g = String((await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>).guidance);
 
     expect(g).not.toMatch(/wait a moment and close again/);
-    expect(g).toMatch(/permanent|cannot be recovered|can never/i);
+    expect(g).toMatch(/will not resolve on its own|waiting does not change it/i);
   });
 
-  it("names the affordance — the operator is told what actually remains open to them", async () => {
-    // Invariant 4. A refusal without a next step is where operators and agents both stall, and the
-    // stall here has a terminal exit sitting right next to it.
+  it("does NOT predict the counterparty's refusal — that was never measured here", async () => {
+    // Review HIGH-1. `#diverged` records a parting between THIS tree and THE RELAY's counter. The
+    // bilateral check compares leaf COUNTS, not roots, and both sides append a behind-frontier leaf
+    // at the tail — so a counterparty that skewed the same way still agrees and the seal succeeds.
+    // Asserting "the counterparty will refuse" states an outcome this daemon has not observed, and
+    // an over-claim in a refusal is how an operator is talked into the irreversible exit.
+    const h = harness(readiness({ ready: false, diverged: true }));
+    const g = String((await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>).guidance);
+
+    expect(g, "must not assert the peer's outcome").not.toMatch(/can never compute the same root/i);
+    expect(g, "must not promise a refusal it did not measure").not.toMatch(/would be refused as leaf_count_mismatch/i);
+    expect(g, "must admit the seal may still succeed").toMatch(/may also succeed|counts still match/i);
+  });
+
+  it("names the affordance, and force is the LAST resort — not the only exit", async () => {
+    // Invariant 4. A refusal without a next step is where operators and agents both stall. But the
+    // cheaper action has to come first: the earlier wording called force "the only exit", which
+    // points at the one irreversible action while a comparison with the counterparty is free.
     const h = harness(readiness({ ready: false, diverged: true }));
     const g = String((await h.close({ session_id: SESSION }, "conn") as Record<string, unknown>).guidance);
 
     expect(g).toMatch(/cello_transcript/);
     expect(g).toMatch(/force: true|force:true/);
     expect(g, "the cost of the escape hatch must be explicit").toMatch(/no notarized receipt|no receipt/i);
+    expect(g, "force must not be presented as the only option").not.toMatch(/only exit|only way out/i);
+    expect(g, "the cheaper action must be offered").toMatch(/compare message counts/i);
   });
 
   it("emits its own log event as well as answering the caller — the log line is not replaced", async () => {
@@ -322,6 +338,32 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
       state: "unknown",
       reason: "record_diverged_from_relay",
     });
+  });
+
+  it("DOD-M15-DIVERGE-1: the flag SURVIVES the node teardown that writes `interrupted`", async () => {
+    // Review HIGH-2, and the reason this test exists at this level rather than against a stub.
+    //
+    // `#diverged` used to be dropped by `#evictSessionCaches`, which runs on EVERY teardown —
+    // including `destroySessionNode`, whose non-sealed reason writes status `interrupted`. That is
+    // one of the two statuses the seal gate acts on. So a diverged session torn down and later
+    // closed arrived at the gate with the fact already forgotten, and the read site cannot tell
+    // "not diverged" from "we forgot": both are `has() === false`, both read ready.
+    //
+    // Every other test here stubs `sealReadiness` or calls it directly, which is precisely why the
+    // hole shipped — no test drove a REAL manager through a teardown.
+    await fx.createSession(SID, "alice");
+    fx.seedSent("alice", SID, "one");
+    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+    expect(fx.snm.sealReadiness("alice", SID).diverged, "precondition").toBe(true);
+
+    await fx.snm.destroySessionNode("alice", SID, "peer_gone");
+
+    expect(fx.snm.getSessionRecord("alice", SID)?.status, "teardown must reach the gated status").toBe("interrupted");
+    expect(
+      fx.snm.sealReadiness("alice", SID).diverged,
+      "the tree still holds the misplaced leaf, so the fact is still true and must still be known",
+    ).toBe(true);
+    expect(fx.snm.sealReadiness("alice", SID).ready).toBe(false);
   });
 
   it("DOD-M15-DIVERGE-1: a healthy session is untouched — no new false positive", async () => {
