@@ -100,14 +100,27 @@ class ControlledFactory implements ISessionNodeFactory {
  * in-process mechanism (the cross-PROCESS gate is E2E-001 under CELLO_E2E_LIVE).
  */
 class LoopbackFakeNode implements Partial<CelloNode> {
-  #handler: ((stream: Stream) => void) | null = null;
+  /**
+   * DOD-M15-FRAME-1: the handler takes the SECOND argument the real transport passes.
+   *
+   * `CelloNode.handle` is `(stream, remotePeerId)` — `node.ts` supplies
+   * `connection?.remotePeer?.toString()`, the Noise-authenticated transport identity. This fake
+   * declared a single-argument handler, so every frame it delivered arrived with `remotePeerId`
+   * undefined. That was invisible while nothing checked it; the content protocol now pins every
+   * frame to the session's counterparty, and an absent identity is refused rather than waved
+   * through — so the fake has to deliver what the real transport delivers, or it is testing a
+   * transport that does not exist.
+   */
+  #handler: ((stream: Stream, remotePeerId?: string) => void) | null = null;
   readonly #peerId = `lb-${Math.random().toString(36).slice(2)}`;
+  /** The peer id inbound frames are delivered as — the counterparty this session was created with. */
+  deliverAs = "bob-peer-id";
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
   listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/0"]; }
   async dial(_addr: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
-  async handle(_p: string, h: (stream: Stream) => void): Promise<void> { this.#handler = h; }
+  async handle(_p: string, h: (stream: Stream, remotePeerId?: string) => void): Promise<void> { this.#handler = h; }
   getProtocols(): string[] { return []; }
   getConnections(): Array<{ peerId: string; encryption: string | undefined }> { return []; }
   onPeerConnect(_h: (p: string) => void): void {}
@@ -116,6 +129,7 @@ class LoopbackFakeNode implements Partial<CelloNode> {
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
     const handler = this.#handler;
+    const deliverAs = this.deliverAs;
     const stream = {
       send(data: unknown) {
         const chunks = [data];
@@ -131,7 +145,7 @@ class LoopbackFakeNode implements Partial<CelloNode> {
             };
           },
         } as unknown as Stream;
-        if (handler) handler(inbound);
+        if (handler) handler(inbound, deliverAs);
       },
       async close() {},
       abort() {},
