@@ -82,6 +82,10 @@ describe("DOD-M15-DEAD-WIRE-FIELD-1: a field with no consumers cannot refuse a s
         "covered by no signature, and read by nothing (the only read of a parsed participant takes " +
         "`.pubkey`).",
     ).not.toBeNull();
+    // THE OUTCOME, not its shadow (hollow-test Q4). `not.toBeNull()` alone passed a mutation that
+    // returned the malformed value verbatim AND one that FABRICATED an address — both measured
+    // green by review. `[]` is what the comment promises, so `[]` is what gets asserted.
+    expect(parsed!.participant_a.multiaddrs).toEqual([]);
   });
 
   it("an ABSENT participant multiaddrs parses too", () => {
@@ -89,7 +93,9 @@ describe("DOD-M15-DEAD-WIRE-FIELD-1: a field with no consumers cannot refuse a s
     // means the client is already compatible when the directory stops sending it.
     const a = assignment();
     delete (a["participant_a"] as Record<string, unknown>)["multiaddrs"];
-    expect(parseSessionAssignment(a)).not.toBeNull();
+    const parsed = parseSessionAssignment(a);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.participant_a.multiaddrs).toEqual([]);
   });
 
   it("the RELAY endpoint's multiaddrs stays STRICT — those are dialed", () => {
