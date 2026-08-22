@@ -157,12 +157,25 @@ export function createSealFlows(deps: SealFlowDeps) {
   //   seal here. The session therefore STOPS at the persisted bilateral commitment rather than
   //   claim a completed seal. Wiring the real seal means injecting a SealManager adapter.
   //
-  //   Merkle-ROOT agreement is deliberately NOT compared at this layer. Under concurrent
-  //   bidirectional traffic the two sides' local append orders — and therefore their roots — can
-  //   legitimately diverge until the relay-assigned canonical sequence exists. Comparing roots here
-  //   would reject honest sessions. leafCount agreement (each side against its own tree size, or
-  //   message_count when no tree exists) is the bilateral check available at this layer; true root
-  //   agreement belongs to the FROST seal against the directory-held tree.
+  //   Merkle-ROOT agreement is deliberately NOT compared at this layer, and the reason is still
+  //   sound: under concurrent bidirectional traffic the two sides' local append orders — and
+  //   therefore their roots — can legitimately diverge until the relay-assigned canonical sequence
+  //   exists, so comparing roots here would reject honest sessions. leafCount agreement (each side
+  //   against its own tree size, or message_count when no tree exists) is the bilateral check
+  //   available at this layer.
+  //
+  //   ⚠️ DOD-M15-CLAIM-COMMENTS-1 — WHAT THIS COMMENT USED TO IMPLY IS NOT TRUE. It ended "true root
+  //   agreement belongs to the FROST seal against the directory-held tree", which reads as *someone
+  //   else checks it*. NOBODY DOES. The directory's own SEAL-leaf handler defers the same check back
+  //   to the client ("deferred to a follow-on story since clients perform this verification
+  //   locally"), and the client check it names does not exist — so the certified root is never
+  //   compared against either party's transcript, on any path except the unilateral one.
+  //
+  //   Two comments deferring to each other is how the gap survived review: each half reads as a
+  //   considered decision to check elsewhere, and there is no elsewhere. `DOD-M15-SEALWIRE-1` moves
+  //   the bilateral root into the content-hash domain and makes the comparison a one-line check the
+  //   client can actually perform; until it lands, this layer's leafCount check is the ONLY
+  //   bilateral agreement there is, and it agrees on counts rather than on contents.
   //
   //   Both sides bind over their OWN tree root + size (SI-001) whenever a non-empty tree exists —
   //   e.g. reloaded from session_tree_leaves after a restart. Only sessions with no persisted tree
