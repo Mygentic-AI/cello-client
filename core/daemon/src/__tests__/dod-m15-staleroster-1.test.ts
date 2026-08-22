@@ -6,25 +6,28 @@
  * Both daemons displayed directory node failures from minutes long past while `curl` reached all
  * three nodes in 37–184 ms. The operator is debugging an outage that ended before they looked.
  *
- * ─── The producer/consumer map, which says why it freezes ──────────────────────────────────────
+ * ─── The producer/consumer map, CORRECTED after review ─────────────────────────────────────────
  *
- *   PRODUCER   `resolveConsortiumRoster` (consortium-bootstrap.ts) — the ONLY writer of
- *              `unresolvedNodes` / `unresolvedSweptAt`.
- *   CALLER     exactly one: `createRosterAwareEndpointResolver`'s `getConsortiumRoster`, i.e. the
- *              FAILOVER path.
- *   CONSUMER   `unresolvedNodesForStatus` in daemon.ts.
+ * This header first claimed `resolveConsortiumRoster` had ONE caller — the failover path — so the
+ * sweep ran only while the daemon was unhealthy. **False.** It has ten callers: the failover
+ * resolver, four session and seal ceremony handlers, the auto-ack broker reconnect, `cello_refresh`,
+ * `cello_get_submission_results`, three cross-node session-setup paths and the seal broker.
  *
- * So the sweep runs only while the daemon is UNHEALTHY. The moment the primary resolves again, the
- * failover path stops being taken, no sweep ever runs, and the reading freezes at the last failing
- * measurement — permanently, for the life of the process.
+ * The real shape is **an IDLE daemon never re-measures**. Every caller is activity-driven, so the
+ * reading is refreshed by ceremonies and session setup and by nothing else — and sitting idle is
+ * what a daemon does between conversations. The measured symptom is a failing reading seeded at boot
+ * that nothing afterwards overwrote.
  *
  * ─── And the harder half: absent and healthy look identical ────────────────────────────────────
  *
- * The block is emitted only when the failure list is non-empty, so "no sweep has ever run" renders
- * exactly like "all three nodes answered". That is not hypothetical: `verifyStartupManifest` returns
- * WITHOUT sweeping on four paths — no manifest configured, a manifest that is not yet valid, an
- * EXPIRED manifest, and a version rollback. A daemon whose consortium manifest has expired reports
- * no directory trouble whatsoever.
+ * The block was emitted only when the failure list was non-empty, so "nothing has ever looked"
+ * rendered exactly like "all three nodes answered".
+ *
+ * The first draft of this file blamed an EXPIRED manifest for that state. Also false — a daemon
+ * whose manifest fails verification REFUSES TO START (ADV-002). The one reachable route is no
+ * manifest provider at all, which is DESIGNED: local dev, the e2e harness, or a CELLO_DIRECTORY_URL
+ * that is not byte-equal to a bundled endpoint. It gets its own calm wording, because an alarm there
+ * would fire on every local run.
  *
  * The line forbids the tempting fix: *"Do not fix it by hiding the field when stale — absent and
  * healthy must not look alike."* So the reading declares its own age instead.
@@ -41,6 +44,7 @@ import {
   describeRosterFreshness,
   startRosterSweep,
   ROSTER_STALE_AFTER_MS,
+  ROSTER_SWEEP_INTERVAL_MS,
 } from "../roster-freshness.js";
 
 const NOW = Date.parse("2026-08-23T12:00:00.000Z");
@@ -113,18 +117,97 @@ describe("DOD-M15-STALEROSTER-1: what the operator is told", () => {
     expect(d.freshness_guidance).toBeUndefined();
   });
 
-  it("★ never-measured says NOT MEASURED — it does not borrow the word 'stale'", () => {
-    // Different facts need different words: "stale" means we looked a while ago; "never measured"
-    // means we have never looked. Only the second can hide an expired manifest.
-    const d = describeRosterFreshness(classifyRosterReading(null, NOW));
+  it("★ never-measured WITH a manifest is an alarm: nothing has finished looking", () => {
+    // Different facts need different words: "stale" means we looked a while ago; "never" means no
+    // sweep has completed. A manifest IS configured here, so this one is worth worrying about.
+    const d = describeRosterFreshness(classifyRosterReading(null, NOW), { manifestConfigured: true });
+    expect(d.measurement).toBe("never");
     expect(d.stale).toBe(true);
     expect(d.checked_at).toBeNull();
     expect(d.age_seconds).toBeNull();
+    // THE CLAIM, not the token (review F-weak): /never/i passed on "we never got around to it".
     expect(
       d.freshness_guidance,
-      "and it must name the reason this happens — the startup manifest gate returned without " +
-        "sweeping, which an expired manifest causes",
-    ).toMatch(/never/i);
+      "it must say the absence of failures is not evidence of health",
+    ).toMatch(/not evidence of health/i);
+    expect(
+      d.freshness_guidance,
+      "and route to the cause when it persists",
+    ).toMatch(/directory\.roster\.sweep\.failed/);
+  });
+
+  it("★ never-measured with NO manifest is CALM — it is a designed configuration, not a fault", () => {
+    /**
+     * Review F2. The first cut treated every unmeasured daemon as an alarm, which fires on every
+     * local-dev run and every e2e-harness spin-up: a signal on the designed normal case, which this
+     * same unit forbids elsewhere. It still EMITS — the line rules out hiding the field — but it
+     * must not read as breakage.
+     */
+    const d = describeRosterFreshness(classifyRosterReading(null, NOW), { manifestConfigured: false });
+    expect(d.measurement).toBe("not_configured");
+    expect(d.stale, "there is no reading to be stale — nothing is being measured at all").toBe(false);
+    expect(
+      d.freshness_guidance,
+      "it must name the real reachable cause: no consortium manifest is configured",
+    ).toMatch(/no consortium manifest is configured/i);
+    expect(
+      d.freshness_guidance,
+      "and the trap that produces it against a REAL directory — a hostname is not byte-equal to a " +
+        "bundled endpoint, which silently turns directory identity authentication off too",
+    ).toMatch(/byte-equal/i);
+    expect(
+      d.freshness_guidance,
+      "it must NOT blame an expired manifest: that daemon refuses to start, so this cause cannot " +
+        "produce this state (review F1 — error substitution in brand-new operator prose)",
+    ).not.toMatch(/EXPIRED/);
+    expect(
+      d.freshness_guidance,
+      "nor send the operator to a log family that has no lines on this path",
+    ).not.toMatch(/directory\.auth\.manifest/);
+  });
+
+  it("★ a failing sweep reaches the RESPONSE, not just the log", () => {
+    /**
+     * Review F4, invariant 2. The freshness bound is 5 minutes and the sweep runs every 90–180 s, so
+     * the first two or three consecutive failures all land while the reading still reports
+     * stale:false — the operator is handed a frozen reading presented as current, which is this
+     * line's own defect arriving through the fix's failure path.
+     */
+    const d = describeRosterFreshness(classifyRosterReading(iso(2_000), NOW), {
+      manifestConfigured: true,
+      lastSweepError: { event: "directory.roster.sweep.failed", error: "dns exploded", at: iso(1_000), consecutive: 2 },
+    });
+    expect(d.stale, "PRECONDITION: still inside the freshness bound — this is the blind window").toBe(false);
+    expect(
+      d.last_sweep_error,
+      "a sweep that has failed twice running is invisible to the agent: the reading still says " +
+        "fresh, and the only account of the failure is a log line nobody is reading",
+    ).toBeDefined();
+    expect(d.last_sweep_error?.error).toContain("dns exploded");
+    expect(d.last_sweep_error?.consecutive).toBe(2);
+  });
+});
+
+describe("DOD-M15-STALEROSTER-1: the interval and the bound are not just a comment", () => {
+  it("★ a healthy daemon cannot flap between fresh and stale", () => {
+    /**
+     * Review F3 — the unit's load-bearing arithmetic was asserted by nothing but a header comment.
+     * Changing ROSTER_SWEEP_INTERVAL_MS from 90_000 to 900_000 (one extra zero) left every test in
+     * the repo green while making every healthy production daemon permanently stale.
+     *
+     * Worst case between two writes = the scheduler's MAX interval + the slowest sweep. The
+     * randomized scheduler is constructed with max = 2x the interval, and the patient probe's
+     * ceiling is 20 s, so that is the number the bound has to beat.
+     */
+    const worstSweepMs = 20_000; // PERSISTENT_PROBE total ceiling, directory-bootstrap.ts
+    const worstGapMs = ROSTER_SWEEP_INTERVAL_MS * 2 + worstSweepMs;
+    expect(
+      worstGapMs,
+      `The slowest possible gap between two roster measurements (${worstGapMs} ms) exceeds the ` +
+        `staleness bound (${ROSTER_STALE_AFTER_MS} ms), so a HEALTHY daemon goes stale between ` +
+        "sweeps. cello_status would then warn about a reading that is doing exactly what it is " +
+        "supposed to do — a signal that fires on the normal case.",
+    ).toBeLessThan(ROSTER_STALE_AFTER_MS);
   });
 });
 
@@ -246,15 +329,31 @@ describe("DOD-M15-STALEROSTER-1: a real daemon that has never measured does not 
       "the block was omitted, so a daemon that has NEVER measured directory reachability is " +
         "indistinguishable from one whose nodes all answered a moment ago",
     ).toBeDefined();
-    expect(block?.["stale"], "an unmeasured reading must not present as current").toBe(true);
+    expect(
+      block?.["measurement"],
+      "this daemon has NO manifest provider, which is the designed local-dev configuration — it " +
+        "must be reported as not-configured rather than as a fault",
+    ).toBe("not_configured");
     expect(block?.["checked_at"], "there is no measurement, so there is no timestamp").toBeNull();
     expect(
       String(block?.["freshness_guidance"]),
-      "and it must say nothing has looked, naming the expired-manifest cause",
-    ).toMatch(/NEVER measured/);
+      "and it must name the real cause rather than the expired-manifest story, which cannot " +
+        "produce this state because that daemon refuses to start",
+    ).toMatch(/no consortium manifest is configured/i);
+
+    /**
+     * THE VALUE, not its absence — hollow-test question 4 and review F8. The original asserted only
+     * `.not.toMatch(/could not resolve these directory endpoints/)`, which `guidance: ""` passes,
+     * and so does `guidance: "all nodes healthy"` — the exact reading this block exists to prevent.
+     */
+    const guidance = String(block?.["guidance"]);
     expect(
-      String(block?.["guidance"]),
-      "the node guidance must not claim endpoints failed to resolve — none are listed",
+      guidance,
+      "the empty node list must be stated as an UNKNOWN, not left to read as an all-clear",
+    ).toMatch(/not mean the nodes are healthy/i);
+    expect(
+      guidance,
+      "and it must not claim endpoints failed to resolve — none are listed",
     ).not.toMatch(/could not\s+resolve these directory endpoints/);
   }, 30_000);
 });

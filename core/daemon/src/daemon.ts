@@ -53,6 +53,7 @@ import {
   classifyRosterReading,
   describeRosterFreshness,
   ROSTER_SWEEP_INTERVAL_MS,
+  type RosterFreshness,
 } from "./roster-freshness.js";
 import { SessionNodeManager, REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS } from "./session-node-manager.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -406,6 +407,8 @@ async function startDaemonHoldingLock(
    * re-measure nothing is noise. That case is not silent — it is the `never_measured` reading, which
    * says so in `cello_status`.
    */
+  /** REVIEW F4: the last sweep failure, surfaced in `cello_status` alongside the log line. */
+  let lastRosterSweepError: RosterFreshness["last_sweep_error"] | undefined;
   const rosterSweepScheduler = manifestProvider
     ? config.rosterSweepScheduler ??
       new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
@@ -418,6 +421,11 @@ async function startDaemonHoldingLock(
         // patient probe and give the more trustworthy answer.
         sweep: () => resolveConsortiumRoster(),
         logger,
+        // REVIEW F4: the failure reaches the agent's response, not just the log. Without this a
+        // sweep failing every cycle is invisible for the first two or three failures, because the
+        // reading is still inside its 5-minute freshness bound and reports stale:false.
+        onSweepError: (e) => { lastRosterSweepError = e; },
+        onSweepSuccess: () => { lastRosterSweepError = undefined; },
       })
     : undefined;
 
@@ -3454,8 +3462,15 @@ async function startDaemonHoldingLock(
      * Silence is therefore reserved for the one case that has earned it: a RECENT reading that
      * found nothing wrong. Every other case says why it cannot make that claim.
      */
-    const freshness = describeRosterFreshness(classifyRosterReading(getUnresolvedSweptAt(), Date.now()));
-    if (failures.length === 0 && !freshness.stale) return undefined;
+    const freshness = describeRosterFreshness(classifyRosterReading(getUnresolvedSweptAt(), Date.now()), {
+      // REVIEW F2: "no manifest configured" is DESIGNED (local dev, the e2e harness, or a
+      // CELLO_DIRECTORY_URL that is not byte-equal to a bundled endpoint) and must not be dressed
+      // as an alarm — it would fire on every local run. It still EMITS, because the line forbids
+      // hiding the field; what differs is what the operator is told.
+      manifestConfigured: manifestProvider !== undefined,
+      ...(lastRosterSweepError ? { lastSweepError: lastRosterSweepError } : {}),
+    });
+    if (failures.length === 0 && freshness.measurement === "current") return undefined;
     return {
       directory_endpoints_unresolved: {
         // WHEN this was measured, and whether that is recent enough to mean anything. Without it the

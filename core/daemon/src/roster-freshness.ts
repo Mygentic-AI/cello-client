@@ -6,11 +6,23 @@
  * Both daemons displayed directory node failures from minutes long past while `curl` reached all
  * three nodes in 37–184 ms. The operator debugs an outage that ended before they looked.
  *
- * The cause is a producer with one caller. `resolveConsortiumRoster` is the only writer of the
- * unresolved-node list, and the only thing that calls it is the roster-aware endpoint resolver —
- * i.e. the FAILOVER path. So the sweep runs only while the daemon is unhealthy. The moment the
- * primary resolves again the failover path stops being taken, nothing sweeps, and the last failing
- * measurement becomes permanent for the life of the process.
+ * ─── The cause, CORRECTED after review ─────────────────────────────────────────────────────────
+ *
+ * This file first said the sweep had ONE caller — the failover path — and therefore ran only while
+ * the daemon was unhealthy. **That is false, and a thirty-second grep falsifies it.**
+ * `resolveConsortiumRoster` has ten callers: the failover resolver, four session and seal ceremony
+ * handlers, the seal auto-ack broker reconnect, `cello_refresh`, `cello_get_submission_results`,
+ * three cross-node session-setup paths, and the seal broker.
+ *
+ * The real shape is **an IDLE daemon never re-measures**. Every one of those callers is
+ * activity-driven, so the reading is refreshed by ceremonies and session setup and by nothing else.
+ * A daemon that sits still — which is what a daemon does between conversations — keeps the reading
+ * it was seeded with at boot, for as long as it stays still. The measured symptom is that startup
+ * seeded a failing reading and nothing happened afterwards to overwrite it.
+ *
+ * The fix is unchanged by the correction: a time-driven sweep is exactly what an activity-driven
+ * producer lacks. But the wrong map had a cost — believing there was a single writer is why the
+ * concurrent-sweep race below was not considered until review found it.
  *
  * ─── Two halves, because "no reading" and "an old reading" are different lies ───────────────────
  *
@@ -23,13 +35,24 @@
  * absent and healthy must not look alike."* Suppressing a stale block trades a wrong answer for no
  * answer, and no answer renders exactly like health.
  *
- * ─── Why `never_measured` is a distinct kind and not just a very old reading ────────────────────
+ * ─── Why "no reading" is a distinct kind, and the SECOND thing review corrected ─────────────────
  *
- * `verifyStartupManifest` returns WITHOUT sweeping on four paths: no manifest configured, a
- * manifest that is not yet valid, an EXPIRED manifest, and a version rollback. In every one of them
- * the failure list is empty, so the status block was omitted and the daemon reported no directory
- * trouble at all. A daemon whose consortium manifest has expired is not healthy, and it was
- * indistinguishable from a daemon whose three nodes had just answered.
+ * This file also claimed an EXPIRED manifest reaches the unmeasured state. It does not: a daemon
+ * whose manifest fails verification **refuses to start** (`daemon.ts`, ADV-002 — "an operator who
+ * configures manifestProvider has opted INTO manifest enforcement"). Not-yet-valid, rollback and
+ * load-failure are the same. Shipping that sentence in operator guidance sent the reader hunting a
+ * manifest problem, through a log family that has no lines on the only path that can actually get
+ * here. Error substitution, in brand-new prose, inside the fix for error substitution.
+ *
+ * The one reachable route is **no manifest provider at all**, and it is DESIGNED and BENIGN:
+ * `manifest-deps.ts` returns `{}` when `CELLO_DIRECTORY_URL` is not byte-equal to a bundled
+ * endpoint — local dev, the e2e harness, or an operator who used a DNS hostname for a bundled node.
+ * So it gets its own kind and its own calm wording. Treating it as an alarm would fire on every
+ * local run and every harness spin-up: a signal on the designed normal case, which this same file
+ * forbids two paragraphs down.
+ *
+ * Both kinds still EMIT — the line rules out hiding the field, because absent and healthy must not
+ * look alike. What changes between them is what the operator is told to do about it.
  */
 
 /**
@@ -88,8 +111,26 @@ export interface RosterFreshness {
   age_seconds: number | null;
   /** True when this reading must not be read as the present tense. */
   stale: boolean;
-  /** Present ONLY when stale — a flag on every reading is not a flag. */
+  /**
+   * WHICH of the non-current states this is, because they call for different responses:
+   *   `current`         — measured recently; the only state that may speak in the present tense.
+   *   `stale`           — measured, too long ago to be trusted as now.
+   *   `never`           — a manifest IS configured but no sweep has completed yet.
+   *   `not_configured`  — no consortium manifest, so there is no roster to measure. DESIGNED.
+   */
+  measurement: "current" | "stale" | "never" | "not_configured";
+  /** Present ONLY when the reading is not current — a flag on every reading is not a flag. */
   freshness_guidance?: string;
+  /**
+   * The last sweep failure, when the background sweep is erroring — DOD-M15-STALEROSTER-1 review F4.
+   *
+   * The log alone was not enough: a sweep failing every 90–180 s leaves the reading inside its
+   * 5-minute freshness bound for the first two or three failures, so the block reports
+   * `stale: false` and hands over a frozen reading as current. That is the defect this whole line
+   * exists to end, arriving through the new code's own failure path. The agent response carries the
+   * cause, and the log line stays.
+   */
+  last_sweep_error?: { event: string; error: string; at: string; consecutive: number };
 }
 
 /**
@@ -99,19 +140,47 @@ export interface RosterFreshness {
  * fires on the ordinary case, which is the failure this milestone keeps re-finding: it is not a
  * signal, and it teaches the reader to skip past the one that is real.
  */
-export function describeRosterFreshness(reading: RosterReading): RosterFreshness {
+export function describeRosterFreshness(
+  reading: RosterReading,
+  opts: { manifestConfigured: boolean; lastSweepError?: RosterFreshness["last_sweep_error"] } = {
+    manifestConfigured: true,
+  },
+): RosterFreshness {
+  const errorField = opts.lastSweepError ? { last_sweep_error: opts.lastSweepError } : {};
+
   if (reading.kind === "never_measured") {
+    // DESIGNED AND BENIGN — the calm branch. Firing an alarm here would fire it on every local-dev
+    // daemon and every e2e-harness spin-up, which is a signal on the normal case.
+    if (!opts.manifestConfigured) {
+      return {
+        checked_at: null,
+        age_seconds: null,
+        stale: false,
+        measurement: "not_configured",
+        freshness_guidance:
+          "Directory reachability is NOT MEASURED on this daemon because no consortium manifest is " +
+          "configured, so there is no node roster to probe. This is expected in local development " +
+          "and in the e2e harness. It also happens against a real directory when " +
+          "CELLO_DIRECTORY_URL is not byte-equal to a bundled endpoint — a DNS hostname for a " +
+          "bundled node does NOT match, and turns this off along with directory identity " +
+          "authentication. Look for daemon.manifest.bundled.skipped in the log; if it is there with " +
+          "a non-local URL, this client is weaker than you think it is. The empty node list below " +
+          "is the absence of a measurement, not a clean bill of health.",
+        ...errorField,
+      };
+    }
     return {
       checked_at: null,
       age_seconds: null,
       stale: true,
+      measurement: "never",
       freshness_guidance:
-        "This daemon has NEVER measured directory reachability, so the absence of failures below " +
-        "is not evidence of health — nothing has looked. The startup manifest gate returns without " +
-        "sweeping when no consortium manifest is configured, when the manifest is not yet valid, " +
-        "when it has EXPIRED, or when it was rolled back; check the daemon log for " +
-        "directory.auth.manifest.* at startup. An expired manifest is the common cause and does " +
-        "not announce itself here.",
+        "A consortium manifest IS configured, but no directory-reachability sweep has completed " +
+        "yet, so the absence of failures below is not evidence of health — nothing has finished " +
+        "looking. Immediately after startup this is normal and resolves within a couple of minutes. " +
+        "If it persists, the background sweep is not completing: look for " +
+        "directory.roster.sweep.failed in the log, and see last_sweep_error here if it is present.",
+      ...errorField,
     };
   }
 
@@ -120,6 +189,8 @@ export function describeRosterFreshness(reading: RosterReading): RosterFreshness
       checked_at: reading.sweptAt,
       age_seconds: Math.floor(reading.ageMs / 1000),
       stale: false,
+      measurement: "current",
+      ...errorField,
     };
   }
 
@@ -128,6 +199,7 @@ export function describeRosterFreshness(reading: RosterReading): RosterFreshness
     checked_at: reading.sweptAt,
     age_seconds: ageKnown ? Math.floor(reading.ageMs / 1000) : null,
     stale: true,
+    measurement: "stale",
     freshness_guidance:
       (ageKnown
         ? `This reading is ${Math.floor(reading.ageMs / 1000)} seconds old. `
@@ -137,8 +209,16 @@ export function describeRosterFreshness(reading: RosterReading): RosterFreshness
       "Anything reported below MAY NO LONGER BE TRUE: the nodes listed may already have recovered. " +
       "Do not begin an investigation from it — this has been measured twice, on two machines, where " +
       "a daemon showed node failures from minutes past while all three nodes answered in under " +
-      "200 ms. A reading this old usually means the background sweep has stopped; look for " +
-      "directory.roster.sweep.failed in the daemon log.",
+      "200 ms. " +
+      // REVIEW F12: the first draft said "the background sweep has stopped; look for
+      // directory.roster.sweep.failed" — but the likeliest cause by far is a laptop that slept,
+      // where the sweep did not FAIL, it did not RUN, and that log line will not be there. Sending
+      // the operator to look for a line that cannot exist is the same substitution as F1, smaller.
+      "The sweep did not complete on schedule. Two causes: the process was suspended (a laptop " +
+      "asleep is the common one, and needs nothing — the next sweep corrects it), or the sweep is " +
+      "erroring, in which case last_sweep_error appears above and directory.roster.sweep.failed is " +
+      "in the log.",
+    ...errorField,
   };
 }
 
@@ -157,9 +237,10 @@ export interface RosterSweepScheduler {
 /**
  * Keep measuring directory reachability on a slow timer, whether or not anything is broken.
  *
- * This is the half that actually fixes the freeze: before it, the sweep's only caller was the
- * failover path, so recovering from an outage was precisely what stopped the daemon from ever
- * noticing it had recovered.
+ * This is the half that actually fixes the freeze: every existing caller of the sweep is
+ * activity-driven (ceremonies, session setup, `cello_refresh`), so an IDLE daemon never
+ * re-measures — and sitting idle is what a daemon does between conversations. A time-driven sweep
+ * is precisely what an activity-driven producer lacks.
  *
  * Mirrors `startHttpManifestPoll`'s shape deliberately — same re-arm discipline, same
  * never-throw-out-of-the-tick rule, same stop function.
@@ -168,15 +249,37 @@ export function startRosterSweep(opts: {
   scheduler: RosterSweepScheduler;
   sweep: () => Promise<unknown>;
   logger: RosterSweepLogger;
+  /**
+   * REVIEW F4 — where a sweep failure becomes visible to the AGENT, not only to the log.
+   *
+   * Invariant 2 asks for both, and the log alone was measurably not enough here: the freshness
+   * bound is five minutes and the sweep runs every 90–180 s, so the first two or three consecutive
+   * failures all land while the reading still reports `stale: false`. The operator is handed a
+   * frozen reading presented as current — this line's own defect, arriving through the fix's
+   * failure path. The bound that prevents flapping is the same window that blinds it.
+   */
+  onSweepError?: (e: NonNullable<RosterFreshness["last_sweep_error"]>) => void;
+  onSweepSuccess?: () => void;
+  now?: () => number;
 }): () => void {
-  const { scheduler, sweep, logger } = opts;
+  const { scheduler, sweep, logger, onSweepError, onSweepSuccess, now = Date.now } = opts;
   let stopped = false;
+  let consecutive = 0;
 
   const tick = async (): Promise<void> => {
     if (stopped) return;
     try {
       await sweep();
+      consecutive = 0;
+      onSweepSuccess?.();
     } catch (err: unknown) {
+      consecutive++;
+      onSweepError?.({
+        event: "directory.roster.sweep.failed",
+        error: err instanceof Error ? err.message : String(err),
+        at: new Date(now()).toISOString(),
+        consecutive,
+      });
       /**
        * LOUD, and then RE-ARMED. Swallowing this would leave the reading frozen with nothing
        * saying measurement had stopped — the original defect, silently reintroduced. Skipping the
