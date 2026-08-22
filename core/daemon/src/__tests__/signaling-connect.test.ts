@@ -277,4 +277,32 @@ describe("createSignalingConnect — relay endpoints from signaling_auth_ok", ()
     expect(result.directoryNodeId).toBe(PEER);
     expect(received).toEqual([]);
   });
+
+  /**
+   * DOD-M15-SURFACE-1 — the directory-facing node must not bind a port.
+   *
+   * SOURCE-LEVEL ON PURPOSE, and the reason is a real limitation worth stating rather than hiding:
+   * every test in this file injects `createDirectoryNode`, so none of them reaches the `createNode`
+   * call this asserts on. A behavioural test would have to let the real construction run and then
+   * dial a real directory, which this suite cannot do. The behaviour that an empty listen config
+   * genuinely binds nothing is pinned where it IS observable — `core/transport`'s node suite.
+   *
+   * What this guards is the regression: someone restoring `/ip4/0.0.0.0/tcp/0` here, on a node that
+   * registers no protocol handler and that the directory never dials, giving every operator an open
+   * port again. That is a one-line edit and it would otherwise pass every test in the repo.
+   */
+  it("DOD-M15-SURFACE-1: the directory-facing node is constructed with NO listen addresses", async () => {
+    const { readFileSync } = await import("node:fs");
+    const raw = readFileSync(new URL("../signaling-connect.ts", import.meta.url), "utf-8");
+    // Comments stripped first — the reasoning beside this call NAMES the address it removed, so a
+    // naive scan matches the explanation instead of the code. Same treatment `msg-022`'s parity
+    // test applies for the same reason.
+    const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
+    const call = src.slice(src.indexOf("await createNode({"), src.indexOf("autonatResponder"));
+
+    expect(call, "the createNode call must be found — this test is worthless if the slice missed").toContain("keyProvider");
+    expect(call).toMatch(/listenAddresses:\s*\[\s*\]/);
+    expect(call, "no interface binding may return here").not.toMatch(/0\.0\.0\.0/);
+    expect(call, "nor a loopback one — this node needs no socket at all").not.toMatch(/127\.0\.0\.1/);
+  });
 });
