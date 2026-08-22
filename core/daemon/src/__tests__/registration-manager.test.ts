@@ -102,13 +102,29 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     expect(await mgr.register("", "token")).toEqual({ error: "signaling_lost" });
   });
 
-  it("returns directory_unreachable when getNode() is null at the DKG stage", async () => {
+  it("names the LOCAL cause when getNode() is null at the DKG stage — not the network", async () => {
+    /**
+     * DOD-M15-SURFACE-1 review F6. This asserted `directory_unreachable`, and in doing so pinned a
+     * network verdict for a purely local fact: the daemon's OWN transport node is briefly null while
+     * a signaling stream dies and is rebuilt. The directory may be perfectly reachable, and the
+     * production comment at the call site already said as much.
+     *
+     * The old name sent an operator — or whoever is debugging for them — at the network, at the
+     * consortium, at their connection. It is the same one-string-for-the-wrong-subsystem shape M15
+     * is closing elsewhere, and a test asserting it made it required behaviour.
+     */
     const h = makeFakeCtx({ getNode: () => null });
     const mgr = new RegistrationManager(h.ctx);
     const promise = mgr.register("", "token");
     await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
     h.deliverDkg({ type: "dkg_ready", epochId: "e1", participants: 1, threshold: 2 });
-    expect(await promise).toEqual({ error: "directory_unreachable" });
+
+    const result = await promise as { error: string; detail?: string };
+    expect(result.error).toBe("transport_node_unavailable");
+    expect(result.error, "must not blame the directory for a local lifecycle state").not.toBe("directory_unreachable");
+    // Invariant 4: the answer carries what to do about it, and says the directory is not implicated.
+    expect(result.detail).toMatch(/local/i);
+    expect(result.detail).toMatch(/retry/i);
   });
 
   it("persists and returns state on an already_registered reply at the dkg_ready stage", async () => {

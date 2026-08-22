@@ -298,9 +298,14 @@ describe("createSignalingConnect — relay endpoints from signaling_auth_ok", ()
     // naive scan matches the explanation instead of the code. Same treatment `msg-022`'s parity
     // test applies for the same reason.
     const src = raw.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
-    const call = src.slice(src.indexOf("await createNode({"), src.indexOf("autonatResponder"));
+    // Review F5: the slice ends at the object literal's CLOSING BRACE, not at an interior key. Cut
+    // short at `autonatResponder`, an address reintroduced after it — as `announceAddresses`, say —
+    // escaped all three assertions below.
+    const from = src.indexOf("await createNode({");
+    const call = src.slice(from, src.indexOf("});", from) + 3);
 
     expect(call, "the createNode call must be found — this test is worthless if the slice missed").toContain("keyProvider");
+    expect(call, "and the slice must reach the end of the literal, not stop at an interior key").toContain("autonatResponder");
     expect(call).toMatch(/listenAddresses:\s*\[\s*\]/);
     expect(call, "no interface binding may return here").not.toMatch(/0\.0\.0\.0/);
     expect(call, "nor a loopback one — this node needs no socket at all").not.toMatch(/127\.0\.0\.1/);

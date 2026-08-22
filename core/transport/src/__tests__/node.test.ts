@@ -123,6 +123,18 @@ describe("AC-001: createNode and start", () => {
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
     await node.start();
 
+    /**
+     * Review F4 — WHAT THIS PROVES, precisely. `listenAddresses()` maps `libp2p.getMultiaddrs()`,
+     * which returns only VERIFIED addresses, so `[]` proves nothing is ANNOUNCED rather than that
+     * no socket exists. That gap is bounded and the bound is why this is enough: the regression
+     * this guards is someone restoring `0.0.0.0` or `127.0.0.1`, and both expand to private or
+     * loopback addresses that libp2p verifies immediately and surfaces here. The escape would be a
+     * public-IP-only listen on a firewalled host, which is not a plausible edit at this call site.
+     *
+     * THE TEST DIRECTLY BELOW IS THE POSITIVE CONTROL — it asserts ≥1 concrete-port multiaddr on a
+     * node built WITH a listen address, which is what demonstrates this assertion can tell bound
+     * from unbound at all. Named here so the two cannot drift apart silently.
+     */
     expect(node.listenAddresses(), "an empty listen config must produce no listen address").toEqual([]);
     // And it is still a usable node: it has an identity and can dial OUT, which is all the
     // directory-facing node ever needed.

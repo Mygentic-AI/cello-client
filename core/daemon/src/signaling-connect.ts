@@ -175,10 +175,18 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
     }
 
     // Fresh directory-facing node per connect → fresh transport key / Peer ID.
-    // DOD-NAT-REACHABILITY-1: relayServer disabled — this is a long-lived client
-    // node bound on 0.0.0.0; without the explicit opt-out the no-nodeType default
-    // (a service node) would advertise HOP and let LAN peers relay through the
-    // operator's machine.
+    //
+    // DOD-NAT-REACHABILITY-1: relayServer disabled, and the opt-out is NOT made redundant by this
+    // node listening on nothing (see below). Leaving `nodeType` unset takes the service-node
+    // default, which adds `circuitRelayServer` to the service map and advertises HOP — and HOP is
+    // advertised over connections WE opened, not only over ones we accept. A node with no listener
+    // still holds a live outbound connection to the directory.
+    //
+    // (This comment described the node as "bound on 0.0.0.0" until DOD-M15-SURFACE-1 removed the
+    // binding. Rewritten rather than deleted: the constraint it records is still load-bearing, and
+    // leaving it in past tense put two comments in one expression contradicting each other about
+    // the exact fact this unit changed — which is how the binding gets "restored" by a later
+    // session that stops reading at the first one.)
     const node = deps.createDirectoryNode
       ? await deps.createDirectoryNode(identity.keyProvider)
       : await createNode({

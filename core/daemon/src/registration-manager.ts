@@ -255,7 +255,27 @@ export class RegistrationManager {
     // stream-death window) — null-check before FROST DKG opens streams on it.
     const dkgNode = this.#ctx.getNode();
     if (!dkgNode) {
-      return { error: "directory_unreachable" };
+      /**
+       * NAMES THE LOCAL STATE, not the network. This returned `directory_unreachable` — a network
+       * verdict for a purely local lifecycle fact, and the comment two lines above already says so:
+       * the daemon's own node reference is briefly null while a stream dies and is rebuilt. The
+       * directory may be perfectly reachable.
+       *
+       * Found by the `DOD-M15-SURFACE-1` review as `[pre-existing]`; fixed under the standing rule
+       * that an error naming the wrong subsystem gets corrected when it is found. It is also the
+       * exact shape M15 is closing elsewhere — one string sending an investigation at the network
+       * when the cause is local — so leaving it while fixing its siblings would be inconsistent.
+       */
+      this.#ctx.logger.warn("registration.dkg.node_unavailable", {
+        impact: "the daemon's own transport node was momentarily absent while a signaling stream was rebuilt; registration was not attempted and nothing about the directory's reachability was established",
+      });
+      // `detail` is the shape this return type carries — the affordance rides there rather than in
+      // a `guidance` key the caller would drop on the floor.
+      return {
+        error: "transport_node_unavailable",
+        detail:
+          "The daemon's transport node was briefly unavailable while its directory connection was rebuilding. This is local and usually clears within seconds; it says nothing about whether the directory is reachable. Retry registration, and if it repeats check the directory connection state with cello status.",
+      };
     }
     // DOD-DKG-1: build the directory-node set the DKG fans across. With a verified consortium
     // manifest the client resolved the full N-node roster (getConsortiumEndpoints) and the DKG
