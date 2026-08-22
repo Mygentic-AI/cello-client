@@ -258,3 +258,96 @@ describe("DOD-M15-STALEROSTER-1: a real daemon that has never measured does not 
     ).not.toMatch(/could not\s+resolve these directory endpoints/);
   }, 30_000);
 });
+
+describe("DOD-M15-STALEROSTER-1: the daemon actually STARTS the sweep", () => {
+  /**
+   * THE REVERT TEST FOUND THIS GAP, and it is the one that mattered.
+   *
+   * Disabling the daemon's sweep wiring entirely — `const rosterSweepScheduler = false && …` — left
+   * all thirteen tests above green. They proved `startRosterSweep` re-arms; nothing proved the
+   * daemon ever called it. The whole point of the line is that a HEALTHY daemon keeps measuring, and
+   * that was the untested half.
+   *
+   * The scheduler is injectable for exactly this reason, following `registryPollScheduler`.
+   */
+  let tempDir: string;
+  let handle: DaemonHandle | null = null;
+
+  const manifest = () => {
+    const hour = 3_600_000;
+    return {
+      version: 1,
+      not_before: new Date(Date.now() - hour).toISOString(),
+      expires: new Date(Date.now() + hour).toISOString(),
+      // A closed local port, so the probe refuses immediately rather than waiting on a timeout.
+      nodes: [{ nodeId: "dead-1", pubkey: "b".repeat(64), region: "us-east-1", provider: "aws", endpoint: "http://127.0.0.1:1" }],
+      signatures: [{ officerIndex: 0, signature: "c".repeat(128) }],
+    };
+  };
+
+  /** A scheduler that hands the tick back so the test drives it, instead of waiting 90 seconds. */
+  function controllable() {
+    let pending: (() => Promise<void>) | null = null;
+    return {
+      scheduleNext(fn: () => Promise<void>) { pending = fn; },
+      cancel() { pending = null; },
+      async fire() { const f = pending; pending = null; if (f) await f(); },
+      get armed() { return pending !== null; },
+    };
+  }
+
+  beforeEach(async () => {
+    tempDir = await mkdtemp(join(tmpdir(), "m15-staleroster-wired-"));
+  });
+  afterEach(async () => {
+    if (handle) await handle.stop("test_cleanup").catch(() => {});
+    handle = null;
+    await rm(tempDir, { recursive: true, force: true });
+  });
+
+  it("★ a daemon with a manifest arms the sweep at startup and re-arms it after each tick", async () => {
+    const sched = controllable();
+    handle = await startDaemon({
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      manifestProvider: {
+        loadAndVerify: vi.fn(async () => manifest()),
+        getCurrentManifest: vi.fn(() => manifest()),
+        updateManifest: vi.fn(),
+      },
+      manifestRootKeys: ["a".repeat(64)],
+      manifestThreshold: 1,
+      rosterSweepScheduler: sched,
+    } as unknown as DaemonConfig);
+
+    expect(
+      sched.armed,
+      "the daemon never armed the roster sweep, so the reading freezes the moment the failover " +
+        "path stops being taken — the exact defect this line reports",
+    ).toBe(true);
+
+    const c = await connectToDaemon(join(tempDir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "mcp" });
+    const before = (await c.send("cello_status", {})) as Record<string, unknown>;
+    const beforeAt = (before["directory_endpoints_unresolved"] as Record<string, unknown>)["checked_at"];
+
+    // One tick of the background sweep — the thing that could not happen before this unit.
+    await sched.fire();
+    expect(sched.armed, "and it must re-arm, or it measures exactly once and freezes again").toBe(true);
+
+    const after = (await c.send("cello_status", {})) as Record<string, unknown>;
+    c.close();
+    const afterAt = (after["directory_endpoints_unresolved"] as Record<string, unknown>)["checked_at"];
+
+    expect(
+      afterAt,
+      "the sweep ran but the reading did not move — cello_status is still answering from the boot " +
+        "measurement, which is what 'frozen' means",
+    ).not.toBe(beforeAt);
+  }, 30_000);
+});

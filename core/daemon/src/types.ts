@@ -483,6 +483,17 @@ export interface DaemonConfig {
    * When absent (or registryPubkey absent), registry polling is disabled.
    */
   registryPollScheduler?: import("@cello-protocol/transport").IManifestPollScheduler;
+  /**
+   * DOD-M15-STALEROSTER-1: scheduler for the background directory-reachability sweep.
+   *
+   * Injectable for the same reason the two above are — without it, "does the daemon actually START
+   * the sweep" is unobservable, and the revert test proved that gap was real: disabling the wiring
+   * entirely left the whole suite green while the reading went back to freezing on recovery.
+   *
+   * When absent the daemon builds its own slow randomized scheduler; the sweep is never off while a
+   * manifest provider exists.
+   */
+  rosterSweepScheduler?: import("@cello-protocol/transport").IManifestPollScheduler;
 }
 
 // --- Session node types ---

@@ -407,7 +407,8 @@ async function startDaemonHoldingLock(
    * says so in `cello_status`.
    */
   const rosterSweepScheduler = manifestProvider
-    ? new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
+    ? config.rosterSweepScheduler ??
+      new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
     : undefined;
   const stopRosterSweep = rosterSweepScheduler
     ? startRosterSweep({
