@@ -13,7 +13,7 @@
 
 import { join } from "node:path";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
-import { createBackup, restoreBackup, readLock, isProcessAlive } from "@cello-protocol/daemon";
+import { createBackup, restoreBackup, probeSingletonLock } from "@cello-protocol/daemon";
 import type { Logger } from "@cello-protocol/daemon";
 import {
   login,
@@ -385,7 +385,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "  half another — which is worse than either failing.\n" +
       "  The archive is checked completely before anything is written, so a corrupt or truncated\n" +
       "  file cannot destroy the agent you still have.\n" +
-      "  Make backups with 'cello_backup' from your agent, or the portal.",
+      "  Make backups with 'cello backup <file>' or the cello_backup tool.",
     async run(ctx, args) {
       const archivePath = args[0] ?? "";
       if (!archivePath) {
@@ -395,17 +395,35 @@ export const COMMANDS: readonly CommandSpec[] = [
           exitCode: 2,
         };
       }
-      // REFUSE while the daemon is up — see the help above. Checked here rather than trusting the
-      // operator to have run logout, because the failure it prevents is silent and unrecoverable.
-      const lock = await readLock(join(ctx.celloDir, "daemon.lock"));
-      if (lock && isProcessAlive(lock.pid)) {
+      /**
+       * `probeSingletonLock`, NOT `readLock` + `isProcessAlive` — review F4.
+       *
+       * My first version used the lock file, which this repo documents as unable to answer this
+       * question. `readLock` returns null for BOTH "absent" and "unparseable", and both took the
+       * permissive branch — so a stale, deleted or corrupt lock let the restore proceed and
+       * overwrite the database UNDER A LIVE DAEMON, which is exactly the hybrid-identity outcome the
+       * help text promises cannot happen. That state is documented as real: an exiting orphan
+       * unlinks a healthy daemon's lock, and so does `rm ~/.cello/daemon.lock`.
+       *
+       * `singleton-lock.ts` puts it plainly: "every stale-lock heuristic ever written is an attempt
+       * to guess what only the kernel actually knows", and `commands.ts` states the law — pid
+       * liveness may never answer "does a daemon exist"; every EXISTENCE decision goes through the
+       * probe.
+       *
+       * `unknown` REFUSES, matching `logout`: declining to act without proof is the only safe
+       * direction when the operation overwrites an identity.
+       */
+      const probe = await probeSingletonLock(ctx.celloDir, ctx.logger);
+      if (probe === "held" || probe === "unknown") {
+        const who = probe === "held" ? `The daemon is running` : `Could not prove the daemon is stopped`;
         return {
           stdout: "",
           stderr:
-            `The daemon is running (pid ${lock.pid}). Stop it before restoring:\n\n` +
+            `${who}. Stop it before restoring:\n\n` +
             `  cello logout\n  cello restore ${archivePath}\n  cello login\n\n` +
             `A running daemon holds the database open; overwriting it underneath can leave a ` +
-            `database that is half one identity and half another.\n`,
+            `database that is half one identity and half another. Refusing without proof is ` +
+            `deliberate — this operation replaces your agent.\n`,
           exitCode: 1,
         };
       }

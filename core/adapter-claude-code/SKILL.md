@@ -356,10 +356,29 @@ they are reachable — `cello_doc_list` shows what has not yet been acknowledged
 to reach them, call `cello_doc_propose` again with the `document_id` it returned rather than making a
 new one; a new proposal is a second, separate document.
 
-**Not yet implemented** — these tools are registered but the daemon returns `not_implemented`. Do not build on them (DOD-CUSTODY-DAEMON-1).
+**Backup and restore are live** (`DOD-M15-BACKUP-1`). `cello_get_inclusion_proof` is still not
+implemented — the daemon returns `not_implemented` for that one; do not build on it.
+
 ```
-cello_backup()  ·  cello_restore()  ·  cello_get_inclusion_proof({ cello_session_id, content_hash })
+cello_backup({ path, overwrite? })   — export this agent to a file
+cello_restore({ path })              — CHECK a backup and print how to restore it
 ```
+
+**The backup file is as sensitive as a private key.** It contains the agent's encrypted database
+*and* the key that opens it — both, because a database without its key restores to something nobody
+can read, including you. Anyone holding that file can sign as this agent and read every transcript
+in it. Keep it where you keep private keys.
+
+**Restoring is CLI-only and REPLACES this machine's agent.** `cello_restore` validates the archive
+and prints the sequence rather than performing it: a running daemon holds the database open, and
+overwriting it underneath could leave a database that is half one identity and half another.
+
+```bash
+cello logout && cello restore <file> && cello login
+```
+
+Restore replaces; it does not merge. Anything that happened on this machine since the backup was
+taken is gone.
 
 ## Configuration
 

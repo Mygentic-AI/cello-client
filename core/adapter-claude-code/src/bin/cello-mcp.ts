@@ -770,15 +770,33 @@ server.tool("cello_inbox", "Check for pending inbound session requests and unrea
   return jsonText(result);
 });
 
-server.tool("cello_backup", "Backup agent state to configured storage", {}, async () => {
-  const result = await proxy.call("cello_backup");
-  return jsonText(result);
-});
+// DOD-M15-BACKUP-1 review F1: these declared an EMPTY schema and forwarded NO params, while the
+// daemon requires `path`. So every agent call returned `missing_path`, whose guidance named a
+// parameter the tool did not accept — an instruction the caller had no way to follow, forever.
+server.tool(
+  "cello_backup",
+  "Export this agent to a backup file. THE FILE IS AS SENSITIVE AS A PRIVATE KEY — it contains the agent's encrypted database AND the key that opens it (a backup without the key restores to something nobody can read), so anyone holding it can sign as this agent and read every transcript. Safe to run while the daemon is up. Give an absolute path; there is deliberately no default location.",
+  {
+    path: z.string().describe("Absolute path to write the backup to, e.g. /Users/you/agent.cello-backup"),
+    overwrite: z.boolean().optional().describe("Replace an existing file at that path (refused otherwise — silently replacing a backup is a way to lose an identity while believing you hold two copies)"),
+  },
+  async ({ path, overwrite }) => {
+    const params: Record<string, unknown> = { path };
+    if (overwrite !== undefined) params.overwrite = overwrite;
+    const result = await proxy.call("cello_backup", params);
+    return jsonText(result);
+  },
+);
 
-server.tool("cello_restore", "Restore agent state from backup", {}, async () => {
-  const result = await proxy.call("cello_restore");
-  return jsonText(result);
-});
+server.tool(
+  "cello_restore",
+  "Check a backup file and explain how to restore it. Restoring REPLACES this machine's agent and must run with the daemon STOPPED, so this tool validates the archive and prints the exact command sequence rather than attempting it — a running daemon holds the database open and could leave a database that is half one identity and half another.",
+  { path: z.string().describe("Absolute path of the backup file to check") },
+  async ({ path }) => {
+    const result = await proxy.call("cello_restore", { path });
+    return jsonText(result);
+  },
+);
 
 server.tool("cello_sealed_receipt", "Get the sealed receipt for a closed session. NOTE: the response echoes `session_name` — that is YOUR private label for the session, not part of the receipt. If you share this receipt with the counterparty or a third party (comparing sealed_root is the normal reason to), strip it: they have never seen it and it may describe the conversation in terms you did not say to them.", {
   cello_session_id: z.string().describe("Session ID"),

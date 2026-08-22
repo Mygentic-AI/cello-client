@@ -161,6 +161,41 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "one every previous audit missed (it is not source and was on nobody's list), which is why " +
       "the scanner enumerates package.json#files rather than trusting a list.",
   },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "backup: 'a database without its key restores to something nobody can read, including you' / 'anyone holding that file can sign as this agent'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Replaces a claim that had become FALSE — both shipped skills still said backup and restore " +
+      "return `not_implemented`, which stopped being true when DOD-M15-BACKUP-1 landed. The new " +
+      "text states properties of the artifact that unit builds: the archive carries the SQLCipher " +
+      "key alongside the database (round-trip test restores into a directory with a different key " +
+      "to prove it), so possession of the file is possession of the agent.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "backup: same sentence, plugin copy",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Same text and same evidence as the tarball SKILL.md row above. Carried on BOTH surfaces " +
+      "because the tarball copy is the one every previous audit missed — it is not source and was " +
+      "on nobody's list, which is why the scanner enumerates package.json#files.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "restore: 'Refusing without proof is deliberate — this operation replaces your agent.'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Review F4. The guard now uses `probeSingletonLock`, the kernel-authoritative check, and " +
+      "refuses on BOTH `held` and `unknown`. It previously used readLock + isProcessAlive, which " +
+      "returns null for absent AND unparseable and took the permissive branch on both — so a " +
+      "stale, deleted or corrupt lock let a restore overwrite the database under a LIVE daemon. " +
+      "`singleton-lock.ts` states the rule the old version broke: every stale-lock heuristic is an " +
+      "attempt to guess what only the kernel knows.",
+  },
 ];
 
 /**

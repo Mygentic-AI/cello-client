@@ -45,12 +45,32 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
-import { readFile, writeFile, rm, mkdir } from "node:fs/promises";
+import { readFile, writeFile, rm, mkdir, chmod, open as fsOpen, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
 import { openEncryptedDatabase, dbKeyPathFor } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+
+/**
+ * Write 0600, fsync, rename — and fsync the directory so the rename itself survives a power loss.
+ *
+ * Restore OVERWRITES an identity. A partially written database is the one failure that opens and is
+ * WRONG rather than failing loudly, because page 1 is enough for `sqlite_master` to read. Rename is
+ * atomic: the path is either the old file or the whole new one.
+ */
+async function writeFileDurably(path: string, bytes: Buffer): Promise<void> {
+  const tmp = `${path}.restore-${randomBytes(6).toString("hex")}`;
+  const fh = await fsOpen(tmp, "wx", 0o600);
+  try {
+    await fh.write(bytes);
+    await fh.sync();
+  } finally {
+    await fh.close();
+  }
+  await rename(tmp, path);
+  const dir = await fsOpen(dirname(path), "r");
+  try { await dir.sync(); } finally { await dir.close(); }
+}
 
 /** Magic + version, so a wrong file is refused by shape before anything else is attempted. */
 const MAGIC = "CELLO-BACKUP-v1";
@@ -125,7 +145,12 @@ export async function createBackup(opts: {
 
   // A snapshot beside the real database, then read and discard it. `VACUUM INTO` refuses to write
   // to an existing path, so the name is fresh per call.
-  const snapshot = join(tmpdir(), `cello-backup-${randomBytes(8).toString("hex")}.db`);
+  // BESIDE THE ARCHIVE, not in the shared temp dir (review F11). On macOS `$TMPDIR` is per-user
+  // 0700, but on Linux it is `/tmp` and SQLite creates the snapshot at `0644 & ~umask`. The contents
+  // are encrypted — verified empirically, the header is ciphertext and it is unopenable without the
+  // key — so that is ciphertext exposure rather than key exposure. It is still a full copy of the
+  // database, and the `finally` below only covers throws: a SIGKILL mid-backup would leave it there.
+  const snapshot = join(dirname(opts.outPath), `.cello-backup-snapshot-${randomBytes(8).toString("hex")}.db`);
   try {
     const key = await readFile(keyPath);
     const db = openEncryptedDatabase(opts.dbPath, new Uint8Array(key));
@@ -145,10 +170,22 @@ export async function createBackup(opts: {
       key_b64: key.toString("base64"),
     };
 
-    await mkdir(dirname(opts.outPath), { recursive: true });
     const packed = gzipSync(Buffer.from(JSON.stringify(envelope), "utf8"));
-    // 0600: the file carries a signing key, so it is not world-readable even for a moment.
     await writeFile(opts.outPath, packed, { mode: 0o600 });
+    /**
+     * CHMOD AFTER THE WRITE, because `mode` is honoured only at `O_CREAT` — review F5, measured on
+     * this machine:
+     *
+     *     existing 0644 file + writeFile(mode 0600)  →  still 0644
+     *     existing 0666 file + writeFile(mode 0600)  →  still 0666
+     *     fresh file                                  →  0600
+     *
+     * So the `--force` path — overwriting yesterday's archive — kept whatever mode was already
+     * there. A file that arrived at 0644 (scp, a shell redirect under umask 022, an iCloud
+     * round-trip) would hold a WORLD-READABLE plaintext signing key. The comment claimed the
+     * property; only the create path enforced it.
+     */
+    await chmod(opts.outPath, 0o600);
 
     opts.logger.info("agent.backup.written", {
       path: opts.outPath,
@@ -274,15 +311,39 @@ export async function restoreBackup(opts: {
   }
 
   try {
-    await mkdir(dirname(opts.dbPath), { recursive: true });
-    // Key first: a database present without its key is the unopenable state, and if the process
-    // dies between the two writes that is the one to avoid being left in.
-    await writeFile(keyPath, parsed.keyBytes, { mode: 0o600 });
-    await writeFile(opts.dbPath, parsed.dbBytes, { mode: 0o600 });
-    // SQLite sidecars belong to the database that was here before; leaving them would let stale WAL
-    // frames replay over the restored file.
+    // 0700, matching `resolveDbKey`'s own mkdir. On a fresh machine THIS is what creates the CELLO
+    // directory, and it holds a signing key (review F12).
+    await mkdir(dirname(opts.dbPath), { recursive: true, mode: 0o700 });
+
+    /**
+     * ORDER AND ATOMICITY — review F6/F7, and the previous comment here had it backwards.
+     *
+     * It said "key first, because a database without its key is the unopenable state". On a machine
+     * that ALREADY has an agent that is true but harmless — a key/db mismatch throws
+     * `db_encryption_key_mismatch`, loudly, and re-running the restore fixes it.
+     *
+     * On a FRESH machine — the actual restore use case — key-first is the dangerous order. Crash
+     * between the two writes and the key is present with NO database, so `resolveDbKey` loads the
+     * key and SQLCipher CREATES A FRESH EMPTY ONE. The daemon boots clean with zero agents and says
+     * nothing. That is the only crash state that opens, is wrong, and is silent.
+     *
+     * Worse, a crash MID-write left a truncated database whose page 1 was present, so
+     * `sqlite_master` read and the open SUCCEEDED against a partial file.
+     *
+     * Both are closed by writing to a temp sibling, fsync'ing, and renaming — rename is atomic, so
+     * the file either is the old one or is the whole new one, never half. The sidecars go first:
+     * stale WAL frames encrypted under the OLD key must not be present when the new database
+     * appears. Then the database, then the key — so the surviving crash state is db-present /
+     * key-absent, which `resolveDbKey` refuses loudly by design.
+     *
+     * The key write is fsync'd for the reason `sqlcipher-db.ts` gives where it writes the same file:
+     * "so a crash right after a fresh install can't lose the key while the encrypted DB exists".
+     * Returning ok:true with the key only in page cache re-opens that hole.
+     */
     await rm(`${opts.dbPath}-wal`, { force: true }).catch(() => {});
     await rm(`${opts.dbPath}-shm`, { force: true }).catch(() => {});
+    await writeFileDurably(opts.dbPath, parsed.dbBytes);
+    await writeFileDurably(keyPath, parsed.keyBytes);
   } catch (err: unknown) {
     const reason = err instanceof Error ? err.message : String(err);
     opts.logger.error("agent.restore.failed", { archivePath: opts.archivePath, reason });
