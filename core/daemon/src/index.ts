@@ -99,3 +99,8 @@ export type { FrostAuthSigner } from "./network-directory-node.js";
 // re-deciding what "usable" means.
 export { resolveAgentState, isAgentRunning } from "./agent-state.js";
 export type { AgentStateInputs } from "./agent-state.js";
+
+// DOD-M15-BACKUP-1: exported so the CLI can restore with the daemon STOPPED — the one moment
+// the daemon itself cannot do it, because it would be holding the database open.
+export { createBackup, restoreBackup, inspectBackup } from "./backup-restore.js";
+export type { BackupResult, RestoreResult } from "./backup-restore.js";

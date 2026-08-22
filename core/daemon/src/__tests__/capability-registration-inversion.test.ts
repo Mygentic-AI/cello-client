@@ -49,6 +49,14 @@ const EXEMPT = new Map<string, string>([
   ["cello_remove_agent", "destructive and irreversible — deliberately requires the terminal"],
   ["cello_status", "`cello status` serves this from `cello_list_agents`; both surfaces have the verb"],
   ["wallet_list_issued", "not its own verb — joined into the results verb on BOTH surfaces so a submission awaiting the subject shows as pending"],
+  /**
+   * DOD-M15-BACKUP-1. Both verbs EXIST on both surfaces — `cello backup` / `cello restore` and
+   * `cello_backup` / `cello_restore` — so this is not the usual single-surface exemption. They are
+   * listed because the CLI does not PROXY the daemon handler, which is what the scan looks for, and
+   * in both cases not proxying is the point.
+   */
+  ["cello_backup", "the CLI runs the capability directly (backup-restore.ts) instead of proxying the handler, so an operator can still export their identity when the daemon will not start — which is exactly when a backup matters"],
+  ["cello_restore", "restore must run with the daemon STOPPED: a running daemon holds the database open and could flush its own pages over the restored ones, leaving a database that is half one identity and half another. The MCP handler therefore refuses and prints the sequence; only the CLI performs it"],
 ]);
 
 /** Handlers that are not capabilities at all. */

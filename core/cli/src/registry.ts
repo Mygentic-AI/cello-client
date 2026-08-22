@@ -11,7 +11,9 @@
  * FORCES adding its one-line summary.
  */
 
+import { join } from "node:path";
 import { MONIKER_RE } from "@cello-protocol/protocol-types";
+import { createBackup, restoreBackup, readLock, isProcessAlive } from "@cello-protocol/daemon";
 import type { Logger } from "@cello-protocol/daemon";
 import {
   login,
@@ -337,6 +339,84 @@ export const COMMANDS: readonly CommandSpec[] = [
       // "Daemon stopped." — the immediate progress line tells the operator the command
       // activated and the short pause is expected.
       return legacy(await logout(ctx.celloDir, ctx.onProgress));
+    },
+  },
+  {
+    name: "backup",
+    group: "Setup",
+    summary: "Write this machine's agent to a backup file. The file is as sensitive as a private key.",
+    help:
+      "Usage: cello backup <file> [--force]  — export this machine's agent for safekeeping.\n" +
+      "  Writes the agent database AND the key that opens it. Both, because a database without its\n" +
+      "  key restores to something nobody can read — including you.\n" +
+      "  So the file IS your agent: whoever holds it can sign as you and read every transcript in\n" +
+      "  it. Keep it where you keep private keys.\n" +
+      "  Safe to run while the daemon is up — the snapshot is taken through SQLite, so it is never\n" +
+      "  a half-written copy.\n" +
+      "  --force replaces an existing file at that path.",
+    flags: [{ name: "--force", consumesValue: false }],
+    async run(ctx, args) {
+      const outPath = args.find((a) => !a.startsWith("--")) ?? "";
+      if (!outPath) {
+        return { stdout: "", stderr: "Usage: cello backup <file> [--force]\n", exitCode: 2 };
+      }
+      const res = await createBackup({
+        dbPath: join(ctx.celloDir, "sessions.db"),
+        outPath,
+        logger: ctx.logger,
+        ...(args.includes("--force") ? { overwrite: true } : {}),
+      });
+      return res.ok
+        ? { stdout: `Wrote ${res.bytes} bytes to ${res.path}\n\n${res.guidance}\n`, stderr: "", exitCode: 0 }
+        : { stdout: "", stderr: `${res.reason}: ${res.guidance}\n`, exitCode: 1 };
+    },
+  },
+  {
+    name: "restore",
+    group: "Setup",
+    summary: "Restore an agent from a backup file. REPLACES this machine's agent — daemon must be stopped.",
+    help:
+      "Usage: cello restore <backup-file>  — put an agent back on this machine from a backup.\n" +
+      "  REPLACES the agent database on this machine. It does not merge: anything that happened\n" +
+      "  here since the backup was taken is gone. That is the whole operation, so it is worth\n" +
+      "  being sure this is the machine you mean.\n" +
+      "  The daemon must be STOPPED first ('cello logout'). A running daemon holds the database\n" +
+      "  open, and overwriting it underneath could leave a database that is half one identity and\n" +
+      "  half another — which is worse than either failing.\n" +
+      "  The archive is checked completely before anything is written, so a corrupt or truncated\n" +
+      "  file cannot destroy the agent you still have.\n" +
+      "  Make backups with 'cello_backup' from your agent, or the portal.",
+    async run(ctx, args) {
+      const archivePath = args[0] ?? "";
+      if (!archivePath) {
+        return {
+          stdout: "",
+          stderr: "Usage: cello restore <backup-file>\n",
+          exitCode: 2,
+        };
+      }
+      // REFUSE while the daemon is up — see the help above. Checked here rather than trusting the
+      // operator to have run logout, because the failure it prevents is silent and unrecoverable.
+      const lock = await readLock(join(ctx.celloDir, "daemon.lock"));
+      if (lock && isProcessAlive(lock.pid)) {
+        return {
+          stdout: "",
+          stderr:
+            `The daemon is running (pid ${lock.pid}). Stop it before restoring:\n\n` +
+            `  cello logout\n  cello restore ${archivePath}\n  cello login\n\n` +
+            `A running daemon holds the database open; overwriting it underneath can leave a ` +
+            `database that is half one identity and half another.\n`,
+          exitCode: 1,
+        };
+      }
+      const res = await restoreBackup({
+        archivePath,
+        dbPath: join(ctx.celloDir, "sessions.db"),
+        logger: ctx.logger,
+      });
+      return res.ok
+        ? { stdout: `${res.guidance}\n`, stderr: "", exitCode: 0 }
+        : { stdout: "", stderr: `${res.reason}: ${res.guidance}\n`, exitCode: 1 };
     },
   },
   {

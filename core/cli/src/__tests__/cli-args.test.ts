@@ -42,6 +42,8 @@ describe("F1: usage string lists every command", () => {
       [
         // Setup
         "login", "logout", "status", "create-agent", "register-agent", "remove-agent",
+        // DOD-M15-BACKUP-1: a lost machine used to lose the agent permanently.
+        "backup", "restore",
         // Agents
         "agents", "start-agent", "use-agent", "stop-using-agent", "set-agent-offline", "refresh",
         // Messaging

@@ -109,6 +109,32 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "it holds no private key for. Consistent with the no-PII-in-the-directory rule: directories " +
       "are federated and possibly public, so they hold hashes and sealed blobs, never plaintext.",
   },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "restore: 'a corrupt or truncated file cannot destroy the agent you still have'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Built and tested as part of DOD-M15-BACKUP-1. `restoreBackup` calls `parseArchive` FIRST, " +
+      "which gunzips, parses, checks the magic and version, requires a 32-byte key and verifies a " +
+      "SHA-256 over the database payload — entirely in memory. Nothing reaches the disk until all " +
+      "of that passes. Two tests cover it: a garbage file and a half-length truncation, each " +
+      "asserting afterwards that the pre-existing database still reads its original marker.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "backup: 'a database without its key restores to something nobody can read — including you' / 'whoever holds it can sign as you'",
+    matches: 2,
+    verdict: "true",
+    evidence:
+      "Both are properties of the artifact built in DOD-M15-BACKUP-1. The database is SQLCipher- " +
+      "encrypted and its key is a separate 32-byte file at `<db>.key` — `sqlcipher-db.ts` calls it " +
+      "'the ONE plaintext key file on disk' — and a fresh daemon mints its own, which cannot open a " +
+      "database encrypted under a different one. The round-trip test proves the archive carries the " +
+      "key by restoring into a directory whose key differs. The second half follows: the archive " +
+      "contains that key in the clear, so possession of the file is possession of the agent. Saying " +
+      "so at the moment one is written is the affordance, not decoration.",
+  },
 ];
 
 /**

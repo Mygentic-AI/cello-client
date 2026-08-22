@@ -406,8 +406,25 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
     }
   });
 
-  it("the three DESCOPED custody tools have no CLI command (a fake pass-through is worse than none)", () => {
-    for (const name of ["backup", "restore", "inclusion-proof"]) {
+  it("the remaining DESCOPED custody tool has no CLI command (a fake pass-through is worse than none)", () => {
+    /**
+     * `backup` and `restore` LEFT this list on 2026-08-22 — `DOD-M15-BACKUP-1` made their daemon
+     * handlers real, which is the exact condition the assertion below names. A lost machine used to
+     * lose the agent permanently.
+     *
+     * They are not ordinary pass-throughs, and that is why they are not in the parity table above:
+     *
+     *   `cello backup`  runs the capability directly (`backup-restore.ts`) rather than proxying an
+     *                   IPC handler, so an operator can still export their identity when the daemon
+     *                   will not start — which is exactly when a backup matters.
+     *   `cello restore` must run with the daemon STOPPED. A running daemon holds the database open
+     *                   and could flush its own pages back over the restored ones, leaving a
+     *                   database that is half one identity and half another. The `cello_restore`
+     *                   MCP tool therefore refuses and prints the sequence instead of attempting it.
+     *
+     * `inclusion-proof` stays: its daemon handler is still a stub.
+     */
+    for (const name of ["inclusion-proof"]) {
       expect(findCommand(name), `'${name}' must NOT exist until the daemon handler is real`).toBeUndefined();
     }
   });
