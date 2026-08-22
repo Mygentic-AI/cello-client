@@ -751,6 +751,51 @@ export class SessionNodeManager {
   // safe to close — the close would be signed, refused as `leaf_count_mismatch`, and the receipt
   // lost for good.
   #diverged = new Set<string>();
+
+  /**
+   * Rehydrate `#diverged` from `sessions.diverged_at` — `DOD-M15-DIVERGE-DURABLE-1`.
+   *
+   * The Set stays as the hot read (the seal gate consults it per close), and the column is the
+   * truth. Loaded once at boot rather than queried per read so the gate's cost does not change.
+   */
+  #loadDivergedFromDb(): void {
+    if (!this.#db) return;
+    const rows = this.#db
+      .prepare(
+        `SELECT s.session_id AS sid, a.agent_name AS agent
+           FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
+          WHERE s.diverged_at IS NOT NULL`,
+      )
+      .all() as Array<{ sid: string; agent: string }>;
+    for (const r of rows) this.#diverged.add(this.#k(r.agent, r.sid));
+    if (rows.length > 0) {
+      this.#logger.info("session.diverged.restored", {
+        count: rows.length,
+        impact:
+          "these sessions provably cannot seal bilaterally and are refused at the seal gate — before " +
+          "this was durable, a restart made them read as healthy",
+      });
+    }
+  }
+
+  /**
+   * Record that this session's tree and the relay's counter have provably parted.
+   *
+   * Idempotent, and deliberately does NOT touch `updated_at`: that column drives the inbox's
+   * last-spoke ordering, and divergence is not activity.
+   */
+  markSessionDiverged(agentName: string, sessionId: string): void {
+    this.#diverged.add(this.#k(agentName, sessionId));
+    if (!this.#db) return;
+    this.#db
+      .prepare("UPDATE sessions SET diverged_at = ? WHERE session_id = ? AND diverged_at IS NULL")
+      .run(Date.now(), sessionId);
+  }
+
+  /** Whether this session has provably parted from the relay's ordering. */
+  isSessionDiverged(agentName: string, sessionId: string): boolean {
+    return this.#diverged.has(this.#k(agentName, sessionId));
+  }
   // DOD-M15-FRAME-1 (review F1): sessions frozen because a frame failed to verify against the
   // expected counterparty. Consulted by `reviveSessionNode` — a teardown writes `interrupted`,
   // which is the REVIVABLE status, so without this the next `cello_receive` silently rebuilt the
@@ -1309,6 +1354,18 @@ export class SessionNodeManager {
       // several times a day re-runs the whole budget against a hopeless session on every boot.
       "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_at INTEGER",
       "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_reason TEXT",
+      // DOD-M15-DIVERGE-DURABLE-1: epoch-ms when this session's tree and the relay's counter
+      // provably parted, so it can never seal bilaterally. NULL = not diverged.
+      //
+      // DURABLE, and the reason is that the read site cannot tell "not diverged" from "forgotten":
+      // both are false and both read READY. `#diverged` was in memory, so a restart turned a
+      // session that provably cannot seal into one the gate was happy to close.
+      //
+      // NOT the trade `frontier-mismatch.ts` makes on purpose. A frontier mismatch is re-detected
+      // by the very next close, so losing it costs a recomputation. Divergence is re-detected only
+      // by the next send that gets an ack behind the frontier — which on a finished conversation
+      // never comes. Losing it costs a WRONG ANSWER.
+      "ALTER TABLE sessions ADD COLUMN diverged_at INTEGER",
     ]) {
       try {
         this.#db.exec(ddl);
@@ -1547,6 +1604,17 @@ export class SessionNodeManager {
     // database it already exists here and is re-keyed in the same transaction; on a fresh one it is
     // absent, is skipped, and RetryQueue then creates it directly in the re-keyed shape.
     migrateSessionTablesToAgentId(this.#db, this.#logger);
+
+    /**
+     * DOD-M15-DIVERGE-DURABLE-1: rehydrate the divergence set from `sessions.diverged_at`.
+     *
+     * AFTER `migrateSessionTablesToAgentId`, not with the column migrations that create the field.
+     * The query joins `sessions.agent_id` to `agents`, and on a database written before REMOVE-001
+     * that column does not exist until this migration adds it — placing the load earlier failed
+     * with `no such column: s.agent_id` on exactly those legacy databases, which are the ones a
+     * restart matters most for.
+     */
+    this.#loadDivergedFromDb();
 
     // DOD-TIER-1 (address-book Step 1): give `contacts` its tier metadata (tier / provenance /
     // last_offered_moniker / away_message). Pure ADD COLUMN, no rebuild — so it runs AFTER the
@@ -7178,7 +7246,7 @@ export class SessionNodeManager {
         agentName, sessionId, assignedSeq, nextExpected, contentHash: contentHashHex, correlationId,
         impact: "this side's tree is ahead of the relay's counter, so the two can no longer agree on a root — the message is kept in the local record and this session can no longer be sealed bilaterally",
       });
-      this.#diverged.add(this.#k(agentName, sessionId));
+      this.markSessionDiverged(agentName, sessionId);
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
       return { placed: true, leafIndex, diverged: true };
     }
@@ -10162,6 +10230,9 @@ export class SessionNodeManager {
       // load-bearing. A terminal status is the one point at which no future close can be refused,
       // so the flag has nothing left to protect.
       this.#diverged.delete(this.#k(agentName, sessionId));
+      // DURABLE too (DOD-M15-DIVERGE-DURABLE-1) — otherwise a sealed session comes back after a
+      // restart still carrying a refusal for a close that can no longer happen.
+      this.#db?.prepare("UPDATE sessions SET diverged_at = NULL WHERE session_id = ?").run(sessionId);
     }
     // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
     // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.

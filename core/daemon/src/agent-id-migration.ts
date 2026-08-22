@@ -98,6 +98,10 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         interrupted_by TEXT,
         restart_seal_gave_up_at INTEGER,
         restart_seal_gave_up_reason TEXT,
+        -- DOD-M15-DIVERGE-DURABLE-1. Omitting it here would delete the flag on the one boot a
+        -- legacy database upgrades, and a dropped divergence reads as HEALTHY — exactly the
+        -- failure the column was added to prevent, reintroduced by the migration that carries it.
+        diverged_at INTEGER,
         PRIMARY KEY (agent_id, session_id)
       )`,
     indexSql: () => [],
