@@ -135,6 +135,32 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "contains that key in the clear, so possession of the file is possession of the agent. Saying " +
       "so at the moment one is written is the affordance, not decoration.",
   },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "doorbell: 'a new kind of message must never be silently ignored because this table is older than the daemon'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "The default direction is implemented and tested (DOD-M15-DOORBELL-1). `buildChannelParams` " +
+      "sets `wake_action` to `none` only for names in HOUSEKEEPING_TYPES and `read_inbox` for " +
+      "everything else, including a type it has never seen — `dod-m15-doorbell-1.test.ts` asserts " +
+      "exactly that with a fabricated future doorbell name. Defaulting the other way would make a " +
+      "new message-bearing type silently ignored, which is a conversation that never gets answered " +
+      "with nothing reporting a problem.",
+  },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "doorbell: 'a new kind of message must never be silently ignored because this table is older than the daemon'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "The same sentence as the plugin skill's, and the same evidence: `buildChannelParams` marks " +
+      "only HOUSEKEEPING_TYPES as `none` and everything else — including an unrecognised type — as " +
+      "`read_inbox`, asserted with a fabricated future doorbell name in " +
+      "`dod-m15-doorbell-1.test.ts`. Carried on BOTH surfaces because the tarball SKILL.md is the " +
+      "one every previous audit missed (it is not source and was on nobody's list), which is why " +
+      "the scanner enumerates package.json#files rather than trusting a list.",
+  },
 ];
 
 /**

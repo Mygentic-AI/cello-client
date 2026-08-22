@@ -108,9 +108,29 @@ describe("AC-002 + SI-001: the session-request doorbell carries routing only", (
       "sessionId",
       "state",
       "type",
+      /**
+       * `wake_action` — added 2026-08-22 by `DOD-M15-DOORBELL-1`, and the question this tripwire
+       * demands is answered here rather than around it.
+       *
+       * IS IT SAFE FOR AN AGENT TO READ OFF AN UNSOLICITED WAKE-UP? Yes, and it is the one field
+       * here that cannot carry anything else. It is not a daemon field at all: the shim SYNTHESIZES
+       * it from the frame's type, and `buildChannelParams` explicitly skips `wake_action` when
+       * copying the daemon's `data`, so an upstream frame cannot set it. Its range is two literals,
+       * `read_inbox` and `none`. It names no session, no counterparty and no content.
+       *
+       * WHY IT EXISTS: `shutdown` rode this channel with the same shape as a real doorbell, so an
+       * agent following its standing "doorbell → read the inbox" contract called `cello_inbox`
+       * against a dying daemon, got `daemon_not_running`, and reported a protocol failure — while
+       * the actual event went unreported.
+       *
+       * It is in the prompt-injection blast radius like everything else here, and that is the
+       * reason it is un-spoofable: a frame that could set it to `none` could talk an agent out of
+       * reading a real message.
+       */
+      "wake_action",
       "who",
       "whoKnown",
-    ]);
+    ].sort());
   });
 
   it("SI-001: message text and session secrets cannot ride the doorbell (structural skips)", () => {

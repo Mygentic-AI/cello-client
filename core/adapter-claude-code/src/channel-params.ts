@@ -170,6 +170,22 @@ export function buildChannelParams(
   // fixtures were the only frames that ever had `data.type` (2026-07-30).
   const meta: Record<string, string> = {};
   for (const [k, v] of Object.entries(data)) {
+    /**
+     * `wake_action` is the SHIM's verdict, not the daemon's — a frame that could set it to `none`
+     * would talk an agent out of reading a real message (`DOD-M15-DOORBELL-1`).
+     *
+     * REDUNDANT TODAY, and said so rather than left to imply otherwise: the assignment below runs
+     * AFTER this loop and overwrites whatever was copied, so the ordering is what actually protects
+     * the field. Measured — deleting this line leaves the spoofing test green.
+     *
+     * Kept anyway, because the protection it duplicates is positional: move that assignment above
+     * the loop, a reasonable-looking tidy-up, and the daemon's value would win. A skip that costs
+     * one line is worth more than a comment asking the next person not to reorder.
+     *
+     * NOT named `cello_action`: every `cello_*` token in shipped prose is a TOOL, and the parity
+     * guard enforces that. A meta field wearing a tool's shape is a name an agent will try to call.
+     */
+    if (k === "wake_action") continue;
     // Identifier-safe keys only (Claude Code drops others); scalars only; never a `content` key
     // (belt-and-suspenders for INV-CONTENTFREE — the body is synthesized here, never carried).
     if (k === "content") continue;
@@ -177,5 +193,40 @@ export function buildChannelParams(
     if (v == null || typeof v === "object") continue;
     meta[k] = String(v);
   }
+  /**
+   * WHAT THE AGENT SHOULD DO, as a field rather than a sentence — `DOD-M15-DOORBELL-1`.
+   *
+   * The standing contract is "the doorbell rings, you call the inbox", and that is deliberate: an
+   * agent should not have to reason about which notification means what before acting. `shutdown`
+   * rode the same shape, so a dying daemon rang a bell, the agent did as instructed, `cello_inbox`
+   * answered `daemon_not_running`, and the agent reported a protocol failure — while the actual
+   * event, *your daemon stopped*, went unreported.
+   *
+   * The body already named the recovery, and that was not enough: an agent following a standing
+   * instruction acts on shape before it weighs prose. This is the same lesson as
+   * `DOD-M15-GUARD-HEARD-1` — a signal whose only consumer has to notice it is not a control.
+   *
+   * DEFAULTS TO `read_inbox`, and the direction is the point. A message-bearing doorbell added to
+   * the daemon before this file learns its name must still be read; defaulting to `none` would make
+   * a new type silently ignored, which is a conversation that never gets answered with nothing
+   * reporting a problem. Defaulting the other way costs one empty inbox call.
+   */
+  meta["wake_action"] = HOUSEKEEPING_TYPES.has(type) ? "none" : "read_inbox";
+
   return { content: doorbellText(type, data), meta };
 }
+
+/**
+ * Doorbells that wake an agent with NOTHING to read.
+ *
+ * `shutdown` is the one that was measured, but it was never the only one: a reconnect and an
+ * agent-state change ring the same bell to the same effect. Enumerated rather than special-casing
+ * the instance that hurt, because fixing only the measured case leaves the next to be found in the
+ * field.
+ */
+const HOUSEKEEPING_TYPES = new Set([
+  "shutdown",
+  "daemon_reconnected",
+  "agent_state_changed",
+  "agent_current_changed",
+]);

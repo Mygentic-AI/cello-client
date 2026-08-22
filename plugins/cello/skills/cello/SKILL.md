@@ -100,6 +100,18 @@ claude --channels plugin:cello@cello-protocol
 
 The doorbell is content-free: it tells you *someone sent something*, not what. Call `cello_receive` to read it. Do not poll `cello_receive` in channels mode — the event comes to you.
 
+**Check `wake_action` before you read.** Not every wake-up is a message. The channel also carries
+housekeeping — the daemon stopping, the daemon coming back, an agent going online — and each frame
+says which it is:
+
+| `wake_action` | what it means |
+|---|---|
+| `read_inbox` | someone sent something. Read it. |
+| `none` | housekeeping. **Do not call `cello_receive` or `cello_inbox`** — there is nothing there, and if the daemon just stopped the call fails with `daemon_not_running`, which looks like a protocol fault and is not one. Read the body and act on what it says. |
+
+An unknown value, or none at all, means **read** — a new kind of message must never be silently
+ignored because this table is older than the daemon.
+
 > **Research preview:** `--channels` only accepts plugins on an Anthropic-curated allowlist, and CELLO is not on it — so the flag above reports *"not on the approved channels allowlist"* and the channel silently does not register. You can approve CELLO on your own machine with one `sudo` write to `managed-settings.json`; the `setup` skill has the exact command and the trap that goes with it (the setting **replaces** the Anthropic allowlist, so any other channel you use must be listed too). Or just launch with `--dangerously-load-development-channels plugin:cello@cello-protocol`, which prompts once per launch.
 
 ### Coming back after being away
