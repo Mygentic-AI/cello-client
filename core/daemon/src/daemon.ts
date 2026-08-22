@@ -105,6 +105,7 @@ import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
 import { createBackup, inspectBackup } from "./backup-restore.js";
+import { resolveCurrentAgentFor } from "./agent-selection.js";
 import { REFUSAL_REASONS, CAPACITY_REASONS, type AnyRefusalReason } from "./refusal-reasons.js";
 import { revocabilityOf } from "./signal-revocability.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
@@ -2338,12 +2339,43 @@ async function startDaemonHoldingLock(
    * alice, alice was stopped, and the work lands on bob reporting success. A lost intent is not the
    * same as no intent, and it must fail loud (no_current_agent) rather than be guessed at.
    */
-  function resolveCurrentAgent(connState: { currentAgent: string | null; clearedAgent?: string } | undefined, explicitAgent?: string): string | null {
-    if (explicitAgent) return explicitAgent;
-    if (connState?.currentAgent) return connState.currentAgent;
-    if (connState?.clearedAgent) return null;
-    if (onlineAgents.size === 1) return [...onlineAgents][0];
-    return null;
+  /**
+   * Which agent this call acts as — `DOD-M15-SELECTION-1`, logic in `agent-selection.ts`.
+   *
+   * It used to end with `if (onlineAgents.size === 1) return [...onlineAgents][0]`, so a connection
+   * that had selected nothing acted as whichever agent happened to be the only one online. On a
+   * shared daemon that can be a DIFFERENT operator's agent, and a live MCP session was being bound
+   * to an identity it never asked for.
+   *
+   * The resolution is now attributable: every path reports how it was reached, and `fallback` — the
+   * one that was invisible — is logged at INFO. `DOD-M15-IPCVISIBLE-1`.
+   */
+  function resolveCurrentAgent(
+    connState: { currentAgent: string | null; clearedAgent?: string; clientType?: string } | undefined,
+    explicitAgent?: string,
+  ): string | null {
+    return resolveCurrentAgentFor({
+      connState,
+      onlineAgents,
+      ...(explicitAgent !== undefined ? { explicitAgent } : {}),
+      onResolved: (agent, trigger) => {
+        // Only the FALLBACK is announced. `explicit` and `selected` are the ordinary cases and
+        // logging them would bury the one that matters — a signal that fires on the normal case is
+        // not a signal.
+        if (trigger !== "fallback") return;
+        logger.info("agent.current.fallback", {
+          agentName: agent,
+          clientType: connState?.clientType ?? "cli",
+          impact:
+            "this call had no selected agent and exactly one was online, so that one was used. It " +
+            "is a per-call subject, NOT an attendance: doorbells route by the connection's " +
+            "registered agent, which this does not set.",
+          guidance:
+            "If this was not the intended agent, name it explicitly, or run cello_use_agent to " +
+            "select one for the connection.",
+        });
+      },
+    });
   }
 
   // Agent lifecycle (agent-handlers.ts): create, remove, start, stop, select, list.
@@ -4418,6 +4450,32 @@ async function startDaemonHoldingLock(
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
   ipcServer.onDisconnect((connectionId) => {
+    /**
+     * DOD-M15-IPCVISIBLE-1: SAY THAT IT CLOSED, and say what it was attending.
+     *
+     * `daemon.ipc.connected` fired on every open and nothing on close, so a live client and a dead
+     * one that was never cleaned up looked identical in the log. The attended agent is the field
+     * that matters: attendance dropping was silent, and an agent losing its last attendee changes
+     * whether away-messages fire and who receives doorbells — so a session that stopped waking is
+     * diagnosable from the log rather than by guesswork.
+     */
+    const closing = perConnectionState.get(connectionId);
+    const stillAttending = closing?.currentAgent
+      ? countAttendance(perConnectionState, closing.currentAgent) - 1
+      : null;
+    logger.info("daemon.ipc.disconnected", {
+      connectionId,
+      clientType: closing?.clientType ?? "unknown",
+      attendedAgent: closing?.currentAgent ?? null,
+      ...(stillAttending !== null ? { remainingAttendance: stillAttending } : {}),
+      ...(stillAttending === 0
+        ? {
+            impact:
+              "that agent has no attending session left — inbound sessions are now answered with " +
+              "its away message rather than a live reply, and its doorbells reach nobody",
+          }
+        : {}),
+    });
     perConnectionState.delete(connectionId);
     connectionCursors.delete(connectionId); // M8C-CURSOR-1: cursor is connection-scoped, dies with it
     // ...and so is the delivery bookmark (review F1). It is a SEPARATE map from the gate's cursor
