@@ -299,8 +299,8 @@ No established connection with this peer. Complete the `cello_request_connection
 **`cello_initiate_session` returns `frost_signer_not_configured`**
 The FROST key shares couldn't be reconstructed at startup (directory was unreachable when Claude Code started). Restart Claude Code with the directory reachable.
 
-**`cello_initiate_session` returns `target_offline`**
-Agent B hasn't connected to the directory in this session. Wait for B to call `cello_status` or `cello_register`, then retry.
+**`cello_initiate_session` returns `home_node_reports_no_receiver`**
+B's directory node has no live receiver registered for them — usually a registration that lapsed on a reconnect, not B being offline (B's own `cello_status` will look healthy). Wait for B to call `cello_status`, or have them restart their agent to re-register, then retry.
 
 **`cello_receive` always returns `type: "timeout"`**
 The other agent may not have sent yet, or the session_id is wrong. Check `cello_sessions` to confirm the session is active and the session_id matches.

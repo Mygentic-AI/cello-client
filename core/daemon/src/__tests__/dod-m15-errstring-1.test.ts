@@ -52,6 +52,7 @@ const TARGET = "bb".repeat(32);
 function negotiatorWith(
   answerDiscovery: () => Record<string, unknown> | null,
   unresolved: ReadonlyArray<{ nodeId: string; reason: string }> = [],
+  answerSessionRequest?: () => Record<string, unknown> | null,
 ) {
   const { logger, events } = makeLogger();
   let inbound: ((frame: Record<string, unknown>) => void) | null = null;
@@ -60,8 +61,16 @@ function negotiatorWith(
     status: "connected",
     currentDirectoryNodeId: HOME,
     async sendRaw(frame: unknown) {
-      if ((frame as Record<string, unknown>)["type"] === "discovery_lookup") {
+      const type = (frame as Record<string, unknown>)["type"];
+      if (type === "discovery_lookup") {
         const reply = answerDiscovery();
+        if (reply) inbound?.(reply);
+      }
+      // Answering session_request lets a test reach the branches BEYOND discovery. Without it the
+      // negotiator waits out a real 30s timeout, which is both slow and a different code path —
+      // that is how the F2 test came to be testing a neighbouring branch (review HIGH-2).
+      if (type === "session_request" && answerSessionRequest) {
+        const reply = answerSessionRequest();
         if (reply) inbound?.(reply);
       }
       return { ok: true as const };
@@ -94,6 +103,7 @@ function negotiatorWith(
     loadedAgents: [{ name: AGENT, pubkey: "aa".repeat(32) }],
     resolveConsortiumRoster: async () => [{ nodeId: HOME }, { nodeId: "dir-b" }] as never,
     getUnresolvedNodes: () => unresolved,
+    getDeclaredNodeCount: () => 4,
   } as unknown as OutboundSessionDeps;
 
   return { negotiator: createOutboundSessions(deps).resolvedSessionNegotiator, events };
@@ -157,23 +167,25 @@ describe("DOD-M15-ERRSTRING-1: the error names the observation, not a party", ()
 
   it("does NOT rewrite the home node's 'no receiver' into a claim that the peer is offline", async () => {
     /**
-     * Review F2, and the reviewer's ruling that this — not the branch I fixed first — is the most
-     * likely source of the 2026-08-16 incident.
+     * Review F2 — and review HIGH-2, because the FIRST version of this test never reached the
+     * branch it was named for.
      *
-     * What the home node reports is `targetStreamFound === false`: no live stream registered for
-     * that agent. At least four conditions produce it and only one is "they are offline" — the
-     * commonest being their receiver's REGISTRATION lapsing on a signaling reconnect, which this
-     * daemon's own notes record happening on 46 of 48 reconnects in an hour, while their
-     * `cello_status` stayed green throughout.
+     * It answered discovery with an owning node that was not in the fake roster, so the negotiator
+     * returned `home_node_not_in_reachable_roster` on attempt 1 and never entered the
+     * `target_offline` retry loop where the F2 fix lives. Its only assertion was
+     * `.not.toBe("counterparty_offline")` — which that neighbouring branch satisfies for free. The
+     * fix could have been reverted and the test would have stayed green. Its sub-second runtime
+     * against a three-attempt loop with backoffs was the tell.
      *
-     * Collapsing that into `counterparty_offline` sends the operator to ask a person whose side is
-     * working about a registration on a stream on the directory's side.
+     * Now: discovery names OUR OWN node (so the request runs same-node), and the directory answers
+     * the `session_request` with `target_offline` — the real upstream observation, which means "I
+     * have no live stream registered for that agent". The assertion is positive.
      */
-    const { negotiator } = negotiatorWith(() => ({
-      type: "discovery_lookup_result",
-      state: "online",
-      owning_node_ids: ["some-other-node"], // cross-node, so the request goes to their home
-    }));
+    const { negotiator } = negotiatorWith(
+      () => ({ type: "discovery_lookup_result", state: "online", owning_node_ids: [HOME] }),
+      [],
+      () => ({ type: "session_request_error", reason: "target_offline" }),
+    );
 
     const result = await negotiate(negotiator);
 
@@ -181,7 +193,10 @@ describe("DOD-M15-ERRSTRING-1: the error names the observation, not a party", ()
     expect(
       result.reason,
       "an unregistered receiver is not the same observation as an offline counterparty",
-    ).not.toBe("counterparty_offline");
+    ).toBe("home_node_reports_no_receiver");
+    // The guidance must lead with "not their fault" — the whole point is where it sends the operator.
+    expect(result.guidance).toMatch(/not the same as them being offline/i);
+    expect(result.guidance).toMatch(/registration lapsing/i);
   }, 60_000);
 
   it("REGRESSION: a directory that genuinely says OFFLINE is still quoted, not second-guessed", async () => {

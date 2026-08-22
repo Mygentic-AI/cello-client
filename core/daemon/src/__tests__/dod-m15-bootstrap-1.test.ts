@@ -15,7 +15,14 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { fetchBootstrapResult, FAST_PROBE, PERSISTENT_PROBE } from "../directory-bootstrap.js";
+import {
+  fetchBootstrapResult,
+  createDirectoryEndpointResolver,
+  manifestNodesToEndpoints,
+  FAST_PROBE,
+  PERSISTENT_PROBE,
+} from "../directory-bootstrap.js";
+import { SIGNALING_CONNECT_WAIT_MS } from "../outbound-sessions.js";
 
 const URL_ = "https://dir.example.test";
 
@@ -188,26 +195,68 @@ describe("DOD-M15-BOOTSTRAP-1 review fixes: the retry must not break what it pro
     expect(calls).toBe(2);
   });
 
-  it("the RECONNECT budget is fast enough to stay inside the signaling wait", async () => {
+  it("the RECONNECT resolver actually SPENDS the fast budget — asserted at the call site", async () => {
     /**
-     * Review F1 — the regression this unit introduced. The endpoint resolver runs on EVERY connect
-     * attempt, and the signaling stream turns over about every 70 seconds. With the persistent
-     * budget a lossy link could spend 16 s there, while `outbound-sessions` waits only 10 s for
-     * signaling before giving up — so `cello_initiate_session` would start failing with
-     * `directory_signaling_timeout` on exactly the links this unit set out to help.
+     * Review HIGH-3. The first version of this test read four fields off two exported constants and
+     * never constructed a resolver. Deleting the `FAST_PROBE` argument from the call site — reverting
+     * the whole fix — left it green, because constants are inert data. The call site is the fix.
      *
-     * The numbers are asserted against that 10 s window rather than described in a comment,
-     * because the two were chosen together and a later edit to either must break this.
+     * This drives the real `createDirectoryEndpointResolver` with a `fetchFn` that always times out
+     * and counts the probes. Two, not three.
      */
-    const SIGNALING_WAIT_MS = 10_000;
-    const worstCase = FAST_PROBE.attempts * FAST_PROBE.timeoutMs;
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls++;
+      throw timeoutError();
+    }) as unknown as typeof fetch;
 
-    expect(worstCase, "the reconnect path must resolve well inside the 10s signaling wait").toBeLessThan(SIGNALING_WAIT_MS);
-    expect(FAST_PROBE.totalMs).toBeLessThanOrEqual(SIGNALING_WAIT_MS);
-    // ...and it must still be a RETRY. One attempt would be the old bug back: the whole mechanism
-    // is a second, fresh connection.
-    expect(FAST_PROBE.attempts, "a fresh connection is the mechanism — one attempt is the old defect").toBeGreaterThan(1);
-    // The persistent budget stays persistent: nothing is blocked on the roster sweep.
+    const resolve = createDirectoryEndpointResolver({
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      directoryUrl: URL_,
+      fetchFn,
+      staleFallback: false,
+    });
+    await resolve();
+
+    expect(
+      calls,
+      "the reconnect path must spend the FAST budget — a caller is blocked on it",
+    ).toBe(FAST_PROBE.attempts);
+    expect(calls, "and it must still RETRY — one probe is the defect this unit fixed").toBeGreaterThan(1);
+  });
+
+  it("the ROSTER SWEEP inside the blocked resolver also spends the fast budget", async () => {
+    /**
+     * Review HIGH-1 — the regression was halved, not removed. The first fix put FAST_PROBE on the
+     * resolver's PRIMARY leg and left the roster sweep on the persistent one. Both sit inside the
+     * same 10s signaling wait, and the sweep is the SLOWER leg: `Promise.all` waits for the slowest
+     * node, so one unreachable node cost it 16s — after the primary had already spent its own.
+     *
+     * Asserted per node, at the sweep's own call site.
+     */
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls++;
+      throw timeoutError();
+    }) as unknown as typeof fetch;
+
+    await manifestNodesToEndpoints(
+      [{ nodeId: "n1", endpoint: "https://n1.example.test", peerId: "12D3KooWN1" }] as never,
+      { logger: { debug() {}, info() {}, warn() {}, error() {} }, fetchFn, probeBudget: FAST_PROBE },
+    );
+
+    expect(calls, "a blocked sweep must not spend the persistent budget per node").toBe(FAST_PROBE.attempts);
+  });
+
+  it("the two budgets are chosen against the SIGNALING WAIT, not in isolation", () => {
+    // The number that matters is the caller's deadline. Both legs of the blocked resolver run
+    // inside it, so the worst case is primary + sweep — which is what the old test failed to model,
+    // and why HIGH-1 slipped past it.
+    const worstCaseBothLegs = FAST_PROBE.attempts * FAST_PROBE.timeoutMs * 2;
+    expect(
+      worstCaseBothLegs,
+      "primary leg + roster sweep must both fit inside the 10s wait outbound-sessions allows",
+    ).toBeLessThanOrEqual(SIGNALING_CONNECT_WAIT_MS);
     expect(PERSISTENT_PROBE.attempts).toBeGreaterThan(FAST_PROBE.attempts);
   });
 

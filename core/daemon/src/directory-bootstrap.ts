@@ -174,11 +174,22 @@ export const PERSISTENT_PROBE: ProbeBudget = {
  * would start returning `directory_signaling_timeout` where it used to get a usable endpoint in
  * time. A resilience fix that breaks the thing it was protecting.
  *
- * Two probes at 4 s: still a FRESH CONNECTION for the lost-handshake case this unit is about, and
- * still inside the 10 s window with room to spare. The persistence belongs where nothing is
- * blocked on it.
+ * TWO PROBES AT 2 s, AND THE ARITHMETIC IS THE POINT. The blocked resolver has TWO legs inside that
+ * one 10 s wait — the primary, and then the roster sweep, whose `Promise.all` waits for the slowest
+ * node. So the budget has to fit TWICE: 2 × 2 s × 2 legs = 8 s, with headroom. A first attempt at
+ * 4 s looked generous and was wrong for exactly this reason, and the test that now asserts it
+ * against `SIGNALING_CONNECT_WAIT_MS` is what caught it.
+ *
+ * ISN'T 2 s TOO SHORT for a link where a probe was measured at 16.2 s? Yes — and that is the honest
+ * answer rather than a problem. Inside a 10 s deadline you cannot afford a 16 s probe from either
+ * leg, so pretending to try is how the deadline gets blown and the caller gets NOTHING. Failing fast
+ * here preserves the thing that actually helps on a bad link: the last-known-good endpoint, and a
+ * background sweep on the persistent budget that keeps the roster current without anyone waiting.
+ *
+ * The retry is still the mechanism — two probes means a second, FRESH connection, which is what
+ * recovers a lost handshake. One would be the original defect.
  */
-export const FAST_PROBE: ProbeBudget = { attempts: 2, timeoutMs: 4_000, totalMs: 9_000 };
+export const FAST_PROBE: ProbeBudget = { attempts: 2, timeoutMs: 2_000, totalMs: 5_000 };
 
 export async function fetchBootstrapResult(
   directoryUrl: string,
@@ -335,6 +346,19 @@ export interface NodeResolveFailure {
 
 export interface ManifestResolveOptions {
   logger: Logger;
+  /**
+   * DOD-M15-BOOTSTRAP-1 (review HIGH-1) — which probe budget this sweep may spend.
+   *
+   * The first fix put `FAST_PROBE` on the resolver's PRIMARY leg and left this sweep on the
+   * persistent one. Both legs sit inside the same 10 s signaling wait, and this is the bigger:
+   * `Promise.all` waits for the slowest node, so ONE unreachable node costs the whole sweep 16 s —
+   * and the failover path pays 8 s on the primary before even starting it. The regression moved
+   * rather than went away.
+   *
+   * Defaults to persistent, which is right for startup and the background poll, where nothing is
+   * blocked. A caller that IS blocked passes `FAST_PROBE`.
+   */
+  probeBudget?: ProbeBudget;
   /** Injectable fetch for testing. */
   fetchFn?: typeof fetch;
   /**
@@ -377,7 +401,7 @@ export async function manifestNodesToEndpoints(
         });
         return null;
       }
-      const probe = await fetchBootstrapResult(base, fetchFn);
+      const probe = await fetchBootstrapResult(base, fetchFn, Date.now, opts.probeBudget ?? PERSISTENT_PROBE);
       if (!probe.ok) {
         opts.logger.warn("directory.consortium.node.unresolved", {
           nodeId: node.nodeId,

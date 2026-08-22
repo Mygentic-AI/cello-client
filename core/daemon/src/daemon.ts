@@ -364,7 +364,7 @@ async function startDaemonHoldingLock(
   }
 
   // The manifest poll starts only AFTER the refuse above — a refused startup must not leak a timer.
-  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, stopHttpManifestPoll } =
+  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, getDeclaredNodeCount, stopHttpManifestPoll } =
     createConsortiumRouting({
       manifestProvider,
       manifestRootKeys,
@@ -1570,6 +1570,7 @@ async function startDaemonHoldingLock(
     // unreachable", which is very often the actual cause and was reported nowhere the operator
     // was looking.
     getUnresolvedNodes,
+    getDeclaredNodeCount,
   });
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
@@ -3313,8 +3314,10 @@ async function startDaemonHoldingLock(
         guidance:
           "AS OF checked_at (this is a point-in-time reading, not necessarily now), this daemon could not "
           + "resolve these directory endpoints, so the consortium roster was short and " +
-          "threshold ceremonies will fail — sessions surface that as counterparty_offline, " +
-          "directory_below_threshold, or ceremony_exhausted, none of which name the real cause. " +
+          "threshold ceremonies will fail — sessions surface that as home_node_reports_no_receiver, " +
+          "home_node_not_in_reachable_roster, directory_named_no_home, directory_below_threshold or " +
+          "ceremony_exhausted, none of which name the real cause on their own (DOD-M15-ERRSTRING-1 " +
+          "renamed the first three; they now append this shortfall to their own guidance). " +
           "Agents can still show 'online': signaling dials multiaddrs and does not need DNS. " +
           "If reason is dns_error after a directory restart or wake, the resolver is holding a cached " +
           "negative answer — flush it (macOS: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder). " +

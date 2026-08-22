@@ -25,10 +25,11 @@ import type {
 } from "@cello-protocol/transport";
 import { randomUUID } from "node:crypto";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
+import type { ProbeBudget } from "./directory-bootstrap.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import {
   resolveDirectoryUrl,
-  manifestNodesToEndpoints,
+  manifestNodesToEndpoints, FAST_PROBE,
   type NodeResolveFailure,
   createRosterAwareEndpointResolver,
   type ConsortiumEndpoint,
@@ -238,6 +239,8 @@ export interface ConsortiumRouting {
   getUnresolvedNodes: () => NodeResolveFailure[];
   /** When the reading getUnresolvedNodes returns was taken (ISO), or null if no sweep has run. */
   getUnresolvedSweptAt: () => string | null;
+  /** Nodes the VERIFIED manifest declares — the denominator a threshold is computed from. */
+  getDeclaredNodeCount: () => number | null;
   /** Null-safe accessor for the ceremony/handler getDirectoryEndpoint sites. */
   getFailoverEndpoint: () => Promise<DirectoryEndpoint | null>;
   /** Stops the daemon-level HTTP manifest poll. Undefined when no poll was started. */
@@ -263,7 +266,7 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   const getUnresolvedNodes = (): NodeResolveFailure[] => [...unresolvedNodes];
   const getUnresolvedSweptAt = (): string | null => unresolvedSweptAt;
 
-  const resolveConsortiumRoster = async (): Promise<ConsortiumEndpoint[] | null> => {
+  const resolveConsortiumRoster = async (budget?: ProbeBudget): Promise<ConsortiumEndpoint[] | null> => {
     const m = manifestProvider?.getCurrentManifest();
     if (!m) return null;
     const failures: NodeResolveFailure[] = [];
@@ -271,11 +274,27 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
       logger,
       fetchFn,
       onNodeUnresolved: (f) => failures.push(f),
+      ...(budget ? { probeBudget: budget } : {}),
     });
     unresolvedNodes = failures;
     unresolvedSweptAt = new Date().toISOString();
     return endpoints;
   };
+
+  /**
+   * How many nodes the VERIFIED MANIFEST declares — no probe, no derivation.
+   *
+   * DOD-M15-ERRSTRING-1 (review MEDIUM-2). The roster-shortfall note first computed
+   * `declared = reachable + unresolved`, which silently undercounts: `manifestNodesToEndpoints`
+   * also drops nodes for an invalid endpoint and for a peer-id mismatch, and neither calls
+   * `onNodeUnresolved`. With 5 declared, 2 peer-id mismatches and 1 probe failure, that arithmetic
+   * yields a threshold of 2 and the note reports ceremonies CAN complete — when the real threshold
+   * is 3 and they cannot. The line whose job is to name a shortfall would have denied it.
+   *
+   * Worse, when every drop is a silent one the note is empty — mute on exactly the security-relevant
+   * case, since a peer-id mismatch is a node you most want named.
+   */
+  const getDeclaredNodeCount = (): number | null => manifestProvider?.getCurrentManifest()?.nodes.length ?? null;
 
   // DECLARED membership, straight off the verified manifest — no probe. Lets the resolver reject a
   // primary that resolves but belongs to a different consortium (the compiled-in default URL after
@@ -290,7 +309,11 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   const failoverEndpointResolver = directoryEndpointResolver
     ? createRosterAwareEndpointResolver({
         primaryResolver: directoryEndpointResolver,
-        getConsortiumRoster: resolveConsortiumRoster,
+        // FAST_PROBE (review HIGH-1): this resolver runs inside the 10 s signaling wait, and the
+        // roster sweep is its slowest leg — Promise.all waits for the slowest node, so one
+        // unreachable node cost 16 s here while the failover path had already spent 8 s on the
+        // primary. Persistence belongs to startup and the background poll, where nothing waits.
+        getConsortiumRoster: () => resolveConsortiumRoster(FAST_PROBE),
         getManifestPeerIds,
         logger,
       })
@@ -317,5 +340,5 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
     });
   }
 
-  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, stopHttpManifestPoll };
+  return { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, getDeclaredNodeCount, stopHttpManifestPoll };
 }

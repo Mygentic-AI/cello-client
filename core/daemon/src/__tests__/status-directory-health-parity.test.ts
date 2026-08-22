@@ -3,7 +3,8 @@
  *
  * What the operator lived through on 2026-07-31: every agent reported `online` with
  * `standing_receiver_ready: true` while not one directory endpoint could be resolved, so no session
- * could possibly form. It surfaced in sequence as `counterparty_offline`, then
+ * could possibly form. It surfaced in sequence as `counterparty_offline` (renamed by
+ * DOD-M15-ERRSTRING-1 — see the guidance assertion below), then
  * `directory_below_threshold`, then `ceremony_exhausted` — three errors naming three different
  * subsystems, none of them the cause. It cost about an hour, and the first conclusion was "the
  * protocol is broken".
@@ -107,9 +108,23 @@ describe("launch triage item 6 — a daemon that cannot reach a directory must n
       | undefined;
     expect(block).toBeDefined();
     expect(block!.nodes.map((n) => n.node)).toContain("dead-1");
-    // The guidance has to name the errors the operator will actually be shown, or it does not close
-    // the gap between "three misleading errors" and "the cause".
-    expect(block!.guidance).toContain("counterparty_offline");
+    /**
+     * The guidance has to name the errors the operator WILL ACTUALLY BE SHOWN, or it does not close
+     * the gap between a misleading error and its cause.
+     *
+     * It named `counterparty_offline`, and this assertion pinned it there — but
+     * DOD-M15-ERRSTRING-1 stopped emitting that for this cause: the session-side symptoms are now
+     * `home_node_reports_no_receiver`, `home_node_not_in_reachable_roster` and
+     * `directory_named_no_home`. A bridge that points at an error nobody sees is worse than none,
+     * and a green test holding the wrong text is how it would have stayed.
+     */
+    for (const reason of [
+      "home_node_reports_no_receiver",
+      "home_node_not_in_reachable_roster",
+      "directory_named_no_home",
+    ]) {
+      expect(block!.guidance, `status guidance must name ${reason} — it is what the operator is shown`).toContain(reason);
+    }
 
     // WHEN it was measured. A reading with no timestamp asserts the present tense, and on
     // 2026-08-09 a sub-minute ENETUNREACH blip on the operator's machine therefore read as an

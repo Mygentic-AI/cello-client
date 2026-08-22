@@ -36,8 +36,12 @@ cello agents      # every agent you expect: state "unattended" or "online", stan
 ```
 
 `standing_receiver_ready: true` is the load-bearing field. An agent that is `online` without it will
-not accept inbound sessions, and callers get `target_offline` with nothing in your logs to explain
-it.
+not accept inbound sessions, and callers get **`home_node_reports_no_receiver`** with nothing in your
+logs to explain it.
+
+That reason is named for exactly this: the directory has no live receiver registered for you, which
+is NOT the same as your agent being offline — and your own `cello_status` will look perfectly
+healthy while it happens. Reconnecting the daemon, below, is what re-registers it.
 
 Then reconnect Claude Code to the daemon — see [stale connection](#after-restarting-the-daemon-mid-session).
 

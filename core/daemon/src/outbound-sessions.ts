@@ -48,6 +48,13 @@ export interface OutboundSessionDeps {
    * and majority(declared) is the threshold a ceremony needs.
    */
   getUnresolvedNodes?: () => ReadonlyArray<{ nodeId: string; reason: string }>;
+  /**
+   * How many nodes the VERIFIED MANIFEST declares. Review MEDIUM-2: deriving this as
+   * `reachable + unresolved` undercounts, because a node dropped for an invalid endpoint or a
+   * peer-id mismatch appears in neither term — and the note would then affirm that ceremonies can
+   * complete when the true threshold is unmet.
+   */
+  getDeclaredNodeCount?: () => number | null;
   /** The WHOLE seal listener bundle — a visiting stream needs every one of them. */
   registerSealListeners: (signaling: SignalingManager, agentName: string, agentPubkeyHex: string) => () => void;
   sessionNegotiator?: SessionNegotiator;
@@ -58,12 +65,25 @@ export interface OutboundSessionDeps {
   loadedAgents: ReadonlyArray<{ name: string; pubkey: string }>;
 }
 
+/**
+ * How long a session initiation waits for signaling before giving up.
+ *
+ * EXPORTED because it is a CONSTRAINT ON SOMETHING ELSE, not just a local number: every probe
+ * budget on the reconnect path has to fit inside it. `DOD-M15-BOOTSTRAP-1` learned that the hard
+ * way — a retry budget chosen in isolation pushed the resolver past this wait and would have made
+ * `cello_initiate_session` fail on exactly the lossy links the retry was added to help.
+ *
+ * `dod-m15-bootstrap-1.test.ts` asserts the budgets against this value, so changing it here breaks
+ * that test rather than silently breaking the behaviour.
+ */
+export const SIGNALING_CONNECT_WAIT_MS = 10_000;
+
 export function createOutboundSessions(deps: OutboundSessionDeps) {
   const {
     logger, sessionNodeManager, getKeyProvider, getPersistence, getAgentSignaling,
     waitForSignalingConnected, getFailoverEndpoint, resolveConsortiumRoster,
     registerSealListeners, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
-    getUnresolvedNodes,
+    getUnresolvedNodes, getDeclaredNodeCount,
   } = deps;
 
   /**
@@ -79,20 +99,34 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
    * Overwriting the observed reason with "roster short" would be the same defect this line closes,
    * pointing the other way.
    */
-  function rosterShortfallNote(reachable: number): string {
+  function rosterShortfallNote(): string {
     const unresolved = getUnresolvedNodes?.() ?? [];
+    // LAZY BY DESIGN (review MEDIUM-1). The first version resolved the roster unconditionally at the
+    // head of every negotiation — a full parallel probe of every consortium node, on the persistent
+    // budget, purely to compute a string two failure branches might use. With one node down that was
+    // +16 s on EVERY initiate, healthy ones included; on a cross-node path it compounded past a
+    // typical MCP client timeout and the operator saw a hang with no output. The condition that
+    // makes this note worth printing is exactly the condition that made it expensive.
     if (unresolved.length === 0) return "";
-    const declared = reachable + unresolved.length;
-    const threshold = Math.floor(declared / 2) + 1;
+    const declared = getDeclaredNodeCount?.() ?? null;
+    // No verified manifest ⇒ no denominator. Name what is unreachable and say the threshold is
+    // unknown, rather than inventing one from a subset (review MEDIUM-2).
     const names = unresolved.map((u) => `${u.nodeId} (${u.reason})`).join(", ");
-    const belowThreshold = reachable < threshold;
+    if (declared === null || declared === 0) {
+      return ` ALSO: ${unresolved.length} directory node(s) were unreachable at the last sweep — ${names}. ` +
+        "This daemon has no verified manifest, so it cannot say whether that leaves the consortium below the " +
+        "threshold a signing ceremony needs — but a short roster is a common hidden cause of failures like this.";
+    }
+    const threshold = Math.floor(declared / 2) + 1;
+    const reachable = declared - unresolved.length;
     return (
       ` ALSO: ${unresolved.length} of this consortium's ${declared} directory nodes were unreachable at the last sweep — ${names}.` +
-      (belowThreshold
+      (reachable < threshold
         ? ` That leaves ${reachable} reachable against a threshold of ${threshold}, so signing ceremonies CANNOT complete and this failure is very likely a symptom of that, not of anything to do with your counterparty. Fix the roster first.`
         : ` ${reachable} of ${threshold} needed are still reachable, so ceremonies can still complete — but the margin is thin.`)
     );
   }
+
 
   // ─── DOD-SPINE-5: real client-side session negotiator (built internally) ──────
   // The directory already brokers `session_request` → FROST-signed `session_assignment`
@@ -581,7 +615,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           "could reach. Most often that means our own probe of it did not answer, not that it has left the " +
           "consortium. Run cello_status: if it appears under directory_endpoints_unresolved, the problem is the " +
           "path from here to it (attempts:1 there means it answered and the answer was unusable; 2 or more means " +
-          "it never answered). Only if it is absent from the manifest altogether has it actually left.",
+          "it never answered). Only if it is absent from the manifest altogether has it actually left." +
+          rosterShortfallNote(),
       };
     }
     logger.info("session.crossnode.initiated", { agentName, brokerNode: owningNodeId, correlationId });
@@ -589,7 +624,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     // Track the release reason across the finally (result is block-scoped in the try).
     let releaseReason = "failure";
     try {
-      if (!(await waitForSignalingConnected(visiting.mgr, 10_000))) {
+      if (!(await waitForSignalingConnected(visiting.mgr, SIGNALING_CONNECT_WAIT_MS))) {
         // The node RESOLVED but the visiting dial/auth didn't complete in time — a TRANSIENT
         // cross-region condition (latency, blip, cold handshake), NOT a manifest miss. Distinct
         // reason, and the caller's retry loop treats it as retryable (re-discover → retry).
@@ -688,7 +723,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         };
       }
       const { signaling } = getAgentSignaling(ctx.agentName, kp, agentRec.pubkey);
-      if (!(await waitForSignalingConnected(signaling, 10_000))) {
+      if (!(await waitForSignalingConnected(signaling, SIGNALING_CONNECT_WAIT_MS))) {
         return {
           ok: false,
           reason: "directory_signaling_timeout",
@@ -705,10 +740,6 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         // stream answers "where is the target?" authoritatively-enough (advisory — the target node's
         // live #streams check stays the authority; a stale answer just triggers the retry below).
         const homeNodeId = signaling.currentDirectoryNodeId;
-        // Reachable-node count for `rosterShortfallNote`. Read once here rather than per failure
-        // path so every message quotes the same sweep, and a null roster (no manifest yet) reads as
-        // zero reachable rather than throwing on a path that is already failing.
-        const rosterSizeForNote = (await resolveConsortiumRoster())?.length ?? 0;
         const backoffs = [1_000, 3_000]; // between attempts — covers re-home + replication lag
         const MAX_ATTEMPTS = 3;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -719,7 +750,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           if (disc.kind === "send_failed") {
             logger.warn("session.discovery.send_failed", { agentName: ctx.agentName, attempt, reason: disc.reason, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            return { ok: false, reason: "directory_unreachable", guidance: "The home directory stream is not connected, so the counterparty's location could not be looked up. Check cello status (directory_signaling), then retry." };
+            return { ok: false, reason: "directory_unreachable", guidance: "The home directory stream is not connected, so the counterparty's location could not be looked up. Check cello status (directory_signaling), then retry." + rosterShortfallNote() };
           }
           // NO REPLY: an old directory (predates discovery) OR a slow/dropped reply on a new one. Retry;
           // fall back to local-only behavior ONLY as a last resort (after the retries), so that a
@@ -735,7 +766,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           if (disc.kind === "error" || disc.kind === "malformed") {
             logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: disc.kind, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            return { ok: false, reason: "directory_unreachable", guidance: "The directory could not resolve the counterparty's location (a directory-side lookup error) after several attempts. Retry shortly." };
+            return { ok: false, reason: "directory_unreachable", guidance: "The directory could not resolve the counterparty's location (a directory-side lookup error) after several attempts. Retry shortly." + rosterShortfallNote() };
           }
 
           // A 3-state RESULT. Route it (pure classifier).
@@ -766,12 +797,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
               ok: false,
               reason: "directory_named_no_home",
               guidance:
-                `The directory node you are connected to (${homeNodeId}) says this counterparty is online but names ` +
+                // LOW-1: `homeNodeId` is `string | null`, and this branch fires whenever the
+                // directory names no owner — including before signaling has learned its node id.
+                // "(null)" in an operator-facing sentence is worse than saying we do not know.
+                `The directory node you are connected to (${homeNodeId ?? "id not yet known"}) says this counterparty is online but names ` +
                 "no node that holds them, three times running. That is a directory-side inconsistency, not the " +
                 "counterparty being offline — there is nothing for them to fix on their side. Retry in a minute; " +
                 "if it repeats, that node's presence data is out of sync and cello_status will show which other " +
                 "directories are available." +
-                rosterShortfallNote(rosterSizeForNote),
+                rosterShortfallNote(),
             };
           }
 
@@ -811,7 +845,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
              * upstream descriptive error.
              */
             return result.reason === "visiting_connection_unreachable"
-              ? { ok: false, reason: "visiting_connection_unreachable", guidance: "The counterparty's home node was reachable at discovery but its visiting connection could not be established after several attempts. Retry shortly." }
+              ? { ok: false, reason: "visiting_connection_unreachable", guidance: "The counterparty's home node was reachable at discovery but its visiting connection could not be established after several attempts. Retry shortly." + rosterShortfallNote() }
               : {
                   ok: false,
                   reason: "home_node_reports_no_receiver",
@@ -820,7 +854,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
                     "after several attempts. This is NOT the same as them being offline, and it is most often not their fault: " +
                     "the commonest cause is their receiver's registration lapsing on a signaling reconnect, which leaves their " +
                     "own cello_status showing perfectly healthy. Retry in a minute — a re-registration usually clears it. " +
-                    "If it persists, have them restart their agent so it re-registers; only if that fails is their daemon actually down.",
+                    "If it persists, have them restart their agent so it re-registers; only if that fails is their daemon actually down." +
+                    rosterShortfallNote(),
                 };
           }
           return result;
@@ -848,7 +883,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             "so it is deliberately not guessing that the counterparty is offline. Retry in a minute. If it repeats: " +
             "run cello_status to check your own directory connection first (a node below threshold or mid-restart " +
             "presents exactly like this), and only then ask the counterparty to check theirs." +
-            rosterShortfallNote(rosterSizeForNote),
+            rosterShortfallNote(),
         };
       } finally {
         negotiationInProgress.delete(ctx.agentName);

@@ -392,8 +392,13 @@ an unselected command would target the agent you meant. Check `cello status`.
 haven't read it yet. The refusal tells you how many messages are waiting;
 read them, then send again. Deliberate, not a bug.
 
-**`target_offline` on initiate** — The peer's agent isn't online. They need
-to start it.
+**`counterparty_offline` on initiate** — The directory says the peer's agent isn't
+online. They need to start it.
+
+**`home_node_reports_no_receiver` on initiate** — Different, and usually not their
+fault: their directory node has no live receiver registered for them, most often
+because that registration lapsed on a reconnect. Their own `cello status` will look
+healthy. Retry; if it persists, ask them to restart their agent so it re-registers.
 
 **`Unknown IPC method`** — Version skew between the shim/CLI and the daemon.
 Upgrade both (see Upgrade above) and restart.
