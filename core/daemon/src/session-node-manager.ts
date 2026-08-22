@@ -4474,6 +4474,39 @@ export class SessionNodeManager {
    * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
    * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
    */
+  /**
+   * The counterparty's threshold group key as this agent has seen it BEFORE — trust on first use.
+   *
+   * DOD-M15-OFFER-SIGNED-1 / RESPONDER-VERIFY-1. The responder does not verify the assignment's
+   * signature (deferred to SESSION-004), so every field in it is whatever the directory said. That
+   * makes a same-frame check circular: a compromised directory just says the same thing twice.
+   *
+   * This is the one anchor the responder holds that a directory CANNOT retroactively change — its
+   * own memory of previous sessions with this counterparty. A directory that names a different
+   * threshold group key for someone you have already talked to is either substituting an identity
+   * or has been compromised since; neither is a session to accept quietly.
+   *
+   * THE BOUND, stated rather than glossed: this is worth nothing on FIRST contact, which is the
+   * definition of trust-on-first-use. It hardens every session after it, which is where a long-lived
+   * counterparty relationship actually lives.
+   *
+   * Keyed on `counterparty_pubkey` — the K_local IDENTITY, which is the stable thing — not on a
+   * session id or a display name.
+   */
+  getPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): string | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare(
+        `SELECT counterparty_primary_pubkey FROM sessions
+          WHERE agent_id = ? AND counterparty_pubkey = ? AND counterparty_primary_pubkey IS NOT NULL
+          ORDER BY updated_at DESC LIMIT 1`,
+      )
+      .get(this.#requireAgentId(agentName), counterpartyPubkeyHex) as
+      | { counterparty_primary_pubkey: string }
+      | undefined;
+    return row?.counterparty_primary_pubkey ?? null;
+  }
+
   recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void {
     if (!this.#db) return;
     this.#db

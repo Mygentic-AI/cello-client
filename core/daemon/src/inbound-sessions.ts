@@ -1073,15 +1073,24 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * excuse trusting it — on its own it hands whichever directory sent that frame unilateral
      * authority over who may dial this agent's receiver.
      *
-     * This is the counterbalance. The assignment is FROST-signed by the INITIATOR's own threshold
-     * group, which no single directory can produce, and it names the same `initiator_session_peer_id`.
-     * So the unsigned frame that opened the door is checked against the signed one that authorises
-     * it, and the two must agree.
+     * ⚠️ WHAT THIS DOES **NOT** BUY, stated first because the first draft of this comment claimed it
+     * did. The assignment IS FROST-signed by the initiator's threshold group — but **this daemon
+     * does not verify that signature on the responder path** (see `session.inbound.assignment.
+     * unverified` below; deferred to SESSION-004). So the comparison is between an UNSIGNED offer
+     * and an UNVERIFIED assignment, and a single compromised directory controls both frames: it
+     * simply names the same peer id in each and this check passes.
      *
-     * A truthful directory never names two different dialers for one session. A compromised one
-     * doing exactly that — pointing the gate at a peer of its choosing in the offer, then producing
-     * a signed assignment for the real session — is the attack this closes, and it is caught BEFORE
-     * `acceptSession` hands over the receiver.
+     * **It does not close `DOD-M15-OFFER-SIGNED-1`.** That line needs the responder to verify what
+     * it is comparing against — `DOD-M15-RESPONDER-VERIFY-1`.
+     *
+     * WHAT IT DOES BUY, which is real but smaller: the two frames must agree, so an attacker who can
+     * influence ONE of them and not the other is caught — a stale or replayed offer, a second
+     * directory node injecting an offer for a session it is not brokering, and a directory whose
+     * own two frames disagree because it is broken rather than hostile. It is a consistency check
+     * between two channels, not an authentication of either.
+     *
+     * It also makes the eventual fix strictly additive: once the responder verifies the assignment,
+     * this comparison becomes the counterbalance it was described as, with no further change here.
      *
      * BLOCKS, because it is a security failure and not an anomaly: there is no reading of a
      * mismatch that is safe to continue from.
@@ -1095,7 +1104,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         assignedPeerId: parsed.initiatorPeerId,
         correlationId,
         impact:
-          "the unsigned session_offer named one dialer and the FROST-signed assignment names another, so the directory told this agent to open its receiver to a peer its own signed document does not authorise; the session was refused and the receiver was not handed over",
+          "the session_offer named one dialer and the assignment names another, so something told this agent to open its receiver to a peer the session's own assignment does not name; the session was refused and the receiver was not handed over",
         guidance:
           "this is not a transient fault — a truthful directory never names two dialers for one session. Retry to reach a different node; if it repeats, the directory that answered is not producing assignments that match its own offers",
       });
@@ -1147,6 +1156,49 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       note: "FROST assignment signature verification deferred to SESSION-004 re-home (expected on every inbound session until SESSION-004)",
       correlationId,
     });
+
+    /**
+     * DOD-M15-OFFER-SIGNED-1 — THE ANCHOR THAT A DIRECTORY CANNOT REWRITE: this agent's own memory.
+     *
+     * Everything in the assignment is whatever the directory said, because the responder does not
+     * verify its signature (above). So no check that compares two fields of the same frame — or two
+     * frames from the same source — is worth anything against a compromised directory. It just says
+     * the same thing twice.
+     *
+     * What the directory CANNOT change is what this daemon already recorded from EARLIER sessions
+     * with this counterparty. If it now names a different threshold group key for someone we have
+     * talked to before, it is either substituting an identity or has been compromised since. Neither
+     * is a session to accept quietly.
+     *
+     * BLOCKS. A changed identity key is a security failure, not an anomaly, and the counterparty is
+     * reachable through the channel they already have with the operator.
+     *
+     * TRUST ON FIRST USE, and that bound is real: this is worth nothing the first time you talk to
+     * someone. It hardens every session after it — which is where a long-lived counterparty
+     * relationship lives, and where a substitution would otherwise be invisible.
+     */
+    if (parsed.signerPubkeyHex) {
+      const pinned = sessionNodeManager.getPinnedCounterpartyPrimary(
+        localAgent.name,
+        parsed.participantAPubkeyHex,
+      );
+      if (pinned !== null && pinned !== parsed.signerPubkeyHex) {
+        logger.error("session.inbound.counterparty_primary_changed", {
+          sessionId: parsed.sessionIdHex,
+          agentName: localAgent.name,
+          counterpartyPubkeyPrefix: parsed.participantAPubkeyHex.slice(0, 16),
+          pinnedPrefix: pinned.slice(0, 16),
+          offeredPrefix: parsed.signerPubkeyHex.slice(0, 16),
+          correlationId,
+          impact:
+            "the directory named a different threshold group key for a counterparty this agent has completed sessions with before; the session was refused and the receiver was not handed over, because accepting it would mean talking to whoever holds the new key under the old name",
+          guidance:
+            "this is not transient. Either that counterparty genuinely re-registered with new keys — confirm with them OUT OF BAND, then remove the old contact so the new identity is pinned afresh — or the directory that answered is substituting an identity",
+        });
+        sessionNodeManager.clearOfferedDialer(localAgent.name);
+        return;
+      }
+    }
 
     inboundInFlight.add(offerKey(localAgent.name, parsed.sessionIdHex));
     // Serialize: the next accept does not begin until this one (and any standing-receiver

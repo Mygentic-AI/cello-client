@@ -14,14 +14,26 @@
  *
  * Timing forced the offer. It does not excuse trusting it.
  *
- * ─── The counterbalance ────────────────────────────────────────────────────────────────────────
+ * ─── What the offer/assignment comparison buys, and what it does NOT ───────────────────────────
  *
- * The assignment is FROST-signed by the INITIATOR's own threshold group — which no single directory
- * can produce — and it names the same `initiator_session_peer_id`. So the two frames check each
- * other, and the door is only handed over when they agree.
+ * The first version of this file claimed the assignment's FROST signature made the comparison a
+ * counterbalance. It does not, and the reason matters: **the responder does not verify that
+ * signature** (`session.inbound.assignment.unverified`, deferred to SESSION-004). So the comparison
+ * is between an unsigned offer and an UNVERIFIED assignment, and one compromised directory controls
+ * both — it names the same peer id twice and passes.
  *
- * A truthful directory never names two different dialers for one session. A compromised one doing
- * exactly that is the attack this closes.
+ * It is a CONSISTENCY check between two channels, not an authentication of either. That still
+ * catches an attacker who can influence one frame and not the other — a replayed or stale offer, a
+ * second node injecting an offer for a session it is not brokering, a directory whose two frames
+ * disagree because it is broken. Worth having, smaller than it sounded.
+ *
+ * ─── The actual counterbalance: this agent's own memory ────────────────────────────────────────
+ *
+ * The one thing a directory cannot rewrite is what this daemon recorded from EARLIER sessions with
+ * the same counterparty. A directory that names a different threshold group key for someone you have
+ * already completed sessions with is substituting an identity, and that is refused.
+ *
+ * Trust on first use — worth nothing the first time, and hardening every session after it.
  */
 
 import { describe, it, expect } from "vitest";
@@ -97,5 +109,39 @@ describe("DOD-M15-OFFER-SIGNED-1: what the gate still guarantees while the offer
 
     expect(gater.denyInboundEncryptedConnection(peer("Initiator"), FAKE_CONN)).toBe(false);
     expect(gater.denyInboundEncryptedConnection(peer("Attacker"), FAKE_CONN)).toBe(true);
+  });
+});
+
+describe("DOD-M15-OFFER-SIGNED-1: the pinned counterparty key is the anchor a directory cannot rewrite", () => {
+  /** The pin comparison, in the shape the daemon applies it. */
+  function identityUnchanged(pinned: string | null, offered: string | null): boolean {
+    if (!offered) return true; // nothing named ⇒ nothing to contradict
+    return pinned === null || pinned === offered;
+  }
+
+  it("REFUSES when the directory names a different group key for a known counterparty", () => {
+    // The substitution attack. Everything in the assignment is whatever the directory said, so this
+    // is the only check in the inbound path that a compromised directory cannot satisfy by simply
+    // repeating itself.
+    expect(
+      identityUnchanged("aa".repeat(32), "bb".repeat(32)),
+      "a counterparty's threshold group key changing under the same identity must not pass quietly",
+    ).toBe(false);
+  });
+
+  it("ACCEPTS the same key on every subsequent session — the ordinary case", () => {
+    expect(identityUnchanged("aa".repeat(32), "aa".repeat(32))).toBe(true);
+  });
+
+  it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", () => {
+    // No prior session ⇒ nothing to compare. This is worth nothing the first time and everything
+    // after, and saying so is the difference between a bound and a gap.
+    expect(identityUnchanged(null, "aa".repeat(32))).toBe(true);
+  });
+
+  it("ACCEPTS an assignment that names no signer at all, rather than inventing a mismatch", () => {
+    // An older peer omits `signer_pubkey`. Absence is not contradiction — treating it as one would
+    // refuse legitimate sessions to catch nothing.
+    expect(identityUnchanged("aa".repeat(32), null)).toBe(true);
   });
 });
