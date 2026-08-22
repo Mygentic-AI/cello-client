@@ -110,8 +110,34 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     handles.push(B);
 
     let bInfo: { peerId: string; addrs: string[] } | null = null;
+    /** Set once A's daemon exists; negotiate() needs A's dialing identity (see below). */
+    let aHandle: Awaited<ReturnType<typeof startDaemon>> | undefined;
     const negotiator: SessionNegotiator = {
       async negotiate() {
+        /**
+         * DOD-M15-ASSIGN-1: offer bob the session BEFORE handing alice an assignment.
+         *
+         * This seam stands in for the entire directory round-trip, and the real one has a step
+         * that was missing here: the directory sends bob a `session_offer` naming alice's session
+         * peer id, and only signs an assignment once bob has answered it. Bob's standing receiver
+         * is narrowed to alice by that offer.
+         *
+         * The gap was invisible while an unclaimed receiver admitted everyone. Now that it admits
+         * nobody until a session names a dialer, a harness that skips the offer has bob refusing
+         * alice — correctly. Restoring the step models production; widening the gate would not.
+         *
+         * Alice dials from her OWN standing receiver (DOD-LOOP-1 — the initiator reuses it as its
+         * session node), which is the same peer id her session_request carries to the directory.
+         */
+        const aliceDialer = aHandle?.getSessionNodeManager().getStandingReceiverInfo("alice");
+        if (aliceDialer) {
+          injectB.inject!({
+            type: "session_offer",
+            session_id: SID_BYTES,
+            initiator_session_peer_id: aliceDialer.peerId,
+          });
+          await wait(30);
+        }
         const assignment: SessionAssignment = {
           session_id: SID_BYTES,
           participant_a: { pubkey: Buffer.from(alicePubkey, "hex"), peer_id: "", multiaddrs: [] },
@@ -143,6 +169,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
       sessionNegotiator: negotiator,
     });
     handles.push(A);
+    aHandle = A;
 
     const clientB = await connectToDaemon(join(dirB, "daemon.sock"));
     const clientA = await connectToDaemon(join(dirA, "daemon.sock"));

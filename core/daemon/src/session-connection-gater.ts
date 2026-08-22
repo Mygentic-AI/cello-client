@@ -7,9 +7,11 @@
  * Two modes:
  *   1. Session node gater: allows exactly one counterparty Peer ID.
  *      Created with the counterparty's Peer ID at session node creation.
- *   2. Standing receiver gater: starts OPEN (all peers allowed) because
- *      the counterparty is unknown at creation time. Call setAllowedPeer()
- *      before handing the node's multiaddr to the directory (AC-015).
+ *   2. Standing receiver gater: created with no allowed peer, which admits
+ *      NOBODY inbound (DOD-M15-ASSIGN-1 — it used to admit everyone) while
+ *      still permitting the outbound errands the receiver doubles as a dialer
+ *      for. Call setAllowedPeer() before handing the node's multiaddr to the
+ *      directory (AC-015); that is what opens the door, to exactly one peer.
  *   3. Directory node gater: delegates to DirectoryPeerIdProvider.
  *      Allows only known directory Peer IDs (MANIFEST-002 fills the real set).
  *
@@ -51,9 +53,9 @@ export class EmptyDirectoryPeerIdProvider implements DirectoryPeerIdProvider {
 /**
  * SessionConnectionGater — enforces a single allowed Peer ID on a session node.
  *
- * Initially open (allowedPeerId = null) for the standing receiver. Close the
- * window by calling setAllowedPeer(initiatorPeerId) before returning the
- * node's multiaddr to the caller (AC-015).
+ * Starts CLOSED to inbound (allowedPeerId = null) for the standing receiver;
+ * setAllowedPeer(initiatorPeerId) names the one peer that may dial, and is
+ * called before the node's multiaddr is returned to the caller (AC-015).
  */
 export class SessionConnectionGater implements ConnectionGater {
   #allowedPeerId: string | null;
@@ -123,7 +125,7 @@ export class SessionConnectionGater implements ConnectionGater {
    * Return true to DENY the connection.
    */
   denyInboundEncryptedConnection(peerId: PeerId, _maConn: MultiaddrConnection): boolean {
-    return this.#denyIfNotAllowed(peerId);
+    return this.#denyIfNotAllowed(peerId, "inbound");
   }
 
   /**
@@ -136,13 +138,42 @@ export class SessionConnectionGater implements ConnectionGater {
     if (this.#allowedOutboundPeerIds.has(peerId.toString())) {
       return false; // allow
     }
-    return this.#denyIfNotAllowed(peerId);
+    return this.#denyIfNotAllowed(peerId, "outbound");
   }
 
-  #denyIfNotAllowed(peerId: PeerId): boolean {
-    // If no allowed peer set (fully open gater), allow all.
+  #denyIfNotAllowed(peerId: PeerId, direction: "inbound" | "outbound"): boolean {
+    /**
+     * DOD-M15-ASSIGN-1 — `null` ADMITS NOBODY INBOUND. It used to admit everyone, both ways.
+     *
+     * A standing receiver is built with `allowedPeerId: null` because the counterparty is unknown
+     * until a session exists. Reading that as "allow all" is what put a real open door on every
+     * operator's machine: a stranger could dial the receiver, hold the connection through
+     * promotion — libp2p never re-runs a gater against a live connection — and then speak the
+     * content protocol the moment it activated.
+     *
+     * NOBODY LEGITIMATELY DIALS AN UNCLAIMED RECEIVER. An inbound session begins with the directory
+     * sending a `session_offer` that NAMES `initiator_session_peer_id`, and the responder narrows
+     * the gate to that peer BEFORE it advertises its own address in `session_offer_accept`. So by
+     * the time the initiator can know where to dial, the gate already names them. The window this
+     * closes is the one where the receiver is up and no offer has arrived — where the only dialer
+     * is, by construction, someone who was not invited.
+     *
+     * OUTBOUND STAYS OPEN WHILE UNCLAIMED, and that asymmetry is deliberate, not an oversight. The
+     * standing receiver is also the daemon's general-purpose dialer for errands that belong to no
+     * session — the content-park deposit and pull against the relay (MSG-001-3b). Those dials are
+     * this agent choosing where to go; INV-5 governs who may come IN. Denying them would have cost
+     * message parking to close a door nobody was standing at.
+     */
     if (this.#allowedPeerId === null) {
-      return false;
+      if (direction === "outbound") return false; // allow — we chose this dial; INV-5 is inbound-only
+      this.#logger.warn("session.node.connection.rejected", {
+        sessionId: this.#sessionId,
+        attemptedPeerId: peerId.toString(),
+        expectedPeerId: "(none — receiver unclaimed)",
+        impact:
+          "a peer dialled a standing receiver that no session has claimed; nothing invited it, so it was refused before the muxer and it learned nothing",
+      });
+      return true; // DENY
     }
     const attemptedPeerId = peerId.toString();
     if (attemptedPeerId === this.#allowedPeerId) {

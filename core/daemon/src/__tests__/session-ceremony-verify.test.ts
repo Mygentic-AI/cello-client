@@ -131,6 +131,10 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
     wireSessionOfferHandler({
       agentName: "bob",
       getStandingReceiverEndpoint: () => deps.sr,
+      // DOD-M15-ASSIGN-1: the receiver is narrowed to the offered dialer before the accept goes
+      // out. These tests are about the REJECT contract, so the narrowing succeeds and stays out of
+      // their way; the narrowing itself is pinned in dod-m15-assign-1-receiver-gate.test.ts.
+      admitOfferedDialer: () => true,
       signaling: seam,
       logger,
     });
@@ -139,7 +143,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
 
   it("AC1: standing_receiver_unavailable → sends session_offer_reject {type, session_id, reason}", async () => {
     const h = wire({ sr: null });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const reject = h.sent.find((f) => f["type"] === "session_offer_reject");
@@ -152,7 +156,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
 
   it("AC3: session.offer.abort is STILL logged with the same reason (the reject adds, never replaces)", async () => {
     const h = wire({ sr: null });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const abort = h.events.find((e) => e.event === "session.offer.abort");
@@ -178,7 +182,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
 
   it("regression: a healthy offer still sends session_offer_accept, and NO reject", async () => {
     const h = wire({ sr: { peerId: "bob-sr-peer", addrs: ["/ip4/127.0.0.1/tcp/1"] } });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const accept = h.sent.find((f) => f["type"] === "session_offer_accept");
@@ -190,7 +194,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
 
   it("SI: a failed reject send is LOUD (session.offer.reject.failed with the upstream detail), never thrown", async () => {
     const h = wire({ sr: null, seamOpts: { sendRawError: new Error("stream torn down") } });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const failed = h.events.find((e) => e.event === "session.offer.reject.failed");
@@ -209,7 +213,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
   // unit exists to fix. These two tests drive the production failure contract.
   it("SI (production contract): sendRaw resolving {ok:false} → reject.failed with the reason, and NO reject.sent", async () => {
     const h = wire({ sr: null, seamOpts: { sendRawResult: { ok: false, reason: "signaling_lost" } } });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const failed = h.events.find((e) => e.event === "session.offer.reject.failed");
@@ -225,7 +229,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
       sr: { peerId: "bob-sr-peer", addrs: [] },
       seamOpts: { sendRawResult: { ok: false, reason: "signaling_reconnecting" } },
     });
-    h.inject({ type: "session_offer", session_id: SID });
+    h.inject({ type: "session_offer", session_id: SID, initiator_session_peer_id: "12D3KooInitiator" });
     await wait(20);
 
     const failed = h.events.find((e) => e.event === "session.offer.accept.failed");

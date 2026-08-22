@@ -2536,10 +2536,30 @@ export class SessionNodeManager {
   }
 
   /**
-   * The standing receiver's libp2p node — a general-purpose, OPEN-gater node usable for
-   * OUTBOUND dials that are not session-scoped (e.g. the content-park deposit/pull to the
-   * relay, MSG-001-3b). Session nodes have restrictive gaters; the standing receiver does not.
-   * Returns null until the receiver is ready.
+   * DOD-M15-ASSIGN-1 — name the one peer allowed to dial this agent's standing receiver, at the
+   * moment the directory's `session_offer` says who is coming.
+   *
+   * This is what makes the receiver's deny-by-default safe. The offer names
+   * `initiator_session_peer_id`, and the responder answers it by advertising its OWN address in
+   * `session_offer_accept`. Narrowing here — BEFORE that answer goes out — means the door opens to
+   * exactly one peer at the same instant the address that reaches them is published, and never
+   * before. The initiator cannot know where to dial until the accept it triggers has been sent.
+   *
+   * Returns false when there is no receiver to narrow, or when the offer named nobody. The caller
+   * decides what that means; this method never widens the gate to compensate.
+   */
+  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string): boolean {
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr || initiatorSessionPeerId === "") return false;
+    sr.gater.setAllowedPeer(initiatorSessionPeerId);
+    return true;
+  }
+
+  /**
+   * The standing receiver's libp2p node — a general-purpose node usable for OUTBOUND dials that
+   * are not session-scoped (e.g. the content-park deposit/pull to the relay, MSG-001-3b). Its
+   * gater admits nobody INBOUND until a session names them (DOD-M15-ASSIGN-1), but leaves these
+   * outbound errands open. Returns null until the receiver is ready.
    */
   getStandingReceiverNode(agentName?: string): CelloNode | null {
     // With an agentName: that agent's own standing-receiver node (needed when the dial must

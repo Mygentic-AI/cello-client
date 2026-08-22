@@ -47,6 +47,13 @@ import type { Logger } from "./types.js";
 export function wireSessionOfferHandler(deps: {
   agentName: string;
   getStandingReceiverEndpoint: () => { peerId: string; addrs: string[] } | null;
+  /**
+   * DOD-M15-ASSIGN-1: name the one peer allowed to dial this agent's standing receiver. Called
+   * with the offer's `initiator_session_peer_id` BEFORE the accept advertises our address, so the
+   * gate is already narrowed by the time anyone could know where to dial. Returns false when
+   * there is no receiver or the offer named nobody.
+   */
+  admitOfferedDialer: (initiatorSessionPeerId: string) => boolean;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -99,6 +106,34 @@ export function wireSessionOfferHandler(deps: {
       if (!sr) {
         deps.logger.warn("session.offer.abort", { agentName: deps.agentName, reason: "standing_receiver_unavailable" });
         await sendOfferReject(sessionId, "standing_receiver_unavailable");
+        return;
+      }
+      /**
+       * DOD-M15-ASSIGN-1 — open the door to the named dialer, and ONLY then publish our address.
+       *
+       * The ordering is the whole mechanism. Our receiver admits nobody until this line runs; the
+       * accept below is what tells the directory (and through it, the initiator) where we listen.
+       * Narrowing first means the gate names the initiator before the initiator can possibly know
+       * where to dial, so there is no interval in which the address is reachable by anyone else.
+       *
+       * REFUSED WHEN THE OFFER NAMES NOBODY. The directory rejects any session_request that omits
+       * `initiator_session_peer_id` (`session_request_missing_peer_id`), so a well-formed request
+       * cannot produce a nameless offer — one here means a directory that is broken or lying.
+       * Advertising anyway would be the worse failure: the initiator would dial an address whose
+       * gate refuses them, and the session would die at the transport with no one able to say why.
+       * Rejecting names the cause on the frame the directory is already waiting for.
+       */
+      const offeredDialer = frame["initiator_session_peer_id"];
+      if (typeof offeredDialer !== "string" || offeredDialer === "" || !deps.admitOfferedDialer(offeredDialer)) {
+        deps.logger.warn("session.offer.abort", {
+          agentName: deps.agentName,
+          reason: "offer_named_no_dialer",
+          impact:
+            "the directory's offer did not say who would dial, so this agent could not open its receiver to exactly one peer; the session was refused rather than served behind a door open to anyone",
+          guidance:
+            "the initiator should retry; a repeat means the directory is not populating initiator_session_peer_id and the session cannot be established safely",
+        });
+        await sendOfferReject(sessionId, "offer_named_no_dialer");
         return;
       }
       try {

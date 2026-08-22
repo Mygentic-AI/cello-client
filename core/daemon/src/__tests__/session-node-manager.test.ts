@@ -697,7 +697,11 @@ describe("SessionNodeManager — unit tests", () => {
   // ── SessionConnectionGater unit tests ──────────────────────────────────────
 
   describe("SessionConnectionGater", () => {
-    it("allows connection when gater is open (allowedPeerId=null)", () => {
+    // DOD-M15-ASSIGN-1: this test used to be "allows connection when gater is open
+    // (allowedPeerId=null)" and asserted that an unclaimed receiver admitted any dialer. That was
+    // the defect written down as a contract. An unclaimed receiver now admits NOBODY inbound,
+    // while still making the outbound dials the standing receiver doubles as a dialer for.
+    it("denies INBOUND but permits OUTBOUND when no peer is named (allowedPeerId=null)", () => {
       const { logger } = makeLogger();
       const gater = new SessionConnectionGater({
         sessionId: "test",
@@ -707,7 +711,8 @@ describe("SessionNodeManager — unit tests", () => {
 
       const fakePeerId = { toString: () => "any-peer-id" } as PeerId;
       const fakeMaConn = {} as MultiaddrConnection;
-      expect(gater.denyInboundEncryptedConnection(fakePeerId, fakeMaConn)).toBe(false);
+      expect(gater.denyInboundEncryptedConnection(fakePeerId, fakeMaConn)).toBe(true);
+      expect(gater.denyOutboundEncryptedConnection(fakePeerId, fakeMaConn)).toBe(false);
     });
 
     it("allows connection from the expected peer", () => {
@@ -757,8 +762,10 @@ describe("SessionNodeManager — unit tests", () => {
       const intruderPeerId = "12D3KooWIntruderPeer";
       const fakeMaConn = {} as MultiaddrConnection;
 
-      // Initially open
-      expect(gater.denyInboundEncryptedConnection({ toString: () => intruderPeerId } as PeerId, fakeMaConn)).toBe(false);
+      // DOD-M15-ASSIGN-1: initially CLOSED to inbound. This assertion used to expect `false` —
+      // an unclaimed standing receiver admitting any dialer on the network. That was the open
+      // door, not the contract; the intruder here is exactly who it let through.
+      expect(gater.denyInboundEncryptedConnection({ toString: () => intruderPeerId } as PeerId, fakeMaConn)).toBe(true);
 
       // Set allowed peer — now only target can connect
       gater.setAllowedPeer(targetPeerId);

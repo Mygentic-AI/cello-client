@@ -749,6 +749,7 @@ async function startDaemonHoldingLock(
     wireSessionOfferHandler({
       agentName,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
+      admitOfferedDialer: (peerId) => sessionNodeManager.admitOfferedDialer(agentName, peerId),
       signaling: mgr,
       logger,
     });
@@ -819,6 +820,7 @@ async function startDaemonHoldingLock(
     wireSessionOfferHandler({
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
+      admitOfferedDialer: (peerId) => sessionNodeManager.admitOfferedDialer(agent.name, peerId),
       signaling: mgr,
       logger,
     });
