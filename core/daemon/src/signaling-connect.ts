@@ -175,15 +175,52 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
     }
 
     // Fresh directory-facing node per connect → fresh transport key / Peer ID.
-    // DOD-NAT-REACHABILITY-1: relayServer disabled — this is a long-lived client
-    // node bound on 0.0.0.0; without the explicit opt-out the no-nodeType default
-    // (a service node) would advertise HOP and let LAN peers relay through the
-    // operator's machine.
+    //
+    // DOD-NAT-REACHABILITY-1: relayServer disabled, and the opt-out is NOT made redundant by this
+    // node listening on nothing (see below). Leaving `nodeType` unset takes the service-node
+    // default, which adds `circuitRelayServer` to the service map and advertises HOP — and HOP is
+    // advertised over connections WE opened, not only over ones we accept. A node with no listener
+    // still holds a live outbound connection to the directory.
+    //
+    // (This comment described the node as "bound on 0.0.0.0" until DOD-M15-SURFACE-1 removed the
+    // binding. Rewritten rather than deleted: the constraint it records is still load-bearing, and
+    // leaving it in past tense put two comments in one expression contradicting each other about
+    // the exact fact this unit changed — which is how the binding gets "restored" by a later
+    // session that stops reading at the first one.)
     const node = deps.createDirectoryNode
       ? await deps.createDirectoryNode(identity.keyProvider)
       : await createNode({
           keyProvider: identity.keyProvider,
-          listenAddresses: ["/ip4/0.0.0.0/tcp/0"],
+          /**
+           * DOD-M15-SURFACE-1 — LISTEN ON NOTHING. This node had a real open port on every
+           * interface, for no reason.
+           *
+           * It bound `/ip4/0.0.0.0/tcp/0` while registering **no protocol handler at all**, and the
+           * directory never dials a client — every directory connection is one this daemon opened.
+           * So the port accepted connections that could reach no CELLO protocol, on an operator's
+           * machine, for the life of the daemon. Not listening is strictly stronger than filtering
+           * who may connect: there is no socket, nothing to scan, and nothing to gate. (A
+           * `DirectoryConnectionGater` exists for the filtering approach and is constructed only in
+           * tests — it is the consolation prize, not the fix.)
+           *
+           * FALSIFIED BEFORE REMOVING, because `listenAddresses()` IS sent to the directory at step
+           * 7 below, in `peer_info_announce`, under a comment saying it is so the directory can
+           * broker sessions. Traced to the consumer: the directory stores it and its own code says
+           * this address is *"its per-agent DIRECTORY node, NOT its standing-receiver session node,
+           * so it is NOT a valid content endpoint (using it yields 'could not negotiate
+           * /cello/content')"*. A counterparty's session endpoint reaches the other side through the
+           * `session_offer` → `session_offer_accept` round-trip, never through this announce. No
+           * client reads `participant_a/b.multiaddrs` at all.
+           *
+           * The announce still matters and still happens: `#peerInfoAnnounced` gates `session_request`
+           * on the directory side, and it is set by the frame ARRIVING, not by what is in it. The
+           * peer id still goes with it, and a peer id needs no listener.
+           *
+           * INBOUND SESSIONS ARE UNAFFECTED. They arrive on the standing receiver, which is a
+           * different node and keeps its socket deliberately (relay-audit Decision 2 — it is
+           * load-bearing for same-machine and same-LAN sessions).
+           */
+          listenAddresses: [],
           relayServer: { enabled: false },
           // Same reason as relayServer above: this is a CLIENT node that leaves nodeType unset, so
           // the service-node default would leave the AutoNAT responder on -- and answering one

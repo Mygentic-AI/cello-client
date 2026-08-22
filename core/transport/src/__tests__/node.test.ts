@@ -107,6 +107,40 @@ describe("AC-001: createNode and start", () => {
   beforeEach(() => { scope = createTestScope(); });
   afterEach(() => scope.run(async () => {}));
 
+  it("DOD-M15-SURFACE-1: an EMPTY listen config binds nothing — no socket, not a filtered one", async () => {
+    /**
+     * The property the daemon's directory-facing node now relies on. That node registered no
+     * protocol handler and the directory never dials a client, yet it bound `/ip4/0.0.0.0/tcp/0` —
+     * a real open port on every interface, on an operator's machine, for the life of the daemon.
+     *
+     * Not listening is strictly stronger than gating who may connect: there is no socket to reach,
+     * nothing to scan, and nothing for a gater to get wrong. This pins that `listenAddresses: []`
+     * actually means that, rather than falling back to a default — a silent default here would give
+     * the daemon a port it believes it does not have, which is worse than the port it had openly.
+     */
+    const { keyProvider } = makeKeyProvider();
+    const node = await createNode({ keyProvider, listenAddresses: [] });
+    scope.addCleanup(async () => { try { await node.stop(); } catch {} });
+    await node.start();
+
+    /**
+     * Review F4 — WHAT THIS PROVES, precisely. `listenAddresses()` maps `libp2p.getMultiaddrs()`,
+     * which returns only VERIFIED addresses, so `[]` proves nothing is ANNOUNCED rather than that
+     * no socket exists. That gap is bounded and the bound is why this is enough: the regression
+     * this guards is someone restoring `0.0.0.0` or `127.0.0.1`, and both expand to private or
+     * loopback addresses that libp2p verifies immediately and surfaces here. The escape would be a
+     * public-IP-only listen on a firewalled host, which is not a plausible edit at this call site.
+     *
+     * THE TEST DIRECTLY BELOW IS THE POSITIVE CONTROL — it asserts ≥1 concrete-port multiaddr on a
+     * node built WITH a listen address, which is what demonstrates this assertion can tell bound
+     * from unbound at all. Named here so the two cannot drift apart silently.
+     */
+    expect(node.listenAddresses(), "an empty listen config must produce no listen address").toEqual([]);
+    // And it is still a usable node: it has an identity and can dial OUT, which is all the
+    // directory-facing node ever needed.
+    expect(node.getPeerId()).toMatch(/^12D3Koo/);
+  });
+
   it("starts node, returns ≥1 multiaddr with concrete port, valid PeerId", async () => {
     const { node } = await makeStartedNode();
     scope.addCleanup(async () => { try { await node.stop(); } catch {} });
