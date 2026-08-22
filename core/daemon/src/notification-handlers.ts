@@ -167,11 +167,33 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       // M12-P18: sessions THIS agent turned away (cap/abuse bound). Local-only visibility so a cap
       // firing does not require reading the daemon log to discover — the failure mode that hid a
       // stranded 297-times-re-pulled message.
+      /**
+       * A refusal an agent can ACT on, not a code it has to look up.
+       *
+       * Most entries here are ordinary capacity or abuse bounds and speak for themselves. Two are
+       * SECURITY refusals from the inbound assignment path, and a bare reason string is the wrong
+       * surface for those — the operator needs to know that something was refused ON PURPOSE, what
+       * it means, and that for one of them the next step happens OUTSIDE this system.
+       */
+      const REFUSAL_GUIDANCE: Record<string, string> = {
+        counterparty_primary_key_changed:
+          "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you " +
+          "have completed sessions with before. Either they genuinely re-registered — confirm that " +
+          "with them OUT OF BAND (a channel that is not this one), then remove and re-add the " +
+          "contact so the new identity is pinned — or a directory is substituting an identity. " +
+          "Do not accept a session from them until you know which.",
+        offer_assignment_dialer_mismatch:
+          "REFUSED ON PURPOSE. The directory's session offer named one dialer and the session " +
+          "assignment named another, so the two frames for one session disagree. Retry — you may " +
+          "reach a different directory node. If it repeats, that node is not producing assignments " +
+          "that match its own offers.",
+      };
       const refused = (refusedSessionRequests.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
         reason: e.reason,
         refused_at: e.refusedAt,
+        ...(REFUSAL_GUIDANCE[e.reason] ? { guidance: REFUSAL_GUIDANCE[e.reason] } : {}),
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const ended_unread = sessionNodeManager.getEndedUnread(agent);

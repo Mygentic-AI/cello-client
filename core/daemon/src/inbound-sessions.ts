@@ -1108,6 +1108,11 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         guidance:
           "this is not a transient fault — a truthful directory never names two dialers for one session. Retry to reach a different node; if it repeats, the directory that answered is not producing assignments that match its own offers",
       });
+      // INVARIANT 2: loud in the log AND on a surface the agent can read. A refusal the operator
+      // never sees is indistinguishable from the session simply never arriving — and this one is a
+      // security refusal, which is the worst kind to be silent about. `cello_check_notifications`
+      // reads this list.
+      recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "offer_assignment_dialer_mismatch");
       sessionNodeManager.clearOfferedDialer(localAgent.name);
       return;
     }
@@ -1195,6 +1200,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           guidance:
             "this is not transient. Either that counterparty genuinely re-registered with new keys — confirm with them OUT OF BAND, then remove the old contact so the new identity is pinned afresh — or the directory that answered is substituting an identity",
         });
+        // INVARIANT 2, and this one most of all: a counterparty's identity key changing is exactly
+        // the event an operator must be told about, and telling only the log tells nobody.
+        recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "counterparty_primary_key_changed");
         sessionNodeManager.clearOfferedDialer(localAgent.name);
         return;
       }
