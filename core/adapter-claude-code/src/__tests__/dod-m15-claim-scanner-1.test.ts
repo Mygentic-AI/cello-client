@@ -58,7 +58,24 @@ const ROOT = repoRoot();
  * frozen at one moment is exactly how the prose ledger came to be incomplete.
  */
 const CLAIM_VOCABULARY =
-  /\b(never|cannot|impossible|tamper-proof|tamper-evident|independently verify|verifiable|notarized|zero-knowledge|no one can|nobody can|only you|guarantee[ds]?)\b/i;
+  /\b(never|cannot|impossible|tamper-proof|tamper-evident|independently verify|verifiable|verified|notarized|zero-knowledge|no one can|nobody can|only you|guarantee[ds]?|encrypted|screened|proof|ACTIVE)\b/g;
+
+/**
+ * COUNT EVERY MATCH, not every matching line.
+ *
+ * The first version counted LINES containing a claim word, and a review demonstrated the bypass by
+ * appending *"CELLO guarantees nobody can ever read your messages, not even us"* to the end of an
+ * existing README claim line: three new absolute claims, line count unchanged, build green. And
+ * appending to a sentence that already makes a claim is the natural way marketing prose is edited.
+ *
+ * Counting matches also makes the number stable under REWRAPPING. A line count changes when a
+ * paragraph reflows or a formatter runs, which would red the shrink-only test for a cosmetic edit
+ * and teach people to "just adjust the baseline" — the one response this file's own failure message
+ * says is never right.
+ */
+function countMatches(text: string): number {
+  return (text.match(CLAIM_VOCABULARY) ?? []).length;
+}
 
 /**
  * Every shipped prose surface, discovered from the system.
@@ -67,6 +84,15 @@ const CLAIM_VOCABULARY =
  *   - the plugin tree — skills and agent definitions an operator installs.
  *   - the repo root — README, AUDIT-ME, what a prospective adopter reads first.
  */
+/** Every `.md` under a directory, at any depth. */
+function walkMarkdown(dir: string, out: Set<string>): void {
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) walkMarkdown(full, out);
+    else if (e.name.endsWith(".md")) out.add(full);
+  }
+}
+
 function shippedSurfaces(): string[] {
   const out = new Set<string>();
 
@@ -76,9 +102,21 @@ function shippedSurfaces(): string[] {
     if (!existsSync(pj)) continue;
     const files = (JSON.parse(readFileSync(pj, "utf8")) as { files?: string[] }).files ?? [];
     for (const f of files) {
-      if (!f.endsWith(".md")) continue;
-      const full = join(coreDir, pkg, f);
-      if (existsSync(full)) out.add(full);
+      /**
+       * A `files` entry may be a FILE, a DIRECTORY, or a GLOB — npm ships all three, and the first
+       * version of this only followed entries literally spelled `….md`.
+       *
+       * A review proved the hole by adding `"docs/"` to this package's `files` and dropping a
+       * `docs/GUARANTEES.md` into it promising *"your key can never leave your machine… tamper-proof
+       * and notarized"*. Four tests passed. That is the SAME failure as the tarball `SKILL.md` this
+       * unit exists to prevent — the hand-kept list had simply moved from an array into "which
+       * entries happen to be spelled as a .md path".
+       */
+      const base = f.replace(/\/?\*.*$/, "");
+      const full = join(coreDir, pkg, base);
+      if (!existsSync(full)) continue;
+      if (statSync(full).isDirectory()) walkMarkdown(full, out);
+      else if (full.endsWith(".md")) out.add(full);
     }
   }
 
@@ -87,41 +125,86 @@ function shippedSurfaces(): string[] {
   }
 
   const plugins = join(ROOT, "plugins");
-  if (existsSync(plugins)) {
-    const walk = (dir: string): void => {
-      for (const e of readdirSync(dir, { withFileTypes: true })) {
-        const full = join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        else if (e.name.endsWith(".md")) out.add(full);
-      }
-    };
-    walk(plugins);
-  }
+  if (existsSync(plugins)) walkMarkdown(plugins, out);
 
   return [...out].sort();
 }
 
-function claimLines(file: string): number {
-  return readFileSync(file, "utf8").split("\n").filter((l) => CLAIM_VOCABULARY.test(l)).length;
+/**
+ * The CLI's own `summary` and `help` strings — the highest-stakes prose in the repo.
+ *
+ * Not markdown, so no `.md` walk reaches it, and the DoD line named it explicitly. These are the
+ * sentences printed to an operator at the moment they decide to act: *"Both sides sign off and get a
+ * tamper-proof receipt"*, *"each gets a notarized receipt"*, *"CELLO never holds your whole signing
+ * key in one place"*, *"The agent becomes UNREACHABLE"*. A claim read at the point of action is
+ * acted on harder than one in a README.
+ */
+const REGISTRY = join(ROOT, "core", "cli", "src", "registry.ts");
+
+function registryClaimStrings(): string {
+  if (!existsSync(REGISTRY)) return "";
+  const src = readFileSync(REGISTRY, "utf8");
+  /**
+   * PROSE-SHAPED LITERALS, not `summary:`/`help:` values.
+   *
+   * Keying on the field name looks tidier and measured 3 claims in a 1514-line file, which is not
+   * plausible for a CLI whose own help text says "tamper-proof receipt". The reason: a `help` value
+   * is usually a multi-line CONCATENATION —
+   *
+   *     help:
+   *       "Usage: cello close-session …\n" +
+   *       "  Both parties sign off … each gets a notarized receipt\n" +
+   *
+   * — so a regex anchored to `help:` captures the first fragment and stops before every line that
+   * carries a claim. Taking any literal of three or more words instead cannot miss a continuation.
+   * It over-includes (an error message, a usage line), and that is the right direction to err: an
+   * error string an operator reads at the moment something fails is a claim surface too.
+   */
+  return [...src.matchAll(/"((?:[^"\\\n]|\\.)*)"|`((?:[^`\\]|\\.)*)`/g)]
+    .map((m) => m[1] ?? m[2] ?? "")
+    .filter((s) => s.trim().split(/\s+/).length >= 3)
+    .join("\n");
+}
+
+function claimCount(file: string): number {
+  return countMatches(readFileSync(file, "utf8"));
+}
+
+/** The CLI surface's name in the baseline — not a file path, so it is spelled to say so. */
+const REGISTRY_SURFACE = "core/cli/src/registry.ts (operator-facing strings)";
+
+/** Every surface and its claim text, as one map — markdown files plus the CLI's operator strings. */
+function surfaceTexts(): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const file of shippedSurfaces()) m.set(relative(ROOT, file), readFileSync(file, "utf8"));
+  const registry = registryClaimStrings();
+  if (registry) m.set(REGISTRY_SURFACE, registry);
+  return m;
 }
 
 /**
- * Claim-shaped lines per shipped surface, as of 2026-08-22. **Shrink these; never raise them.**
+ * Unadjudicated claim MATCHES per shipped surface, as of 2026-08-22. **Shrink these; never raise.**
  *
- * A number here is not an approval — it is a count of lines nobody has adjudicated yet. Lowering one
- * means those claims were checked against the code and either verified, corrected, or withdrawn, and
- * the reasoning went into the prose ledger.
+ * A number here is not an approval — it is a count of claims nobody has checked against the code
+ * yet. Lowering one means those claims were verified, corrected, or withdrawn, and the reasoning
+ * went into the prose ledger.
+ *
+ * These counts REPLACED an earlier set of line counts. They are larger, and the increase is not
+ * inflation: it is the four vocabulary words the DoD line named and the regex had lost
+ * (`encrypted`, `screened`, `proof`, `ACTIVE`), plus counting each claim on a line rather than the
+ * line, plus two surfaces that were not being read at all.
  */
 const UNADJUDICATED_BASELINE: Record<string, number> = {
-  "AUDIT-ME.md": 12,
-  "README.md": 12,
-  "core/adapter-claude-code/SKILL.md": 19,
-  "plugins/cello/agents/cello-receptionist.md": 7,
-  "plugins/cello/skills/cello/SKILL.md": 17,
-  "plugins/cello/skills/documents/SKILL.md": 16,
-  "plugins/cello/skills/receptionist/SKILL.md": 7,
-  "plugins/cello/skills/reconnect/SKILL.md": 5,
-  "plugins/cello/skills/setup/SKILL.md": 6,
+  "AUDIT-ME.md": 18,
+  "README.md": 20,
+  "core/adapter-claude-code/SKILL.md": 30,
+  "core/cli/src/registry.ts (operator-facing strings)": 41,
+  "plugins/cello/agents/cello-receptionist.md": 8,
+  "plugins/cello/skills/cello/SKILL.md": 29,
+  "plugins/cello/skills/documents/SKILL.md": 18,
+  "plugins/cello/skills/receptionist/SKILL.md": 11,
+  "plugins/cello/skills/reconnect/SKILL.md": 4,
+  "plugins/cello/skills/setup/SKILL.md": 9,
 };
 
 describe("DOD-M15-CLAIM-SCANNER-1: shipped surfaces are discovered, not remembered", () => {
@@ -139,23 +222,36 @@ describe("DOD-M15-CLAIM-SCANNER-1: shipped surfaces are discovered, not remember
     expect(surfaces.some((s) => s.startsWith("plugins/")), "the installed plugin tree ships prose too").toBe(true);
 
     // A vacuous-pass guard: if discovery silently returned almost nothing, every count below would
-    // pass as a comfortable zero.
-    expect(surfaces.length, "surface discovery returned implausibly few files").toBeGreaterThanOrEqual(8);
+    // pass as a comfortable zero. Tied to the BASELINE's own size rather than a number typed once —
+    // the first version said `>= 8` against 9 discovered surfaces, so it would have shrugged at
+    // discovery losing a file, which is the failure it was written for.
+    expect(
+      surfaces.length,
+      "surface discovery returned fewer files than the baseline names — something stopped being read",
+    ).toBeGreaterThanOrEqual(Object.keys(UNADJUDICATED_BASELINE).length - 1);
+  });
+
+  it("reads the CLI's operator-facing strings, which no markdown walk reaches", () => {
+    // The sentences printed at the moment an operator acts. `registry.ts` is TypeScript, so every
+    // .md-based enumeration above is blind to it, and the DoD line named it specifically.
+    const text = registryClaimStrings();
+    expect(text, "no summary/help strings were extracted from registry.ts").not.toBe("");
+    expect(text, "the extraction is matching something other than the operator-facing fields")
+      .toMatch(/receipt|session|agent/i);
   });
 });
 
 describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
-  it("no shipped surface carries MORE claim-shaped lines than its recorded baseline", () => {
+  it("no shipped surface carries MORE claims than its recorded baseline", () => {
     const grown: string[] = [];
-    for (const file of shippedSurfaces()) {
-      const rel = relative(ROOT, file);
-      const found = claimLines(file);
-      const allowed = UNADJUDICATED_BASELINE[rel] ?? 0;
-      if (found > allowed) grown.push(`${rel}: ${found} claim lines, baseline ${allowed}`);
+    for (const [surface, text] of surfaceTexts()) {
+      const found = countMatches(text);
+      const allowed = UNADJUDICATED_BASELINE[surface] ?? 0;
+      if (found > allowed) grown.push(`${surface}: ${found} claims, baseline ${allowed}`);
     }
     expect(
       grown,
-      `These shipped surfaces gained claim-shaped lines that are not in the ledger: ${grown.join("; ")}. ` +
+      `These shipped surfaces gained claims that are not in the ledger: ${grown.join("; ")}. ` +
         `A claim on a surface an operator reads is a promise they will act on — audit it against the ` +
         `code and record the verdict in the claims ledger, or reword it. Raising the baseline to make ` +
         `this pass is the one response that is never right.`,
@@ -166,12 +262,13 @@ describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
     // What stops the baseline becoming a permanent exemption nobody revisits. If a surface now has
     // FEWER claims than recorded, the work was done and the number must come down with it —
     // otherwise the ledger overstates the debt and hides that the guard is already stricter.
+    const texts = surfaceTexts();
     const stale: string[] = [];
-    for (const [rel, allowed] of Object.entries(UNADJUDICATED_BASELINE)) {
-      const full = join(ROOT, rel);
-      if (!existsSync(full)) { stale.push(`${rel}: file no longer exists`); continue; }
-      const found = claimLines(full);
-      if (found < allowed) stale.push(`${rel}: ${found} claim lines, baseline still says ${allowed}`);
+    for (const [surface, allowed] of Object.entries(UNADJUDICATED_BASELINE)) {
+      const text = texts.get(surface);
+      if (text === undefined) { stale.push(`${surface}: no longer discovered`); continue; }
+      const found = countMatches(text);
+      if (found < allowed) stale.push(`${surface}: ${found} claims, baseline still says ${allowed}`);
     }
     expect(
       stale,
@@ -180,13 +277,13 @@ describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
   });
 
   it("every baselined surface is one the enumeration actually finds", () => {
-    // A baseline entry for a file discovery no longer reaches is a silent hole: the count would
+    // A baseline entry for a surface discovery no longer reaches is a silent hole: the count would
     // never be checked again, and nobody would know.
-    const discovered = new Set(shippedSurfaces().map((f) => relative(ROOT, f)));
-    const orphans = Object.keys(UNADJUDICATED_BASELINE).filter((rel) => !discovered.has(rel));
+    const discovered = surfaceTexts();
+    const orphans = Object.keys(UNADJUDICATED_BASELINE).filter((s) => !discovered.has(s));
     expect(
       orphans,
-      `These baselines name files the surface enumeration does not find, so their claims are no ` +
+      `These baselines name surfaces the enumeration does not find, so their claims are no ` +
         `longer being counted: ${orphans.join(", ")}`,
     ).toEqual([]);
   });
