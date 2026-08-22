@@ -328,9 +328,12 @@ transcript <id>       — the full conversation, sent and received
 sealed-receipt <id>   — the notarized bilateral seal
 ```
 
-**Contacts** — the per-agent address book. Tiers raise a peer's limits. Content
-screening is **planned, not yet active** — the daemon currently passes messages
-through unscreened, so a tier is a limits setting, not a safety boundary.
+**Contacts** — the per-agent address book. Tiers raise a peer's limits, and they
+do not change content screening: a higher tier does not reduce it. Screening
+runs on inbound and outbound content in the daemon's security gateway. Its
+semantic layer — the one that judges meaning rather than matching patterns —
+needs a classifier model that is not installed by default; the gateway reports
+which layers it loaded at startup.
 ```
 contacts                                 — list your address book
 contact <pubkey> add / remove

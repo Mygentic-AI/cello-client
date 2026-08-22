@@ -147,16 +147,24 @@ or shortening its window — is refused from the agent surface and must be done 
 terminal. That is deliberate: an agent must not be able to weaken its own guards, least of all
 because an incoming message asked it to.
 
-Content screening **is active**, in both directions. Inbound messages are screened before they
-reach any reader, and outbound ones before they leave. A screened-out item does not silently
-vanish: an outbound message can be **held for a decision**, and resolving it means re-sending the
-same content with a `governance_decisions` map — `{flagId: "redact" | "allow_once" |
-"allow_always"}` — deciding each flagged item. Nothing reaches the peer until you do.
+Content screening **runs in both directions**. Inbound messages are screened before they reach any
+reader, and outbound ones before they leave. A screened-out item does not silently vanish: an
+outbound message can be **held for a decision**, and resolving it means re-sending the same content
+with a `governance_decisions` map — `{flagId: "redact" | "allow_once" | "allow_always"}` — deciding
+each flagged item. Nothing reaches the peer until you do.
 
-(This paragraph previously said screening was "planned, not yet active". That was true when the
-daemon defaulted to a null-object gateway; the default is gone, a real gateway is now required at
-startup, and a live hold was observed on 2026-08-07. Tiers remain a limits setting rather than the
-safety boundary — screening is the boundary.)
+**What runs, and what does not.** The deterministic sanitizer and the pattern matcher are live and
+enforcing. The layer that judges *meaning* — the one that would catch a prompt injection phrased in
+a way no pattern anticipates — loads only if a classifier model is present at
+`~/.cello/gateway-model`, and CELLO does not install one. The gateway says which it got on its
+startup line: `layer2=active`, or `layer2=off:<reason>`. **Read that line before relying on
+screening to stop a determined attacker.**
+
+(This paragraph has now been wrong in both directions. It first said screening was "planned, not yet
+active", which was true only while the daemon defaulted to a null-object gateway. It then said
+screening "is active", which reads as all of it being on. Tiers remain a limits setting rather than
+the safety boundary — screening is the boundary, and the boundary has a hole that is named above
+rather than left for someone to discover.)
 
 ### Optional extras
 

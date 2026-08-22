@@ -245,7 +245,7 @@ server.tool("cello_contact_set_moniker", "Set (or clear, by passing null) YOUR p
 });
 
 // DOD-CONTACT-VIEW-1: set a contact's reachability tier. Forward-only (D7).
-server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still bounded — a higher tier only RAISES limits, it never removes them. It does NOT change content screening, which is ACTIVE at every tier and applies in both directions — a higher tier never buys less screening. Defaults to the current agent.", {
+server.tool("cello_contact_set_tier", "Set a contact's reachability tier: 0=blocked (refused, indistinguishable from a full inbox), 1=unknown (stranger caps), 2=known (a real contact — richer away replies, larger caps), 3=whitelisted (auto-accepted when you're away), 4=vip (highest caps). Every tier is still bounded — a higher tier only RAISES limits, it never removes them. It does NOT change content screening, which applies in both directions at every tier — a higher tier never buys less screening. Defaults to the current agent.", {
   pubkey: z.string().describe("Hex-encoded public key of the contact"),
   tier: z.number().int().min(0).max(4).describe("0=blocked, 1=unknown, 2=known, 3=whitelisted, 4=vip"),
   agent: z.string().optional().describe("Agent name whose contact to set (defaults to the current agent)"),
