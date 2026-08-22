@@ -2364,6 +2364,20 @@ async function startDaemonHoldingLock(
    * The resolution is now attributable: every path reports how it was reached, and `fallback` — the
    * one that was invisible — is logged at INFO. `DOD-M15-IPCVISIBLE-1`.
    */
+  /**
+   * The fallback notice owed to a connection's NEXT response — `DOD-M15-SELECTION-1` clause 2.
+   *
+   * Keyed on the per-connection STATE OBJECT rather than the connection id, and that is the reason
+   * this needed no changes at ~16 call sites: `resolveCurrentAgent` already receives the state
+   * object, and every handler already has the id to look it up by. Threading an id through all of
+   * them would have worked today and been forgotten by the seventeenth.
+   *
+   * A `WeakMap`, so a connection's entry disappears with its state and nothing has to remember to
+   * clean up. The notice is TAKEN (read-and-cleared) at the boundary, so it rides exactly one
+   * response — the one whose call actually used the fallback.
+   */
+  const pendingFallbackNotice = new WeakMap<object, Record<string, unknown>>();
+
   function resolveCurrentAgent(
     connState: { currentAgent: string | null; clearedAgent?: string; clientType?: string } | undefined,
     explicitAgent?: string,
@@ -2377,6 +2391,25 @@ async function startDaemonHoldingLock(
         // logging them would bury the one that matters — a signal that fires on the normal case is
         // not a signal.
         if (trigger !== "fallback") return;
+        /**
+         * RECORDED FOR THE RESPONSE, not just the log — `DOD-M15-SELECTION-1` clause 2.
+         *
+         * The log tells whoever reads the daemon log. The RESPONSE tells the agent that just acted
+         * as an identity it never selected, which is the one that stops the half-attended state
+         * being read as the protocol dropping messages.
+         */
+        if (agent && connState) {
+          pendingFallbackNotice.set(connState, {
+            acting_as: agent,
+            agent_selection: "fallback",
+            agent_selection_guidance:
+              `No agent was selected on this connection, so '${agent}' was used because it is the ` +
+              `only one online. This is a per-call subject, NOT an attendance: doorbells route by ` +
+              `the connection's registered agent, so this session will not WAKE on an incoming ` +
+              `message even though sending and reading work. Run cello_use_agent to select it ` +
+              `properly, or name the agent explicitly on each call.`,
+          });
+        }
         logger.info("agent.current.fallback", {
           agentName: agent,
           clientType: connState?.clientType ?? "cli",
@@ -4463,6 +4496,14 @@ async function startDaemonHoldingLock(
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
+  ipcServer.setFallbackNoticeSource((connectionId) => {
+    const state = perConnectionState.get(connectionId);
+    if (!state) return undefined;
+    const notice = pendingFallbackNotice.get(state);
+    if (notice) pendingFallbackNotice.delete(state);
+    return notice;
+  });
+
   ipcServer.onDisconnect((connectionId) => {
     /**
      * DOD-M15-IPCVISIBLE-1: SAY THAT IT CLOSED, and say what it was attending.

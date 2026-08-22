@@ -146,4 +146,63 @@ describe("DOD-M15-SELECTION-1 diagnosis: what a release actually leaves behind",
     ).toBeDefined();
     expect(fallback?.context["agentName"]).toBe("solo");
   }, 30_000);
+
+  it("★ CLAUSE 2: a fallback is EXPLICIT IN THE RESPONSE, not announced as an accomplished fact", async () => {
+    /**
+     * *"If a fallback is wanted it is EXPLICIT in the response, not announced as an accomplished
+     * fact."*
+     *
+     * The diagnosis above settled what the harm actually is. It is not that the fallback picks a
+     * wrong agent — with one online it picks the only one there is. It is the HALF-ATTENDED state:
+     * the call resolves and works, and doorbells never arrive, because attendance was never
+     * registered. An operator reads that as the protocol dropping messages rather than as a
+     * selection nobody made.
+     *
+     * So the response says which agent it acted as and that this was a fallback, with the verb that
+     * fixes it. Added at the IPC boundary — the ONE place every response passes through — so a
+     * handler added tomorrow cannot forget it.
+     */
+    handle = await startDaemon(makeConfig());
+    const sock = join(dir, "daemon.sock");
+
+    const c = await connectToDaemon(sock);
+    await c.send("ipc.connect", { clientType: "mcp" });
+    await c.send("cello_create_agent", { name: "solo" });
+    await c.send("cello_start_agent", { name: "solo" });
+
+    const res = (await c.send("cello_list_sessions", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(
+      res["acting_as"],
+      "the response must name the agent it acted as — the caller never selected one",
+    ).toBe("solo");
+    expect(res["agent_selection"]).toBe("fallback");
+    expect(
+      String(res["agent_selection_guidance"]),
+      "and it must name the half-attended consequence plus the verb that fixes it",
+    ).toMatch(/cello_use_agent/);
+  }, 30_000);
+
+  it("a connection that SELECTED an agent gets no fallback notice", async () => {
+    /**
+     * The counterexample. A notice on every response would fire on the ordinary case — the defect
+     * this milestone keeps naming: a signal that fires on the normal case is not a signal, and it
+     * trains the reader to ignore the one that is real.
+     */
+    handle = await startDaemon(makeConfig());
+    const sock = join(dir, "daemon.sock");
+
+    const c = await connectToDaemon(sock);
+    await c.send("ipc.connect", { clientType: "mcp" });
+    await c.send("cello_create_agent", { name: "solo" });
+    await c.send("cello_start_agent", { name: "solo" });
+    await c.send("cello_use_agent", { name: "solo" });
+
+    const res = (await c.send("cello_list_sessions", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(res["agent_selection"], "an explicit selection is not a fallback").toBeUndefined();
+    expect(res["acting_as"]).toBeUndefined();
+  }, 30_000);
 });

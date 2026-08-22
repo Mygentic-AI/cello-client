@@ -57,6 +57,8 @@ export interface IpcServer {
   stop(): Promise<void>;
   getConnectionCount(): number;
   onDisconnect(handler: IpcDisconnectHandler): void;
+  /** DOD-M15-SELECTION-1: annotate a response whose agent came from the sole-online fallback. */
+  setFallbackNoticeSource(fn: (connectionId: string) => Record<string, unknown> | undefined): void;
   /** Write a notification to a specific connection. Returns false on write failure. */
   sendNotification(connectionId: string, notification: IpcNotification): boolean;
   /** Return all active connection IDs. */
@@ -114,6 +116,11 @@ export function createIpcServer(
     return current.dev === createdSocket.dev && current.ino === createdSocket.ino ? "ours" : "foreign";
   }
   let disconnectHandler: IpcDisconnectHandler | null = null;
+  /**
+   * Set by the daemon. Returns the fallback notice for a connection's LAST resolution and clears it,
+   * so it rides exactly one response — the one whose call actually used it.
+   */
+  let takeFallbackNotice: ((connectionId: string) => Record<string, unknown> | undefined) | null = null;
 
   function handleConnection(socket: Socket): void {
     if (stopping) {
@@ -236,7 +243,32 @@ export function createIpcServer(
     Promise.resolve(handler(request.params, conn.id))
       .then((result) => {
         try {
-          const resp: IpcResponse = { id: request.id, result };
+          /**
+           * A FALLBACK SELECTION IS SAID OUT LOUD — `DOD-M15-SELECTION-1` clause 2.
+           *
+           * *"If a fallback is wanted it is EXPLICIT in the response, not announced as an
+           * accomplished fact."*
+           *
+           * Applied HERE because this is the one place every response passes through. Threading it
+           * into the ~16 handlers that resolve an agent would work today and be forgotten by the
+           * seventeenth — the same shape as the refusal reasons that were open-coded per call site
+           * until one of them did a quarter of what the others did.
+           *
+           * WHY IT MATTERS, from the diagnosis rather than from the line's wording: with one agent
+           * online the fallback does not pick the WRONG agent, it picks the only one there is. The
+           * harm is the HALF-ATTENDED state — the call resolves and works, and doorbells never
+           * arrive, because the fallback answers "which agent is this call about" and never
+           * registers attendance. An operator reads that as the protocol dropping messages.
+           *
+           * Only on the fallback path. A notice on every response would fire on the ordinary case,
+           * which is not a signal.
+           */
+          const notice = takeFallbackNotice?.(conn.id);
+          const annotated =
+            notice && result !== null && typeof result === "object" && !Array.isArray(result)
+              ? { ...(result as Record<string, unknown>), ...notice }
+              : result;
+          const resp: IpcResponse = { id: request.id, result: annotated };
           conn.socket.write(JSON.stringify(resp) + "\n");
         } catch {
           // Socket closed before response could be written
@@ -384,6 +416,9 @@ export function createIpcServer(
       return connections.size;
     },
 
+    setFallbackNoticeSource(fn: (connectionId: string) => Record<string, unknown> | undefined): void {
+      takeFallbackNotice = fn;
+    },
     onDisconnect(handler: IpcDisconnectHandler): void {
       disconnectHandler = handler;
     },
