@@ -282,6 +282,37 @@ describe("daemon", () => {
     expect(shutdownDisconnect).toBeDefined();
   });
 
+  it("DOD-M15-IPCVISIBLE-1: `selected` is annotated as THIS connection's view", async () => {
+    /**
+     * Clause 3, and the reason it is an annotation rather than a rename: every `cello` CLI
+     * invocation opens a FRESH connection with no current agent, so a client asking about its own
+     * state always read `selected: false` for an agent it genuinely had selected elsewhere. Both
+     * Andre and a Hermes agent misread it during one investigation, in opposite directions.
+     *
+     * The name cannot change without breaking every reader, so a sibling says whose view it is and
+     * `attended_by` answers the question people were actually asking.
+     */
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connectToDaemon(config.socketPath);
+    await client.send("ipc.connect", { clientType: "cli" });
+
+    const res = (await client.send("cello_list_agents", {})) as {
+      agents?: Array<Record<string, unknown>>;
+    };
+    client.close();
+
+    const rows = res.agents ?? [];
+    for (const row of rows) {
+      expect(
+        row["selected_by_this_connection"],
+        "`selected` must be annotated as connection-scoped, or a fresh CLI connection reads false " +
+          "for an agent it has selected in another session",
+      ).toBe(row["selected"]);
+      expect(typeof row["attended_by"], "how many connections hold this agent at all").toBe("number");
+    }
+  });
+
   it("DOD-M15-IPCVISIBLE-1: the disconnect line carries WHO was attending, in ONE line", async () => {
     /**
      * Neither half of this had a test — review, and both failed the revert test: deleting the

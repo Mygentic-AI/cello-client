@@ -2002,7 +2002,21 @@ async function startDaemonHoldingLock(
         return {
           name: a.name,
           state,
+          /**
+           * `selected` IS THIS CONNECTION'S VIEW, NOT THE AGENT'S — `DOD-M15-IPCVISIBLE-1` clause 3.
+           *
+           * Every `cello` CLI invocation opens a FRESH connection, which starts with no current
+           * agent. So a client asking about its own state through the CLI always reads `false`, for
+           * an agent it genuinely has selected in another session. Both Andre and a Hermes agent
+           * misread it that way during one investigation, in opposite directions.
+           *
+           * The field name cannot be changed without breaking every reader, so it is ANNOTATED: the
+           * sibling below says whose view this is, and `attended_by` says how many connections hold
+           * this agent at all — which is the question people were actually asking.
+           */
           selected,
+          selected_by_this_connection: selected,
+          attended_by: countAttendance(perConnectionState, a.name),
           pubkey: a.pubkey,
           // M8B F14 (fix 5): per-agent standing-receiver readiness on the MCP surface
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
