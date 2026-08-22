@@ -57,7 +57,23 @@ export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
  * ENUMERATED, never pattern-matched. A substring rule like `reason.includes("sealed")` would absorb
  * a future reason nobody has considered — which is the same collapse in a new coat.
  */
-export const TERMINAL_RELAY_REFUSALS: ReadonlySet<string> = new Set(["session_sealed", "session_not_found"]);
+export const TERMINAL_RELAY_REFUSALS: ReadonlySet<string> = new Set([
+  "session_sealed",
+  "session_not_found",
+  /**
+   * `DOD-M15-TERMINAL-REASON-1` split `session_sealed` into named causes, and this set is one of
+   * THREE places keyed on the old literal — a rename on the relay silently made a terminal refusal
+   * non-terminal here, which is the 68-minute defect above reopened by a string change.
+   *
+   * `seal_refused`: a directory READ the seal and rejected it. Terminal in the strongest sense —
+   * there is no later, and no retry can change a merits verdict.
+   *
+   * `seal_in_progress` is deliberately ABSENT. A seal in flight may still succeed, and after
+   * `DOD-M15-TRANSPORT-TERMINAL-1` the session can return to `active` — treating it as terminal
+   * would retire a conversation that is about to seal normally.
+   */
+  "seal_refused",
+]);
 
 /** True when the relay has ended this session and no later submit can succeed. */
 export function isTerminalRelayRefusal(reason: string | undefined): boolean {

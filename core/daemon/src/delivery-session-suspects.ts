@@ -39,6 +39,11 @@ export const TERMINAL_ISH_REFUSALS: ReadonlySet<string> = new Set([
   "session_sealed",
   "session_not_found",
   "relay_session_gone",
+  // DOD-M15-TERMINAL-REASON-1: the relay now names WHY it ended a session, and this set was keyed
+  // on the old catch-all literal. A merits refusal must count as a suspect here for the same reason
+  // `session_sealed` does — the session is over and a document that keeps being pushed down it is
+  // being pushed at nothing.
+  "seal_refused",
 ]);
 
 /** Consecutive terminal-ish refusals before delivery stops reusing a session. */

@@ -52,7 +52,32 @@ describe("a relay refusal that can never resolve is not treated as a hiccup", ()
     // Enumerated rather than pattern-matched: a substring rule like `reason.includes("sealed")`
     // would silently absorb a future reason nobody has thought about, which is how the original
     // collapse happened.
-    expect([...TERMINAL_RELAY_REFUSALS].sort()).toEqual(["session_not_found", "session_sealed"]);
+    expect([...TERMINAL_RELAY_REFUSALS].sort()).toEqual([
+      "seal_refused",
+      "session_not_found",
+      "session_sealed",
+    ]);
+  });
+
+  it("`seal_refused` is terminal — a directory READ the seal and rejected it", () => {
+    /**
+     * `DOD-M15-TERMINAL-REASON-1` split the relay's catch-all `session_sealed` into named causes,
+     * and this set was one of THREE keyed on the old literal. The rename alone made a terminal
+     * refusal non-terminal here — reopening the 68-minute defect this file exists to prevent, by
+     * changing a string rather than by touching any logic.
+     *
+     * That is why the set above is asserted EXACTLY: a new relay reason that nobody adds here is
+     * silently treated as transient, and "transient" means the conversation keeps running against a
+     * chain that has stopped growing.
+     */
+    expect(isTerminalRelayRefusal("seal_refused")).toBe(true);
+  });
+
+  it("`seal_in_progress` is NOT terminal — a seal in flight may still succeed", () => {
+    // The counterexample, and it matters more since DOD-M15-TRANSPORT-TERMINAL-1: a session can
+    // now leave `sealing` and return to `active`. Retiring on this would kill a conversation that
+    // is about to seal normally.
+    expect(isTerminalRelayRefusal("seal_in_progress")).toBe(false);
   });
 
   it("`session_sealed` is terminal — the relay has closed the session and will never witness again", () => {

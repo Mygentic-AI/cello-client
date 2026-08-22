@@ -787,9 +787,22 @@ export class SessionNodeManager {
   markSessionDiverged(agentName: string, sessionId: string): void {
     this.#diverged.add(this.#k(agentName, sessionId));
     if (!this.#db) return;
+    /**
+     * KEYED ON (agent_id, session_id) — review F3, and the loopback case makes it concrete.
+     *
+     * This was `WHERE session_id = ?` alone. The table's PK is composite for a documented reason
+     * (`DOD-LOOP-1`, on the CREATE TABLE above): **two of one operator's agents can hold both ends
+     * of the SAME session_id on ONE daemon**, so `sessions` holds two rows. Unkeyed, marking one
+     * side diverged marked BOTH, and the clear below wiped BOTH — so side B sealing its half
+     * erased side A's divergence, and after a restart A's seal gate read healthy and signed a close
+     * that could only be refused. The line's own defect, produced by the line's own clear.
+     *
+     * Every other per-session UPDATE in this file keys on both columns; these two were the
+     * exceptions.
+     */
     this.#db
-      .prepare("UPDATE sessions SET diverged_at = ? WHERE session_id = ? AND diverged_at IS NULL")
-      .run(Date.now(), sessionId);
+      .prepare("UPDATE sessions SET diverged_at = ? WHERE agent_id = ? AND session_id = ? AND diverged_at IS NULL")
+      .run(Date.now(), this.#requireAgentId(agentName), sessionId);
   }
 
   /** Whether this session has provably parted from the relay's ordering. */
@@ -5412,6 +5425,26 @@ export class SessionNodeManager {
               // document for a killed conversation, which is a strictly worse bug than the one this
               // unit fixes. It still refuses the send; it just does not reach for the shovel.
               retireSession: (id) => {
+                /**
+                 * `session_sealed` retires as SEALED. `seal_refused` retires as ABANDONED —
+                 * `DOD-M15-TERMINAL-REASON-1`, and the distinction is the whole reason that unit
+                 * exists.
+                 *
+                 * A refused seal has NO certificate: a directory read it and rejected it. Writing
+                 * `sealed` here would be a fabricated notarization claim — `cello_close_session`
+                 * answering "already sealed, view its notarization" while the receipt read answers
+                 * "not sealed yet", which is the two-answers-pointing-at-each-other deadlock
+                 * described above. `abandoned` is the state invented for exactly this:
+                 * locally terminal with nothing to notarize.
+                 */
+                if (witnessed.reason === "seal_refused") {
+                  // `abandonSession`, not a hand-rolled flip-then-teardown: it already does the
+                  // status write synchronously BEFORE the async teardown yields, which is the
+                  // ordering the comment above spends a paragraph on. Reimplementing it here would
+                  // be a second copy of that reasoning, free to drift from the first.
+                  void this.abandonSession(agentName, id);
+                  return;
+                }
                 if (witnessed.reason !== "session_sealed") return;
                 // STATUS FIRST AND SYNCHRONOUS, teardown second — the order `abandonSession` uses,
                 // and for a sharper reason here: `destroySessionNode` returns early at its
@@ -10232,7 +10265,11 @@ export class SessionNodeManager {
       this.#diverged.delete(this.#k(agentName, sessionId));
       // DURABLE too (DOD-M15-DIVERGE-DURABLE-1) — otherwise a sealed session comes back after a
       // restart still carrying a refusal for a close that can no longer happen.
-      this.#db?.prepare("UPDATE sessions SET diverged_at = NULL WHERE session_id = ?").run(sessionId);
+      // (agent_id, session_id) — see markSessionDiverged. Unkeyed, one side sealing cleared the
+      // OTHER side's divergence on a loopback session.
+      this.#db
+        ?.prepare("UPDATE sessions SET diverged_at = NULL WHERE agent_id = ? AND session_id = ?")
+        .run(this.#requireAgentId(agentName), sessionId);
     }
     // THE TERMINAL GUARD LIVES HERE, not in one wrapper, because there are three writers of
     // "sealed": markSealed, destroySessionNode, and retireSession on the witnessed-submit path.

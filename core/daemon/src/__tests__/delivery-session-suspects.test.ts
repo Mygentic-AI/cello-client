@@ -74,8 +74,11 @@ describe("DOD-MP-SESSION-RETIRE-1 — a session that keeps refusing stops being 
     // The whole point of the unit: this string is the one the fully-sealed case answers, and it is
     // handled HERE — where the response is non-destructive — rather than in TERMINAL_RELAY_REFUSALS,
     // where the response would be to destroy local state.
+    // `seal_refused` joined on 2026-08-22 (DOD-M15-TERMINAL-REASON-1), when the relay stopped
+    // answering every ended session with the catch-all `session_sealed`. A document that keeps
+    // being pushed down a refused session is being pushed at nothing, exactly as for the others.
     expect([...TERMINAL_ISH_REFUSALS].sort()).toEqual(
-      ["relay_session_gone", "session_not_found", "session_sealed"],
+      ["relay_session_gone", "seal_refused", "session_not_found", "session_sealed"],
     );
   });
 

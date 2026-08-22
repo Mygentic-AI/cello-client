@@ -158,6 +158,55 @@ describe("DOD-M15-DIVERGE-DURABLE-1: a restart does not turn diverged into healt
     await mgr.stop?.();
   });
 
+  it("★ TWO AGENTS SHARING ONE session_id — one side's divergence is not the other's", async () => {
+    /**
+     * THE LOOPBACK CASE, and the one the first version of this test missed.
+     *
+     * It used two sessions of the SAME agent, which an unkeyed `WHERE session_id = ?` handles
+     * correctly by accident — so it passed while the real defect sat underneath. The schema's own
+     * comment says why this shape exists: the PK is composite because **two of one operator's
+     * agents can hold both ends of the same session_id on ONE daemon**. That is Andre's daily
+     * setup, not an edge case.
+     *
+     * Unkeyed, marking side A diverged marked BOTH rows, and side B sealing cleared BOTH — so A's
+     * divergence was erased by B's success, and after a restart A read healthy and signed a close
+     * that could only be refused. Review F3.
+     */
+    const shared = "ee".repeat(16);
+    // Seeded through the real helper, not a hand-rolled INSERT: `agents` has NOT NULL columns
+    // (k_local_seed among them) that a partial insert violates, and reproducing its shape here
+    // would be a second copy of the schema free to drift from the first.
+    const seed = openTestDb(dbPath);
+    const bobId = (await seedAgents(seed, ["bob"])).get("bob")!;
+    seed.close();
+
+    let mgr = await boot();
+    for (const [aid] of [[agentId], [bobId]] as const) {
+      mgr.getDb().prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at,
+                               message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', 1000, 1000, 0, NULL)`,
+      ).run(shared, aid, COUNTERPARTY);
+    }
+
+    mgr.markSessionDiverged(AGENT, shared);
+    expect(mgr.isSessionDiverged(AGENT, shared), "alice's side diverged").toBe(true);
+    expect(mgr.isSessionDiverged("bob", shared), "bob's side did NOT").toBe(false);
+
+    // Bob seals HIS half. Alice's divergence must survive it.
+    mgr.markSealed("bob", shared);
+    await mgr.stop?.();
+
+    mgr = await boot();
+    expect(
+      mgr.isSessionDiverged(AGENT, shared),
+      "Bob sealing his half cleared Alice's divergence. Both ends share the session_id on this " +
+        "daemon, so an unkeyed UPDATE writes and wipes BOTH rows — and after a restart Alice's " +
+        "seal gate reads healthy on a session that provably cannot seal.",
+    ).toBe(true);
+    await mgr.stop?.();
+  });
+
   it("divergence is scoped to ITS session — one diverged conversation does not condemn another", async () => {
     const other = "dd".repeat(16);
     let mgr = await boot();

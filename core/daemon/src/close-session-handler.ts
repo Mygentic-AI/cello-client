@@ -257,6 +257,13 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     "seal_unilateral_timeout",
     "session_seal_already_pending",
     "session_sealed",
+    /**
+     * DOD-M15-TERMINAL-REASON-1. Without this, a close on a session the relay REFUSED skips
+     * `pullSealCertificate` entirely — the one probe that distinguishes "never sealed" from "sealed
+     * and you were never told". Losing it here is how a close ends with no receipt and no
+     * explanation of why.
+     */
+    "seal_refused",
     "relay_session_gone",
   ]);
 
