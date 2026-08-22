@@ -104,6 +104,7 @@ import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
+import { REFUSAL_REASONS, CAPACITY_REASONS, type AnyRefusalReason } from "./refusal-reasons.js";
 import { revocabilityOf } from "./signal-revocability.js";
 import { registerAgentHandlers } from "./agent-handlers.js";
 import { registerRegisterHandler } from "./register-handler.js";
@@ -3671,7 +3672,24 @@ async function startDaemonHoldingLock(
     const agentName = params?.agentName as string | undefined;
     const sessionId = params?.sessionId as string | undefined;
     if (!agentName || !sessionId) return { error: "missing_params", guidance: "Provide agentName and sessionId." };
-    recordRefusal(agentName, sessionId, (params?.counterpartyPubkey as string) ?? "", (params?.reason as string) ?? "test");
+    // The reason is VALIDATED against the closed union rather than cast through it. A test seam
+    // that can inject a reason production cannot produce would let a test prove the inbox handles a
+    // code no refusal path emits — which is the shape DOD-M15-GUARD-HEARD-1 exists to remove, and a
+    // seam is not exempt from it.
+    const asked = (params?.reason as string) ?? CAPACITY_REASONS.ABUSE_BOUND_SESSIONS_PER_SENDER;
+    const known: readonly string[] = [
+      ...Object.values(REFUSAL_REASONS),
+      ...Object.values(CAPACITY_REASONS),
+    ];
+    if (!known.includes(asked)) {
+      return {
+        error: "unknown_refusal_reason",
+        guidance:
+          `"${asked}" is not a reason any refusal path can emit. Use one of: ${known.join(", ")}. ` +
+          `Seeding an invented reason would test the inbox against a code production never produces.`,
+      };
+    }
+    recordRefusal(agentName, sessionId, (params?.counterpartyPubkey as string) ?? "", asked as AnyRefusalReason);
     return { ok: true };
   });
 

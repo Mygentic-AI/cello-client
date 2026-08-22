@@ -216,8 +216,17 @@ describe("DOD-M12B-INBOX-TRUTH-1: the inbox does not report accepted sessions as
     // An ended-unread row, which is what selects the OTHER return branch.
     await client.send("__test_insert_session_row", { agentName: "alice", sessionId: ended, status: "sealed" });
     snm.recordTranscriptMessage("alice", ended, 0, "received", new TextEncoder().encode("unread"), "seed");
+    /**
+     * A REAL reason, not an invented one.
+     *
+     * This seeded `"sender_cap"`, which no refusal path emits — the test seam took a free-form
+     * string, so it could prove the inbox handles a code production never produces.
+     * `DOD-M15-GUARD-HEARD-1` closed the union and the seam now validates against it, so this had
+     * to become a reason that actually exists. It is the capacity bound this test is about.
+     */
     await client.send("__test_record_refusal", {
-      agentName: "alice", sessionId: refused, counterpartyPubkey: "cp", reason: "sender_cap",
+      agentName: "alice", sessionId: refused, counterpartyPubkey: "cp",
+      reason: "abuse_bound_sessions_per_sender",
     });
 
     const box = (await inboxFor(client, "alice")) as unknown as Record<string, unknown>;

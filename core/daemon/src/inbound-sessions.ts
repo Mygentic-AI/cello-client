@@ -23,7 +23,7 @@ import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { verifyInboundAssignment } from "./assignment-verify.js";
-import { REFUSAL_REASONS } from "./refusal-reasons.js";
+import { REFUSAL_REASONS, type RefusalReason, type AnyRefusalReason } from "./refusal-reasons.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import { TIER } from "./contacts-tier-migration.js";
@@ -576,7 +576,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     agentName: string;
     sessionIdHex: string;
     counterpartyPubkeyHex: string;
-    reason: string;
+    reason: RefusalReason;
     offeredDialer: string | null;
     /** What the counterparty is told, if their tier earns a reason. */
     counterpartyGuidance: string;
@@ -616,7 +616,16 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     }
   }
 
-  function recordRefusal(agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string, reason: string): void {
+  /**
+   * `reason` is a CLOSED union, not `string` — see `AnyRefusalReason`. A review proved that a
+   * free-form code slipped past every test in the milestone's own guard file.
+   */
+  function recordRefusal(
+    agentName: string,
+    sessionIdHex: string,
+    counterpartyPubkeyHex: string,
+    reason: AnyRefusalReason,
+  ): void {
     const list = refusedSessionRequests.get(agentName) ?? [];
     list.push({ sessionIdHex, counterpartyPubkeyHex, reason, refusedAt: Date.now() });
     refusedSessionRequests.set(agentName, list.slice(-REFUSED_SESSION_REQUESTS_CAP));
@@ -1611,6 +1620,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     handleTrustSignalPickup,
     enqueueInboundSession,
     recordRefusal,
+    // Exposed alongside recordRefusal because it is the SHARED refusal path — the one that reaches
+    // all three audiences. DOD-M15-GUARD-HEARD-1 enumerates over it, so a reason added later is
+    // covered without anyone remembering to write a test for its call site.
+    refuseInboundSession,
     reapExpiredInboundSessions,
     inboundSessionQueues,
     inboundSessionWaiters,

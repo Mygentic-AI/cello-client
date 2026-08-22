@@ -19,6 +19,7 @@
 // the thin varargs surface; `openEncryptedDatabase` opens with a PRAGMA key and `resolveDbKey`
 // manages the single plaintext key file.
 import { wireContentHash } from "./wire-content-hash.js";
+import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -2444,7 +2445,10 @@ export class SessionNodeManager {
    *  global anti-swarm cap then applies ONLY to UNKNOWN-tier senders (KNOWN+ are trusted, not part of
    *  the stranger pool; BLOCKED never reaches it). Checked BEFORE accepting a fresh inbound session
    *  (counts reflect sessions already active, not yet counting this one). */
-  checkUnknownSenderAcceptanceBound(agentName: string, counterpartyPubkey: string): { ok: true } | { ok: false; reason: string } {
+  checkUnknownSenderAcceptanceBound(
+    agentName: string,
+    counterpartyPubkey: string,
+  ): { ok: true } | { ok: false; reason: CapacityReason } {
     const tier = this.getTier(agentName, counterpartyPubkey);
     const perSenderCap = this.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
@@ -2453,14 +2457,14 @@ export class SessionNodeManager {
       // over-cap UNKNOWN must be indistinguishable, or the refusal tells someone they are blocked.
       // The operator's alarm needs numbers, so it asks for them SEPARATELY via capDiagnostics;
       // hanging them off this object would put a distinguishing oracle in the return value.
-      return { ok: false, reason: "abuse_bound_sessions_per_sender" };
+      return { ok: false, reason: CAPACITY_REASONS.ABUSE_BOUND_SESSIONS_PER_SENDER };
     }
     // The global stranger cap is only for the UNKNOWN pool. A KNOWN+ sender is past it by trust;
     // a BLOCKED sender was already refused above (cap 0).
     if (tier === TIER.UNKNOWN) {
       const globalUnknown = this.countActiveSessionsFromUnknownSenders(agentName);
       if (globalUnknown >= ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL) {
-        return { ok: false, reason: "abuse_bound_unknown_sessions_global" };
+        return { ok: false, reason: CAPACITY_REASONS.ABUSE_BOUND_UNKNOWN_SESSIONS_GLOBAL };
       }
     }
     return { ok: true };

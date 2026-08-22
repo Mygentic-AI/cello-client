@@ -39,6 +39,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerNotificationHandlers, type NotificationHandlerDeps } from "../notification-handlers.js";
 import { REFUSAL_REASONS, REFUSAL_GUIDANCE, type RefusalReason } from "../refusal-reasons.js";
+import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
+import { TIER } from "../contacts-tier-migration.js";
 import type { IpcHandler } from "../ipc-server.js";
 import type { Logger } from "../types.js";
 
@@ -57,7 +59,10 @@ interface RefusedRow { sessionIdHex: string; counterpartyPubkeyHex: string; reas
  * section of the response, and a stub that returned plausible content elsewhere would only make a
  * failure harder to read.
  */
-async function inboxFor(reasons: readonly string[]): Promise<Array<Record<string, unknown>>> {
+async function inboxFor(
+  reasons: readonly string[],
+  opts: { endedUnread?: boolean } = {},
+): Promise<Array<Record<string, unknown>>> {
   const handlers = new Map<string, IpcHandler>();
   const refusedSessionRequests = new Map<string, RefusedRow[]>([
     [
@@ -73,7 +78,21 @@ async function inboxFor(reasons: readonly string[]): Promise<Array<Record<string
 
   const sessionNodeManager = {
     getUnreadSummary: () => [],
-    getEndedUnread: () => [],
+    /**
+     * THE OTHER RETURN. `cello_check_notifications` has TWO, and which one runs turns on whether
+     * this is empty (`notification-handlers.ts`). A review measured the cost of only ever exercising
+     * one: leave `refused_session_requests` present on the ended-unread branch but let it build its
+     * rows without the guidance spread, and **24 tests stay green** while every operator who has any
+     * ended-unread history — sealed conversations they have not read, i.e. the normal steady state —
+     * gets bare reason codes on every security refusal.
+     *
+     * That is DOD-M12B-INBOX-TRUTH-1 recurring one field deeper, in the file whose whole subject is
+     * that class. So both branches are driven.
+     */
+    getEndedUnread: () =>
+      opts.endedUnread === true
+        ? [{ session_id: "ff".repeat(16), counterparty_pubkey: "cc".repeat(32), unread_count: 1, status: "sealed" }]
+        : [],
     getRenameNotices: () => [],
     getConsentRequests: () => [],
     listSessions: () => [],
@@ -136,11 +155,50 @@ describe("DOD-M15-GUARD-HEARD-1: every refusal reason reaches the operator's inb
       expect(guidance, `${String(row["reason"])} does not say the refusal was deliberate`).toMatch(
         /refused on purpose/i,
       );
+      // A FLOOR, not the property — kept because it catches a stub left behind by a refactor, and
+      // named as a floor because it cannot express "carries a next step". The three real entries are
+      // 433, 510 and 455 characters, so this constrains nothing in the live range.
       expect(
         guidance.length,
-        `${String(row["reason"])}'s guidance is too short to carry both the cause and a next step`,
+        `${String(row["reason"])}'s guidance is a stub — too short to carry a cause and a next step`,
       ).toBeGreaterThan(120);
+
+      /**
+       * THE ACTUAL PROPERTY. A review cleared the length floor with 154 characters of
+       * "Something went wrong with this session and it was not accepted", twice, plus "Contact
+       * support if needed" — magic phrase present, floor cleared, no verb the reader can perform,
+       * Invariant 4 violated in the same breath.
+       *
+       * An allowlist of REAL affordances instead: a tool this operator can run, or an action they
+       * can take outside CELLO. Prose gets an allowlist; wire names get a denylist.
+       */
+      const AFFORDANCES = [
+        /cello_[a-z_]+/,                       // a tool they can actually call
+        /out of band/i,                        // the one remedy that is deliberately not a tool
+        /do not accept/i,                      // a decision they can make about a counterparty
+        /confirm(ed)? (that )?with them/i,
+      ];
+      expect(
+        AFFORDANCES.some((re) => re.test(guidance)),
+        `${String(row["reason"])}'s guidance names nothing the operator can DO. It says what ` +
+          `happened and stops. Name a tool (cello_*), or an action outside CELLO ("confirm out of ` +
+          `band"), or a decision they can take ("do not accept a session from them until…").`,
+      ).toBe(true);
     }
+  });
+
+  it("guidance survives the OTHER inbox branch — the one an operator with unread history gets", async () => {
+    // H2. `cello_check_notifications` has two returns and this is the one taken whenever the agent
+    // has ended-unread sessions, which is the ordinary steady state rather than an edge case.
+    const rows = await inboxFor(ALL_REASONS, { endedUnread: true });
+    expect(rows.length, "the refused list must survive the ended-unread branch").toBe(ALL_REASONS.length);
+    const bare = rows.filter((r) => typeof r["guidance"] !== "string").map((r) => String(r["reason"]));
+    expect(
+      bare,
+      `On the ended-unread branch these arrive as bare codes: ${bare.join(", ")}. The presence of ` +
+        `the LIST on this branch is pinned by DOD-M12B-INBOX-TRUTH-1; the guidance on its rows was ` +
+        `not, and a branch that builds its own row objects can drop it with every test green.`,
+    ).toEqual([]);
   });
 
   it("names no verb the READER cannot perform — the reader is the responder's operator", async () => {
@@ -154,12 +212,32 @@ describe("DOD-M15-GUARD-HEARD-1: every refusal reason reaches the operator's inb
      */
     for (const row of await inboxFor(ALL_REASONS)) {
       const guidance = String(row["guidance"]);
+      /**
+       * SENTENCE-SCOPED, because the first version was not and one reason was already exempt.
+       *
+       * It tested the whole string for "retry" and then excused it if the whole string ALSO
+       * contained "nothing for you to retry" — a phrase `inbound_assignment_invalid` legitimately
+       * contains. So that reason was permanently exempt from the rule in the committed tree: a
+       * review prefixed it with "Retry now to reach a different directory node." and got 8/8 green,
+       * while the identical edit to a sibling went red. The check worked only where it was not
+       * needed.
+       *
+       * The natural way this happens is a copy-paste: that exact sentence exists verbatim in the
+       * LOG guidance for the same refusal, where it is correct, because the log is also read by
+       * whoever is debugging rather than by the refused party.
+       */
+      const offending = guidance
+        .split(/(?<=\.)\s+/)
+        .filter((sentence) => /\bretry\b/i.test(sentence))
+        .filter((sentence) => !/\b(no|nothing|cannot|can't|not)\b/i.test(sentence));
       expect(
-        /\bretry\b/i.test(guidance) && !/cannot retry|nothing for you to retry/i.test(guidance),
-        `${String(row["reason"])} tells the RESPONDER's operator to retry. They did not initiate ` +
-          `this session and hold nothing to retry — put that advice in the session_refused frame ` +
-          `instead, which reaches the side that can use it.`,
-      ).toBe(false);
+        offending,
+        `${String(row["reason"])} tells the RESPONDER's operator to retry, in: ` +
+          `"${offending.join(" ")}". They did not initiate this session and hold nothing to retry — ` +
+          `put that advice in the session_refused frame instead, which reaches the side that can ` +
+          `use it. A sentence NEGATING retry ("there is nothing for you to retry") is fine and is ` +
+          `why this reads one sentence at a time rather than the whole paragraph.`,
+      ).toEqual([]);
     }
   });
 
@@ -169,7 +247,12 @@ describe("DOD-M15-GUARD-HEARD-1: every refusal reason reaches the operator's inb
     // wrong next step costs more than a bare code, because the operator acts on it.
     const rows = await inboxFor(["some_bound_that_speaks_for_itself"]);
     expect(rows).toHaveLength(1);
-    expect(rows[0]["guidance"]).toBeUndefined();
+    expect(
+      rows[0]["guidance"],
+      `A reason with no entry in REFUSAL_GUIDANCE received guidance anyway, which means something ` +
+        `is supplying a default. A generic next step attached to a refusal nobody wrote it for is ` +
+        `worse than a bare code: the operator ACTS on it. Leave it absent.`,
+    ).toBeUndefined();
     expect(rows[0]["reason"]).toBe("some_bound_that_speaks_for_itself");
   });
 });
@@ -190,9 +273,16 @@ describe("DOD-M15-GUARD-HEARD-1: no security refusal is recorded with a loose st
      * still reads as coverage — and the tests above would happily prove that a reason no code path
      * can produce reaches the inbox beautifully.
      */
+    // NO `catch { return "" }` here. It silently turned a renamed or split file into an empty
+    // string, so the scan would check two files instead of three and say nothing — masked today
+    // only because all three reasons happen to live in one of them.
     const sources = ["inbound-sessions.ts", "session-node-manager.ts", "outbound-sessions.ts"]
       .map((f) => {
-        try { return readFileSync(join(SRC, f), "utf8"); } catch { return ""; }
+        const text = readFileSync(join(SRC, f), "utf8");
+        expect(text.length, `${f} is empty — the emitter scan would silently check less`).toBeGreaterThan(0);
+        // Comments do not emit. A commented-out reference used to satisfy this scan, so a real
+        // emission could be replaced by a bare literal with the old line left as a `// was: …` note.
+        return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
       })
       .join("\n");
 
@@ -226,5 +316,132 @@ describe("DOD-M15-GUARD-HEARD-1: no security refusal is recorded with a loose st
         `Use REFUSAL_REASONS.<MEMBER> so a rename is a compile error rather than a silently missed ` +
         `guidance lookup.`,
     ).toEqual([]);
+  });
+});
+
+/**
+ * Drive the REAL shared refusal path for one reason, and capture every audience it reaches.
+ *
+ * `refuseInboundSession` rather than an injected frame: the point is to enumerate over REASONS, and
+ * constructing a frame that provokes each specific refusal would tie the enumeration back to the
+ * call sites it exists to be independent of.
+ */
+async function refusalHarness(
+  reason: string,
+  opts: { tier?: number } = {},
+): Promise<{ durable: Array<{ reason: string }>; sent: Array<Record<string, unknown>> }> {
+  const durable: Array<{ reason: string }> = [];
+  const sent: Array<Record<string, unknown>> = [];
+
+  const sessionNodeManager = {
+    getOfferedDialer: () => null,
+    clearOfferedDialer: () => {},
+    revokeOfferedDialer: async () => {},
+    recordRefusedSession: (_a: string, _s: string, r: string) => { durable.push({ reason: r }); },
+    getTier: () => opts.tier ?? TIER.KNOWN,
+    resolveTierBound: () => 3,
+    getPinnedCounterpartyPrimary: () => null,
+    getSessionRecord: () => undefined,
+    getStandingReceiverReady: () => true,
+  };
+
+  const api = createInboundSessions({
+    logger: silent,
+    sessionNodeManager,
+    agents: [{ name: AGENT, pubkey: "bb".repeat(32) }],
+    sharedSignaling: { registerInboundHandler: () => () => {} },
+    sendOver: async (_agent: string, frame: Record<string, unknown>) => { sent.push(frame); return { ok: true }; },
+    isExplicitlyOffline: () => false,
+    getConnState: () => undefined,
+    resolveCurrentAgent: () => AGENT,
+    NO_CURRENT_AGENT_RESPONSE: {},
+    getKeyProvider: () => undefined,
+    handleInboundSealInterruptedRequest: async () => {},
+    reapDeadHalfOpenSessions: () => {},
+    sendAwayResponse: async () => {},
+    dispatchSessionStateChangedWithTelegram: () => {},
+    sendTelegramDoorbell: async () => {},
+    isDeliveryOpenToAgent: () => false,
+  } as unknown as InboundSessionDeps);
+
+  api.refuseInboundSession({
+    agentName: AGENT,
+    sessionIdHex: "ab".repeat(16),
+    counterpartyPubkeyHex: "aa".repeat(32),
+    reason,
+    offeredDialer: null,
+    counterpartyGuidance:
+      REFUSAL_GUIDANCE[reason as RefusalReason] ?? "no guidance was supplied for this reason",
+    correlationId: "corr-1",
+  });
+  // sendOver is awaited inside a floating promise; let it settle.
+  await new Promise((r) => setImmediate(r));
+  return { durable, sent };
+}
+
+describe("DOD-M15-GUARD-HEARD-1: all THREE audiences, enumerated over the reasons", () => {
+  /**
+   * ─── Why this exists when `dod-m15-offer-signed-1.test.ts` already covers the same property ───
+   *
+   * It covers it PER CALL SITE. Delete the durable row or the `session_refused` send and three of
+   * its tests go red, so the property genuinely holds today — I checked rather than assumed.
+   *
+   * But the DoD line asked for something different, and the difference is the entire reason the
+   * line exists:
+   *
+   *   > an enumeration over the refusal reason codes asserting each one reaches the operator
+   *   > surface AND, where a counterparty is involved, THE WIRE.
+   *
+   * A per-site test covers the sites that exist. The failure mode this line is named for is the
+   * NEXT site — the fifth occurrence, written by someone who copies the shortest nearby example,
+   * which is exactly how the two security refusals came to do one of the four things the cap
+   * refusal does. Enumerating over the reasons means a new reason arrives already covered.
+   *
+   * The three audiences, and what losing each one costs:
+   *
+   *   1. the operator's inbox — a refusal they never see is indistinguishable from the session
+   *      never arriving
+   *   2. the DURABLE row — content the initiator already parked re-pulls forever without it (the
+   *      78-times-per-message loop), and the in-memory list dies with the process
+   *   3. the WIRE — otherwise the counterparty sees a transport-shaped failure naming nothing that
+   *      is wrong, and reports that CELLO is broken while this side holds a precise finding
+   */
+  it("every SECURITY reason reaches the durable store and the counterparty, not just the inbox", async () => {
+    for (const reason of ALL_REASONS) {
+      const h = await refusalHarness(reason);
+
+      expect(
+        h.durable.map((d) => d.reason),
+        `${reason} left no durable row. The initiator held a valid assignment and will have parked ` +
+          `content for this session; with no refused-session row the drain re-pulls it forever, and ` +
+          `the in-memory record dies with the daemon — so the most serious thing this path detects ` +
+          `would be more perishable than a routine capacity refusal.`,
+      ).toContain(reason);
+
+      const frame = h.sent.find((f) => f["type"] === "session_refused");
+      expect(
+        frame,
+        `${reason} told the counterparty nothing. They dialled an assignment their directory called ` +
+          `valid, hit a shut gate, and see only a transport failure naming nothing that is wrong.`,
+      ).toBeDefined();
+      expect(frame?.["reason"]).toBe(reason);
+      expect(
+        String(frame?.["guidance"]).length,
+        `${reason}'s wire guidance is empty — the frame arrives naming a code they cannot look up`,
+      ).toBeGreaterThan(80);
+    }
+  });
+
+  it("a STRANGER is still told nothing — the oracle rule survives this enumeration", async () => {
+    // The counterexample that stops the test above being satisfied by telling everyone everything.
+    // UNKNOWN and BLOCKED get silence on purpose: a stranger learns nothing, and a blocked party
+    // cannot tell blocking from a refusal. Only KNOWN+ earn a reason, and an identity-change
+    // refusal is by definition a repeat counterparty.
+    const h = await refusalHarness(REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED, { tier: TIER.UNKNOWN });
+    expect(h.durable.length, "the durable record is kept regardless of tier").toBe(1);
+    expect(
+      h.sent.find((f) => f["type"] === "session_refused"),
+      "a stranger must not be told why they were refused — that is a blocking oracle",
+    ).toBeUndefined();
   });
 });
