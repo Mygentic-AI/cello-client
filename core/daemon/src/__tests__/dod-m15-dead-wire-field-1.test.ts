@@ -98,6 +98,54 @@ describe("DOD-M15-DEAD-WIRE-FIELD-1: a field with no consumers cannot refuse a s
     expect(parsed!.participant_a.multiaddrs).toEqual([]);
   });
 
+  it("★ an EMPTY participant peer_id no longer refuses the whole assignment", () => {
+    /**
+     * THE SAME DEFECT, ONE LINE ABOVE — and strictly worse, because the directory PRODUCES the
+     * killing value from two explicit defaults rather than needing a bug to generate it:
+     *
+     *   `directory-node.ts:2049`  on AUTH, seeds `#peerInfo[pubkey] = { peer_id: "", multiaddrs: [] }`
+     *   `directory-node.ts:3867`  `?? { peer_id: "", multiaddrs: [] }` when the map misses
+     *
+     * and `:4120` copies whichever it got straight into `participant_a/b`. Nothing gates it: the
+     * only announce requirement checks the INITIATOR announced — the TARGET never has to.
+     *
+     * So: agent B authenticates, its peer-info announce is late or never sent, A opens a session,
+     * the directory FROST-signs a perfectly valid assignment and pushes it to both sides — and both
+     * clients refuse it over an empty string in a field neither one reads. Two healthy agents, a
+     * valid threshold signature, conversation dead.
+     *
+     * `peer_id` satisfies every clause of this DoD line: unread (the only reads are the directory's
+     * own encoder), covered by no signature, and it refused the whole assignment.
+     */
+    const a = assignment();
+    (a["participant_b"] as Record<string, unknown>)["peer_id"] = "";
+    const parsed = parseSessionAssignment(a);
+    expect(
+      parsed,
+      "A valid, FROST-signed assignment was refused because the directory defaulted a peer_id to " +
+        "the empty string — a field nothing reads and no signature covers. Both agents are healthy " +
+        "and the conversation dies.",
+    ).not.toBeNull();
+    expect(parsed!.participant_b.peer_id).toBe("");
+  });
+
+  it("a MISSING participant peer_id parses too, and yields the empty string", () => {
+    // Same disposition for absent as for empty — there is no third meaning for a value nobody reads.
+    const a = assignment();
+    delete (a["participant_a"] as Record<string, unknown>)["peer_id"];
+    const parsed = parseSessionAssignment(a);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.participant_a.peer_id).toBe("");
+  });
+
+  it("the RELAY endpoint's peer_id stays STRICT — it is dialed", () => {
+    // The same line as for multiaddrs: the relay's peer id is what a session is dialed at, so an
+    // empty one is a session that cannot connect and is worth refusing at the boundary.
+    const a = assignment();
+    (a["relay_endpoint"] as Record<string, unknown>)["peer_id"] = "";
+    expect(parseSessionAssignment(a), "an empty RELAY peer_id must still refuse").toBeNull();
+  });
+
   it("the RELAY endpoint's multiaddrs stays STRICT — those are dialed", () => {
     /**
      * The line this must not cross. `parseEndpointInfo` reads an identically-named field on the

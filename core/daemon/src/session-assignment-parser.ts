@@ -46,8 +46,23 @@ function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-ty
   const r = raw as Record<string, unknown>;
   const pubkey = toU8Safe(r["pubkey"]);
   if (!pubkey || pubkey.length !== 32) return null;
-  const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : null;
-  if (!peerId) return null;
+  /**
+   * `peer_id` IS TOLERATED TOO, and it is the WORSE of the two.
+   *
+   * Same three properties as `multiaddrs` below — unread (the only reads anywhere are the
+   * directory's own encoder), covered by no signature, and it refused the entire assignment. But
+   * the killing value is not a bug's output, it is a DEFAULT the directory writes on purpose:
+   * `directory-node.ts:2049` seeds `{ peer_id: "", multiaddrs: [] }` on auth, and `:3867` uses the
+   * same object when the peer-info map misses. `:4120` copies whichever it got into
+   * `participant_a/b`, and nothing gates it — the only announce requirement checks the INITIATOR,
+   * never the TARGET.
+   *
+   * So an agent whose peer-info announce is late or absent could not be talked to at all: the
+   * directory FROST-signs a valid assignment, both clients parse it, both refuse over an empty
+   * string neither one reads, and the operator is told the assignment was "missing or malformed"
+   * when it was neither.
+   */
+  const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : "";
   /**
    * `multiaddrs` IS TOLERATED, NOT VALIDATED — `DOD-M15-DEAD-WIRE-FIELD-1`.
    *
