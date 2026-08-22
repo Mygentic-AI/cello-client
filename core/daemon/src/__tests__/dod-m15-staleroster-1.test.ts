@@ -75,9 +75,11 @@ describe("DOD-M15-STALEROSTER-1: classifying the age of a reading", () => {
 
   it("★ never measured is its OWN kind — it is not 'fresh and clean'", () => {
     /**
-     * The half that is easy to miss. `verifyStartupManifest` returns without sweeping on four
-     * paths, including an EXPIRED manifest. With no reading at all, treating the empty failure list
-     * as health tells an operator their directory is fine when the daemon has never once looked.
+     * The half that is easy to miss: with no reading at all, treating the empty failure list as
+     * health tells an operator their directory is fine when the daemon has never once looked.
+     *
+     * (This comment used to say an EXPIRED manifest reaches here. It does not — that daemon refuses
+     * to start. See the file header.)
      */
     expect(classifyRosterReading(null, NOW).kind).toBe("never_measured");
   });
@@ -448,5 +450,71 @@ describe("DOD-M15-STALEROSTER-1: the daemon actually STARTS the sweep", () => {
       "the sweep ran but the reading did not move — cello_status is still answering from the boot " +
         "measurement, which is what 'frozen' means",
     ).not.toBe(beforeAt);
+  }, 30_000);
+});
+
+describe("DOD-M15-STALEROSTER-1: a slower sweep cannot overwrite a newer reading", () => {
+  /**
+   * Review F6, and the finding my wrong producer/consumer map hid. Believing there was ONE writer
+   * is exactly why I did not ask what happens when two sweeps overlap — and they now do, routinely:
+   * the background sweep uses the patient probe (up to ~16 s) while the failover resolver uses
+   * FAST_PROBE (2 s), on a timer that fires every 90-180 s.
+   *
+   * The write stamped COMPLETION, so whichever finished last won and was labelled "measured now,
+   * 0 seconds old". A slow-but-healthy node flips in and out of the block and every version of it
+   * claims to be current.
+   */
+  it("★ a sweep that STARTED earlier but finished later is discarded for the reading", async () => {
+    const { createConsortiumRouting } = await import("../consortium-bootstrap.js");
+    const events: string[] = [];
+    const logger = {
+      debug: () => {}, info: (e: string) => events.push(e), warn: () => {}, error: () => {},
+    };
+
+    // Node "slow" takes 60ms to answer; "fast" answers immediately. Two overlapping sweeps.
+    const manifest = {
+      version: 1,
+      not_before: new Date(Date.now() - 3_600_000).toISOString(),
+      expires: new Date(Date.now() + 3_600_000).toISOString(),
+      nodes: [{ nodeId: "n1", pubkey: "b".repeat(64), region: "r", provider: "p", endpoint: "http://127.0.0.1:1" }],
+      signatures: [{ officerIndex: 0, signature: "c".repeat(128) }],
+    };
+
+    let delayMs = 0;
+    const routing = createConsortiumRouting({
+      manifestProvider: {
+        loadAndVerify: async () => manifest,
+        getCurrentManifest: () => manifest,
+        updateManifest: () => {},
+      },
+      logger,
+      fetchFn: (async () => {
+        await new Promise((r) => setTimeout(r, delayMs));
+        throw new Error("refused");
+      }) as unknown as typeof fetch,
+    } as never);
+
+    // Sweep A starts first and is SLOW.
+    delayMs = 80;
+    const slow = routing.resolveConsortiumRoster();
+    await new Promise((r) => setTimeout(r, 10));
+    // Sweep B starts later and is FAST — it lands first and its reading is the newer measurement.
+    delayMs = 0;
+    await routing.resolveConsortiumRoster();
+    const afterFast = routing.getUnresolvedSweptAt();
+    await slow;
+    const afterSlow = routing.getUnresolvedSweptAt();
+
+    expect(
+      afterSlow,
+      "the slower sweep -- which began BEFORE the one already recorded -- overwrote the newer " +
+        "reading and stamped it as current, so cello_status reports a measurement older than the " +
+        "one it discarded while claiming it is the freshest available",
+    ).toBe(afterFast);
+    expect(
+      events,
+      "and the discard must be stated, not silent — a sweep whose result went nowhere is exactly " +
+        "the kind of thing that reads as a bug six months later",
+    ).toContain("directory.roster.sweep.superseded");
   }, 30_000);
 });

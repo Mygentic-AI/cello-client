@@ -266,9 +266,39 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   const getUnresolvedNodes = (): NodeResolveFailure[] => [...unresolvedNodes];
   const getUnresolvedSweptAt = (): string | null => unresolvedSweptAt;
 
+  /**
+   * When the reading currently held was STARTED (epoch ms), so a slow sweep cannot overwrite a
+   * newer one — `DOD-M15-STALEROSTER-1` review F6.
+   */
+  let unresolvedStartedAtMs = deps.initialUnresolvedSweptAt ? Date.parse(deps.initialUnresolvedSweptAt) : 0;
+
   const resolveConsortiumRoster = async (budget?: ProbeBudget): Promise<ConsortiumEndpoint[] | null> => {
     const m = manifestProvider?.getCurrentManifest();
-    if (!m) return null;
+    if (!m) {
+      // DOD-M15-STALEROSTER-1 review F13: this returns before the write and used to return before
+      // any log too, so "there is no manifest to probe" was indistinguishable from a clean sweep —
+      // the background sweep would tick forever, succeed every time, and never move the reading.
+      logger.warn("directory.roster.sweep.no_manifest", {
+        impact:
+          "no roster measurement was taken — there is no verified manifest to enumerate nodes from, " +
+          "so cello_status keeps whatever reading it already had.",
+      });
+      return null;
+    }
+    /**
+     * STAMP THE START, NOT THE FINISH — review F6.
+     *
+     * `unresolvedSweptAt = new Date()` after the await recorded when the sweep COMPLETED, and there
+     * is no mutual exclusion between the ten callers. The background sweep uses the patient probe
+     * (up to ~16 s) while the failover resolver uses FAST_PROBE (2 s), so the two overlap routinely:
+     * a slow-but-healthy node is marked unresolved by the fast sweep, the patient sweep finishes
+     * later and resolves it — or the reverse — and whichever lands last is stamped "measured now, 0
+     * seconds old". The operator gets a confidently fresh reading assembled from a race.
+     *
+     * Recording the start time and discarding a completion that began before the reading currently
+     * held makes last-writer-wins into newest-measurement-wins.
+     */
+    const startedAtMs = Date.now();
     const failures: NodeResolveFailure[] = [];
     const endpoints = await manifestNodesToEndpoints(m.nodes, {
       logger,
@@ -276,8 +306,19 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
       onNodeUnresolved: (f) => failures.push(f),
       ...(budget ? { probeBudget: budget } : {}),
     });
-    unresolvedNodes = failures;
-    unresolvedSweptAt = new Date().toISOString();
+    if (startedAtMs >= unresolvedStartedAtMs) {
+      unresolvedNodes = failures;
+      unresolvedSweptAt = new Date(startedAtMs).toISOString();
+      unresolvedStartedAtMs = startedAtMs;
+    } else {
+      // Not an error — a slower sweep that began earlier finished later. Its endpoints are still
+      // returned to ITS caller; only the shared reading is left alone.
+      logger.info("directory.roster.sweep.superseded", {
+        startedAt: new Date(startedAtMs).toISOString(),
+        heldReadingStartedAt: new Date(unresolvedStartedAtMs).toISOString(),
+        impact: "this sweep's result was discarded for the status reading because a newer measurement is already held.",
+      });
+    }
     return endpoints;
   };
 
