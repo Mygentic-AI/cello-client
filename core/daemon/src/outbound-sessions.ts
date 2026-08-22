@@ -512,10 +512,39 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     const roster = await resolveConsortiumRoster();
     const target = roster?.find((e) => e.nodeId === owningNodeId) ?? null;
     if (!target) {
-      // Manifest MISS — the node genuinely isn't in the signed roster. A hard, non-retryable cause
-      // (distinct from a reachable-but-unconnectable node below).
-      logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "discovery_node_unresolvable", correlationId });
-      return { ok: false, reason: "discovery_node_unresolvable", guidance: `The counterparty's home node (${owningNodeId}) is not in the signed consortium manifest. It may have left the consortium.` };
+      /**
+       * DOD-M15-ERRSTRING-1 (review F1) — THIS IS NOT A MANIFEST MISS, and calling it one sent
+       * operators to investigate consortium membership over a lost packet.
+       *
+       * `resolveConsortiumRoster()` returns the REACHABLE subset: `manifestNodesToEndpoints` drops
+       * any node whose `/bootstrap` probe failed. So absence from this list has two very different
+       * causes and this code cannot tell them apart —
+       *   1. our own probe of that node did not answer during the last sweep (the common one, and
+       *      before `DOD-M15-BOOTSTRAP-1` a single lost packet was enough to produce it);
+       *   2. the node genuinely is not in the signed manifest.
+       * The old message asserted (2) unconditionally, in the words "It may have left the
+       * consortium." The comment above it asserted the same thing to the next reader.
+       *
+       * Named for what was observed — it is not in the roster we could reach — with both causes in
+       * the order they actually occur, and the check that separates them.
+       */
+      logger.warn("session.crossnode.failed", {
+        agentName,
+        brokerNode: owningNodeId,
+        reason: "home_node_not_in_reachable_roster",
+        rosterSize: roster?.length ?? 0,
+        correlationId,
+      });
+      return {
+        ok: false,
+        reason: "home_node_not_in_reachable_roster",
+        guidance:
+          `The counterparty's home node (${owningNodeId}) is not in the set of directory nodes this daemon ` +
+          "could reach. Most often that means our own probe of it did not answer, not that it has left the " +
+          "consortium. Run cello_status: if it appears under directory_endpoints_unresolved, the problem is the " +
+          "path from here to it (attempts:1 there means it answered and the answer was unusable; 2 or more means " +
+          "it never answered). Only if it is absent from the manifest altogether has it actually left.",
+      };
     }
     logger.info("session.crossnode.initiated", { agentName, brokerNode: owningNodeId, correlationId });
     const visiting = openVisitingConnection(agentName, agentKeyProvider, agentPubkeyHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, owningNodeId);
@@ -679,7 +708,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           }
           // Online but no owner named — transient, re-discover.
           if (action.kind === "retry") {
-            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: "online_no_owner", correlationId: ctx.correlationId });
+            logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: "online_no_owner", homeNodeId, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             /**
              * DOD-M15-ERRSTRING-1 — NAME WHAT WAS OBSERVED. This returned `counterparty_offline`,
@@ -695,10 +724,11 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
               ok: false,
               reason: "directory_named_no_home",
               guidance:
-                "The directory said this counterparty is online but named no node that holds them, three times. " +
-                "That is a directory-side inconsistency, not the counterparty being offline — there is nothing " +
-                "for them to fix on their side. Retry in a minute; if it repeats, run cello_status to see which " +
-                "directory node you are on, and try again once it has re-synced.",
+                `The directory node you are connected to (${homeNodeId}) says this counterparty is online but names ` +
+                "no node that holds them, three times running. That is a directory-side inconsistency, not the " +
+                "counterparty being offline — there is nothing for them to fix on their side. Retry in a minute; " +
+                "if it repeats, that node's presence data is out of sync and cello_status will show which other " +
+                "directories are available.",
             };
           }
 
@@ -716,11 +746,39 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           if (!result.ok && (result.reason === "target_offline" || result.reason === "visiting_connection_unreachable")) {
             logger.info("session.crossnode.stale_discovery_retry", { agentName: ctx.agentName, attempt, reason: result.reason, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            // Exhausted: keep the truthful transient-connection reason; a stale target_offline surfaces
-            // as counterparty_offline (state 2).
+            /**
+             * DOD-M15-ERRSTRING-1 (review F2) — KEEP THE UPSTREAM OBSERVATION. This branch used to
+             * rewrite `target_offline` into `counterparty_offline`, and that rewrite is the most
+             * likely source of the 2026-08-16 incident.
+             *
+             * What the home node actually reported is `targetStreamFound === false`: it has no live
+             * stream registered for that agent. At least four different conditions produce it, and
+             * only one of them is "the counterparty is offline":
+             *   - their standing receiver's REGISTRATION lapsed on a signaling reconnect — this
+             *     daemon's own notes record 46 of 48 reconnects in one hour leaving every agent
+             *     unregistered, while `cello status`, `agent.online` and the directory's own
+             *     presence table all still showed them healthy;
+             *   - the node garbage-collected the stream;
+             *   - the agent is re-homing between discovery and the request;
+             *   - they really are offline.
+             *
+             * Collapsing all four into "counterparty_offline" tells the operator to go and ask a
+             * person whose side is working, about a registration on OUR side of a stream on the
+             * DIRECTORY's side. Invariant 3 prescribes the fix literally: do not overwrite the
+             * upstream descriptive error.
+             */
             return result.reason === "visiting_connection_unreachable"
               ? { ok: false, reason: "visiting_connection_unreachable", guidance: "The counterparty's home node was reachable at discovery but its visiting connection could not be established after several attempts. Retry shortly." }
-              : { ok: false, reason: "counterparty_offline", guidance: "The counterparty was online at discovery but not reachable at its home node after several attempts (it may be re-homing). Retry shortly." };
+              : {
+                  ok: false,
+                  reason: "home_node_reports_no_receiver",
+                  guidance:
+                    `The counterparty's home node (${action.kind === "cross_node" ? action.owningNodeId : homeNodeId}) reports no live receiver registered for them, ` +
+                    "after several attempts. This is NOT the same as them being offline, and it is most often not their fault: " +
+                    "the commonest cause is their receiver's registration lapsing on a signaling reconnect, which leaves their " +
+                    "own cello_status showing perfectly healthy. Retry in a minute — a re-registration usually clears it. " +
+                    "If it persists, have them restart their agent so it re-registers; only if that fails is their daemon actually down.",
+                };
           }
           return result;
         }

@@ -294,8 +294,29 @@ The daemon only picks an agent for you when it knows exactly ONE. With several a
 **`session_not_current` on send**
 The other side has spoken and you have not read it. The refusal tells you how many messages are waiting. Read them (`cello_receive`, or `cello_transcript` for the whole history), then send again. This is deliberate — you cannot reply to something you never saw.
 
-**`target_offline` on initiate**
-The peer's agent is not online. They need to start it.
+**`counterparty_offline` on initiate**
+The directory says the peer's agent is not online. They need to start it.
+
+**`home_node_reports_no_receiver` on initiate**
+Different from the above, and usually NOT the peer's fault: their home directory node has no live
+receiver registered for them. The commonest cause is that registration lapsing on a signaling
+reconnect, which leaves their own `cello_status` showing perfectly healthy. Retry in a minute; if it
+persists, ask them to restart their agent so it re-registers.
+
+**`directory_named_no_home` on initiate**
+The directory node you are on says the peer is online but names no node holding them — its presence
+data is out of sync. Nothing for the peer to fix. Retry, then check `cello_status` for other
+directories.
+
+**`home_node_not_in_reachable_roster` on initiate**
+This daemon could not reach the peer's home directory node — most often our own probe of it did not
+answer, not that it has left the consortium. Check `cello_status` under
+`directory_endpoints_unresolved`.
+
+**`session_setup_exhausted` on initiate**
+Every attempt failed and the cause was not one the daemon can name — it is deliberately not guessing
+that the peer is offline. Check your OWN directory connection first (`cello_status`); a node below
+threshold or mid-restart looks exactly like this.
 
 **`cello_receive` always times out**
 Check `cello_sessions()` that the session is active. A timeout is a normal answer — the other agent may simply not have sent yet.

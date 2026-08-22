@@ -151,6 +151,35 @@ describe("DOD-M15-ERRSTRING-1: the error names the observation, not a party", ()
     expect(result.reason).toBe("timeout");
   }, 60_000);
 
+  it("does NOT rewrite the home node's 'no receiver' into a claim that the peer is offline", async () => {
+    /**
+     * Review F2, and the reviewer's ruling that this — not the branch I fixed first — is the most
+     * likely source of the 2026-08-16 incident.
+     *
+     * What the home node reports is `targetStreamFound === false`: no live stream registered for
+     * that agent. At least four conditions produce it and only one is "they are offline" — the
+     * commonest being their receiver's REGISTRATION lapsing on a signaling reconnect, which this
+     * daemon's own notes record happening on 46 of 48 reconnects in an hour, while their
+     * `cello_status` stayed green throughout.
+     *
+     * Collapsing that into `counterparty_offline` sends the operator to ask a person whose side is
+     * working about a registration on a stream on the directory's side.
+     */
+    const { negotiator } = negotiatorWith(() => ({
+      type: "discovery_lookup_result",
+      state: "online",
+      owning_node_ids: ["some-other-node"], // cross-node, so the request goes to their home
+    }));
+
+    const result = await negotiate(negotiator);
+
+    expect(result.ok).toBe(false);
+    expect(
+      result.reason,
+      "an unregistered receiver is not the same observation as an offline counterparty",
+    ).not.toBe("counterparty_offline");
+  }, 60_000);
+
   it("REGRESSION: a directory that genuinely says OFFLINE is still quoted, not second-guessed", async () => {
     // The over-correction this unit must not make. `counterparty_offline` is the right answer when
     // the directory actually reported that state — the defect was returning it when it had not.

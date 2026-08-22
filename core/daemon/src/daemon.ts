@@ -3301,7 +3301,11 @@ async function startDaemonHoldingLock(
         // under a minute — a network transition on the operator's machine — and the block went on
         // reporting them unreachable long after they answered again. True when taken, false when read.
         checked_at: getUnresolvedSweptAt(),
-        nodes: failures.map((f) => ({ node: f.nodeId, endpoint: f.endpoint, reason: f.reason, detail: f.detail })),
+        // DOD-M15-BOOTSTRAP-1: `attempts` distinguishes a node that answered definitively (one
+        // probe — a 404, a bad payload, its configuration) from one that never answered at all
+        // (every probe spent — the path to it). Those call for opposite responses, and without the
+        // count they rendered identically here.
+        nodes: failures.map((f) => ({ node: f.nodeId, endpoint: f.endpoint, reason: f.reason, detail: f.detail, attempts: f.attempts })),
         guidance:
           "AS OF checked_at (this is a point-in-time reading, not necessarily now), this daemon could not "
           + "resolve these directory endpoints, so the consortium roster was short and " +
@@ -3311,7 +3315,9 @@ async function startDaemonHoldingLock(
           "If reason is dns_error after a directory restart or wake, the resolver is holding a cached " +
           "negative answer — flush it (macOS: sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder). " +
           "Verify with node -e 'require(\"dns\").lookup(host,console.log)', NOT dig: dig bypasses the " +
-          "cache this daemon is stuck behind, so it reports success while the daemon still fails.",
+          "cache this daemon is stuck behind, so it reports success while the daemon still fails. "
+          + "attempts:1 means the node ANSWERED and the answer was unusable — look at that node. "
+          + "attempts:2+ means it never answered — look at the path to it.",
       },
     };
   }

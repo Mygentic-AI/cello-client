@@ -145,27 +145,63 @@ function classifyFetchError(err: unknown): { reason: BootstrapFailureReason; det
  * so callers can log a `reason` that distinguishes "this machine cannot resolve
  * the name" from "the server is down" from "the payload is wrong".
  */
+export interface ProbeBudget {
+  /** How many probes to spend. */
+  attempts: number;
+  /** Deadline for each probe. */
+  timeoutMs: number;
+  /** Wall-clock ceiling across all probes. */
+  totalMs: number;
+}
+
+/**
+ * The default: persistent. Used where nothing is waiting on the answer — the roster sweep, which
+ * runs its nodes in parallel and would rather spend 16 s than drop a healthy node.
+ */
+export const PERSISTENT_PROBE: ProbeBudget = {
+  attempts: PROBE_ATTEMPTS,
+  timeoutMs: PROBE_TIMEOUT_MS,
+  totalMs: PROBE_TOTAL_BUDGET_MS,
+};
+
+/**
+ * FAIL-FAST, for the reconnect path — review F1, a regression the retry introduced.
+ *
+ * `createDirectoryEndpointResolver` runs on EVERY connect attempt, and the signaling stream turns
+ * over roughly every 70 seconds. Giving that path the persistent budget meant a lossy link could
+ * spend 16 s resolving before falling back to the last-known-good endpoint it already had — and
+ * `outbound-sessions` waits only 10 s for signaling before giving up, so `cello_initiate_session`
+ * would start returning `directory_signaling_timeout` where it used to get a usable endpoint in
+ * time. A resilience fix that breaks the thing it was protecting.
+ *
+ * Two probes at 4 s: still a FRESH CONNECTION for the lost-handshake case this unit is about, and
+ * still inside the 10 s window with room to spare. The persistence belongs where nothing is
+ * blocked on it.
+ */
+export const FAST_PROBE: ProbeBudget = { attempts: 2, timeoutMs: 4_000, totalMs: 9_000 };
+
 export async function fetchBootstrapResult(
   directoryUrl: string,
   fetchFn: typeof fetch = fetch,
   nowMs: () => number = Date.now,
+  budget: ProbeBudget = PERSISTENT_PROBE,
 ): Promise<BootstrapResult> {
   const started = nowMs();
   let last: BootstrapResult = { ok: false, reason: "connect_error", detail: "no attempt was made" };
 
-  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-    last = await probeOnce(directoryUrl, fetchFn);
+  for (let attempt = 1; attempt <= budget.attempts; attempt++) {
+    last = await probeOnce(directoryUrl, fetchFn, budget.timeoutMs);
     if (last.ok) return { ...last, attempts: attempt };
     if (!RETRYABLE.has(last.reason)) return { ...last, attempts: attempt };
 
     // Stop if another full attempt cannot finish inside the budget — better to let the caller move
     // on to the next node than to spend the remainder proving this one is still unreachable.
     const spent = nowMs() - started;
-    if (attempt === PROBE_ATTEMPTS || spent + PROBE_TIMEOUT_MS > PROBE_TOTAL_BUDGET_MS) {
+    if (attempt === budget.attempts || spent + budget.timeoutMs > budget.totalMs) {
       return { ...last, attempts: attempt };
     }
   }
-  return { ...last, attempts: PROBE_ATTEMPTS };
+  return { ...last, attempts: budget.attempts };
 }
 
 /**
@@ -173,10 +209,10 @@ export async function fetchBootstrapResult(
  * connection is the mechanism — each call is a new `fetch`, so a handshake lost in TCP backoff is
  * abandoned rather than waited out.
  */
-async function probeOnce(directoryUrl: string, fetchFn: typeof fetch): Promise<BootstrapResult> {
+async function probeOnce(directoryUrl: string, fetchFn: typeof fetch, timeoutMs: number): Promise<BootstrapResult> {
   const bootstrapUrl = `${directoryUrl.replace(/\/$/, "")}/bootstrap`;
   const ac = new AbortController();
-  const timeout = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
+  const timeout = setTimeout(() => ac.abort(), timeoutMs);
   try {
     let resp: Response;
     try {
@@ -189,6 +225,25 @@ async function probeOnce(directoryUrl: string, fetchFn: typeof fetch): Promise<B
     try {
       json = (await resp.json()) as { multiaddr?: unknown };
     } catch (err: unknown) {
+      /**
+       * AN ABORTED BODY READ IS A TIMEOUT, NOT A MALFORMED PAYLOAD — review F3.
+       *
+       * The deadline covers the body as well as the request, so a server that sends headers and
+       * then stalls — the ordinary shape of a lossy mobile link, which is this unit's entire
+       * subject — aborts inside `resp.json()`. Reporting that as `bad_response` was wrong twice:
+       * it sent the operator to inspect a payload that was never received, and `bad_response` is
+       * deliberately NOT retryable, so the node got one probe and was dropped. Precisely the
+       * outcome the retry exists to prevent, reached through the retry's own policy.
+       */
+      const classified = classifyFetchError(err);
+      if (classified.reason === "timeout" || ac.signal.aborted) {
+        // Both conditions, deliberately. The signal alone is what production sees when the deadline
+        // fires, but keying ONLY on it makes the behaviour depend on controller state rather than on
+        // what was actually thrown — untestable, and wrong the moment a body read aborts for any
+        // other reason. `classifyFetchError` already knows an AbortError is a timeout; reuse it
+        // rather than growing a second opinion about the same error.
+        return { ok: false, reason: "timeout", detail: classified.detail ?? "aborted reading the response body" };
+      }
       return { ok: false, reason: "bad_response", detail: err instanceof Error ? err.message : String(err) };
     }
     if (typeof json.multiaddr === "string" && json.multiaddr.includes("/p2p/")) {
@@ -267,6 +322,15 @@ export interface NodeResolveFailure {
   endpoint: string;
   reason: string;
   detail?: string;
+  /**
+   * How many probes were spent before giving up (DOD-M15-BOOTSTRAP-1).
+   *
+   * On the OPERATOR SURFACE, not only in the log, because the two shapes call for opposite
+   * responses: one probe means the node answered definitively (a 404, a bad payload) and the
+   * problem is that node's configuration; three means it never answered and the problem is the
+   * path to it.
+   */
+  attempts?: number;
 }
 
 export interface ManifestResolveOptions {
@@ -330,6 +394,10 @@ export async function manifestNodesToEndpoints(
           endpoint: node.endpoint,
           reason: probe.reason,
           detail: probe.detail,
+          // Review F2: this is the OPERATOR SURFACE (it feeds cello_status), and it was left
+          // without the count while the log got it. This file's own comment says it: "a `warn` in
+          // the log is not a surface." One 404 and three timed-out probes are different problems.
+          attempts: probe.attempts,
         });
         return null;
       }
@@ -419,7 +487,8 @@ export function createDirectoryEndpointResolver(
   let lastGood: DirectoryEndpoint | null = null;
 
   return async function getDirectoryEndpoint(): Promise<DirectoryEndpoint | null> {
-    const probe = await fetchBootstrapResult(directoryUrl, fetchFn);
+    // FAST_PROBE, not the persistent one: a caller is blocked on this. See its definition.
+    const probe = await fetchBootstrapResult(directoryUrl, fetchFn, Date.now, FAST_PROBE);
     if (probe.ok) {
       const multiaddr = probe.multiaddr;
       const peerId = parsePeerIdFromMultiaddr(multiaddr);

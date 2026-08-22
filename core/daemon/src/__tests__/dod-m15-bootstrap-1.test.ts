@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { fetchBootstrapResult } from "../directory-bootstrap.js";
+import { fetchBootstrapResult, FAST_PROBE, PERSISTENT_PROBE } from "../directory-bootstrap.js";
 
 const URL_ = "https://dir.example.test";
 
@@ -150,5 +150,77 @@ describe("DOD-M15-BOOTSTRAP-1: the total budget is bounded", () => {
     expect(calls, "16s spent + another 8s would exceed the 20s cap, so the third probe is skipped").toBe(2);
     expect(result.ok).toBe(false);
     expect(result.attempts).toBe(2);
+  });
+});
+
+describe("DOD-M15-BOOTSTRAP-1 review fixes: the retry must not break what it protects", () => {
+  it("an ABORTED BODY READ is a timeout, not a malformed payload — and is therefore retried", async () => {
+    /**
+     * Review F3. The deadline covers the body as well as the request, so a server that sends
+     * headers and then stalls — the ordinary shape of a lossy link, this unit's whole subject —
+     * aborts inside `resp.json()`.
+     *
+     * Reporting that as `bad_response` was wrong twice: it sent the operator to inspect a payload
+     * that was never received, and `bad_response` is deliberately NOT retryable, so the node got one
+     * probe and was dropped. The retry's own policy delivering the outcome the retry exists to
+     * prevent.
+     */
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls++;
+      if (calls === 1) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => {
+            const e = new Error("The operation was aborted");
+            e.name = "AbortError";
+            throw e;
+          },
+        } as unknown as Response;
+      }
+      return multiaddrResponse();
+    }) as unknown as typeof fetch;
+
+    const result = await fetchBootstrapResult(URL_, fetchFn, () => 0);
+
+    expect(result.ok, "a stalled body must not drop the node — it is a timeout, and timeouts retry").toBe(true);
+    expect(calls).toBe(2);
+  });
+
+  it("the RECONNECT budget is fast enough to stay inside the signaling wait", async () => {
+    /**
+     * Review F1 — the regression this unit introduced. The endpoint resolver runs on EVERY connect
+     * attempt, and the signaling stream turns over about every 70 seconds. With the persistent
+     * budget a lossy link could spend 16 s there, while `outbound-sessions` waits only 10 s for
+     * signaling before giving up — so `cello_initiate_session` would start failing with
+     * `directory_signaling_timeout` on exactly the links this unit set out to help.
+     *
+     * The numbers are asserted against that 10 s window rather than described in a comment,
+     * because the two were chosen together and a later edit to either must break this.
+     */
+    const SIGNALING_WAIT_MS = 10_000;
+    const worstCase = FAST_PROBE.attempts * FAST_PROBE.timeoutMs;
+
+    expect(worstCase, "the reconnect path must resolve well inside the 10s signaling wait").toBeLessThan(SIGNALING_WAIT_MS);
+    expect(FAST_PROBE.totalMs).toBeLessThanOrEqual(SIGNALING_WAIT_MS);
+    // ...and it must still be a RETRY. One attempt would be the old bug back: the whole mechanism
+    // is a second, fresh connection.
+    expect(FAST_PROBE.attempts, "a fresh connection is the mechanism — one attempt is the old defect").toBeGreaterThan(1);
+    // The persistent budget stays persistent: nothing is blocked on the roster sweep.
+    expect(PERSISTENT_PROBE.attempts).toBeGreaterThan(FAST_PROBE.attempts);
+  });
+
+  it("honours a caller-supplied budget rather than the module default", async () => {
+    let calls = 0;
+    const fetchFn = (async () => {
+      calls++;
+      throw timeoutError();
+    }) as unknown as typeof fetch;
+
+    const result = await fetchBootstrapResult(URL_, fetchFn, () => 0, FAST_PROBE);
+
+    expect(calls, "FAST_PROBE spends two probes, not the default three").toBe(FAST_PROBE.attempts);
+    expect(result.attempts).toBe(FAST_PROBE.attempts);
   });
 });
