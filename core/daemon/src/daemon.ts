@@ -28,6 +28,7 @@
 
 import { mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { dirname, join } from "node:path";
 import type {
   DaemonConfig,
@@ -2365,18 +2366,30 @@ async function startDaemonHoldingLock(
    * one that was invisible — is logged at INFO. `DOD-M15-IPCVISIBLE-1`.
    */
   /**
-   * The fallback notice owed to a connection's NEXT response — `DOD-M15-SELECTION-1` clause 2.
+   * The fallback notice owed to THIS REQUEST's response — `DOD-M15-SELECTION-1` clause 2.
    *
-   * Keyed on the per-connection STATE OBJECT rather than the connection id, and that is the reason
-   * this needed no changes at ~16 call sites: `resolveCurrentAgent` already receives the state
-   * object, and every handler already has the id to look it up by. Threading an id through all of
-   * them would have worked today and been forgotten by the seventeenth.
+   * ─── Why an AsyncLocalStorage and not a per-connection map ─────────────────────────────────────
    *
-   * A `WeakMap`, so a connection's entry disappears with its state and nothing has to remember to
-   * clean up. The notice is TAKEN (read-and-cleared) at the boundary, so it rides exactly one
-   * response — the one whose call actually used the fallback.
+   * The first cut keyed a `WeakMap` on the per-connection state object, so the notice belonged to
+   * the CONNECTION and was read back at the response boundary. Review found that hands the notice to
+   * whichever response finishes first, and Claude Code issues tool calls in parallel:
+   *
+   *   1. the agent calls `cello_receive` — nothing selected, so the fallback resolves and records
+   *      the notice, then the handler BLOCKS for up to 30 s waiting for content;
+   *   2. in the same turn it calls `cello_sessions {agent: "bob"}`, which names an agent explicitly
+   *      and never falls back;
+   *   3. `cello_sessions` returns first and takes the notice on its way out.
+   *
+   * Bob's response now says *"no agent was selected, so 'solo' was used"* — false, on the one call
+   * that did name an agent — and `cello_receive`, the call that actually fell back, says nothing.
+   * Exactly inverted.
+   *
+   * A notice is a fact about ONE CALL, so it is stored in that call's async context. The store is
+   * created per request in `renderedHandlers` and dies with it, which also means a handler that
+   * THROWS cannot leave a notice behind to attach itself to some later, unrelated response — the
+   * other half of the same review finding.
    */
-  const pendingFallbackNotice = new WeakMap<object, Record<string, unknown>>();
+  const fallbackNoticeStore = new AsyncLocalStorage<{ notice?: Record<string, unknown> }>();
 
   function resolveCurrentAgent(
     connState: { currentAgent: string | null; clearedAgent?: string; clientType?: string } | undefined,
@@ -2398,17 +2411,30 @@ async function startDaemonHoldingLock(
          * as an identity it never selected, which is the one that stops the half-attended state
          * being read as the protocol dropping messages.
          */
-        if (agent && connState) {
-          pendingFallbackNotice.set(connState, {
+        /**
+         * No `connState` guard. The first cut wrote the notice only `if (agent && connState)`, and
+         * `perConnectionState` is populated at `ipc.connect` — which `withIpc` in the CLI
+         * (`core/cli/src/commands.ts`) does not send. So every plain `cello` invocation fell back
+         * and got a response that said nothing, while the log line below fired regardless: the
+         * clause asks for explicit IN THE RESPONSE, and those callers had it explicit in the log
+         * only. The store is per-REQUEST, so it exists whether or not the connection ever
+         * handshook.
+         */
+        const store = fallbackNoticeStore.getStore();
+        if (agent && store) {
+          store.notice = {
             acting_as: agent,
             agent_selection: "fallback",
             agent_selection_guidance:
               `No agent was selected on this connection, so '${agent}' was used because it is the ` +
               `only one online. This is a per-call subject, NOT an attendance: doorbells route by ` +
-              `the connection's registered agent, so this session will not WAKE on an incoming ` +
-              `message even though sending and reading work. Run cello_use_agent to select it ` +
-              `properly, or name the agent explicitly on each call.`,
-          });
+              `the connection's registered agent and this does not set it. Two things follow — ` +
+              `this session will not WAKE on an incoming message even though sending and reading ` +
+              `work, and anyone who opens a session with you is sent an AWAY auto-reply while you ` +
+              `sit here able to answer. Run cello_use_agent to fix both. Naming the agent on each ` +
+              `call is NOT a remedy for either: it settles which agent a call is about and leaves ` +
+              `the connection just as unattended.`,
+          };
         }
         logger.info("agent.current.fallback", {
           agentName: agent,
@@ -4028,12 +4054,28 @@ async function startDaemonHoldingLock(
       const handler = handlers.get(method);
       if (!handler) return undefined;
       return async (params, connectionId) => {
-        const result = await handler(params, connectionId);
+        /**
+         * ONE request, ONE store — and the fallback notice is spread in BEFORE `renderForSurface`.
+         *
+         * `DOD-M15-SELECTION-1` clause 2 first annotated the response out in `ipc-server.ts`, which
+         * is downstream of this wrapper and therefore downstream of surface rendering. The notice
+         * says *"Run cello_use_agent"*; `isInstructionKey` in `vocabulary.ts` rewrites any key
+         * ending in `guidance`, so that WOULD have become `cello use-agent` for a terminal — but it
+         * arrived after the rewrite had already run. An operator running `cello inbox` was handed a
+         * verb that does not exist in a shell, which is the exact failure the vocabulary layer was
+         * built to prevent. Annotating here puts it back in front of the renderer.
+         */
+        const store: { notice?: Record<string, unknown> } = {};
+        const result = await fallbackNoticeStore.run(store, () => handler(params, connectionId));
+        const annotated =
+          store.notice && result !== null && typeof result === "object" && !Array.isArray(result)
+            ? { ...(result as Record<string, unknown>), ...store.notice }
+            : result;
         // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
         // the CLI verb is the safe answer — it is at least a real command an operator can run,
         // whereas an MCP tool name is useless in a terminal.
         const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
-        return renderForSurface(result, surface);
+        return renderForSurface(annotated, surface);
       };
     },
   };
@@ -4496,14 +4538,6 @@ async function startDaemonHoldingLock(
 
   // MCP-001: Clean up per-connection state when a connection disconnects
   // MCP-002: Also unregister from notification dispatcher
-  ipcServer.setFallbackNoticeSource((connectionId) => {
-    const state = perConnectionState.get(connectionId);
-    if (!state) return undefined;
-    const notice = pendingFallbackNotice.get(state);
-    if (notice) pendingFallbackNotice.delete(state);
-    return notice;
-  });
-
   ipcServer.onDisconnect((connectionId) => {
     /**
      * DOD-M15-IPCVISIBLE-1: SAY THAT IT CLOSED, and say what it was attending.
