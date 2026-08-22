@@ -199,7 +199,7 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   "AUDIT-ME.md": 18,
   "README.md": 20,
   "core/adapter-claude-code/SKILL.md": 30,
-  "core/cli/src/registry.ts (operator-facing strings)": 39,
+  "core/cli/src/registry.ts (operator-facing strings)": 37,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
   "plugins/cello/skills/documents/SKILL.md": 18,

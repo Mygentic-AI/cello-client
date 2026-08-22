@@ -83,7 +83,46 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "'notarized' accurately still spends claim vocabulary — and a guard that charges for honest " +
       "disclosure would teach people to delete it.",
   },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "refresh: 'CELLO never holds your whole signing key in one place — it is split into shares held with the directory nodes.'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Verified, and the verification matters because the WEAKER implementation exists in the tree. " +
+      "`frost-threshold-signer.ts` has a `trustedDealer` path where one party does hold the whole " +
+      "key momentarily — but `bootstrapKeyShares` THROWS unless `NODE_ENV === \"test\"` " +
+      "(\"bootstrapKeyShares is a test-only shortcut. Real DKG (M3) is required in production\"). " +
+      "Production registration runs a real distributed key generation across the consortium " +
+      "(`register-handler.ts`, `network-directory-node.ts` frost_dkg_round1), so no whole key is " +
+      "ever assembled anywhere. The claim would have been FALSE under the dealer path, which is why " +
+      "the guard is the evidence rather than the comment.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "attestations: 'It is sealed to the CELLO portal (the directory cannot read it)'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "`signal-submission.ts:239` calls `sealToRecipient(intakeKey.pubkey, encoded)` — an anonymous " +
+      "public-key seal to the PORTAL's intake key. The directory stores and replicates ciphertext " +
+      "it holds no private key for. Consistent with the no-PII-in-the-directory rule: directories " +
+      "are federated and possibly public, so they hold hashes and sealed blobs, never plaintext.",
+  },
 ];
+
+/**
+ * DELIBERATELY NOT ADJUDICATED, and worth saying why rather than leaving a silent gap.
+ *
+ * The same attestation sentence also says the submission is **"screened"**. That screening happens
+ * in the PORTAL, a different repo and a different component from the daemon's security gateway, and
+ * I have not read it. `DOD-M15-CLAIM-SCREEN-1` was opened precisely because a screening claim was
+ * being repeated on surfaces nobody had checked against the code, in both directions.
+ *
+ * So it stays in the unadjudicated backlog. Moving it here without reading the portal would be the
+ * prose ledger's original defect — a row recording that somebody looked, rather than what they
+ * found — reproduced inside the mechanism built to replace it.
+ */
 
 /** How many matches on a surface are accounted for by an adjudicated entry. */
 export function adjudicatedMatches(surface: string): number {
