@@ -2513,7 +2513,11 @@ export class SessionNodeManager {
     return retry !== undefined && retry.attempts > SR_RESERVATION_MAX_RETRIES ? "unreachable" : "retrying";
   }
 
-  /** First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use (gater-open). */
+  /**
+   * First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use. Its gater admits
+   * nobody INBOUND until a session names them (DOD-M15-ASSIGN-1); outbound stays open, which is the
+   * property these callers depend on.
+   */
   #anyStandingReceiver(): { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null {
     for (const sr of this.#standingReceivers.values()) return sr;
     return null;
@@ -2545,14 +2549,21 @@ export class SessionNodeManager {
    * exactly one peer at the same instant the address that reaches them is published, and never
    * before. The initiator cannot know where to dial until the accept it triggers has been sent.
    *
-   * Returns false when there is no receiver to narrow, or when the offer named nobody. The caller
-   * decides what that means; this method never widens the gate to compensate.
+   * Returns WHICH failure it was, never a bare false (review F6). The caller reports a distinct
+   * reason per cause: "no receiver" and "the directory named nobody" are different subsystems, and
+   * collapsing them sent the operator to the directory for a local problem. This method never
+   * widens the gate to compensate.
+   *
+   * Narrows INBOUND ONLY. The receiver is still the daemon's general-purpose dialer at this point
+   * — no assignment exists yet — so revoking its outbound latitude here would break content
+   * parking and restart-seal submission (review F2).
    */
-  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string): boolean {
+  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string): "narrowed" | "no_receiver" | "no_peer_named" {
     const sr = this.#standingReceivers.get(agentName);
-    if (!sr || initiatorSessionPeerId === "") return false;
-    sr.gater.setAllowedPeer(initiatorSessionPeerId);
-    return true;
+    if (!sr) return "no_receiver";
+    if (initiatorSessionPeerId === "") return "no_peer_named";
+    sr.gater.admitInboundPeer(initiatorSessionPeerId);
+    return "narrowed";
   }
 
   /**
@@ -7745,7 +7756,10 @@ export class SessionNodeManager {
    * DOD-M15-FRAME-1 — NARROWING THE GATE DOES NOT EVICT ANYONE ALREADY INSIDE. This does.
    *
    * `setAllowedPeer` sets the allowlist libp2p consults **when a connection is established**. A
-   * standing receiver accepts everyone by design (`allowedPeerId: null`), so a stranger can attach
+   * standing receiver USED TO accept everyone (`allowedPeerId: null` read as allow-all), so a stranger could attach
+   * — closed by DOD-M15-ASSIGN-1, which made an unclaimed receiver admit nobody inbound. The
+   * constraint underneath this sweep is UNCHANGED and still load-bearing: libp2p does not re-run a
+   * gater against a connection that already exists, so narrowing the gate never evicts anyone.
    * before any session exists, hold the connection open, and still be attached when the receiver is
    * promoted and the content protocol activates. Narrowing the gate changes nothing for them: the
    * gater is not re-run against live connections.
@@ -7784,7 +7798,7 @@ export class SessionNodeManager {
      * CONCURRENT AND CAPPED, because the count is ATTACKER-CONTROLLED (review F4).
      *
      * This runs inside `acceptSession`, before the session row is written, and the standing receiver
-     * accepts everyone by design — so opening N connections to an agent's advertised receiver used
+     * used to accept everyone (closed by DOD-M15-ASSIGN-1) — so opening N connections to an agent's advertised receiver used
      * to make every later session setup on that agent wait for N sequential graceful closes.
      * `hangUp` is libp2p's graceful close and takes no timeout, so the wait was unbounded in both
      * directions. Evicting an injection foothold must not itself become the way to stall an agent.
@@ -8023,7 +8037,7 @@ export class SessionNodeManager {
       /**
        * DOD-M15-FRAME-1 — ONE GATE, BEFORE THE DISPATCH, FOR EVERY FRAME ON THIS PROTOCOL.
        *
-       * A stranger could dial an agent's standing receiver (it accepts everyone by design), hold
+       * A stranger could dial an agent's standing receiver (it admitted everyone until DOD-M15-ASSIGN-1), hold
        * the connection open through promotion — libp2p's gater runs only at connection
        * establishment, so narrowing it does not evict anyone already attached — and then speak the
        * content protocol the moment it activated. The frame was ingested, leafed, transcribed, and
@@ -8854,7 +8868,9 @@ export class SessionNodeManager {
     const sessionId = `standing_receiver_${randomUUID()}`;
     const gater = new SessionConnectionGater({
       sessionId,
-      allowedPeerId: null, // open — counterparty unknown at creation time
+      // No named peer: admits NOBODY inbound until a session offer names the dialer, while leaving
+      // this node's own outbound errands open (DOD-M15-ASSIGN-1). It does NOT mean "open".
+      allowedPeerId: null,
       logger: this.#logger,
     });
 

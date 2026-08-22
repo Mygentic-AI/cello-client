@@ -53,7 +53,7 @@ export function wireSessionOfferHandler(deps: {
    * gate is already narrowed by the time anyone could know where to dial. Returns false when
    * there is no receiver or the offer named nobody.
    */
-  admitOfferedDialer: (initiatorSessionPeerId: string) => boolean;
+  admitOfferedDialer: (initiatorSessionPeerId: string) => "narrowed" | "no_receiver" | "no_peer_named";
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -123,17 +123,31 @@ export function wireSessionOfferHandler(deps: {
        * gate refuses them, and the session would die at the transport with no one able to say why.
        * Rejecting names the cause on the frame the directory is already waiting for.
        */
-      const offeredDialer = frame["initiator_session_peer_id"];
-      if (typeof offeredDialer !== "string" || offeredDialer === "" || !deps.admitOfferedDialer(offeredDialer)) {
+      const offeredDialerRaw = frame["initiator_session_peer_id"];
+      const offeredDialer = typeof offeredDialerRaw === "string" ? offeredDialerRaw : "";
+      const narrowed = deps.admitOfferedDialer(offeredDialer);
+      if (narrowed !== "narrowed") {
+        /**
+         * Review F6 — ONE REASON PER CAUSE. This branch used to report `offer_named_no_dialer` for
+         * both outcomes, and its guidance sent the operator to "the directory is not populating
+         * initiator_session_peer_id" even when the truth was that this agent had no standing
+         * receiver. That is a local problem wearing a remote label, which is the exact shape that
+         * costs days. `standing_receiver_unavailable` already exists two branches above and is the
+         * correct name for it.
+         */
+        const isLocal = narrowed === "no_receiver";
+        const reason = isLocal ? "standing_receiver_unavailable" : "offer_named_no_dialer";
         deps.logger.warn("session.offer.abort", {
           agentName: deps.agentName,
-          reason: "offer_named_no_dialer",
-          impact:
-            "the directory's offer did not say who would dial, so this agent could not open its receiver to exactly one peer; the session was refused rather than served behind a door open to anyone",
-          guidance:
-            "the initiator should retry; a repeat means the directory is not populating initiator_session_peer_id and the session cannot be established safely",
+          reason,
+          impact: isLocal
+            ? "this agent has no standing receiver to open, so it cannot serve the session; the session was refused rather than accepted with nowhere to be dialled"
+            : "the directory's offer did not say who would dial, so this agent could not open its receiver to exactly one peer; the session was refused rather than served behind a door open to anyone",
+          guidance: isLocal
+            ? "the receiver is created when the agent comes online — check that cello_start_agent reached this daemon, then have the initiator retry"
+            : "the initiator should retry; a repeat means the directory is not populating initiator_session_peer_id and the session cannot be established safely",
         });
-        await sendOfferReject(sessionId, "offer_named_no_dialer");
+        await sendOfferReject(sessionId, reason);
         return;
       }
       try {

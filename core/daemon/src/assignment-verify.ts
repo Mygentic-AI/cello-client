@@ -10,7 +10,11 @@
  * "did the right party say it". Keeping them apart means the second cannot be quietly skipped by a
  * caller that only wanted the first — which is how the gap existed.
  */
-import { verify, verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
+// `verify` (plain Ed25519) is deliberately NOT imported: the single-key branch that used it was
+// removed with the downgrade refusal (review F1). Verifying `directory_signature` against the
+// `directory_pubkey` riding beside it in the same unsigned frame checks a key against itself, and
+// having that call available is how a future edit reintroduces the bypass.
+import { verifyFrostSignature, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { DbRegistrationPersistence } from "./db-identity-store.js";
@@ -54,21 +58,58 @@ export async function verifyAssignmentSignature(
     assignment.transport_mode,
   );
 
-  if (assignment.signature_type === "frost") {
-    const reg = await persistence.loadRegistrationState();
-    if (!reg) {
-      // FAIL CLOSED. Without our own registration we cannot know whose quorum should have signed,
-      // so the signature is unverifiable — which is not the same as valid.
-      logger.warn("session.assignment.verify.no_identity", {
-        agentName, correlationId,
-        impact: "this agent has no persisted registration, so the signer of its own session assignment cannot be established; the session was refused rather than accepted unverified",
-      });
-      return {
-        ok: false,
-        reason: "assignment_unverifiable_no_registration",
-        guidance: "This agent has no registration on record, so the directory's session assignment cannot be checked against the key that should have signed it. Re-register with cello register-agent, then try again.",
-      };
-    }
+  /**
+   * LOAD THE REGISTRATION BEFORE BRANCHING ON `signature_type` — review F1, and this ordering is
+   * the entire fix.
+   *
+   * `signature_type` rides in the frame and is covered by no signature. The parser reads any value
+   * that is not the string "frost" — including an ABSENT field — as "single". So while this load
+   * lived inside the frost branch, a hostile directory disabled every check below by omitting one
+   * field: it put its own freshly-minted key in `directory_pubkey`, signed a TBS naming an
+   * impostor as the counterparty, and the single-key branch verified that signature against that
+   * same key and returned ok. The anti-circularity comparison, the threshold verify and the
+   * fail-closed were all simply stepped over.
+   *
+   * Reading the registration first closes it: an agent that HAS a threshold registration knows its
+   * assignments are FROST-signed, so a non-FROST one is a downgrade attempt and is refused by
+   * name — never quietly routed to a weaker check.
+   */
+  const reg = await persistence.loadRegistrationState();
+  if (!reg) {
+    // FAIL CLOSED. Without our own registration we cannot know whose quorum should have signed,
+    // so the signature is unverifiable — which is not the same as valid.
+    logger.warn("session.assignment.verify.no_identity", {
+      agentName, correlationId,
+      impact: "this agent has no persisted registration, so the signer of its own session assignment cannot be established; the session was refused rather than accepted unverified",
+    });
+    return {
+      ok: false,
+      reason: "assignment_unverifiable_no_registration",
+      guidance: "This agent has no registration on record, so the directory's session assignment cannot be checked against the key that should have signed it. Re-register with cello register-agent, then try again.",
+    };
+  }
+
+  if (assignment.signature_type !== "frost") {
+    /**
+     * THE DOWNGRADE REFUSAL. Checked against the producer, not assumed: the directory constructs
+     * `signature_type: "frost"` unconditionally at a single site (`directory-node.ts`), with no
+     * branch that can emit anything else. There is no legitimate producer of a single-key session
+     * assignment for a registered agent, so this is not a compatibility path being closed — it is
+     * a shape that only an attacker or a broken directory can send.
+     */
+    logger.error("session.assignment.signature_type_downgraded", {
+      agentName, correlationId,
+      offeredType: assignment.signature_type,
+      impact: "the assignment claimed a weaker signature type than this agent's registration can produce, which would have routed it to a check that verifies a key against itself; it was refused, and no session was established",
+    });
+    return {
+      ok: false,
+      reason: "assignment_signature_type_downgraded",
+      guidance: "The directory returned a session assignment that does not carry a threshold signature, though this agent is registered with one. Nothing was established and no message was sent. Retry the session; if it repeats, the directory you reached is not producing valid assignments and cello status will show which one that is.",
+    };
+  }
+
+  {
     // THE ANTI-CIRCULARITY CHECK. `signer_pubkey` comes from the frame; `reg.primaryPubkey` comes
     // from this machine's own registration. Comparing them is what makes verifying against
     // `signer_pubkey` mean anything at all.
@@ -99,22 +140,4 @@ export async function verifyAssignmentSignature(
     }
     return { ok: true };
   }
-
-  // Single-key assignments verify against the directory's own key, which rides the assignment as
-  // `directory_pubkey`. NOTE the asymmetry, stated rather than glossed: there is no independent
-  // value to compare that against here the way `primaryPubkey` anchors the FROST case, so this
-  // branch proves internal consistency only. It exists for legacy and direct-mode assignments;
-  // production registration produces FROST.
-  if (!verify(assignment.directory_pubkey, tbs, assignment.directory_signature)) {
-    logger.error("session.assignment.signature_invalid", {
-      agentName, correlationId, signatureType: "single",
-      impact: "the assignment's signature did not verify over its own contents; it was refused, and no session was established",
-    });
-    return {
-      ok: false,
-      reason: "assignment_signature_invalid",
-      guidance: "The directory's session assignment did not verify against the key it names. Nothing was established. Retry the session; if it repeats, cello status will show which directory answered.",
-    };
-  }
-  return { ok: true };
 }

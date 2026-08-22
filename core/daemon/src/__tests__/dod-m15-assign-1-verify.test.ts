@@ -156,3 +156,64 @@ describe("DOD-M15-ASSIGN-1: a session assignment is verified before anything dia
     expect(r.ok === false && r.guidance).toMatch(/cello register-agent/);
   });
 });
+
+/**
+ * ─── Review F1: the one-field downgrade that disabled every check above ──────────────────────────
+ *
+ * `signature_type` rides in the frame and no signature covers it. The parser reads anything that is
+ * not the literal "frost" — an absent field included — as "single", and the verifier used to route
+ * that to a branch which checked `directory_signature` against the `directory_pubkey` sitting
+ * beside it in the same unsigned frame. A key verified against itself proves nothing.
+ *
+ * So a hostile directory disabled the whole unit by omitting one field: mint a fresh keypair, name
+ * an impostor as the counterparty, sign, drop `signature_type`, and the daemon dialled the impostor
+ * having "verified" the assignment.
+ */
+describe("DOD-M15-ASSIGN-1: a weaker signature type cannot be claimed to skip the check", () => {
+  it("REFUSES an assignment whose signature_type is not frost, even when its own signature verifies", async () => {
+    const attacker = generateKeypair();
+    const ours = generateKeypair();
+    const { logger, seen } = events();
+
+    // The attacker's assignment is INTERNALLY VALID: they signed it with their own key and named
+    // that key. Under the old code the single-key branch verified it and returned ok.
+    const forged = await makeAssignment({ signWith: attacker, counterpartyPeerId: "12D3KooWImpostor" });
+    (forged as unknown as Record<string, unknown>)["signature_type"] = "single";
+    (forged as unknown as Record<string, unknown>)["directory_pubkey"] = await attacker.getPublicKey();
+
+    const verdict = await verifyAssignmentSignature(
+      forged,
+      persistenceWith(Buffer.from(await ours.getPublicKey()).toString("hex")),
+      logger,
+      "agent-1",
+      "corr-1",
+    );
+
+    expect(verdict.ok, "a non-frost assignment must not be accepted for a threshold-registered agent").toBe(false);
+    expect(verdict.ok === false && verdict.reason).toBe("assignment_signature_type_downgraded");
+    // Named as its own cause, not collapsed into the generic invalid-signature reason: the
+    // signature here is perfectly valid, and saying otherwise would send the reader hunting a
+    // crypto fault instead of a downgrade.
+    expect(seen).toContain("session.assignment.signature_type_downgraded");
+  });
+
+  it("REFUSES an assignment with signature_type absent entirely (the parser reads it as single)", async () => {
+    const attacker = generateKeypair();
+    const ours = generateKeypair();
+    const { logger } = events();
+
+    const forged = await makeAssignment({ signWith: attacker });
+    delete (forged as unknown as Record<string, unknown>)["signature_type"];
+
+    const verdict = await verifyAssignmentSignature(
+      forged,
+      persistenceWith(Buffer.from(await ours.getPublicKey()).toString("hex")),
+      logger,
+      "agent-1",
+      "corr-1",
+    );
+
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toBe("assignment_signature_type_downgraded");
+  });
+});

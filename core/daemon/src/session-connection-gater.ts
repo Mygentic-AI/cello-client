@@ -73,6 +73,25 @@ export class SessionConnectionGater implements ConnectionGater {
   readonly #sessionId: string;
   readonly #logger: Logger;
 
+  /**
+   * Is this node still acting as a STANDING RECEIVER, whose outbound dials are unrestricted?
+   *
+   * DOD-M15-ASSIGN-1 review F2. The outbound carve-out originally keyed off `#allowedPeerId ===
+   * null`, which broke the moment `admitInboundPeer` narrowed the inbound gate at offer time: the
+   * receiver was still the daemon's general-purpose dialer, but its outbound gate had silently
+   * closed to everything except the named dialer and the reservation relays.
+   *
+   * What that cost, concretely: the content-park deposit/pull and the restart-seal submission both
+   * dial relays that are NOT on the reservation list — the second one persisted from an EARLIER
+   * session. So an agent that merely RECEIVED one inbound offer would quietly stop being able to
+   * submit a seal, and the operator would see `relay_unavailable` — a transport label for what was
+   * actually a local gater decision. A seal leaf that does not land is not a papercut.
+   *
+   * So the two things are now tracked separately: narrowing WHO MAY DIAL IN (INV-5) does not
+   * revoke this node's own right to dial out. Only promotion into a session does that.
+   */
+  #standingReceiverOutbound: boolean;
+
   constructor(opts: {
     sessionId: string;
     allowedPeerId: string | null;
@@ -80,11 +99,31 @@ export class SessionConnectionGater implements ConnectionGater {
   }) {
     this.#sessionId = opts.sessionId;
     this.#allowedPeerId = opts.allowedPeerId;
+    // A gater built with no named peer is a standing receiver; one built naming its counterparty is
+    // a session node, which has never been allowed to dial anywhere but its counterparty and relays.
+    this.#standingReceiverOutbound = opts.allowedPeerId === null;
     this.#logger = opts.logger;
   }
 
-  /** Update the allowed Peer ID (called when standing receiver is claimed). */
+  /**
+   * PROMOTION — this node is now a session node serving exactly this counterparty.
+   *
+   * Narrows inbound AND ends the standing-receiver outbound latitude: from here the node may dial
+   * only its counterparty and the relays explicitly added to the outbound allowlist.
+   */
   setAllowedPeer(peerId: string): void {
+    this.#allowedPeerId = peerId;
+    this.#standingReceiverOutbound = false;
+  }
+
+  /**
+   * DOD-M15-ASSIGN-1 — name the one peer that may dial IN, without promoting the node.
+   *
+   * Used when a `session_offer` names the initiator, before any assignment exists. The node is
+   * still the daemon's general-purpose dialer at this point, so its outbound latitude is untouched;
+   * see `#standingReceiverOutbound`.
+   */
+  admitInboundPeer(peerId: string): void {
     this.#allowedPeerId = peerId;
   }
 
@@ -138,6 +177,12 @@ export class SessionConnectionGater implements ConnectionGater {
     if (this.#allowedOutboundPeerIds.has(peerId.toString())) {
       return false; // allow
     }
+    // Review F2: a standing receiver is also the daemon's dialer for errands that belong to no
+    // session — content-park deposit/pull, restart-seal submission to a PRIOR session's relay.
+    // Those targets are on no allowlist and cannot be, since they are chosen per errand.
+    if (this.#standingReceiverOutbound) {
+      return false; // allow — this node chose the dial; INV-5 governs who comes IN
+    }
     return this.#denyIfNotAllowed(peerId, "outbound");
   }
 
@@ -164,6 +209,32 @@ export class SessionConnectionGater implements ConnectionGater {
      * this agent choosing where to go; INV-5 governs who may come IN. Denying them would have cost
      * message parking to close a door nobody was standing at.
      */
+    /**
+     * Review F7: a RESERVATION RELAY dialling back is infrastructure, not a stranger.
+     *
+     * The standing receiver runs the libp2p AutoNAT *client*: it asks connected peers to dial its
+     * observed address so it can learn whether it is publicly reachable. Its connected peers are
+     * its own reservation relays. That dial-back arrives INBOUND, and the outbound allowlist was
+     * only consulted on the outbound path — so it was refused, and refused repeatedly.
+     *
+     * Two costs, and the second is the quiet one. It logged `connection.rejected` on every probe
+     * cycle, on the one line that is supposed to mean a stranger tried an unclaimed receiver — a
+     * signal that fires on the normal case is not a signal. And AutoNAT answers repeated dial
+     * failures by REMOVING the observed address, so an agent's own public address never becomes
+     * verified and never reaches `listenAddresses()` — the array shipped in `session_offer_accept`.
+     * We would have been advertising a shorter address list and blaming the network.
+     *
+     * These are peers this node already dials and holds reservations with. Admitting their
+     * dial-back grants nothing it did not already have.
+     *
+     * SCOPED TO THE STANDING-RECEIVER ROLE, and the first version of this fix was not — it admitted
+     * relays inbound on every gater, which breaks INV-5: a SESSION node admits exactly one
+     * counterparty, and the existing tests say so in those words. A promoted node has no AutoNAT
+     * probe to answer, so it needs nothing here. The relay stays outbound-only there, as it was.
+     */
+    if (direction === "inbound" && this.#standingReceiverOutbound && this.#allowedOutboundPeerIds.has(peerId.toString())) {
+      return false; // allow — our own relay, answering a probe we started
+    }
     if (this.#allowedPeerId === null) {
       if (direction === "outbound") return false; // allow — we chose this dial; INV-5 is inbound-only
       this.#logger.warn("session.node.connection.rejected", {

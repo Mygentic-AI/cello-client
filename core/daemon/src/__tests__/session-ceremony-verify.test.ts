@@ -134,7 +134,7 @@ describe("DOD-OFFER-REJECT-1: wireSessionOfferHandler answers with session_offer
       // DOD-M15-ASSIGN-1: the receiver is narrowed to the offered dialer before the accept goes
       // out. These tests are about the REJECT contract, so the narrowing succeeds and stays out of
       // their way; the narrowing itself is pinned in dod-m15-assign-1-receiver-gate.test.ts.
-      admitOfferedDialer: () => true,
+      admitOfferedDialer: () => "narrowed" as const,
       signaling: seam,
       logger,
     });
