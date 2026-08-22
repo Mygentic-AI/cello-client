@@ -37,7 +37,21 @@ export interface SealCertificatePullDeps {
 }
 
 export type SealCertificatePullResult =
-  | { ok: true; rootHex: string }
+  /**
+   * `verified` is REQUIRED, not optional, and that is the point.
+   *
+   * `verifyBilateralSealCertificate` returns `{ok:true, verified:false}` when this daemon holds no
+   * key for the certificate's signer — a legitimate state, and no longer a rare one: clearing a
+   * counterparty's pin (the remedy for the identity-refusal lockout) moves every past session with
+   * them from *verified* to *taken on their word*.
+   *
+   * Until now the pull returned `{ok:true, rootHex}` either way, so `cello_sealed_receipt` handed
+   * the agent a response byte-for-byte identical to a verified one. An operator could clear a
+   * contact, pull an old receipt, and pass it to a third party as proof. It is not proof, and
+   * nothing in the response said so. Making the field non-optional means a new caller cannot
+   * construct this result without deciding what to tell them.
+   */
+  | { ok: true; rootHex: string; verified: boolean }
   /**
    * `reason` is never collapsed. Each of these sends the caller somewhere different, and the whole
    * defect class this unit belongs to is exit-point labels standing in for causes:
@@ -222,7 +236,13 @@ export async function pullSealCertificate(
     sessionId: sessionIdHex,
     sealedRoot: rootHex,
     verified: verdict.verified,
-    impact: "a seal this side never received the push for is now local and provable",
+    // The impact line said "provable" unconditionally, which is FALSE in exactly the branch above:
+    // an unverified certificate is recorded on the counterparty's word and proves nothing to a
+    // third party. A claim that is true on the common path and false on the dangerous one is worse
+    // than no claim, because it reads as reassurance precisely when reassurance is unwarranted.
+    impact: verdict.verified
+      ? "a seal this side never received the push for is now local, and its signature was checked"
+      : "a seal this side never received the push for is now local, but its signature was NOT checked — it is recorded on the counterparty's word",
   });
 
   // STATUS FIRST AND SYNCHRONOUS, teardown second — the same terminal transition the push path
@@ -237,10 +257,12 @@ export async function pullSealCertificate(
     logger.error("session.seal.status.write.threw", {
       sessionId: sessionIdHex, agentName,
       error: err instanceof Error ? err.message : String(err),
-      impact: "the certificate was pulled and verified, but this row still reads interrupted",
+      impact: verdict.verified
+        ? "the certificate was pulled and verified, but this row still reads interrupted"
+        : "the certificate was pulled (signature NOT checked), but this row still reads interrupted",
     });
   }
   void sessionNodeManager.destroySessionNode(agentName, sessionIdHex, "sealed");
 
-  return { ok: true, rootHex };
+  return { ok: true, rootHex, verified: verdict.verified };
 }

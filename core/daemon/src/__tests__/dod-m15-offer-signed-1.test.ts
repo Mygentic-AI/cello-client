@@ -95,10 +95,30 @@ function harness(opts: {
     getPinnedCounterpartyPrimary: () => opts.pinnedPrimary ?? null,
     getSessionRecord: () => undefined,
     // Reaching this means neither refusal fired — the session was accepted.
-    ensureStandingReceiverForAgent: (agentName: string) => {
+    ensureStandingReceiverForAgent: async (agentName: string) => {
       accepted.push(agentName);
     },
     getStandingReceiverReady: () => true,
+    /**
+     * THE ACCEPT PATH, stubbed so acceptance is OBSERVABLE.
+     *
+     * Without these the accept threw `checkUnknownSenderAcceptanceBound is not a function` and the
+     * session was never enqueued — which the three "ACCEPTS …" tests above did not notice, because
+     * they only assert that a refusal event is ABSENT. An accept that dies of a missing stub also
+     * has no refusal event, so they were passing on the absence of a thing that could not happen.
+     * `enqueued()` is the positive assertion they were missing.
+     */
+    checkUnknownSenderAcceptanceBound: () => ({ ok: true as const }),
+    sessionsConsumingCap: () => 0,
+    capDiagnostics: () => ({}),
+    recordCounterpartyPrimary: () => {},
+    recordOfferedMoniker: () => {},
+    addContact: () => {},
+    acceptSession: async () => ({ ok: true }),
+    resolveAgentId: () => "agent-id",
+    // Throws on purpose: the trust-signal projection catches it and logs signal.projection.failed,
+    // which is the documented degraded path. A stub returning a fake DB would be testing the stub.
+    getDb: () => { throw new Error("no db in this harness"); },
   };
 
   const deps = {
@@ -164,6 +184,9 @@ function harness(opts: {
     accepted,
     durable,
     sentFrames,
+    /** The event queued for `cello_await_session` — what the AGENT actually receives. */
+    enqueued: (): { verification?: string } | undefined =>
+      (api.inboundSessionQueues.get(AGENT) ?? [])[0] as { verification?: string } | undefined,
     /** What `cello_inbox` would show this operator. */
     operatorSees: (): Array<{ reason: string; sessionIdHex: string }> =>
       (api.refusedSessionRequests.get(AGENT) ?? []) as Array<{ reason: string; sessionIdHex: string }>,
@@ -228,6 +251,8 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
 
     expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
     expect(h.revoked).toEqual([]);
+    // POSITIVE, not merely the absence of a refusal — see the note on the accept-path stubs.
+    expect(h.enqueued(), "the session must actually reach the agent").toBeDefined();
   });
 
   it("ACCEPTS when no offer was recorded — absence is not disagreement", async () => {
@@ -239,6 +264,7 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
     await settle();
 
     expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
+    expect(h.enqueued(), "the session must actually reach the agent").toBeDefined();
   });
 });
 
@@ -279,6 +305,46 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
 
     expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
     expect(h.revoked).toEqual([]);
+    expect(h.enqueued(), "the session must actually reach the agent").toBeDefined();
+  });
+
+  it("TELLS THE AGENT it is first contact — the bound is worthless if only the log knows", async () => {
+    /**
+     * Review F6. The weaker mode was documented in a source comment and one log line, so
+     * `cello_inbox` and `cello_await_session` handed the agent a first-contact session that looked
+     * identical to a pinned one.
+     *
+     * Walk what that costs: a hostile directory wins the race to your first contact with someone.
+     * It mints a keypair and signs a consistent assignment, which internal mode accepts — correctly,
+     * it cannot do otherwise — and THAT KEY BECOMES YOUR PERMANENT ANCHOR for that person. When the
+     * real counterparty's genuinely-signed assignment arrives later, you refuse it and tell your
+     * operator their contact may have been substituted, backwards. And the seal path reads the same
+     * poisoned value as its trust anchor.
+     *
+     * None of that is preventable here — first contact has nothing to check against, and saying so
+     * is the whole remedy. Which is why it must reach the agent.
+     */
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: null });
+    await h.inject(REAL_DIALER, generateKeypair());
+    await settle();
+
+    const event = h.enqueued();
+    expect(event, "the session must be accepted — first contact is legitimate").toBeDefined();
+    expect(event?.verification, "the agent must be told this could not be checked against anything")
+      .toBe("first_contact");
+  });
+
+  it("marks a REPEAT counterparty as pinned, so the two are distinguishable", async () => {
+    // The negative control. Without it, the assertion above is satisfied by stamping
+    // "first_contact" on every session, which would be a worse lie than saying nothing.
+    const pinned = generateKeypair();
+    const pinnedHex = Buffer.from(await pinned.getPublicKey()).toString("hex");
+
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: pinnedHex });
+    await h.inject(REAL_DIALER, pinned);
+    await settle();
+
+    expect(h.enqueued()?.verification).toBe("pinned");
   });
 
   it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", async () => {
@@ -290,6 +356,7 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     await settle();
 
     expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
+    expect(h.enqueued(), "the session must actually reach the agent").toBeDefined();
   });
 
   it("REFUSES a TAMPERED assignment even on first contact — a bad first pin is permanent", async () => {

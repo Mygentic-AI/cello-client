@@ -49,7 +49,10 @@ export interface SessionReadDeps {
    * daemon cannot ask" and "this session never sealed" are different facts and only one of them is
    * about the conversation.
    */
-  pullSealCertificate?: (agentName: string, sessionIdHex: string) => Promise<{ ok: boolean; reason?: string }>;
+  pullSealCertificate?: (
+    agentName: string,
+    sessionIdHex: string,
+  ) => Promise<{ ok: boolean; reason?: string; verified?: boolean }>;
 }
 
 export function registerSessionReadHandlers(deps: SessionReadDeps): void {
@@ -128,9 +131,12 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // ⚠️ IT DOES NOT ALWAYS VERIFY IT, and this comment used to say it did (review N3). The pull
       // refuses a certificate whose signature FAILS. It ACCEPTS one whose signature it cannot check
       // at all — when this daemon holds no key for the signer — and that case stopped being rare
-      // once `cello_contact_remove` began clearing a counterparty's pinned identity. The pull now
-      // logs `seal.certificate.pull.unverified` when that happens, so "recovered" and "recovered and
-      // verified" are distinguishable; they were not.
+      // once `cello_contact_remove` began clearing a counterparty's pinned identity.
+      //
+      // Logging that was not enough (review F5). The response below is what the AGENT reads, and it
+      // used to be byte-for-byte identical either way — so an operator could clear a contact, pull
+      // an old receipt, and hand it to a third party as proof. It is not proof. `verified` now rides
+      // on the response, with guidance naming the way back.
       if (deps.pullSealCertificate) {
         const pulled = await deps.pullSealCertificate(agentName, sessionId);
         if (pulled.ok) {
@@ -150,6 +156,20 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
               leaf_count: recoveredLeaves.length,
               content_leaf_count: recoveredLeaves.filter((l) => l.kind === "msg").length,
               legibility: recovered.legibility,
+              verified: pulled.verified === true,
+              ...(pulled.verified === true
+                ? {}
+                : {
+                    verification_note:
+                      "THIS RECEIPT'S SIGNATURE WAS NOT CHECKED. It was recovered from the directory " +
+                      "and recorded on the counterparty's word, because this agent holds no signing " +
+                      "key for them — most often because their pinned identity was cleared with " +
+                      "cello_contact_remove. Do not present it to a third party as proof.",
+                    guidance:
+                      "To get a verifiable receipt: start a new session with them, which re-pins " +
+                      "their identity, then ask them to re-seal. Nothing is wrong with the session " +
+                      "itself — only with what this side can independently prove about it.",
+                  }),
             };
           }
         }

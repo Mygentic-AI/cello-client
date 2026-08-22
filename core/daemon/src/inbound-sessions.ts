@@ -87,6 +87,25 @@ export interface InboundSessionEvent {
    * projected as current.
    */
   presentedSignalHashes?: string[];
+  /**
+   * HOW the session assignment was verified — and this is the one field on this event that changes
+   * what a careful agent should DO.
+   *
+   * `pinned` — the signature verified under the key THIS daemon recorded for this counterparty in
+   * an earlier session. No directory can produce that alone; a substitution is caught.
+   *
+   * `first_contact` — nothing was recorded for them yet, so the signature could only be checked
+   * against the assignment's own contents. That catches TAMPERING, and it cannot authenticate the
+   * directory at all: a hostile one that wins the race to your first contact with someone mints a
+   * keypair, signs a consistent assignment, and **that key becomes your permanent anchor for that
+   * person**. Every later session is then measured against it, and the seal path reads the same
+   * value as its trust anchor.
+   *
+   * Review F6: the distinction existed in a source comment and one log line, so `cello_inbox` and
+   * `cello_await_session` handed the agent a first-contact session that looked identical to a
+   * verified one. A detection whose only consumer is a log line is not a control.
+   */
+  verification?: "pinned" | "first_contact";
 }
 
 export interface InboundSessionWaiter {
@@ -725,6 +744,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     parsed: NonNullable<ReturnType<typeof extractInboundSessionAssignment>>,
     agentName: string,
     correlationId: string,
+    verification: "pinned" | "first_contact",
   ): Promise<void> {
     // M12-P16: refuse BEFORE anything else — in particular before ensureStandingReceiverForAgent,
     // whose first line would resurrect the receiver this agent was just relieved of.
@@ -1047,6 +1067,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         genesisPrevRootHex,
         offeredMoniker: parsed.offeredMoniker,
         presentedSignalHashes: presentedHashes,
+        verification,
       });
       dispatchSessionStateChangedWithTelegram(
         agentName,
@@ -1315,6 +1336,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * against. Pinned stays at debug — that one is the boring, good case.
      */
     const firstContact = verdict.mode === "internal";
+    // Carried to the AGENT, not just the log — review F6. `internal` is the wire word for the mode;
+    // `first_contact` is what it means to the person reading it.
+    const verification: "pinned" | "first_contact" = firstContact ? "first_contact" : "pinned";
     (firstContact ? logger.info : logger.debug)("session.inbound.assignment.verified", {
       sessionId: parsed.sessionIdHex,
       agentName: localAgent.name,
@@ -1353,7 +1377,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     // rebuild it triggers) settles. A throw inside one accept must not break the chain.
     const agentName = localAgent.name;
     inboundAcceptChain = inboundAcceptChain
-      .then(() => acceptInboundAssignment(parsed, agentName, correlationId))
+      .then(() => acceptInboundAssignment(parsed, agentName, correlationId, verification))
       .catch((err: unknown) => {
         inboundInFlight.delete(offerKey(localAgent.name, parsed.sessionIdHex));
         logger.error("session.inbound.accept.error", {
@@ -1530,6 +1554,21 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           counterparty_pubkey: e.counterpartyPubkeyHex,
           genesis_prev_root: e.genesisPrevRootHex,
           offered_moniker: e.offeredMoniker ?? null,
+          // Only present when this daemon actually established the session (the test seam at
+          // daemon.ts:3707 enqueues without one). Absent means "not recorded", never "pinned".
+          ...(e.verification === undefined ? {} : { verification: e.verification }),
+          ...(e.verification === "first_contact"
+            ? {
+                verification_note:
+                  "FIRST CONTACT. This counterparty's signing identity is being recorded now, and " +
+                  "there was nothing to check it against — the assignment proves only that it was " +
+                  "not altered after signing. From the next session on, a substituted identity IS " +
+                  "caught.",
+                guidance:
+                  "If this conversation matters, confirm their public key with them out of band — a " +
+                  "channel that is not this one — before relying on the seal.",
+              }
+            : {}),
           ...(trustSignalProjection ?? {}),
         };
       };
