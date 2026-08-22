@@ -47,6 +47,13 @@ import { acquireLock, removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
+import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
+import {
+  startRosterSweep,
+  classifyRosterReading,
+  describeRosterFreshness,
+  ROSTER_SWEEP_INTERVAL_MS,
+} from "./roster-freshness.js";
 import { SessionNodeManager, REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS } from "./session-node-manager.js";
 import { type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
@@ -384,6 +391,34 @@ async function startDaemonHoldingLock(
       initialUnresolvedSweptAt: startupSweptAt,
       logger,
     });
+
+  /**
+   * DOD-M15-STALEROSTER-1 — keep measuring directory reachability even when nothing is wrong.
+   *
+   * The sweep's only caller was the roster-aware endpoint resolver, which runs on the FAILOVER
+   * path. So the daemon measured only while it was unhealthy, and RECOVERING was precisely what
+   * stopped it from ever noticing it had recovered: the last failing reading became permanent for
+   * the life of the process. Measured twice, on two machines — node failures from minutes past
+   * displayed while `curl` reached all three nodes in 37–184 ms.
+   *
+   * Skipped when there is no manifest provider: with no verified manifest there are no nodes to
+   * probe, `resolveConsortiumRoster` returns null immediately, and a timer that can only ever
+   * re-measure nothing is noise. That case is not silent — it is the `never_measured` reading, which
+   * says so in `cello_status`.
+   */
+  const rosterSweepScheduler = manifestProvider
+    ? new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
+    : undefined;
+  const stopRosterSweep = rosterSweepScheduler
+    ? startRosterSweep({
+        scheduler: rosterSweepScheduler,
+        // FAST_PROBE is deliberately NOT used here. It exists because the failover resolver runs
+        // inside the 10 s signaling wait; nothing waits on this sweep, so it can afford the
+        // patient probe and give the more trustworthy answer.
+        sweep: () => resolveConsortiumRoster(),
+        logger,
+      })
+    : undefined;
 
   // DOD-REGISTRY-1: type registry poll — daemon-level, runs even with zero agents.
   // When registryPubkey is configured, the daemon polls GET /registry, verifies the inner
@@ -3405,21 +3440,46 @@ async function startDaemonHoldingLock(
    */
   function unresolvedNodesForStatus(): { directory_endpoints_unresolved: unknown } | undefined {
     const failures = getUnresolvedNodes();
-    if (failures.length === 0) return undefined;
+    /**
+     * DOD-M15-STALEROSTER-1 — the block is now gated on the AGE of the reading, not just on whether
+     * it found anything.
+     *
+     * `if (failures.length === 0) return undefined` made two different states render identically:
+     * "all three nodes answered a moment ago" and "nothing has ever looked". The second is
+     * reachable — `verifyStartupManifest` returns without sweeping when the consortium manifest is
+     * missing, not yet valid, EXPIRED, or rolled back — so a daemon with an expired manifest
+     * reported no directory trouble at all.
+     *
+     * Silence is therefore reserved for the one case that has earned it: a RECENT reading that
+     * found nothing wrong. Every other case says why it cannot make that claim.
+     */
+    const freshness = describeRosterFreshness(classifyRosterReading(getUnresolvedSweptAt(), Date.now()));
+    if (failures.length === 0 && !freshness.stale) return undefined;
     return {
       directory_endpoints_unresolved: {
-        // WHEN this was measured. Without it the block asserts the PRESENT, and a transient blip
-        // reads as an ongoing outage: on 2026-08-09 all three endpoints failed with ENETUNREACH for
-        // under a minute — a network transition on the operator's machine — and the block went on
-        // reporting them unreachable long after they answered again. True when taken, false when read.
-        checked_at: getUnresolvedSweptAt(),
+        // WHEN this was measured, and whether that is recent enough to mean anything. Without it the
+        // block asserts the PRESENT, and a transient blip reads as an ongoing outage: on 2026-08-09
+        // all three endpoints failed with ENETUNREACH for under a minute — a network transition on
+        // the operator's machine — and the block went on reporting them unreachable long after they
+        // answered again. True when taken, false when read.
+        ...freshness,
         // DOD-M15-BOOTSTRAP-1: `attempts` distinguishes a node that answered definitively (one
         // probe — a 404, a bad payload, its configuration) from one that never answered at all
         // (every probe spent — the path to it). Those call for opposite responses, and without the
         // count they rendered identically here.
         nodes: failures.map((f) => ({ node: f.nodeId, endpoint: f.endpoint, reason: f.reason, detail: f.detail, attempts: f.attempts })),
-        guidance:
-          "AS OF checked_at (this is a point-in-time reading, not necessarily now), this daemon could not "
+        guidance: failures.length === 0
+          // The block is present with an EMPTY node list, which before DOD-M15-STALEROSTER-1 could
+          // not happen. Saying "could not resolve these endpoints" here would be a flat lie — there
+          // are no endpoints listed and the point is that nothing was measured. The empty list is
+          // the ABSENCE of a reading, not a clean bill of health, and freshness_guidance above says
+          // which of the two it is.
+          ? "This block is present with NO nodes listed, which does not mean the nodes are healthy — " +
+            "it means this reading cannot support that claim. See freshness_guidance above for " +
+            "whether the daemon has never measured, or measured too long ago to speak for the " +
+            "present. Directory reachability is what threshold ceremonies depend on, so an " +
+            "unmeasured roster is an unknown, not an all-clear."
+          : "AS OF checked_at (this is a point-in-time reading, not necessarily now), this daemon could not "
           + "resolve these directory endpoints, so the consortium roster was short and " +
           "threshold ceremonies will fail — sessions surface that as home_node_reports_no_receiver, " +
           "home_node_not_in_reachable_roster, directory_named_no_home, directory_below_threshold or " +
@@ -4651,6 +4711,11 @@ async function startDaemonHoldingLock(
     if (manifestPollScheduler) {
       manifestPollScheduler.cancel();
     }
+    // DOD-M15-STALEROSTER-1: same discipline as the manifest poll — the stop function sets the
+    // flag so an in-flight sweep cannot re-arm, and the belt-and-suspenders cancel covers the
+    // scheduler-without-sweep case.
+    stopRosterSweep?.();
+    rosterSweepScheduler?.cancel();
     stopRegistryPoll?.();
     if (config.registryPollScheduler) {
       config.registryPollScheduler.cancel();
