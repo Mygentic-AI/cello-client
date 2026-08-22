@@ -1,50 +1,51 @@
 /**
- * DOD-M15-OFFER-SIGNED-1 — the unsigned frame that opens the door is checked against the signed one.
+ * DOD-M15-OFFER-SIGNED-1 — the two inbound refusals, exercised through the REAL handler.
  *
- * ─── Why this exists ───────────────────────────────────────────────────────────────────────────
+ * ─── What this unit does and does not do ───────────────────────────────────────────────────────
  *
- * `DOD-M15-ASSIGN-1` closed a real open door: an unclaimed standing receiver used to admit any peer
- * on the network. It narrows the gate to the peer named by the directory's `session_offer`.
+ * `DOD-M15-ASSIGN-1` narrows the standing receiver's gate to the peer the directory's `session_offer`
+ * names. That frame carries **no signature**, and Design Decision 2 says the socket is *"gated on
+ * the assignment"*. The offer stands in for it only because it is the one frame that arrives before
+ * the initiator can know where to dial.
  *
- * That frame carries **no signature**. On its own it hands whichever directory sent it unilateral
- * authority over who may dial this agent's receiver — the same trust concentration `ASSIGN-1`'s
- * other half exists to remove, one layer down. Design Decision 2 says the socket is *"gated on the
- * assignment"*, and the offer was standing in for it because it is the only frame that arrives
- * before the initiator can know where to dial.
+ * Two checks land on the assignment:
  *
- * Timing forced the offer. It does not excuse trusting it.
+ *   1. **Offer vs assignment agree on the dialer.** This is a CONSISTENCY check between two
+ *      channels, not an authentication of either — the responder does not verify the assignment's
+ *      signature (`session.inbound.assignment.unverified`, deferred to SESSION-004), so one
+ *      compromised directory controls both frames and simply says the same thing twice. It catches
+ *      an attacker who can influence one and not the other: a replayed or stale offer, a second node
+ *      injecting an offer for a session it is not brokering, a self-contradicting broken directory.
+ *      **It does not close this DoD line.**
  *
- * ─── What the offer/assignment comparison buys, and what it does NOT ───────────────────────────
+ *   2. **The counterparty's pinned threshold key has not changed.** This one a directory cannot
+ *      satisfy by repeating itself, because the anchor is what THIS daemon recorded during an
+ *      earlier session. Trust on first use: worth nothing the first time, hardening every session
+ *      after.
  *
- * The first version of this file claimed the assignment's FROST signature made the comparison a
- * counterbalance. It does not, and the reason matters: **the responder does not verify that
- * signature** (`session.inbound.assignment.unverified`, deferred to SESSION-004). So the comparison
- * is between an unsigned offer and an UNVERIFIED assignment, and one compromised directory controls
- * both — it names the same peer id twice and passes.
+ * ─── Why these drive `createInboundSessions` and not a local copy of the predicate ─────────────
  *
- * It is a CONSISTENCY check between two channels, not an authentication of either. That still
- * catches an attacker who can influence one frame and not the other — a replayed or stale offer, a
- * second node injecting an offer for a session it is not brokering, a directory whose two frames
- * disagree because it is broken. Worth having, smaller than it sounded.
+ * The first version of this file tested two helper functions it had defined ITSELF, importing
+ * nothing from the files the unit changed. All eight tests passed with the production checks fully
+ * deleted, and the whole file ran in 1 ms. I justified it as avoiding a two-daemon harness — and the
+ * counter-example was in the same milestone: `dod-m15-assign-1-wiring.test.ts` drives the real
+ * `createOutboundSessions` over a fake deps object. `createInboundSessions` takes the same shape,
+ * and `sharedSignaling` is the seam that hands frames to the real handler.
  *
- * ─── The actual counterbalance: this agent's own memory ────────────────────────────────────────
- *
- * The one thing a directory cannot rewrite is what this daemon recorded from EARLIER sessions with
- * the same counterparty. A directory that names a different threshold group key for someone you have
- * already completed sessions with is substituting an identity, and that is refused.
- *
- * Trust on first use — worth nothing the first time, and hardening every session after it.
+ * That was the THIRD hollow test on this branch. The rule earned: a test that imports nothing from
+ * the file it is named for is testing its own arithmetic.
  */
 
 import { describe, it, expect } from "vitest";
-import type { PeerId, MultiaddrConnection } from "@libp2p/interface";
-import { SessionConnectionGater } from "../session-connection-gater.js";
+import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
 import type { Logger } from "../types.js";
 
-function makeLogger(): { logger: Logger; events: Array<{ level: string; event: string; context: Record<string, unknown> }> } {
-  const events: Array<{ level: string; event: string; context: Record<string, unknown> }> = [];
-  const push = (level: string) => (event: string, context: Record<string, unknown>) => {
-    events.push({ level, event, context });
+interface LogEvent { level: string; event: string; context: Record<string, unknown> }
+
+function makeLogger(): { logger: Logger; events: LogEvent[] } {
+  const events: LogEvent[] = [];
+  const push = (level: string) => (event: string, context?: Record<string, unknown>) => {
+    events.push({ level, event, context: context ?? {} });
   };
   return {
     logger: { debug: push("debug"), info: push("info"), warn: push("warn"), error: push("error") },
@@ -52,96 +53,162 @@ function makeLogger(): { logger: Logger; events: Array<{ level: string; event: s
   };
 }
 
-function peer(label: string): PeerId {
-  return { toString: () => `12D3Koo${label}` } as PeerId;
-}
-
-const FAKE_CONN = {} as MultiaddrConnection;
+const AGENT = "alice";
+const AGENT_PUBKEY = "bb".repeat(32);
+const COUNTERPARTY = "aa".repeat(32);
+const SESSION_ID = new Uint8Array(16).fill(9);
+const REAL_DIALER = "12D3KooWRealInitiator";
 
 /**
- * The check itself, in the shape the daemon applies it: what the offer narrowed to, versus what the
- * signed assignment names. Extracted so the property can be exercised without standing up two
- * daemons, a directory and a FROST ceremony — the wiring is covered by the daemon's own suite.
+ * Build the real inbound handler over fakes, and return the levers a test needs: the frame injector,
+ * the captured log, and what the manager was asked.
  */
-function assignmentAgreesWithOffer(offered: string | null, assigned: string): boolean {
-  return offered === null || offered === assigned;
+function harness(opts: {
+  offeredDialer?: string | null;
+  pinnedPrimary?: string | null;
+}) {
+  const { logger, events } = makeLogger();
+  let inbound: ((frame: Record<string, unknown>) => void) | null = null;
+  const revoked: Array<{ agent: string; session: string }> = [];
+  const accepted: string[] = [];
+
+  const sessionNodeManager = {
+    getOfferedDialer: () => opts.offeredDialer ?? null,
+    clearOfferedDialer: () => {},
+    revokeOfferedDialer: async (agent: string, session: string) => {
+      revoked.push({ agent, session });
+    },
+    getPinnedCounterpartyPrimary: () => opts.pinnedPrimary ?? null,
+    getSessionRecord: () => undefined,
+    // Reaching this means neither refusal fired — the session was accepted.
+    ensureStandingReceiverForAgent: (agentName: string) => {
+      accepted.push(agentName);
+    },
+    getStandingReceiverReady: () => true,
+  };
+
+  const deps = {
+    logger,
+    sessionNodeManager,
+    agents: [{ name: AGENT, pubkey: AGENT_PUBKEY }],
+    sharedSignaling: {
+      registerInboundHandler(h: (frame: Record<string, unknown>) => void) {
+        inbound = h;
+        return () => {};
+      },
+    },
+    sendOver: async () => ({ ok: true }),
+    isExplicitlyOffline: () => false,
+    getConnState: () => undefined,
+    resolveCurrentAgent: () => AGENT,
+    NO_CURRENT_AGENT_RESPONSE: {},
+    getKeyProvider: () => undefined,
+    handleInboundSealInterruptedRequest: async () => {},
+    reapDeadHalfOpenSessions: () => {},
+    sendAwayResponse: async () => {},
+    dispatchSessionStateChangedWithTelegram: () => {},
+    sendTelegramDoorbell: async () => {},
+    isDeliveryOpenToAgent: () => false,
+  } as unknown as InboundSessionDeps;
+
+  createInboundSessions(deps);
+
+  /** Inject a `session_assignment` naming `assignedDialer` and `signerPubkey`. */
+  const inject = (assignedDialer: string, signerPubkey: string): void => {
+    inbound?.({
+      type: "session_assignment",
+      assignment: {
+        session_id: SESSION_ID,
+        participant_a: { pubkey: Buffer.from(COUNTERPARTY, "hex"), peer_id: "", multiaddrs: [] },
+        participant_b: { pubkey: Buffer.from(AGENT_PUBKEY, "hex"), peer_id: "", multiaddrs: [] },
+        relay_endpoint: { peer_id: "", multiaddrs: [] },
+        directory_endpoint: { peer_id: "", multiaddrs: [] },
+        session_timestamp: 1_700_000_000_000,
+        directory_pubkey: new Uint8Array(32),
+        directory_signature: new Uint8Array(64),
+        signature_type: "frost",
+        signer_pubkey: Buffer.from(signerPubkey, "hex"),
+        initiator_session_peer_id: assignedDialer,
+        initiator_session_addrs: ["/ip4/127.0.0.1/tcp/1"],
+        counterparty_session_peer_id: "12D3KooWReceiver",
+        counterparty_session_addrs: ["/ip4/127.0.0.1/tcp/2"],
+        transport_mode: "relay",
+      },
+    });
+  };
+
+  return { inject, events, revoked, accepted };
 }
 
-describe("DOD-M15-OFFER-SIGNED-1: the signed assignment must name the peer the offer did", () => {
-  it("REFUSES when the offer named one dialer and the signed assignment names another", () => {
-    // The attack: a compromised directory points the gate at a peer of its choosing in the unsigned
-    // offer, then produces a properly signed assignment for the real session. Before this check the
-    // receiver had already been opened to the attacker's peer and would be handed over.
-    expect(
-      assignmentAgreesWithOffer("12D3KooAttacker", "12D3KooRealInitiator"),
-      "a directory naming two different dialers for one session must not get the receiver",
-    ).toBe(false);
+const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
+
+describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the dialer", () => {
+  it("REFUSES when they name different dialers, and re-closes the gate it had opened", async () => {
+    // The gate was already narrowed to whoever the offer named. Refusing without re-closing would
+    // leave the door open to exactly the peer just declared unauthorised (review F4).
+    const h = harness({ offeredDialer: "12D3KooWAttacker" });
+    h.inject(REAL_DIALER, COUNTERPARTY);
+    await settle();
+
+    const refused = h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch");
+    expect(refused, "a disagreement between the two frames must refuse the session").toBeDefined();
+    expect(refused?.level).toBe("error");
+    expect(h.accepted, "nothing may be accepted after a refusal").toEqual([]);
+    expect(h.revoked.length, "the gate must be re-closed, not left open to the refused peer").toBe(1);
   });
 
-  it("ACCEPTS when both frames name the same dialer — the ordinary case", () => {
-    expect(assignmentAgreesWithOffer("12D3KooInitiator", "12D3KooInitiator")).toBe(true);
+  it("ACCEPTS when both name the same dialer", async () => {
+    const h = harness({ offeredDialer: REAL_DIALER });
+    h.inject(REAL_DIALER, COUNTERPARTY);
+    await settle();
+
+    expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
+    expect(h.revoked).toEqual([]);
   });
 
-  it("ACCEPTS when no offer was recorded — the assignment is then the only authority", () => {
-    /**
-     * Not every inbound path is preceded by an offer this daemon saw: a restart between the offer
-     * and the assignment loses the record, and the in-process test seams inject assignments
-     * directly.
-     *
-     * Treating "no offer recorded" as a mismatch would refuse those legitimately, and the
-     * assignment is the SIGNED document — the stronger of the two. So absence means the assignment
-     * stands alone, which is exactly what Decision 2 asks for; it is the DISAGREEMENT that is
-     * evidence, not the silence.
-     */
-    expect(assignmentAgreesWithOffer(null, "12D3KooInitiator")).toBe(true);
-  });
-});
+  it("ACCEPTS when no offer was recorded — absence is not disagreement", async () => {
+    // A restart between the two frames loses the record, and the in-process seams inject
+    // assignments directly. Treating that as a mismatch would refuse legitimate sessions to catch
+    // nothing; the assignment is the stronger document and stands alone.
+    const h = harness({ offeredDialer: null });
+    h.inject(REAL_DIALER, COUNTERPARTY);
+    await settle();
 
-describe("DOD-M15-OFFER-SIGNED-1: what the gate still guarantees while the offer stands alone", () => {
-  it("the receiver admits ONLY the offered dialer in the window before the assignment", () => {
-    // The offer's narrowing is still doing real work — it is what closes the window between the
-    // receiver advertising its address and the signed assignment arriving. The cross-check does not
-    // replace it; it stops that window being usable by a directory that lies in it.
-    const { logger } = makeLogger();
-    const gater = new SessionConnectionGater({ sessionId: "s", allowedPeerId: null, logger });
-
-    gater.admitInboundPeer(peer("Initiator").toString());
-
-    expect(gater.denyInboundEncryptedConnection(peer("Initiator"), FAKE_CONN)).toBe(false);
-    expect(gater.denyInboundEncryptedConnection(peer("Attacker"), FAKE_CONN)).toBe(true);
+    expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
   });
 });
 
-describe("DOD-M15-OFFER-SIGNED-1: the pinned counterparty key is the anchor a directory cannot rewrite", () => {
-  /** The pin comparison, in the shape the daemon applies it. */
-  function identityUnchanged(pinned: string | null, offered: string | null): boolean {
-    if (!offered) return true; // nothing named ⇒ nothing to contradict
-    return pinned === null || pinned === offered;
-  }
+describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change quietly", () => {
+  it("REFUSES when the directory names a different threshold key for a known counterparty", async () => {
+    // The one check in this path a compromised directory cannot satisfy by repeating itself: the
+    // anchor is what THIS daemon wrote during an earlier session.
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: "cc".repeat(32) });
+    h.inject(REAL_DIALER, "dd".repeat(32));
+    await settle();
 
-  it("REFUSES when the directory names a different group key for a known counterparty", () => {
-    // The substitution attack. Everything in the assignment is whatever the directory said, so this
-    // is the only check in the inbound path that a compromised directory cannot satisfy by simply
-    // repeating itself.
-    expect(
-      identityUnchanged("aa".repeat(32), "bb".repeat(32)),
-      "a counterparty's threshold group key changing under the same identity must not pass quietly",
-    ).toBe(false);
+    const refused = h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed");
+    expect(refused, "an identity substitution must not be accepted quietly").toBeDefined();
+    expect(refused?.level).toBe("error");
+    // The remedy has to be one that WORKS — review F2 found the printed one did not clear the pin.
+    expect(String(refused?.context["guidance"])).toMatch(/out of band/i);
+    expect(h.accepted).toEqual([]);
+    expect(h.revoked.length, "the gate must be re-closed here too").toBe(1);
   });
 
-  it("ACCEPTS the same key on every subsequent session — the ordinary case", () => {
-    expect(identityUnchanged("aa".repeat(32), "aa".repeat(32))).toBe(true);
+  it("ACCEPTS the same key on a later session — the ordinary repeat-counterparty case", async () => {
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: "cc".repeat(32) });
+    h.inject(REAL_DIALER, "cc".repeat(32));
+    await settle();
+
+    expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
   });
 
-  it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", () => {
-    // No prior session ⇒ nothing to compare. This is worth nothing the first time and everything
-    // after, and saying so is the difference between a bound and a gap.
-    expect(identityUnchanged(null, "aa".repeat(32))).toBe(true);
-  });
+  it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", async () => {
+    // Worth nothing the first time, and saying so is the difference between a bound and a gap.
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: null });
+    h.inject(REAL_DIALER, "dd".repeat(32));
+    await settle();
 
-  it("ACCEPTS an assignment that names no signer at all, rather than inventing a mismatch", () => {
-    // An older peer omits `signer_pubkey`. Absence is not contradiction — treating it as one would
-    // refuse legitimate sessions to catch nothing.
-    expect(identityUnchanged("aa".repeat(32), null)).toBe(true);
+    expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
   });
 });

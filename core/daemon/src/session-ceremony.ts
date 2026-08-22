@@ -53,7 +53,7 @@ export function wireSessionOfferHandler(deps: {
    * gate is already narrowed by the time anyone could know where to dial. Returns false when
    * there is no receiver or the offer named nobody.
    */
-  admitOfferedDialer: (initiatorSessionPeerId: string) => "narrowed" | "no_receiver" | "no_peer_named";
+  admitOfferedDialer: (initiatorSessionPeerId: string, sessionIdHex: string) => "narrowed" | "no_receiver" | "no_peer_named";
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -125,7 +125,9 @@ export function wireSessionOfferHandler(deps: {
        */
       const offeredDialerRaw = frame["initiator_session_peer_id"];
       const offeredDialer = typeof offeredDialerRaw === "string" ? offeredDialerRaw : "";
-      const narrowed = deps.admitOfferedDialer(offeredDialer);
+      // Keyed by SESSION (review F1): two overlapping offers to one agent must not overwrite
+      // each other's record, or a legitimate session is refused and the check disarms itself.
+      const narrowed = deps.admitOfferedDialer(offeredDialer, Buffer.from(sessionId).toString("hex"));
       if (narrowed !== "narrowed") {
         /**
          * Review F6 — ONE REASON PER CAUSE. This branch used to report `offer_named_no_dialer` for

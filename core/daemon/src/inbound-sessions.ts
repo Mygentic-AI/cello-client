@@ -1095,7 +1095,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * BLOCKS, because it is a security failure and not an anomaly: there is no reading of a
      * mismatch that is safe to continue from.
      */
-    const offered = sessionNodeManager.getOfferedDialer(localAgent.name);
+    const offered = sessionNodeManager.getOfferedDialer(localAgent.name, parsed.sessionIdHex);
     if (offered !== null && offered !== parsed.initiatorPeerId) {
       logger.error("session.inbound.assignment.dialer_mismatch", {
         sessionId: parsed.sessionIdHex,
@@ -1106,14 +1106,16 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         impact:
           "the session_offer named one dialer and the assignment names another, so something told this agent to open its receiver to a peer the session's own assignment does not name; the session was refused and the receiver was not handed over",
         guidance:
-          "this is not a transient fault — a truthful directory never names two dialers for one session. Retry to reach a different node; if it repeats, the directory that answered is not producing assignments that match its own offers",
+          "retry — the offer and the assignment for this session disagreed about who would dial, which a replayed or stale offer also produces, so a single occurrence is not evidence of a hostile directory. If it repeats on the same node, that node is not producing assignments that match its own offers",
       });
       // INVARIANT 2: loud in the log AND on a surface the agent can read. A refusal the operator
       // never sees is indistinguishable from the session simply never arriving — and this one is a
       // security refusal, which is the worst kind to be silent about. `cello_check_notifications`
       // reads this list.
       recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "offer_assignment_dialer_mismatch");
-      sessionNodeManager.clearOfferedDialer(localAgent.name);
+      // Review F4: the gate was already narrowed to the peer this offer named, so refusing without
+      // re-closing leaves the door open to exactly the peer just declared unauthorised.
+      void sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, correlationId);
       return;
     }
 
@@ -1198,12 +1200,12 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           impact:
             "the directory named a different threshold group key for a counterparty this agent has completed sessions with before; the session was refused and the receiver was not handed over, because accepting it would mean talking to whoever holds the new key under the old name",
           guidance:
-            "this is not transient. Either that counterparty genuinely re-registered with new keys — confirm with them OUT OF BAND, then remove the old contact so the new identity is pinned afresh — or the directory that answered is substituting an identity",
+            "this is not transient. Either that counterparty genuinely re-registered with new keys — confirm with them OUT OF BAND (on a channel that is not this one), then run cello_contact_remove for them, which now clears the pinned identity so the next session re-pins — or a directory is substituting an identity. Do not accept a session from them until you know which; from here the two look identical and only they can tell you.",
         });
         // INVARIANT 2, and this one most of all: a counterparty's identity key changing is exactly
         // the event an operator must be told about, and telling only the log tells nobody.
         recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "counterparty_primary_key_changed");
-        sessionNodeManager.clearOfferedDialer(localAgent.name);
+        void sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, correlationId);
         return;
       }
     }

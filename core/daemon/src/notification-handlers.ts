@@ -179,8 +179,9 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         counterparty_primary_key_changed:
           "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you " +
           "have completed sessions with before. Either they genuinely re-registered — confirm that " +
-          "with them OUT OF BAND (a channel that is not this one), then remove and re-add the " +
-          "contact so the new identity is pinned — or a directory is substituting an identity. " +
+          "with them OUT OF BAND (a channel that is not this one), then run cello_contact_remove for " +
+          "them — that clears the pinned identity, so the next session re-pins — or a directory is " +
+          "substituting an identity. " +
           "Do not accept a session from them until you know which.",
         offer_assignment_dialer_mismatch:
           "REFUSED ON PURPOSE. The directory's session offer named one dialer and the session " +

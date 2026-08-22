@@ -143,6 +143,18 @@ export class SessionConnectionGater implements ConnectionGater {
   }
 
   /**
+   * Return to admitting NOBODY inbound — the resting state of an unclaimed receiver.
+   *
+   * DOD-M15-OFFER-SIGNED-1 review F4: when an offer is refused after the gate was already narrowed
+   * to the peer it named, leaving that peer admitted means the code has declared someone
+   * unauthorised and left the door open to exactly them. Outbound latitude is untouched; this node
+   * is still the daemon's general-purpose dialer.
+   */
+  closeInbound(): void {
+    this.#allowedPeerId = null;
+  }
+
+  /**
    * Record that this receiver now holds a LIVE circuit reservation with `peerId`, which is what
    * earns that relay the inbound AutoNAT carve-out. Pass null when the reservation is lost.
    */

@@ -648,7 +648,18 @@ export class SessionNodeManager {
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
   /**
-   * agentName → the peer id the last `session_offer` named as the dialer.
+   * (agentName, sessionId) → the peer id that session's `session_offer` named as the dialer.
+   *
+   * KEYED BY SESSION, not by agent (review F1). Keyed by agent alone, two overlapping inbound
+   * sessions destroyed each other: offer P narrows to peer P, offer Q overwrites with peer Q, then
+   * assignment P arrives and MISMATCHES — refusing a legitimate session while accusing the directory
+   * of naming two dialers, which it had not. It then cleared Q's record too, so assignment Q passed
+   * unchecked. An attacker could therefore disarm the check by provoking one mismatch.
+   *
+   * The gap between offer and assignment spans a cross-region threshold ceremony, so overlapping
+   * sessions are ordinary, not exotic. `DOD-M15-OFFER-EXPIRY-1` already prescribed this fix shape —
+   * "bind the narrowing to the session id it came from" — and the session id was in hand at both
+   * ends the whole time.
    *
    * DOD-M15-OFFER-SIGNED-1: read back when the SIGNED assignment arrives, so an unsigned offer
    * cannot name a peer the signed document does not.
@@ -2267,8 +2278,40 @@ export class SessionNodeManager {
     if (!this.#db) return false;
     const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
     // DOD-RENAME-1: a removed contact has no pending rename to resolve.
-    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
+    if (res.changes > 0) {
+      this.clearRenameNotice(agentName, pubkey);
+      // DOD-M15-OFFER-SIGNED-1 (review F2): forgetting a contact must forget their PINNED identity
+      // too, or the pin outlives the relationship and there is no way back.
+      this.clearPinnedCounterpartyPrimary(agentName, pubkey);
+    }
     return res.changes > 0;
+  }
+
+  /**
+   * Forget the pinned threshold group key for a counterparty, so the next session re-pins.
+   *
+   * DOD-M15-OFFER-SIGNED-1 review F2 — WITHOUT THIS THE REFUSAL WAS PERMANENT. The identity-change
+   * check refuses a counterparty whose group key differs from the one recorded in an earlier
+   * session, and its guidance told the operator to confirm out of band and then remove the contact
+   * so the new identity is pinned afresh. `removeContact` deleted a row in `contacts`; the pin lives
+   * in `sessions.counterparty_primary_pubkey`, and nothing in the daemon ever cleared it.
+   *
+   * So an operator who did exactly as instructed — called their counterparty, confirmed the
+   * re-registration was genuine, removed the contact, retried — got the identical refusal, with no
+   * way out short of editing the database. A security control that cannot be reset by the person it
+   * protects is a lockout, and the printed remedy made it worse by reading as though it worked.
+   *
+   * Nulls the column rather than deleting the session rows: those rows are the transcript record,
+   * and a re-pin is not a reason to lose them.
+   */
+  clearPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): number {
+    if (!this.#db) return 0;
+    const res = this.#db
+      .prepare(
+        "UPDATE sessions SET counterparty_primary_pubkey = NULL, updated_at = ? WHERE agent_id = ? AND counterparty_pubkey = ?",
+      )
+      .run(Date.now(), this.#requireAgentId(agentName), counterpartyPubkeyHex);
+    return Number(res.changes);
   }
 
   /** MONIKER-4: the operator's pet name for a pubkey (whoLabel's top tier), or null. Read-only
@@ -2565,12 +2608,16 @@ export class SessionNodeManager {
    * — no assignment exists yet — so revoking its outbound latitude here would break content
    * parking and restart-seal submission (review F2).
    */
-  admitOfferedDialer(agentName: string, initiatorSessionPeerId: string): "narrowed" | "no_receiver" | "no_peer_named" {
+  admitOfferedDialer(
+    agentName: string,
+    initiatorSessionPeerId: string,
+    sessionIdHex: string,
+  ): "narrowed" | "no_receiver" | "no_peer_named" {
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) return "no_receiver";
     if (initiatorSessionPeerId === "") return "no_peer_named";
     sr.gater.admitInboundPeer(initiatorSessionPeerId);
-    this.#offeredDialer.set(agentName, initiatorSessionPeerId);
+    this.#offeredDialer.set(this.#k(agentName, sessionIdHex), initiatorSessionPeerId);
     return "narrowed";
   }
 
@@ -2589,13 +2636,36 @@ export class SessionNodeManager {
    * does, and which is exactly the move a compromised one would make to slip a peer past the gate
    * before the signed document arrives.
    */
-  getOfferedDialer(agentName: string): string | null {
-    return this.#offeredDialer.get(agentName) ?? null;
+  getOfferedDialer(agentName: string, sessionIdHex: string): string | null {
+    return this.#offeredDialer.get(this.#k(agentName, sessionIdHex)) ?? null;
   }
 
-  /** Forget the offered dialer once a session is claimed or abandoned. */
-  clearOfferedDialer(agentName: string): void {
-    this.#offeredDialer.delete(agentName);
+  /** Forget the offered dialer for ONE session, once it is claimed or refused. */
+  clearOfferedDialer(agentName: string, sessionIdHex: string): void {
+    this.#offeredDialer.delete(this.#k(agentName, sessionIdHex));
+  }
+
+  /**
+   * RE-CLOSE the standing receiver and hang up whoever the refused offer let in.
+   *
+   * DOD-M15-OFFER-SIGNED-1 review F4. When the inbound path refuses an assignment, the gate has
+   * ALREADY been narrowed to the peer that offer named — so the code declares a peer unauthorised
+   * and then leaves the door open to exactly it. libp2p never re-runs a gater against a live
+   * connection, so a peer that connected in the meantime stays connected until some later promotion
+   * sweeps it. `DOD-M15-FRAME-1`'s frame gate stops it doing anything, which makes this a foothold
+   * rather than an open door — and a foothold is precisely what that sweep exists to remove.
+   *
+   * Returns to admitting NOBODY, which is the correct resting state for an unclaimed receiver: this
+   * session is not happening, so nobody is expected to dial.
+   */
+  async revokeOfferedDialer(agentName: string, sessionIdHex: string, correlationId: string): Promise<void> {
+    this.clearOfferedDialer(agentName, sessionIdHex);
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr) return;
+    sr.gater.closeInbound();
+    // No allowed peer any more: everyone inbound is outside the gate. `""` matches no peer id,
+    // and the relay allowances are exempted inside the sweep so reachability survives.
+    await this.#evictPeersOutsideGate(sr.node, sr.gater, `standing_receiver:${agentName}`, "", correlationId);
   }
 
   /**
