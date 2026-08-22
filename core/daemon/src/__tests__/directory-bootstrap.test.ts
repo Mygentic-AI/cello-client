@@ -128,7 +128,9 @@ describe("fetchBootstrapResult failure classification", () => {
       throw undiciError("ENOTFOUND");
     });
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "ENOTFOUND" });
+    // DOD-M15-BOOTSTRAP-1: `attempts` is asserted rather than matched loosely, so these classification
+    // tests also pin the retry policy — a DNS blip is TRANSIENT and gets the full three probes.
+    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "ENOTFOUND", attempts: 3 });
   });
 
   it("classifies EAI_AGAIN as dns_error", async () => {
@@ -136,7 +138,7 @@ describe("fetchBootstrapResult failure classification", () => {
       throw undiciError("EAI_AGAIN");
     });
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "EAI_AGAIN" });
+    expect(r).toEqual({ ok: false, reason: "dns_error", detail: "EAI_AGAIN", attempts: 3 });
   });
 
   it("classifies ECONNREFUSED as connect_error", async () => {
@@ -144,7 +146,7 @@ describe("fetchBootstrapResult failure classification", () => {
       throw undiciError("ECONNREFUSED");
     });
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: false, reason: "connect_error", detail: "ECONNREFUSED" });
+    expect(r).toEqual({ ok: false, reason: "connect_error", detail: "ECONNREFUSED", attempts: 3 });
   });
 
   it("classifies an AbortError as timeout", async () => {
@@ -152,13 +154,15 @@ describe("fetchBootstrapResult failure classification", () => {
       throw Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
     });
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: false, reason: "timeout", detail: "AbortError" });
+    expect(r).toEqual({ ok: false, reason: "timeout", detail: "AbortError", attempts: 3 });
   });
 
   it("classifies non-2xx as http_error with the status", async () => {
     const fetchFn = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) }) as unknown as Response);
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: false, reason: "http_error", detail: "503" });
+    // DETERMINISTIC — the server answered. One probe, not three: retrying spends the budget to
+    // receive the same 503 again and delays every other node in the roster.
+    expect(r).toEqual({ ok: false, reason: "http_error", detail: "503", attempts: 1 });
   });
 
   it("classifies unparseable JSON as bad_response", async () => {
@@ -181,7 +185,8 @@ describe("fetchBootstrapResult failure classification", () => {
   it("returns ok+multiaddr on success", async () => {
     const fetchFn = vi.fn(async () => jsonResponse({ multiaddr: MULTIADDR }));
     const r = await fetchBootstrapResult("http://dir.example", fetchFn as unknown as typeof fetch);
-    expect(r).toEqual({ ok: true, multiaddr: MULTIADDR });
+    // The happy path costs exactly ONE probe — the retry must not add latency when nothing is wrong.
+    expect(r).toEqual({ ok: true, multiaddr: MULTIADDR, attempts: 1 });
   });
 });
 

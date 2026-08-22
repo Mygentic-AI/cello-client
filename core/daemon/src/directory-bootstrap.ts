@@ -83,8 +83,38 @@ export function resolveDirectoryUrl(env: Record<string, string | undefined> = pr
 export type BootstrapFailureReason = "dns_error" | "connect_error" | "timeout" | "http_error" | "bad_response";
 
 export type BootstrapResult =
-  | { ok: true; multiaddr: string }
-  | { ok: false; reason: BootstrapFailureReason; detail?: string };
+  | { ok: true; multiaddr: string; /** How many probes it took. 1 on the happy path. */ attempts?: number }
+  | { ok: false; reason: BootstrapFailureReason; detail?: string; /** How many probes were spent. */ attempts?: number };
+
+/**
+ * DOD-M15-BOOTSTRAP-1 — retry budget for the bootstrap probe.
+ *
+ * Three attempts at 8 s, capped at 20 s in total. The numbers come from a measurement, not a guess:
+ * over a mobile link one probe returned at **16.2 s** and another returned nothing in 30 s, while
+ * the old code gave each node ONE attempt with a 5-second deadline. A packet lost during the TCP
+ * handshake is abandoned inside the retransmit backoff, and the node is dropped from the roster —
+ * for a normal user, on a normal lossy link, with nothing wrong anywhere in the system.
+ *
+ * A LONGER DEADLINE ALONE DOES NOT FIX IT, which is the counter-intuitive part and the reason this
+ * is a retry rather than a bigger number: the win comes from a FRESH CONNECTION. Waiting 20 s on
+ * the original socket keeps waiting on the same lost handshake; a new `fetch` starts a new one.
+ *
+ * The total cap exists so a genuinely dead node cannot hold startup for a minute — the roster has
+ * other nodes to try, and spending 3 × 8 s on the first one delays reaching them.
+ */
+const PROBE_ATTEMPTS = 3;
+const PROBE_TIMEOUT_MS = 8_000;
+const PROBE_TOTAL_BUDGET_MS = 20_000;
+
+/**
+ * Failure classes worth a second look. A lost packet, a DNS server that blinked, a connection
+ * refused during a node restart — all of these can succeed on a fresh connection moments later.
+ *
+ * `http_error` and `bad_response` are NOT here, deliberately: a 404, a 500, or a payload without a
+ * `/p2p/` is a deterministic answer from a server that IS reachable. Retrying it spends the whole
+ * budget to receive the same reply three times and delays every other node in the roster.
+ */
+const RETRYABLE: ReadonlySet<BootstrapFailureReason> = new Set(["timeout", "connect_error", "dns_error"]);
 
 /** DNS-level getaddrinfo failures vs transport-level connection failures. */
 const DNS_CODES = new Set(["ENOTFOUND", "EAI_AGAIN"]);
@@ -118,10 +148,35 @@ function classifyFetchError(err: unknown): { reason: BootstrapFailureReason; det
 export async function fetchBootstrapResult(
   directoryUrl: string,
   fetchFn: typeof fetch = fetch,
+  nowMs: () => number = Date.now,
 ): Promise<BootstrapResult> {
+  const started = nowMs();
+  let last: BootstrapResult = { ok: false, reason: "connect_error", detail: "no attempt was made" };
+
+  for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+    last = await probeOnce(directoryUrl, fetchFn);
+    if (last.ok) return { ...last, attempts: attempt };
+    if (!RETRYABLE.has(last.reason)) return { ...last, attempts: attempt };
+
+    // Stop if another full attempt cannot finish inside the budget — better to let the caller move
+    // on to the next node than to spend the remainder proving this one is still unreachable.
+    const spent = nowMs() - started;
+    if (attempt === PROBE_ATTEMPTS || spent + PROBE_TIMEOUT_MS > PROBE_TOTAL_BUDGET_MS) {
+      return { ...last, attempts: attempt };
+    }
+  }
+  return { ...last, attempts: PROBE_ATTEMPTS };
+}
+
+/**
+ * ONE probe, on its OWN connection. Separated from the retry loop above precisely because the fresh
+ * connection is the mechanism — each call is a new `fetch`, so a handshake lost in TCP backoff is
+ * abandoned rather than waited out.
+ */
+async function probeOnce(directoryUrl: string, fetchFn: typeof fetch): Promise<BootstrapResult> {
   const bootstrapUrl = `${directoryUrl.replace(/\/$/, "")}/bootstrap`;
   const ac = new AbortController();
-  const timeout = setTimeout(() => ac.abort(), 5000);
+  const timeout = setTimeout(() => ac.abort(), PROBE_TIMEOUT_MS);
   try {
     let resp: Response;
     try {
@@ -265,6 +320,10 @@ export async function manifestNodesToEndpoints(
           endpoint: node.endpoint,
           reason: probe.reason,
           detail: probe.detail,
+          // DOD-M15-BOOTSTRAP-1: how many probes were spent before giving up. Without it, a node
+          // dropped after one deterministic 404 and a node dropped after three timed-out probes on
+          // a lossy link read identically — and they call for opposite responses.
+          attempts: probe.attempts,
         });
         opts.onNodeUnresolved?.({
           nodeId: node.nodeId,
@@ -273,6 +332,24 @@ export async function manifestNodesToEndpoints(
           detail: probe.detail,
         });
         return null;
+      }
+      /**
+       * DOD-M15-BOOTSTRAP-1 — a node that only answered on a RETRY is not the same as one that
+       * answered first time, and a silent success hides that difference.
+       *
+       * This is the operator's early warning: the link to that node is losing packets. Before the
+       * retry existed, the same conditions dropped it from the roster outright, and the log said
+       * only "unresolved". Reported at INFO, not WARN — nothing is wrong yet, and a warning that
+       * fires on a recovered probe would be noise.
+       */
+      if ((probe.attempts ?? 1) > 1) {
+        opts.logger.info("directory.consortium.node.resolved_after_retry", {
+          nodeId: node.nodeId,
+          endpoint: node.endpoint,
+          attempts: probe.attempts,
+          impact:
+            "this node answered only after a repeated probe, which means the path to it is dropping packets; before the retry existed this node would have been skipped entirely",
+        });
       }
       const multiaddr = probe.multiaddr;
       const peerId = parsePeerIdFromMultiaddr(multiaddr);
