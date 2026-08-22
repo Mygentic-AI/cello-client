@@ -186,12 +186,30 @@ server.tool("cello_agents", "List all agents with state from this connection's p
 });
 
 // ─── Contact whitelist tools (CC-9) ─────────────────────────────────────────
+//
 // The per-agent whitelist is load-bearing: a known contact is fast-tracked and exempt from the
-// unknown-sender gate + the ABUSE-1 acceptance caps. Those caps ARE enforced. CONTENT screening
-// (prompt-injection defense) IS live as of DOD-M9B-WIRE-1 — the daemon spawns the screening
-// sidecar and runs enforcing; this comment previously said the opposite, which was true when the
-// layer was inert and shipped in the tarball claiming so
-// description here may tell the operator's agent that message text is screened.
+// unknown-sender gate and the ABUSE-1 acceptance caps. Those caps ARE enforced.
+//
+// ⚠️ CONTENT SCREENING IS TWO LAYERS LIVE AND ONE OFF, and the difference is the whole reason this
+// comment is here rather than a cheerful one-liner (`DOD-M15-CLAIM-COMMENTS-1`).
+//
+//   Layer 1 (deterministic sanitizer) and Layer 3 (pattern matcher) — LIVE. The daemon spawns the
+//   screening sidecar and it runs enforcing, as of DOD-M9B-WIRE-1.
+//
+//   Layer 2, the one that judges MEANING — OFF on any ordinary install. It loads only if an ONNX
+//   classifier is present at ~/.cello/gateway-model (`cello-gateway.ts`, `loadInjectionClassifier`),
+//   and nothing ships one. The gateway announces which it got on its ready line as
+//   `layer2=active` or `layer2=off:<reason>`; on a normal install it is the second.
+//
+// So "message content is screened" is TRUE, and "prompt-injection defense is fully active" is NOT.
+// Anything an operator reads — a tool description on this file, skill prose, status output — must
+// not collapse the two. `DOD-M15-CLAIM-SCREEN-1` is that rule; `DOD-M15-SCREENINSTALL-1` is the
+// work that would make the stronger sentence true.
+//
+// This comment previously asserted the opposite of the truth in BOTH directions at different times
+// — first that screening was inert after it had been wired, then that it was live without naming
+// the layer that is not. It is rewritten rather than deleted on purpose: it is the evidence that
+// the distinction is easy to lose, and the next person to touch a description here needs it.
 
 server.tool("cello_contacts", "List an agent's contact whitelist — the peers it treats as known/trusted (fast-tracked, exempt from the unknown-sender gate and anti-spam caps). Defaults to the current agent; pass { agent } to target another.", {
   agent: z.string().optional().describe("Agent name whose whitelist to list (defaults to the current agent)"),
