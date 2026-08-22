@@ -47,7 +47,16 @@ function resolve(opts: {
   online: string[];
   explicit?: string;
 }): Recorded {
-  let recorded: Recorded = { agent: null, trigger: "none" };
+  /**
+   * `undefined` until reported — NOT pre-seeded with a plausible default.
+   *
+   * It was initialised to `{agent:null, trigger:"none"}`, which made the "reports a trigger on
+   * EVERY path" test below VACUOUS: a branch that returned without reporting left the initialiser
+   * in place, `expect(agent).toBe(recorded.agent)` compared null to null and passed, and the test
+   * named after the property asserted nothing about it. Review found it by mutating a `return
+   * report(null,"none")` into a bare `return null` — green.
+   */
+  let recorded: Recorded | undefined;
   const agent = resolveCurrentAgentFor({
     connState: {
       currentAgent: opts.currentAgent ?? null,
@@ -58,8 +67,13 @@ function resolve(opts: {
     ...(opts.explicit !== undefined ? { explicitAgent: opts.explicit } : {}),
     onResolved: (a, t) => { recorded = { agent: a, trigger: t }; },
   });
-  expect(agent, "the returned agent and the reported agent must be the same thing").toBe(recorded.agent);
-  return recorded;
+  expect(
+    recorded,
+    "this resolution reported NOTHING — the branch it took has no attribution, which is the defect " +
+      "DOD-M15-IPCVISIBLE-1 exists to remove",
+  ).toBeDefined();
+  expect(agent, "the returned agent and the reported agent must be the same thing").toBe(recorded!.agent);
+  return recorded!;
 }
 
 describe("DOD-M15-SELECTION-1: a live session is never bound to an agent it did not choose", () => {

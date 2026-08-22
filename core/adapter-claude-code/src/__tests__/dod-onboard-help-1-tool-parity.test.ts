@@ -60,9 +60,17 @@ const SHIPPED_DOCS = (PKG.files ?? [])
   .filter((f) => f.endsWith(".md"))
   .map((f) => ({ name: f, text: readFileSync(join(here, "..", "..", f), "utf8") }));
 
-/** Every tool the shim entrypoint registers — the surface an operator's MCP client actually sees. */
+/**
+ * Every tool the shim entrypoint registers — the surface an operator's MCP client actually sees.
+ *
+ * `\s*` between `server.tool(` and the name, because FORMATTING MUST NOT HIDE A TOOL FROM THE AUDIT.
+ * The pattern required them on one line; `DOD-M15-BACKUP-1` gave `cello_backup` a real parameter
+ * schema and a long description, prettier wrapped the call, and the tool vanished from this scan —
+ * reported as "not registered" while being perfectly registered. A source audit that a line break
+ * can defeat is measuring the layout, not the surface.
+ */
 function registeredTools(): string[] {
-  return [...source.matchAll(/server\.tool\("(cello_[a-z_]+)"/g)].map((m) => m[1]).sort();
+  return [...source.matchAll(/server\.tool\(\s*"(cello_[a-z_]+)"/g)].map((m) => m[1]).sort();
 }
 
 describe("DOD-ONBOARD-HELP-1 §2b — CLI ↔ MCP name parity", () => {

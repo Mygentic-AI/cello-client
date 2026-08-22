@@ -32,8 +32,8 @@ import { describe, it, expect } from "vitest";
 import { buildChannelParams } from "../channel-params.js";
 
 /** Every doorbell type the shim can forward, from the switch that renders them. */
-const INBOX_DOORBELLS = ["cello_message", "cello_session_request"] as const;
-const HOUSEKEEPING = ["shutdown", "daemon_reconnected", "agent_state_changed", "agent_current_changed"] as const;
+const INBOX_DOORBELLS = ["cello_message", "cello_session_request", "daemon_reconnected"] as const;
+const HOUSEKEEPING = ["shutdown", "agent_state_changed", "agent_current_changed"] as const;
 
 describe("DOD-M15-DOORBELL-1: a shutdown is distinguishable from an invitation to read", () => {
   it("shutdown carries a disposition an agent can BRANCH on, not just prose", () => {

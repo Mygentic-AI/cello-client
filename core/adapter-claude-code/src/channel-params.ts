@@ -226,7 +226,20 @@ export function buildChannelParams(
  */
 const HOUSEKEEPING_TYPES = new Set([
   "shutdown",
-  "daemon_reconnected",
   "agent_state_changed",
   "agent_current_changed",
 ]);
+
+/**
+ * `daemon_reconnected` is NOT housekeeping — review F9, and marking it `none` was a new way to miss
+ * a message.
+ *
+ * It fires when the daemon has been DOWN, which is exactly the window in which unread mail
+ * accumulates and in which any doorbell the daemon dispatched had no connection to route to. The
+ * body says "Tools work again"; marking it `none` told the agent not to look. Before this field
+ * existed, an agent following "doorbell → read the inbox" would have caught up; the first version
+ * of this unit stopped it doing so.
+ *
+ * It is the one wake-up where there genuinely may be something waiting, which is the file's own
+ * stated bias: defaulting toward reading costs one empty inbox call.
+ */
