@@ -48,8 +48,28 @@ function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-ty
   if (!pubkey || pubkey.length !== 32) return null;
   const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : null;
   if (!peerId) return null;
-  const multiaddrs = parseStringArray(r["multiaddrs"]);
-  if (!multiaddrs) return null;
+  /**
+   * `multiaddrs` IS TOLERATED, NOT VALIDATED — `DOD-M15-DEAD-WIRE-FIELD-1`.
+   *
+   * It has been permanently `[]` on every session assignment since the directory-facing node
+   * stopped listening. The directory stores it and SIGNS NOTHING over it — neither the session nor
+   * the relay TBS includes it — and the only read of a parsed participant takes `.pubkey`.
+   *
+   * Rejecting the WHOLE assignment when it was malformed therefore ended a conversation over a
+   * value that cannot affect anything and that no signature protects: a checked-then-ignored, and
+   * the refusing half is the one that costs. Absent or malformed now yields `[]`, which is what it
+   * always is in practice.
+   *
+   * ⚠️ NOT the same field on `parseEndpointInfo` below. Those multiaddrs belong to the RELAY and
+   * DIRECTORY endpoints and are DIALED — a malformed one is a session that cannot connect, worth
+   * refusing at the boundary rather than discovering at dial time. Identical name, adjacent
+   * function, one dead and one load-bearing.
+   *
+   * Removing the field from the wire is bilateral and rides with the other pending wire changes so
+   * the two repos move once; accepting its ABSENCE here is what makes this client already
+   * compatible when that lands.
+   */
+  const multiaddrs = parseStringArray(r["multiaddrs"]) ?? [];
   return { pubkey, peer_id: peerId, multiaddrs };
 }
 
