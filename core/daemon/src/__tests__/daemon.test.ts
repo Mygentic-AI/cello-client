@@ -282,6 +282,46 @@ describe("daemon", () => {
     expect(shutdownDisconnect).toBeDefined();
   });
 
+  it("DOD-M15-IPCVISIBLE-1: a sole-online FALLBACK announces itself", async () => {
+    /**
+     * The last of the three, and it had no test — the reviewer measured that deleting the log call
+     * left the gate green, because every test in `dod-m15-selection-1.test.ts` injects its own
+     * `onResolved` and never reaches the daemon's logger.
+     *
+     * What it buys: an operator's explicit selection, the shim's reconnect replay, and a fallback
+     * nobody made used to arrive identically. Two switches fired one second after a reconnect on
+     * 2026-08-09 and neither could be attributed.
+     *
+     * The `impact` line is the load-bearing half — the fallback gives this CALL a subject but does
+     * NOT register the connection for doorbells, so a session can send and receive while never
+     * waking, which reads as the protocol dropping messages.
+     */
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connectToDaemon(config.socketPath);
+    await client.send("ipc.connect", { clientType: "cli" });
+    await client.send("cello_create_agent", { name: "solo" });
+    await client.send("cello_start_agent", { name: "solo" });
+
+    const before = logEvents.length;
+    // A name-defaulting tool with NO selection made: this is the fallback path.
+    await client.send("cello_list_sessions", {});
+    client.close();
+
+    const fallback = logEvents.slice(before).find((e) => e.event === "agent.current.fallback");
+    expect(
+      fallback,
+      "the fallback resolved a subject and said nothing — indistinguishable from a selection the " +
+        "operator actually made, which is the defect this line exists to remove",
+    ).toBeDefined();
+    expect(fallback?.context["agentName"]).toBe("solo");
+    expect(
+      String(fallback?.context["impact"]),
+      "it must say this is a per-call subject and NOT an attendance — doorbells route by the " +
+        "connection's registered agent, which the fallback does not set",
+    ).toMatch(/not an attendance/i);
+  });
+
   it("DOD-M15-IPCVISIBLE-1: `selected` is annotated as THIS connection's view", async () => {
     /**
      * Clause 3, and the reason it is an annotation rather than a rename: every `cello` CLI
