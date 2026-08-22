@@ -46,7 +46,11 @@ export interface IpcServerConfig {
   logger: Logger;
 }
 
-export type IpcDisconnectHandler = (connectionId: string) => void;
+/**
+ * Returns context to MERGE into the single `daemon.ipc.disconnected` line — see the close handler.
+ * Returning nothing is fine; a second log line from the handler is not (review F8).
+ */
+export type IpcDisconnectHandler = (connectionId: string) => Record<string, unknown> | void;
 
 export interface IpcServer {
   start(): Promise<void>;
@@ -170,8 +174,20 @@ export function createIpcServer(
     socket.on("close", () => {
       connections.delete(connectionId);
       const reason = conn.shutdownReason || "client_closed";
-      logger.info("daemon.ipc.disconnected", { connectionId, reason });
-      if (disconnectHandler) disconnectHandler(connectionId);
+      /**
+       * ONE LINE, and the handler contributes to it — review F8.
+       *
+       * `DOD-M15-IPCVISIBLE-1` added a SECOND `daemon.ipc.disconnected` from the daemon's own
+       * handler, carrying clientType and the attended agent. Two lines under one event name, with
+       * disjoint fields and neither carrying the whole picture — and a naive count doubled, so a
+       * shutdown with five clients emitted ten. For a unit whose entire subject is that the log is
+       * readable, that is the wrong shape.
+       *
+       * The handler now RETURNS its context and it is merged here. `reason` lives on this side
+       * because only the socket knows it.
+       */
+      const extra = disconnectHandler ? disconnectHandler(connectionId) : undefined;
+      logger.info("daemon.ipc.disconnected", { connectionId, reason, ...(extra ?? {}) });
     });
 
     // Set shutdownReason so the 'close' handler (which always fires after 'error') logs it.

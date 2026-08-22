@@ -282,6 +282,45 @@ describe("daemon", () => {
     expect(shutdownDisconnect).toBeDefined();
   });
 
+  it("DOD-M15-IPCVISIBLE-1: the disconnect line carries WHO was attending, in ONE line", async () => {
+    /**
+     * Neither half of this had a test — review, and both failed the revert test: deleting the
+     * daemon's whole disconnect block left the suite green, because the assertions above are
+     * satisfied by the pre-existing `ipc-server` line alone.
+     *
+     * The attended agent is the field that matters. Attendance dropping was silent, and an agent
+     * losing its LAST attendee changes whether away-messages fire and who receives doorbells — so a
+     * session that mysteriously stopped waking was not diagnosable from the log.
+     *
+     * ONE line, asserted as one: it briefly became two under the same event name with disjoint
+     * fields, which doubled every count and left neither carrying the whole picture.
+     */
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connectToDaemon(config.socketPath);
+    await client.send("ipc.connect", { clientType: "mcp" });
+
+    const before = logEvents.length;
+    client.close();
+    await new Promise((r) => setTimeout(r, 150));
+
+    const lines = logEvents.slice(before).filter((e) => e.event === "daemon.ipc.disconnected");
+    expect(
+      lines.length,
+      `Expected exactly ONE disconnect line, got ${lines.length}. Two lines under one event name ` +
+        `double every count and split the fields across them.`,
+    ).toBe(1);
+
+    const ctx = lines[0]!.context;
+    expect(ctx["reason"], "the socket's own cause still rides").toBeDefined();
+    expect(ctx["clientType"], "which kind of client left").toBe("mcp");
+    expect(
+      "attendedAgent" in ctx,
+      "the agent this connection was attending — the field that makes a stopped-waking session " +
+        "diagnosable from the log",
+    ).toBe(true);
+  });
+
   it("logs daemon.ipc.disconnected with actual error.message on socket error (AC-010)", async () => {
     const config = makeConfig();
     handle = await startDaemon(config);

@@ -4463,8 +4463,10 @@ async function startDaemonHoldingLock(
     const stillAttending = closing?.currentAgent
       ? countAttendance(perConnectionState, closing.currentAgent) - 1
       : null;
-    logger.info("daemon.ipc.disconnected", {
-      connectionId,
+    // RETURNED, not logged here — `ipcServer` merges this into its single
+    // `daemon.ipc.disconnected` line. A second line under the same name left neither carrying the
+    // whole picture and doubled every count (review F8).
+    const disconnectContext: Record<string, unknown> = {
       clientType: closing?.clientType ?? "unknown",
       attendedAgent: closing?.currentAgent ?? null,
       ...(stillAttending !== null ? { remainingAttendance: stillAttending } : {}),
@@ -4475,7 +4477,7 @@ async function startDaemonHoldingLock(
               "its away message rather than a live reply, and its doorbells reach nobody",
           }
         : {}),
-    });
+    };
     perConnectionState.delete(connectionId);
     connectionCursors.delete(connectionId); // M8C-CURSOR-1: cursor is connection-scoped, dies with it
     // ...and so is the delivery bookmark (review F1). It is a SEPARATE map from the gate's cursor
@@ -4504,6 +4506,7 @@ async function startDaemonHoldingLock(
       if (survivors.length > 0) inboundSessionWaiters.set(agentName, survivors);
       else inboundSessionWaiters.delete(agentName);
     }
+    return disconnectContext;
   });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
