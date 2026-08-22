@@ -1064,6 +1064,45 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       return;
     }
 
+    /**
+     * DOD-M15-OFFER-SIGNED-1 — THE SIGNED ASSIGNMENT MUST NAME THE PEER THE OFFER DID.
+     *
+     * Decision 2 rules that the listening socket is "gated on the assignment". The gate is actually
+     * narrowed from `session_offer`, which carries NO signature, because that is the only frame that
+     * arrives before the initiator can know where to dial. Timing forced the offer; it does not
+     * excuse trusting it — on its own it hands whichever directory sent that frame unilateral
+     * authority over who may dial this agent's receiver.
+     *
+     * This is the counterbalance. The assignment is FROST-signed by the INITIATOR's own threshold
+     * group, which no single directory can produce, and it names the same `initiator_session_peer_id`.
+     * So the unsigned frame that opened the door is checked against the signed one that authorises
+     * it, and the two must agree.
+     *
+     * A truthful directory never names two different dialers for one session. A compromised one
+     * doing exactly that — pointing the gate at a peer of its choosing in the offer, then producing
+     * a signed assignment for the real session — is the attack this closes, and it is caught BEFORE
+     * `acceptSession` hands over the receiver.
+     *
+     * BLOCKS, because it is a security failure and not an anomaly: there is no reading of a
+     * mismatch that is safe to continue from.
+     */
+    const offered = sessionNodeManager.getOfferedDialer(localAgent.name);
+    if (offered !== null && offered !== parsed.initiatorPeerId) {
+      logger.error("session.inbound.assignment.dialer_mismatch", {
+        sessionId: parsed.sessionIdHex,
+        agentName: localAgent.name,
+        offeredPeerId: offered,
+        assignedPeerId: parsed.initiatorPeerId,
+        correlationId,
+        impact:
+          "the unsigned session_offer named one dialer and the FROST-signed assignment names another, so the directory told this agent to open its receiver to a peer its own signed document does not authorise; the session was refused and the receiver was not handed over",
+        guidance:
+          "this is not a transient fault — a truthful directory never names two dialers for one session. Retry to reach a different node; if it repeats, the directory that answered is not producing assignments that match its own offers",
+      });
+      sessionNodeManager.clearOfferedDialer(localAgent.name);
+      return;
+    }
+
     // DOD-INBOUND-GUARD-1 (D3): the receive-side mirror of the initiator's F13 guard (~3189).
     // An empty counterparty endpoint means the offer-accept never happened (this agent's standing
     // receiver was not up when the directory's session_offer arrived) and the directory signed the

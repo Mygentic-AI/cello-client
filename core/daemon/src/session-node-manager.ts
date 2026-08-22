@@ -647,6 +647,13 @@ export class SessionNodeManager {
 
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; hasReservation: boolean; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; relayPeerId?: string }>();
   #standingReceiverCreating = new Set<string>();
+  /**
+   * agentName → the peer id the last `session_offer` named as the dialer.
+   *
+   * DOD-M15-OFFER-SIGNED-1: read back when the SIGNED assignment arrives, so an unsigned offer
+   * cannot name a peer the signed document does not.
+   */
+  #offeredDialer = new Map<string, string>();
   // M8B F14: agents that SHOULD have a standing receiver — marked by
   // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
   // unmarked by removeStandingReceiverForAgent (cello_set_agent_offline). Consulted by the
@@ -2563,7 +2570,32 @@ export class SessionNodeManager {
     if (!sr) return "no_receiver";
     if (initiatorSessionPeerId === "") return "no_peer_named";
     sr.gater.admitInboundPeer(initiatorSessionPeerId);
+    this.#offeredDialer.set(agentName, initiatorSessionPeerId);
     return "narrowed";
+  }
+
+  /**
+   * What the UNSIGNED offer claimed, so the SIGNED assignment can be checked against it.
+   *
+   * DOD-M15-OFFER-SIGNED-1. Decision 2 rules that the listening socket is "gated on the
+   * assignment", and the gate is narrowed from `session_offer` — a frame carrying no signature —
+   * because that is the only thing that arrives early enough. Timing forced the offer; it does not
+   * excuse trusting it.
+   *
+   * Keeping what the offer said turns the two frames into a CHECK ON EACH OTHER. The assignment is
+   * FROST-signed by the initiator's own threshold group, which no single directory can produce, and
+   * it names the same peer id. A directory that says one peer in the offer and another in the
+   * assignment is naming two different dialers for one session — which a truthful directory never
+   * does, and which is exactly the move a compromised one would make to slip a peer past the gate
+   * before the signed document arrives.
+   */
+  getOfferedDialer(agentName: string): string | null {
+    return this.#offeredDialer.get(agentName) ?? null;
+  }
+
+  /** Forget the offered dialer once a session is claimed or abandoned. */
+  clearOfferedDialer(agentName: string): void {
+    this.#offeredDialer.delete(agentName);
   }
 
   /**
