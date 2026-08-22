@@ -41,7 +41,22 @@ function parseStringArray(v: unknown): string[] | null {
   return v as string[];
 }
 
-function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-types").ParticipantInfo | null {
+/**
+ * A dead field that arrived PRESENT-BUT-MALFORMED — `DOD-M15-DEAD-WIRE-FIELD-1` review F3.
+ *
+ * Tolerating these is right (nothing reads them, no signature covers them), but discarding the fact
+ * silently is not: this parse is the ONLY place in the system where evidence that a directory is
+ * emitting junk in them can exist, because no signature covers them and no consumer sees them.
+ *
+ * ABSENT is deliberately NOT reported. Once the bilateral half removes the field, absent is the
+ * designed normal case, and a signal that fires on the normal case is not a signal.
+ */
+export type ToleratedField = "participant.multiaddrs" | "participant.peer_id";
+
+function parseParticipantInfo(
+  raw: unknown,
+  onTolerated?: (field: ToleratedField) => void,
+): import("@cello-protocol/protocol-types").ParticipantInfo | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
   const pubkey = toU8Safe(r["pubkey"]);
@@ -62,6 +77,7 @@ function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-ty
    * string neither one reads, and the operator is told the assignment was "missing or malformed"
    * when it was neither.
    */
+  if (r["peer_id"] !== undefined && typeof r["peer_id"] !== "string") onTolerated?.("participant.peer_id");
   const peerId = typeof r["peer_id"] === "string" ? r["peer_id"] : "";
   /**
    * `multiaddrs` IS TOLERATED, NOT VALIDATED — `DOD-M15-DEAD-WIRE-FIELD-1`.
@@ -84,6 +100,9 @@ function parseParticipantInfo(raw: unknown): import("@cello-protocol/protocol-ty
    * the two repos move once; accepting its ABSENCE here is what makes this client already
    * compatible when that lands.
    */
+  if (r["multiaddrs"] !== undefined && parseStringArray(r["multiaddrs"]) === null) {
+    onTolerated?.("participant.multiaddrs");
+  }
   const multiaddrs = parseStringArray(r["multiaddrs"]) ?? [];
   return { pubkey, peer_id: peerId, multiaddrs };
 }
@@ -102,7 +121,15 @@ function parseEndpointInfo(raw: unknown): import("@cello-protocol/protocol-types
  * Decode a raw CBOR-decoded object (frame["assignment"]) into a typed SessionAssignment.
  * Returns null if any required field is missing or malformed.
  */
-export function parseSessionAssignment(raw: Record<string, unknown>): SessionAssignment | null {
+export function parseSessionAssignment(
+  raw: Record<string, unknown>,
+  /**
+   * Called for each dead field that arrived PRESENT-BUT-MALFORMED. Optional so the parser keeps no
+   * logger dependency — it is a pure shape-validator, as its header says. Callers that have a
+   * logger (the inbound and outbound session paths) pass one; the rest are unaffected.
+   */
+  onTolerated?: (field: ToleratedField) => void,
+): SessionAssignment | null {
   const sessionId = toU8Safe(raw["session_id"]);
   if (!sessionId || sessionId.length !== 16) return null;
 
@@ -123,9 +150,9 @@ export function parseSessionAssignment(raw: Record<string, unknown>): SessionAss
   const sessionTimestamp = typeof tsRaw === "number" ? tsRaw : typeof tsRaw === "bigint" ? Number(tsRaw) : null;
   if (sessionTimestamp === null) return null;
 
-  const participantA = parseParticipantInfo(raw["participant_a"]);
+  const participantA = parseParticipantInfo(raw["participant_a"], onTolerated);
   if (!participantA) return null;
-  const participantB = parseParticipantInfo(raw["participant_b"]);
+  const participantB = parseParticipantInfo(raw["participant_b"], onTolerated);
   if (!participantB) return null;
   const relayEndpoint = parseEndpointInfo(raw["relay_endpoint"]);
   if (!relayEndpoint) return null;

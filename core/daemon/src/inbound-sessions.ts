@@ -1283,6 +1283,30 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     // cannot be verified, and is refused rather than waved through.
     const rawAssignment = parseSessionAssignment(
       (frame["assignment"] ?? {}) as Record<string, unknown>,
+      /**
+       * A dead field arrived PRESENT-BUT-MALFORMED. It is tolerated — nothing reads it and no
+       * signature covers it, so refusing over it would let any directory deny a session for free —
+       * but this parse is the ONLY place the fact can be observed, so it is not discarded silently
+       * (review F3).
+       *
+       * WARN rather than error, and not a refusal: nothing degrades for this session. It means a
+       * directory is emitting junk in a field it signs nothing over, which is worth knowing before
+       * the bilateral half removes the field and the evidence disappears with it.
+       */
+      (field) => {
+        logger.warn("session.inbound.assignment.dead_field_malformed", {
+          sessionId: parsed.sessionIdHex,
+          agentName: localAgent.name,
+          field,
+          impact:
+            "the session was ACCEPTED — this field is read by nothing and covered by no signature, " +
+            "so refusing over it would hand any directory a free way to deny a session",
+          guidance:
+            "no action for this conversation. If it repeats, the directory node brokering it is " +
+            "emitting malformed values in a field it does not sign.",
+          correlationId,
+        });
+      },
     );
     const verdict = rawAssignment === null
       ? { ok: false as const, reason: "inbound_assignment_unparseable", detail: "the assignment object failed shape validation" }

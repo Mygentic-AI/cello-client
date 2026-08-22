@@ -30,7 +30,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseSessionAssignment } from "../session-assignment-parser.js";
+import { parseSessionAssignment, type ToleratedField } from "../session-assignment-parser.js";
 
 /** A well-formed assignment, with the pieces a test wants to corrupt exposed. */
 function assignment(overrides: {
@@ -168,5 +168,36 @@ describe("DOD-M15-DEAD-WIRE-FIELD-1: a field with no consumers cannot refuse a s
     const a = assignment();
     (a["participant_a"] as Record<string, unknown>)["pubkey"] = new Uint8Array(8);
     expect(parseSessionAssignment(a), "a short pubkey must still refuse").toBeNull();
+  });
+
+  it("a MALFORMED dead field is REPORTED — tolerating it is not the same as discarding the fact", () => {
+    /**
+     * Review F3. This parse is the ONLY place in the system where evidence that a directory is
+     * emitting junk in these fields can exist: no signature covers them, and no consumer sees them.
+     * `?? []` was destroying that silently.
+     */
+    const seen: ToleratedField[] = [];
+    const parsed = parseSessionAssignment(
+      assignment({ participantMultiaddrs: [1, 2, 3] }),
+      (f) => seen.push(f),
+    );
+    expect(parsed).not.toBeNull();
+    expect(seen, "a malformed dead field must be reported, not silently dropped")
+      .toContain("participant.multiaddrs");
+  });
+
+  it("an ABSENT dead field is NOT reported — that is the designed normal case", () => {
+    /**
+     * The direction that matters, and the counterexample to the test above. Once the bilateral half
+     * removes the field, ABSENT is what every well-formed assignment looks like. Warning on it would
+     * fire on every session forever — a signal that fires on the normal case is not a signal, and it
+     * would train the operator to ignore the one that is real.
+     */
+    const a = assignment();
+    delete (a["participant_a"] as Record<string, unknown>)["multiaddrs"];
+    delete (a["participant_a"] as Record<string, unknown>)["peer_id"];
+    const seen: ToleratedField[] = [];
+    expect(parseSessionAssignment(a, (f) => seen.push(f))).not.toBeNull();
+    expect(seen, "absence is the designed normal case and must stay silent").toEqual([]);
   });
 });
