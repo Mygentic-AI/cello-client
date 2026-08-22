@@ -39,6 +39,15 @@ export interface OutboundSessionDeps {
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
   getFailoverEndpoint: () => Promise<DirectoryEndpoint | null>;
   resolveConsortiumRoster: () => Promise<ConsortiumEndpoint[] | null>;
+  /**
+   * DOD-M15-ERRSTRING-1 — the nodes whose bootstrap probe failed in the last sweep.
+   *
+   * Needed here because a SHORT ROSTER is the cause the DoD line asks these errors to name ("a
+   * roster below threshold says so"), and the negotiator otherwise sees only the reachable subset —
+   * it cannot tell three-of-three from three-of-five. Reachable + unresolved is the declared count,
+   * and majority(declared) is the threshold a ceremony needs.
+   */
+  getUnresolvedNodes?: () => ReadonlyArray<{ nodeId: string; reason: string }>;
   /** The WHOLE seal listener bundle — a visiting stream needs every one of them. */
   registerSealListeners: (signaling: SignalingManager, agentName: string, agentPubkeyHex: string) => () => void;
   sessionNegotiator?: SessionNegotiator;
@@ -54,7 +63,36 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     logger, sessionNodeManager, getKeyProvider, getPersistence, getAgentSignaling,
     waitForSignalingConnected, getFailoverEndpoint, resolveConsortiumRoster,
     registerSealListeners, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
+    getUnresolvedNodes,
   } = deps;
+
+  /**
+   * A sentence naming the roster shortfall, or "" when the roster is whole.
+   *
+   * DOD-M15-ERRSTRING-1's first clause: **a roster below threshold says so.** Every failure below
+   * used to stay silent about it, so an operator holding "the session did not establish" had no way
+   * to know the real cause was that two of their five directories were unreachable — and a threshold
+   * ceremony needs a majority. `cello_status` reported it; the error they were actually holding did
+   * not, and the error is what people act on.
+   *
+   * Appended rather than substituted: it is CONTEXT for the observation, never a replacement for it.
+   * Overwriting the observed reason with "roster short" would be the same defect this line closes,
+   * pointing the other way.
+   */
+  function rosterShortfallNote(reachable: number): string {
+    const unresolved = getUnresolvedNodes?.() ?? [];
+    if (unresolved.length === 0) return "";
+    const declared = reachable + unresolved.length;
+    const threshold = Math.floor(declared / 2) + 1;
+    const names = unresolved.map((u) => `${u.nodeId} (${u.reason})`).join(", ");
+    const belowThreshold = reachable < threshold;
+    return (
+      ` ALSO: ${unresolved.length} of this consortium's ${declared} directory nodes were unreachable at the last sweep — ${names}.` +
+      (belowThreshold
+        ? ` That leaves ${reachable} reachable against a threshold of ${threshold}, so signing ceremonies CANNOT complete and this failure is very likely a symptom of that, not of anything to do with your counterparty. Fix the roster first.`
+        : ` ${reachable} of ${threshold} needed are still reachable, so ceremonies can still complete — but the margin is thin.`)
+    );
+  }
 
   // ─── DOD-SPINE-5: real client-side session negotiator (built internally) ──────
   // The directory already brokers `session_request` → FROST-signed `session_assignment`
@@ -667,6 +705,10 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         // stream answers "where is the target?" authoritatively-enough (advisory — the target node's
         // live #streams check stays the authority; a stale answer just triggers the retry below).
         const homeNodeId = signaling.currentDirectoryNodeId;
+        // Reachable-node count for `rosterShortfallNote`. Read once here rather than per failure
+        // path so every message quotes the same sweep, and a null roster (no manifest yet) reads as
+        // zero reachable rather than throwing on a path that is already failing.
+        const rosterSizeForNote = (await resolveConsortiumRoster())?.length ?? 0;
         const backoffs = [1_000, 3_000]; // between attempts — covers re-home + replication lag
         const MAX_ATTEMPTS = 3;
         for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
@@ -728,7 +770,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
                 "no node that holds them, three times running. That is a directory-side inconsistency, not the " +
                 "counterparty being offline — there is nothing for them to fix on their side. Retry in a minute; " +
                 "if it repeats, that node's presence data is out of sync and cello_status will show which other " +
-                "directories are available.",
+                "directories are available." +
+                rosterShortfallNote(rosterSizeForNote),
             };
           }
 
@@ -804,7 +847,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             "Three attempts to set up the session all failed, and the cause was not one this daemon can name — " +
             "so it is deliberately not guessing that the counterparty is offline. Retry in a minute. If it repeats: " +
             "run cello_status to check your own directory connection first (a node below threshold or mid-restart " +
-            "presents exactly like this), and only then ask the counterparty to check theirs.",
+            "presents exactly like this), and only then ask the counterparty to check theirs." +
+            rosterShortfallNote(rosterSizeForNote),
         };
       } finally {
         negotiationInProgress.delete(ctx.agentName);

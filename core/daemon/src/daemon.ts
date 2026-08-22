@@ -1566,6 +1566,10 @@ async function startDaemonHoldingLock(
     challengeVerifier,
     getManifestVersion: () => verifiedManifestVersion,
     loadedAgents,
+    // DOD-M15-ERRSTRING-1: so a session failure can say "and 2 of your 5 directories are
+    // unreachable", which is very often the actual cause and was reported nowhere the operator
+    // was looking.
+    getUnresolvedNodes,
   });
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).

@@ -49,7 +49,10 @@ const TARGET = "bb".repeat(32);
  *
  * `answerDiscovery` returns the frame to push back, or null to stay silent.
  */
-function negotiatorWith(answerDiscovery: () => Record<string, unknown> | null) {
+function negotiatorWith(
+  answerDiscovery: () => Record<string, unknown> | null,
+  unresolved: ReadonlyArray<{ nodeId: string; reason: string }> = [],
+) {
   const { logger, events } = makeLogger();
   let inbound: ((frame: Record<string, unknown>) => void) | null = null;
 
@@ -86,10 +89,11 @@ function negotiatorWith(answerDiscovery: () => Record<string, unknown> | null) {
     getAgentSignaling: () => ({ signaling, getNode: () => null }),
     waitForSignalingConnected: async () => true,
     getFailoverEndpoint: async () => null,
-    resolveConsortiumRoster: async () => null,
     registerSealListeners: () => () => {},
     getManifestVersion: () => 1,
     loadedAgents: [{ name: AGENT, pubkey: "aa".repeat(32) }],
+    resolveConsortiumRoster: async () => [{ nodeId: HOME }, { nodeId: "dir-b" }] as never,
+    getUnresolvedNodes: () => unresolved,
   } as unknown as OutboundSessionDeps;
 
   return { negotiator: createOutboundSessions(deps).resolvedSessionNegotiator, events };
@@ -209,5 +213,54 @@ describe("DOD-M15-ERRSTRING-1: the error names the observation, not a party", ()
     expect(result.ok).toBe(false);
     expect(result.reason).toBe("unknown_agent");
     expect(result.guidance).toMatch(/verify the pubkey/i);
+  }, 30_000);
+});
+
+describe("DOD-M15-ERRSTRING-1: a roster below threshold SAYS SO", () => {
+  it("names the unreachable nodes and the threshold when the roster is short", async () => {
+    /**
+     * The DoD line's first clause, and the one this unit had not delivered: *"A roster below
+     * threshold says so."*
+     *
+     * A signing ceremony needs a majority of the declared nodes. When two of five are unreachable,
+     * every session failure is very likely a symptom of that — and the operator holding the error
+     * had no way to know, because only `cello_status` reported it. The error is what people act on.
+     *
+     * Appended as CONTEXT, never substituted for the observation: overwriting the observed reason
+     * with "roster short" would be this line's own defect pointing the other way.
+     */
+    const { negotiator } = negotiatorWith(
+      () => ({ type: "discovery_lookup_result", state: "online", owning_node_ids: [] }),
+      [
+        { nodeId: "dir-euc1", reason: "dns_error" },
+        { nodeId: "dir-apne1", reason: "timeout" },
+      ],
+    );
+
+    const result = await negotiate(negotiator);
+
+    expect(result.ok).toBe(false);
+    // The OBSERVATION survives — the shortfall is added to it, not instead of it.
+    expect(result.reason).toBe("directory_named_no_home");
+    // Named nodes and their reasons, not a count the operator has to go and expand.
+    expect(result.guidance).toContain("dir-euc1");
+    expect(result.guidance).toContain("dns_error");
+    // The arithmetic that matters: 2 reachable of 4 declared, threshold 3 — ceremonies cannot run.
+    expect(result.guidance).toMatch(/threshold of 3/);
+    expect(result.guidance).toMatch(/CANNOT complete/);
+  }, 30_000);
+
+  it("says NOTHING about the roster when every node is reachable", async () => {
+    // A note that fires on the healthy case is noise, and noise is how a real shortfall gets
+    // scrolled past the day it matters.
+    const { negotiator } = negotiatorWith(
+      () => ({ type: "discovery_lookup_result", state: "online", owning_node_ids: [] }),
+      [],
+    );
+
+    const result = await negotiate(negotiator);
+
+    expect(result.ok).toBe(false);
+    expect(result.guidance).not.toMatch(/unreachable at the last sweep/);
   }, 30_000);
 });
