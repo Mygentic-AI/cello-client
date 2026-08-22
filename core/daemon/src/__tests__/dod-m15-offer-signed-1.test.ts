@@ -37,7 +37,9 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { generateKeypair } from "@cello-protocol/crypto";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -113,31 +115,29 @@ function harness(opts: {
 
   createInboundSessions(deps);
 
-  /** Inject a `session_assignment` naming `assignedDialer` and `signerPubkey`. */
-  const inject = (assignedDialer: string, signerPubkey: string): void => {
-    inbound?.({
-      type: "session_assignment",
-      assignment: {
-        session_id: SESSION_ID,
-        participant_a: { pubkey: Buffer.from(COUNTERPARTY, "hex"), peer_id: "", multiaddrs: [] },
-        participant_b: { pubkey: Buffer.from(AGENT_PUBKEY, "hex"), peer_id: "", multiaddrs: [] },
-        relay_endpoint: { peer_id: "", multiaddrs: [] },
-        directory_endpoint: { peer_id: "", multiaddrs: [] },
-        session_timestamp: 1_700_000_000_000,
-        directory_pubkey: new Uint8Array(32),
-        directory_signature: new Uint8Array(64),
-        signature_type: "frost",
-        signer_pubkey: Buffer.from(signerPubkey, "hex"),
-        initiator_session_peer_id: assignedDialer,
-        initiator_session_addrs: ["/ip4/127.0.0.1/tcp/1"],
-        counterparty_session_peer_id: "12D3KooWReceiver",
-        counterparty_session_addrs: ["/ip4/127.0.0.1/tcp/2"],
-        transport_mode: "relay",
-      },
+  /**
+   * Inject a GENUINELY SIGNED `session_assignment`.
+   *
+   * It used to inject an all-zeros `directory_signature`, which worked only because the responder
+   * did not verify. `DOD-M15-RESPONDER-VERIFY-1` made it verify, and these tests would then have
+   * been refused before reaching the checks they are about — passing for the wrong reason on the
+   * ACCEPTS cases and for a coincidental one on the REFUSES cases.
+   *
+   * `signWith` lets a test control the signer, so the pinned-key check can be exercised against a
+   * key the fixture also seeds as the pin.
+   */
+  const inject = async (assignedDialer: string, signer: ReturnType<typeof generateKeypair>): Promise<void> => {
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SESSION_ID,
+      initiatorPubkey: Buffer.from(COUNTERPARTY, "hex"),
+      responderPubkey: Buffer.from(AGENT_PUBKEY, "hex"),
+      initiatorSessionPeerId: assignedDialer,
+      signWith: signer,
     });
+    inbound?.(frame);
   };
 
-  return { inject, events, revoked, accepted };
+  return { inject, injectRaw: (f: Record<string, unknown>) => inbound?.(f), events, revoked, accepted };
 }
 
 const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -147,7 +147,7 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
     // The gate was already narrowed to whoever the offer named. Refusing without re-closing would
     // leave the door open to exactly the peer just declared unauthorised (review F4).
     const h = harness({ offeredDialer: "12D3KooWAttacker" });
-    h.inject(REAL_DIALER, COUNTERPARTY);
+    await h.inject(REAL_DIALER, generateKeypair());
     await settle();
 
     const refused = h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch");
@@ -159,7 +159,7 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
 
   it("ACCEPTS when both name the same dialer", async () => {
     const h = harness({ offeredDialer: REAL_DIALER });
-    h.inject(REAL_DIALER, COUNTERPARTY);
+    await h.inject(REAL_DIALER, generateKeypair());
     await settle();
 
     expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
@@ -171,7 +171,7 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
     // assignments directly. Treating that as a mismatch would refuse legitimate sessions to catch
     // nothing; the assignment is the stronger document and stands alone.
     const h = harness({ offeredDialer: null });
-    h.inject(REAL_DIALER, COUNTERPARTY);
+    await h.inject(REAL_DIALER, generateKeypair());
     await settle();
 
     expect(h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch")).toBeUndefined();
@@ -179,36 +179,82 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
 });
 
 describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change quietly", () => {
-  it("REFUSES when the directory names a different threshold key for a known counterparty", async () => {
-    // The one check in this path a compromised directory cannot satisfy by repeating itself: the
-    // anchor is what THIS daemon wrote during an earlier session.
-    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: "cc".repeat(32) });
-    h.inject(REAL_DIALER, "dd".repeat(32));
+  it("REFUSES when the assignment does not verify under the key recorded for this counterparty", async () => {
+    /**
+     * The one check in this path a compromised directory cannot satisfy by repeating itself: the
+     * anchor is what THIS daemon wrote during an earlier session.
+     *
+     * And it is a VERIFICATION, not a comparison — the signature must verify under the pinned key.
+     * A directory that names the right key without holding it passes a comparison and fails this.
+     */
+    const pinned = generateKeypair();
+    const pinnedHex = Buffer.from(await pinned.getPublicKey()).toString("hex");
+    const impostor = generateKeypair();
+
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: pinnedHex });
+    await h.inject(REAL_DIALER, impostor);
     await settle();
 
     const refused = h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed");
     expect(refused, "an identity substitution must not be accepted quietly").toBeDefined();
     expect(refused?.level).toBe("error");
-    // The remedy has to be one that WORKS — review F2 found the printed one did not clear the pin.
+    // The remedy must be one that WORKS — review F2 found the printed one did not clear the pin.
     expect(String(refused?.context["guidance"])).toMatch(/out of band/i);
+    expect(String(refused?.context["guidance"])).toMatch(/cello_contact_remove/);
     expect(h.accepted).toEqual([]);
     expect(h.revoked.length, "the gate must be re-closed here too").toBe(1);
   });
 
-  it("ACCEPTS the same key on a later session — the ordinary repeat-counterparty case", async () => {
-    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: "cc".repeat(32) });
-    h.inject(REAL_DIALER, "cc".repeat(32));
+  it("ACCEPTS a session signed by the SAME key on a later session", async () => {
+    const pinned = generateKeypair();
+    const pinnedHex = Buffer.from(await pinned.getPublicKey()).toString("hex");
+
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: pinnedHex });
+    await h.inject(REAL_DIALER, pinned);
+    await settle();
+
+    expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
+    expect(h.revoked).toEqual([]);
+  });
+
+  it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", async () => {
+    // No pin ⇒ nothing independent to verify against, so the check falls back to internal
+    // consistency. Worth nothing the first time, and saying so is the difference between a bound
+    // and a gap.
+    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: null });
+    await h.inject(REAL_DIALER, generateKeypair());
     await settle();
 
     expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
   });
 
-  it("ACCEPTS first contact, which is the stated bound of trust-on-first-use", async () => {
-    // Worth nothing the first time, and saying so is the difference between a bound and a gap.
-    const h = harness({ offeredDialer: REAL_DIALER, pinnedPrimary: null });
-    h.inject(REAL_DIALER, "dd".repeat(32));
+  it("REFUSES a TAMPERED assignment even on first contact — a bad first pin is permanent", async () => {
+    /**
+     * The half of `DOD-M15-RESPONDER-VERIFY-1` that matters most on first contact. Internal
+     * consistency cannot authenticate the directory, and is not claimed to — but it does catch an
+     * assignment whose fields were altered after signing. Without it, a tampered first contact gets
+     * PINNED, and every later session with that counterparty is then measured against a poisoned
+     * anchor.
+     */
+    const signer = generateKeypair();
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SESSION_ID,
+      initiatorPubkey: Buffer.from(COUNTERPARTY, "hex"),
+      responderPubkey: Buffer.from(AGENT_PUBKEY, "hex"),
+      initiatorSessionPeerId: REAL_DIALER,
+      signWith: signer,
+    });
+    // Tamper AFTER signing — change a field the TBS covers. This tests that the BINDING holds,
+    // which is stronger than feeding it noise.
+    (frame["assignment"] as Record<string, unknown>)["initiator_session_peer_id"] = "12D3KooWImpostor";
+
+    const h = harness({ offeredDialer: "12D3KooWImpostor", pinnedPrimary: null });
+    h.injectRaw(frame);
     await settle();
 
-    expect(h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed")).toBeUndefined();
+    const refused = h.events.find((e) => e.event === "session.inbound.assignment.invalid");
+    expect(refused, "a tampered assignment must not be pinned").toBeDefined();
+    expect(String(refused?.context["reason"])).toBe("inbound_assignment_signature_invalid");
+    expect(h.accepted).toEqual([]);
   });
 });

@@ -20,9 +20,10 @@ import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import {
   ABUSE_MAX_SESSION_RECEIVED_BYTES,
   ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER,
@@ -240,19 +241,16 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
 
     // Their next REAL inbound request must be refused by the actual accept-path wiring.
     const newSid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 200 + b));
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: newSid,
-        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "stranger-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: newSid,
+      initiatorPubkey: new Uint8Array(Buffer.from(strangerPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "stranger-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
     });
+    injectRef.inject!(frame);
     await wait(150);
 
     expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();
@@ -274,20 +272,17 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     snm.addContact("bob", blockedPubkey);
     snm.getDb().prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?").run(TIER.BLOCKED, bobId, blockedPubkey);
 
-    events.length = 0; // observe only the knock's effects
     const sid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 100 + b));
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: sid,
-        participant_a: { pubkey: Buffer.from(blockedPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "blocked-peer-id",
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: sid,
+      initiatorPubkey: new Uint8Array(Buffer.from(blockedPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "blocked-peer-id",
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
     });
+    events.length = 0; // observe only the knock's effects
+    injectRef.inject!(frame);
     await wait(150);
 
     // Refused with the SAME reason an over-cap unknown gets — no distinguishing oracle (DOD-TIER-3 AC1).
@@ -313,21 +308,24 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     await snm.ensureStandingReceiverForAgent("bob");
 
     const strangerPubkey = "3c".repeat(32);
+    // DOD-M15-RESPONDER-VERIFY-1: the first ACCEPTED session pins this signer as the stranger's
+    // threshold key, so every later knock from the same pubkey must be signed by the SAME keypair —
+    // a fresh one per knock is correctly refused as an identity substitution, which would mask the
+    // per-sender bound this test is actually about.
+    const strangerSigner = generateKeypair();
     const knock = async (n: number): Promise<void> => {
       const sid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => (n * 16 + b) & 0xff));
-      injectRef.inject!({
-        type: "session_assignment",
-        assignment: {
-          session_id: sid,
-          participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
-          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-          session_timestamp: 1_700_000_000_000 + n,
-          signature_type: "frost",
-          initiator_session_peer_id: `stranger-peer-${n}`,
-          // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-          counterparty_session_peer_id: "bob-session-peer-id",
-        },
+      const { frame } = await makeSignedAssignmentFrame({
+        sessionId: sid,
+        initiatorPubkey: new Uint8Array(Buffer.from(strangerPubkey, "hex")),
+        responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+        initiatorSessionPeerId: `stranger-peer-${n}`,
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterpartySessionPeerId: "bob-session-peer-id",
+        sessionTimestamp: 1_700_000_000_000 + n,
+        signWith: strangerSigner,
       });
+      injectRef.inject!(frame);
       await wait(120); // accepts are serialized — let each settle before the next
     };
 
@@ -379,19 +377,16 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
 
     // The stranger's next REAL knock must be ACCEPTED — the ghosts are provably dead.
     const newSid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 100 + b));
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: newSid,
-        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "stranger-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: newSid,
+      initiatorPubkey: new Uint8Array(Buffer.from(strangerPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "stranger-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
     });
+    injectRef.inject!(frame);
     await wait(150);
 
     expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeUndefined();
@@ -476,18 +471,20 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
       ).run(`7${i}`.padStart(2, "0").repeat(16), bobId, strangerPubkey, now, now, new Date(now).toISOString());
     }
 
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 200 + b)),
-        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "stranger-peer-id",
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    // Both knocks below come from the SAME stranger, so they are signed by the same keypair — a
+    // second key under the same pubkey is refused as an identity substitution, which would refuse
+    // the knock before the cap ever fires.
+    const strangerSigner = generateKeypair();
+    const first = await makeSignedAssignmentFrame({
+      sessionId: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 200 + b)),
+      initiatorPubkey: new Uint8Array(Buffer.from(strangerPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "stranger-peer-id",
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
+      signWith: strangerSigner,
     });
+    injectRef.inject!(first.frame);
     await wait(200);
 
     const alarm = events.filter((e) => e.event === "session.inbound.cap.reached");
@@ -508,18 +505,16 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
 
     // A SECOND knock from the same peer must not write a second ERROR — the peer controls the retry
     // rate, and an unbounded alarm hands them the daemon's error log.
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 220 + b)),
-        participant_a: { pubkey: Buffer.from(strangerPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "stranger-peer-id",
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    const second = await makeSignedAssignmentFrame({
+      sessionId: Uint8Array.from(Array.from({ length: 16 }, (_, b) => 220 + b)),
+      initiatorPubkey: new Uint8Array(Buffer.from(strangerPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "stranger-peer-id",
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
+      signWith: strangerSigner,
     });
+    injectRef.inject!(second.frame);
     await wait(200);
     expect(events.filter((e) => e.event === "session.inbound.cap.reached").length, "one alarm per peer per window").toBe(1);
   });
@@ -555,19 +550,16 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     expect(snm.isContact("bob", attackerPubkey)).toBe(false);
 
     const newSid = Uint8Array.from(Array.from({ length: 16 }, (_, b) => 150 + b));
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: newSid,
-        participant_a: { pubkey: Buffer.from(attackerPubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "attacker-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: newSid,
+      initiatorPubkey: new Uint8Array(Buffer.from(attackerPubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "attacker-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
     });
+    injectRef.inject!(frame);
     await wait(150);
 
     expect(events.find((e) => e.event === "session.inbound.accept.failed" && e.context.reason === "abuse_bound_sessions_per_sender")).toBeDefined();

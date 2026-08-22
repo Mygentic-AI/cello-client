@@ -23,6 +23,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -139,19 +140,19 @@ describe("M8B F14 (daemon): inbound accept path ensures the standing receiver; d
       // ── Fix 2: an inbound assignment must KICK creation, not just poll and drop.
       const awaitP = client.send("cello_await_session", { timeout_ms: 20_000 }) as Promise<Record<string, unknown>>;
       await wait(30); // waiter registered before the assignment arrives
-      injectB.inject!({
-        type: "session_assignment",
-        assignment: {
-          session_id: SID_BYTES,
-          participant_a: { pubkey: new Uint8Array(32).fill(3) },
-          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-          initiator_session_peer_id: "initiator-peer-f14",
-          session_timestamp: TS,
-          signature_type: "frost",
-          // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-          counterparty_session_peer_id: "bob-session-peer-id",
-        },
+      // DOD-M15-RESPONDER-VERIFY-1: the responder verifies inbound assignments, so the frame is
+      // genuinely signed. Nothing about signatures is under test here — this is the standing
+      // receiver's door, and the assignment now has to get through it the way a real one does.
+      const { frame } = await makeSignedAssignmentFrame({
+        sessionId: SID_BYTES,
+        initiatorPubkey: new Uint8Array(32).fill(3),
+        responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+        initiatorSessionPeerId: "initiator-peer-f14",
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterpartySessionPeerId: "bob-session-peer-id",
+        sessionTimestamp: TS,
       });
+      injectB.inject!(frame);
       const awaited = await awaitP;
       expect(awaited.type, `offer must be accepted (got ${JSON.stringify(awaited)})`).toBe("new_session");
       expect(awaited.session_id).toBe(SID_HEX);

@@ -36,6 +36,7 @@ import { spawnGatewaySidecar, LocalSidecarGatewayClient, GatewayConfigStore, Gat
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -254,19 +255,20 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     expect(initRes.ok).toBe(true);
 
     const naPeerId = A.getSessionNodeManager().getSessionNodePeerId("alice", SID_HEX);
-    injectB.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: SID_BYTES,
-        participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        initiator_session_peer_id: naPeerId,
-        session_timestamp: TS,
-        signature_type: "frost",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    // DOD-M15-RESPONDER-VERIFY-1: B now VERIFIES the inbound assignment, so the frame is minted by
+    // the shared helper — a real FROST-context signature over the establishment TBS recomputed from
+    // the assignment's own contents. The pubkeys stay alice/bob so the daemon still routes it to the
+    // local agent, and the initiator's session peer id is A's REAL one so B's gater admits A's dial.
+    const { frame: assignmentFrame } = await makeSignedAssignmentFrame({
+      sessionId: SID_BYTES,
+      initiatorPubkey: Uint8Array.from(Buffer.from(alicePubkey, "hex")),
+      responderPubkey: Uint8Array.from(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: naPeerId!,
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: TS,
     });
+    injectB.inject!(assignmentFrame);
     const awaited = await awaitP;
     expect(awaited.type).toBe("new_session");
 

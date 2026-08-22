@@ -22,6 +22,9 @@ import type { ConnState } from "./contact-handlers.js";
 import { frameValueToHex } from "./frame-values.js";
 import { computeGenesisPrevRoot, decodeTrustSignalEnvelope, hashTrustSignalEnvelope, verifyTrustSignalHash, decodeCbor, type TrustSignalEnvelope } from "@cello-protocol/protocol-types";
 import { TrustSignalStore } from "./trust-signal-store.js";
+import { verifyInboundAssignment } from "./assignment-verify.js";
+import { REFUSAL_REASONS } from "./refusal-reasons.js";
+import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
@@ -1112,10 +1115,10 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       // never sees is indistinguishable from the session simply never arriving — and this one is a
       // security refusal, which is the worst kind to be silent about. `cello_check_notifications`
       // reads this list.
-      recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "offer_assignment_dialer_mismatch");
+      recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, REFUSAL_REASONS.OFFER_ASSIGNMENT_DIALER_MISMATCH);
       // Review F4: the gate was already narrowed to the peer this offer named, so refusing without
       // re-closing leaves the door open to exactly the peer just declared unauthorised.
-      void sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, correlationId);
+      sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, offered);
       return;
     }
 
@@ -1157,6 +1160,79 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     // session, and at WARN it read as a failure and actively misled live diagnosis. The
     // deferred-verification state is a known, tracked gap (SESSION-004), not a per-session
     // anomaly.
+    /**
+     * DOD-M15-RESPONDER-VERIFY-1 — THE RESPONDER NOW VERIFIES, and this is what unblocks
+     * `DOD-M15-OFFER-SIGNED-1`.
+     *
+     * Everything below acts on this assignment: the dialer the receiver opens to, and the
+     * `signer_pubkey` persisted as the seal trust anchor. Until now none of it was checked — the
+     * responder logged "unverified" and proceeded, so a tampered or fabricated assignment reached
+     * the seal path unchallenged and got PINNED, poisoning every later session with that
+     * counterparty.
+     *
+     * The pin is what makes a real check possible. For a repeat counterparty the signature must
+     * verify under the key THIS daemon recorded during an earlier session — a value no directory can
+     * retroactively change, so it is not the circular "verify the frame against a key the frame
+     * names". On first contact there is nothing independent to verify against, so the check falls
+     * back to internal consistency, which is weaker and is logged as such rather than reported as
+     * the same thing.
+     *
+     * BLOCKS on failure: this is a security check on the document that decides who may dial this
+     * agent, and the DoD's ordering rule is explicit that gating on an unverified document relocates
+     * trust rather than closing it.
+     */
+    const pinnedSigner = sessionNodeManager.getPinnedCounterpartyPrimary(
+      localAgent.name,
+      parsed.participantAPubkeyHex,
+    );
+    // Re-parse the RAW assignment object: `parsed` is a flattened projection for the accept path
+    // and does not carry the fields the TBS is rebuilt from. A shape that cannot be parsed here
+    // cannot be verified, and is refused rather than waved through.
+    const rawAssignment = parseSessionAssignment(
+      (frame["assignment"] ?? {}) as Record<string, unknown>,
+    );
+    const verdict = rawAssignment === null
+      ? { ok: false as const, reason: "inbound_assignment_unparseable", detail: "the assignment object failed shape validation" }
+      : verifyInboundAssignment(rawAssignment, pinnedSigner);
+    if (!verdict.ok) {
+      const isIdentityChange =
+        verdict.reason === "inbound_assignment_signer_not_pinned" ||
+        (pinnedSigner !== null && verdict.reason === "inbound_assignment_signature_invalid");
+      logger.error(
+        isIdentityChange ? "session.inbound.counterparty_primary_changed" : "session.inbound.assignment.invalid",
+        {
+        sessionId: parsed.sessionIdHex,
+        agentName: localAgent.name,
+        reason: verdict.reason,
+        detail: verdict.detail,
+        verifiedAgainst: pinnedSigner !== null ? "pinned_key" : "frame_key",
+        correlationId,
+        impact: isIdentityChange
+          ? "the assignment for a counterparty this agent has completed sessions with did not verify under the key it recorded for them; the session was refused and no receiver was handed over, because accepting it would mean talking to whoever holds the new key under the old name"
+          : "the session assignment did not verify, so this agent refused it rather than opening its receiver to a peer named by a document it could not check; nothing was accepted and no receiver was handed over",
+        guidance: isIdentityChange
+          ? "this is not transient. Either that counterparty genuinely re-registered — confirm OUT OF BAND (on a channel that is not this one), then run cello_contact_remove for them, which clears the pinned identity so the next session re-pins — or a directory is producing assignments for them that they did not authorise. From here the two look identical and only they can tell you which."
+          : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
+        },
+      );
+      recordRefusal(
+        localAgent.name,
+        parsed.sessionIdHex,
+        parsed.participantAPubkeyHex,
+        isIdentityChange ? REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED : REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID,
+      );
+      sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, offered);
+      return;
+    }
+    logger.debug("session.inbound.assignment.verified", {
+      sessionId: parsed.sessionIdHex,
+      agentName: localAgent.name,
+      // "internal" is the WEAKER mode and says so, so a reader never mistakes first contact for a
+      // verified counterparty. Pinned means a directory could not have produced this alone.
+      mode: verdict.mode,
+      correlationId,
+    });
+
     logger.debug("session.inbound.assignment.unverified", {
       sessionId: parsed.sessionIdHex,
       agentName: localAgent.name,
@@ -1165,51 +1241,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     });
 
     /**
-     * DOD-M15-OFFER-SIGNED-1 — THE ANCHOR THAT A DIRECTORY CANNOT REWRITE: this agent's own memory.
+     * NO SEPARATE PIN CHECK HERE — it moved INTO the verification above, and leaving both would have
+     * been worse than either.
      *
-     * Everything in the assignment is whatever the directory said, because the responder does not
-     * verify its signature (above). So no check that compares two fields of the same frame — or two
-     * frames from the same source — is worth anything against a compromised directory. It just says
-     * the same thing twice.
+     * There was a second block at this point comparing `signer_pubkey` against the pinned key. Once
+     * `verifyInboundAssignment` took the pin as its expected signer, that comparison became dead
+     * code: the verifier reaches the same conclusion first, and reaches it *better* — it does not
+     * merely check that the named key matches, it checks that the SIGNATURE verifies under the
+     * pinned key. A directory that names the right key without holding it passes a comparison and
+     * fails a verification.
      *
-     * What the directory CANNOT change is what this daemon already recorded from EARLIER sessions
-     * with this counterparty. If it now names a different threshold group key for someone we have
-     * talked to before, it is either substituting an identity or has been compromised since. Neither
-     * is a session to accept quietly.
-     *
-     * BLOCKS. A changed identity key is a security failure, not an anomaly, and the counterparty is
-     * reachable through the channel they already have with the operator.
-     *
-     * TRUST ON FIRST USE, and that bound is real: this is worth nothing the first time you talk to
-     * someone. It hardens every session after it — which is where a long-lived counterparty
-     * relationship lives, and where a substitution would otherwise be invisible.
+     * Two checks for one property is how they drift: the survivor gets fixed and the dead one keeps
+     * asserting the old rule to anyone reading.
      */
-    if (parsed.signerPubkeyHex) {
-      const pinned = sessionNodeManager.getPinnedCounterpartyPrimary(
-        localAgent.name,
-        parsed.participantAPubkeyHex,
-      );
-      if (pinned !== null && pinned !== parsed.signerPubkeyHex) {
-        logger.error("session.inbound.counterparty_primary_changed", {
-          sessionId: parsed.sessionIdHex,
-          agentName: localAgent.name,
-          counterpartyPubkeyPrefix: parsed.participantAPubkeyHex.slice(0, 16),
-          pinnedPrefix: pinned.slice(0, 16),
-          offeredPrefix: parsed.signerPubkeyHex.slice(0, 16),
-          correlationId,
-          impact:
-            "the directory named a different threshold group key for a counterparty this agent has completed sessions with before; the session was refused and the receiver was not handed over, because accepting it would mean talking to whoever holds the new key under the old name",
-          guidance:
-            "this is not transient. Either that counterparty genuinely re-registered with new keys — confirm with them OUT OF BAND (on a channel that is not this one), then run cello_contact_remove for them, which now clears the pinned identity so the next session re-pins — or a directory is substituting an identity. Do not accept a session from them until you know which; from here the two look identical and only they can tell you.",
-        });
-        // INVARIANT 2, and this one most of all: a counterparty's identity key changing is exactly
-        // the event an operator must be told about, and telling only the log tells nobody.
-        recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, "counterparty_primary_key_changed");
-        void sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, correlationId);
-        return;
-      }
-    }
-
     inboundInFlight.add(offerKey(localAgent.name, parsed.sessionIdHex));
     // Serialize: the next accept does not begin until this one (and any standing-receiver
     // rebuild it triggers) settles. A throw inside one accept must not break the chain.

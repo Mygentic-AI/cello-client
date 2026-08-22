@@ -141,3 +141,98 @@ export async function verifyAssignmentSignature(
     return { ok: true };
   }
 }
+
+
+/**
+ * DOD-M15-RESPONDER-VERIFY-1 — the RESPONDER's half, which until now did not exist.
+ *
+ * The initiator verifies its assignment against its own threshold group key (above). The responder
+ * did not verify at all: it logged `session.inbound.assignment.unverified` and proceeded, so every
+ * field it then acted on — the dialer it opens its receiver to, the `signer_pubkey` it persists as
+ * the seal trust anchor — was whatever the directory said.
+ *
+ * ─── Why this could not simply reuse the function above ────────────────────────────────────────
+ *
+ * That one compares `signer_pubkey` against the agent's OWN persisted `primaryPubkey`. The responder
+ * is not the signer — the assignment is signed by the INITIATOR's quorum — so it has no equivalent
+ * value, and verifying a frame's signature against a key from the same frame is circular: mint a
+ * key, sign with it, name it. That circularity is why the check was deferred rather than written.
+ *
+ * ─── What breaks the circle ────────────────────────────────────────────────────────────────────
+ *
+ * The TOFU pin. For a counterparty this agent has completed a session with, `expectedSignerHex` is
+ * what THIS daemon recorded then — a value no directory can retroactively change. Verifying against
+ * that is a real check: a compromised directory can produce a signature, but not one that verifies
+ * under a key it does not hold.
+ *
+ * ─── Two modes, and the weaker one is honest about being weaker ────────────────────────────────
+ *
+ * PINNED (`expectedSignerHex` given): the signature must verify under the PINNED key. Non-circular.
+ * This is the mode that matters, and it covers every repeat counterparty.
+ *
+ * UNPINNED (first contact): there is nothing independent to verify against, so this checks INTERNAL
+ * CONSISTENCY only — the signature verifies over the TBS recomputed from the assignment's own
+ * contents, under the key the frame names. That does NOT authenticate the directory, and it is not
+ * claimed to. What it does catch is a TAMPERED or garbage assignment — one whose fields were altered
+ * after signing, or whose signature is noise — which today reaches the seal path unchallenged and
+ * gets PINNED, poisoning every later session with that counterparty. Refusing it here is what stops
+ * a bad first contact becoming a permanent one.
+ */
+export function verifyInboundAssignment(
+  assignment: SessionAssignment,
+  expectedSignerHex: string | null,
+): { ok: true; mode: "pinned" | "internal" } | { ok: false; reason: string; detail: string } {
+  if (assignment.signature_type !== "frost") {
+    return {
+      ok: false,
+      reason: "inbound_assignment_not_frost",
+      detail: `signature_type was ${String(assignment.signature_type)}; the directory produces frost for every session assignment`,
+    };
+  }
+  const signer = assignment.signer_pubkey;
+  if (!signer || signer.length !== 32) {
+    return { ok: false, reason: "inbound_assignment_no_signer", detail: "signer_pubkey missing or not 32 bytes" };
+  }
+
+  // PINNED beats named. When we hold an independent value, the frame's own claim about who signed is
+  // not consulted at all — using it would reintroduce the circularity the pin exists to break.
+  const verifyAgainst = expectedSignerHex !== null ? Buffer.from(expectedSignerHex, "hex") : signer;
+  if (expectedSignerHex !== null && Buffer.from(signer).toString("hex").toLowerCase() !== expectedSignerHex.toLowerCase()) {
+    return {
+      ok: false,
+      reason: "inbound_assignment_signer_not_pinned",
+      detail: "the assignment names a different signer than this agent recorded for this counterparty",
+    };
+  }
+
+  const genesisPrevRoot = computeGenesisPrevRoot(
+    assignment.participant_a.pubkey,
+    assignment.participant_b.pubkey,
+    assignment.session_id,
+    assignment.session_timestamp,
+  );
+  const tbs = buildSessionEstablishmentTbs(
+    assignment.session_id,
+    assignment.participant_a.pubkey,
+    assignment.participant_b.pubkey,
+    genesisPrevRoot,
+    assignment.session_timestamp,
+    assignment.initiator_session_peer_id,
+    assignment.initiator_session_addrs,
+    assignment.counterparty_session_peer_id,
+    assignment.counterparty_session_addrs,
+    assignment.transport_mode,
+  );
+
+  if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, new Uint8Array(verifyAgainst))) {
+    return {
+      ok: false,
+      reason: "inbound_assignment_signature_invalid",
+      detail:
+        expectedSignerHex !== null
+          ? "the signature did not verify under the key this agent recorded for this counterparty"
+          : "the signature did not verify over the assignment's own recomputed contents — the frame is tampered or malformed",
+    };
+  }
+  return { ok: true, mode: expectedSignerHex !== null ? "pinned" : "internal" };
+}

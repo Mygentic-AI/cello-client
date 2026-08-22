@@ -10,6 +10,7 @@
  * it exists to backstop would be no reconciler at all.
  */
 import type { IpcHandler } from "./ipc-server.js";
+import { REFUSAL_GUIDANCE } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -175,26 +176,18 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
        * surface for those — the operator needs to know that something was refused ON PURPOSE, what
        * it means, and that for one of them the next step happens OUTSIDE this system.
        */
-      const REFUSAL_GUIDANCE: Record<string, string> = {
-        counterparty_primary_key_changed:
-          "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you " +
-          "have completed sessions with before. Either they genuinely re-registered — confirm that " +
-          "with them OUT OF BAND (a channel that is not this one), then run cello_contact_remove for " +
-          "them — that clears the pinned identity, so the next session re-pins — or a directory is " +
-          "substituting an identity. " +
-          "Do not accept a session from them until you know which.",
-        offer_assignment_dialer_mismatch:
-          "REFUSED ON PURPOSE. The directory's session offer named one dialer and the session " +
-          "assignment named another, so the two frames for one session disagree. Retry — you may " +
-          "reach a different directory node. If it repeats, that node is not producing assignments " +
-          "that match its own offers.",
-      };
+      const guidanceFor = (reason: string): string | undefined =>
+        (REFUSAL_GUIDANCE as Record<string, string>)[reason];
+      // Shared with the site that RECORDS the refusal (review N8) — a duplicated literal here
+      // meant a rename on either side silently dropped the guidance and left a bare reason code.
       const refused = (refusedSessionRequests.get(agent) ?? []).map((e) => ({
         session_id: e.sessionIdHex,
         from: e.counterpartyPubkeyHex,
         reason: e.reason,
         refused_at: e.refusedAt,
-        ...(REFUSAL_GUIDANCE[e.reason] ? { guidance: REFUSAL_GUIDANCE[e.reason] } : {}),
+        // `e.reason` is a free-form string on the record (capacity and abuse bounds use their own
+        // codes and speak for themselves); only the security reasons carry guidance.
+        ...(guidanceFor(e.reason) !== undefined ? { guidance: guidanceFor(e.reason) } : {}),
       }));
       const unread = sessionNodeManager.getUnreadSummary(agent);
       const ended_unread = sessionNodeManager.getEndedUnread(agent);

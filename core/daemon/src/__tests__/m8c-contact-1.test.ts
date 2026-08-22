@@ -33,6 +33,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { Stream } from "@libp2p/interface";
 import { markAsAutoReply } from "../away-detection.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -265,20 +266,22 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
   const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 1));
   const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
   const TS = 1_700_000_000_000;
-  function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Record<string, unknown> {
-    return {
-      type: "session_assignment",
-      assignment: {
-        session_id: SID_BYTES,
-        participant_a: { pubkey: Buffer.from(initiatorPubkeyHex, "hex") },
-        participant_b: { pubkey: Buffer.from(counterpartyPubkeyHex, "hex") },
-        session_timestamp: TS,
-        signature_type: "frost",
-        initiator_session_peer_id: "alice-session-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
-    };
+  /**
+   * DOD-M15-RESPONDER-VERIFY-1: the responder now VERIFIES inbound assignments, so these fixtures
+   * inject a genuinely signed one. Nothing about contacts, monikers or away-text is under test
+   * here — the signature is only what gets the frame past the door it now has to pass through.
+   */
+  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Promise<Record<string, unknown>> {
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SID_BYTES,
+      initiatorPubkey: new Uint8Array(Buffer.from(initiatorPubkeyHex, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(counterpartyPubkeyHex, "hex")),
+      initiatorSessionPeerId: "alice-session-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: TS,
+    });
+    return frame;
   }
 
   it("K3/K4 (CC-1): an inbound request from an UNKNOWN sender gets 'Dispatched.' and does NOT auto-whitelist them — accepting the connection ≠ trusting the sender", async () => {
@@ -291,7 +294,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     const strangerPubkey = "cd".repeat(32);
     expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
-    injectRef.inject!(assignmentFrame(strangerPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
     await wait(150);
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
@@ -344,7 +347,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const knownPubkey = "ef".repeat(32);
     h.getSessionNodeManager().addContact("bob", knownPubkey, undefined, null, TIER.KNOWN); // KNOWN BEFORE this session
 
-    injectRef.inject!(assignmentFrame(knownPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(knownPubkey, bobPubkey));
     await wait(150);
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");

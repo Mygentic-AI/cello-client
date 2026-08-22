@@ -25,6 +25,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -192,19 +193,25 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     expect(initRes.ok).toBe(true);
 
     const naPeerId = A.getSessionNodeManager().getSessionNodePeerId("alice", SID_HEX);
-    injectB.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: SID_BYTES,
-        participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        initiator_session_peer_id: naPeerId,
-        session_timestamp: TS,
-        signature_type: "frost",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    /**
+     * DOD-M15-RESPONDER-VERIFY-1: bob's daemon now VERIFIES the assignment it is handed before it
+     * opens its receiver to anyone. Nothing about liveness is under test here — the signature is
+     * only what gets the frame past the door it now has to pass through, and a hand-built frame
+     * with a zeroed `directory_signature` is refused (correctly) before any session exists.
+     */
+    const { frame: assignmentFrame } = await makeSignedAssignmentFrame({
+      sessionId: SID_BYTES,
+      initiatorPubkey: new Uint8Array(Buffer.from(alicePubkey, "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      // Non-null by construction: cello_initiate_session above returned ok, so alice's session node
+      // exists. If it ever did not, the frame would name an empty dialer and bob would refuse it —
+      // the same outcome, reached without a silent "" standing in for a missing peer id.
+      initiatorSessionPeerId: naPeerId!,
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: TS,
     });
+    injectB.inject!(assignmentFrame);
     const awaited = await awaitP;
     expect(awaited.type).toBe("new_session");
 

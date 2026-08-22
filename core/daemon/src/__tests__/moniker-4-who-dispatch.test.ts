@@ -13,10 +13,11 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider } from "@cello-protocol/crypto";
+import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import { NotificationDispatcher } from "../notification-dispatcher.js";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -154,26 +155,48 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
     return { inject: injectRef.inject!, client, bobPubkey, notifications };
   }
 
-  function assignmentFrame(initiatorHex: string, bobHex: string, moniker?: string): Record<string, unknown> {
-    const assignment: Record<string, unknown> = {
-      session_id: SID_BYTES,
-      participant_a: { pubkey: Buffer.from(initiatorHex, "hex") },
-      participant_b: { pubkey: Buffer.from(bobHex, "hex") },
-      session_timestamp: 1_700_000_000_000,
-      signature_type: "frost",
-      initiator_session_peer_id: "alice-session-peer-id",
+  /**
+   * DOD-M15-RESPONDER-VERIFY-1: the responder VERIFIES inbound assignments, so this fixture mints a
+   * genuinely signed one rather than a frame with a zeroed signature. What MONIKER-4 is about — who
+   * the doorbell names — is unchanged; the frame now reaches that code through the real gate.
+   *
+   * The moniker is attached AFTER signing on purpose: it is not covered by the session-establishment
+   * TBS, so it is not tampering, and MONIKER-5 says exactly that — the name rides beside the signed
+   * document and is never something the directory attested.
+   *
+   * `signWith` matters for the two-offer test. The first accepted session PINS the signer as this
+   * counterparty's threshold key, so a second offer from the same initiator signed by a fresh key is
+   * an identity substitution and is refused. Both offers here come from the same quorum, which is
+   * what a repeat session from one counterparty actually looks like.
+   */
+  async function assignmentFrame(
+    initiatorHex: string,
+    bobHex: string,
+    moniker?: string,
+    opts?: { sessionId?: Uint8Array; signWith?: ReturnType<typeof generateKeypair> },
+  ): Promise<Record<string, unknown>> {
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: opts?.sessionId ?? SID_BYTES,
+      initiatorPubkey: Uint8Array.from(Buffer.from(initiatorHex, "hex")),
+      responderPubkey: Uint8Array.from(Buffer.from(bobHex, "hex")),
+      initiatorSessionPeerId: "alice-session-peer-id",
       // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-      counterparty_session_peer_id: "bob-session-peer-id",
-    };
-    if (moniker !== undefined) assignment["moniker"] = moniker;
-    return { type: "session_assignment", assignment };
+      counterpartySessionPeerId: "bob-session-peer-id",
+      signWith: opts?.signWith,
+    });
+    if (moniker !== undefined) {
+      (frame["assignment"] as Record<string, unknown>)["moniker"] = moniker;
+    }
+    return frame;
   }
 
   it("offered name (stranger): who = offered, whoKnown = false; pet name (contact): who = pet, whoKnown = true", async () => {
     const h = await startHarness();
     const initiator = "cd".repeat(32);
+    // One quorum key across both offers — see assignmentFrame: the first session pins it.
+    const quorum = generateKeypair();
 
-    h.inject(assignmentFrame(initiator, h.bobPubkey, "Wonderland_Alice"));
+    h.inject(await assignmentFrame(initiator, h.bobPubkey, "Wonderland_Alice", { signWith: quorum }));
     await wait(150);
 
     const created = h.notifications.find(
@@ -191,8 +214,12 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
       await h.client.send("cello_contact_add", { agent: "bob", pubkey: initiator, moniker: "MyAlice" });
     }
     const sid2 = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 100));
-    const frame2 = assignmentFrame(initiator, h.bobPubkey, "Wonderland_Alice");
-    (frame2["assignment"] as Record<string, unknown>)["session_id"] = sid2;
+    // The session id is covered by the signature, so the second offer is signed for sid2 from the
+    // start rather than having its id swapped after the fact.
+    const frame2 = await assignmentFrame(initiator, h.bobPubkey, "Wonderland_Alice", {
+      sessionId: sid2,
+      signWith: quorum,
+    });
     h.inject(frame2);
     await wait(150);
 
@@ -208,7 +235,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
     const h = await startHarness();
     const initiator = "ce".repeat(32);
 
-    h.inject(assignmentFrame(initiator, h.bobPubkey));
+    h.inject(await assignmentFrame(initiator, h.bobPubkey));
     await wait(150);
 
     const created = h.notifications.find(

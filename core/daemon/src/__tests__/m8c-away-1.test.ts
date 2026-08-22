@@ -35,6 +35,7 @@ import type { Stream } from "@libp2p/interface";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { markAsAutoReply } from "../away-detection.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -217,20 +218,23 @@ describe("M8C-AWAY-1: away response", () => {
   const SID_HEX = Buffer.from(SID_BYTES).toString("hex");
   const TS = 1_700_000_000_000;
 
-  function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Record<string, unknown> {
-    return {
-      type: "session_assignment",
-      assignment: {
-        session_id: SID_BYTES,
-        participant_a: { pubkey: Buffer.from(initiatorPubkeyHex, "hex") },
-        participant_b: { pubkey: Buffer.from(counterpartyPubkeyHex, "hex") },
-        session_timestamp: TS,
-        signature_type: "frost",
-        initiator_session_peer_id: "alice-session-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
-    };
+  /**
+   * DOD-M15-RESPONDER-VERIFY-1: the responder now VERIFIES inbound assignments, so this fixture
+   * injects a genuinely signed one instead of a frame with no directory signature at all. Nothing
+   * about away mode is under test in the signature — it is only what gets the frame past the door
+   * the production path now makes every assignment pass through.
+   */
+  async function assignmentFrame(initiatorPubkeyHex: string, counterpartyPubkeyHex: string): Promise<Record<string, unknown>> {
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SID_BYTES,
+      initiatorPubkey: Uint8Array.from(Buffer.from(initiatorPubkeyHex, "hex")),
+      responderPubkey: Uint8Array.from(Buffer.from(counterpartyPubkeyHex, "hex")),
+      initiatorSessionPeerId: "alice-session-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: TS,
+    });
+    return frame;
   }
 
   it("M12-P16: an agent taken OFFLINE refuses the inbound assignment and sends no away reply", async () => {
@@ -259,7 +263,7 @@ describe("M8C-AWAY-1: away response", () => {
     await client.send("ipc.connect", { clientType: "test" });
     await client.send("cello_set_agent_offline", { name: "bob" });
 
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(200);
 
     expect(
@@ -283,7 +287,7 @@ describe("M8C-AWAY-1: away response", () => {
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
     h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(150);
 
     expect(events.find((e) => e.event === "session.away.response.sent" && e.context.kind === "request")).toBeDefined();
@@ -318,7 +322,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
     snm.setContactAwayMessage("bob", initiatorPubkey, "Hey - reach me on Signal");
 
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey)); // unattended
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // unattended
     await wait(150);
 
     // The RESOLVED custom text is what landed in the transcript — not the system default (bypass:
@@ -345,7 +349,7 @@ describe("M8C-AWAY-1: away response", () => {
     const initiatorPubkey = "cd".repeat(32);
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
 
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(150);
 
     expect(events.find((e) => e.event === "session.away.response.screened_out" && e.context.disposition === "block")).toBeDefined();
@@ -367,7 +371,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
     snm.setContactAwayMessage("bob", initiatorPubkey, "my home address is 123 Main St"); // would-be leak
 
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(150);
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent")[0];
@@ -392,7 +396,7 @@ describe("M8C-AWAY-1: away response", () => {
     await connectAs("bob"); // bob is now ATTENDED
 
     const initiatorPubkey = "ef".repeat(32);
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(150);
 
     expect(events.find((e) => e.event === "session.away.response.sent")).toBeUndefined();
@@ -612,7 +616,7 @@ describe("M8C-AWAY-1: away response", () => {
     snm.addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
 
     // Step 1: inbound session request → daemon sends away greeting (seq 0, sent).
-    injectRef.inject!(assignmentFrame("cd".repeat(32), bobPubkey));
+    injectRef.inject!(await assignmentFrame("cd".repeat(32), bobPubkey));
     await wait(150);
 
     // Step 2: caller sends a [[WRAP]] message → daemon skips away reply.
@@ -639,7 +643,7 @@ describe("M8C-AWAY-1: away response", () => {
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
     h.getSessionNodeManager().addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
 
-    injectRef.inject!(assignmentFrame("cd".repeat(32), bobPubkey));
+    injectRef.inject!(await assignmentFrame("cd".repeat(32), bobPubkey));
     await wait(150);
 
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
@@ -1057,7 +1061,7 @@ describe("M8C-AWAY-1: away response", () => {
          VALUES (?, ?, ?, 'active', ?, ?, 1, NULL)`,
       ).run(("f" + i.toString(16)).padStart(32, "0"), bobId, initiatorPubkey, now, now);
     }
-    injectRef.inject!(assignmentFrame(initiatorPubkey, bobPubkey));
+    injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(150);
     return events;
   }

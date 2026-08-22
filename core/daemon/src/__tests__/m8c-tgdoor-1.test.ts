@@ -26,6 +26,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { TelegramBotClient, TelegramUpdate } from "../telegram-bot-client.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 
 function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
@@ -231,19 +232,19 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
     const SID_BYTES = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 1));
-    injectRef.inject!({
-      type: "session_assignment",
-      assignment: {
-        session_id: SID_BYTES,
-        participant_a: { pubkey: Buffer.from("dd".repeat(32), "hex") },
-        participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-        session_timestamp: 1_700_000_000_000,
-        signature_type: "frost",
-        initiator_session_peer_id: "initiator-peer-id",
-        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-        counterparty_session_peer_id: "bob-session-peer-id",
-      },
+    // DOD-M15-RESPONDER-VERIFY-1: the responder VERIFIES inbound assignments now, so the frame is
+    // genuinely signed. Nothing about the doorbell is under test in the signature — it is only what
+    // gets the frame past the door the accept path now has to open.
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SID_BYTES,
+      initiatorPubkey: new Uint8Array(Buffer.from("dd".repeat(32), "hex")),
+      responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
+      initiatorSessionPeerId: "initiator-peer-id",
+      // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: 1_700_000_000_000,
     });
+    injectRef.inject!(frame);
     await wait(150);
 
     const requestMsg = bot.sent.find((s) => s.text.includes("New session request"));

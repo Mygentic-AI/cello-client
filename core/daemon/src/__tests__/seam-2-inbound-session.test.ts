@@ -18,10 +18,16 @@
  *     → inbound event enqueued
  *     → cello_await_session returns { type:"new_session", session_id, counterparty_pubkey, genesis_prev_root }
  *
- * No infra, no relay, no real directory — the directory's push is injected as a
- * trusted frame. The FROST signature verification of the assignment is the
- * SESSION-004 re-home (deferred); this seam asserts that deferral is logged loudly
- * (session.inbound.assignment.unverified), never silent.
+ * No infra, no relay, no real directory — the directory's push is injected
+ * directly onto the signaling stream.
+ *
+ * DOD-M15-RESPONDER-VERIFY-1: that injected frame is now GENUINELY SIGNED
+ * (`signedAssignmentFrame` below). The responder verifies inbound assignments, so a
+ * frame with a zeroed signature no longer reaches any of the behaviour this file is
+ * about — it is refused at the gate. The frames that this file deliberately builds
+ * BROKEN (no initiator peer id, no counterparty endpoint, single-key signature type,
+ * addressed to nobody local) stay unsigned on purpose: every one of them is refused
+ * strictly before the verification step, so signing them would assert nothing.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -33,6 +39,7 @@ import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -180,6 +187,44 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     return { type: "session_assignment", assignment };
   }
 
+  /**
+   * The same frame, but one the responder can actually VERIFY — DOD-M15-RESPONDER-VERIFY-1.
+   *
+   * `assignmentFrame` above builds an assignment with no signature at all. That was accepted while
+   * the responder only logged `session.inbound.assignment.unverified` and proceeded; now it is
+   * refused before any of the seam this file tests is reached. So every case that must get PAST the
+   * gate mints a keypair, rebuilds the session-establishment TBS from the assignment's own contents
+   * and signs it — the frame arrives through the real check rather than around it.
+   *
+   * `relay_directory_signature` is attached AFTER signing, and that is not tampering: the
+   * establishment TBS covers the participants, the session id/timestamp and the two session
+   * endpoints — not the relay's own signature, which is a separate directory attestation riding
+   * beside the assignment.
+   */
+  async function signedAssignmentFrame(opts: {
+    sessionId?: Uint8Array;
+    initiatorPubkeyHex: string;    // participant_a (our counterparty)
+    counterpartyPubkeyHex: string; // participant_b (the local agent)
+    initiatorPeerId: string;
+    /** DOD-FIRSTMSG-WITNESS-1: the directory's signature over the RELAY assignment. */
+    relayDirectorySignature?: Uint8Array;
+  }): Promise<Record<string, unknown>> {
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: opts.sessionId ?? SID_BYTES,
+      initiatorPubkey: Uint8Array.from(Buffer.from(opts.initiatorPubkeyHex, "hex")),
+      responderPubkey: Uint8Array.from(Buffer.from(opts.counterpartyPubkeyHex, "hex")),
+      initiatorSessionPeerId: opts.initiatorPeerId,
+      // DOD-INBOUND-GUARD-1: a complete assignment names the responder's accepted endpoint.
+      counterpartySessionPeerId: "bob-session-peer-id",
+      sessionTimestamp: TS,
+    });
+    if (opts.relayDirectorySignature !== undefined) {
+      (frame["assignment"] as Record<string, unknown>)["relay_directory_signature"] =
+        opts.relayDirectorySignature;
+    }
+    return frame;
+  }
+
   function expectedGenesisHex(initiatorHex: string, counterpartyHex: string, sid: Uint8Array, ts: number): string {
     return Buffer.from(
       computeGenesisPrevRoot(Buffer.from(initiatorHex, "hex"), Buffer.from(counterpartyHex, "hex"), sid, ts),
@@ -201,7 +246,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await snm.ensureStandingReceiverForAgent("bob");
     const initiatorPubkey = "cd".repeat(32);
 
-    injectRef.inject!(assignmentFrame({
+    injectRef.inject!(await signedAssignmentFrame({
       initiatorPubkeyHex: initiatorPubkey,
       counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-session-peer-id",
@@ -254,7 +299,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       await wait(40); // ensure the waiter is registered
 
       const initiatorPubkey = "ab".repeat(32);
-      injectRef.inject!(assignmentFrame({
+      injectRef.inject!(await signedAssignmentFrame({
         initiatorPubkeyHex: initiatorPubkey,
         counterpartyPubkeyHex: bobPubkey,
         initiatorPeerId: "alice-session-peer-id",
@@ -279,7 +324,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     // Per-agent SR (DOD-LOOP-1): bob must be online for his inbound assignment to be accepted.
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
     const initiatorPubkey = "cd".repeat(32);
-    const frame = assignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" });
+    const frame = await signedAssignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" });
     injectRef.inject!(frame);
     await wait(120);
     injectRef.inject!(frame); // retransmit
@@ -318,10 +363,15 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const sidB = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 100));
     const initA = "11".repeat(32);
     const initB = "22".repeat(32);
+    // Both frames are built (and signed) BEFORE either is pushed, so the two pushes are still
+    // back-to-back with nothing awaited between them — that burst is the whole point of M2.
+    // Two distinct initiators means two distinct counterparties, so each may carry its own signer.
+    const frameA = await signedAssignmentFrame({ initiatorPubkeyHex: initA, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-a" });
+    const frameB = await signedAssignmentFrame({ sessionId: sidB, initiatorPubkeyHex: initB, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-b" });
     // Two pushes back-to-back: the first consumes the standing receiver; the second
     // must wait for the async rebuild rather than being dropped.
-    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: initA, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-a" }));
-    injectRef.inject!(assignmentFrame({ sessionId: sidB, initiatorPubkeyHex: initB, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "peer-b" }));
+    injectRef.inject!(frameA);
+    injectRef.inject!(frameB);
     await wait(300);
 
     expect(events.filter((e) => e.event === "session.inbound.accepted").length).toBe(2);
@@ -477,7 +527,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
 
     // Now the directory pushes the session. The dead waiter must NOT swallow it.
     const initiatorPubkey = "ef".repeat(32);
-    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" }));
+    injectRef.inject!(await signedAssignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" }));
     await wait(120);
 
     // A fresh connection's await receives the session (it landed in the queue, not a dead waiter).
@@ -562,11 +612,10 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     (snm as any).acceptSession = (...args: unknown[]) => { seen.push(args[5]); return (realAccept as any)(...args); };
 
     const DIR_SIG = Uint8Array.from(Array.from({ length: 64 }, (_, i) => (i * 7 + 3) & 0xff));
-    injectRef.inject!(assignmentFrame({
+    injectRef.inject!(await signedAssignmentFrame({
       initiatorPubkeyHex: "cd".repeat(32),
       counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-session-peer-id",
-      relayPeerId: "relay-peer-id",
       relayDirectorySignature: DIR_SIG,
     }));
     await wait(150);

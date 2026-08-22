@@ -2278,13 +2278,22 @@ export class SessionNodeManager {
     if (!this.#db) return false;
     const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
     // DOD-RENAME-1: a removed contact has no pending rename to resolve.
-    if (res.changes > 0) {
-      this.clearRenameNotice(agentName, pubkey);
-      // DOD-M15-OFFER-SIGNED-1 (review F2): forgetting a contact must forget their PINNED identity
-      // too, or the pin outlives the relationship and there is no way back.
-      this.clearPinnedCounterpartyPrimary(agentName, pubkey);
-    }
-    return res.changes > 0;
+    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
+    /**
+     * OUTSIDE the `changes > 0` guard — review N2, and inside it the F2 fix did nothing for the
+     * case that matters.
+     *
+     * The pin is written on every ACCEPTED INBOUND session. A contact row is written only on an
+     * outbound initiate, an explicit add, a reply, or a trust-signal presentation — and an inbound
+     * requester is deliberately NOT auto-added. So a counterparty you never replied to (away-mode
+     * auto-ack is exactly this) has a pin and no contact row.
+     *
+     * Guarded, `cello_contact_remove` for them returned `{ ok: true, removed: false }`, cleared
+     * nothing, and the identity refusal stayed permanent — the original lockout, now wearing an
+     * `ok: true`, which is harder to notice than the original.
+     */
+    const pinsCleared = this.clearPinnedCounterpartyPrimary(agentName, pubkey);
+    return res.changes > 0 || pinsCleared > 0;
   }
 
   /**
@@ -2308,9 +2317,16 @@ export class SessionNodeManager {
     if (!this.#db) return 0;
     const res = this.#db
       .prepare(
-        "UPDATE sessions SET counterparty_primary_pubkey = NULL, updated_at = ? WHERE agent_id = ? AND counterparty_pubkey = ?",
+        // NO `updated_at` BUMP — review N6. `CAP_COUNTS` counts an interrupted session only while
+        // `updated_at` is inside the staleness window, so touching it here reset the clock on every
+        // stale session with that counterparty, re-inflating their per-sender cap — while removing
+        // the contact simultaneously dropped them to UNKNOWN tier, which LOWERS it. The operator
+        // follows the printed remedy and their counterparty's next session is refused for cap,
+        // through a reason string deliberately identical to every other refusal. A second lockout
+        // that says nothing. Nothing needs the timestamp: every candidate row ends up NULL.
+        "UPDATE sessions SET counterparty_primary_pubkey = NULL WHERE agent_id = ? AND counterparty_pubkey = ?",
       )
-      .run(Date.now(), this.#requireAgentId(agentName), counterpartyPubkeyHex);
+      .run(this.#requireAgentId(agentName), counterpartyPubkeyHex);
     return Number(res.changes);
   }
 
@@ -2640,32 +2656,48 @@ export class SessionNodeManager {
     return this.#offeredDialer.get(this.#k(agentName, sessionIdHex)) ?? null;
   }
 
-  /** Forget the offered dialer for ONE session, once it is claimed or refused. */
+  /** Forget the offered dialer for ONE session — called on BOTH the claim and the refusal paths. */
   clearOfferedDialer(agentName: string, sessionIdHex: string): void {
     this.#offeredDialer.delete(this.#k(agentName, sessionIdHex));
   }
 
   /**
-   * RE-CLOSE the standing receiver and hang up whoever the refused offer let in.
+   * RE-CLOSE the standing receiver — but ONLY if this session is still the one holding it.
    *
-   * DOD-M15-OFFER-SIGNED-1 review F4. When the inbound path refuses an assignment, the gate has
-   * ALREADY been narrowed to the peer that offer named — so the code declares a peer unauthorised
-   * and then leaves the door open to exactly it. libp2p never re-runs a gater against a live
-   * connection, so a peer that connected in the meantime stays connected until some later promotion
-   * sweeps it. `DOD-M15-FRAME-1`'s frame gate stops it doing anything, which makes this a foothold
-   * rather than an open door — and a foothold is precisely what that sweep exists to remove.
+   * DOD-M15-OFFER-SIGNED-1 review F4, then N1. The first version closed the gate unconditionally,
+   * and that was worse than the defect it fixed: an agent has ONE standing receiver with ONE allowed
+   * peer, so a refusal for session P closed the gate that offer Q had narrowed. Q's initiator —
+   * invited, legitimate — was then refused with *"nothing invited it"*, which this daemon had.
    *
-   * Returns to admitting NOBODY, which is the correct resting state for an unclaimed receiver: this
-   * session is not happening, so nobody is expected to dial.
+   * That is the same cross-session interference F1 was written to remove, moved one method along,
+   * and triggerable the same way: one bogus offer/assignment pair collapses a concurrent real
+   * session.
+   *
+   * So the gate is closed only when it still names the peer THIS session opened it to. If a later
+   * offer has already re-narrowed it, that offer owns the receiver and its narrowing stands.
+   *
+   * NO EVICTION SWEEP, deliberately (N4). The sweep evicts by "not the allowed peer", and
+   * `getConnections()` returns OUTBOUND connections too — including the content-park and
+   * restart-seal dials this node makes as the daemon's general-purpose dialer, whose targets are on
+   * no allowlist by construction. Sweeping here hung those up, and the failure surfaced as
+   * `relay_unavailable`: a transport label for a local decision, which is the exact substitution
+   * that comment was written to prevent. The load-bearing control is `DOD-M15-FRAME-1`'s frame gate,
+   * which refuses what an unauthorised peer sends; closing the door is enough here.
    */
-  async revokeOfferedDialer(agentName: string, sessionIdHex: string, correlationId: string): Promise<void> {
+  revokeOfferedDialer(agentName: string, sessionIdHex: string, offeredPeerId: string | null): void {
     this.clearOfferedDialer(agentName, sessionIdHex);
     const sr = this.#standingReceivers.get(agentName);
-    if (!sr) return;
+    if (!sr || offeredPeerId === null) return;
+    if (sr.gater.getAllowedPeerId() !== offeredPeerId) {
+      // A later offer already owns the receiver. Closing it would refuse THAT session's initiator.
+      this.#logger.debug("session.gate.revoke.skipped", {
+        agentName,
+        sessionId: sessionIdHex,
+        reason: "a later offer has re-narrowed this receiver; its narrowing stands",
+      });
+      return;
+    }
     sr.gater.closeInbound();
-    // No allowed peer any more: everyone inbound is outside the gate. `""` matches no peer id,
-    // and the relay allowances are exempted inside the sweep so reachability survives.
-    await this.#evictPeersOutsideGate(sr.node, sr.gater, `standing_receiver:${agentName}`, "", correlationId);
   }
 
   /**
@@ -3499,6 +3531,12 @@ export class SessionNodeManager {
     correlationId: string,
     relay?: RelayConnectParams,
   ): Promise<CreateSessionResult> {
+    // DOD-M15-OFFER-SIGNED-1 review N5: the offer record has done its job the moment this session is
+    // claimed. Keying it by session (the F1 fix) removed the accidental bound that agent-keying gave
+    // it — each new offer used to overwrite the last — so without a clear on the SUCCESS path the
+    // map gained one permanent entry per offer ever received, on directory-supplied keys. Cleared
+    // here rather than only on refusal, which is what the doc comment always claimed.
+    this.clearOfferedDialer(agentName, sessionId);
     const inboundSr = this.#standingReceivers.get(agentName);
     if (!inboundSr) {
       // DOD-LOOP-1: per-agent — kick off (idempotent) creation so a retry finds it.
@@ -9461,6 +9499,14 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     const live = this.#activeNodes.get(key);
     if (live) return { ok: true, peerId: live.node.getPeerId() };
+
+    // PARITY with `acceptSession` — and the parity guard in msg-022 is what caught its absence.
+    // A revived session's offer record has almost always been cleared already (it was cleared when
+    // the session was first accepted), so this is usually a no-op. It is here because "usually a
+    // no-op" is not a reason for establishment and revival to do different things: every divergence
+    // between those two paths in this file has been a defect, and the guard exists because one of
+    // them shipped past a green suite for two days.
+    this.clearOfferedDialer(agentName, sessionId);
 
     const record = this.getSessionRecord(agentName, sessionId);
     if (!record) return { ok: false, reason: "session_not_found" };

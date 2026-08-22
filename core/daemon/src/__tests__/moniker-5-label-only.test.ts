@@ -14,6 +14,7 @@ import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -102,19 +103,30 @@ async function startHarness(): Promise<{ inject: (f: unknown) => void; client: I
   return { inject: injectRef.inject!, client, bobPubkey, snm };
 }
 
-function assignmentFrame(initiatorHex: string, bobHex: string, sid: Uint8Array, moniker?: string): Record<string, unknown> {
-  const assignment: Record<string, unknown> = {
-    session_id: sid,
-    participant_a: { pubkey: Buffer.from(initiatorHex, "hex") },
-    participant_b: { pubkey: Buffer.from(bobHex, "hex") },
-    session_timestamp: 1_700_000_000_000,
-    signature_type: "frost",
-    initiator_session_peer_id: "alice-session-peer-id",
+/**
+ * DOD-M15-RESPONDER-VERIFY-1: the responder now VERIFIES inbound assignments, so this fixture mints
+ * a genuinely signed one. The moniker is attached AFTER signing on purpose — it is not covered by
+ * the session-establishment TBS, and that is exactly the point of MONIKER-5: the name rides beside
+ * the signed document, so it can never be mistaken for something the directory attested.
+ */
+async function assignmentFrame(
+  initiatorHex: string,
+  bobHex: string,
+  sid: Uint8Array,
+  moniker?: string,
+): Promise<Record<string, unknown>> {
+  const { frame } = await makeSignedAssignmentFrame({
+    sessionId: sid,
+    initiatorPubkey: Uint8Array.from(Buffer.from(initiatorHex, "hex")),
+    responderPubkey: Uint8Array.from(Buffer.from(bobHex, "hex")),
+    initiatorSessionPeerId: "alice-session-peer-id",
     // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-    counterparty_session_peer_id: "bob-session-peer-id",
-  };
-  if (moniker !== undefined) assignment["moniker"] = moniker;
-  return { type: "session_assignment", assignment };
+    counterpartySessionPeerId: "bob-session-peer-id",
+  });
+  if (moniker !== undefined) {
+    (frame["assignment"] as Record<string, unknown>)["moniker"] = moniker;
+  }
+  return frame;
 }
 
 const sid = (n: number) => Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + n));
@@ -126,8 +138,8 @@ describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and witho
     const named = "bb".repeat(32);
 
     // Two strangers: one offers a name, one does not. Same screening inputs otherwise.
-    h.inject(assignmentFrame(nameless, h.bobPubkey, sid(1)));
-    h.inject(assignmentFrame(named, h.bobPubkey, sid(50), "Trusted_Admin"));
+    h.inject(await assignmentFrame(nameless, h.bobPubkey, sid(1)));
+    h.inject(await assignmentFrame(named, h.bobPubkey, sid(50), "Trusted_Admin"));
     await wait(200);
 
     // CC-1: neither is auto-added — a name does not promote to "known".
@@ -145,7 +157,7 @@ describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and witho
     const h = await startHarness();
     const initiator = "cc".repeat(32);
 
-    h.inject(assignmentFrame(initiator, h.bobPubkey, sid(1), "Wonderland_Alice"));
+    h.inject(await assignmentFrame(initiator, h.bobPubkey, sid(1), "Wonderland_Alice"));
     await wait(150);
 
     const sessions = (await h.client.send("cello_list_sessions", { agent: "bob" })) as {

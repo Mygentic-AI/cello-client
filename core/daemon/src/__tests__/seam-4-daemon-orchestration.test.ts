@@ -39,6 +39,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -211,21 +212,25 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       expect(initRes.sessionId).toBe(SID_HEX);
 
       // ── The directory pushes the assignment to B, carrying N_A's peer id (known only now).
+      //
+      // DOD-M15-RESPONDER-VERIFY-1: B VERIFIES this assignment before it hands its standing
+      // receiver over, so the push is a genuinely FROST-signed frame rather than one with a
+      // zeroed signature. That is the production shape — B has never met alice, so the verifier
+      // runs in its internal-consistency mode. What seam 4 is about (the two daemons carrying a
+      // session end to end over real libp2p) is unchanged; the assignment now arrives through
+      // the same gate a real directory push goes through.
       const naPeerId = A.getSessionNodeManager().getSessionNodePeerId("alice", SID_HEX);
       expect(typeof naPeerId).toBe("string");
-      injectB.inject!({
-        type: "session_assignment",
-        assignment: {
-          session_id: SID_BYTES,
-          participant_a: { pubkey: Buffer.from(alicePubkey, "hex") },
-          participant_b: { pubkey: Buffer.from(bobPubkey, "hex") },
-          initiator_session_peer_id: naPeerId,
-          session_timestamp: TS,
-          signature_type: "frost",
-          // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
-          counterparty_session_peer_id: "bob-session-peer-id",
-        },
+      const { frame: assignmentFrame } = await makeSignedAssignmentFrame({
+        sessionId: SID_BYTES,
+        initiatorPubkey: Uint8Array.from(Buffer.from(alicePubkey, "hex")),
+        responderPubkey: Uint8Array.from(Buffer.from(bobPubkey, "hex")),
+        initiatorSessionPeerId: naPeerId as string,
+        // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
+        counterpartySessionPeerId: "bob-session-peer-id",
+        sessionTimestamp: TS,
       });
+      injectB.inject!(assignmentFrame);
 
       // ── B discovers the session via the blocked await (proves seam-2 acceptSession ran).
       const awaited = await awaitP;

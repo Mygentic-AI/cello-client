@@ -122,8 +122,15 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // apart: the session genuinely has not sealed, or it sealed and the `session_sealed` push never
       // reached this daemon. The second is the divergence, and answering `not_sealed_yet` for it is
       // how an operator got sent round the loop into a force-abandon that destroyed their half of a
-      // receipt that existed. The pull is what distinguishes them — and it distinguishes them by
-      // VERIFYING a certificate, not by trusting an answer.
+      // receipt that existed. The pull is what distinguishes them — and it does so by fetching a
+      // certificate rather than trusting an answer.
+      //
+      // ⚠️ IT DOES NOT ALWAYS VERIFY IT, and this comment used to say it did (review N3). The pull
+      // refuses a certificate whose signature FAILS. It ACCEPTS one whose signature it cannot check
+      // at all — when this daemon holds no key for the signer — and that case stopped being rare
+      // once `cello_contact_remove` began clearing a counterparty's pinned identity. The pull now
+      // logs `seal.certificate.pull.unverified` when that happens, so "recovered" and "recovered and
+      // verified" are distinguishable; they were not.
       if (deps.pullSealCertificate) {
         const pulled = await deps.pullSealCertificate(agentName, sessionId);
         if (pulled.ok) {

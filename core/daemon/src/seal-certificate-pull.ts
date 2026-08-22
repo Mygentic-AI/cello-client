@@ -175,6 +175,34 @@ export async function pullSealCertificate(
     logger.error("seal.certificate.pull.invalid", { agentName, sessionId: sessionIdHex, reason: verdict.reason });
     return { ok: false, reason: "verification_failed", detail: verdict.reason };
   }
+  if (!verdict.verified) {
+    /**
+     * ACCEPTED WITHOUT VERIFICATION — and until now that was SILENT, on a path whose own header
+     * claims it *"distinguishes them by VERIFYING a certificate, not by trusting an answer"*
+     * (review N3).
+     *
+     * `verifyBilateralSealCertificate` returns `{ok:true, verified:false}` when it does not hold the
+     * signer's key. That is a legitimate state — but it stopped being rare the moment
+     * `cello_contact_remove` began NULLing the pin (the fix for the identity-refusal lockout). One
+     * operator action silently moved every past session with that counterparty from *verified* to
+     * *taken on trust*, and nothing said so.
+     *
+     * Forgetting a counterparty's identity genuinely DOES cost the ability to verify their old
+     * certificates — the key was thrown away on purpose. The defect was never the cost; it was that
+     * the cost was invisible while a comment two files away promised the opposite. The certificate
+     * is still recorded (it arrived over an authenticated channel), and the operator is now told
+     * what they are holding.
+     */
+    logger.warn("seal.certificate.pull.unverified", {
+      agentName,
+      sessionId: sessionIdHex,
+      reason: verdict.reason,
+      impact:
+        "this certificate was accepted without checking its signature, because this daemon holds no key for its signer — most often because the counterparty's pinned identity was cleared by cello_contact_remove. The sealed root is recorded on the counterparty's word, not on a verified signature",
+      guidance:
+        "if you need this receipt to be independently verifiable, ask the counterparty to re-seal, or re-establish a session with them first so their identity is pinned again",
+    });
+  }
 
   const rootHex = Buffer.from(sealedRoot).toString("hex");
   const legibility = f["legibility"];
