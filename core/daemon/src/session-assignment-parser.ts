@@ -2,10 +2,26 @@
  * Session assignment parsing.
  *
  * Decodes a raw CBOR-decoded `assignment` object (from a directory
- * `session_assignment` frame) into a typed SessionAssignment. Shape-validates ONLY;
- * the FROST/single signature is verified downstream by the transport/session layer
- * against the directory's pinned key. The logic lives here in the daemon because the
- * daemon must NOT import the core/client stack.
+ * `session_assignment` frame) into a typed SessionAssignment. **Shape-validates ONLY** — it checks
+ * that a signature is 64 bytes, never that it is correct. The logic lives here in the daemon
+ * because the daemon must NOT import the core/client stack.
+ *
+ * ⚠️ DOD-M15-CLAIM-COMMENTS-1 — THIS HEADER NAMED A CHECK THAT DID NOT EXIST. It read: *"the
+ * FROST/single signature is verified downstream by the transport/session layer against the
+ * directory's pinned key."* There was no such site anywhere in the tree —
+ * `buildSessionEstablishmentTbs` was called to SIGN and nowhere to verify — so every caller of this
+ * parser was relying on a verification the sentence invented.
+ *
+ * Verification now exists, in exactly one place: `assignment-verify.ts`, called by
+ * `outbound-sessions.ts` on the initiator path, which REFUSES the session when it fails. Two
+ * corrections to the old sentence while the record is open: it is not verified by "the
+ * transport/session layer", and it is not "the directory's pinned key" — the FROST signature is by
+ * the INITIATOR's own threshold group key, which is why the verifier compares `signer_pubkey`
+ * against this agent's persisted `primaryPubkey` before trusting it.
+ *
+ * **The responder path does NOT verify it** and cannot today without a directory lookup of the
+ * initiator's `primary_pubkey`. Said plainly here rather than left for the next reader to assume
+ * symmetry, because assuming symmetry is what the original sentence cost.
  */
 
 import type { SessionAssignment } from "@cello-protocol/protocol-types";

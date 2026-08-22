@@ -22,6 +22,7 @@ import type { SessionNegotiator, SessionNegotiationResult } from "./transport-se
 import { classifyOnlineResult, type DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { parseDiscoveryLookupResult, discoveryLookupErrorReason, parseSessionAssignment, sessionRequestErrorReason, resolveOutboundMoniker } from "./session-assignment-parser.js";
 import { DbIdentityStore } from "./db-identity-store.js";
+import { verifyAssignmentSignature } from "./assignment-verify.js";
 import { createSignalingConnect } from "./signaling-connect.js";
 import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-ceremony.js";
@@ -375,7 +376,29 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       if (!assignment) {
         return { ok: false, reason: "assignment_parse_failed", guidance: "The directory's session_assignment was missing or malformed." };
       }
-      logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type });
+      /**
+       * DOD-M15-ASSIGN-1 — VERIFY THE SIGNATURE BEFORE ANYTHING TRUSTS THE ASSIGNMENT.
+       *
+       * WHAT THIS STOPS, stated first because an earlier draft of this note undersold it into
+       * sounding like paperwork: **without it, whichever directory node this daemon is talking to
+       * can hand it a permission slip naming any peer id and addresses it likes, and the daemon
+       * dials them.** One compromised directory could put an operator into a session with an
+       * impostor, and everything downstream would look normal — the impostor is a real agent
+       * signing with its own real key. Verification means a single node cannot do that: the slip
+       * must carry a threshold signature from this agent's own quorum, which no one node can
+       * produce. That is the forgery-resistance property FROST exists for, and it was claimed in
+       * the design and enforced nowhere.
+       *
+       * THE BOUND, equally explicit: a THRESHOLD of this agent's own directories, colluding, could
+       * still sign an assignment naming the wrong counterparty. That is the designed-for limit, not
+       * the everyday one. The substitution is caught at ingest by the wrong-signer check
+       * (`DOD-M15-FRAME-1`) and closed by relay corroboration (`DOD-M15-CORROBORATE-1`).
+       */
+      const verified = await verifyAssignmentSignature(assignment, getPersistence(agentName), logger, agentName, correlationId);
+      if (!verified.ok) {
+        return { ok: false, reason: verified.reason, guidance: verified.guidance };
+      }
+      logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
       return { ok: true, assignment };
     } finally {
       unregister();
