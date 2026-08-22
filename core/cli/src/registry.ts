@@ -535,7 +535,12 @@ export const COMMANDS: readonly CommandSpec[] = [
   {
     name: "close-session",
     group: "Messaging",
-    summary: "End a session. Both sides sign off and get a tamper-proof receipt.",
+    // DOD-M15-LEDGER-1 — adjudicated 2026-08-22. Two corrections in one line. "tamper-PROOF" was
+    // wrong: a hash chain plus a Merkle root plus a threshold signature makes alteration DETECTABLE,
+    // not impossible, and the help text three lines below already said "tamper-evident" — the
+    // summary was overclaiming what its own help disclaimed. And "both sides sign off" is the good
+    // case, not the guarantee: a counterparty who never returns yields a unilateral seal.
+    summary: "End a session. Both sides sign off where they can, and each gets a tamper-evident receipt.",
     help:
       "Usage: cello close-session <session-id> [--session-name \"<text>\"] [--force] [--agent <name>] [--pretty]\n" +
       "  Both parties sign off on the whole conversation and each gets a notarized receipt\n" +
@@ -861,12 +866,20 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: "sealed-receipt",
     group: "Sessions & receipts",
     // THE one users want. Named and described so it cannot be confused with relay-receipts.
-    summary: "Print a closed session's notarized receipt — proof both sides signed off on the conversation.",
+    // DOD-M15-LEDGER-1 — adjudicated 2026-08-22. This said "proof both sides signed off". A seal can
+    // be UNILATERAL (`seal_type: "unilateral"`, seal-escalation.ts) when the counterparty never
+    // returns, and that receipt is exactly the one an operator is most likely to be holding when
+    // something went wrong — so the sentence was false precisely where it mattered most. The receipt
+    // now says which kind it is instead of promising the stronger kind.
+    summary: "Print a closed session's notarized receipt — what was said, and who signed off on it.",
     help:
       "Usage: cello sealed-receipt <session-id> [--agent <name>] [--pretty]  — the NOTARIZED receipt.\n" +
-      "  This is the proof CELLO exists to produce: when a session closes, both parties sign off on\n" +
-      "  the whole conversation and the directory notarizes it. The receipt is tamper-evident — if a\n" +
+      "  This is the proof CELLO exists to produce: when a session closes, the parties sign off on the\n" +
+      "  whole conversation and the directory notarizes it. The receipt is tamper-evident — if a\n" +
       "  single message were altered, added or dropped, it would no longer match.\n" +
+      "  BILATERAL or UNILATERAL, and the receipt says which. Bilateral means both parties signed;\n" +
+      "  unilateral means the counterparty never returned to sign, so it carries YOUR account of the\n" +
+      "  conversation, notarized and tamper-evident, but not their agreement that it is complete.\n" +
       "  It attests RECEIPT, never agreement (implies_assent: false) — an unanswered last message\n" +
       "  reads as delivered-but-unanswered, never as consent.\n" +
       "  NOT the same as 'cello relay-receipts', which is a low-level delivery-plumbing artifact.",

@@ -19,7 +19,7 @@
  *
  * ─── The baseline is a BACKLOG, not an exemption ───────────────────────────────────────────────
  *
- A first run found **188 claims across 10 shipped surfaces**, against a ledger holding 13 rows
+ * A first run found **188 claims across 10 shipped surfaces**, against a ledger holding 13 rows
  * and covering 2 of them. Eight surfaces had never been audited at all.
  *
  * Adjudicating 188 claims is real work and cannot be a precondition for having the guard. So the
@@ -27,12 +27,24 @@
  * claim fails immediately, and the numbers cannot be raised to accommodate one. That is the same
  * shape the chain-writes guard uses, and it is the difference between a backlog and a blanket
  * exemption.
+ *
+ * ─── Three states, not two ─────────────────────────────────────────────────────────────────────
+ *
+ * A claim is UNADJUDICATED (counted in the baseline), ADJUDICATED (recorded in
+ * `helpers/claims-ledger.ts` with a verdict and the evidence, and subtracted from the count), or
+ * gone. Adjudicating moves a claim from the first state to the second and the baseline shrinks.
+ *
+ * That third state is not bookkeeping. Without it, correcting *"tamper-proof receipt"* to
+ * *"tamper-evident receipt"* plus three lines explaining that a seal may be unilateral made the
+ * count go UP — so the guard failed the build for an edit that made the product more honest. A
+ * guard that charges for disclosure teaches people to delete the disclosure.
  */
 
 import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ADJUDICATED, adjudicatedMatches } from "./helpers/claims-ledger.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -187,7 +199,7 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   "AUDIT-ME.md": 18,
   "README.md": 20,
   "core/adapter-claude-code/SKILL.md": 30,
-  "core/cli/src/registry.ts (operator-facing strings)": 41,
+  "core/cli/src/registry.ts (operator-facing strings)": 39,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
   "plugins/cello/skills/documents/SKILL.md": 18,
@@ -231,12 +243,23 @@ describe("DOD-M15-CLAIM-SCANNER-1: shipped surfaces are discovered, not remember
 });
 
 describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
-  it("no shipped surface carries MORE claims than its recorded baseline", () => {
+  it("no shipped surface carries MORE UNADJUDICATED claims than its recorded baseline", () => {
+    /**
+     * `found` is every claim on the surface; `adjudicatedMatches` is the part somebody has checked
+     * against the code and recorded a verdict for. The baseline governs the REMAINDER.
+     *
+     * Without that subtraction the guard punished honest disclosure: correcting "tamper-proof
+     * receipt" to "tamper-evident receipt" plus three lines explaining that a seal may be unilateral
+     * made the count go UP, and the build failed for an edit that made the product more truthful.
+     * A guard that charges for disclosure teaches people to delete the disclosure.
+     */
     const grown: string[] = [];
     for (const [surface, text] of surfaceTexts()) {
-      const found = countMatches(text);
+      const found = countMatches(text) - adjudicatedMatches(surface);
       const allowed = UNADJUDICATED_BASELINE[surface] ?? 0;
-      if (found > allowed) grown.push(`${surface}: ${found} claims, baseline ${allowed}`);
+      if (found > allowed) {
+        grown.push(`${surface}: ${found} unadjudicated claims, baseline ${allowed}`);
+      }
     }
     expect(
       grown,
@@ -256,7 +279,7 @@ describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
     for (const [surface, allowed] of Object.entries(UNADJUDICATED_BASELINE)) {
       const text = texts.get(surface);
       if (text === undefined) { stale.push(`${surface}: no longer discovered`); continue; }
-      const found = countMatches(text);
+      const found = countMatches(text) - adjudicatedMatches(surface);
       if (found < allowed) stale.push(`${surface}: ${found} claims, baseline still says ${allowed}`);
     }
     expect(
@@ -274,6 +297,53 @@ describe("DOD-M15-CLAIM-SCANNER-1: an unlisted claim fails the build", () => {
       orphans,
       `These baselines name surfaces the enumeration does not find, so their claims are no ` +
         `longer being counted: ${orphans.join(", ")}`,
+    ).toEqual([]);
+  });
+});
+
+describe("DOD-M15-LEDGER-1: an adjudicated claim carries a verdict and evidence", () => {
+  it("every entry names the code or change that settles it, not a belief", () => {
+    /**
+     * The prose ledger's whole failure was rows recording that somebody had LOOKED, rather than what
+     * they found. "It looks right" is not a disposition. An entry that cannot name the file, the
+     * behaviour, or the change it rests on has not adjudicated anything — it has moved a claim out
+     * of the count, which is strictly worse than leaving it in.
+     */
+    const thin = ADJUDICATED.filter((a) => a.evidence.trim().length < 80).map((a) => a.claim);
+    expect(
+      thin,
+      `These ledger entries have evidence too thin to be a check: ${thin.join("; ")}. Name the code ` +
+        `that makes the claim true, or the change that made it true.`,
+    ).toEqual([]);
+  });
+
+  it("every entry names a surface the enumeration actually finds", () => {
+    // An entry for a surface nothing reads subtracts from a count nobody checks — a claim laundered
+    // out of the backlog without being audited.
+    const discovered = new Set(surfaceTexts().keys());
+    const orphans = ADJUDICATED.filter((a) => !discovered.has(a.surface)).map((a) => a.surface);
+    expect(
+      orphans,
+      `These ledger entries name surfaces the scanner does not read: ${orphans.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  it("no surface has more adjudicated matches than it has claims", () => {
+    /**
+     * The arithmetic guard, and the one that stops this file becoming an exemption list. If entries
+     * ever account for more matches than the surface contains, the subtraction goes negative and
+     * every future claim on that surface is free.
+     */
+    const over: string[] = [];
+    for (const [surface, text] of surfaceTexts()) {
+      const total = countMatches(text);
+      const claimed = adjudicatedMatches(surface);
+      if (claimed > total) over.push(`${surface}: ${claimed} adjudicated vs ${total} present`);
+    }
+    expect(
+      over,
+      `The ledger accounts for more claims than these surfaces contain, so the remainder goes ` +
+        `negative and new claims stop being counted: ${over.join("; ")}`,
     ).toEqual([]);
   });
 });
