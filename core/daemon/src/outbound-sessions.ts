@@ -681,7 +681,25 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           if (action.kind === "retry") {
             logger.info("directory.discovery.lookup.retry", { agentName: ctx.agentName, attempt, kind: "online_no_owner", correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
-            return { ok: false, reason: "counterparty_offline", guidance: "The directory reported the counterparty online but named no home node. Retry shortly." };
+            /**
+             * DOD-M15-ERRSTRING-1 — NAME WHAT WAS OBSERVED. This returned `counterparty_offline`,
+             * and its own guidance said the opposite in the next sentence: *the directory reported
+             * the counterparty ONLINE*. The counterparty is not the broken thing here; the
+             * directory answered "online" and then named nobody who could serve them.
+             *
+             * That mismatch is the whole defect this line exists to close. An operator told
+             * "counterparty offline" goes and asks their counterparty to check — the one place the
+             * fault is not.
+             */
+            return {
+              ok: false,
+              reason: "directory_named_no_home",
+              guidance:
+                "The directory said this counterparty is online but named no node that holds them, three times. " +
+                "That is a directory-side inconsistency, not the counterparty being offline — there is nothing " +
+                "for them to fix on their side. Retry in a minute; if it repeats, run cello_status to see which " +
+                "directory node you are on, and try again once it has re-synced.",
+            };
           }
 
           const result =
@@ -706,7 +724,30 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           }
           return result;
         }
-        return { ok: false, reason: "counterparty_offline", guidance: "Session establishment did not succeed after several attempts. Retry shortly." };
+        /**
+         * DOD-M15-ERRSTRING-1 — UNREACHABLE BACKSTOP, and it is worth saying so precisely because
+         * the previous value made it look like a live path.
+         *
+         * Every branch in the loop above either `continue`s (only while `attempt < MAX_ATTEMPTS`) or
+         * returns, and the body ends in `return result`. So the loop cannot complete normally; this
+         * exists because the compiler cannot see that. It was checked by trace, not assumed — an
+         * earlier draft of this comment claimed this line was the catch-all behind the 2026-08-16
+         * incident, and it is not: the reachable false-offline was the no-home branch above.
+         *
+         * It still must not say `counterparty_offline`. A backstop that fires is by definition a
+         * case nobody predicted, which is the worst possible moment to assert a specific party is
+         * at fault — and if this ever DOES appear in a log, "the cause was not one this daemon can
+         * name" is exactly the truth the reader needs.
+         */
+        return {
+          ok: false,
+          reason: "session_setup_exhausted",
+          guidance:
+            "Three attempts to set up the session all failed, and the cause was not one this daemon can name — " +
+            "so it is deliberately not guessing that the counterparty is offline. Retry in a minute. If it repeats: " +
+            "run cello_status to check your own directory connection first (a node below threshold or mid-restart " +
+            "presents exactly like this), and only then ask the counterparty to check theirs.",
+        };
       } finally {
         negotiationInProgress.delete(ctx.agentName);
       }
