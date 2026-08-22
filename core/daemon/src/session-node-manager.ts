@@ -7755,14 +7755,13 @@ export class SessionNodeManager {
   /**
    * DOD-M15-FRAME-1 — NARROWING THE GATE DOES NOT EVICT ANYONE ALREADY INSIDE. This does.
    *
-   * `setAllowedPeer` sets the allowlist libp2p consults **when a connection is established**. A
-   * standing receiver USED TO accept everyone (`allowedPeerId: null` read as allow-all), so a stranger could attach
-   * — closed by DOD-M15-ASSIGN-1, which made an unclaimed receiver admit nobody inbound. The
-   * constraint underneath this sweep is UNCHANGED and still load-bearing: libp2p does not re-run a
-   * gater against a connection that already exists, so narrowing the gate never evicts anyone.
-   * before any session exists, hold the connection open, and still be attached when the receiver is
-   * promoted and the content protocol activates. Narrowing the gate changes nothing for them: the
-   * gater is not re-run against live connections.
+   * libp2p consults the gater only when a connection is ESTABLISHED, so narrowing it never evicts a
+   * peer already attached. That is why this sweep exists and why it cannot be replaced by the gate.
+   *
+   * A peer that attached early can therefore hold its connection open, still be attached when the
+   * receiver is promoted, and be sitting there when the content protocol activates. DOD-M15-ASSIGN-1
+   * shrank who can get that foothold — an unclaimed standing receiver now admits nobody inbound,
+   * where it used to admit everyone — but it did not, and could not, change the constraint above.
    *
    * That is the foothold the whole injection path depends on — placed before the door narrows. The
    * frame-level gate above refuses what they send; this closes the connection they send it on, so
@@ -8964,6 +8963,10 @@ export class SessionNodeManager {
       circuitAddrs > 0
         ? (heldCircuitAddr?.match(CIRCUIT_RELAY_ID)?.[1] ?? reservations.addrs[0]?.match(CIRCUIT_RELAY_ID)?.[1])
         : undefined;
+    // DOD-M15-ASSIGN-1 review N3: the ONE relay this receiver actually reserved with earns the
+    // inbound AutoNAT carve-out — nothing else does. Set only when a reservation genuinely
+    // completed, so a directory that merely NAMES a relay cannot dial in behind it.
+    gater.setReservedRelayPeer(circuitAddrs > 0 && reservedRelayPeerId !== undefined ? reservedRelayPeerId : null);
     this.#standingReceivers.set(agentName, {
       node,
       gater,

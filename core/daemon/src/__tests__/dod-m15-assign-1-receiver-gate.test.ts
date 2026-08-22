@@ -128,12 +128,54 @@ describe("DOD-M15-ASSIGN-1 (b) — an unclaimed standing receiver admits nobody"
     const gater = new SessionConnectionGater({ sessionId: "sr-autonat", allowedPeerId: null, logger });
     const relay = peer("ReservationRelay");
     gater.setAllowedOutboundPeer(relay.toString());
+    gater.setReservedRelayPeer(relay.toString());
 
     expect(gater.denyInboundEncryptedConnection(relay, FAKE_CONN)).toBe(false);
     expect(
       events.find((e) => e.event === "session.node.connection.rejected"),
       "our own relay answering a probe we started is not a rejection worth reporting",
     ).toBeUndefined();
+  });
+
+  it("does NOT admit a relay the directory merely NAMED but we never reserved with (review N3)", () => {
+    // The carve-out first keyed on the outbound allowlist, which is built from relay peer ids the
+    // DIRECTORY supplies — cumulatively, including ones whose reservation never completed. In a
+    // unit whose whole threat model is a compromised directory, that handed the adversary an
+    // inbound foothold: name a relay, never reserve, dial in anyway.
+    const { logger } = makeLogger();
+    const gater = new SessionConnectionGater({ sessionId: "sr-named-only", allowedPeerId: null, logger });
+    const namedButUnreserved = peer("DirectoryNamedRelay");
+
+    // On the outbound allowlist — the directory named it — but no reservation ever completed.
+    gater.setAllowedOutboundPeer(namedButUnreserved.toString());
+    gater.setReservedRelayPeer(null);
+
+    expect(
+      gater.denyInboundEncryptedConnection(namedButUnreserved, FAKE_CONN),
+      "being named by the directory must not buy an inbound foothold; only a live reservation does",
+    ).toBe(true);
+    // Outbound is unaffected — we may still dial it.
+    expect(gater.denyOutboundEncryptedConnection(namedButUnreserved, FAKE_CONN)).toBe(false);
+  });
+
+  it("a PROMOTED node denies its relay inbound — INV-5 holds where every real session ends up (review N4)", () => {
+    // The existing INV-5 test builds a constructor-named session node. Every real session instead
+    // arrives by PROMOTION of a standing receiver, and nothing pinned that the carve-out dies on
+    // that path. It does — `setAllowedPeer` clears the standing-receiver flag — but "it does" and
+    // "a test says so" are different claims.
+    const { logger } = makeLogger();
+    const gater = new SessionConnectionGater({ sessionId: "promoted", allowedPeerId: null, logger });
+    const relay = peer("ReservationRelay");
+    gater.setAllowedOutboundPeer(relay.toString());
+    gater.setReservedRelayPeer(relay.toString());
+
+    gater.setAllowedPeer(peer("Counterparty").toString());
+
+    expect(
+      gater.denyInboundEncryptedConnection(relay, FAKE_CONN),
+      "a session node admits exactly one counterparty inbound — the relay is outbound-only there",
+    ).toBe(true);
+    expect(gater.denyOutboundEncryptedConnection(relay, FAKE_CONN)).toBe(false);
   });
 
   it("admits the named peer, and only that peer, once a session claims the receiver", () => {

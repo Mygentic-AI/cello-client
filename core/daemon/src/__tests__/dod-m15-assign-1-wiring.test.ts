@@ -93,10 +93,30 @@ function makeNegotiator(opts: {
 }) {
   let inbound: ((frame: Record<string, unknown>) => void) | null = null;
 
+  /**
+   * Review N2 — ANSWER THE DISCOVERY LOOKUP, so this test runs the production route.
+   *
+   * The first version's fake answered only `session_request`. The negotiator therefore ran its
+   * discovery loop to exhaustion (three 5s lookups plus backoffs — 19 seconds), gave up, and
+   * reached the code under test through the LEGACY unsupported-directory fallback. The assertion
+   * was real and the revert test genuine, but it paid 19s of gate time per run and exercised a path
+   * no live agent takes. Worse, if that exhausted branch is ever made consistent with its siblings
+   * (which return `directory_unreachable` rather than falling through), this test would go red for
+   * an unrelated reason and the tempting repair would be to weaken the assertion.
+   *
+   * Answering `discovery_lookup` with "online, homed on the node we are already talking to" puts it
+   * on the `same_node` path — what an initiator actually does — and it finishes in milliseconds.
+   */
+  const HOME_NODE = "fake-dir";
   const signaling = {
     status: "connected",
+    currentDirectoryNodeId: HOME_NODE,
     async sendRaw(frame: unknown) {
-      if ((frame as Record<string, unknown>)["type"] === "session_request") {
+      const type = (frame as Record<string, unknown>)["type"];
+      if (type === "discovery_lookup") {
+        inbound?.({ type: "discovery_lookup_result", state: "online", owning_node_ids: [HOME_NODE] });
+      }
+      if (type === "session_request") {
         // The directory answers asynchronously, as it does in production.
         opts.onRequest((f) => inbound?.(f));
       }
@@ -171,6 +191,14 @@ describe("DOD-M15-ASSIGN-1 (a) wiring: the DAEMON refuses an assignment it canno
       advertisedAddress: { peerId: "12D3KooWInitiatorReceiver", addrs: ["/ip4/127.0.0.1/tcp/3"] },
       params: { target_pubkey: Buffer.from(pubB).toString("hex") },
     } as never);
+
+    // PIN THE ROUTE (review N2). Without this, a future change that breaks discovery sends the test
+    // quietly back through the legacy exhausted-fallback path — still passing, still 19 seconds,
+    // and no longer testing what an initiator actually does.
+    expect(
+      events.find((e) => e.event === "session.discovery.unsupported_fallback"),
+      "this must reach the verifier by the production same-node route, not the legacy fallback",
+    ).toBeUndefined();
 
     expect(result.ok, "the daemon must refuse an assignment signed by a key that is not its own quorum").toBe(false);
     expect(result.ok === false && result.reason).toBe("assignment_signer_not_this_agent");

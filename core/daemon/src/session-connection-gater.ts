@@ -92,6 +92,21 @@ export class SessionConnectionGater implements ConnectionGater {
    */
   #standingReceiverOutbound: boolean;
 
+  /**
+   * The ONE relay this receiver currently holds a live circuit reservation with, or null.
+   *
+   * Review N3. The inbound AutoNAT carve-out below first keyed on `#allowedOutboundPeerIds`, and
+   * that set is populated from the relay peer ids **the directory hands out at signaling-auth
+   * time** — cumulatively, including relays whose reservation never completed. In a unit whose
+   * entire threat model is "one compromised directory", that handed the adversary back a narrow
+   * inbound foothold: name a relay, never complete a reservation, and dial in anyway.
+   *
+   * A single slot, set only when a reservation actually succeeds, is the honest version of the
+   * justification the carve-out's comment makes — "a peer this node already dials and holds a
+   * reservation with" — rather than a set that merely tends to contain those.
+   */
+  #reservedRelayPeerId: string | null = null;
+
   constructor(opts: {
     sessionId: string;
     allowedPeerId: string | null;
@@ -125,6 +140,14 @@ export class SessionConnectionGater implements ConnectionGater {
    */
   admitInboundPeer(peerId: string): void {
     this.#allowedPeerId = peerId;
+  }
+
+  /**
+   * Record that this receiver now holds a LIVE circuit reservation with `peerId`, which is what
+   * earns that relay the inbound AutoNAT carve-out. Pass null when the reservation is lost.
+   */
+  setReservedRelayPeer(peerId: string | null): void {
+    this.#reservedRelayPeerId = peerId;
   }
 
   /**
@@ -227,13 +250,20 @@ export class SessionConnectionGater implements ConnectionGater {
      * These are peers this node already dials and holds reservations with. Admitting their
      * dial-back grants nothing it did not already have.
      *
-     * SCOPED TO THE STANDING-RECEIVER ROLE, and the first version of this fix was not — it admitted
-     * relays inbound on every gater, which breaks INV-5: a SESSION node admits exactly one
-     * counterparty, and the existing tests say so in those words. A promoted node has no AutoNAT
-     * probe to answer, so it needs nothing here. The relay stays outbound-only there, as it was.
+     * SCOPED TWICE, and each scope closed a hole the previous version had.
+     *
+     * To the STANDING-RECEIVER ROLE: the first attempt admitted relays inbound on every gater, which
+     * breaks INV-5 — a SESSION node admits exactly one counterparty, and the existing tests say so
+     * in those words. A promoted node has no AutoNAT probe to answer, so it needs nothing here.
+     *
+     * To the ONE RELAY HOLDING A LIVE RESERVATION (`#reservedRelayPeerId`), not the outbound
+     * allowlist. That allowlist is built from relay peer ids the DIRECTORY supplies, cumulatively,
+     * including ones whose reservation never completed — so keying on it let a compromised
+     * directory name a relay and dial in without ever holding a reservation. In a unit whose threat
+     * model is exactly that adversary, the set was the wrong thing to trust.
      */
-    if (direction === "inbound" && this.#standingReceiverOutbound && this.#allowedOutboundPeerIds.has(peerId.toString())) {
-      return false; // allow — our own relay, answering a probe we started
+    if (direction === "inbound" && this.#standingReceiverOutbound && peerId.toString() === this.#reservedRelayPeerId) {
+      return false; // allow — the relay we hold a live reservation with, answering a probe we started
     }
     if (this.#allowedPeerId === null) {
       if (direction === "outbound") return false; // allow — we chose this dial; INV-5 is inbound-only
