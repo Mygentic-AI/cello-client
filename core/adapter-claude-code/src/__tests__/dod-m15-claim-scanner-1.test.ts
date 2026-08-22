@@ -196,8 +196,7 @@ function surfaceTexts(): Map<string, string> {
  * line, plus two surfaces that were not being read at all.
  */
 const UNADJUDICATED_BASELINE: Record<string, number> = {
-  "AUDIT-ME.md": 18,
-  "README.md": 20,
+  "README.md": 19,
   "core/adapter-claude-code/SKILL.md": 30,
   "core/cli/src/registry.ts (operator-facing strings)": 37,
   "plugins/cello/agents/cello-receptionist.md": 8,

@@ -283,12 +283,6 @@ it (or `cello initiate-session <pubkey>` from bash).
 No build tools required. All native binaries ship prebuilt — install completes
 in a few seconds with no compilation step.
 
-## Privacy audit
-
-See [AUDIT-ME.md](./AUDIT-ME.md) for verifiable claims about what CELLO does
-and does not do with your data, with specific file pointers so you can check
-the code yourself.
-
 ## Tools
 
 Every tool below exists as both an MCP tool (`cello_x`) and a `cello` CLI
