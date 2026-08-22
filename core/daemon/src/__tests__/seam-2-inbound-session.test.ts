@@ -260,8 +260,26 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     expect(record!.agent_name).toBe("bob");
     expect(record!.counterparty_pubkey).toBe(initiatorPubkey);
 
-    // (2) The deferred FROST-verification gap is logged loudly (never silent).
-    expect(events.find((e) => e.event === "session.inbound.assignment.unverified")).toBeDefined();
+    /**
+     * (2) The assignment is VERIFIED, and the log says which of the two ways.
+     *
+     * This assertion used to require `session.inbound.assignment.unverified` — a deliberate,
+     * loudly-logged record of the gap where the responder did not check the directory's signature
+     * at all. `DOD-M15-RESPONDER-VERIFY-1` closed the gap, so that event is gone and the assertion
+     * moves to its successor rather than being dropped: the SUBJECT changed on purpose, and a test
+     * quietly deleted here would take with it the guarantee that the responder says what it did.
+     *
+     * `mode` is checked because a verified event with no mode would be the more dangerous shape:
+     * `internal` is first contact, which proves the frame was not altered but cannot say which
+     * directory signed it, and a reader must never mistake that for `pinned`.
+     */
+    const verified = events.find((e) => e.event === "session.inbound.assignment.verified");
+    expect(verified, "the responder must record that it verified the assignment").toBeDefined();
+    expect(["pinned", "internal"]).toContain(verified?.context?.["mode"]);
+    expect(
+      events.find((e) => e.event === "session.inbound.assignment.unverified"),
+      "the deferred-verification event must be GONE — it contradicted the verification above",
+    ).toBeUndefined();
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeDefined();
 
     // (3) cello_await_session returns the queued inbound session for bob's connection,

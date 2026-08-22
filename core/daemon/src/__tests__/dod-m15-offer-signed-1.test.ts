@@ -11,12 +11,12 @@
  * Two checks land on the assignment:
  *
  *   1. **Offer vs assignment agree on the dialer.** This is a CONSISTENCY check between two
- *      channels, not an authentication of either — the responder does not verify the assignment's
- *      signature (`session.inbound.assignment.unverified`, deferred to SESSION-004), so one
- *      compromised directory controls both frames and simply says the same thing twice. It catches
- *      an attacker who can influence one and not the other: a replayed or stale offer, a second node
- *      injecting an offer for a session it is not brokering, a self-contradicting broken directory.
- *      **It does not close this DoD line.**
+ *      channels, not an authentication of either. The assignment's signature IS verified now
+ *      (`DOD-M15-RESPONDER-VERIFY-1`), but that runs after this and, on first contact, proves only
+ *      internal consistency — so one compromised directory still controls both frames here and says
+ *      the same thing twice. It catches an attacker who can influence one and not the other: a
+ *      replayed or stale offer, a second node injecting an offer for a session it is not brokering,
+ *      a self-contradicting broken directory.
  *
  *   2. **The counterparty's pinned threshold key has not changed.** This one a directory cannot
  *      satisfy by repeating itself, because the anchor is what THIS daemon recorded during an
@@ -39,6 +39,7 @@
 import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
+import { TIER } from "../contacts-tier-migration.js";
 import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
@@ -68,11 +69,17 @@ const REAL_DIALER = "12D3KooWRealInitiator";
 function harness(opts: {
   offeredDialer?: string | null;
   pinnedPrimary?: string | null;
+  /** The counterparty's trust tier. KNOWN+ earns a `session_refused` frame. */
+  tier?: number;
 }) {
   const { logger, events } = makeLogger();
   let inbound: ((frame: Record<string, unknown>) => void) | null = null;
   const revoked: Array<{ agent: string; session: string }> = [];
   const accepted: string[] = [];
+  /** The DURABLE refusal rows — what stops parked content re-pulling forever across a restart. */
+  const durable: Array<{ agent: string; session: string; reason: string }> = [];
+  /** Frames this daemon sent back out. The counterparty's only view of what happened. */
+  const sentFrames: Array<Record<string, unknown>> = [];
 
   const sessionNodeManager = {
     getOfferedDialer: () => opts.offeredDialer ?? null,
@@ -80,6 +87,11 @@ function harness(opts: {
     revokeOfferedDialer: async (agent: string, session: string) => {
       revoked.push({ agent, session });
     },
+    recordRefusedSession: (agent: string, session: string, reason: string) => {
+      durable.push({ agent, session, reason });
+    },
+    getTier: () => opts.tier ?? TIER.KNOWN,
+    resolveTierBound: () => 3,
     getPinnedCounterpartyPrimary: () => opts.pinnedPrimary ?? null,
     getSessionRecord: () => undefined,
     // Reaching this means neither refusal fired — the session was accepted.
@@ -99,7 +111,10 @@ function harness(opts: {
         return () => {};
       },
     },
-    sendOver: async () => ({ ok: true }),
+    sendOver: async (_agent: string, frame: Record<string, unknown>) => {
+      sentFrames.push(frame);
+      return { ok: true };
+    },
     isExplicitlyOffline: () => false,
     getConnState: () => undefined,
     resolveCurrentAgent: () => AGENT,
@@ -113,7 +128,11 @@ function harness(opts: {
     isDeliveryOpenToAgent: () => false,
   } as unknown as InboundSessionDeps;
 
-  createInboundSessions(deps);
+  // The RETURN VALUE, not discarded. `refusedSessionRequests` is the in-memory list `cello_inbox`
+  // reads — the operator-facing half of Invariant 2. The first version of this file threw it away
+  // and asserted only on the log, which is the belief the invariant exists to break: a review
+  // deleted BOTH `recordRefusal` calls and the whole 4,057-test gate stayed green.
+  const api = createInboundSessions(deps);
 
   /**
    * Inject a GENUINELY SIGNED `session_assignment`.
@@ -137,7 +156,53 @@ function harness(opts: {
     inbound?.(frame);
   };
 
-  return { inject, injectRaw: (f: Record<string, unknown>) => inbound?.(f), events, revoked, accepted };
+  return {
+    inject,
+    injectRaw: (f: Record<string, unknown>) => inbound?.(f),
+    events,
+    revoked,
+    accepted,
+    durable,
+    sentFrames,
+    /** What `cello_inbox` would show this operator. */
+    operatorSees: (): Array<{ reason: string; sessionIdHex: string }> =>
+      (api.refusedSessionRequests.get(AGENT) ?? []) as Array<{ reason: string; sessionIdHex: string }>,
+  };
+}
+
+/**
+ * THE THREE SURFACES A SECURITY REFUSAL MUST REACH, asserted together.
+ *
+ * Invariant 2 says loud in the LOG **and** in the agent-facing response, never one instead of the
+ * other — and this milestone has now had that guard go missing four separate times. Each of the
+ * three below was, at review time, deletable with a fully green gate:
+ *
+ *   - the operator's `cello_inbox` list (in-memory)
+ *   - the DURABLE refused-session row, without which content the initiator already parked for this
+ *     session re-pulls forever — the 78-times-per-message loop M12-P18 closed
+ *   - the `session_refused` frame, without which the counterparty sees a transport-shaped failure
+ *     naming nothing that is actually wrong, and reports that CELLO is broken
+ */
+function expectFullyRefused(
+  h: ReturnType<typeof harness>,
+  reason: string,
+  guidanceMatch: RegExp,
+): void {
+  expect(h.accepted, "nothing may be accepted after a refusal").toEqual([]);
+  expect(h.revoked.length, "the gate must be re-closed, not left open to the refused peer").toBe(1);
+
+  const inbox = h.operatorSees();
+  expect(inbox.map((r) => r.reason), "the operator must see this in cello_inbox, not only in the log")
+    .toContain(reason);
+
+  expect(h.durable.map((r) => r.reason), "a durable row must exist or parked content re-pulls forever")
+    .toContain(reason);
+
+  const refusedFrame = h.sentFrames.find((f) => f["type"] === "session_refused");
+  expect(refusedFrame, "a KNOWN counterparty must be told why, not left with a dead dial").toBeDefined();
+  expect(refusedFrame?.["reason"]).toBe(reason);
+  expect(String(refusedFrame?.["guidance"]), "the counterparty's guidance must name their own next step")
+    .toMatch(guidanceMatch);
 }
 
 const settle = (): Promise<void> => new Promise((r) => setImmediate(r));
@@ -153,8 +218,7 @@ describe("DOD-M15-OFFER-SIGNED-1: the offer and the assignment must agree on the
     const refused = h.events.find((e) => e.event === "session.inbound.assignment.dialer_mismatch");
     expect(refused, "a disagreement between the two frames must refuse the session").toBeDefined();
     expect(refused?.level).toBe("error");
-    expect(h.accepted, "nothing may be accepted after a refusal").toEqual([]);
-    expect(h.revoked.length, "the gate must be re-closed, not left open to the refused peer").toBe(1);
+    expectFullyRefused(h, "offer_assignment_dialer_mismatch", /start a new session/i);
   });
 
   it("ACCEPTS when both name the same dialer", async () => {
@@ -201,8 +265,8 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     // The remedy must be one that WORKS — review F2 found the printed one did not clear the pin.
     expect(String(refused?.context["guidance"])).toMatch(/out of band/i);
     expect(String(refused?.context["guidance"])).toMatch(/cello_contact_remove/);
-    expect(h.accepted).toEqual([]);
-    expect(h.revoked.length, "the gate must be re-closed here too").toBe(1);
+    // And the counterparty is told the SAME remedy, since they are the one who must act on it.
+    expectFullyRefused(h, "counterparty_primary_key_changed", /out of band/i);
   });
 
   it("ACCEPTS a session signed by the SAME key on a later session", async () => {
@@ -255,6 +319,6 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     const refused = h.events.find((e) => e.event === "session.inbound.assignment.invalid");
     expect(refused, "a tampered assignment must not be pinned").toBeDefined();
     expect(String(refused?.context["reason"])).toBe("inbound_assignment_signature_invalid");
-    expect(h.accepted).toEqual([]);
+    expectFullyRefused(h, "inbound_assignment_invalid", /start a new session/i);
   });
 });

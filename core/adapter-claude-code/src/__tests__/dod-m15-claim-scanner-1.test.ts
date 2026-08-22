@@ -19,14 +19,14 @@
  *
  * ─── The baseline is a BACKLOG, not an exemption ───────────────────────────────────────────────
  *
- * A first run found **101 claim-shaped lines across 9 shipped surfaces**, against a ledger holding
- * 13 rows and covering 2 of them. Seven surfaces had never been audited at all.
+ A first run found **188 claims across 10 shipped surfaces**, against a ledger holding 13 rows
+ * and covering 2 of them. Eight surfaces had never been audited at all.
  *
- * Adjudicating 101 claims is real work and cannot be a precondition for having the guard. So the
+ * Adjudicating 188 claims is real work and cannot be a precondition for having the guard. So the
  * current count per surface is recorded here as a dated baseline that may only **shrink**: a NEW
- * claim-shaped line fails immediately, and the numbers cannot be raised to accommodate one. That is
- * the same shape the chain-writes guard uses, and it is the difference between a backlog and a
- * blanket exemption.
+ * claim fails immediately, and the numbers cannot be raised to accommodate one. That is the same
+ * shape the chain-writes guard uses, and it is the difference between a backlog and a blanket
+ * exemption.
  */
 
 import { describe, it, expect } from "vitest";
@@ -77,13 +77,6 @@ function countMatches(text: string): number {
   return (text.match(CLAIM_VOCABULARY) ?? []).length;
 }
 
-/**
- * Every shipped prose surface, discovered from the system.
- *
- *   - `package.json#files` per workspace package — what the npm tarball actually carries.
- *   - the plugin tree — skills and agent definitions an operator installs.
- *   - the repo root — README, AUDIT-ME, what a prospective adopter reads first.
- */
 /** Every `.md` under a directory, at any depth. */
 function walkMarkdown(dir: string, out: Set<string>): void {
   for (const e of readdirSync(dir, { withFileTypes: true })) {
@@ -131,7 +124,7 @@ function shippedSurfaces(): string[] {
 }
 
 /**
- * The CLI's own `summary` and `help` strings — the highest-stakes prose in the repo.
+ * The CLI's own operator-facing strings — the highest-stakes prose in the repo.
  *
  * Not markdown, so no `.md` walk reaches it, and the DoD line named it explicitly. These are the
  * sentences printed to an operator at the moment they decide to act: *"Both sides sign off and get a
@@ -164,10 +157,6 @@ function registryClaimStrings(): string {
     .map((m) => m[1] ?? m[2] ?? "")
     .filter((s) => s.trim().split(/\s+/).length >= 3)
     .join("\n");
-}
-
-function claimCount(file: string): number {
-  return countMatches(readFileSync(file, "utf8"));
 }
 
 /** The CLI surface's name in the baseline — not a file path, so it is spelled to say so. */

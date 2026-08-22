@@ -2656,6 +2656,22 @@ export class SessionNodeManager {
     return this.#offeredDialer.get(this.#k(agentName, sessionIdHex)) ?? null;
   }
 
+  /**
+   * Which peer this agent's standing receiver is currently admitting INBOUND — `null` for nobody.
+   *
+   * Read-only, and it answers a question the daemon otherwise cannot: *"whose dial would this
+   * receiver accept right now?"* The gate is narrowed and re-closed from several paths (an offer
+   * arrives, an assignment is refused, a session is promoted), and until now the only way to know
+   * where it had ended up was to reproduce the sequence in your head.
+   *
+   * Added for `DOD-M15-RESPONDER-VERIFY-1`, where a refusal for one session was closing the gate a
+   * DIFFERENT session had narrowed — a defect with no observable symptom short of the second
+   * session's initiator being refused with "nothing invited it".
+   */
+  getStandingReceiverAllowedPeer(agentName: string): string | null {
+    return this.#standingReceivers.get(agentName)?.gater.getAllowedPeerId() ?? null;
+  }
+
   /** Forget the offered dialer for ONE session — called on BOTH the claim and the refusal paths. */
   clearOfferedDialer(agentName: string, sessionIdHex: string): void {
     this.#offeredDialer.delete(this.#k(agentName, sessionIdHex));

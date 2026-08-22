@@ -19,9 +19,12 @@
  * the INITIATOR's own threshold group key, which is why the verifier compares `signer_pubkey`
  * against this agent's persisted `primaryPubkey` before trusting it.
  *
- * **The responder path does NOT verify it** and cannot today without a directory lookup of the
- * initiator's `primary_pubkey`. Said plainly here rather than left for the next reader to assume
- * symmetry, because assuming symmetry is what the original sentence cost.
+ * **The responder verifies it too, but asymmetrically** (`verifyInboundAssignment`,
+ * `DOD-M15-RESPONDER-VERIFY-1`). It has no key of its own to compare against, so for a REPEAT
+ * counterparty it verifies under the key this daemon pinned during an earlier session, and on FIRST
+ * CONTACT it can only prove the signature holds over the assignment's own recomputed contents —
+ * which catches tampering but cannot authenticate a directory. Said plainly rather than left for
+ * the next reader to assume symmetry, because assuming symmetry is what the original sentence cost.
  */
 
 import type { SessionAssignment } from "@cello-protocol/protocol-types";

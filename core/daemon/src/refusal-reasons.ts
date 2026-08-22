@@ -30,6 +30,12 @@ export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASON
  * what it means, and (for the identity change) that the next step happens OUTSIDE CELLO.
  *
  * Typed as a total map over `RefusalReason`, so adding a reason without guidance fails to compile.
+ *
+ * ⚠️ THE READER IS THE RESPONDER'S OPERATOR, and every verb here must be one THEY can perform.
+ * Two of these said "Retry" — which is the INITIATOR's move. The person reading this did not start
+ * the session and has nothing to retry; telling them to is an affordance that resolves to nothing,
+ * which is worse than no advice because they will try to follow it. The retry advice belongs in the
+ * `session_refused` frame, which goes to the side that can act on it.
  */
 export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
   [REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED]:
@@ -41,12 +47,14 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
   [REFUSAL_REASONS.OFFER_ASSIGNMENT_DIALER_MISMATCH]:
     "REFUSED ON PURPOSE. The directory's session offer named one dialer and the session assignment " +
     "named another, so the two frames for one session disagree. A stale or replayed offer produces " +
-    "this too, so one occurrence is not proof of a hostile directory. Retry — you may reach a " +
-    "different node. If it repeats on the same node, that node is not producing assignments that " +
-    "match its own offers.",
+    "this too, so one occurrence is not proof of a hostile directory. Nothing was accepted, and " +
+    "nothing is wrong on your side — the other party has been told to start a new session. If the " +
+    "same counterparty keeps failing this way, the directory node brokering between you is not " +
+    "producing assignments that match its own offers.",
   [REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID]:
     "REFUSED ON PURPOSE. The session assignment did not verify, so this agent would have been " +
-    "opening its receiver to a peer named by a document it could not check. Retry to reach a " +
-    "different directory node. If it repeats, either that node is not producing valid assignments, " +
-    "or the counterparty re-registered — confirm out of band before accepting anything from them.",
+    "opening its receiver to a peer named by a document it could not check. Nothing was accepted. " +
+    "There is nothing for you to retry — the other party holds the session and has been told to " +
+    "start a new one. If it repeats for the SAME counterparty, do not accept anything from them " +
+    "until you have confirmed out of band that they still control the identity you know them by.",
 };

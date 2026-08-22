@@ -530,6 +530,73 @@ export function createInboundSessions(deps: InboundSessionDeps) {
   // M12-P18: same lasting-log shape and the same cap as expiredSessionRequests.
   const refusedSessionRequests = new Map<string, RefusedSessionRequest[]>();
   const REFUSED_SESSION_REQUESTS_CAP = 20;
+  /**
+   * The FULL refusal, for the two security refusals on the assignment path.
+   *
+   * ─── Why one function and not three calls at each site ────────────────────────────────────────
+   *
+   * Review found that both new refusals did only the in-memory half. The cap refusal above does
+   * four things and its comments say why each one is load-bearing; the security refusals — the more
+   * serious event by any reading — did one of the four. That asymmetry is not something anyone
+   * decided; it is what happens when the steps are open-coded at each site and a new site copies
+   * the shortest one.
+   *
+   * The four:
+   *
+   *  1. **In-memory record** — what `cello_inbox` reads, so the operator sees it this session.
+   *  2. **Durable record** — the initiator held a valid assignment and will have PARKED CONTENT for
+   *     this session. Without a refused-session row the drain re-pulls it forever: the
+   *     78-times-per-message `counterparty_unknown` loop M12-P18 closed. The in-memory map is also
+   *     capped at 20 and dies with the process, so without this the operator-visible trace of the
+   *     most serious thing this path can detect was more perishable than a routine cap refusal.
+   *  3. **Re-close the gate** — it was narrowed to the offered peer, and refusing without
+   *     re-closing leaves the door open to exactly the peer just declared unauthorised.
+   *  4. **Tell the counterparty, if they are KNOWN+** — see the tier reasoning below.
+   */
+  function refuseInboundSession(args: {
+    agentName: string;
+    sessionIdHex: string;
+    counterpartyPubkeyHex: string;
+    reason: string;
+    offeredDialer: string | null;
+    /** What the counterparty is told, if their tier earns a reason. */
+    counterpartyGuidance: string;
+    correlationId: string;
+  }): void {
+    recordRefusal(args.agentName, args.sessionIdHex, args.counterpartyPubkeyHex, args.reason);
+    sessionNodeManager.recordRefusedSession(args.agentName, args.sessionIdHex, args.reason);
+    sessionNodeManager.revokeOfferedDialer(args.agentName, args.sessionIdHex, args.offeredDialer);
+
+    /**
+     * TELL THE COUNTERPARTY — same rule the cap refusal uses, and the oracle argument that
+     * justifies silence for strangers does not reach here at all.
+     *
+     * Without this: they initiate, the directory hands them a valid assignment, they dial, the gate
+     * is shut, and all they see is a transport-shaped failure naming nothing that is wrong. They
+     * report "CELLO is broken" while this side holds a precise and correct security finding.
+     *
+     * An identity-change refusal is BY DEFINITION a repeat counterparty, so they are KNOWN+ almost
+     * by construction — and a repeat counterparty already knows they have a prior relationship with
+     * this agent, which is the only thing the message reveals. UNKNOWN and BLOCKED still get
+     * silence, so a stranger learns nothing and a blocked party cannot tell blocking from a refusal.
+     */
+    const senderTier = sessionNodeManager.getTier(args.agentName, args.counterpartyPubkeyHex);
+    if (senderTier >= TIER.KNOWN && senderTier <= TIER.VIP) {
+      void deps.sendOver(args.agentName, {
+        type: "session_refused",
+        sessionId: args.sessionIdHex,
+        initiatorPubkey: args.counterpartyPubkeyHex,
+        reason: args.reason,
+        guidance: args.counterpartyGuidance,
+      }).then((sent) => {
+        logger.info("session.inbound.refusal.notified", {
+          agentName: args.agentName, sessionId: args.sessionIdHex, reason: args.reason,
+          delivered: sent.ok, tier: senderTier, correlationId: args.correlationId,
+        });
+      }).catch(() => { /* best-effort: the durable record above is the half that must not be lost */ });
+    }
+  }
+
   function recordRefusal(agentName: string, sessionIdHex: string, counterpartyPubkeyHex: string, reason: string): void {
     const list = refusedSessionRequests.get(agentName) ?? [];
     list.push({ sessionIdHex, counterpartyPubkeyHex, reason, refusedAt: Date.now() });
@@ -1030,8 +1097,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       return;
     }
 
-    // L1: refuse M1 single-key assignments outright (downgrade guard). Distinct from the
-    // deferred FROST verification below — track it so SESSION-004's re-home keeps it.
+    // L1: refuse M1 single-key assignments outright (downgrade guard). Distinct from the FROST
+    // signature verification below, and deliberately BEFORE it: this refuses the algorithm, that
+    // checks the signature.
     if (parsed.signatureType === "single") {
       logger.warn("session.inbound.assignment.refused", {
         sessionId: parsed.sessionIdHex,
@@ -1077,14 +1145,11 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * authority over who may dial this agent's receiver.
      *
      * ⚠️ WHAT THIS DOES **NOT** BUY, stated first because the first draft of this comment claimed it
-     * did. The assignment IS FROST-signed by the initiator's threshold group — but **this daemon
-     * does not verify that signature on the responder path** (see `session.inbound.assignment.
-     * unverified` below; deferred to SESSION-004). So the comparison is between an UNSIGNED offer
-     * and an UNVERIFIED assignment, and a single compromised directory controls both frames: it
-     * simply names the same peer id in each and this check passes.
-     *
-     * **It does not close `DOD-M15-OFFER-SIGNED-1`.** That line needs the responder to verify what
-     * it is comparing against — `DOD-M15-RESPONDER-VERIFY-1`.
+     * did. It is a CONSISTENCY check between two frames, not an authentication of either. The
+     * assignment's signature is verified further down (`verifyInboundAssignment`), but that happens
+     * AFTER this, and on first contact it can only prove internal consistency — so a single
+     * compromised directory still controls both frames here and simply names the same peer id in
+     * each.
      *
      * WHAT IT DOES BUY, which is real but smaller: the two frames must agree, so an attacker who can
      * influence ONE of them and not the other is caught — a stale or replayed offer, a second
@@ -1113,12 +1178,20 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       });
       // INVARIANT 2: loud in the log AND on a surface the agent can read. A refusal the operator
       // never sees is indistinguishable from the session simply never arriving — and this one is a
-      // security refusal, which is the worst kind to be silent about. `cello_check_notifications`
-      // reads this list.
-      recordRefusal(localAgent.name, parsed.sessionIdHex, parsed.participantAPubkeyHex, REFUSAL_REASONS.OFFER_ASSIGNMENT_DIALER_MISMATCH);
-      // Review F4: the gate was already narrowed to the peer this offer named, so refusing without
-      // re-closing leaves the door open to exactly the peer just declared unauthorised.
-      sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, offered);
+      // security refusal, which is the worst kind to be silent about.
+      refuseInboundSession({
+        agentName: localAgent.name,
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        reason: REFUSAL_REASONS.OFFER_ASSIGNMENT_DIALER_MISMATCH,
+        offeredDialer: offered,
+        counterpartyGuidance:
+          "They refused this session: the invitation they received and the assignment you dialled on " +
+          "named different peers, so they could not tell which one was you. Nothing is wrong on your " +
+          "side — start a new session, which will get a fresh assignment. If it keeps happening, the " +
+          "directory node brokering between you is not producing assignments that match its own offers.",
+        correlationId,
+      });
       return;
     }
 
@@ -1150,16 +1223,6 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       return;
     }
 
-    // SECURITY — DEFERRED (SESSION-004 re-home): the directory's FROST threshold signature
-    // on the assignment (directory_signature over the TBS, verified against signer_pubkey)
-    // is NOT yet verified here. The old client's receiveSessionAssignment performed that
-    // check; it must be re-homed natively before this path faces a real (untrusted)
-    // directory. Until then we accept directory-pushed assignments on trust — the in-process
-    // seam tests inject trusted frames.
-    // M8B F15: logged at DEBUG with an "expected" note — it fires on EVERY healthy inbound
-    // session, and at WARN it read as a failure and actively misled live diagnosis. The
-    // deferred-verification state is a known, tracked gap (SESSION-004), not a per-session
-    // anomaly.
     /**
      * DOD-M15-RESPONDER-VERIFY-1 — THE RESPONDER NOW VERIFIES, and this is what unblocks
      * `DOD-M15-OFFER-SIGNED-1`.
@@ -1215,28 +1278,59 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
         },
       );
-      recordRefusal(
-        localAgent.name,
-        parsed.sessionIdHex,
-        parsed.participantAPubkeyHex,
-        isIdentityChange ? REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED : REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID,
-      );
-      sessionNodeManager.revokeOfferedDialer(localAgent.name, parsed.sessionIdHex, offered);
+      refuseInboundSession({
+        agentName: localAgent.name,
+        sessionIdHex: parsed.sessionIdHex,
+        counterpartyPubkeyHex: parsed.participantAPubkeyHex,
+        reason: isIdentityChange
+          ? REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED
+          : REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID,
+        offeredDialer: offered,
+        counterpartyGuidance: isIdentityChange
+          ? "They refused this session: the signing key on your assignment is not the one they " +
+            "recorded for you in an earlier session. If you re-registered or moved to a new device, " +
+            "that is expected — tell them out of band, on a channel that is not this one, and ask " +
+            "them to run cello_contact_remove for you so the next session re-pins. If you did not " +
+            "re-register, something is issuing assignments in your name and neither of you should " +
+            "proceed until you know what."
+          : "They refused this session: the assignment you dialled on did not verify against its own " +
+            "contents, so it was altered somewhere between the directory signing it and them reading " +
+            "it. Start a new session to get a fresh one. If it repeats, the directory node you are " +
+            "reaching is not producing valid assignments — nothing is wrong with your agent.",
+        correlationId,
+      });
       return;
     }
-    logger.debug("session.inbound.assignment.verified", {
+    /**
+     * ONE event, and `internal` is loud.
+     *
+     * There used to be a second call here firing `session.inbound.assignment.unverified` with a
+     * note saying verification was deferred — on the same successful path, nine lines after the
+     * event saying it happened. Every healthy session emitted both. The next person debugging an
+     * inbound session would have read the "unverified" line, concluded the responder still trusts
+     * the directory blind, and either redone this work or dismissed a real signal.
+     *
+     * `internal` is INFO, not debug, because it is not a routine state: it is the one moment this
+     * daemon chooses a permanent trust anchor for a counterparty and has nothing to check it
+     * against. Pinned stays at debug — that one is the boring, good case.
+     */
+    const firstContact = verdict.mode === "internal";
+    (firstContact ? logger.info : logger.debug)("session.inbound.assignment.verified", {
       sessionId: parsed.sessionIdHex,
       agentName: localAgent.name,
-      // "internal" is the WEAKER mode and says so, so a reader never mistakes first contact for a
-      // verified counterparty. Pinned means a directory could not have produced this alone.
       mode: verdict.mode,
-      correlationId,
-    });
-
-    logger.debug("session.inbound.assignment.unverified", {
-      sessionId: parsed.sessionIdHex,
-      agentName: localAgent.name,
-      note: "FROST assignment signature verification deferred to SESSION-004 re-home (expected on every inbound session until SESSION-004)",
+      ...(firstContact
+        ? {
+            impact:
+              "FIRST CONTACT. The signature is internally consistent, which proves the frame was not " +
+              "altered after signing — it does NOT prove which directory signed it, because there is " +
+              "no earlier key recorded for this counterparty to check against. The key in this frame " +
+              "is being pinned now and every later session with them is measured against it.",
+            guidance:
+              "If this counterparty matters, confirm their pubkey out of band before relying on the " +
+              "seal. Once pinned, a substitution IS caught.",
+          }
+        : {}),
       correlationId,
     });
 
