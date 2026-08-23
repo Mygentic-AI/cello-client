@@ -9,6 +9,18 @@ export { createNode, isValidMultiaddr, buildConfiguredHosts } from "./node.js";
 // capability marker a consumer can test for — the relay refuses to start on a transport that
 // predates the policy, because there the connectionMonitor option is silently ignored.
 export { resolveConnectionMonitorConfig, WAN_PING_TIMEOUT_FLOOR_MS } from "./node.js";
+// DOD-M15-IDLE-CONNS-1 — the declared connection posture and the idle-connection judgement.
+export {
+  resolveConnectionLimits,
+  selectIdleConnections,
+  IDLE_CONNECTION_GRACE_MS,
+  IDLE_CONNECTION_SWEEP_MS,
+  DECLARED_MAX_CONNECTIONS,
+  DECLARED_INBOUND_CONNECTION_THRESHOLD,
+  DECLARED_MAX_INCOMING_PENDING,
+  DECLARED_INBOUND_UPGRADE_TIMEOUT_MS,
+} from "./node.js";
+export type { ResolvedConnectionLimits, IdleConnectionCandidate } from "./node.js";
 export type { ResolvedConnectionMonitorConfig } from "./node.js";
 export type { CelloNode, CreateNodeOptions, CelloStreamHandler } from "./types.js";
 export type {

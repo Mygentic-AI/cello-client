@@ -188,6 +188,18 @@ class CelloNodeImpl implements CelloNode {
   // zero-listener refusal in start()).
   readonly #hasCircuitListen: boolean;
   readonly #dropAutonatResponder: boolean;
+  /**
+   * DOD-M15-IDLE-CONNS-1. Set once by createNode from the SAME object libp2p was given, so the
+   * reported policy cannot drift from the configured one — the discipline
+   * `resolveConnectionMonitorConfig` already states: what libp2p is configured with is what the
+   * node reports, by construction rather than by two call sites agreeing.
+   */
+  #connectionLimits: ResolvedConnectionLimits = resolveConnectionLimits({});
+  /** The idle-connection sweep, when this node runs one. Cleared in stop() so it cannot outlive it. */
+  #idleReaperTimer: ReturnType<typeof setInterval> | null = null;
+  #idleReaperConfig: { graceMs: number; sweepIntervalMs: number } | null = null;
+  /** Peers the reaper must never hang up — the reserved relay and the directory. */
+  #idleReaperSpared: (peerId: string) => boolean = () => false;
 
   constructor(
     libp2p: Libp2p,
@@ -277,10 +289,80 @@ class CelloNodeImpl implements CelloNode {
         message: "no listener of any kind materialised for a circuit-only listen set (every relay unreachable)",
       };
     }
+    // Armed by createNode; started here so the interval's lifetime is exactly the node's running
+    // lifetime, and a node that was built but never started leaves nothing behind.
+    this.#startIdleReaper();
   }
 
   async stop(): Promise<void> {
+    // Before libp2p, so a sweep cannot fire against a stopping node and log a hangUp failure that
+    // reads like a fault. A timer that outlives its node is how a "stopped" daemon keeps working.
+    if (this.#idleReaperTimer !== null) {
+      clearInterval(this.#idleReaperTimer);
+      this.#idleReaperTimer = null;
+    }
     await this.#libp2p.stop();
+  }
+
+  /** The connection-manager policy libp2p was actually given. */
+  getConnectionLimits(): ResolvedConnectionLimits {
+    return this.#connectionLimits;
+  }
+
+  /** Set by createNode with the resolved object — never a second copy. */
+  setConnectionLimits(limits: ResolvedConnectionLimits): void {
+    this.#connectionLimits = limits;
+  }
+
+  /**
+   * DOD-M15-IDLE-CONNS-1 — name the peers the idle reaper must never hang up.
+   *
+   * The daemon calls this with the gater's reserved-relay slot and the directory peers. Left as a
+   * setter rather than a constructor argument because the reserved relay CHANGES: a reservation is
+   * lost and retaken against a different relay, and a predicate captured once at construction would
+   * go on sparing a relay this node no longer talks to while reaping the one it does.
+   */
+  setIdleReaperSpared(isSpared: (peerId: string) => boolean): void {
+    this.#idleReaperSpared = isSpared;
+  }
+
+  /**
+   * Arm the idle sweep. The TIMER does not start here — `start()` starts it, so a node that is
+   * built and never started leaves no interval behind, and a stop()/start() cycle gets a fresh one.
+   */
+  enableIdleReaper(config: { graceMs: number; sweepIntervalMs: number }): void {
+    this.#idleReaperConfig = config;
+  }
+
+  #startIdleReaper(): void {
+    const config = this.#idleReaperConfig;
+    if (config === null || this.#idleReaperTimer !== null) return;
+    this.#idleReaperTimer = setInterval(() => {
+      void this.#sweepIdleConnections();
+    }, config.sweepIntervalMs);
+    // Node keeps the event loop alive for a pending interval; a daemon that has stopped serving
+    // must still be able to exit.
+    this.#idleReaperTimer.unref?.();
+  }
+
+  async #sweepIdleConnections(): Promise<void> {
+    const config = this.#idleReaperConfig;
+    if (config === null) return;
+    const doomed = selectIdleConnections({
+      connections: this.getConnections(),
+      now: Date.now(),
+      isSpared: this.#idleReaperSpared,
+      graceMs: config.graceMs,
+    });
+    for (const peerId of doomed) {
+      try {
+        await this.hangUp(peerId);
+      } catch {
+        // The peer may have gone on its own between selection and hang-up; that is the outcome we
+        // wanted either way. Swallowed rather than logged because this class has no logger and a
+        // throw here would kill the sweep for every other connection in the same pass.
+      }
+    }
   }
 
   listenAddresses(): string[] {
@@ -383,10 +465,20 @@ class CelloNodeImpl implements CelloNode {
     remoteAddr?: string;
     status: string;
     muxerStatus?: string;
+    direction: "inbound" | "outbound";
+    openedAt: number;
+    streamCount: number;
   }> {
     return this.#libp2p.getConnections().map((c) => ({
       peerId: c.remotePeer.toString(),
       encryption: c.encryption,
+      // DOD-M15-IDLE-CONNS-1: the three fields a reaper needs, and the three an operator needs to
+      // see a flood instead of inferring one. Nothing reported a connection count before this —
+      // which is why the DoD's own instruction to "measure a healthy daemon's connection count
+      // first" could not be followed: the measurement did not exist.
+      direction: c.direction,
+      openedAt: c.timeline.open,
+      streamCount: c.streams.length,
       // DOD-M12-CONN-OBSERVE-1: the SOCKET status, which is not the muxer's. libp2p checks the two
       // separately in `newStream` — muxer first — so a stream failing with
       // `The connection muxer is "closed" and not "open"` returns before the socket is looked at,
@@ -660,6 +752,114 @@ export interface ResolvedConnectionMonitorConfig {
  * the unilateral-seal gate. Only a node with no liveness duty toward its peers — the relay,
  * whose client liveness is the reservation TTL's job — should turn it off.
  */
+/**
+ * ─── DOD-M15-IDLE-CONNS-1 — the connection posture is DECLARED HERE, not inherited ─────────────
+ *
+ * `createNode` passed no `connectionManager` block at all, so every one of these came from
+ * libp2p's own constants. They were correct; nobody had chosen them. A minor version bump
+ * re-prices what an unauthenticated peer can spend on an operator's machine, and no test in this
+ * repo would go red.
+ *
+ * The four values below are libp2p@3.3.2's defaults, adopted deliberately rather than changed. The
+ * DoD line is explicit that caps must not be guessed — *"a cap set without measurement breaks
+ * REACHABILITY, the one property this milestone must not trade away"* — and there is no
+ * measurement yet, because until this unit nothing reported a connection count at all. So the
+ * change here is **authorship, not tuning**: pin what runs today, make it visible, and let
+ * `getConnectionLimits()` supply the number a later tuning pass needs.
+ */
+
+/** Total connections before libp2p prunes. libp2p@3.3.2 `MAX_CONNECTIONS`. */
+export const DECLARED_MAX_CONNECTIONS = 300;
+/** Inbound connections per remote host per window before refusal. `INBOUND_CONNECTION_THRESHOLD`. */
+export const DECLARED_INBOUND_CONNECTION_THRESHOLD = 5;
+/** Inbound connections mid-upgrade before new ones are refused. `MAX_INCOMING_PENDING_CONNECTIONS`. */
+export const DECLARED_MAX_INCOMING_PENDING = 10;
+/** How long an inbound connection may sit un-upgraded. `INBOUND_UPGRADE_TIMEOUT`. */
+export const DECLARED_INBOUND_UPGRADE_TIMEOUT_MS = 10_000;
+
+/**
+ * How long an inbound connection may carry NO stream before it is reaped.
+ *
+ * 90s, and the reasoning matters more than the number. The legitimate inbound dialer is a
+ * counterparty an offer already named, and it opens its first stream immediately — the dial and the
+ * content stream are the same act. A minute and a half is far past that and far short of anything
+ * a slow network explains, so a connection still silent at 90s is one nothing is using.
+ */
+export const IDLE_CONNECTION_GRACE_MS = 90_000;
+
+/** How often the sweep runs. A third of the grace period, so nothing lives much past it. */
+export const IDLE_CONNECTION_SWEEP_MS = 30_000;
+
+/** The connection-manager block handed to libp2p, resolved once. */
+export interface ResolvedConnectionLimits {
+  maxConnections: number;
+  inboundConnectionThreshold: number;
+  maxIncomingPendingConnections: number;
+  inboundUpgradeTimeout: number;
+}
+
+/**
+ * Resolve the declared limits, honouring per-node overrides.
+ *
+ * Spreads the declared block FIRST so an override that names one key keeps the other three. An
+ * override that returned only what it was given would re-inherit the rest from libp2p — this
+ * unit's own defect, reintroduced by its fix.
+ */
+export function resolveConnectionLimits(opts: {
+  connectionLimits?: Partial<ResolvedConnectionLimits>;
+}): ResolvedConnectionLimits {
+  return {
+    maxConnections: DECLARED_MAX_CONNECTIONS,
+    inboundConnectionThreshold: DECLARED_INBOUND_CONNECTION_THRESHOLD,
+    maxIncomingPendingConnections: DECLARED_MAX_INCOMING_PENDING,
+    inboundUpgradeTimeout: DECLARED_INBOUND_UPGRADE_TIMEOUT_MS,
+    ...(opts.connectionLimits ?? {}),
+  };
+}
+
+/** What the reaper needs to judge one connection. */
+export interface IdleConnectionCandidate {
+  peerId: string;
+  direction: "inbound" | "outbound";
+  streamCount: number;
+  openedAt: number;
+}
+
+/**
+ * Which connections should be hung up — pure, so the judgement is testable apart from the sweep.
+ *
+ * FOUR THINGS ARE SPARED, and each is spared for a reason that costs something real if forgotten:
+ *
+ *  - **Anything carrying a stream.** That is the definition of in use.
+ *  - **Anything inside the grace period.** A connection is silent for a moment on every dial.
+ *  - **Every OUTBOUND connection.** This node chose those — the content-park deposit and pull, the
+ *    restart-seal submission to a prior session's relay. Reaping one cancels our own errand to
+ *    bound someone else's connection. The gater draws the same inbound/outbound line for the same
+ *    reason (`#standingReceiverOutbound`).
+ *  - **Whatever `isSpared` names.** In production that is the relay this node holds a live
+ *    reservation with, and the directory. A relay reservation is IDLE BY NATURE between refreshes,
+ *    which is exactly the shape hunted here — so a reaper without this predicate would take an
+ *    agent's inbound reachability away and report nothing. That is the one trade this milestone
+ *    forbids.
+ */
+export function selectIdleConnections(args: {
+  connections: readonly IdleConnectionCandidate[];
+  now: number;
+  isSpared: (peerId: string) => boolean;
+  graceMs?: number;
+}): string[] {
+  const grace = args.graceMs ?? IDLE_CONNECTION_GRACE_MS;
+  return args.connections
+    .filter(
+      (c) =>
+        c.direction === "inbound" &&
+        c.streamCount === 0 &&
+        args.now - c.openedAt >= grace &&
+        !args.isSpared(c.peerId),
+    )
+    .map((c) => c.peerId);
+}
+
 export function resolveConnectionMonitorConfig(opts: {
   keepAliveIntervalMs?: number;
   connectionMonitor?: { abortConnectionOnPingFailure?: boolean; pingTimeoutMinMs?: number };
@@ -698,6 +898,8 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // Resolved ONCE and shared: what libp2p is configured with is what the node reports, by
   // construction rather than by two call sites agreeing.
   const connectionMonitorPolicy = resolveConnectionMonitorConfig(opts);
+  // Same discipline, same reason: resolved ONCE and handed to both libp2p and the node.
+  const connectionLimits = resolveConnectionLimits(opts);
 
   const libp2p = await createLibp2p({
     start: false,
@@ -751,6 +953,8 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       dcutr: dcutr(),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
+    // DOD-M15-IDLE-CONNS-1: declared, not inherited. Same object the node reports.
+    connectionManager: connectionLimits,
     // DOD-RELAY-KEEPALIVE-1: the monitor's policy is ours now, not libp2p's defaults.
     // Keepalive pings still detect a peer that vanished without a clean close, but the deadline
     // a ping must meet is a WAN deadline rather than 5 seconds.
@@ -767,5 +971,12 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
   const node = new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder);
   node.setConnectionMonitorPolicy(connectionMonitorPolicy);
+  node.setConnectionLimits(connectionLimits);
+  if (opts.idleConnectionReaper) {
+    node.enableIdleReaper({
+      graceMs: opts.idleConnectionReaper.graceMs ?? IDLE_CONNECTION_GRACE_MS,
+      sweepIntervalMs: opts.idleConnectionReaper.sweepIntervalMs ?? IDLE_CONNECTION_SWEEP_MS,
+    });
+  }
   return node;
 }
