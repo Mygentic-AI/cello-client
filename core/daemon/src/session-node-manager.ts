@@ -8453,7 +8453,21 @@ export class SessionNodeManager {
       // `sha256` and is exactly right for a peer that predates the field.
       env.contentHashAlg,
     );
-    if (priorDeclaredAlg !== undefined && result.ok) {
+    /**
+     * `ok` IS NOT "DELIVERED" — review B2a pass-2 F1, and this is the same class the F1 fix was
+     * raised for, one predicate over.
+     *
+     * `ingestReceivedContent` returns `ok` in three shapes and only one is a delivery:
+     *   `{ok, held: true}`       — buffered behind an ordering gap; not appended, not shown YET.
+     *   `{ok, screenedOut: true}` — leafed and PERMANENTLY never shown to the agent.
+     * Announcing *"the message was delivered by the other route"* for either is a false all-clear on
+     * the operator's one line about this message, and the memo is deleted in the same breath, so
+     * nothing ever re-raises it.
+     *
+     * Leaving the memo ARMED on `held` is deliberate: the release path re-enters ingest, which is
+     * when delivery actually happens, and the claim becomes true there.
+     */
+    if (priorDeclaredAlg !== undefined && result.ok && result.held !== true && result.screenedOut !== true) {
       // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
       // refusal even when the recovery fails, so the next genuine reconciliation says nothing.
       const byHash = this.#unreadableAlgSeen.get(memoKey);
