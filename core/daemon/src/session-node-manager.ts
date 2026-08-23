@@ -8902,6 +8902,35 @@ export class SessionNodeManager {
    * silent split it exists to prevent, one restart later.
    */
   #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
+    /**
+     * ⚠️ ADOPTION IS ONLY OPEN BEFORE THE FIRST LEAF — Decision #8, `DOD-M15-SEALWIRE-1` part B2b-2.
+     *
+     * *"Agreed at session open, BEFORE the first leaf is hashed. Every leaf uses the same salt."*
+     * Once `contentHashForSession` consults the salt, that question is answered fresh on every send —
+     * so a salt adopted after messages already exist would hash leaves 1..n under one rule and n+1..
+     * under another, in one session, with nothing recording where the change happened. **Neither half
+     * is then verifiable by a single rule**, which is worse than the correlation weakness the salt
+     * exists to remove.
+     *
+     * THIS GUARD IS WHAT REMOVES A SCHEMA CHANGE. Without it, "is this session salted?" would need a
+     * durable per-session flag — a column, a migration, and an entry in the rebuild DDL, which is
+     * where this milestone has now silently lost data twice. With it, the question is decided once
+     * and `content_salt IS NULL` answers it forever.
+     *
+     * Refusing costs this session a weaker content hash for its whole life, and that is the right
+     * trade — an unsalted transcript is exactly as verifiable as every transcript shipped to date —
+     * but it is announced, because silently declining a protection is how the rest of this
+     * milestone's defects looked.
+     */
+    const leafCount = this.getSessionTree(agentName, sessionId).size();
+    if (leafCount > 0) {
+      this.#logger.warn("session.salt.adoption.refused", {
+        agentName, sessionId, leafCount,
+        impact: "this session already has leaves hashed under the unsalted rule, so the salt was NOT adopted — it stays unsalted FOR THE LIFE of the session. Adopting now would hash the rest of the conversation differently and leave a transcript that neither rule can verify end to end.",
+        guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
+      });
+      return false;
+    }
     if (!this.#db) {
       // NOT a silent return — review F7. The other two persist failures each emit an event, so a
       // derive that could not store because the handle is closed was the ONE salt path producing no
