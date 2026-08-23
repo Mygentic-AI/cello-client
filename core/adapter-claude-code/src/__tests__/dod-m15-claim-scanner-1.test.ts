@@ -203,7 +203,16 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   // Adjudicating it now would be exactly the laundering this file's own note below warns about.
   "README.md": 2,
   "core/adapter-claude-code/SKILL.md": 30,
-  "core/cli/src/registry.ts (operator-facing strings)": 37,
+  // Paid down 37 → 3 by `DOD-M15-LEDGER-1` (→ Entry S1). The three that remain are held on
+  // purpose, each for a reason that would make adjudicating them laundering rather than auditing:
+  //   · "This is the proof CELLO exists to produce" and "The receipt is tamper-evident — if a
+  //     single message were altered, added or dropped, it would no longer match." That promise of
+  //     detectability is what `DOD-M15-SEALWIRE-1` builds; today the client cannot perform the
+  //     comparison it describes. Its row flips in SEALWIRE's own commit, per the claim-truth lens.
+  //   · "screened" in the attestations text, which refers to screening performed in the PORTAL —
+  //     a different repo this lane has not read. The note at the foot of claims-ledger.ts says why
+  //     moving it without reading would reproduce the prose ledger's original defect.
+  "core/cli/src/registry.ts (operator-facing strings)": 3,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
   "plugins/cello/skills/documents/SKILL.md": 18,
