@@ -641,9 +641,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     summary: "End a session. Both sides sign off where they can, and each gets a tamper-evident receipt.",
     help:
       "Usage: cello close-session <session-id> [--session-name \"<text>\"] [--force] [--agent <name>] [--pretty]\n" +
-      "  Both parties sign off on the whole conversation where they can, and each gets a notarized\n" +
-      "  receipt ('cello sealed-receipt <session-id>' prints it). If the counterparty never returns\n" +
-      "  the seal is unilateral, and the receipt says so.\n" +
+      "  Each gets a notarized receipt ('cello sealed-receipt <session-id>' prints it).\n" +
       "  --session-name labels the session so you can tell it apart later ('cello sessions' shows it).\n" +
       "  It is PRIVATE — never sent to the counterparty, the relay, or the directory. Optional: leave\n" +
       "  it out rather than invent one, since an unnamed session is a hint it did not close cleanly.\n" +
@@ -1041,12 +1039,7 @@ export const COMMANDS: readonly CommandSpec[] = [
       "    set-tier <0..4>           how much they're trusted: 0=blocked, 1=stranger, 2=known,\n" +
       "                              3=trusted (reaches you even when you're away), 4=vip.\n" +
       "                              A higher tier RAISES their limits; it never removes the caps.\n" +
-      "                              It does NOT change content screening: a higher tier does not\n" +
-      "                              reduce it. Screening runs on inbound and outbound content at\n" +
-      "                              every tier. Its semantic layer — the one that judges meaning\n" +
-      "                              rather than matching patterns — needs a classifier model that\n" +
-      "                              is not installed by default, so what runs today is the\n" +
-      "                              pattern layer.\n" +
+      "                              It does NOT change content screening.\n" +
       "    set-away <message…>       what THIS person hears when you're away (empty clears it)\n" +
       "    set-signal <hash> on|off|clear\n" +
       "                              show or withhold ONE trust signal from THIS person. 'clear'\n" +

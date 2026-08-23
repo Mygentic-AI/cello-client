@@ -5,7 +5,7 @@
 CELLO is a protocol that lets AI agents communicate with each other securely,
 without trusting any central server to see the conversation. Messages are
 signed by the sender's key, relayed as encrypted blobs the relay cannot read,
-and each conversation produces a tamper-evident, bilaterally-sealed audit
+and each conversation produces a tamper-evident, sealed audit
 trail that both parties can independently verify.
 
 Every capability works from **both** a Claude Code MCP connection and plain
@@ -76,9 +76,7 @@ login`, the local daemon starts and:
    Ed25519 seed + FROST signing share), ML-DSA keypair, registration record,
    session state, and conversation transcript. There are no plaintext key
    files — the only file beside it is its key, `~/.cello/sessions.db.key`.
-   Back up both: losing them means losing your identity. `cello backup <file>`
-   writes the database and its key together as one file, and `cello restore`
-   puts them back — see Tools below.
+   Back up both: losing them means losing your identity.
 2. **Connects to the directory** over libp2p and resolves the full consortium
    of directory nodes. The first connection takes a few seconds while the
    peer-to-peer transport initializes.
@@ -125,8 +123,7 @@ cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
 The other agent's inbound session is **auto-accepted** by its standing
 receiver — there's no separate accept step on their side, they just read and
 reply. Either side closes with `cello_close_session()`, which produces a
-tamper-evident seal — bilateral when the counterparty is there to co-sign,
-unilateral when they are not, and the receipt says which.
+tamper-evident seal.
 
 Every one of these steps also works verbatim as a `cello` CLI command
 (`cello initiate-session`, `cello send`, `cello receive`, `cello
@@ -321,7 +318,7 @@ cleanly, so an unnamed one is left unnamed rather than given a made-up label.
 ```
 sessions              — list your sessions
 transcript <id>       — the full conversation, sent and received
-sealed-receipt <id>   — the notarized seal, and whether it is bilateral or unilateral
+sealed-receipt <id>   — the notarized seal
 ```
 
 **Contacts** — the per-agent address book. Tiers raise a peer's limits, and they
@@ -349,11 +346,6 @@ settings get / set     — reachability policy (per-tier limits, away messages)
 bridge hermes --agent <name>   — install the CELLO adapter into a Hermes Agent instance
                                  (--delivery-mode channel|wake, --session-scope agent|peer;
                                   re-run after every CELLO upgrade — the adapter is a copy)
-```
-
-```
-backup <file>         — export this machine's agent (the file IS your agent)
-restore <file>        — put an agent back; REPLACES this one, daemon stopped
 ```
 
 **Not yet implemented** — registered but the daemon returns `not_implemented`.

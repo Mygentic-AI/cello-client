@@ -34,23 +34,84 @@
  * ledger's whole failure was rows that recorded a belief rather than a check.
  */
 
+/**
+ * ─── WHY `excerpts` EXISTS, AND WHY `matches` IS NO LONGER A NUMBER SOMEBODY TYPES ─────────────
+ *
+ * The first version of this file carried a hand-written `matches: N` per row, guarded by two tests:
+ * the count may only shrink, and no surface may account for more matches than it contains. A review
+ * of `DOD-M15-LEDGER-1` demonstrated in ONE attempt that both guards are strictly weaker than they
+ * read. This entry passed them and zeroed an entire unswept surface:
+ *
+ *   { surface: "plugins/cello/skills/documents/SKILL.md",
+ *     claim: "the documents skill's safety properties",
+ *     matches: 18,
+ *     evidence: "Verified against document-handlers.ts and document-inbound.ts, whose guards are
+ *                structural rather than conventional and hold on every apply path." }
+ *
+ * Nothing checked that the claim text existed on the surface, that the cited files existed, or that
+ * 18 corresponded to any real vocabulary hit. The shrink-only test then drove that baseline to zero
+ * PERMANENTLY. The guards constrained the ledger's internal consistency, never its correspondence to
+ * reality — which is the same defect class this milestone exists to remove, reproduced inside the
+ * mechanism built to police it.
+ *
+ * So a row now carries the **verbatim text it accounts for**, and the number is DERIVED from that
+ * text by the same regex the scanner uses. Three consequences worth stating because they are the
+ * point rather than side effects:
+ *
+ *   1. A row for text that is not on the surface fails. Laundering needs the words to exist.
+ *   2. Double-counting is impossible to hide: two rows quoting the same sentence are visible as the
+ *      same string, and the arithmetic they produce is no longer a matter of opinion.
+ *   3. The judgement calls that used to live in comments ("ONE, not three", "ZERO, and that is the
+ *      honest number") become arithmetic. Those comments were arguments where they should have been
+ *      code, and both of them were written to correct my own over-counting.
+ */
 export interface AdjudicatedClaim {
   /** The surface it lives on, exactly as the scanner names it. */
   surface: string;
-  /** The claim text, verbatim enough to find. */
+  /** The claim text, as a human reads it. Display only — `excerpts` is what counts. */
   claim: string;
-  /** How many claim-vocabulary matches this entry accounts for on that surface. */
-  matches: number;
+  /**
+   * VERBATIM slices of the surface this row accounts for. Each must appear in the surface text
+   * exactly, and the row's match count is the sum of the vocabulary hits inside them.
+   *
+   * An array rather than one string because a single claim is often stated in several places (the
+   * "encrypted database" phrasing appears four times in the README), and because a claim split
+   * across a wrapped line needs both halves.
+   */
+  excerpts: readonly string[];
   verdict: "true" | "corrected" | "withdrawn";
+  /**
+   * WHO ENFORCES IT — carried onto this line by `DOD-M15-CLAIM-SCANNER-1` and load-bearing for
+   * Invariant 1. Without it, a claim held up by the operator's own rewritable client and a claim
+   * held up by the absence of a wire field are indistinguishable rows.
+   *
+   *   `structural`   — nothing has to run. There is no field to carry it, no branch to skip.
+   *   `daemon-local` — the operator's own daemon checks it. Ergonomics, not a guarantee: they can
+   *                    rewrite it. Honest for a claim about what YOUR machine does for YOU.
+   *   `directory`    — a party other than the claimant enforces it (directory, relay, portal).
+   *   `nobody-yet`   — the claim is not enforced anywhere. A row may only be `true` with this if
+   *                    the claim asserts an ABSENCE or is a disclaimer.
+   */
+  enforcedBy: "structural" | "daemon-local" | "directory" | "nobody-yet";
   /** The code or change that settles it. Never a belief. */
   evidence: string;
+}
+
+/** Vocabulary hits inside one string — the SAME regex the scanner applies to a whole surface. */
+export function countClaimWords(text: string): number {
+  return (
+    text.match(
+      /\b(never|cannot|impossible|tamper-proof|tamper-evident|independently verify|verifiable|verified|notarized|zero-knowledge|no one can|nobody can|only you|guarantee[ds]?|encrypted|screened|proof|ACTIVE)\b/g,
+    ) ?? []
+  ).length;
 }
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "close-session: 'Both sides sign off where they can, and each gets a tamper-evident receipt.'",
-    matches: 1,
+    excerpts: ["each gets a tamper-evident receipt."],
+    enforcedBy: "directory",
     verdict: "corrected",
     evidence:
       "Said 'tamper-PROOF' and 'Both sides sign off'. Both were wrong. A hash chain plus a Merkle " +
@@ -63,7 +124,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "sealed-receipt: 'what was said, and who signed off on it.'",
-    matches: 1,
+    excerpts: ["notarized receipt — what was said, and who signed off on it."],
+    enforcedBy: "directory",
     verdict: "corrected",
     evidence:
       "Said 'proof both sides signed off on the conversation'. False for a unilateral seal — and " +
@@ -74,7 +136,11 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "sealed-receipt help: 'BILATERAL or UNILATERAL, and the receipt says which.'",
-    matches: 3,
+    excerpts: [
+      "unilateral means the counterparty never returned to sign",
+      "conversation, notarized and tamper-evident, but not their agreement that it is complete.",
+    ],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "New disclosure, not a claim inherited from anywhere. `close-session-handler.ts:350` and " +
@@ -86,7 +152,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "refresh: 'CELLO never holds your whole signing key in one place — it is split into shares held with the directory nodes.'",
-    matches: 1,
+    excerpts: ["CELLO never holds your whole signing key in one place"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Verified, and the verification matters because the WEAKER implementation exists in the tree. " +
@@ -101,7 +168,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "attestations: 'It is sealed to the CELLO portal (the directory cannot read it)'",
-    matches: 1,
+    excerpts: ["cannot read it)"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "`signal-submission.ts:239` calls `sealToRecipient(intakeKey.pubkey, encoded)` — an anonymous " +
@@ -112,7 +180,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "restore: 'a corrupt or truncated file cannot destroy the agent you still have'",
-    matches: 1,
+    excerpts: ["file cannot destroy the agent you still have."],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Built and tested as part of DOD-M15-BACKUP-1. `restoreBackup` calls `parseArchive` FIRST, " +
@@ -124,7 +193,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "backup: 'a database without its key restores to something nobody can read — including you' / 'whoever holds it can sign as you'",
-    matches: 2,
+    // ONE, not two — F10 on review. The second match this row used to buy is `never` in "the
+    // snapshot is taken through SQLite, so it is never a half-written copy", a DIFFERENT claim that
+    // this row's evidence says nothing about. It has its own row below. A row paying for a sentence
+    // it does not discuss is how a match leaves the backlog unexamined.
+    excerpts: ["key restores to something nobody can read — including you."],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Both are properties of the artifact built in DOD-M15-BACKUP-1. The database is SQLCipher- " +
@@ -138,7 +212,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
     claim: "doorbell: 'a new kind of message must never be silently ignored because this table is older than the daemon'",
-    matches: 1,
+    excerpts: ["a new kind of message must never be silently"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The default direction is implemented and tested (DOD-M15-DOORBELL-1). `buildChannelParams` " +
@@ -151,7 +226,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/adapter-claude-code/SKILL.md",
     claim: "doorbell: 'a new kind of message must never be silently ignored because this table is older than the daemon'",
-    matches: 1,
+    excerpts: ["a new kind of message must never be silently"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The same sentence as the plugin skill's, and the same evidence: `buildChannelParams` marks " +
@@ -164,7 +240,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/adapter-claude-code/SKILL.md",
     claim: "backup: 'a database without its key restores to something nobody can read, including you' / 'anyone holding that file can sign as this agent'",
-    matches: 1,
+    // NOT the "nobody can read" sentence, which is what this row used to be counted against. The
+    // scanner's `\bnobody can\b` cannot match it: the two words straddle a line break in the
+    // markdown, so the phrase is `nobody\ncan` and the regex never fires. The row was therefore
+    // paying for a match that does not exist, and the surface's real hit here is `encrypted`.
+    excerpts: ["It contains the agent's encrypted database"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Replaces a claim that had become FALSE — both shipped skills still said backup and restore " +
@@ -176,7 +257,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
     claim: "backup: same sentence, plugin copy",
-    matches: 1,
+    // NOT the "nobody can read" sentence, which is what this row used to be counted against. The
+    // scanner's `\bnobody can\b` cannot match it: the two words straddle a line break in the
+    // markdown, so the phrase is `nobody\ncan` and the regex never fires. The row was therefore
+    // paying for a match that does not exist, and the surface's real hit here is `encrypted`.
+    excerpts: ["It contains the agent's encrypted database"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Same text and same evidence as the tarball SKILL.md row above. Carried on BOTH surfaces " +
@@ -186,7 +272,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/adapter-claude-code/SKILL.md",
     claim: "seal_failed: 'Your commitment is durable and the conversation is intact — the receipt was simply not produced.'",
-    matches: 1,
+    excerpts: ["a directory it cannot reach"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "DOD-M15-SEAL-FAILED-TERMINAL-1. Both halves are properties of code, not reassurance. " +
@@ -202,7 +289,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
     claim: "seal_failed: same sentence, plugin copy",
-    matches: 1,
+    excerpts: ["a directory it cannot reach"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Same text and same evidence as the tarball SKILL.md row above. Carried on BOTH surfaces for " +
@@ -211,8 +299,26 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
+    claim: "backup: 'the snapshot is taken through SQLite, so it is never a half-written copy'",
+    // Split out of the backup row above on review (F10). It was being PAID FOR by a row whose
+    // evidence discusses key material and says nothing about snapshot atomicity — the claim is
+    // true, which is exactly why it survived unexamined for a pass.
+    excerpts: ["the snapshot is taken through SQLite, so it is never"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "`backup-restore.ts:158` performs the copy with SQLite's `VACUUM INTO`, which writes a " +
+      "transactionally consistent snapshot of the database — so a backup taken while the daemon " +
+      "holds the write lock cannot capture a torn page or a half-applied transaction. That is what " +
+      "makes 'safe to run while the daemon is up' true rather than optimistic, and it matters " +
+      "because the alternative an operator would otherwise reach for is copying the file, which " +
+      "has none of that property.",
+  },
+  {
+    surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "restore: 'Refusing without proof is deliberate — this operation replaces your agent.'",
-    matches: 1,
+    excerpts: ["Refusing without proof is "],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Review F4. The guard now uses `probeSingletonLock`, the kernel-authoritative check, and " +
@@ -231,7 +337,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "Headline: 'relayed as encrypted blobs the relay cannot read'",
-    matches: 2,
+    excerpts: ["relayed as encrypted blobs the relay cannot read"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "The relay is a blind witness by construction, not by policy. It is bound to a session with " +
@@ -246,7 +353,13 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'ONE encrypted database' / 'the encrypted database' / 'inside the encrypted DB' (four places)",
-    matches: 4,
+    excerpts: [
+      "encrypted database); **`connect`**",
+      "**Creates ONE encrypted database**",
+      "inside the encrypted DB",
+      "key material, and the encrypted database",
+    ],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Whole-file SQLCipher, and the claim is stronger than it looks because there is no second " +
@@ -258,8 +371,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "README.md",
-    claim: "Close produces 'a tamper-evident seal — bilateral when the counterparty is there to co-sign, unilateral when they are not, and the receipt says which.'",
-    matches: 1,
+    claim: "Close produces 'a tamper-evident seal.'",
+    excerpts: ["tamper-evident seal."],
+    enforcedBy: "directory",
     verdict: "corrected",
     evidence:
       "Said 'a tamper-evident bilateral seal', which promises the good case as the guarantee. " +
@@ -273,8 +387,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   },
   {
     surface: "README.md",
-    claim: "sealed-receipt: 'the notarized seal, and whether it is bilateral or unilateral'",
-    matches: 1,
+    claim: "sealed-receipt: 'the notarized seal'",
+    excerpts: ["— the notarized seal"],
+    enforcedBy: "directory",
     verdict: "corrected",
     evidence:
       "Said 'the notarized bilateral seal' — false for exactly the receipt an operator is most " +
@@ -286,7 +401,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'Not yet implemented — registered but the daemon returns not_implemented': inclusion-proof",
-    matches: 1,
+    excerpts: ["inclusion-proof <session-id>"],
+    enforcedBy: "daemon-local",
     verdict: "corrected",
     evidence:
       "THE CLAIM WAS FALSE IN THE UNDERSTATING DIRECTION, which is the case a claims audit is " +
@@ -303,7 +419,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "Read-before-write: \"You can't reply to something you never saw.\"",
-    matches: 1,
+    excerpts: ["never saw."],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "`session-content-handlers.ts:246` returns `reason: \"session_not_current\"` on the send " +
@@ -316,7 +433,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'the cello_* tools remain available for the things a conversation cannot do'",
-    matches: 1,
+    excerpts: ["the things a conversation cannot do"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Not a security claim — an operational statement about which verbs exist outside the bridge's " +
@@ -330,23 +448,29 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "Bridge: 'the daemon's security gateway screens inbound content on the same path either way… not whether they are screened.'",
-    matches: 2,
+    excerpts: ["The bridge changes which door the screened bytes", "not whether they are screened."],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
-      "The bridge does not introduce a second ingest path. `session-node-manager.ts:6326` calls " +
-      "`securityGateway.screenInbound(content, …)` inside the content-ingest routine every inbound " +
-      "message passes through, and the Hermes adapter reaches content only by calling " +
-      "`cello_receive` on its own daemon socket (`assets.ts` `_fetch_content`, whose docstring " +
-      "calls them 'the peer's screened words'). The gateway is also non-optional: `daemon.ts:365` " +
-      "refuses to start without one (INV-9) rather than defaulting to a permissive stub. NOTE the " +
-      "bound this row does NOT assert: it says screening RUNS on this path, not that screening is " +
-      "complete — the semantic layer is still uninstallable (`DOD-M15-SCREENINSTALL-1`) and that " +
-      "scope is stated separately in the Contacts section.",
+      "The claim is COMPARATIVE — the bridge does not change whether screening happens — and that " +
+      "is what holds. The Hermes adapter reaches content only by calling `cello_receive` on its " +
+      "own daemon socket (`assets.ts` `_fetch_content`, docstring: 'the peer's screened words'), " +
+      "so it is downstream of whatever the daemon already did; it adds no ingest path of its own. " +
+      "The gateway is also non-optional — `daemon.ts:365` refuses to start without one (INV-9) " +
+      "rather than defaulting to a permissive stub. **CORRECTED ON REVIEW: an earlier version of " +
+      "this row said `session-node-manager.ts:6326` is the routine 'every inbound message passes " +
+      "through'. That is false and the row must not rest on it.** There are three `screenInbound` " +
+      "call sites (`session-node-manager.ts:6326`, `daemon.ts:4454`, `content-park.ts:200`), and " +
+      "at `session-node-manager.ts:6316` a DOCUMENT FRAME skips screening entirely " +
+      "(`isDocFrame ? { disposition: \"allow\", content } : await screenInbound(...)`). The " +
+      "conclusion survived on evidence that did not support it, which is the laundering shape this " +
+      "ledger exists to prevent — a row whose premise is false is a row nobody can re-check.",
   },
   {
     surface: "README.md",
     claim: "session_scope peer: 'two customers must never end up in one context'",
-    matches: 1,
+    excerpts: ["two customers must never end up in one"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "`assets.ts` `_chat_id_for` returns `agent_name + \"/\" + counterparty` under `peer` scope, " +
@@ -359,7 +483,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'a setting you cannot see in the command you just typed is a setting you will be surprised by later'",
-    matches: 1,
+    excerpts: ["a setting you cannot see in the command you just"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Design rationale, and the behaviour it describes is real: `install-hermes.ts:171` calls " +
@@ -372,7 +497,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'A session name is private to you — never sent to the counterparty, the relay, or the directory'",
-    matches: 1,
+    excerpts: ["**private to you** — never sent to the counterparty"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Verified STRUCTURALLY rather than by inspection of send sites, which is what makes it hold " +
@@ -384,7 +510,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "contact set-moniker: 'YOUR pet name for THEM (they cannot spoof it)'",
-    matches: 1,
+    excerpts: ["YOUR pet name for THEM (they cannot spoof it)"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The claim needs checking precisely because a peer's OWN moniker does cross the wire — " +
@@ -402,8 +529,9 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
 
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "close-session help: 'Both parties sign off on the whole conversation where they can… If the counterparty never returns the seal is unilateral, and the receipt says so.'",
-    matches: 2,
+    claim: "close-session help: 'Each gets a notarized receipt.'",
+    excerpts: ["Each gets a notarized receipt"],
+    enforcedBy: "directory",
     verdict: "corrected",
     evidence:
       "THE CORRECTION HAD BEEN MADE ONE LINE ABOVE AND NOT PROPAGATED. An earlier entry in this " +
@@ -417,12 +545,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "contact set-tier: screening 'runs on inbound and outbound content at every tier. Its semantic layer… needs a classifier model that is not installed by default, so what runs today is the pattern layer.'",
-    // ZERO, and that is the honest number rather than a modest one. The correction DELETED the
-    // vocabulary word it was made for — "ACTIVE" is gone and the replacement contains no claim
-    // word at all — so there is no remaining match on this surface for this entry to account for.
-    // Claiming 1 here would subtract a match that no longer exists, which is the arithmetic the
-    // over-accounting guard exists to catch. The entry stays because the REASONING is the record.
-    matches: 0,
+    // NO EXCERPTS, and that is now arithmetic rather than an argument. The correction DELETED the
+    // vocabulary word it was made for: the line reads "It does NOT change content screening." and
+    // "screening" is not in the vocabulary ("screened" is). A row that accounts for nothing
+    // subtracts nothing. It stays because the REASONING is the durable record — see the evidence.
+    excerpts: [],
+    enforcedBy: "daemon-local",
     verdict: "corrected",
     evidence:
       "Said 'that is ACTIVE at every tier, in both directions' — the unqualified form " +
@@ -441,7 +569,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "The ledger's own correction note: \"This said 'proof both sides signed off'\"",
-    matches: 1,
+    excerpts: ["proof both sides signed off"],
+    enforcedBy: "nobody-yet",
     verdict: "corrected",
     evidence:
       "Not a live claim — it is the SOURCE COMMENT recording a claim this ledger already " +
@@ -455,7 +584,11 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "sealed-receipt help: unilateral 'carries YOUR account… but not their agreement' / 'attests RECEIPT, never agreement (implies_assent: false)… never as consent.'",
-    matches: 2,
+    excerpts: [
+      "It attests RECEIPT, never agreement (implies_assent: false)",
+      "reads as delivered-but-unanswered, never as consent.",
+    ],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "The strongest disclosure in the CLI and it holds: `implies_assent: false` is a real field, " +
@@ -469,7 +602,11 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "close-session --force: 'abandons a half-open session that can never be sealed… It FORFEITS the receipt — never use it on a healthy session.'",
-    matches: 3,
+    excerpts: [
+      "a half-open session that can never be sealed",
+      "never joined). It FORFEITS the receipt — never use it on a healthy session.",
+    ],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Accurate and load-bearing: an operator who read a slow close as a hang force-abandoned " +
@@ -482,7 +619,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "--session-name / name-session: 'PRIVATE — never sent to the counterparty, the relay, or the directory' and 'cannot change anything the protocol does' (three places)",
-    matches: 3,
+    excerpts: [
+      "It is PRIVATE — never sent to the counterparty",
+      "The name is PRIVATE: never sent to the counterparty",
+      "cannot change anything the protocol does",
+    ],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Verified structurally, which is what makes it survive future edits: `session_name` appears " +
@@ -496,7 +638,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "dismiss: 'Sets a local read_at timestamp — never propagated, never part of the seal or hash chain.'",
-    matches: 2,
+    excerpts: ["never propagated, never part of the seal or hash chain."],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Structural again: `read_at` appears in no type under `core/protocol-types/src`, so it " +
@@ -508,7 +651,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "inbox: 'pending session requests and unread message COUNTS — never message content'",
-    matches: 1,
+    excerpts: ["unread message COUNTS — never message content"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The distinction is the whole point of the command and it is real: reading content is what " +
@@ -520,7 +664,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "set-agent-offline: 'The agent becomes UNREACHABLE: inbound sessions are refused and it cannot even send an away message.'",
-    matches: 1,
+    excerpts: ["inbound sessions are refused and it cannot even send an away"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The claim's value is the CONTRAST it draws, and the contrast is real: away messages are " +
@@ -533,7 +678,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "doc remove: 'You cannot remove a fellow admin this way, and there is no demote command to reach for: demotion needs every other admin's signature and that verb is not built.'",
-    matches: 1,
+    excerpts: ["You cannot remove a fellow admin this way"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Verified by attempted falsification, because 'that verb is not built' is exactly the kind " +
@@ -546,7 +692,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "doc propose --retry: 'Re-send an offer that was created but never reached them'",
-    matches: 1,
+    excerpts: ["Re-send an offer that was created but never reached them"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Operational, and the flag it describes exists rather than being aspirational prose: " +
@@ -558,7 +705,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "'Quoting is only needed if a value contains spaces (agent names and tokens never do).'",
-    matches: 1,
+    excerpts: ["(agent names and tokens never do)"],
+    enforcedBy: "structural",
     verdict: "true",
     evidence:
       "Enforced by a shared charset rule rather than by convention: `protocol-types/src/moniker.ts` " +
@@ -570,7 +718,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "doc propose: 'for a running log; it does NOT make the document tamper-evident.'",
-    matches: 1,
+    excerpts: ["it does NOT make the document tamper-evident"],
+    enforcedBy: "nobody-yet",
     verdict: "true",
     evidence:
       "A DISCLAIMER rather than a claim, and the right one — it withdraws a property a reader " +
@@ -582,7 +731,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "relay fallback: 'When a message cannot go directly to the other agent (they are offline, or the network is in the way)…'",
-    matches: 1,
+    excerpts: ["When a message cannot go directly to the other agent"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Describes the content-park path, which is real and is deliberately unauthenticated on " +
@@ -595,7 +745,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "set-tier: 'A higher tier RAISES their limits; it never removes the caps.' / set-signal: 'Can only narrow: it never presents something you have not accepted.'",
-    matches: 2,
+    excerpts: ["it never removes the caps", "Can only narrow: it never"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "The set-signal half is enforced positively, which is why the universal is safe: every read " +
@@ -607,7 +758,11 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "attestation-consent refuse: 'it stays inert and is never presented' / 'a refused signal is indistinguishable from one that was never issued, everywhere it is checked.'",
-    matches: 2,
+    excerpts: [
+      "it stays inert and is never presented",
+      "is indistinguishable from one that was never issued, everywhere it is checked",
+    ],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "'Everywhere it is checked' is a universal, so it was checked as one rather than sampled. It " +
@@ -617,28 +772,34 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "missing row fail. There is no path that tests for refusal, which is what makes the " +
       "indistinguishability total instead of a list someone must keep complete.",
   },
-  {
-    surface: "core/cli/src/registry.ts (operator-facing strings)",
-    claim: "attestations: 'You cannot attest about yourself.'",
-    // ONE, not three. The other two matches on those lines belong to entries that already exist:
-    // the `cannot` in "(the directory cannot read it)" is accounted for by the earlier attestations
-    // row in this file, and the `screened` beside it is deliberately NOT adjudicated (see below).
-    // Counting them here would have subtracted the same two matches twice.
-    matches: 1,
-    verdict: "true",
-    evidence:
-      "The invisibility half is the same positive `consent_state = 'accepted'` gate as above, and " +
-      "`trust-signal-store.ts:474` is where it is set: an `issuerKind === \"agent\"` signal is " +
-      "born `pending` while a portal-issued one is born accepted — so a peer-written attestation " +
-      "is inert by construction at the moment of insertion, not by a later filter that could be " +
-      "forgotten. NOT ADJUDICATED HERE: the word 'screened' in the same sentence refers to " +
-      "screening performed in the PORTAL, a different repo this lane has not read, and the note " +
-      "below this array explains why moving it would be the prose ledger's original defect.",
-  },
+  /**
+   * WITHDRAWN FROM THE LEDGER ON REVIEW — `registry.ts`: *"You cannot attest about yourself."*
+   *
+   * It was adjudicated `true`, and the evidence I wrote for it described the CONSENT gate
+   * (`consent_state = 'accepted'`, signals born `pending` for `issuerKind === "agent"`). That is a
+   * real mechanism and it makes an unaccepted attestation invisible — **it says nothing about who
+   * may issue one.** Evidence establishing X for a claim about Y is the shape a review of this unit
+   * caught twice elsewhere, and this is the third.
+   *
+   * Searching for the enforcement point finds **only the sentence itself**. There is no
+   * self-attestation refusal anywhere in `core/`: the nearest authorization check,
+   * `trust-signal-store.ts:588`, compares an envelope's issuer against the signal's recorded issuer,
+   * which is a different question. Either the PORTAL refuses it — a repo this lane has not read —
+   * or nothing does.
+   *
+   * So the match goes BACK IN THE BACKLOG and the registry baseline rises by one. That is the whole
+   * point of the three states: a claim I cannot settle is unadjudicated, not quietly true. Settling
+   * it needs someone to read the portal's issuance path.
+   */
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "trust-signals: 'verifiable claims about you… issued by the CELLO portal, notarized by the directory, and held in your local encrypted wallet.'",
-    matches: 3,
+    excerpts: [
+      "Trust signals are verifiable claims about you",
+      "agent presents to contacts during sessions. They are issued by the CELLO portal, notarized by",
+      "the directory, and held in your local encrypted wallet",
+    ],
+    enforcedBy: "directory",
     verdict: "true",
     evidence:
       "Three separate properties, each with a home. 'Held in your local encrypted wallet' is the " +
@@ -653,7 +814,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "moniker: 'the one thing they cannot spoof' / 'It is a HINT, not proof — like caller ID… shown it as self-declared'",
-    matches: 2,
+    excerpts: ["name they offer — the one thing they cannot spoof", "It is a HINT, not proof"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "These two sentences are about DIFFERENT monikers and both are right, which is why they can " +
@@ -667,7 +829,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "doc write: 'your offsets cannot go stale under an edit the peer made while you were typing' / 'editing a shared document never depends on the peer being reachable'",
-    matches: 2,
+    excerpts: ["so your offsets cannot go stale", "editing a shared document never depends on the"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "Both are consequences of the same design rather than two promises: edits are applied " +
@@ -681,12 +844,19 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "policy log: 'Every screened message and what happened to it: clean, redacted, blocked or warned… chainValid: false means the log itself was tampered with'",
-    matches: 1,
+    excerpts: ["Every screened message and what happened to it"],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
-      "'Every' is a completeness claim and it rests on there being ONE ingest path to record from: " +
-      "`session-node-manager.ts:6326` is the single `screenInbound` call every inbound message " +
-      "passes, and `daemon.ts:1489` is the outbound counterpart. The `chainValid` half is the " +
+      "'Every' is a completeness claim, and CORRECTED ON REVIEW: an earlier version of this row " +
+      "rested it on there being ONE ingest path (`session-node-manager.ts:6326`). That premise is " +
+      "false — there are three `screenInbound` call sites and a document frame skips screening " +
+      "entirely at `session-node-manager.ts:6316`. The claim survives for a BETTER reason, which " +
+      "is why the citation had to move: recording does not happen at any ingest path at all. " +
+      "`cello-gateway.ts:184,199` call `recordOutcome` for outbound and inbound inside the gateway " +
+      "itself, synchronously before the verdict is returned (`gateway/src/server.ts:13` states " +
+      "exactly that ordering) — so anything the gateway screens is recorded by construction, " +
+      "however many callers there are. The `chainValid` half is the " +
       "sharper sentence and it is the right instruction — it tells the reader to STOP reasoning " +
       "from the log rather than to interpret it, which is the correct response to a hash-chain " +
       "break and the opposite of the 'detection that does not act' pattern this milestone exists " +
@@ -695,7 +865,8 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "bridge hermes: 'where two customers must never share a context.'",
-    matches: 1,
+    excerpts: ["where two customers must never share a context."],
+    enforcedBy: "daemon-local",
     verdict: "true",
     evidence:
       "`assets.ts` `_chat_id_for` returns `agent_name + \"/\" + counterparty` under `peer` scope, " +
@@ -720,7 +891,12 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
  * found — reproduced inside the mechanism built to replace it.
  */
 
-/** How many matches on a surface are accounted for by an adjudicated entry. */
+/** Vocabulary hits a single row accounts for — derived from its verbatim text, never typed. */
+export function rowMatches(a: AdjudicatedClaim): number {
+  return a.excerpts.reduce((n, e) => n + countClaimWords(e), 0);
+}
+
+/** How many matches on a surface are accounted for by adjudicated entries. */
 export function adjudicatedMatches(surface: string): number {
-  return ADJUDICATED.filter((a) => a.surface === surface).reduce((n, a) => n + a.matches, 0);
+  return ADJUDICATED.filter((a) => a.surface === surface).reduce((n, a) => n + rowMatches(a), 0);
 }
