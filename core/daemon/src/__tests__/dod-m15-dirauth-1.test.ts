@@ -7,12 +7,19 @@
  * enumerated before a word of it was written.
  *
  *   DECIDED   `manifest-deps.ts` — a challenge verifier is built ONLY when the resolved directory
- *             URL byte-matches a bundled endpoint. Otherwise it returns `{}` and logs
- *             `daemon.manifest.bundled.skipped` ONCE at startup.
+ *             URL matches a bundled endpoint after NORMALISATION (trim, drop trailing slash,
+ *             lowercase). Otherwise it returns `{}` and logs `daemon.manifest.bundled.skipped` ONCE
+ *             at startup.
  *   ENFORCED  `signaling-connect.ts` step 6 — `if (verifier) { … }`. When a verifier exists this
  *             FAILS CLOSED correctly: missing proof throws, a bad signature throws.
  *   SKIPPED   the same `if (verifier)`. With no verifier the whole block is stepped over, on every
- *             connect and every reconnect, and **nothing is logged at that site at all.**
+ *             connect and every reconnect.
+ *
+ * **Correction (review F4).** This header first claimed nothing was logged at that site. False, and
+ * falsifiable in one grep: `directory.signaling.connected` carries `verified: !!verifier` six lines
+ * later, every connect and every reconnect. The skip is logged twice over. The reason this unit
+ * exists is not an absent log — it is that **a log is not a control**: an agent reading
+ * `cello_status` cannot grep `daemon.log`, and the agent-facing surface said nothing either way.
  *
  * NOT the live path, despite its own comment saying otherwise: `signaling-manager.ts`'s
  * `processStep5Frame` (*"called inside production connect() after auth_ok"*) has no production
@@ -22,11 +29,11 @@
  *
  * ─── What is actually wrong ────────────────────────────────────────────────────────────────────
  *
- * The byte-match is a workaround, not a fix, and the DoD line says so: *"That is why the production
+ * The string match is a workaround, not a fix, and the DoD line says so: *"That is why the production
  * directory URL is a raw IP: the fail-open is known and was worked around with string matching."*
- * A DNS name pointing at the very same machine does not match, so an operator who does the most
- * natural thing in the world — put a hostname in `CELLO_DIRECTORY_URL` — silently loses directory
- * identity authentication.
+ * Normalisation forgives case and a trailing slash; it does not forgive DNS. So an operator who does
+ * the most natural thing in the world — put a hostname in `CELLO_DIRECTORY_URL` — silently loses
+ * directory identity authentication.
  *
  * The consequence is not abstract. Step 6 is what stops a `/bootstrap` MITM redirecting failover to
  * a rogue directory. Without it the client will authenticate to whatever answers.
@@ -78,9 +85,20 @@ describe("DOD-M15-DIRAUTH-1: the posture is stated, not inferred from silence", 
     ).toMatch(/rogue directory|MITM/i);
     expect(
       g,
-      "and the fix: byte-equality against a bundled endpoint, so a HOSTNAME for the same machine " +
-        "does not match — which is the trap",
-    ).toMatch(/byte-equal|hostname/i);
+      "and the fix: matched against a bundled endpoint after normalisation, so a HOSTNAME for the " +
+        "same machine does not match — which is the trap",
+    ).toMatch(/normalisation|hostname/i);
+    expect(
+      g,
+      "the remedy must WORK: CELLO_CONSORTIUM_MANIFEST alone makes the daemon refuse to start with " +
+        "a DIFFERENT error, because the two companion variables are mandatory (review F3)",
+    ).toMatch(/CELLO_CONSORTIUM_ROOT_KEYS/);
+    expect(g).toMatch(/CELLO_CONSORTIUM_THRESHOLD/);
+    expect(
+      g,
+      "and the off-switch must name its VALUES — an operator on a k8s ConfigMap often cannot unset " +
+        "a key, only set it to something (review F8)",
+    ).toMatch(/0, false, no or off/);
   });
 
   it("a LOCAL directory is disabled-but-expected, and says that instead of raising alarm", () => {
@@ -249,7 +267,12 @@ describe("DOD-M15-DIRAUTH-1: the demand is enforced at STARTUP, not deferred", (
       err?.message,
       "an operator whose hostname resolves to exactly the right machine will otherwise conclude " +
         "the check is broken rather than that the comparison is byte-equality",
-    ).toMatch(/BYTE-EQUALITY|hostname/i);
+    ).toMatch(/NORMALISATION|hostname/i);
+    expect(
+      err?.message,
+      "and it must NOT claim byte-equality — case and a trailing slash ARE forgiven, so an operator " +
+        "told that would hunt a capital letter and never find it (review F7)",
+    ).not.toMatch(/byte-equal/i);
     expect(err?.message, "and it must name the ways out").toMatch(/CELLO_CONSORTIUM_MANIFEST/);
   }, 30_000);
 

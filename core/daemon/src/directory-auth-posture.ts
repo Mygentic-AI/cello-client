@@ -21,14 +21,23 @@
  * e2e harness run their own directory on 127.0.0.1, which the bundle cannot describe, so enforcing
  * there would reject every connection. The skip is correct for them.
  *
- * The hole is that the test is byte-equality against a bundled endpoint. **A DNS name pointing at
- * the very same machine does not match**, so an operator doing the most natural thing available —
- * putting a hostname in `CELLO_DIRECTORY_URL` — silently loses directory identity authentication.
+ * The hole is the test itself. It compares against the bundled roster after NORMALISATION — trimmed,
+ * trailing slash dropped, lowercased (`manifest-deps.ts`) — so case and a trailing slash are
+ * forgiven. **A DNS name pointing at the very same machine is not**, so an operator doing the most
+ * natural thing available — putting a hostname in `CELLO_DIRECTORY_URL` — silently loses directory
+ * identity authentication.
+ *
+ * (Review F7: this said "byte-equality" three times, including in operator-facing text. An operator
+ * told that would hunt a trailing slash or a capital letter — both of which are tolerated — and not
+ * find it.)
  * The DoD line is explicit that this is a workaround rather than a fix: *"That is why the production
  * directory URL is a raw IP."*
  *
- * Step 6 is what stops a `/bootstrap` MITM redirecting failover to a rogue directory. Without it the
- * client authenticates to whatever answers.
+ * Step 6 is what stops a `/bootstrap` MITM redirecting failover to a rogue directory — precisely, it
+ * CONVERTS the redirect into a refused connection: the rogue host cannot produce a signature over
+ * `nodeId ‖ our agent pubkey ‖ nonce ‖ timestamp` without a manifest node's private key, so the
+ * connect throws and the failover resolver moves on. The attacker keeps denial-of-service; they do
+ * not get impersonation. Without step 6 the client authenticates to whatever answers.
  *
  * ─── Scope ─────────────────────────────────────────────────────────────────────────────────────
  *
@@ -94,15 +103,22 @@ export function describeDirectoryAuth(opts: {
       ? `Directory identity authentication (step 6) is OFF because ${opts.directoryUrl} is a local ` +
         "address, which the bundled consortium manifest cannot describe. This is the designed " +
         "configuration for local development and the e2e harness — enforcing here would reject " +
-        "every connection. Supply a matching manifest via CELLO_CONSORTIUM_MANIFEST to turn it on."
+        "every connection. To turn it on, supply a matching manifest with CELLO_CONSORTIUM_MANIFEST " +
+        "AND CELLO_CONSORTIUM_ROOT_KEYS AND CELLO_CONSORTIUM_THRESHOLD — all three are required " +
+        "together, and setting only the first makes the daemon refuse to start with a different error."
       : `Directory identity authentication (step 6) is OFF, because ${opts.directoryUrl} is not ` +
-        "byte-equal to any endpoint in the bundled consortium manifest. This client is weaker than " +
+        "in the bundled consortium manifest after normalisation (trimmed, trailing slash dropped, " +
+        "lowercased — so case and a trailing slash are forgiven). This client is weaker than " +
         "it looks: step 6 is what stops a MITM on the plaintext /bootstrap endpoint redirecting " +
         "failover to a ROGUE DIRECTORY, and without it this daemon will authenticate to whatever " +
-        "answers. The usual cause is a HOSTNAME — the comparison is byte-equality, so a DNS name " +
-        "pointing at exactly the right machine still does not match, which is why the production " +
-        "directory URL is a raw address. Either use the bundled address, or supply a matching " +
-        "manifest via CELLO_CONSORTIUM_MANIFEST. Set CELLO_REQUIRE_DIRECTORY_AUTH=1 to refuse to " +
-        "start rather than run without it.",
+        "answers. The usual cause is a HOSTNAME — normalisation forgives case and slashes but not " +
+        "DNS, so a name pointing at exactly the right machine still does not match, which is why the " +
+        "production " +
+        "directory URL is a raw address. Either use a bundled endpoint address, or supply a matching " +
+        "manifest with CELLO_CONSORTIUM_MANIFEST AND CELLO_CONSORTIUM_ROOT_KEYS AND " +
+        "CELLO_CONSORTIUM_THRESHOLD — all three are required together, and setting only the first " +
+        "makes the daemon refuse to start with a different error. Set CELLO_REQUIRE_DIRECTORY_AUTH=1 " +
+        "to refuse to start rather than run without step 6; to turn that demand back off set it to " +
+        "0, false, no or off (an unrecognised value counts as ON, deliberately).",
   };
 }

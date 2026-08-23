@@ -296,6 +296,47 @@ async function startDaemonHoldingLock(
     );
   }
 
+  /**
+   * DOD-M15-DIRAUTH-1 — an operator can DEMAND directory identity authentication.
+   *
+   * HERE, under the ADV-006/008 rule above, because this IS pure config validation: both operands
+   * are already in hand and it touches nothing.
+   *
+   * Review F1 caught me putting it ninety lines lower, next to ADV-002, on the reasoning that it
+   * "mirrors" it. It does not. ADV-002 sits down there because it MUST — it depends on
+   * `verifyStartupManifest`, which depends on the anti-rollback floor in the DB. This depends on
+   * nothing, and down there it ran AFTER: the irreversible flat-file → SQLCipher identity migration
+   * (which renames and unlinks files), the creation of `sessions.db` and its key, and the sweep that
+   * marks every `active` session `interrupted` with `interrupted_by='local'`.
+   *
+   * So a misconfigured daemon "failed to start" and changed the operator's record on the way out —
+   * two live sessions permanently interrupted, attributed to a local cause, by a config check that
+   * could have run before anything was touched.
+   */
+  if (directoryAuthRequired(process.env) && challengeVerifier === undefined) {
+    const url = config.directoryHttpUrl ?? resolveDirectoryUrl(process.env);
+    logger.error("directory.auth.required.unavailable", {
+      directoryUrl: url,
+      impact: "the daemon refused to start rather than connect without directory identity authentication.",
+      guidance:
+        "CELLO_REQUIRE_DIRECTORY_AUTH is set, but no challenge verifier could be built for this " +
+        "directory URL. Point CELLO_DIRECTORY_URL at a bundled endpoint, or supply a manifest with " +
+        "CELLO_CONSORTIUM_MANIFEST plus CELLO_CONSORTIUM_ROOT_KEYS and CELLO_CONSORTIUM_THRESHOLD " +
+        "(all three are required together), or set CELLO_REQUIRE_DIRECTORY_AUTH to 0/false/no/off " +
+        "to accept the risk.",
+    });
+    throw new Error(
+      `CELLO_REQUIRE_DIRECTORY_AUTH is set, but directory identity authentication (step 6) cannot ` +
+      `be enforced: no challenge verifier was supplied for this daemon. The directory URL is ` +
+      `compared against the bundled consortium roster after NORMALISATION (trimmed, trailing slash ` +
+      `dropped, lowercased) — so case and a trailing slash are forgiven, but a DNS hostname ` +
+      `pointing at exactly the right machine is NOT, which is the usual cause. Either use a bundled ` +
+      `endpoint address, or supply a manifest with CELLO_CONSORTIUM_MANIFEST plus ` +
+      `CELLO_CONSORTIUM_ROOT_KEYS and CELLO_CONSORTIUM_THRESHOLD (all three are required together), ` +
+      `or set CELLO_REQUIRE_DIRECTORY_AUTH to 0/false/no/off to start without step 6.`,
+    );
+  }
+
   // ── PERSIST-002: open the encrypted store FIRST (runs the one-time flat-file → SQLCipher migration
   // (AC-006) + creates the agents/manifest_state schema), under the single-instance lock. This must
   // precede the manifest verification below because the manifest version is now stored in the
@@ -363,41 +404,6 @@ async function startDaemonHoldingLock(
     // background probe are exercised through one seam rather than one being untestable.
     ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
   });
-
-  /**
-   * DOD-M15-DIRAUTH-1 — an operator can DEMAND directory identity authentication.
-   *
-   * The skip itself is legitimate and stays: local dev and the e2e harness run against a directory
-   * the bundled manifest cannot describe, and enforcing there would reject every connection. What
-   * was missing is any way to say "I would rather not connect than connect unauthenticated" — the
-   * decision was made for the operator, by a byte-comparison, and never surfaced.
-   *
-   * Refused HERE rather than at connect time, and deliberately: a daemon that starts and then
-   * silently declines every session is a worse failure than one that does not start and says why.
-   * This mirrors ADV-002 below, which is the same shape for the same reason.
-   */
-  if (directoryAuthRequired(process.env) && challengeVerifier === undefined) {
-    try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
-    await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
-    const url = directoryHttpUrl ?? resolveDirectoryUrl(process.env);
-    logger.error("directory.auth.required.unavailable", {
-      directoryUrl: url,
-      impact: "the daemon refused to start rather than connect without directory identity authentication.",
-      guidance:
-        "CELLO_REQUIRE_DIRECTORY_AUTH is set, but no challenge verifier could be built for this " +
-        "directory URL. Either point CELLO_DIRECTORY_URL at a bundled endpoint (byte-equality — a " +
-        "hostname for the same machine does not match), supply a matching manifest via " +
-        "CELLO_CONSORTIUM_MANIFEST, or unset CELLO_REQUIRE_DIRECTORY_AUTH to accept the risk.",
-    });
-    throw new Error(
-      `CELLO_REQUIRE_DIRECTORY_AUTH is set, but directory identity authentication (step 6) cannot be ` +
-      `enforced against ${url}: no challenge verifier could be built for it. The comparison against ` +
-      `the bundled consortium roster is BYTE-EQUALITY, so a DNS hostname pointing at exactly the ` +
-      `right machine still does not match — that is the usual cause. Use the bundled address, or ` +
-      `supply a matching manifest via CELLO_CONSORTIUM_MANIFEST, or unset ` +
-      `CELLO_REQUIRE_DIRECTORY_AUTH to start without step 6.`,
-    );
-  }
 
   // ADV-002: an operator who configures manifestProvider has opted INTO manifest enforcement, so a
   // failed verification is fatal — never a warning we start anyway on.
