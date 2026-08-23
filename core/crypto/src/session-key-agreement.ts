@@ -152,8 +152,18 @@ export function deriveSessionSecrets(opts: {
    *
    * A small-order peer point drives the shared secret to all zeros. Both sides would then derive the
    * same key, every message would encrypt and decrypt correctly, and whoever supplied the point
-   * would hold the key. There is no symptom to notice, which is exactly why this refuses loudly
-   * instead of deriving.
+   * would hold the key. There is no symptom to notice.
+   *
+   * ⚠️ THIS BRANCH IS UNREACHABLE TODAY, and saying so is the point. `@noble/curves` already refuses
+   * — `getSharedSecret` throws *"invalid private or public key received"* before control arrives
+   * here — which the revert test proved: deleting this check left every test green. So this is a
+   * BACKSTOP against that dependency behaviour changing, not the thing currently providing the
+   * property, and an earlier version of this comment claimed otherwise.
+   *
+   * It is kept rather than deleted because the cost is one branch and the failure it guards has no
+   * symptom. The test pins the PROPERTY (a degenerate agreement is refused) rather than which layer
+   * refuses, so it keeps its teeth either way — and would catch a `@noble` upgrade that stopped
+   * rejecting.
    */
   if (isAllZero(shared)) {
     throw new Error(

@@ -193,6 +193,13 @@ describe("DOD-M15-KEYAGREE-1: a degenerate agreement FAILS CLOSED", () => {
      *
      * The all-zero point is the canonical small-order input (RFC 7748 §6.1 requires implementations
      * to reject the resulting zero output).
+     *
+     * DELIBERATELY PINS THE PROPERTY, NOT THE PRODUCER. Today `@noble/curves` refuses first
+     * ("invalid private or public key received") and our own all-zero check never runs — the revert
+     * test proved that by deleting the check and staying green. Asserting *that it is refused*
+     * rather than *who refuses* is what keeps this test meaningful across a dependency upgrade: if
+     * `@noble` ever stopped rejecting, the backstop would take over and this test would still pass;
+     * if BOTH stopped, it goes red, which is the case that matters.
      */
     const a = generateSessionEphemeral();
     expect(
