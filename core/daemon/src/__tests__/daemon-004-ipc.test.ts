@@ -551,7 +551,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     expect(reloaded.leaves().filter((l) => l.kind === "msg").length).toBe(1);
   });
 
-  it("finding #4: two concurrent active cello_close_session calls — only one initiates a seal; the other is rejected seal_interrupted_in_progress", async () => {
+  it("finding #4: two concurrent active cello_close_session calls — only one initiates a seal; the other is rejected seal_in_progress", async () => {
     const { logger } = makeLogger();
     await makeAgentDir("alice");
     const cpKp = generateKeypair();
@@ -575,7 +575,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
         client.send("cello_close_session", { session_id: SID }),
       ]) as Record<string, unknown>[];
       const results = [r1, r2];
-      const inProgress = results.filter((r) => r.reason === "seal_interrupted_in_progress");
+      const inProgress = results.filter((r) => r.reason === "seal_in_progress");
       const initiated = results.filter((r) => r.ok === true && r.status === "seal_interrupted_pending");
       // Exactly one initiates the seal; the other is rejected by the concurrency guard.
       expect(inProgress).toHaveLength(1);

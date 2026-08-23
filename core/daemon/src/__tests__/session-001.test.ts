@@ -21,7 +21,7 @@
  *   with guidance field.
  *
  * AC-011 Unit: cello_close_session while in-progress returns
- *   seal_interrupted_in_progress with guidance field.
+ *   seal_in_progress with guidance field.
  *
  * AC-012 Unit: seal-interrupted fails when signaling unavailable returns
  *   seal_interrupted_counterparty_unavailable with guidance field.
@@ -710,7 +710,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
   it("AC-014: error codes are distinct and non-colliding", () => {
     const errorCodes = [
       "session_already_sealed",
-      "seal_interrupted_in_progress",
+      "seal_in_progress",
       "seal_interrupted_counterparty_unavailable",
       "seal_interrupted_rejected_by_counterparty",
       "signaling_reconnecting",
@@ -720,7 +720,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
   });
 });
 
-// ─── AC-011: seal_interrupted_in_progress guard ──────────────────────────────
+// ─── AC-011: seal_in_progress guard ──────────────────────────────
 //
 // L7-guard note (AC-004/AC-005): the tests above use a fake relay stream
 // (makeFakeRelayStream) rather than a real libp2p relay. This is the best we
@@ -728,7 +728,7 @@ describe("SESSION-001: cello_close_session error codes", () => {
 // integration path (relay process → daemon → SQLite) is exercised by AC-016
 // below via the composition root.
 
-describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
+describe("SESSION-001: AC-011 seal_in_progress guard", () => {
   let tempDir: string;
   let handle: Awaited<ReturnType<typeof startDaemon>> | null;
 
@@ -748,7 +748,7 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("AC-011: cello_close_session while in-progress returns seal_interrupted_in_progress with guidance", async () => {
+  it("AC-011: cello_close_session while in-progress returns seal_in_progress with guidance", async () => {
     // Create an agent directory so the daemon recognises it
     const agentDir = join(tempDir, "agents", "alice");
     await mkdir(agentDir, { recursive: true });
@@ -822,7 +822,11 @@ describe("SESSION-001: AC-011 seal_interrupted_in_progress guard", () => {
       // Second call must hit the guard
       const second = await client.send("cello_close_session", { session_id: sessionId }) as Record<string, unknown>;
       expect(second.ok).toBe(false);
-      expect(second.reason).toBe("seal_interrupted_in_progress");
+      // DOD-M15-CLOSEWAIT-1 review HIGH-3: renamed from seal_interrupted_in_progress. The common
+      // case is now an ACTIVE session whose BACKGROUND ceremony is mid-flight — nothing interrupted
+      // — and the old guidance told the operator to wait for a log event that is emitted nowhere in
+      // the tree.
+      expect(second.reason).toBe("seal_in_progress");
       expect(typeof second.guidance).toBe("string");
       expect((second.guidance as string).length).toBeGreaterThan(0);
     } finally {

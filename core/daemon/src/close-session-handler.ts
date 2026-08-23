@@ -2,7 +2,7 @@
  * cello_close_session — the bilateral close, and every way it can fail.
  *
  * M7 error discipline: each distinct failure cause produces a DISTINCT error code
- * (session_already_sealed, seal_interrupted_in_progress, seal_interrupted_counterparty_unavailable,
+ * (session_already_sealed, seal_in_progress, seal_interrupted_counterparty_unavailable,
  * seal_interrupted_rejected_by_counterparty, signaling_reconnecting). A close that fails must tell
  * the operator WHY, not merely that it failed — this handler exists as much for its error paths as
  * for its happy path.
@@ -231,7 +231,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
   // ─── M7-SESSION-001: cello_close_session ────────────────────────────────────
   // M7 error discipline: each distinct failure cause produces a distinct error code.
   // AC-010: session_already_sealed
-  // AC-011: seal_interrupted_in_progress
+  // AC-011: seal_in_progress
   // AC-012: seal_interrupted_counterparty_unavailable
   // AC-013: seal_interrupted_rejected_by_counterparty
   // DB-001: signaling_reconnecting
@@ -726,12 +726,35 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       };
     }
 
-    // AC-011: seal-interrupted already in progress
+    /**
+     * AC-011: a seal attempt is already running for this session.
+     *
+     * DOD-M15-CLOSEWAIT-1 review HIGH-3 rewrote this, because the change made it COMMON and the old
+     * wording did not survive contact:
+     *
+     *   - it said *"wait for `session.interrupted.sealed` to appear in the daemon logs"*. That event
+     *     is emitted NOWHERE in the tree — grep finds it only inside this string. An operator would
+     *     tail a log for a line that cannot arrive.
+     *   - it named the seal-INTERRUPTED subsystem, but the common case now is an ACTIVE session
+     *     whose background ceremony is mid-flight. Wrong subsystem, on the path an operator most
+     *     often reaches.
+     *   - it was hard to reach before, because the first close held the caller for the whole
+     *     ceremony. Now the operator has their terminal back for up to eleven minutes, and
+     *     re-closing is the obvious move.
+     */
     if (sealInterruptedInProgress.has(sealKey(record.agent_name, sessionId))) {
       return {
         ok: false,
-        reason: "seal_interrupted_in_progress",
-        guidance: "A seal-interrupted attempt is already in progress for this session. Wait for session.interrupted.sealed to appear in the daemon logs before retrying. Do not call cello_close_session again until the current attempt completes or times out.",
+        reason: "seal_in_progress",
+        seal_status: "committed",
+        guidance:
+          "A seal ceremony is ALREADY RUNNING for this session — your commitment is recorded and " +
+          "there is nothing to retry. This is the normal state after a close: the close answers as " +
+          "soon as the commitment is durable and notarizes in the background, which waits for the " +
+          "counterparty and can take several minutes. Fetch the result with cello_sealed_receipt " +
+          `(session_id ${sessionId}); a seal_in_progress answer there means the same thing — still ` +
+          "running, not failed. Do NOT re-close with { force: true } to hurry it: forcing ABANDONS " +
+          "the session and permanently forfeits the receipt this ceremony is about to produce.",
       };
     }
 

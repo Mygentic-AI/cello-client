@@ -425,7 +425,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     const [resA, resB] = await Promise.all([closeA, closeB]);
     const reasons = [resA.reason, resB.reason].sort();
     // One close runs the flow; the other is rejected by the in-progress guard.
-    expect(reasons).toContain("seal_interrupted_in_progress");
+    expect(reasons).toContain("seal_in_progress");
     expect(reasons).toContain("seal_counterparty_pending");
     // The invariant with teeth: exactly ONE relay SEAL ctrl leaf was submitted.
     expect(relay.ctrlSubmits().length).toBe(1);
