@@ -148,6 +148,56 @@ const LEGACY_DDL = `
  * and the entire defect being guarded here IS a forgotten second place. Add a column to
  * `session-node-manager.ts` and this test replays it on the next run, with nobody in the loop.
  */
+/**
+ * Every JS string-literal BODY in `text`, comments excluded — in ONE pass.
+ *
+ * Stripping comments first and then finding literals is what the earlier version did, and it is
+ * wrong in a way review pass 2 named and this file's own unit test then reproduced: a `//` or `/*`
+ * INSIDE a string literal is not a comment, but the stripper cannot tell, so it ate the rest of the
+ * line — and the `ALTER TABLE` on the next line vanished silently.
+ *
+ * Comment state and string state are the same scan or they are wrong. A single walk knows which one
+ * it is in; two passes each guess about the other.
+ *
+ * A regex literal containing a quote could still mis-seed this scan. That risk is bounded rather
+ * than argued away: a mis-scan changes the parsed COUNT, and the ground-truth assertion in the data
+ * test compares that count against the raw source. This parser can no longer fail quietly.
+ */
+function stringLiterals(text: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i < text.length) {
+    const c = text[i]!;
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i += 1;
+      i += 2;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      i += 1;
+      let buf = "";
+      let escaped = false;
+      while (i < text.length) {
+        const d = text[i]!;
+        if (escaped) { buf += d; escaped = false; i += 1; continue; }
+        if (d === "\\") { escaped = true; i += 1; continue; }
+        if (d === c) { i += 1; break; }
+        buf += d;
+        i += 1;
+      }
+      out.push(buf);
+      continue;
+    }
+    i += 1;
+  }
+  return out;
+}
+
 function literalAlters(text: string, table: string): string[] {
   const out: string[] = [];
   /**
@@ -161,10 +211,8 @@ function literalAlters(text: string, table: string): string[] {
    * land on a rebuilt table would have been invisible.
    */
   const inner = new RegExp(`^ALTER TABLE ${table} ADD COLUMN (.+)$`, "i");
-  // Find whole JS string literals first, then read the SQL out of one. Scanning for the SQL
-  // directly cannot know where the statement ends, which is how the quoted-DEFAULT case was lost.
-  for (const m of stripComments(text).matchAll(/(["'`])((?:\\.|(?!\1)[\s\S])*)\1/g)) {
-    const sql = m[2]!.trim().replace(/\s+/g, " ");
+  for (const literal of stringLiterals(text)) {
+    const sql = literal.trim().replace(/\s+/g, " ");
     const hit = inner.exec(sql);
     if (hit === null) continue;
     const ddl = hit[1]!.trim();
@@ -265,6 +313,56 @@ function legacyDb(): DatabaseSync {
   return db;
 }
 
+/**
+ * ─── THE PARSERS ARE UNIT-TESTED, BECAUSE THEIR FIXES OTHERWISE HAVE NO TEETH ──────────────────
+ *
+ * Review pass 2 reverted all three parser fixes below and the whole file stayed GREEN — every one
+ * produces identical output against today's sources, because no current column happens to use the
+ * shapes they were fixed for. The bypasses were proven by hand-mutating source files and that
+ * evidence was never committed, so the next edit reintroducing any of them would pass the gate.
+ *
+ * That is this file's own thesis turned on itself: a checker which silently matches nothing reports
+ * success either way. These cases are the committed proof.
+ */
+describe("DOD-M15-MIGRATION-GUARD-1 — the source parsers survive the shapes that broke them", () => {
+  it("literalAlters reads a column whose DEFAULT contains a quote", () => {
+    // The pass-1 defect. `([^"'`]+)` stopped at the apostrophe, yielding
+    // `origin TEXT NOT NULL DEFAULT` — invalid SQL, swallowed by the replay's bare catch.
+    // This shape is already written twice in the file this parses (`held_content.origin`).
+    const src = `db.exec("ALTER TABLE sessions ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");`;
+    expect(literalAlters(src, "sessions")).toEqual(["origin TEXT NOT NULL DEFAULT 'received'"]);
+  });
+
+  it("literalAlters is not confused by a // or /* inside an EARLIER string literal", () => {
+    // `stripComments` runs before literal-finding, so a comment marker inside a string can eat the
+    // line that follows it. The colon guard covers `https://`; these are the uncovered shapes.
+    const slash = `const a = "x // y";\ndb.exec("ALTER TABLE sessions ADD COLUMN read_at INTEGER");`;
+    const block = `const a = "x /* y";\ndb.exec("ALTER TABLE sessions ADD COLUMN read_at INTEGER");`;
+    expect(literalAlters(slash, "sessions"), "a // inside a string swallowed the ALTER").toEqual(["read_at INTEGER"]);
+    expect(literalAlters(block, "sessions"), "a /* inside a string swallowed the ALTER").toEqual(["read_at INTEGER"]);
+  });
+
+  it("literalAlters still ignores a real comment", () => {
+    expect(literalAlters(`// db.exec("ALTER TABLE sessions ADD COLUMN ghost TEXT");`, "sessions")).toEqual([]);
+  });
+
+  it("retryQueueAlters reads a multi-word type, and ignores a decoy outside the array", () => {
+    // Pass-1 F2: `(\w+)` parsed a multi-word type to NOTHING. F4: an unscoped match invented columns.
+    const src = `
+      const decoy = { name: "not_a_column", type: "TEXT" };
+      for (const col of [
+        { name: "structure1_cbor", type: "BLOB" },
+        { name: "priority", type: "INTEGER NOT NULL DEFAULT 0" },
+      ]) {
+        this.#db.exec(\`ALTER TABLE retry_queue ADD COLUMN \${col.name} \${col.type}\`);
+      }`;
+    expect(retryQueueAlters(src)).toEqual([
+      "structure1_cbor BLOB",
+      "priority INTEGER NOT NULL DEFAULT 0",
+    ]);
+  });
+});
+
 describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven rebuilt tables", () => {
   it("every value written before the re-key is still there after it", () => {
     /**
@@ -298,6 +396,50 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
      *
      * `addColumnIfMissing` swallows ONLY `duplicate column name` and rethrows everything else.
      */
+    /**
+     * ─── GROUND TRUTH: what the SOURCE contains, measured without the pinned DDL ────────────────
+     *
+     * The inverse assertion further down derives its expectation from the pinned DDL, which makes
+     * it structurally incapable of catching the one failure this whole file exists for: a column
+     * that is missing from the pinned DDL **and** missed by the parser is in neither set, so
+     * nothing reddens and the operator loses the data. Review pass 2 proved that deductively.
+     *
+     * This closes it from the other side. Count the raw `ALTER TABLE <t> ADD COLUMN` occurrences in
+     * the UNSTRIPPED source and require the parser to have produced exactly that many. It measures
+     * the gap between *present in source* and *parsed*, which is the actual failure mode, and it
+     * depends on nothing else.
+     *
+     * **Deliberately the RAW source, not the comment-stripped one.** A stripped count would move
+     * together with the parser if `stripComments` itself corrupted the text — both would shrink and
+     * agree, which is the same false-agreement shape being closed here. Raw and stripped both read
+     * 17/1 today (measured), so raw costs nothing and catches strictly more. If a genuine ALTER is
+     * ever written inside a comment this goes red: fix it by not writing SQL in a comment.
+     */
+    const groundTruth: Record<string, { table: string; file: string }> = {
+      sessions: { table: "sessions", file: "session-node-manager.ts" },
+      contacts: { table: "contacts", file: "session-node-manager.ts" },
+    };
+    for (const [key, { table, file }] of Object.entries(groundTruth)) {
+      const raw = readFileSync(join(SRC, file), "utf8");
+      const occurrences = (raw.match(new RegExp(`ALTER TABLE ${table} ADD COLUMN`, "g")) ?? []).length;
+      expect(
+        alters[key]!.length,
+        `${file} contains ${String(occurrences)} 'ALTER TABLE ${table} ADD COLUMN' statements but ` +
+          `the parser produced ${String(alters[key]!.length)}. A column present in the source and ` +
+          `missed by the parser is never replayed, never seeded and never checked — and if it is ` +
+          `also missing from the pinned DDL, that is exactly the silent upgrade data loss this ` +
+          `file exists to prevent. Fix the parser; do not adjust this count.`,
+      ).toBe(occurrences);
+    }
+    // retry_queue's columns are data in an array, not statements — count the entries the same way.
+    const rqRaw = readFileSync(join(SRC, "retry-queue.ts"), "utf8");
+    const rqEntries = (rqRaw.match(/\{\s*name:\s*"/g) ?? []).length;
+    expect(
+      alters["retry_queue"]!.length,
+      `retry-queue.ts declares ${String(rqEntries)} { name, type } column entries but the parser ` +
+        `produced ${String(alters["retry_queue"]!.length)}.`,
+    ).toBe(rqEntries);
+
     for (const [table, ddls] of Object.entries(alters)) {
       for (const ddl of ddls) {
         addColumnIfMissing(db as unknown as DaemonDatabase, silentLogger(), {
