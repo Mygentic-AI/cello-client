@@ -62,6 +62,16 @@ export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./r
 
 // M7-MSG-001: recipient content sealed box (E2E encryption for parked content)
 export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./content-seal.js";
+// DOD-M15-KEYAGREE-1: CELLO's own per-session key agreement — ephemeral-ephemeral X25519 with the
+// hybrid-PQ hook built in, producing both the content key and the content-hash salt.
+export {
+  generateSessionEphemeral,
+  deriveSessionSecrets,
+  SESSION_KEY_BYTES,
+  SESSION_SALT_BYTES,
+  type SessionEphemeral,
+  type SessionSecrets,
+} from "./session-key-agreement.js";
 
 // M7-MANIFEST-001: consortium manifest verification and root key constants
 export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
