@@ -132,6 +132,44 @@ export type ParkAuthFailure =
 export type ParkAuthVerdict = { ok: true } | { ok: false; reason: ParkAuthFailure };
 
 /**
+ * Why this build refused to SEAL an entry — the producer side, distinct from `ParkAuthFailure`,
+ * which is why it refused to ACCEPT one.
+ */
+export const PARK_ENVELOPE_REASONS = {
+  /** The entry names a content-hash algorithm this build cannot itself reproduce. */
+  ALG_UNREADABLE: "park_envelope_alg_unreadable",
+} as const;
+
+export type ParkEnvelopeReason = (typeof PARK_ENVELOPE_REASONS)[keyof typeof PARK_ENVELOPE_REASONS];
+
+/**
+ * A REFUSAL TO SEAL, carrying a code the caller can branch on — `DOD-M15-SEALWIRE-1` B2b-2
+ * constraint 6, inherited from B2a's review.
+ *
+ * ⚠️ THE PROSE WAS NEVER THE PROBLEM; WHERE IT LANDED WAS. This threw a bare `Error` with a clear
+ * paragraph, and `#parkContent`'s catch put `err.message` into `cause` — a field its own callers
+ * document as the MACHINE-READABLE half, added (M12-P13) so that nobody would have to substring-match
+ * English to decide what to do. A paragraph there is unbranchable, so this fault fell into the
+ * generic relay branch and inherited its guidance: *"the relay refused the hand-off, so the message
+ * is queued and will be re-sent automatically when the relay link is back."*
+ *
+ * Both halves of that are false here. The relay was never asked, and every re-park throws in exactly
+ * the same place, so the message sits in the queue while its sender waits for a recovery that cannot
+ * happen. Splitting the code from the prose is what lets the caller say something true instead.
+ */
+export class ParkEnvelopeError extends Error {
+  readonly reason: ParkEnvelopeReason;
+  /** The offending value alone, so a caller can log it without re-parsing the sentence. */
+  readonly detail: string;
+  constructor(reason: ParkEnvelopeReason, detail: string, message: string) {
+    super(message);
+    this.name = "ParkEnvelopeError";
+    this.reason = reason;
+    this.detail = detail;
+  }
+}
+
+/**
  * SEC-1: encode a SIGNED park envelope. `senderPubkey` and `parkSig` are REQUIRED — the type system
  * is the enforcement point, so no call site can construct an unsigned envelope by omission (the
  * exact drift that made this a downgrade attack: verification existed, but was opt-in).
@@ -176,7 +214,9 @@ export function encodeParkEnvelope(args: {
    * A throw here is a developer error at the moment it is made, rather than a silent mail loop.
    */
   if (!isKnownContentHashAlg(alg)) {
-    throw new Error(
+    throw new ParkEnvelopeError(
+      PARK_ENVELOPE_REASONS.ALG_UNREADABLE,
+      alg,
       `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${alg}", which this ` +
       "build cannot itself reproduce. The recipient would refuse it and keep re-pulling it forever, " +
       "and nothing at the sender would say why.",

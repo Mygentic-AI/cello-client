@@ -20,7 +20,7 @@
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { FileKeyProvider, msgLeafHash } from "@cello-protocol/crypto";
+import { FileKeyProvider, msgLeafHash, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../../daemon.js";
 import { connectToDaemon, type IpcClient } from "../../ipc-client.js";
@@ -34,6 +34,12 @@ import type { Stream } from "@libp2p/interface";
 export class FakeNode implements Partial<CelloNode> {
   sent: Uint8Array[] = [];
   readonly #peerId = `fake-${Math.random().toString(36).slice(2)}`;
+  /**
+   * `newStreamFails` makes every direct send fail, which is the only way to reach the PARK route —
+   * the route a message takes when the counterparty is not there to receive it directly. Optional
+   * and defaulted off, so every existing caller keeps a node whose streams succeed.
+   */
+  constructor(private readonly opts: { newStreamFails?: boolean } = {}) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
@@ -58,6 +64,7 @@ export class FakeNode implements Partial<CelloNode> {
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
+    if (this.opts.newStreamFails) throw new Error("connection_lost: counterparty stream dead");
     const sink = this.sent;
     return { send(d: Uint8Array) { sink.push(d); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;
   }
@@ -108,7 +115,19 @@ export interface TwoConnectionFixture {
   connectAs(agent: string): Promise<IpcClient>;
   /** Open a connection WITHOUT attending — the un-attended observer case. */
   connect(): Promise<IpcClient>;
-  createSession(sessionId: string, agent: string, counterpartyPubkey?: string, peerId?: string): Promise<void>;
+  /**
+   * `relay: true` configures the session with a relay target and real signing key material, which is
+   * what makes the PARK route reachable — without it a failed direct send returns
+   * `session_stream_unavailable` and the park hook is never consulted at all. Default `false`, so no
+   * existing caller changes behaviour (fixture rule: new options carry non-breaking defaults).
+   */
+  createSession(
+    sessionId: string,
+    agent: string,
+    counterpartyPubkey?: string,
+    peerId?: string,
+    opts?: { relay?: boolean },
+  ): Promise<void>;
   /** Seed a RECEIVED message exactly as the inbound path does: tree leaf + transcript row. */
   seedReceived(agent: string, sessionId: string, text: string): number;
   /** Append a leaf this agent SENT, with its transcript row — what a sibling connection's send produces. */
@@ -185,8 +204,24 @@ export async function startTwoConnectionFixture(
       await client.send("cello_use_agent", { name: agent });
       return client;
     },
-    async createSession(sessionId, agent, counterpartyPubkey = "bobpubkeyhex", peerId = "bob-peer-id") {
-      await handle.getSessionNodeManager().createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
+    async createSession(sessionId, agent, counterpartyPubkey = "bobpubkeyhex", peerId = "bob-peer-id", sessionOpts) {
+      const snm = handle.getSessionNodeManager();
+      if (!sessionOpts?.relay) {
+        await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
+        return;
+      }
+      // A REAL keypair, not a stub: the park path signs the entry, and `sealParkEnvelope` is the
+      // sole producer of that signature. A fake signer here would make every park test pass against
+      // a producer that signs the wrong statement — the exact hollow-test finding that made
+      // `sealParkEnvelope` a single producer in the first place.
+      const kp = generateKeypair();
+      await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture", false, {
+        relayPeerId: "12D3KooWFixtureRelay",
+        relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFixtureRelay"],
+        keyProvider: kp,
+        senderPubkey: await kp.getPublicKey(),
+        sessionIdBytes: Buffer.from(sessionId, "hex"),
+      });
     },
     seedSent(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();

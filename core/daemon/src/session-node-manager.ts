@@ -58,7 +58,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
-import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
+import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, PARK_ENVELOPE_REASONS, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
@@ -1363,12 +1363,30 @@ export class SessionNodeManager {
       }
       return { outcome: "parked" };
     } catch (err: unknown) {
+      /**
+       * THE CODE GOES IN `cause`, THE PARAGRAPH GOES IN THE LOG — B2b-2 constraint 6.
+       *
+       * `cause` is documented as the machine-readable half and is handed to callers that branch on
+       * it. Putting `err.message` there meant a producer-side refusal — this build cannot seal that
+       * algorithm — was indistinguishable from a relay outage, so it inherited the relay's guidance:
+       * *"queued, and will be re-sent when the relay link is back."* The relay was never asked, and
+       * every re-park throws in the same place, so that sends the operator to the wrong subsystem
+       * and then tells them to wait for a recovery that cannot happen.
+       *
+       * `instanceof`, not a string test: an untyped failure keeps the old behaviour exactly, so this
+       * narrows what the caller can distinguish without changing anything it could not.
+       */
+      const coded = err instanceof ParkEnvelopeError ? err : null;
       this.#logger.warn("content.park.deposit.failed", {
         sessionId,
         contentHash: contentHashHex,
+        ...(coded === null ? {} : { reason: coded.reason, detail: coded.detail }),
         error: err instanceof Error ? err.message : String(err),
       });
-      return { outcome: "refused", cause: err instanceof Error ? err.message : String(err) };
+      return {
+        outcome: "refused",
+        cause: coded?.reason ?? (err instanceof Error ? err.message : String(err)),
+      };
     }
   }
 
@@ -5975,9 +5993,25 @@ export class SessionNodeManager {
         // died inside #parkContent. An operator keying on `reason` alone is sent to the transport
         // when the blocker is the receiver.
         ...(attempt.cause !== undefined ? { cause: attempt.cause } : {}),
-        guidance: durable
-          ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
-          : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
+        /**
+         * ⚠️ A FAULT THAT IS NOT THE RELAY MUST NOT SAY IT IS — B2b-2 constraint 6.
+         *
+         * The `durable` branch below is written for a relay that is down: queued, retried, nothing
+         * for you to do. That is right for the case it was written for and WRONG for a producer-side
+         * refusal, which reaches the same branch by the same route. There the relay was never asked,
+         * and the drain re-parks the same entry into the same throw — so the message is genuinely
+         * durable and will genuinely never leave. Telling that operator to wait costs them however
+         * long they are willing to wait before they stop believing the message.
+         *
+         * This is the reason `cause` had to become a code first: the distinction is unbranchable
+         * while the field holds an English paragraph.
+         */
+        guidance:
+          attempt.cause === PARK_ENVELOPE_REASONS.ALG_UNREADABLE
+            ? "This message names a content-hash algorithm your build cannot produce, so it could not be sealed for hand-off. The relay is NOT involved and this will not clear on its own — the message is safely stored but every retry fails the same way. Upgrade to a build that knows the algorithm, or start a new session with this counterparty. Re-sending on this build changes nothing."
+            : durable
+              ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
+              : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
       };
     }
   }
