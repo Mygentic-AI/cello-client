@@ -6331,7 +6331,22 @@ export class SessionNodeManager {
       const contentHash = new Uint8Array(
         createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
       );
-      const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL);
+      /**
+       * ⚠️ `sealPayload` IS PASSED, AND ITS ABSENCE WAS THE WHOLE DEFECT — `DOD-M15-SEALWIRE-1`
+       * bullets 3+4, review pass 1, F1.
+       *
+       * These exact bytes were computed two lines above, hashed, and then dropped: `submitLeaf` had
+       * no parameter for them. So the directory received a SHA-256 pre-image nobody transmitted, and
+       * the client's SIGNED `final_root` — the one value in the seal the relay cannot produce — was
+       * unrecoverable. Four legs of this line shipped and were reviewed green while the head of the
+       * chain did not exist.
+       *
+       * The payload and the hash MUST come from the same derivation. If they ever diverge the
+       * directory reports `seal_payload_unbound`, whose guidance says *"someone between them and here
+       * altered or fabricated the payload — the relay is the only party on that path"* — a correct
+       * relay accused by name, in an error written to sound like an attack, for a mismatch made here.
+       */
+      const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
       if (!result.ok) {
         // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
         this.#responderSealSubmitted.delete(sealKey);
@@ -8093,6 +8108,35 @@ export class SessionNodeManager {
 
     if (assignedSeq === undefined) {
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
+      /**
+       * ─── DOD-M15-UNWITNESSED-1(b): SAY IT HERE, where the code says the damage happens ────────
+       *
+       * This branch was entirely silent — no log, no flag — while the `position_behind_frontier`
+       * branch twenty lines below logs at ERROR and its own comment says the loss occurred
+       * *"at the unwitnessed append, not here."* So the system announced the consequence one send
+       * later than it announced nothing about the cause.
+       *
+       * **This does NOT gate the seal, deliberately.** The DoD bar is explicit: do not gate on
+       * suspicion, because a relay that has not witnessed a leaf YET is indistinguishable here from
+       * one that never will, and refusing on the first would make a healthy session unsealable —
+       * which is worse than the thing it guards. What was missing is not a refusal, it is the
+       * ERROR at the moment the code already believes something was lost.
+       */
+      this.#logger.error("session.tree.own_leaf_unwitnessed", {
+        sessionId,
+        leafIndex,
+        kind,
+        correlationId,
+        impact:
+          "this message was appended to the local record with NO relay witness, so the ordering " +
+          "authority has no copy of it. The counterparty's tree cannot gain this leaf from the " +
+          "relay, so the two records may no longer agree — and a bilateral seal needs them to.",
+        guidance:
+          "Usually the relay was briefly unreachable and the next send re-establishes ordering. If " +
+          "it repeats, the relay is not carrying this session: check connectivity before closing, " +
+          "because sealing on a record the counterparty cannot match produces a receipt only one " +
+          "side can verify.",
+      });
       return { placed: true, leafIndex };
     }
 
