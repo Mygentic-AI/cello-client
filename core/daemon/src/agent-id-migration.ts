@@ -205,25 +205,41 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
     table: "retry_queue",
     backfill: "nullable",
     /**
-     * ⚠️ THREE COLUMNS WERE MISSING FROM THE DDL BELOW, AND TWO OF THEM WERE A LIVE DATA-LOSS BUG.
+     * ⚠️ THREE COLUMNS WERE MISSING FROM THE DDL BELOW. NOTHING WAS EVER LOST — AND WHAT KEPT IT
+     * THAT WAY IS THE ORDER OF TWO CALLS, NOT A CHECK.
      *
-     * `retry-queue.ts`'s constructor adds `structure1_cbor` and `structure2_cbor` by idempotent
-     * `ALTER TABLE`, and this DDL omitted them — so the rebuild copied the INTERSECTION and dropped
-     * both, exactly as the header at the top of this file warns. They reappear seconds later,
-     * because that constructor re-adds them AFTER this migration runs, which is what made it quiet:
-     * the schema looks right afterwards and only the DATA is gone.
+     * ⚠️ THIS COMMENT PREVIOUSLY CALLED IT *"a live data-loss bug"*, and that was WRONG. The other
+     * lane disproved it against git history and I verified it independently rather than take it:
+     * this re-key shipped 2026-07-10, `structure1_cbor` / `structure2_cbor` arrived in
+     * `retry-queue.ts` on 2026-08-05, and the re-key is one-shot. Every database that has ever run
+     * it did so a month before the columns existed, so there was never an ordering record present to
+     * drop. Recording the correction here because a comment stating a live bug that is not live is
+     * exactly the artifact this milestone keeps finding — one with the FORM of a verified finding
+     * and no verification behind it.
      *
-     * What that costs: those columns are the relay's signed ordering record, carried so a parked
-     * entry is self-ordering on recovery. Without it the recipient places the content at its ARRIVAL
-     * index rather than its witnessed sequence, the two trees part, and the session can no longer
-     * seal bilaterally — on the one boot that carries the upgrade.
+     * **The real property, which is narrower and more fragile than the claim it replaces.** The
+     * rebuild copies the INTERSECTION of the two column lists, so omitting a column here does drop
+     * it — that mechanism is real and is what the header at the top of this file warns about. It is
+     * unreachable for this table only because `RetryQueue`'s constructor, which owns those
+     * `ALTER TABLE`s, runs AFTER `initialize()` — so at the moment this DDL executes, the columns do
+     * not exist to be copied. `daemon.ts` builds the queue roughly 1,400 lines after it calls
+     * `initialize()`, and nothing enforces that distance but a comment saying not to reorder.
+     *
+     * So the columns are listed here anyway. They cost nothing while the order holds, and they are
+     * the difference between a silent loss and no loss on the day someone moves the construction up.
+     *
+     * What that loss WOULD cost, if it ever became reachable: those two columns are the relay's
+     * signed ordering record, carried so a parked entry is self-ordering on recovery. Without it the
+     * recipient places the content at its ARRIVAL index rather than its witnessed sequence, the two
+     * trees part, and the session can no longer seal bilaterally.
      *
      * `content_hash_alg` is `DOD-M15-SEALWIRE-1` part B2b's own column, added here in the same edit
      * as the two it would otherwise have joined. It is why the omission was found at all.
      *
-     * The existing guard could not see it: `dod-agent-id-joinkey-migration` replays the inline ALTERs
-     * in the real boot order, but only the `sessions` ones — `retry_queue`'s live in a different file
-     * and run from a different constructor.
+     * The existing guard could not see any of it: `dod-agent-id-joinkey-migration` replays the inline
+     * ALTERs in the real boot order, but only the `sessions` ones — `retry_queue`'s live in a
+     * different file and run from a different constructor. `DOD-M15-MIGRATION-GUARD-1` is what now
+     * covers the cross-file case.
      */
     createSql: (t) => `
       CREATE TABLE ${t} (
