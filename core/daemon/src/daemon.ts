@@ -49,6 +49,7 @@ import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } 
 import { renderForSurface } from "./vocabulary.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
 import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
+import { describeDirectoryAuth, directoryAuthRequired } from "./directory-auth-posture.js";
 import {
   startRosterSweep,
   classifyRosterReading,
@@ -362,6 +363,41 @@ async function startDaemonHoldingLock(
     // background probe are exercised through one seam rather than one being untestable.
     ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
   });
+
+  /**
+   * DOD-M15-DIRAUTH-1 — an operator can DEMAND directory identity authentication.
+   *
+   * The skip itself is legitimate and stays: local dev and the e2e harness run against a directory
+   * the bundled manifest cannot describe, and enforcing there would reject every connection. What
+   * was missing is any way to say "I would rather not connect than connect unauthenticated" — the
+   * decision was made for the operator, by a byte-comparison, and never surfaced.
+   *
+   * Refused HERE rather than at connect time, and deliberately: a daemon that starts and then
+   * silently declines every session is a worse failure than one that does not start and says why.
+   * This mirrors ADV-002 below, which is the same shape for the same reason.
+   */
+  if (directoryAuthRequired(process.env) && challengeVerifier === undefined) {
+    try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
+    await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
+    const url = directoryHttpUrl ?? resolveDirectoryUrl(process.env);
+    logger.error("directory.auth.required.unavailable", {
+      directoryUrl: url,
+      impact: "the daemon refused to start rather than connect without directory identity authentication.",
+      guidance:
+        "CELLO_REQUIRE_DIRECTORY_AUTH is set, but no challenge verifier could be built for this " +
+        "directory URL. Either point CELLO_DIRECTORY_URL at a bundled endpoint (byte-equality — a " +
+        "hostname for the same machine does not match), supply a matching manifest via " +
+        "CELLO_CONSORTIUM_MANIFEST, or unset CELLO_REQUIRE_DIRECTORY_AUTH to accept the risk.",
+    });
+    throw new Error(
+      `CELLO_REQUIRE_DIRECTORY_AUTH is set, but directory identity authentication (step 6) cannot be ` +
+      `enforced against ${url}: no challenge verifier could be built for it. The comparison against ` +
+      `the bundled consortium roster is BYTE-EQUALITY, so a DNS hostname pointing at exactly the ` +
+      `right machine still does not match — that is the usual cause. Use the bundled address, or ` +
+      `supply a matching manifest via CELLO_CONSORTIUM_MANIFEST, or unset ` +
+      `CELLO_REQUIRE_DIRECTORY_AUTH to start without step 6.`,
+    );
+  }
 
   // ADV-002: an operator who configures manifestProvider has opted INTO manifest enforcement, so a
   // failed verification is fatal — never a warning we start anyway on.
@@ -2349,6 +2385,14 @@ async function startDaemonHoldingLock(
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
         manifestOrigin,
       ) ?? {}),
+      // DOD-M15-DIRAUTH-1: the posture is STATED, in both directions. Unlike every other field in
+      // this milestone the healthy case is reported too — the defect is precisely that "enforced"
+      // and "skipped" differ only by the absence of a log line, so an operator must be able to
+      // confirm it is on, not merely fail to find evidence that it is off.
+      ...describeDirectoryAuth({
+        verifierPresent: challengeVerifier !== undefined,
+        directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+      }),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
       // aggregate below (kept for backward compatibility).
@@ -3607,6 +3651,14 @@ async function startDaemonHoldingLock(
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
         manifestOrigin,
       ) ?? {}),
+      // DOD-M15-DIRAUTH-1: the posture is STATED, in both directions. Unlike every other field in
+      // this milestone the healthy case is reported too — the defect is precisely that "enforced"
+      // and "skipped" differ only by the absence of a log line, so an operator must be able to
+      // confirm it is on, not merely fail to find evidence that it is off.
+      ...describeDirectoryAuth({
+        verifierPresent: challengeVerifier !== undefined,
+        directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+      }),
       agents: getAgentsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.
