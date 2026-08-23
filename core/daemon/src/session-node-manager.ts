@@ -45,7 +45,8 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { verify } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
+import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
@@ -1785,6 +1786,63 @@ export class SessionNodeManager {
    * directory for the OFFLINE tree rebuild. Empty when no leaves were logged (e.g. a direct-only session
    * with no relay witness) — the caller then has nothing to carry and the seal stays bilateral/pending.
    */
+  /**
+   * REBUILD THE CERTIFIED ROOT FROM THIS DAEMON'S OWN LEAVES — `DOD-M15-SEALWIRE-1` bullet 2.
+   *
+   * The receipt used to prove only that the directory signed SOMETHING: the client took the sealed
+   * root off the wire, confirmed the directory's signature over those bytes, stored it, and threw
+   * away the root it had computed a step earlier. At co-signing time that means **your key signs a
+   * root you never checked.**
+   *
+   * Bullet 1 moved the certified root into the content-hash domain, which is the domain this daemon
+   * can actually rebuild — each carry leaf's `content_hash` is the leaf hash (RFC 6962 §2.1 "hash"
+   * leaves are used as-is), and the carry is ordered by the relay's canonical `sequence_number`,
+   * which is the order the directory rebuilds in.
+   *
+   * ─── Why this returns "cannot judge" instead of always answering ───────────────────────────
+   *
+   * A root comparison that is WRONG makes every session unsealable, and force-abandon — no receipt —
+   * becomes the only exit. That failure is worse than the one being guarded, and this file already
+   * carries two comments saying so about other gates.
+   *
+   * The carry is this daemon's view, and it is not guaranteed complete at the instant a certificate
+   * arrives: the counterparty's SEAL ctrl leaf is what TRIGGERS the seal, so it may not have been
+   * witnessed here yet. So completeness is checked FIRST, against the certificate's own leaf count.
+   * A short carry means this daemon cannot judge — which is a different answer from "the roots
+   * disagree", and conflating them would turn a local timing gap into an accusation.
+   */
+  verifyCertifiedRoot(
+    agentPubkeyHex: string,
+    sessionIdHex: string,
+    certifiedRoot: Uint8Array,
+    certifiedLeafCount: number,
+  ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string } | { verdict: "cannot_judge"; reason: string } {
+    const carry = this.getSealCarry(agentPubkeyHex, sessionIdHex);
+    if (carry.length === 0) return { verdict: "cannot_judge", reason: "no_carry" };
+    if (carry.length !== certifiedLeafCount) {
+      return { verdict: "cannot_judge", reason: `carry_incomplete: hold ${carry.length}, certificate covers ${certifiedLeafCount}` };
+    }
+    const inputs: LeafInput[] = [];
+    for (const leaf of carry) {
+      let contentHash: unknown;
+      try {
+        // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
+        contentHash = (decode(leaf.structure1Cbor) as unknown[])[1];
+      } catch {
+        return { verdict: "cannot_judge", reason: "structure1_decode_failed" };
+      }
+      if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) {
+        return { verdict: "cannot_judge", reason: "structure1_content_hash_missing" };
+      }
+      inputs.push({ kind: "hash", data: contentHash });
+    }
+    const ownRoot = merkleRoot(buildMerkleTree(inputs));
+    const ownRootHex = Buffer.from(ownRoot).toString("hex");
+    return Buffer.compare(Buffer.from(ownRoot), Buffer.from(certifiedRoot)) === 0
+      ? { verdict: "match" }
+      : { verdict: "mismatch", ownRootHex };
+  }
+
   getSealCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {
     if (!this.#sealLeafStore && this.#db) {
       this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);

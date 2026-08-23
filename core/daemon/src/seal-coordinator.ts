@@ -133,6 +133,59 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             logger.error("session.sealed.signature.invalid", { sessionId: sidHex, reason: verdict.reason });
             return;
           }
+
+          /**
+           * IS THIS A ROOT OVER *OUR* CONVERSATION? — `DOD-M15-SEALWIRE-1` bullet 2.
+           *
+           * The signature check above proves the directory signed these bytes. It does not prove the
+           * bytes describe this session. Until bullet 1 the client could not tell: the certified root
+           * was the relay/directory internal root, which carries relay-assigned fields this daemon
+           * never sees for the counterparty's leaves. So the root computed one step earlier was
+           * discarded, and at co-signing time this key signed a root it had never checked.
+           *
+           * Now both live in the content-hash domain and it is a comparison.
+           *
+           * THE COUNTERBALANCE, and why this is not simply "refuse on any difference": a wrong
+           * comparison makes every session unsealable, leaving force-abandon — no receipt — as the
+           * only exit. That is worse than the defect it guards. So the daemon distinguishes "the
+           * roots disagree" from "I cannot judge": the carry is this daemon's own view and may be
+           * legitimately short at this instant, because the counterparty's SEAL leaf is what
+           * TRIGGERS the seal and may not have been witnessed here yet. Only a provably complete
+           * carry can accuse.
+           */
+          const rootCheck = sessionNodeManager.verifyCertifiedRoot(
+            agentPubkeyHex, sidHex, sealedRootBytes, leafCount,
+          );
+          if (rootCheck.verdict === "mismatch") {
+            logger.error("session.sealed.root.mismatch", {
+              sessionId: sidHex,
+              certifiedRoot: rootHex,
+              ownRoot: rootCheck.ownRootHex,
+              leafCount,
+              impact:
+                "the directory signed a root over a leaf set this daemon does not hold. The signature " +
+                "is valid, so this is not a forged certificate — it is a certificate over a DIFFERENT " +
+                "conversation, or over this one with leaves added, dropped or reordered. Refusing: " +
+                "storing it would produce a receipt that proves nothing about what was actually said.",
+              guidance:
+                "The session is NOT marked sealed and the transcript is untouched. Compare the leaf " +
+                "count with the counterparty, and check the relay and directory logs for this session id.",
+            });
+            return;
+          }
+          logger.info("session.sealed.root.checked", {
+            sessionId: sidHex,
+            verdict: rootCheck.verdict,
+            ...(rootCheck.verdict === "cannot_judge" ? { reason: rootCheck.reason } : {}),
+            ...(rootCheck.verdict === "cannot_judge"
+              ? {
+                  impact:
+                    "the certified root was accepted WITHOUT being checked against this daemon's own " +
+                    "leaves, because this daemon cannot yet prove it holds the same leaf set. The " +
+                    "signature was verified; the CONTENT was not.",
+                }
+              : {}),
+          });
           // F2-a: on verified:false, surface WHY (signer_key_not_held / no_frost_share / …) so this
           // event can never be mistaken for a tolerated failed check. A real failure took the early
           // return above (session.sealed.signature.invalid) and never reaches here.
