@@ -96,6 +96,12 @@ export interface CloseSessionDeps {
   ) => Promise<DiscoveryOutcome>;
   /** sessionId → the broker node id that brokered this cross-node session. */
   crossNodeBrokerBySession: Map<string, string>;
+  /**
+   * DOD-M15-CLOSEWAIT-1 review MEDIUM-6: hand a detached seal tail to the daemon so `stop()` can
+   * drain it. Optional so an embedder or a test harness constructs without one — but when it is
+   * absent the tail is genuinely untracked, which is why the daemon always passes it.
+   */
+  registerBackgroundSeal?: (p: Promise<unknown>) => void;
   // ── the seal cluster (seal-coordinator.ts) ──
   sealKey: (agentName: string, sessionId: string) => string;
   sealInterruptedInProgress: Set<string>;
@@ -122,6 +128,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, signalingFor, sendOver, waitForSignalingConnected,
     openVisitingConnection, runDiscoveryLookup, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
+    registerBackgroundSeal,
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
     recoverParkedContent,
   } = deps;
@@ -1151,7 +1158,22 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          * rejection — and must not be silent either: the operator has already been told the seal is
          * running, so a failure they never hear about is the worst of both worlds.
          */
-        void finishSeal().then(
+        const tail = finishSeal();
+        /**
+         * TRACKED FOR SHUTDOWN — review MEDIUM-6.
+         *
+         * `stop()` cancels or awaits every other background worker: the reconcile scheduler, the
+         * telegram poller, the manifest poll, the roster sweep. `RestartSealResolver.stop()` goes
+         * further and AWAITS its in-flight seal, with a comment saying exactly why — *"severing
+         * signaling under a half-finished seal-interrupted exchange leaves the counterparty holding
+         * a commitment we never acknowledged… permanently divergent."*
+         *
+         * A detached, untracked ceremony was the one background task that could be cut at an
+         * arbitrary point by `cello logout`. Recoverable on the next boot, but recoverable is not
+         * the same as not breaking it.
+         */
+        registerBackgroundSeal?.(tail);
+        void tail.then(
           (result) => {
             const r = result as { ok?: boolean; reason?: string };
             if (r?.ok) logger.info("session.seal.background.completed", { sessionId: sid, agentName: rec.agent_name, correlationId });

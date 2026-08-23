@@ -1173,6 +1173,14 @@ async function startDaemonHoldingLock(
   // whether its counterparty is quiet or its sibling was faster. Written at the destructive drain in
   // session-content-handlers; read at that handler's timeout. Delivery itself is unchanged.
   const contentTakes = new ContentTakeLedger();
+  /**
+   * In-flight background seal ceremonies — `DOD-M15-CLOSEWAIT-1` review MEDIUM-6.
+   *
+   * The close now answers at commitment and finishes the ceremony detached. Without this the tail
+   * was the ONE background task `stop()` could cut at an arbitrary point, while it cancels or awaits
+   * every other one.
+   */
+  const backgroundSeals = new Set<Promise<unknown>>();
   // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
   // the call site so it names the specific away agent.
   // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
@@ -3754,6 +3762,13 @@ async function startDaemonHoldingLock(
   // cello_close_session (close-session-handler.ts). Fifteen dependencies — a long list, but a KNOWN
   // one, which is the whole difference from a closure over 73 shared locals.
   registerCloseSessionHandler({
+    // DOD-M15-CLOSEWAIT-1 review MEDIUM-6: a detached seal tail is registered here so stop() can
+    // drain it, like every other background worker. Self-evicting, so a long-running daemon does not
+    // accumulate settled promises.
+    registerBackgroundSeal: (p) => {
+      backgroundSeals.add(p);
+      void p.finally(() => backgroundSeals.delete(p));
+    },
     // M12-P14: the pre-seal readiness gate drains the parked mailbox before judging, so a close
     // does not refuse over content the relay is still holding for us.
     recoverParkedContent: (agentName: string, trigger: string) => autoRecoverForAgent(agentName, trigger),
@@ -4906,6 +4921,33 @@ async function startDaemonHoldingLock(
     // outbound work is not draining. Above the `daemon.stopped` log with the other cancels, because
     // this is "stop making new work", not "tear down transports".
     await restartSealResolver?.stop();
+    /**
+     * DRAIN THE DETACHED SEAL TAILS — review MEDIUM-6, and it sits HERE for the same reason
+     * `restartSealResolver.stop()` does: both are directory ceremonies that must not be cut with
+     * the counterparty holding a commitment this side never acknowledged. Before
+     * `stopAllSignaling()`, because that is what severs the transport underneath them.
+     *
+     * BOUNDED. A ceremony can legitimately wait eleven minutes for a counterparty, and a shutdown
+     * must not. Past the bound they are abandoned deliberately and said out loud — the next boot
+     * resolves them, which is exactly what the restart seal resolver is for.
+     */
+    if (backgroundSeals.size > 0) {
+      const SHUTDOWN_SEAL_DRAIN_MS = 5_000;
+      logger.info("session.seal.background.draining", { count: backgroundSeals.size, budgetMs: SHUTDOWN_SEAL_DRAIN_MS });
+      const drained = await Promise.race([
+        Promise.allSettled([...backgroundSeals]).then(() => true),
+        new Promise<boolean>((r) => { const t = setTimeout(() => r(false), SHUTDOWN_SEAL_DRAIN_MS); (t as unknown as { unref?: () => void }).unref?.(); }),
+      ]);
+      if (!drained) {
+        logger.warn("session.seal.background.abandoned", {
+          count: backgroundSeals.size,
+          impact:
+            "shutdown did not wait for these seal ceremonies. Each session holds a durable commitment " +
+            "but no receipt yet, and the counterparty may hold a commitment this side never acknowledged.",
+          guidance: "The next daemon start resolves them via the restart seal resolver; no operator action is needed.",
+        });
+      }
+    }
     logger.info("daemon.stopped", { pid: process.pid, reason });
     // DOD-LOGOUT-EXIT-1: what the teardown actually DID, carried to onStopped so the binary can
     // exit non-zero on a dirty stop. Without it a shutdown that threw halfway — sessions never

@@ -138,10 +138,19 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
     const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
     const stop = vi.fn(async () => {});
     const crossNodeBrokerBySession = new Map<string, string>([[`${AGENT}:${SESSION}`, "gcp-usc1"]]);
+    /**
+     * A RECORDING logger, not a no-op — review §4. The three logger calls in the detached handler
+     * were tested against `{ info(){}, warn(){}, error(){} }`, so nothing proved the background
+     * failure is announced at all. That is hollow-test question 1: the property lived in the stub.
+     */
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const rec = (event: string, ctx?: Record<string, unknown>) => { events.push({ event, ctx: ctx ?? {} }); };
+    const backgroundSeals: Array<Promise<unknown>> = [];
 
     registerCloseSessionHandler({
       handlers,
-      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      logger: { info: rec, warn: rec, error: rec, debug: () => {} },
+      registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
       sessionNodeManager: {
         getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "active" }),
         // A successful submit is what puts the flow into the bilateral wait — the tail under test.
@@ -171,7 +180,7 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
       handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
     } as never);
 
-    return { close: handlers.get("cello_close_session")!, stop };
+    return { close: handlers.get("cello_close_session")!, stop, events, backgroundSeals };
   }
 
   it("★ the close returns WITHOUT releasing the broker connection the background seal still needs", async () => {
@@ -250,6 +259,103 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
     } finally {
       if (bilateral === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
       else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = bilateral;
+    }
+  }, 30_000);
+});
+
+describe("DOD-M15-CLOSEWAIT-1: the background ceremony is announced and tracked", () => {
+  const AGENT = "agent-a";
+  const SESSION = "ab".repeat(16);
+
+  async function harness(sealSubmitOk: boolean) {
+    const { registerCloseSessionHandler } = await import("../close-session-handler.js");
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const rec = (event: string, ctx?: Record<string, unknown>) => { events.push({ event, ctx: ctx ?? {} }); };
+    const backgroundSeals: Array<Promise<unknown>> = [];
+
+    registerCloseSessionHandler({
+      handlers,
+      logger: { info: rec, warn: rec, error: rec, debug: () => {} },
+      registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
+      sessionNodeManager: {
+        getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "active" }),
+        submitSealLeaf: async () => (sealSubmitOk
+          ? { ok: true as const, sequenceNumber: 1, reportedRootHex: "aa".repeat(32) }
+          : { ok: false as const, reason: "responder_seal_already_submitted", reportedRootHex: "bb".repeat(32), sequenceNumber: 2 }),
+        getSealCarry: () => [],
+        getSealCertificate: () => null,
+        resolveAgentId: () => "aid",
+        setSessionName: () => {},
+        sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
+      },
+      getConnState: () => ({ currentAgent: AGENT }),
+      resolveCurrentAgent: () => AGENT,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32) }),
+      signalingFor: () => ({ status: "connected" }),
+      sendOver: async () => ({ ok: true }),
+      waitForSignalingConnected: async () => true,
+      openVisitingConnection: () => null,
+      crossNodeBrokerBySession: new Map<string, string>(),
+      sealKey: (a: string, s: string) => `${a}\x1f${s}`,
+      sealInterruptedInProgress: new Set<string>(),
+      pendingSealWaiters: new Map(),
+      pendingUnilateralWaiters: new Map(),
+      resolveConsortiumRoster: async () => [],
+      unilateralTimeoutMs: 10,
+      handleSealInterruptedFlow: async () => ({ ok: false, reason: "unused" }),
+      handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
+    } as never);
+
+    return { close: handlers.get("cello_close_session")!, events, backgroundSeals };
+  }
+
+  it("★ the detached tail is REGISTERED, so shutdown can drain it", async () => {
+    /**
+     * Review MEDIUM-6. `stop()` cancels or awaits every other background worker; the seal tail was
+     * the one it could cut at an arbitrary point. `RestartSealResolver.stop()` awaits its in-flight
+     * seal for exactly this reason — severing signaling under a half-finished exchange leaves the
+     * counterparty holding a commitment this side never acknowledged.
+     */
+    const { close, backgroundSeals } = await harness(true);
+    const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
+    try {
+      const res = (await close({ session_id: SESSION }, "c1")) as Record<string, unknown>;
+      expect(res["seal_status"], "PRECONDITION: the handed-off path").toBe("committed");
+      expect(
+        backgroundSeals.length,
+        "the detached ceremony was never handed to the daemon, so shutdown cannot wait for it and " +
+          "cello logout can cut a directory ceremony mid-flight",
+      ).toBe(1);
+      await Promise.allSettled(backgroundSeals);
+    } finally {
+      if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = prev;
+    }
+  }, 30_000);
+
+  it("★ the background outcome is LOGGED — the operator already got ok:true", async () => {
+    /**
+     * Invariant 2, and review §4 item 2: these three logger calls were tested against a no-op
+     * logger, so nothing proved the background outcome is announced at all. The caller has already
+     * been told the close succeeded, so a silent background failure is the worst of both worlds.
+     */
+    const { close, events, backgroundSeals } = await harness(true);
+    const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
+    try {
+      await close({ session_id: SESSION }, "c1");
+      await Promise.allSettled(backgroundSeals);
+      const names = events.map((e) => e.event);
+      expect(
+        names.some((n) => n.startsWith("session.seal.background.")),
+        `the background ceremony finished and said nothing. Events seen: ${names.join(", ")}`,
+      ).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = prev;
     }
   }, 30_000);
 });
