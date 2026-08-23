@@ -174,7 +174,16 @@ export async function composeSealedSubmission(
         `The consortium manifest verified at daemon start (v${manifest.version}) expired at ` +
         `${manifest.expires}, so its portal intake key can no longer be trusted — sealing to a ` +
         "retired key produces a message the portal cannot open and cannot even attribute. " +
-        "Restart the daemon to load and verify a current manifest, then retry.",
+        // DOD-M15-MANIFEST-EXPIRY-LIVE-1 review F4: this used to say "Restart the daemon to load and
+        // verify a current manifest, then retry." That is the one move that must NOT be made here.
+        // Startup fails closed on an expired manifest (ADV-002), so a restart without a REPLACEMENT
+        // does not reload anything — the daemon refuses to come back and every agent goes offline.
+        // The instruction turned a refused submission into a dead daemon, and it contradicted the
+        // guidance `cello_status` gives for the identical condition.
+        "Replace the manifest first — a new file at CELLO_CONSORTIUM_MANIFEST, or an " +
+        "@cello-protocol/connect upgrade if this daemon uses the compiled-in one — and then restart. " +
+        "Do NOT restart without one: startup refuses an expired manifest, so the daemon will not " +
+        "come back up. Run cello_status for the full picture.",
     };
   }
 

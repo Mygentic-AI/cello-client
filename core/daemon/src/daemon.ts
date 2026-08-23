@@ -48,7 +48,7 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
-import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity } from "./manifest-validity.js";
+import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
 import {
   startRosterSweep,
   classifyRosterReading,
@@ -416,6 +416,19 @@ async function startDaemonHoldingLock(
    * that can only ever re-measure nothing is noise. That case is NOT silent — `cello_status`
    * reports `measurement: "not_configured"` and says why.
    */
+  /**
+   * WHERE the held manifest came from, because it decides what the operator can actually DO about
+   * an expired one — `DOD-M15-MANIFEST-EXPIRY-LIVE-1` review F5.
+   *
+   * `EmbeddedManifestProvider` is the compiled-in bundled roster: there is no file to replace and no
+   * poll to adopt a replacement, so "rotate the manifest" is not an available action and telling
+   * that operator to do it routes them toward the one workaround that silently disables directory
+   * identity authentication. Detected by the provider's own constructor rather than by re-reading
+   * the env var, so a caller that injects a provider directly is classified by what it IS.
+   */
+  const manifestOrigin: ManifestOrigin =
+    manifestProvider?.constructor?.name === "EmbeddedManifestProvider" ? "bundled" : "file";
+
   /** REVIEW F4: the last sweep failure, surfaced in `cello_status` alongside the log line. */
   let lastRosterSweepError: RosterFreshness["last_sweep_error"] | undefined;
 
@@ -444,10 +457,28 @@ async function startDaemonHoldingLock(
         // inside the 10 s signaling wait; nothing waits on this sweep, so it can afford the
         // patient probe and give the more trustworthy answer.
         sweep: async () => {
-          // DOD-M15-MANIFEST-EXPIRY-LIVE-1: the anchor's validity is re-checked on the same tick.
-          // BEFORE the probe, so an expired manifest is reported even on a cycle where every node
-          // is unreachable and the roster resolve throws.
-          checkManifestValidity();
+          /**
+           * DOD-M15-MANIFEST-EXPIRY-LIVE-1: the anchor's validity is re-checked on the same tick.
+           * BEFORE the probe, so an expired manifest is reported even on a cycle where every node is
+           * unreachable and the roster resolve throws.
+           *
+           * Its OWN try/catch — review F11. Sharing the sweep's error path meant a throw in here
+           * would surface as `directory.roster.sweep.failed` AND skip `resolveConsortiumRoster()`
+           * entirely: the roster reading would freeze while the operator was pointed at the
+           * directory. A manifest-check failure must never be reported as a directory failure, and
+           * must never cost the measurement it rides along with.
+           */
+          try {
+            checkManifestValidity();
+          } catch (err: unknown) {
+            logger.error("directory.auth.manifest.check.failed", {
+              error: err instanceof Error ? err.message : String(err),
+              impact:
+                "the manifest validity re-check did not run this cycle. cello_status still computes " +
+                "it independently on every read, so the FIELD is unaffected; what is lost is the " +
+                "unprompted log line on a transition.",
+            });
+          }
           return resolveConsortiumRoster();
         },
         logger,
@@ -2316,6 +2347,7 @@ async function startDaemonHoldingLock(
       // not a warning, and it teaches the reader to skip the block that matters.
       ...(describeManifestValidity(
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
+        manifestOrigin,
       ) ?? {}),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
@@ -3573,6 +3605,7 @@ async function startDaemonHoldingLock(
       // not a warning, and it teaches the reader to skip the block that matters.
       ...(describeManifestValidity(
         classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
+        manifestOrigin,
       ) ?? {}),
       agents: getAgentsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
