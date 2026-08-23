@@ -56,7 +56,7 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-b2b-alg-", node: node = new FakeNode() as unknown as CelloNode });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const { hash, alg } = fx.snm.contentHashForSession("alice", SID, CONTENT);
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, CONTENT);
     await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", LEAF_KIND_MSG, alg);
     await wait(200);
 
@@ -80,7 +80,7 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-b2b-match-", node: node = new FakeNode() as unknown as CelloNode });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const { hash, alg } = fx.snm.contentHashForSession("alice", SID, CONTENT);
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, CONTENT);
     await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", LEAF_KIND_MSG, alg);
     await wait(200);
 
@@ -106,7 +106,7 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-b2b-pair-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-    const { hash, alg } = fx.snm.contentHashForSession("alice", SID, CONTENT);
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, CONTENT);
     expect(Buffer.from(hash).toString("hex"))
       .toBe(Buffer.from(contentHashFor(CONTENT, { alg, salt: null })).toString("hex"));
   }, 60_000);

@@ -1422,7 +1422,7 @@ async function startDaemonHoldingLock(
           const rejectText = markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]");
           const rejectBytes = new TextEncoder().encode(rejectText);
           // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
-          const reject = sessionNodeManager.contentHashForSession(agentName, sessionId, rejectBytes);
+          const reject = await sessionNodeManager.contentHashForSession(agentName, sessionId, rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
           const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(reject.hash), randomUUID(), LEAF_KIND_MSG, reject.alg);
           // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
@@ -1641,7 +1641,7 @@ async function startDaemonHoldingLock(
         markAsAutoReply(new TextDecoder().decode(screenedBytes)),
       );
       // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
-      const away = sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
+      const away = await sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), LEAF_KIND_MSG, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this

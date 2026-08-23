@@ -97,6 +97,23 @@ const MAX_REFUSED_PARKED_ENTRIES = 512;
 const MAX_UNREADABLE_ALG_FRAMES = 64;
 
 /**
+ * How long the first send waits for an in-flight salt agreement before giving up on it —
+ * `DOD-M15-SEALWIRE-1` B2b-2 constraint 2.
+ *
+ * The agreement is ONE round trip on a stream that is already open, so a healthy exchange finishes
+ * in milliseconds; this bound is not sized for the normal case, it is sized for how long an operator
+ * should wait before their message goes out unsalted instead of not going out.
+ *
+ * Five seconds because both errors cost real things. Too short and a merely slow counterparty makes
+ * the session permanently unsalted for no reason — the decision is irreversible, so the bound should
+ * be generous relative to the round trip. Too long and the first message of every conversation with
+ * a peer on an older build visibly hangs, which is the failure a user actually notices and blames
+ * the product for. This is only ever paid by a session that HAS an agreement outstanding: a
+ * park-only session never starts one and never waits (constraint 5).
+ */
+const SALT_AGREEMENT_WAIT_MS = 5_000;
+
+/**
  * DOD-M12B-ACK-1 — inbound `/cello/content/1.0.0` streams allowed per connection.
  *
  * libp2p's registrar default is 32, and it enforces the cap AFTER protocol negotiation has already
@@ -867,6 +884,34 @@ export class SessionNodeManager {
    * `alreadyRepairedAgainstPeerHalf`.
    */
   #saltRepairedAgainst = new Map<string, string>();
+  /**
+   * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
+   *
+   * `#saltPending` — an agreement that has actually gone out and not yet been answered. The first
+   * send waits on it (constraint 2). Absent means *nothing is in flight*, which is not the same as
+   * "no salt": a park-only session never starts one at all, and must not wait (constraint 5).
+   *
+   * `#hashedWithoutSalt` — this session has already computed an unsalted content hash. Decision #8
+   * closes adoption at the moment content is HASHED, and for a session's first message that is a
+   * full network round trip before any leaf, held row or in-flight entry exists. Without this flag
+   * the frontier count reads empty for exactly the window in which adopting would split the
+   * transcript.
+   *
+   * `#unsaltedAnnounced` — the fallback has been stated for this session. Decision #15 says once per
+   * session; a per-message warning is a filter waiting to be written.
+   *
+   * All three are per-session and in-memory by design, and are dropped with the rest of a session's
+   * caches on eviction — a revived session re-reads its salt from the row, re-derives its frontier
+   * from durable state, and starts a fresh agreement if it reconnects.
+   */
+  #saltPending = new Map<string, {
+    settled: Promise<"agreed" | "timeout" | "closed">;
+    resolve: (v: "agreed" | "timeout" | "closed") => void;
+    timer: ReturnType<typeof setTimeout>;
+    boundMs: number;
+  }>();
+  #hashedWithoutSalt = new Set<string>();
+  #unsaltedAnnounced = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -4236,6 +4281,23 @@ export class SessionNodeManager {
     this.#saltContributions.delete(key);
     this.#sessionSalts.delete(key);
     this.#saltRepairedAgainst.delete(key);
+    /**
+     * B2b-2's three, and the pending one is SETTLED rather than dropped.
+     *
+     * A `delete` alone leaves any send waiting on that promise waiting until its own timer fires —
+     * five seconds of a torn-down session holding a message that has nowhere to go. `closed` is the
+     * truthful outcome: the agreement is over, because the session is.
+     *
+     * `#hashedWithoutSalt` and `#unsaltedAnnounced` go with the caches, and that is correct rather
+     * than merely tidy. A revived session re-derives its frontier from durable state — leaves, held
+     * rows, queued rows — so the adoption question is answered from disk, not from a flag that would
+     * be a stale in-memory claim about a process that no longer exists. Re-announcing the fallback
+     * once per revival is the right frequency too: it is what an operator reading a fresh log needs
+     * in order to know why this session has no salt.
+     */
+    this.#settleSaltPending(agentName, sessionId, "closed");
+    this.#hashedWithoutSalt.delete(key);
+    this.#unsaltedAnnounced.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
@@ -8866,18 +8928,151 @@ export class SessionNodeManager {
    * deciding whether to salt is that defect again with a worse failure mode — a message hashed one
    * way and LABELLED another is refused by every peer, including a correct one.
    *
-   * ⚠️ IT RETURNS `sha256` TODAY, ALWAYS. Part B2b is deliberately two steps: thread the value
-   * end to end while it is the one that cannot break anything, prove the plumbing, and only then
-   * change what it decides. The same receiver-first ordering B1 and B2a used, applied to the sender.
-   * The salt is read but not yet used — `getSessionContentSalt` is what B2b-2 switches on.
+   * ⚠️ ASYNC, AND THAT IS THE POINT — B2b-2 constraint 2, not an implementation detail.
+   *
+   * The agreement is in flight while the operator composes their first message. Hash without waiting
+   * and it comes out unsalted, and that first unsalted hash closes adoption for the LIFE of the
+   * session (Decision #8, unit 1). Every session would fall back permanently while every log line
+   * about it stayed true — the feature present, wired, tested, and never once reached.
+   *
+   * The wait lives HERE rather than at the four call sites for the same reason `contentHashAlg` is a
+   * required parameter rather than a defaulted one: a site that forgets it must fail to compile. A
+   * caller that drops the `await` gets a `Promise` where bytes belong, which is a typecheck error;
+   * a caller that forgot to call a separate `awaitSaltSettled()` would silently send unsalted.
    */
-  contentHashForSession(
+  async contentHashForSession(
     agentName: string,
     sessionId: string,
     content: Uint8Array,
-  ): { hash: Uint8Array; alg: ContentHashAlg } {
+  ): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> {
+    const salt = await this.#saltForHashing(agentName, sessionId);
+    if (salt !== null) {
+      const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
+      return { hash: contentHashFor(content, { alg, salt }), alg };
+    }
+    /**
+     * ⚠️ MARKED BEFORE THE HASH IS RETURNED, and this closes a window the row cannot see.
+     *
+     * `#saltAdoptionClosed` counts leaves, held content and in-flight sends. For the FIRST message of
+     * a session none of the three exists at this moment — the leaf lands after `sendContent` returns,
+     * which is a network round trip later. A peer contribution arriving in that gap would be adopted,
+     * and the message already on the wire would become the single unsalted leaf in an otherwise
+     * salted transcript: the exact split Decision #8 forbids, reached by the one route every count
+     * reads as empty.
+     *
+     * In memory rather than in a column, and that is sufficient rather than convenient: if this
+     * process survives, the flag holds; if it does not, the message it protects either reached a
+     * durable form (leaf, held row, queued row — all of which the counts see) or never left, in which
+     * case there is nothing to split. The one remaining case — hashed, sent, and no local record —
+     * is covered from the other side, because the peer DID leaf it and closes its own adoption, and
+     * the wire state added in unit 1 tells us so.
+     */
+    this.#hashedWithoutSalt.add(this.#k(agentName, sessionId));
+    this.#announceUnsaltedOnce(agentName, sessionId);
     const alg = CONTENT_HASH_ALGS.SHA256;
     return { hash: contentHashFor(content, { alg, salt: null }), alg };
+  }
+
+  /**
+   * The salt to hash this session's next message under, waiting for a pending agreement if one is
+   * genuinely in flight — B2b-2 constraints 2 and 5.
+   *
+   * Three exits, and the order matters:
+   *
+   *   1. We already hold one. No wait, ever.
+   *   2. Adoption is closed — this session has hashed or leafed something already, so a salt could
+   *      never be adopted now even if one arrived. Waiting would be waiting for a value we would
+   *      then have to refuse.
+   *   3. Nothing is pending. **This is the park-only case (constraint 5)**: the announcement hangs
+   *      off `onPeerConnect`, an offline counterparty never connects, so no agreement was ever
+   *      started. Waiting the full bound there pauses every message to an offline peer and falls
+   *      back anyway — a stall bought for nothing.
+   *
+   * Only a session with an agreement actually in flight waits, and only until it settles or the
+   * bound expires.
+   */
+  async #saltForHashing(agentName: string, sessionId: string): Promise<Uint8Array | null> {
+    const held = this.#getSessionSalt(agentName, sessionId);
+    if (held !== null) return held;
+
+    const key = this.#k(agentName, sessionId);
+    if (this.#saltAdoptionClosed(agentName, sessionId).closed) return null;
+
+    const pending = this.#saltPending.get(key);
+    if (pending === undefined) return null;
+
+    const settled = await pending.settled;
+    if (settled === "agreed") return this.#getSessionSalt(agentName, sessionId);
+    if (settled === "timeout") {
+      /**
+       * A DECISION, NOT A RETRY. Logged once, here, because this is the moment the session became
+       * permanently unsalted — and an operator reading a later `session.content.unsalted` needs to
+       * be able to find out WHY this session has no salt when their others do.
+       */
+      this.#logger.warn("session.salt.agreement.timeout", {
+        agentName, sessionId, waitedMs: pending.boundMs,
+        impact: "the counterparty did not answer the salt agreement in time, so this session is unsalted FOR ITS LIFE — the message is being sent now rather than held any longer. Nothing is lost and nothing is degraded relative to any shipped release.",
+        guidance: "Most often the counterparty is on a build that predates the salt agreement, in which case this is expected and permanent for this session — a newer one will agree normally. If you know they are on the same version, look for session.salt.announce.failed on either side.",
+      });
+    }
+    return null;
+  }
+
+  /**
+   * Decision #15's fallback announcement — ONCE per session, never per message.
+   *
+   * A warning that fires on every message of every unsalted session is not a signal, it is a reason
+   * to build a filter; and the operator who filters it also filters the one session where it meant
+   * something. Stated once, with what the session actually loses.
+   */
+  #announceUnsaltedOnce(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#unsaltedAnnounced.has(key)) return;
+    this.#unsaltedAnnounced.add(key);
+    this.#logger.info("session.content.unsalted", {
+      agentName, sessionId,
+      impact: "this session hashes its messages the way every build before this feature did. Nothing is degraded relative to any shipped release and no message is affected — it only means a relay holding the hashes could confirm a guess at a short message in THIS conversation, which a salt would have prevented.",
+      guidance: "Expected when your counterparty runs a build that predates the salt agreement. If you want the protection, both sides need a build that has it, and the agreement runs at session open — so start a new session once they upgrade.",
+    });
+  }
+
+  /**
+   * Register that a salt agreement is IN FLIGHT for this session, so the first send waits for it.
+   *
+   * Called where we announce our own state — not at session creation. That distinction is
+   * constraint 5: an agreement exists to be waited for only once a frame has actually gone out.
+   */
+  #markSaltPending(agentName: string, sessionId: string, boundMs = SALT_AGREEMENT_WAIT_MS): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#saltPending.has(key)) return;
+    let resolve: (v: "agreed" | "timeout" | "closed") => void = () => { };
+    const settled = new Promise<"agreed" | "timeout" | "closed">((r) => { resolve = r; });
+    const timer = setTimeout(() => this.#settleSaltPending(agentName, sessionId, "timeout"), boundMs);
+    // The daemon must be able to exit with this outstanding — a pending agreement is not a reason to
+    // hold the process open.
+    if (typeof timer.unref === "function") timer.unref();
+    this.#saltPending.set(key, { settled, resolve, timer, boundMs });
+  }
+
+  /** Resolve a pending agreement. Idempotent: the first outcome wins and the timer is cleared. */
+  #settleSaltPending(agentName: string, sessionId: string, outcome: "agreed" | "timeout" | "closed"): void {
+    const key = this.#k(agentName, sessionId);
+    const pending = this.#saltPending.get(key);
+    if (pending === undefined) return;
+    this.#saltPending.delete(key);
+    clearTimeout(pending.timer);
+    pending.resolve(outcome);
+  }
+
+  /**
+   * TEST SEAM — put a session into the state a real one is in between announcing and being answered.
+   *
+   * Reaching that state for real needs a live counterparty connection, which the daemon-level
+   * fixtures do not have; without a seam the wait could only be tested by not testing it. It calls
+   * the same private registration the announce path calls, so it cannot drift from it.
+   */
+  markSaltAgreementPendingForTest(agentName: string, sessionId: string, boundMs?: number): void {
+    this.#markSaltPending(agentName, sessionId, boundMs);
   }
 
   /**
@@ -8969,14 +9164,24 @@ export class SessionNodeManager {
       const leaves = this.getSessionTree(agentName, sessionId).size();
       const held = this.#heldContent.get(key)?.size ?? 0;
       const inFlight = this.#awaitingAck.get(key)?.size ?? 0;
-      const total = leaves + held + inFlight;
+      /**
+       * ⚠️ THE HASH ITSELF COUNTS — B2b-2, and none of the three counts above can see it.
+       *
+       * Decision #8 closes adoption when content is HASHED. For a session's first message the leaf
+       * lands after `sendContent` returns, a network round trip later; there is no held row and no
+       * in-flight entry yet either. So between the hash and the leaf every count reads zero, and a
+       * peer contribution arriving in that window would be adopted — leaving the message already on
+       * the wire as the one unsalted leaf in a salted transcript.
+       */
+      const hashed = this.#hashedWithoutSalt.has(key) ? 1 : 0;
+      const total = leaves + held + inFlight + hashed;
       return {
         closed: total > 0,
         // The label crosses the WIRE, so it carries no counts and no error text — only which of the
         // two refusals this is. The counts stay in `why`, which stays local.
         label: SALT_ADOPTION_LABELS.ALREADY_HASHING,
         leafCount: total,
-        why: `leaves=${leaves} held=${held} awaiting_ack=${inFlight}`,
+        why: `leaves=${leaves} held=${held} awaiting_ack=${inFlight} hashed=${hashed}`,
       };
     } catch (err: unknown) {
       return {
@@ -9154,6 +9359,17 @@ export class SessionNodeManager {
         ...(frame.adoptionClosed ? { adoption_closed: frame.adoptionClosed } : {}),
       }) as Uint8Array));
       await stream.close();
+      /**
+       * B2b-2 constraint 2/5: the agreement is IN FLIGHT from here, and the first send may wait for
+       * it. Registered on a frame that actually LEFT — not at session creation — because that is the
+       * distinction constraint 5 turns on: a park-only session never connects, never announces, and
+       * so must never wait. `#markSaltPending` is a no-op once one is outstanding, so a re-announce
+       * on reconnect does not restart the clock.
+       *
+       * Not registered for a terminal frame: `adoption_closed` says the agreement is over, and
+       * opening a wait for it would make a settled question take the full bound to answer.
+       */
+      if (!frame.adoptionClosed) this.#markSaltPending(agentName, sessionId);
       this.#logger.debug("session.salt.announced", {
         agentName, sessionId, correlationId,
         /**
@@ -9207,13 +9423,20 @@ export class SessionNodeManager {
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "fingerprint_match",
       });
+      // B2b-2: release a first send that is waiting on this agreement. Both `confirmed` and
+      // `derive_and_announce` end with a salt this side can hash under, so both settle the wait.
+      this.#settleSaltPending(agentName, sessionId, "agreed");
       return;
     }
     if (action.action === "derive_and_announce") {
+      // NOT settled on a failed persist: `#persistSessionSalt` returning false means this side holds
+      // no salt, so releasing the waiter here would hand it a null it would hash unsalted under
+      // while the agreement is still open. Let the bound expire instead — that path says so.
       if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) return;
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "derived",
       });
+      this.#settleSaltPending(agentName, sessionId, "agreed");
       // `void`, not `await` — review F10. This runs inside the INBOUND content-stream handler, so
       // awaiting an outbound `newStream` here lets a stalled dial hold up the stream we are reading.
       // The connect-side call is `void`-ed for the same reason and this is now consistent with it.
@@ -9221,6 +9444,10 @@ export class SessionNodeManager {
       return;
     }
     if (action.action === "adoption_closed") {
+      // B2b-2: terminal means there is nothing left to wait for. A send still holding on the bound
+      // would otherwise sit out the full five seconds for an answer that has already arrived and
+      // said no — the slowest possible way to reach a decision both sides already agree on.
+      this.#settleSaltPending(agentName, sessionId, "closed");
       /**
        * Terminal, and NOT a freeze — review F1/F2. Both sides stay unsalted, which is exactly as
        * verifiable as every session shipped before the salt existed; the thing that was broken was

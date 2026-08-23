@@ -259,7 +259,7 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
     ).not.toMatch(/frozen/);
 
     const body = new TextEncoder().encode("the conversation continues, just unsalted");
-    const { hash, alg } = fx.snm.contentHashForSession("alice", SID, body);
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, body);
     expect(alg, "a refused session must hash the way it already hashed — naming a salted algorithm it holds no salt for is how every peer starts refusing it").toBe("sha256");
     await expect(
       fx.snm.sendContent("alice", SID, body, hash, "corr-after-refusal", LEAF_KIND_MSG, alg),

@@ -81,7 +81,7 @@ export interface DocumentTransportDeps {
     agentName: string,
     sessionId: string,
     content: Uint8Array,
-  ): { hash: Uint8Array; alg: string };
+  ): Promise<{ hash: Uint8Array; alg: string }>;
   /** `SessionNodeManager.sendContent`. */
   sendContent(
     agentName: string,
@@ -265,7 +265,7 @@ export function createDocumentDeliveryTransport(
       // invisible from here (see the paragraph above). Four sites independently deciding whether to
       // salt would be that same defect with a worse outcome: a message hashed one way and labelled
       // another is refused by every peer, including a correct one.
-      const { hash, alg } = deps.contentHashForSession(deps.agentName, session.sessionId, bytes);
+      const { hash, alg } = await deps.contentHashForSession(deps.agentName, session.sessionId, bytes);
       const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND, alg);
       // DOD-MP-SESSION-RETIRE-1 — a working send breaks the run; a terminal-ish answer extends it.
       //

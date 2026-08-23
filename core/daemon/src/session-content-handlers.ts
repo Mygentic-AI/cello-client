@@ -363,7 +363,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
      * with a worse failure mode — a message hashed one way and LABELLED another is refused by every
      * peer, including a correct one.
      */
-    const { hash: contentHash, alg: contentHashAlg } = sessionNodeManager.contentHashForSession(
+    const { hash: contentHash, alg: contentHashAlg } = await sessionNodeManager.contentHashForSession(
       record.agent_name, sessionId, sendBytes,
     );
     const contentHashHex = Buffer.from(contentHash).toString("hex");
