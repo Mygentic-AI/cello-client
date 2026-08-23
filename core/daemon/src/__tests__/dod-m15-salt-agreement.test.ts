@@ -14,10 +14,22 @@
  *   `contribution` present → "I hold no salt for this session; here is my half."
  *   `fingerprint`  present → "I already hold a salt; here is a one-way digest of it."
  *
- * That makes the four combinations exhaustive, and two of them are disagreements no retry can fix:
- * a side that holds a salt and a side that does not cannot converge, because the salt is a function
- * of two contributions that the holder no longer keeps. Saying so out loud is the whole point —
- * the alternative is the silent-discard loop `wire-content-hash.ts` already cost two daemons.
+ * That makes the four combinations exhaustive. **Two of them REPAIR** — a side that holds a salt and
+ * a side that does not DO converge, because the holder still keeps its own half and
+ * `deriveSessionSalt` sorts its arguments, so re-sending that half lands the peer on byte-identical
+ * bytes.
+ *
+ * ⚠️ THIS HEADER USED TO SAY THE OPPOSITE, and it was the false sentence that produced a
+ * session-killing defect (review F1, then F17 for this file). It claimed the two cells "cannot be
+ * repaired… the holder no longer keeps" the inputs. We do keep ours. Freezing on that reasoning
+ * meant one dropped frame destroyed a healthy session, to defend a value nothing consumes yet.
+ * It is corrected here rather than deleted, because a reader who re-derives the old claim would
+ * re-derive the old behaviour with it — and this is the sentence they would use to argue the repair
+ * back out.
+ *
+ * Exactly ONE state cannot converge: we hold a salt read back from the row and the half it was
+ * built from is gone. Loudness is still the whole point there — the alternative is the
+ * silent-discard loop `wire-content-hash.ts` already cost two daemons.
  */
 
 import { describe, it, expect } from "vitest";

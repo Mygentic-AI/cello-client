@@ -844,6 +844,13 @@ export class SessionNodeManager {
    */
   #saltContributions = new Map<string, Uint8Array>();
   #sessionSalts = new Map<string, Uint8Array>();
+  /**
+   * The peer half we last answered with a repair, hex — review F14, and it is what makes the repair
+   * TERMINATE. Without it, two daemons that already hold the same salt trade contributions forever
+   * once a reconnect leaves a stale copy queued on each side. See `onPeerSaltFrame`'s
+   * `alreadyRepairedAgainstPeerHalf`.
+   */
+  #saltRepairedAgainst = new Map<string, string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -4155,6 +4162,7 @@ export class SessionNodeManager {
      */
     this.#saltContributions.delete(key);
     this.#sessionSalts.delete(key);
+    this.#saltRepairedAgainst.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
@@ -8404,6 +8412,18 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seam: drop this session's own half while leaving the stored salt in place — the state every
+   * teardown produces, because `#evictSessionCaches` clears the map and the row survives.
+   *
+   * It clears the SAME map the eviction clears rather than a stand-in, so a test cannot pass against
+   * a state the daemon never reaches. Reproducing it through a real teardown/revive would also drag
+   * in node rebuild and relay reconnection, none of which this is about.
+   */
+  forgetSaltContributionForTest(agentName: string, sessionId: string): void {
+    this.#saltContributions.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
    * The pair the agreement reasons over: our salt, and the half that goes with it.
    *
    * Minting is deliberate and conditional. With NO salt we are certain to need a half — to offer, or
@@ -8506,14 +8526,39 @@ export class SessionNodeManager {
        * Found by a mutant that removed the caller's `if (!persisted) return`: the suite stayed green,
        * because nothing could produce a false from here.
        */
+      /**
+       * ONE SALT PER SESSION, ENFORCED AT THE WRITE — review F18.
+       *
+       * This `UPDATE` was unconditional, so it could replace an already-stored VALID salt. The path
+       * is real: `#getSessionSalt` returns null on a transient read failure, which sends this side
+       * down the derive path, which then overwrote the perfectly good salt on disk. The read error
+       * was logged; the destruction of the durable value was not — and the read log actively said
+       * the wrong thing, promising only that we would "offer a fresh contribution".
+       *
+       * The predicate has to allow ONE overwrite: a wrong-width blob is refused by `#getSessionSalt`
+       * (F8) precisely so a corrupt row can be replaced rather than stranding the session forever.
+       * So: write when there is nothing there, or when what is there is not a salt.
+       */
       const written = this.#db
-        .prepare("UPDATE sessions SET content_salt = ? WHERE agent_id = ? AND session_id = ?")
-        .run(Buffer.from(salt), this.#requireAgentId(agentName), sessionId);
+        .prepare(
+          "UPDATE sessions SET content_salt = ? WHERE agent_id = ? AND session_id = ? " +
+          "AND (content_salt IS NULL OR length(content_salt) <> ?)",
+        )
+        .run(Buffer.from(salt), this.#requireAgentId(agentName), sessionId, SESSION_SALT_BYTES);
       if (Number(written.changes) !== 1) {
+        // WHICH of the two it was. "No row" is a broken session record; "a salt is already there" is
+        // this guard doing its job, and telling an operator the row is missing when it is not would
+        // send them to look at the wrong thing.
+        const existing = this.#db
+          .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
+          .get(this.#requireAgentId(agentName), sessionId) as { n: number | null } | undefined;
+        const alreadyStored = existing?.n === SESSION_SALT_BYTES;
         this.#logger.error("session.salt.persist.failed", {
           agentName, sessionId, changes: Number(written.changes),
-          reason: "no_session_row",
-          impact: "the salt was NOT stored — no session row matched — so it is not announced either; the agreement stays open rather than being confirmed against a value that exists only in memory",
+          reason: alreadyStored ? "salt_already_stored" : "no_session_row",
+          impact: alreadyStored
+            ? "this session already has a salt and it was NOT replaced — Decision #8 is one salt per session. Reaching here means a read failure made this side believe it had none; the stored salt is intact, nothing was announced, and the agreement re-runs against it on the next connect."
+            : "the salt was NOT stored — no session row matched — so it is not announced either; the agreement stays open rather than being confirmed against a value that exists only in memory",
         });
         return false;
       }
@@ -8544,10 +8589,32 @@ export class SessionNodeManager {
     // `override` is the repair and the mismatch notice: a frame the AGREEMENT chose, which is not
     // the one our current state would produce. A side that holds a salt normally announces a
     // fingerprint — the repair has it send its CONTRIBUTION instead, which is the whole mechanism.
-    const frame = override ?? ownSaltFrame({
-      ownSalt: this.#getSessionSalt(agentName, sessionId),
-      ownContribution: this.#saltContributionFor(agentName, sessionId),
-    });
+    /**
+     * `#saltState`, NOT a direct call to the minting accessor — review F15, and this one line was
+     * the difference between the safety argument written for the repair and the code that ran.
+     *
+     * It read `ownContribution: this.#saltContributionFor(...)`, which mints unconditionally. Both
+     * arguments are evaluated, so a session that already held a salt got a fresh half minted into
+     * `#saltContributions` even though `ownSaltFrame` discards it on that branch — and
+     * `#evictSessionCaches` drops the half on every teardown while the salt stays on disk, so ANY
+     * revived session hit it, before any inbound frame could be handled.
+     *
+     * The consequence was not cosmetic. `#ownSaltHalf` never returned null, so `STATE_DIVERGENT`
+     * was dead code, and a revived session would REPAIR its counterparty onto a half its salt was
+     * never built from — then both sides froze on `salt_fingerprint_mismatch`, whose guidance sends
+     * the operator to compare build versions with a counterparty that did nothing wrong.
+     */
+    const state = this.#saltState(agentName, sessionId);
+    const frame = override ?? ownSaltFrame(state);
+    if (!frame) {
+      // Neither a salt nor a half. `#saltState` does not produce this, so it is a defect rather
+      // than a state to paper over — and inventing a contribution here is exactly what F15 was.
+      this.#logger.error("session.salt.announce.failed", {
+        agentName, sessionId, correlationId, reason: "no_salt_and_no_contribution",
+        impact: "this side has neither an agreed salt nor a half to offer, so it announced nothing; no half was invented, because one minted now would not be the half any stored salt was built from",
+      });
+      return;
+    }
     // Held outside the try so the catch can retire a stream that was opened and then failed to
     // write — the same leak, and the same fix, as `#sendDeliveryAck`.
     let saltStream: Stream | undefined;
@@ -8587,7 +8654,15 @@ export class SessionNodeManager {
     frame: SaltAgreementFrame,
     correlationId?: string,
   ): Promise<void> {
-    const action = onPeerSaltFrame({ ...this.#saltState(agentName, sessionId), frame });
+    const key = this.#k(agentName, sessionId);
+    const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
+    const action = onPeerSaltFrame({
+      ...this.#saltState(agentName, sessionId),
+      // Keyed on the peer's BYTES, not on a repair counter: a genuinely NEW half from the peer must
+      // still get our contribution back, and only an identical re-offer is the loop (review F14).
+      alreadyRepairedAgainstPeerHalf: peerHalfHex !== null && this.#saltRepairedAgainst.get(key) === peerHalfHex,
+      frame,
+    });
     if (action.action === "confirmed") {
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "fingerprint_match",
@@ -8616,7 +8691,12 @@ export class SessionNodeManager {
        */
       this.#logger.info("session.salt.repair", {
         agentName, sessionId, correlationId, detail: action.detail,
+        answeredWith: action.frame.contribution ? "contribution" : "fingerprint",
       });
+      // Recorded ONLY for a repair that sent our half, because that is the one a second identical
+      // offer must not repeat (review F14). Recording the fingerprint answer too would be harmless
+      // but says nothing — that branch is already terminal for the peer.
+      if (peerHalfHex && action.frame.contribution) this.#saltRepairedAgainst.set(key, peerHalfHex);
       void this.#sendSaltFrame(agentName, sessionId, correlationId, action.frame);
       return;
     }

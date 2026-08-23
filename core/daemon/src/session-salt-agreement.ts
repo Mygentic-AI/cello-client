@@ -210,8 +210,22 @@ function digestsEqual(a: Uint8Array, b: Uint8Array): boolean {
  * value, the fingerprints would never settle, and the symptom — a session that reconnects and still
  * disagrees — reads as a network fault rather than a bug here.
  */
-export function ownSaltFrame(state: { ownSalt: Uint8Array | null; ownContribution: Uint8Array }): SaltAgreementFrame {
+export function ownSaltFrame(
+  state: { ownSalt: Uint8Array | null; ownContribution: Uint8Array | null },
+): SaltAgreementFrame | null {
   if (state.ownSalt) return { fingerprint: saltFingerprint(state.ownSalt) };
+  /**
+   * `null` — nothing to announce, and the caller must say so rather than invent a half.
+   *
+   * Review F15: `ownContribution` was typed non-null here, so the daemon satisfied it by calling
+   * the MINTING accessor — which minted for a session that already held a salt, on the one state
+   * `null` exists to name. Taking the nullable type is what forces the caller to pass `#saltState`
+   * and makes minting a decision rather than a side effect of a parameter list.
+   *
+   * Reaching here at all means we hold neither a salt nor a half, which `#saltState` does not
+   * produce; it is a real defect if seen, not a state to paper over with a fresh contribution.
+   */
+  if (!state.ownContribution) return null;
   return { contribution: state.ownContribution };
 }
 
@@ -262,6 +276,24 @@ function ownHalfDefect(ownContribution: Uint8Array): string | null {
 export function onPeerSaltFrame(state: {
   ownSalt: Uint8Array | null;
   ownContribution: Uint8Array | null;
+  /**
+   * TERMINATION — review F14, and the repair did not have it.
+   *
+   * `(hold a salt) + (peer contribution) → emit a contribution, state unchanged` is a FIXED POINT
+   * that emits on every receipt. Two daemons both in it exchange contributions at round-trip speed
+   * forever, one new stream and one INFO line each per iteration — and they reach it while holding
+   * the SAME salt, so the whole exchange is waste.
+   *
+   * One reconnect during the exchange is enough: both sides re-announce (correctly — neither holds
+   * a salt yet), each ends up with a second copy of the other's half queued, and after both derive,
+   * that second copy lands on a side that now holds a salt.
+   *
+   * This flag breaks it. A contribution we have ALREADY answered gets our fingerprint instead, and a
+   * fingerprint drives the peer to `confirmed` or `FINGERPRINT_MISMATCH` — both terminal — so the
+   * cycle cannot re-enter. The FIRST repair against any given half still happens, so F1's
+   * convergence property is untouched.
+   */
+  alreadyRepairedAgainstPeerHalf?: boolean;
   frame: SaltAgreementFrame;
 }): SaltAgreementAction {
   const hasContribution = state.frame.contribution instanceof Uint8Array;
@@ -289,6 +321,16 @@ export function onPeerSaltFrame(state: {
           detail:
             "we hold this session's salt but no longer hold the half it was built from — a teardown or a restart evicted it — so the peer, who is starting over, cannot be brought back to the same value. " +
             "Offering a freshly minted half instead would put them on a DIFFERENT salt with both sides believing they had agreed.",
+        };
+      }
+      if (state.alreadyRepairedAgainstPeerHalf) {
+        // TERMINATION (review F14). We have already sent our half in answer to this exact one; the
+        // peer is not short of it. Answering with our fingerprint instead makes their next step
+        // terminal — `confirmed` or `FINGERPRINT_MISMATCH` — instead of another contribution.
+        return {
+          action: "repair",
+          frame: { fingerprint: saltFingerprint(state.ownSalt) },
+          detail: "we have already answered this exact peer half with ours, so a second identical repair would loop; sending our fingerprint instead moves the peer to a terminal answer",
         };
       }
       return {

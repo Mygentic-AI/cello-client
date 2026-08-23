@@ -21,7 +21,9 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { CelloNode } from "@cello-protocol/transport";
+import { decode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { deriveSessionSalt, saltFingerprint, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
 import * as lp from "it-length-prefixed";
@@ -37,6 +39,27 @@ function saltFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({ type: "session_salt_agreement", session_id: SID, ...fields }) as Uint8Array).subarray();
 }
 
+/**
+ * What the daemon actually PUT ON THE WIRE, decoded.
+ *
+ * `FakeNode.sent` has existed all along and no salt test read it — which is why three mutants on the
+ * outbound half survived pass 1 (review F16). Asserting the log alone proves the daemon reached a
+ * verdict; it cannot prove it sent the frame that verdict is made of.
+ */
+function sentFrames(node: CelloNode | null): Array<Record<string, unknown>> {
+  const raw = (node as unknown as { sent?: Uint8Array[] } | null)?.sent ?? [];
+  return raw.flatMap((framed) => {
+    try {
+      // `lp.encode.single` prefixes a varint length; every frame here is far below 128 bytes ×
+      // nothing, so strip the prefix by decoding from the first byte that parses.
+      for (let off = 0; off < Math.min(4, framed.length); off++) {
+        try { return [decode(framed.subarray(off)) as Record<string, unknown>]; } catch { /* try next */ }
+      }
+      return [];
+    } catch { return []; }
+  });
+}
+
 function storedSalt(fx: TwoConnectionFixture, agent: string): Uint8Array | null {
   const agentId = (fx.snm.getDb().prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get(agent) as { agent_id: string }).agent_id;
   const row = fx.snm.getDb()
@@ -47,7 +70,8 @@ function storedSalt(fx: TwoConnectionFixture, agent: string): Uint8Array | null 
 
 describe("DOD-M15-SEALWIRE-1 part A: an inbound contribution reaches the agreement and lands on disk", () => {
   let fx: TwoConnectionFixture | null = null;
-  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+  let node: CelloNode | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; node = null; });
 
   it("★ the counterparty's contribution derives a salt and PERSISTS it", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-a-" });
@@ -134,6 +158,152 @@ describe("DOD-M15-SEALWIRE-1 part A: an inbound contribution reaches the agreeme
       fx.eventsNamed("session.salt.agreed").length,
       "agreement must not be claimed for a salt that is not on disk",
     ).toBe(0);
+  }, 60_000);
+
+  it("★ the REPAIR puts our own half on the wire — not a fingerprint, and not a fresh half", async () => {
+    /**
+     * Review F16, mutant 1: delete `override ??` in `#sendSaltFrame` and the repair silently
+     * degrades to re-announcing a fingerprint — no repair at all — with every test still green. The
+     * only wired repair test had the daemon holding NO salt, where the override frame and the
+     * state-derived frame are byte-identical, so it could not see the difference.
+     *
+     * This is the state that tells them apart: the daemon HOLDS a salt, and must answer a peer's
+     * contribution with its own half rather than the fingerprint its state would otherwise produce.
+     *
+     * And review F15, mutant 3: the half it sends must be the one its salt was BUILT from. A daemon
+     * that mints a fresh one repairs the peer onto a different salt — which is why this asserts the
+     * exact bytes rather than merely "a 32-byte contribution".
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-j-", node: node = new FakeNode() as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const ourHalf = new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x4e);
+    fx.snm.setSaltContributionForTest("alice", SID, ourHalf);
+    // Agree a salt first, so the daemon is in the "holds a salt" state.
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(200);
+    expect(storedSalt(fx, "alice"), "precondition: the daemon must hold a salt").not.toBeNull();
+
+    const before = sentFrames(node).length;
+    // The peer starts over — its salt did not survive. This used to freeze the session.
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(300);
+
+    const repairFrame = sentFrames(node).slice(before).find((f) => f["type"] === "session_salt_agreement");
+    expect(repairFrame, "the repair must actually send something").toBeDefined();
+    expect(
+      repairFrame!["contribution"],
+      "a repair that sends a fingerprint is not a repair — the peer has no way to reach our salt from it",
+    ).toBeInstanceOf(Uint8Array);
+    expect(
+      Buffer.from(repairFrame!["contribution"] as Uint8Array).toString("hex"),
+      "it must be the half our salt was built from, or we repair them onto a DIFFERENT salt",
+    ).toBe(Buffer.from(ourHalf).toString("hex"));
+    expect(fx.eventsNamed("session.salt.frozen").length, "and must not freeze").toBe(0);
+  }, 60_000);
+
+  it("★ a REVIVED session whose half is gone refuses instead of repairing onto the wrong salt", async () => {
+    /**
+     * Review F15, and it was live: `#sendSaltFrame` minted a half unconditionally, so `#ownSaltHalf`
+     * never returned null and `salt_state_divergent` was DEAD CODE. `#evictSessionCaches` drops the
+     * half on every teardown while the salt stays on disk, so any revived session was in this state
+     * — and would repair its counterparty onto a half its salt was never built from.
+     *
+     * The operator then read the MISMATCH guidance, which sends them to compare build versions with
+     * a counterparty that did nothing wrong. The reason written for exactly this — "nothing is
+     * broken and neither of you did anything wrong" — was unreachable.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-k-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(200);
+    expect(storedSalt(fx, "alice")).not.toBeNull();
+
+    // The teardown/revival state: salt on disk, half gone. Reached in production by any interruption.
+    fx.snm.forgetSaltContributionForTest("alice", SID);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(400);
+
+    const disagreements = fx.eventsNamed("session.salt.disagreement");
+    expect(disagreements.length, "it must refuse rather than repair onto a half we never used").toBe(1);
+    expect(disagreements[0]!.ctx!.reason).toBe("salt_state_divergent");
+    expect(fx.eventsNamed("session.salt.repair").length, "and must NOT repair").toBe(0);
+    // The guidance must not send them to their counterparty's build version.
+    expect(String(disagreements[0]!.ctx!.guidance)).toMatch(/neither of you did anything wrong/);
+  }, 60_000);
+
+  it("★ a MISMATCH hands the peer our digest before the session goes — Decision #10 wants both sides to refuse", async () => {
+    /**
+     * Review F16, mutant 2: delete the `notifyPeer` send in the daemon and every test stayed green,
+     * because the only assertion on it pinned the FIELD in the pure function, never the SEND. The
+     * fingerprint-mismatch path had no daemon-level test at all.
+     *
+     * Without the notice the far operator gets nothing — the session simply stops answering — while
+     * ours gets a full explanation.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-l-", node: node = new FakeNode() as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(200);
+    const ourSalt = storedSalt(fx, "alice")!;
+
+    const before = sentFrames(node).length;
+    const theirSalt = deriveSessionSalt(PEER_CONTRIBUTION, new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x77));
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ fingerprint: saltFingerprint(theirSalt) }), PEER);
+    await wait(400);
+
+    const notice = sentFrames(node).slice(before).find((f) => f["fingerprint"] !== undefined);
+    expect(notice, "the peer must be told before the session disappears").toBeDefined();
+    expect(Buffer.from(notice!["fingerprint"] as Uint8Array).toString("hex"))
+      .toBe(Buffer.from(saltFingerprint(ourSalt)).toString("hex"));
+    expect(fx.eventsNamed("session.salt.frozen").length, "and the session still stops").toBe(1);
+  }, 60_000);
+
+  it("★ the repair TERMINATES — an identical re-offer gets a fingerprint, not another contribution", async () => {
+    /**
+     * Review F14. `(hold a salt) + (peer contribution) → emit a contribution, state unchanged` is a
+     * fixed point that emits on every receipt, so two daemons in it trade contributions at
+     * round-trip speed forever — while holding the SAME salt, making the whole exchange waste. One
+     * reconnect mid-exchange is enough to enter it, which is the very event the repair exists to
+     * survive.
+     *
+     * A fingerprint is terminal for the peer (`confirmed` or `FINGERPRINT_MISMATCH`), so answering
+     * a repeat with one closes the cycle while leaving the FIRST repair untouched.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-m-", node: node = new FakeNode() as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(200);
+
+    // First repair: our half goes out.
+    let before = sentFrames(node).length;
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(300);
+    const first = sentFrames(node).slice(before).find((f) => f["type"] === "session_salt_agreement");
+    expect(first!["contribution"], "the first repair sends our half").toBeInstanceOf(Uint8Array);
+
+    // The SAME half again — a queued duplicate after a reconnect. This is where it used to loop.
+    before = sentFrames(node).length;
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(300);
+    const second = sentFrames(node).slice(before).find((f) => f["type"] === "session_salt_agreement");
+    expect(second, "it must still answer — silence is not termination, it is a stall").toBeDefined();
+    expect(
+      second!["fingerprint"],
+      "a second identical contribution must be answered with a fingerprint, which is terminal for the peer",
+    ).toBeInstanceOf(Uint8Array);
+    expect(second!["contribution"], "another contribution here is the livelock").toBeUndefined();
+
+    // A genuinely NEW half from the peer must still get our contribution — the guard keys on bytes,
+    // not on a "have we repaired once" flag, or a real re-agreement would be answered uselessly.
+    before = sentFrames(node).length;
+    await fx.snm.handleContentFrameForTest(
+      "alice", SID, saltFrame({ contribution: new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x2b) }), PEER,
+    );
+    await wait(300);
+    const third = sentFrames(node).slice(before).find((f) => f["type"] === "session_salt_agreement");
+    expect(third!["contribution"], "a new peer half is not a repeat and must get our half").toBeInstanceOf(Uint8Array);
   }, 60_000);
 
   it("★ a STRANGER cannot seed this session's salt", async () => {
