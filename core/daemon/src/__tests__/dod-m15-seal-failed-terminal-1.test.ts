@@ -120,3 +120,74 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: what the agent is told", () => {
     expect(String(failed()["guidance"])).toMatch(/intact|not lost|only unproduced/i);
   });
 });
+
+describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", () => {
+  /**
+   * Asserted at the wiring, because a module test proving the helper works has failed to notice a
+   * missing daemon call THREE times in this milestone — the roster sweep, its probe budget, and the
+   * manifest validity tick. Each time the module tests were green and the daemon never called it.
+   *
+   * The writer is the close handler's detached tail; the reader is `cello_get_sealed_receipt`. The
+   * property is that they share ONE store, so a failure recorded by the tail is the one the receipt
+   * surface reports.
+   */
+  const AGENT2 = "agent-a";
+  const SESSION2 = "cd".repeat(16);
+
+  async function readHandlerWith(failure: { reason: string; at: string } | undefined, sealing: boolean) {
+    const { registerSessionReadHandlers } = await import("../session-read-handlers.js");
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    registerSessionReadHandlers({
+      handlers,
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      sessionNodeManager: {
+        getSealCertificate: () => null,
+        getSessionRecord: () => ({ agent_name: AGENT2, agent_id: "aid", session_id: SESSION2, status: "active" }),
+        getSessionTree: () => ({ leaves: () => [] }),
+        listSessions: () => [],
+        resolveAgentId: () => "aid",
+      },
+      loadedAgents: [{ name: AGENT2 }],
+      getConnState: () => ({ currentAgent: AGENT2 }),
+      resolveCurrentAgent: () => AGENT2,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      resolveWho: () => ({ who: "someone", whoKnown: false }),
+      isSealing: () => sealing,
+      getSealFailure: () => failure,
+      safeCursorAdvance: () => {},
+      safeWatermarkAdvance: () => {},
+      attendanceCount: () => 0,
+      reapDeadHalfOpenSessions: () => {},
+      frontierMismatches: { get: () => undefined },
+    } as never);
+    return handlers.get("cello_get_sealed_receipt")!;
+  }
+
+  it("★ a recorded failure reaches cello_sealed_receipt as seal_failed", async () => {
+    const h = await readHandlerWith({ reason: "directory_below_threshold", at: AT }, false);
+    const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
+    expect(
+      res["reason"],
+      "the ceremony died and the receipt surface still reported not_sealed_yet — indistinguishable " +
+        "from a session that was never closed, while the agent holds an ok:true from the close",
+    ).toBe("seal_failed");
+    expect(res["seal_failure_reason"]).toBe("directory_below_threshold");
+  });
+
+  it("★ a RUNNING ceremony outranks an old failure — the re-close remedy must not read as dead", async () => {
+    /**
+     * The ordering property. The marker is cleared when a ceremony starts, but the read must ALSO
+     * prefer "running" — belt and braces, because getting this backwards tells an operator their
+     * retry is dead while it is working, and the retry is the remedy this unit's own guidance names.
+     */
+    const h = await readHandlerWith({ reason: "stale_verdict", at: AT }, true);
+    const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
+    expect(res["reason"], "a running ceremony must win over a remembered failure").toBe("seal_in_progress");
+  });
+
+  it("no failure and no ceremony still reads as not_sealed_yet", async () => {
+    const h = await readHandlerWith(undefined, false);
+    const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
+    expect(res["reason"]).toBe("not_sealed_yet");
+  });
+});
