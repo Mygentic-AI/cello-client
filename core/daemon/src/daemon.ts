@@ -2956,6 +2956,28 @@ async function startDaemonHoldingLock(
       subject_kind: r.subjectKind,
       subject: r.subject,
       issuer_kind: r.issuerKind,
+      /**
+       * DOD-M15-SAMEOP-FALSEPOS-1: WHO ISSUED IT. The listing carried `subject` — who the signal is
+       * ABOUT — and never who SAID it, so an operator could see "someone endorsed me" and not see
+       * who. For the decision this list exists to support (do I rely on this endorsement?) the
+       * author is the primary fact, and an endorsement nobody can attribute is worth roughly
+       * nothing.
+       *
+       * `issuer_kind` reads like it answers this and does not: it says `"agent"` or `"portal"`, a
+       * category. Elsewhere a field literally named `issuer` holds `"peer-claimed"` /
+       * `"platform-verified"` — also a category. Two fields whose names promise identity, neither
+       * carrying it.
+       *
+       * It also unblocks an investigation this omission stalled: four endorsements in a wallet all
+       * read `same_operator: true`, and **nothing in the response could say whether the stranger's
+       * was among them** — so "a stranger is flagged as self-dealing" and "the stranger's
+       * endorsement never arrived" were indistinguishable from the listing. Different bugs, in
+       * different places, and the field that separates them was already in the row.
+       *
+       * Discloses nothing new: the issuer pubkey is inside the notarized envelope the recipient
+       * already holds and can already present.
+       */
+      issuer_pubkey: r.issuerPubkey,
       status: r.status,
       issued_at: r.issuedAt,
       expires_at: r.expiresAt,
