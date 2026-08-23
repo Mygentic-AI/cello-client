@@ -158,7 +158,8 @@ describe("launch triage item 6 — a daemon that cannot reach a directory must n
      * both reads and stays in the comparison, so a surface that dropped the timestamp still fails.
      */
     const withoutAge = (v: unknown): unknown => {
-      const { age_seconds: _ignored, ...rest } = v as Record<string, unknown>;
+      const rest = { ...(v as Record<string, unknown>) };
+      delete rest["age_seconds"];
       return rest;
     };
     expect(withoutAge(mcp["directory_endpoints_unresolved"])).toEqual(
