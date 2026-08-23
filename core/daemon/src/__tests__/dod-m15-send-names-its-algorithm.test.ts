@@ -28,7 +28,6 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { decode } from "cbor-x";
-import { readFile } from "node:fs/promises";
 import { CONTENT_HASH_ALGS, contentHashFor } from "../wire-content-hash.js";
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
 
@@ -112,31 +111,19 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
       .toBe(Buffer.from(contentHashFor(CONTENT, { alg, salt: null })).toString("hex"));
   }, 60_000);
 
-  it("★ the document ADAPTER forwards both trailing arguments — a lower-arity function assigns silently", async () => {
-    /**
-     * Review B2b-1 F3/M1. This replaces a test that asserted `sendContent`'s DEFAULT algorithm — a
-     * default that no longer exists, because it was the defect: it made a dropped argument at any of
-     * five hops produce byte-identical output, and four mutants survived the whole 2,800-test suite.
-     * Both trailing parameters are required now, so three of those four are typecheck failures.
-     *
-     * The fourth is NOT, and this is it. TypeScript assigns a function of LOWER arity to a parameter
-     * of higher arity, silently — so an adapter written `(a, b, c, d, e, leafKind) =>` satisfies a
-     * seven-parameter type and drops the last argument with no error anywhere. That is not
-     * hypothetical: it is how `leafKind` was lost for a whole release, and
-     * `document-leaf-kind-on-the-wire.test.ts` already guards that exact adapter with a source
-     * assertion for exactly this reason.
-     *
-     * A SOURCE check, deliberately — the behaviour is unobservable while every algorithm is `sha256`,
-     * so there is nothing to assert at runtime until the day it is too late.
-     */
-    const root = await readFile(new URL("../daemon.ts", import.meta.url), "utf8");
-    const adapter = /sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/.exec(root);
-    expect(adapter, "the document transport's sendContent adapter must still be findable").not.toBeNull();
-
-    const [, params, args] = adapter!;
-    for (const name of ["leafKind", "contentHashAlg"]) {
-      expect(params, `the adapter must ACCEPT ${name}`).toContain(name);
-      expect(args, `the adapter must FORWARD ${name} — dropping it type-checks silently`).toContain(name);
-    }
-  }, 60_000);
+  /**
+   * ⚠️ THE DOCUMENT-ADAPTER ASSERTION LIVES IN `document-leaf-kind-on-the-wire.test.ts`, NOT HERE.
+   *
+   * B2b-1 first put a clone of it in this file — same regex, same two assertions — and review F5
+   * called that correctly: a rename of the adapter would then break two tests, and someone fixes
+   * one. It is merged into the original, which now checks BOTH trailing parameters and uses
+   * `matchAll` so a second adapter appearing earlier in the file cannot silently become the thing
+   * being guarded.
+   *
+   * The clone's stated justification had also gone stale. It said a lower-arity adapter "drops the
+   * last argument with no error anywhere" — true when `sendContent`'s parameters were optional, and
+   * false once they were required, because the inner call then has too few arguments. What survives
+   * is the HARDCODE mutant (`..., leafKind, "sha256")`), which does compile, and that is what the
+   * merged assertion catches.
+   */
 });

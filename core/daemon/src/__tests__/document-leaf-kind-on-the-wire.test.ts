@@ -113,16 +113,38 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     // the defect the first time.
     const root = readFileSync(new URL("../daemon.ts", import.meta.url), "utf8");
 
-    const contentAdapter = /sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/.exec(root);
-    expect(contentAdapter, "the sendContent adapter in daemon.ts was renamed or restructured").not.toBeNull();
+    /**
+     * `matchAll`, not `exec` — `DOD-M15-SEALWIRE-1` B2b-1 pass-2 F5. `exec` returns the FIRST match,
+     * so a second `sendContent:` adapter appearing earlier in the file would silently become the
+     * thing this guard checks, and the real one would go unguarded with the test still green.
+     * Asserting exactly one match makes that a failure instead.
+     */
+    const adapters = [...root.matchAll(/sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/g)];
     expect(
-      contentAdapter![1].includes("leafKind"),
-      "daemon.ts's sendContent adapter does not ACCEPT leafKind — the transport's 0x04 is dropped here",
-    ).toBe(true);
-    expect(
-      contentAdapter![2].includes("leafKind"),
-      "daemon.ts's sendContent adapter accepts leafKind but does not PASS it on",
-    ).toBe(true);
+      adapters.length,
+      `expected exactly ONE sendContent adapter in daemon.ts, found ${adapters.length} — with more than one, this guard checks whichever comes first and the others are unprotected`,
+    ).toBe(1);
+    const contentAdapter = adapters[0]!;
+
+    /**
+     * BOTH trailing parameters, in one place. `DOD-M15-SEALWIRE-1` part B2b added `contentHashAlg`
+     * beside `leafKind` and it has the same failure mode for the same reason — TypeScript assigns a
+     * lower-arity function to a higher-arity type silently, so an adapter that drops the last
+     * argument compiles clean.
+     *
+     * Checked HERE rather than in a second file: B2b-1 first cloned this whole assertion into its own
+     * test, and a rename would then have broken two tests that someone fixes one of.
+     */
+    for (const param of ["leafKind", "contentHashAlg"]) {
+      expect(
+        contentAdapter[1]!.includes(param),
+        `daemon.ts's sendContent adapter does not ACCEPT ${param} — it is dropped here`,
+      ).toBe(true);
+      expect(
+        contentAdapter[2]!.includes(param),
+        `daemon.ts's sendContent adapter accepts ${param} but does not PASS it on`,
+      ).toBe(true);
+    }
 
     const frameAdapter = /sendFrame:\s*async\s*\(([^)]*)\)/.exec(root);
     expect(frameAdapter, "the sendFrame adapter in daemon.ts was renamed or restructured").not.toBeNull();
