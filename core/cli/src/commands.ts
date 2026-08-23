@@ -74,7 +74,25 @@ export async function autoStartAllAgents(
 
 export interface CommandResult {
   exitCode: number;
+  /**
+   * STDOUT. For a command whose help promises JSON, this must be JSON and NOTHING ELSE — see
+   * `guidance` below for why that had to be written down.
+   */
   output: string;
+  /**
+   * STDERR — guidance for a human, kept OUT of the data stream.
+   *
+   * DOD-M15-CLIJSON-1: `register-agent` used to append its "Next: run cello status…" hint to
+   * `output`, after the JSON. It exits 0, the registration succeeds, and every consumer that parses
+   * the output dies on the trailing prose — with a parse error naming a byte offset, so it reads as
+   * "registration is broken" when registration is fine. Five end-to-end journeys died at their first
+   * line on it.
+   *
+   * The hint is worth keeping: it is what tells a new operator that registration is asynchronous and
+   * may take a minute. It just belongs on stderr, which is what stderr is for. A human sees both
+   * streams in a terminal and loses nothing; a script sees clean JSON.
+   */
+  guidance?: string;
 }
 
 export async function login(
@@ -422,15 +440,19 @@ export async function register(
     }
     return {
       exitCode: 0,
-      output:
-        JSON.stringify(
-          { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
-          null,
-          2,
-        ) +
-        // M8C-ONBOARD-NEXTSTEP-1: every command output carries the next step + state legibility.
-        // Broken onto multiple lines — a dense one-liner buries the three status cues.
-        `\n\nNext: run  cello status  to confirm '${agent}' is registered.\n` +
+      output: JSON.stringify(
+        { ok: true, agent_id: result.agent_id, primary_pubkey: result.primary_pubkey },
+        null,
+        2,
+      ),
+      // M8C-ONBOARD-NEXTSTEP-1: every command output carries the next step + state legibility.
+      // Broken onto multiple lines — a dense one-liner buries the three status cues.
+      //
+      // DOD-M15-CLIJSON-1: on STDERR, not appended to the JSON above. A human in a terminal sees
+      // both streams and loses nothing; a script gets parseable output. This text used to make
+      // `register-agent` unparseable on its SUCCESS path.
+      guidance:
+        `Next: run  cello status  to confirm '${agent}' is registered.\n` +
         `  • it's normal for this to take a minute or two while registration settles.\n` +
         `  • ready = the agent shows state 'online' and directory_signaling 'connected'.\n` +
         `  • if it stays offline, run  cello logout  then  cello login.`,

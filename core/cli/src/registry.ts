@@ -231,7 +231,9 @@ function flagError(err: unknown): CliOutput {
 
 /** Adapt a legacy CommandResult (single `output` string, always stdout) to the CliOutput triple. */
 function legacy(result: CommandResult): CliOutput {
-  return { stdout: result.output, stderr: "", exitCode: result.exitCode };
+  // DOD-M15-CLIJSON-1: `guidance` is human help and goes to STDERR, so a command that advertises
+  // JSON emits only JSON on stdout. Dropping it here instead would delete the onboarding hint.
+  return { stdout: result.output, stderr: result.guidance ?? "", exitCode: result.exitCode };
 }
 
 /**
