@@ -23,6 +23,7 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { createHash, createHmac } from "node:crypto";
 import {
   generateSaltContribution,
   deriveSessionSalt,
@@ -162,7 +163,6 @@ describe("content hash: salted, and HMAC rather than concatenation", () => {
      * construction rather than trusting the comment — a comment naming a construction is exactly
      * what this milestone keeps catching.
      */
-    const { createHash, createHmac } = require("node:crypto") as typeof import("node:crypto");
     const naive = new Uint8Array(
       createHash("sha256").update(salt).update(new Uint8Array([0x00])).update(msg).digest(),
     );
@@ -177,7 +177,7 @@ describe("content hash: salted, and HMAC rather than concatenation", () => {
 
   it("the 0x00 domain byte is inside the HMAC, so salted and unsalted forms cannot collide", () => {
     const withoutDomain = new Uint8Array(
-      (require("node:crypto") as typeof import("node:crypto")).createHmac("sha256", Buffer.from(salt)).update(Buffer.from(msg)).digest(),
+      createHmac("sha256", Buffer.from(salt)).update(Buffer.from(msg)).digest(),
     );
     expect(Buffer.from(saltedContentHash(salt, msg))).not.toEqual(Buffer.from(withoutDomain));
   });
