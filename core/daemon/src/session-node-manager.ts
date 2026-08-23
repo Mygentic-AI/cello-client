@@ -980,6 +980,20 @@ export class SessionNodeManager {
     timer: ReturnType<typeof setTimeout>;
     boundMs: number;
   }>();
+  /**
+   * HOW THE LAST AGREEMENT ENDED, kept after `#saltPending` is cleared.
+   *
+   * ⚠️ FOUND BY FALSIFYING MY OWN FIX. `#settleSaltPending` deletes the pending entry, so a send that
+   * arrives AFTER an agreement has already failed finds nothing pending and is told
+   * `no_agreement_started` — *"your counterparty was not connected"* — when in fact they were
+   * connected and our own dial to them failed. The outcome was observable only to a send that
+   * happened to already be waiting, which is the minority case.
+   *
+   * So the verdict outlives the wait. An ABSENT entry still means what it always meant — no
+   * agreement was ever started, the park-only case — and that distinction is the whole reason this
+   * is a separate map rather than a default.
+   */
+  #saltLastOutcome = new Map<string, "timeout" | "closed" | "persist_failed" | "announce_failed">();
   #hashedWithoutSalt = new Map<string, number>();
   #unsaltedAnnounced = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
@@ -4368,6 +4382,7 @@ export class SessionNodeManager {
     this.#settleSaltPending(agentName, sessionId, "closed");
     this.#hashedWithoutSalt.delete(key);
     this.#unsaltedAnnounced.delete(key);
+    this.#saltLastOutcome.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
@@ -9094,7 +9109,13 @@ export class SessionNodeManager {
     }
 
     const pending = this.#saltPending.get(key);
-    if (pending === undefined) return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
+    if (pending === undefined) {
+      // An agreement that already ENDED is not an agreement that never started. Only the second is
+      // "your counterparty was not connected", and only an absent entry means it.
+      const last = this.#saltLastOutcome.get(key);
+      if (last !== undefined) return { salt: null, reason: this.#reasonForOutcome(last) };
+      return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
+    }
 
     const settled = await pending.settled;
     if (settled === "agreed") {
@@ -9196,12 +9217,25 @@ export class SessionNodeManager {
     this.#saltPending.set(key, { settled, resolve, timer, boundMs });
   }
 
+  /**
+   * ONE mapping from a settled outcome to the operator-facing reason, so the send that WAITED and the
+   * send that arrived afterwards cannot disagree about what happened.
+   */
+  #reasonForOutcome(outcome: "timeout" | "closed" | "persist_failed" | "announce_failed"): UnsaltedReason {
+    if (outcome === "announce_failed") return UNSALTED_REASONS.ANNOUNCE_FAILED;
+    if (outcome === "persist_failed") return UNSALTED_REASONS.OUR_PERSIST_FAILED;
+    if (outcome === "closed") return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
+    return UNSALTED_REASONS.AGREEMENT_TIMED_OUT;
+  }
+
   /** Resolve a pending agreement. Idempotent: the first outcome wins and the timer is cleared. */
   #settleSaltPending(agentName: string, sessionId: string, outcome: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed"): void {
     const key = this.#k(agentName, sessionId);
     const pending = this.#saltPending.get(key);
     if (pending === undefined) return;
     this.#saltPending.delete(key);
+    // `agreed` is not recorded: the salt itself is the record, and `#getSessionSalt` answers first.
+    if (outcome !== "agreed") this.#saltLastOutcome.set(key, outcome);
     clearTimeout(pending.timer);
     pending.resolve(outcome);
   }

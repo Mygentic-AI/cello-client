@@ -444,6 +444,28 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
       elapsedMs,
       "a frame that never left has no answer coming — holding the send for the bound is five seconds spent on a certainty",
     ).toBeLessThan(2_000);
+
+    /**
+     * ⚠️ THE LABEL, AND ITS ABSENCE LET A MUTANT LIVE. This test asserted only the algorithm and the
+     * latency, so reverting the reason to `"timeout"` survived the whole pass — predicted by the
+     * reviewer and confirmed by re-running it.
+     *
+     * It matters because the two say opposite things about who is at fault. `agreement_timed_out`
+     * means *your counterparty was connected and did not answer* and sends the operator to ask about
+     * their build version. Here the frame never left this machine: they were never asked, and their
+     * build has nothing to do with it. That is the substitution the closed reason set was built to
+     * end, re-entering through the settle site the previous pass asked for.
+     */
+    const said = fx.eventsNamed("session.content.unsalted");
+    expect(said.length).toBe(1);
+    expect(
+      said[0]!.ctx!["reason"],
+      "a frame that never left is not a counterparty who did not answer — reporting it as one blames a peer that was never asked",
+    ).toBe("our_announce_failed");
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "and the guidance must steer them away from the counterparty's build, not toward it",
+    ).toMatch(/Do not ask them to upgrade/i);
   }, 60_000);
 
   it("★ HASHING closes adoption — the window the row cannot see", async () => {
