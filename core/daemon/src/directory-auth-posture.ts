@@ -81,12 +81,30 @@ export function directoryAuthRequired(env: Record<string, string | undefined>): 
 export function describeDirectoryAuth(opts: {
   verifierPresent: boolean;
   directoryUrl: string;
+  /**
+   * Did the operator actually SET `CELLO_DIRECTORY_URL` — review F5.
+   *
+   * With it unset, `resolveDirectoryUrl` returns a RANDOM bundled endpoint, freshly picked on every
+   * call. So the first cut printed a different URL on consecutive status reads, and worse, the
+   * refusal asserted *"the usual cause is a DNS hostname"* while quoting a URL that IS a bundled
+   * endpoint — naming a cause that could not have produced the state it was describing. Exactly the
+   * error-substitution class this milestone exists to kill.
+   *
+   * When it is unset there is no configured URL to blame, and the honest explanation is different:
+   * no challenge verifier was supplied to this daemon at all.
+   */
+  urlExplicitlyConfigured?: boolean;
 }): Record<string, unknown> {
   if (opts.verifierPresent) {
     return { directory_authentication: "enforced" };
   }
 
-  const expected = LOCAL_URL.test(opts.directoryUrl);
+  const configured = opts.urlExplicitlyConfigured !== false;
+  // NORMALISE FIRST — review F6. `manifest-deps.ts` applies its local/public test to the normalised
+  // URL; applying it to the raw one here made the two classifiers disagree on `HTTP://127.0.0.1`
+  // (the regex is case-sensitive) and on a leading space from a .env or compose value. The result
+  // was the rogue-directory alarm firing on a loopback dev run — a signal on the designed case.
+  const expected = LOCAL_URL.test(opts.directoryUrl.trim().toLowerCase());
   return {
     directory_authentication: "disabled",
     /**
@@ -98,8 +116,17 @@ export function describeDirectoryAuth(opts: {
      * believes, and the only previous signal was the absence of a log line.
      */
     directory_authentication_expected: expected,
-    directory_authentication_directory_url: opts.directoryUrl,
-    directory_authentication_guidance: expected
+    // Only reported when the operator actually chose it. An unset CELLO_DIRECTORY_URL yields a fresh
+    // RANDOM bundled endpoint per call, and printing that as "the directory URL" invites an operator
+    // to debug a value nothing decided anything from (review F5).
+    ...(configured ? { directory_authentication_directory_url: opts.directoryUrl } : {}),
+    directory_authentication_guidance: !configured
+      ? "Directory identity authentication (step 6) is OFF: no challenge verifier was supplied to " +
+        "this daemon, and CELLO_DIRECTORY_URL is not set, so there is no configured directory URL " +
+        "to have failed the roster match. This is the shape an in-process embedder or a test harness " +
+        "produces. A daemon started through the normal CLI builds a verifier automatically when its " +
+        "directory URL matches the bundled roster."
+      : expected
       ? `Directory identity authentication (step 6) is OFF because ${opts.directoryUrl} is a local ` +
         "address, which the bundled consortium manifest cannot describe. This is the designed " +
         "configuration for local development and the e2e harness — enforcing here would reject " +

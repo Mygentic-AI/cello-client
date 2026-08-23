@@ -2398,6 +2398,9 @@ async function startDaemonHoldingLock(
       ...describeDirectoryAuth({
         verifierPresent: challengeVerifier !== undefined,
         directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+        // Review F5: with neither set, `resolveDirectoryUrl` re-picks a RANDOM bundled endpoint on
+        // every call, so there is no configured URL to quote or to blame.
+        urlExplicitlyConfigured: directoryHttpUrl !== undefined || process.env["CELLO_DIRECTORY_URL"] !== undefined,
       }),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
@@ -3664,6 +3667,9 @@ async function startDaemonHoldingLock(
       ...describeDirectoryAuth({
         verifierPresent: challengeVerifier !== undefined,
         directoryUrl: directoryHttpUrl ?? resolveDirectoryUrl(process.env),
+        // Review F5: with neither set, `resolveDirectoryUrl` re-picks a RANDOM bundled endpoint on
+        // every call, so there is no configured URL to quote or to blame.
+        urlExplicitlyConfigured: directoryHttpUrl !== undefined || process.env["CELLO_DIRECTORY_URL"] !== undefined,
       }),
       agents: getAgentsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as

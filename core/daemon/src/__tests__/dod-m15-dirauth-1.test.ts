@@ -136,6 +136,18 @@ describe("DOD-M15-DIRAUTH-1: an operator can demand it", () => {
     expect(directoryAuthRequired({ CELLO_REQUIRE_DIRECTORY_AUTH: "true" })).toBe(true);
   });
 
+  it("whitespace and case are tolerated on the OFF values", () => {
+    /**
+     * Review §4: deleting `.trim().toLowerCase()` left the suite green. The docstring claimed the
+     * behaviour and nothing asserted it — and it is exactly the shape a compose file or a systemd
+     * drop-in produces, where a trailing space is invisible in the source.
+     */
+    expect(directoryAuthRequired({ CELLO_REQUIRE_DIRECTORY_AUTH: " 0 " })).toBe(false);
+    expect(directoryAuthRequired({ CELLO_REQUIRE_DIRECTORY_AUTH: "FALSE" })).toBe(false);
+    expect(directoryAuthRequired({ CELLO_REQUIRE_DIRECTORY_AUTH: "Off" })).toBe(false);
+    expect(directoryAuthRequired({ CELLO_REQUIRE_DIRECTORY_AUTH: "  " })).toBe(false);
+  });
+
   it("an unrecognised value does NOT silently mean off", () => {
     /**
      * The shape that would undo the whole unit: an operator sets
@@ -292,4 +304,161 @@ describe("DOD-M15-DIRAUTH-1: the demand is enforced at STARTUP, not deferred", (
     handle = await startDaemon(cfg());
     expect(handle, "enforcing unconditionally would reject every local-dev and e2e connection").toBeDefined();
   }, 30_000);
+});
+
+describe("DOD-M15-DIRAUTH-1: the gaps the review enumerated as revert-green", () => {
+  let dir: string;
+  let handle: DaemonHandle | null = null;
+  const saved = process.env["CELLO_REQUIRE_DIRECTORY_AUTH"];
+  const savedUrl = process.env["CELLO_DIRECTORY_URL"];
+
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "m15-dirauth-gaps-")); });
+  afterEach(async () => {
+    if (handle) await handle.stop("test_cleanup").catch(() => {});
+    handle = null;
+    if (saved === undefined) delete process.env["CELLO_REQUIRE_DIRECTORY_AUTH"];
+    else process.env["CELLO_REQUIRE_DIRECTORY_AUTH"] = saved;
+    if (savedUrl === undefined) delete process.env["CELLO_DIRECTORY_URL"];
+    else process.env["CELLO_DIRECTORY_URL"] = savedUrl;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  const cfg = (extra: Record<string, unknown> = {}) => ({
+    securityGateway: new PassthroughGatewayClient(),
+    celloDir: dir,
+    socketPath: join(dir, "daemon.sock"),
+    lockFilePath: join(dir, "daemon.lock"),
+    maxConnections: 8,
+    version: "0.0.1-test",
+    logger: { debug() {}, info() {}, warn() {}, error() {} },
+    ...extra,
+  }) as unknown as DaemonConfig;
+
+  it("★ the CLI `status` verb carries the posture too, not just cello_status", async () => {
+    /**
+     * Review F2, and this is the SECOND unit running to ship the identical omission — the previous
+     * one's own test file documents it. Two copy-pasted spread sites, one asserted. `status` is what
+     * `cello status` calls and JSON-dumps, so it is the surface an operator with no MCP client sees.
+     */
+    handle = await startDaemon(cfg());
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "cli" });
+    const cli = (await c.send("status", {})) as Record<string, unknown>;
+    c.close();
+    expect(
+      cli["directory_authentication"],
+      "`cello status` said nothing about whether directory identity authentication is running",
+    ).toBe("disabled");
+  }, 30_000);
+
+  it("★ a refused start leaves NOTHING behind — the next start with a verifier succeeds", async () => {
+    /**
+     * Review F1's real consequence, asserted rather than argued. The refusal used to run after the
+     * identity migration, after the DB and key were created, and after every active session was
+     * marked interrupted. Moving it to pure-config-validation position means a refused start is a
+     * no-op on disk — and the way to prove that is to refuse, then start properly on the SAME
+     * celloDir and see a working daemon.
+     */
+    process.env["CELLO_REQUIRE_DIRECTORY_AUTH"] = "1";
+    await expect(startDaemon(cfg())).rejects.toThrow(/CELLO_REQUIRE_DIRECTORY_AUTH/);
+
+    handle = await startDaemon(cfg({ challengeVerifier: { verifyChallenge: vi.fn(() => ({ valid: true })) } }));
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "mcp" });
+    const status = (await c.send("cello_status", {})) as Record<string, unknown>;
+    c.close();
+    expect(
+      status["directory_authentication"],
+      "the refused start left the directory in a state the next start could not recover from",
+    ).toBe("enforced");
+  }, 30_000);
+
+  it("★ the refusal is LOUD in the log, not only in the thrown error", async () => {
+    /**
+     * Review §4: both refusal tests passed a silent logger, so deleting the whole
+     * `directory.auth.required.unavailable` block was green. Invariant 2 wants the log half AND the
+     * response half; only the response half had a test.
+     */
+    process.env["CELLO_REQUIRE_DIRECTORY_AUTH"] = "1";
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const logger = {
+      debug() {}, info() {}, warn() {},
+      error: (event: string, ctx?: Record<string, unknown>) => events.push({ event, ctx: ctx ?? {} }),
+    };
+    await expect(startDaemon(cfg({ logger }))).rejects.toThrow();
+
+    const rec = events.find((e) => e.event === "directory.auth.required.unavailable");
+    expect(rec, "a refused startup that logs nothing leaves no forensic record of WHY").toBeDefined();
+    expect(rec?.ctx["directoryUrl"], "the log must name the URL that was judged").toBeDefined();
+    expect(
+      String(rec?.ctx["guidance"]),
+      "and carry a remedy that works — all three manifest variables, not just the first",
+    ).toMatch(/CELLO_CONSORTIUM_ROOT_KEYS/);
+  }, 30_000);
+
+  it("★ a LOOPBACK directory is expected-and-calm at the WIRING, not just in the helper", async () => {
+    /**
+     * Review F6 + §4: the daemon tests asserted only the single string "disabled", so hardcoding
+     * `expected: false` — or dropping the guidance entirely — stayed green. That is the only test
+     * that would have caught the two classifiers disagreeing, and it is the shape a compose-based
+     * dev loop actually runs.
+     */
+    process.env["CELLO_DIRECTORY_URL"] = "http://127.0.0.1:9099";
+    handle = await startDaemon(cfg());
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "mcp" });
+    const status = (await c.send("cello_status", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(status["directory_authentication"]).toBe("disabled");
+    expect(
+      status["directory_authentication_expected"],
+      "a loopback directory is the DESIGNED local configuration — printing the rogue-directory " +
+        "alarm on every local status call is a signal that fires on the normal case",
+    ).toBe(true);
+    expect(String(status["directory_authentication_guidance"])).toMatch(/local|harness|development/i);
+  }, 30_000);
+});
+
+describe("DOD-M15-DIRAUTH-1: the guidance does not blame a cause it never checked", () => {
+  it("★ F5: with no CELLO_DIRECTORY_URL set, it does NOT accuse a hostname", () => {
+    /**
+     * `resolveDirectoryUrl` with the env var unset returns a RANDOM bundled endpoint, freshly picked
+     * on every call. So the first cut printed a different URL on consecutive status reads, and the
+     * refusal asserted "the usual cause is a DNS hostname" while quoting a URL that IS a bundled
+     * endpoint — a cause that cannot produce the state being described.
+     */
+    const d = describeDirectoryAuth({
+      verifierPresent: false,
+      directoryUrl: "http://1.2.3.4:9090",
+      urlExplicitlyConfigured: false,
+    });
+    const g = String(d["directory_authentication_guidance"]);
+    expect(
+      g,
+      "it accused a hostname while quoting a bundled endpoint address — the operator would go and " +
+        "check DNS for a URL that matched fine",
+    ).not.toMatch(/HOSTNAME/);
+    expect(g, "the honest explanation is that no verifier was supplied").toMatch(/no challenge verifier was supplied/i);
+    expect(
+      d["directory_authentication_directory_url"],
+      "and a randomly re-picked URL must not be printed as though it were a configured setting",
+    ).toBeUndefined();
+  });
+
+  it("★ F6: an UPPERCASE loopback URL is still recognised as local", () => {
+    /**
+     * The two classifiers disagreed: `manifest-deps` tests the NORMALISED url, this module tested
+     * the raw one with a case-sensitive regex. So `HTTP://127.0.0.1:9090` was logged as benign local
+     * dev by one and reported as a rogue-directory risk by the other — the alarm firing on the
+     * designed case, on every status call of a compose-based dev loop.
+     */
+    const d = describeDirectoryAuth({ verifierPresent: false, directoryUrl: "HTTP://127.0.0.1:9090" });
+    expect(d["directory_authentication_expected"]).toBe(true);
+  });
+
+  it("★ F6: a leading space from a .env or compose value does not flip it to alarming", () => {
+    const d = describeDirectoryAuth({ verifierPresent: false, directoryUrl: " http://127.0.0.1:9090" });
+    expect(d["directory_authentication_expected"]).toBe(true);
+  });
 });
