@@ -367,14 +367,16 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
    * one failed. Verifying it under the wrong algorithm refuses it, keeps the relay copy, and pulls it
    * again on the next drain — forever.
    */
-  async function parkedEntry(agent: string, sessionId: string, alg: string, salt: Uint8Array | null) {
+  async function parkedEntry(
+    agent: string, sessionId: string, alg: string, salt: Uint8Array | null, body: Uint8Array = CONTENT,
+  ) {
     const sender = generateKeypair();
     const recipient = generateKeypair();
     const recipientPub = await recipient.getPublicKey();
-    const contentHash = contentHashFor(CONTENT, { alg, salt });
+    const contentHash = contentHashFor(body, { alg, salt });
     const sealed = await sealParkEnvelope({
       signer: sender, sessionIdHex: sessionId, recipientPubkey: recipientPub,
-      content: CONTENT, contentHash,
+      content: body, contentHash,
       ...(alg === CONTENT_HASH_ALGS.SHA256 ? {} : { contentHashAlg: alg }),
     });
     const plaintext = await recipient.openContentSeal!(sealed);
@@ -418,7 +420,72 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
     ).toBe("content_hash_salt_unavailable");
   }, 60_000);
 
-  it("★ an UNSALTED (v2) parked entry still verifies — every peer in existence today", async () => {
+  it("★ the refusal/recovery reconciliation fires ONLY on a real delivery, and only for that message", async () => {
+    /**
+     * ⚠️ REVIEW PASS-2 F2 — THE F1 FIX HAD ZERO COVERAGE, and the reviewer proved it rather than
+     * grepping: `content.recover.alg_refusal_reconciled` appeared twice in the whole repository, at
+     * its emit site and in `dist/`. `#unreadableAlgSeen` is private, reaches no IPC surface and no
+     * return value, so its ONLY observable effect is this log line — which means reverting half the
+     * fix could not be distinguished by any test in the suite.
+     *
+     * That is the F3 class repeating inside F3's own commit: I fixed "the wiring has no test" and
+     * shipped a fix with no test.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-recon-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    // Arm the memo the way production does: a direct frame naming an algorithm we cannot read.
+    await fx.snm.ingestReceivedContent(
+      "alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, "hmac-sha512-salt-v9",
+    );
+    expect(fx.eventsNamed("session.content.cross_check.failed").length, "precondition: the memo is armed").toBe(1);
+
+    /**
+     * A DIFFERENT message recovers first. The reconciliation must stay silent — it is not about this
+     * message, and firing here is the session-keyed bug the memo was made hash-keyed to fix.
+     *
+     * ⚠️ DIFFERENT BODY, not just a different envelope. My first version of this fixture reused the
+     * same `CONTENT`, so it produced the SAME content hash and was not an unrelated message at all —
+     * the assertion failed and showed me the fixture, not the code. A test whose "unrelated" case is
+     * secretly the related one proves nothing about keying.
+     */
+    const other = await parkedEntry(
+      "alice", SID, CONTENT_HASH_ALGS.SHA256, null, new TextEncoder().encode("an entirely different message"),
+    );
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await other.sender.getPublicKey()).toString("hex"), SID);
+    await fx.snm.recoverParkedEntry("alice", SID, other.recipientPub, other.plaintext, other.contentHash, "c2");
+    expect(
+      fx.eventsNamed("content.recover.alg_refusal_reconciled").length,
+      "an unrelated recovery must not announce someone else's reconciliation",
+    ).toBe(0);
+
+    // Now the REFUSED message arrives by the park route, re-parked without the unreadable name.
+    const e = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.SHA256, null);
+    const sameHash = wireContentHash(CONTENT);
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
+    const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, sameHash, "c3");
+    const announced = fx.eventsNamed("content.recover.alg_refusal_reconciled").length;
+
+    if (res.ok) {
+      expect(announced, "a real delivery of the refused message must be reported exactly once").toBe(1);
+    } else {
+      // F1's fix: the block used to fire on the memo hit alone, announcing a delivery that had not
+      // happened — once per drain, forever, because the entry is never confirm-deleted.
+      expect(announced, "a FAILED recovery must never announce that the message was delivered").toBe(0);
+    }
+  }, 60_000);
+
+  it("a v2 parked entry still verifies — REGRESSION GUARD, not coverage of this change", async () => {
+    /**
+     * Named honestly after review pass 2: this test is green under every mutant of this unit,
+     * because `contentHashFor` with `sha256` returns exactly what the old hardcoded expression did.
+     * It does NOT survive the revert test and is not evidence for the change.
+     *
+     * It earns its place anyway — it is the assertion that goes red if the algorithm work ever
+     * breaks the path every peer in existence uses today.
+     */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-c-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
