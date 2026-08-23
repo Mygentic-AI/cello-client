@@ -275,6 +275,33 @@ describe("M10B-D4 — a refusal rides the same sealed path", () => {
     // manifest" from a message that simply failed to arrive.
     expect(res.guidance).toContain("2026-01-02T00:00:00Z");
     expect(res.guidance).toMatch(/manifest/i);
+
+    /**
+     * AND IT MUST NOT TELL THEM TO RESTART — `DOD-M15-MANIFEST-EXPIRY-LIVE-1` review F4.
+     *
+     * This guidance used to end *"Restart the daemon to load and verify a current manifest, then
+     * retry."* Startup FAILS CLOSED on an expired manifest (ADV-002), so that restart reloads
+     * nothing: the daemon refuses to come back and every one of the operator's agents goes offline.
+     * Following the instruction turned a refused submission into a dead daemon — and the same
+     * daemon's `cello_status` gave the opposite advice for the identical condition.
+     *
+     * The reason assertions above could not see any of that: they check the CODE, and the harmful
+     * part was the prose. So the prose is asserted too.
+     */
+    expect(
+      res.guidance,
+      "the operator is being told to restart, which fails closed on an expired manifest and takes " +
+        "every agent offline — a refused submission becomes a dead daemon",
+    ).not.toMatch(/^.*Restart the daemon to load/);
+    expect(
+      res.guidance,
+      "it must say the manifest is REPLACED first, and name both origins — a file at " +
+        "CELLO_CONSORTIUM_MANIFEST, or a package upgrade for the compiled-in one",
+    ).toMatch(/Replace the manifest first/);
+    expect(
+      res.guidance,
+      "and warn explicitly against restarting without one",
+    ).toMatch(/Do NOT restart without one/);
   });
 
   it("composes when the manifest is still inside its window — the gate is not just 'always refuse'", async () => {
