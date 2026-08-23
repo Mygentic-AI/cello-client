@@ -199,6 +199,39 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the check actually runs while the daem
         "rotated once would never be warned again",
     ).toHaveBeenCalledTimes(2);
   });
+
+  it("★ rotating to ANOTHER near-expiry manifest warns again, without passing through valid", async () => {
+    /**
+     * The revert test found this gap: collapsing the latch key to the bare STATE stayed green,
+     * because the test above happens to pass through a valid state in between, which resets a bare
+     * latch just as well as a keyed one.
+     *
+     * The case that separates them has no valid state in between — an operator warned that manifest
+     * A expires in four days rotates to manifest B, which is itself already inside the warning
+     * window (a stale artefact, or one minted with a short window). The state never leaves
+     * `expiring_soon`, so a bare latch says nothing and the operator believes they have fixed it.
+     * The key includes the expiry date for exactly this.
+     */
+    const { startManifestValidityWatch } = await import("../manifest-validity.js");
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    let m = manifest({ expires: at(4 * DAY) });
+    const check = startManifestValidityWatch({ getManifest: () => m, logger, now: () => NOW });
+
+    check();
+    expect(logger.warn, "PRECONDITION: manifest A must warn").toHaveBeenCalledTimes(1);
+
+    // Rotated to a DIFFERENT manifest that is also inside the warning window. Still expiring_soon.
+    m = manifest({ expires: at(2 * DAY) });
+    check();
+
+    expect(
+      logger.warn,
+      "the replacement manifest is ALSO about to expire and nothing said so, because the latch " +
+        "keyed on the state alone and the state never changed. The operator rotated, saw silence, " +
+        "and concluded they were fine.",
+    ).toHaveBeenCalledTimes(2);
+    expect(logger.warn.mock.calls[1]?.[1]?.["expiresAt"]).toBe(at(2 * DAY));
+  });
 });
 
 describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the DAEMON surfaces it, not just the module", () => {
