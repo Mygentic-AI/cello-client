@@ -404,6 +404,28 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
         const m = frontierMismatches.get(row.agent_name, row.session_id);
         return m ? { frontierMismatch: renderFrontierMismatch(m, row.session_id) } : {};
       })(),
+      /**
+       * `DOD-M15-SEALWIRE-1` — THE STATE THE INVARIANT ASKED FOR, and it is a FIELD, not an alert.
+       *
+       * B2b-2 turned salting on. When a session cannot agree a salt it falls back to the hashing
+       * every shipped build uses and logs `session.content.unsalted` once — which satisfies the
+       * "loud in the log" half of the invariant and nothing at all of the "and in the agent
+       * response" half. An operator reading tool output had no way to tell a protected conversation
+       * from an unprotected one.
+       *
+       * ⚠️ PRESENT ON EVERY ROW, INCLUDING THE TRUE ONE — the one place this list breaks its own
+       * present-only-when-interesting convention (`sealing`, `frontierMismatch`), and deliberately.
+       * Those two say *something is happening*; absence means nothing is. This says *what protects
+       * this conversation*, and for that, absence is unreadable: a missing field on an older daemon
+       * and a missing field meaning "unprotected" would look identical, which is the collapse
+       * Decision #15 spends a whole wire discriminator avoiding. A security property must not be
+       * inferable from a gap.
+       *
+       * Deliberately NOT urgent, per the DoD: an unsalted session is exactly as verifiable as every
+       * session shipped before the feature existed. This is the difference between *knowing* and
+       * *working*, and it costs one boolean per row rather than an event per message.
+       */
+      contentSalted: sessionNodeManager.getSessionContentSalt(row.agent_name, row.session_id) !== null,
     }));
     return { ok: true, filter, limit, totalMatched: matched.length, sessions };
   }

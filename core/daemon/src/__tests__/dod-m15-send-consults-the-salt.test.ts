@@ -233,6 +233,52 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
     ).toBe(CONTENT_HASH_ALGS.HMAC_SALT_V1);
   }, 60_000);
 
+  it("★★ TWO CONCURRENT SENDS: a sibling's refusal must not release the in-flight send's claim", async () => {
+    /**
+     * ⚠️ REVIEW PASS 2's BLOCKING FINDING (HIGH), AND THE TEST THAT WOULD HAVE CAUGHT IT.
+     *
+     * `#hashedWithoutSalt` was a `Set` — one flag per SESSION for a fact that is per MESSAGE — and
+     * `abandonUnsaltedHash` deleted it outright. The `sibling_send_in_flight` path is the one path
+     * whose defining precondition is that another send is mid-flight with an unsalted hash of its
+     * own:
+     *
+     *   1. Connection A hashes unsalted and sets the flag.
+     *   2. A enters `sendContent`, which awaits a full relay round trip before `#trackAwaitingAck`
+     *      records anything — so A is invisible to every frontier count.
+     *   3. Connection B hashes, sees A's claim, is refused, and abandons — **deleting A's flag.**
+     *   4. The frontier now reads entirely empty. A salt frame arriving in that window is adopted.
+     *   5. A's message lands as leaf 0 hashed sha256, in a session that hashes everything after it
+     *      under HMAC.
+     *
+     * The split transcript, through a window a relay round trip wide. The previous test drove
+     * `abandonUnsaltedHash` directly and could never see it: with one caller, a delete and a
+     * decrement are indistinguishable.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-sibling-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    // TWO messages hashed before either has produced a leaf — A and B, both in flight.
+    const a = await fx.snm.contentHashForSession("alice", SID, BODY);
+    const b = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("the sibling"));
+    expect(a.alg, "precondition: both hashed unsalted").toBe(CONTENT_HASH_ALGS.SHA256);
+    expect(b.alg, "precondition: both hashed unsalted").toBe(CONTENT_HASH_ALGS.SHA256);
+
+    // B is refused and gives its claim back. A is STILL in flight.
+    fx.snm.abandonUnsaltedHash("alice", SID);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+    await wait(300);
+
+    expect(
+      fx.snm.getSessionContentSalt("alice", SID),
+      "one send abandoning must not re-open adoption while a sibling's unsalted message is still on its way to the wire — that message becomes the one sha256 leaf in an HMAC transcript",
+    ).toBeNull();
+    expect(
+      fx.eventsNamed("session.salt.adoption.refused").length,
+      "and the refusal must still be announced — the surviving claim is what keeps adoption closed",
+    ).toBe(1);
+  }, 60_000);
+
   it("★ a send that produced NOTHING does not unsalt the session for its life", async () => {
     /**
      * Review Finding 3, and it is the reachable one — the flag was set too eagerly, not too late.
@@ -259,6 +305,19 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
       fx.snm.getSessionContentSalt("alice", SID),
       "nothing was sent, so there is no transcript to split — the session must still be able to adopt a salt",
     ).not.toBeNull();
+
+    /**
+     * Review pass 2, F3. `session.content.unsalted` already told this operator, at INFO, that the
+     * session was *permanently* unsalted. That statement is now false, and a retraction logged below
+     * the level of the claim it retracts is not a retraction — it is off wherever the false claim is
+     * on.
+     */
+    const retracted = fx.eventsNamed("session.content.unsalted.retracted");
+    expect(retracted.length, "the earlier 'permanently unsalted' line must be corrected").toBe(1);
+    expect(
+      retracted[0]!.level,
+      "and at the level of the claim it retracts, or the operator keeps the wrong one",
+    ).toBe("info");
   }, 60_000);
 
   it("★ the fallback names WHICH of the six reasons it is — one sentence cannot serve five causes", async () => {

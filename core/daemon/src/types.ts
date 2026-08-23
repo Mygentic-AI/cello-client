@@ -639,6 +639,20 @@ export interface SessionListEntry {
    * has a name, so an unnamed closed one is a hint it did not.
    */
   sessionName: string | null;
+  /**
+   * Whether this session's message hashes are salted — `DOD-M15-SEALWIRE-1` bullet 6.
+   *
+   * `false` is not a fault. It means this conversation hashes the way every build before the salt
+   * existed, which is exactly as verifiable; what it loses is that a relay holding the hashes could
+   * confirm a guess at a short message in this conversation. The common cause is a counterparty who
+   * was offline or on an older build when the session opened, and it is permanent for the session
+   * either way — the agreement runs at open, before anything is hashed.
+   *
+   * ⚠️ REQUIRED, NOT OPTIONAL. An absent field would be indistinguishable from `false`, so an older
+   * daemon and an unprotected session would read the same — the exact collapse Decision #15 spends a
+   * whole wire discriminator preventing. A security property must never be inferable from a gap.
+   */
+  contentSalted: boolean;
 }
 
 /**

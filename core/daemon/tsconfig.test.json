@@ -34,6 +34,7 @@
     "src/__tests__/dod-m15-salt-adoption-rule.test.ts",
     "src/__tests__/dod-m15-salt-capability-signal.test.ts",
     "src/__tests__/dod-m15-send-consults-the-salt.test.ts",
+    "src/__tests__/dod-m15-salt-visible-to-the-agent.test.ts",
     "src/__tests__/dod-m15-send-names-its-algorithm.test.ts",
     "src/__tests__/dod-m15-retry-queue-column-upgrade.test.ts",
     "src/__tests__/msg-020-revival-bound.test.ts",
