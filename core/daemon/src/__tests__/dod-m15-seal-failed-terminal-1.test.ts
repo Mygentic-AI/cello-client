@@ -309,3 +309,84 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the WRITE side is wired too", () => {
     }
   }, 30_000);
 });
+
+describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the branch production actually takes", () => {
+  /**
+   * Review HIGH-1's fix, and the revert test found it unheld — deleting the `record` on the RESOLVED
+   * branch left every test green, because the only write-side test forces a THROW.
+   *
+   * That is the finding's own defect repeating one level up. `escalateToUnilateralSeal` contains
+   * zero throws: all nine of its failure paths resolve with `{ ok: false, reason }`. So the branch
+   * with no test is the branch that fires in production, exactly as it was before the fix.
+   */
+  const AGENT4 = "agent-a";
+  const SESSION4 = "12".repeat(16);
+
+  it("★ a tail that RESOLVES ok:false records an 'unresolved' failure", async () => {
+    const { registerCloseSessionHandler } = await import("../close-session-handler.js");
+    const { SealFailureStore: Store } = await import("../seal-failure-store.js");
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    const store = new Store();
+    const backgroundSeals: Array<Promise<unknown>> = [];
+
+    registerCloseSessionHandler({
+      handlers,
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      sealFailures: store,
+      registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
+      sessionNodeManager: {
+        getSessionRecord: () => ({ agent_name: AGENT4, agent_id: "aid", session_id: SESSION4, status: "active" }),
+        submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 1, reportedRootHex: "aa".repeat(32) }),
+        // An EMPTY carry is one of the nine resolved failure reasons — no exception anywhere.
+        getSealCarry: () => [],
+        getSealCertificate: () => null,
+        resolveAgentId: () => "aid",
+        setSessionName: () => {},
+        sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
+      },
+      getConnState: () => ({ currentAgent: AGENT4 }),
+      resolveCurrentAgent: () => AGENT4,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32) }),
+      signalingFor: () => ({ status: "connected" }),
+      sendOver: async () => ({ ok: true }),
+      waitForSignalingConnected: async () => true,
+      openVisitingConnection: () => null,
+      crossNodeBrokerBySession: new Map<string, string>(),
+      sealKey: (a: string, s: string) => `${a}\x1f${s}`,
+      sealInterruptedInProgress: new Set<string>(),
+      pendingSealWaiters: new Map(),
+      pendingUnilateralWaiters: new Map(),
+      resolveConsortiumRoster: async () => [],
+      unilateralTimeoutMs: 10,
+      handleSealInterruptedFlow: async () => ({ ok: false, reason: "unused" }),
+      handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
+    } as never);
+
+    const close = handlers.get("cello_close_session")!;
+    const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
+    try {
+      const res = (await close({ session_id: SESSION4 }, "c1")) as Record<string, unknown>;
+      expect(res["seal_status"], "PRECONDITION: the handed-off path").toBe("committed");
+      await Promise.allSettled(backgroundSeals);
+
+      const rec = store.get(AGENT4, SESSION4);
+      expect(
+        rec,
+        "the ceremony RESOLVED without a receipt and nothing was recorded — which is the original " +
+          "HIGH-1 defect: the escalation never throws, so this is the branch that fires in " +
+          "production, and cello_sealed_receipt goes back to answering not_sealed_yet",
+      ).toBeDefined();
+      expect(
+        rec?.kind,
+        "and it must be marked 'unresolved', not 'threw' — they get different guidance because a " +
+          "resolved failure is often just a counterparty who has not closed yet",
+      ).toBe("unresolved");
+      expect(rec?.reason, "carrying the upstream reason, not a label").toBeTruthy();
+    } finally {
+      if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = prev;
+    }
+  }, 30_000);
+});
