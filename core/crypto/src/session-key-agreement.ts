@@ -99,6 +99,23 @@ export function generateSessionEphemeral(): SessionEphemeral {
   return { secretKey, publicKey: x25519.getPublicKey(secretKey) };
 }
 
+/**
+ * DESTROY THIS SIDE'S EPHEMERAL SECRET — `DOD-M15-KEYAGREE-1`, review F4.
+ *
+ * The line's clause is *"destroys the ephemerals at close"*, and it existed only as a sentence in a
+ * docstring telling the caller to do it. Forward secrecy is not a property of generating a fresh
+ * key; it is a property of the old one being GONE. A comment asserting that is the failure mode this
+ * milestone has caught five times in seal and persistence code, so it is code now.
+ *
+ * HONEST LIMIT: JavaScript cannot guarantee no copy survives. The garbage collector may have moved
+ * the buffer, and a `Uint8Array` handed across a module boundary may have been copied. Zeroing the
+ * buffer we hold removes the value from the one place we control, which is strictly better than not
+ * doing it and strictly weaker than the guarantee a language with explicit memory would give.
+ */
+export function destroySessionEphemeral(e: SessionEphemeral): void {
+  e.secretKey.fill(0);
+}
+
 /** Constant-time-ish all-zero check. Not secret-dependent branching — the input is already known bad. */
 function isAllZero(b: Uint8Array): boolean {
   let acc = 0;
@@ -131,21 +148,98 @@ export function deriveSessionSecrets(opts: {
    * parameter exists to avoid.
    */
   extraSharedSecret?: Uint8Array;
+  /**
+   * THE PQ TRANSCRIPT — review F8, and it is added NOW precisely because it cannot be added later.
+   *
+   * `extraSharedSecret` alone is not a complete hybrid combiner. Concatenating shared secrets is the
+   * right shape and matches TLS's X25519MLKEM768 and NIST SP 800-56C Rev 2 §2 — that part was
+   * checked and is sound. What it lacks is the KEM's PUBLIC material: X-Wing's combiner hashes
+   * `ss_pq ‖ ss_x ‖ ct_x ‖ pk_x`, binding the ciphertext and public key, and the current analysis
+   * ("On the Necessity of Public Contexts in Hybrid KEMs", eprint 2026/140) is that this is
+   * NECESSARY rather than belt-and-braces.
+   *
+   * A caller doing the obvious thing — passing only the ML-KEM shared secret — would get a hybrid
+   * whose ciphertext and public key are unbound. This parameter is where `ct_pq ‖ pk_pq` goes.
+   *
+   * It is empty today and that is the point: the DoD line's whole justification for building the
+   * hook before there is anything to put in it is that hybrid PQ must be *"an addition, not a
+   * rewrite."* Added after a wire format exists, this is a wire change — the exact rewrite the hook
+   * was meant to avoid.
+   */
+  pqTranscript?: Uint8Array;
 }): SessionSecrets {
   if (opts.peerEphemeralPublic.length !== X25519_KEY_BYTES) {
     throw new Error(
       `KEYAGREE: peer ephemeral public key must be ${X25519_KEY_BYTES} bytes, got ${opts.peerEphemeralPublic.length}. ` +
-      "Refusing rather than padding — a short key silently zero-extended is an agreement with something that is not the peer.",
+      "Refusing rather than padding — a short key silently zero-extended is an agreement with " +
+      "something that is not the peer. This check ALSO does double duty as the canonicalisation " +
+      "guard for the HKDF `info` (review F9): the label is recoverable as info[0 : len-64-|transcript|] " +
+      "only because both public keys are exactly 32 bytes. A variable-length public would let a " +
+      "crafted key make a content-key info equal a content-salt info.",
+    );
+  }
+  if (opts.ownEphemeralSecret.length !== X25519_KEY_BYTES) {
+    // Review F11: symmetric with the peer check above. `@noble` catches it, but names its own
+    // parameter rather than CELLO's key — the same substitution as F7, one layer down.
+    throw new Error(
+      `KEYAGREE: own ephemeral secret must be ${X25519_KEY_BYTES} bytes, got ${opts.ownEphemeralSecret.length}. ` +
+      "This is a local defect, not something the peer did.",
+    );
+  }
+  /**
+   * REFUSE A NON-CANONICAL PEER KEY — review F10, and it is a one-bit attack with no diagnosis.
+   *
+   * RFC 7748 §5 has X25519 MASK bit 255 of the u-coordinate, so `pk` and `pk | 0x80…` produce the
+   * SAME shared secret — but they are different BYTES, and the binding below uses the bytes as
+   * received, including in the sort comparison.
+   *
+   * So a relay that flips the top bit of one relayed ephemeral costs itself nothing: ECDH still
+   * agrees, but one side binds `pk` and the other binds `pk'`, possibly in a different sorted order.
+   * The two derive different keys, the session never decrypts, and nothing anywhere explains why —
+   * precisely the failure the sorted binding exists to prevent, achieved for one flipped bit.
+   *
+   * Refusing rather than masking, deliberately: masking would make the tamper invisible, and a peer
+   * sending a non-canonical encoding is either broken or probing. Say so.
+   */
+  if ((opts.peerEphemeralPublic[31] as number) & 0x80) {
+    throw new Error(
+      "KEYAGREE: the peer's ephemeral public key is non-canonical — bit 255 is set. X25519 masks " +
+      "that bit (RFC 7748 §5) so the agreement would still succeed, but the raw bytes are bound into " +
+      "the key derivation, so the two sides would derive DIFFERENT keys and the session would never " +
+      "decrypt with nothing explaining why. Refusing: a correct peer never sets it, and a flipped " +
+      "bit in transit is exactly what this catches.",
     );
   }
   if (opts.sessionId.length === 0) {
     throw new Error(
-      "KEYAGREE: sessionId must not be empty. It is bound in as the HKDF salt, which is what stops " +
-      "two sessions between the same peers from ever sharing a key.",
+      "KEYAGREE: sessionId must not be empty. It is bound in as the HKDF salt — the BACKSTOP against " +
+      "catastrophic ephemeral reuse. (Review F13: what ordinarily stops two sessions between the " +
+      "same peers sharing a key is the fresh ephemerals, not this. An earlier version of this " +
+      "message claimed the stronger thing.)",
     );
   }
 
-  const shared = x25519.getSharedSecret(opts.ownEphemeralSecret, opts.peerEphemeralPublic);
+  /**
+   * WRAPPED — review F7. `@noble` rejects a small-order or otherwise invalid point here, and its
+   * message is *"invalid private or public key received"*: it names neither CELLO, nor which of the
+   * two keys, nor the session. That is a third-party exit-point label standing in for the cause, on
+   * the path that ACTUALLY fires — while the carefully-written message below sits on the branch
+   * documented as unreachable.
+   */
+  let shared: Uint8Array;
+  try {
+    shared = x25519.getSharedSecret(opts.ownEphemeralSecret, opts.peerEphemeralPublic);
+  } catch (err: unknown) {
+    throw new Error(
+      "KEYAGREE: the peer's ephemeral public key is unusable for X25519 — it is invalid or a " +
+      `small-order point (RFC 7748 §6.1), so no session key can be agreed. Peer key began ` +
+      `${Buffer.from(opts.peerEphemeralPublic.subarray(0, 8)).toString("hex")}…. This is the peer's ` +
+      "key, not yours; a correct client never sends one. Refusing rather than deriving: a degenerate " +
+      "agreement yields a key the sender of that point also holds, while every message appears to " +
+      "encrypt normally.",
+      { cause: err },
+    );
+  }
 
   /**
    * FAIL CLOSED ON A DEGENERATE AGREEMENT — RFC 7748 §6.1.
@@ -175,6 +269,17 @@ export function deriveSessionSecrets(opts: {
 
   const ownPublic = x25519.getPublicKey(opts.ownEphemeralSecret);
   /**
+   * REFLECTION — the peer sent back our own ephemeral public. Standard hygiene: it is not a
+   * key-recovery attack against X25519, but it means the "peer" contributed nothing to the
+   * agreement, and both sorted halves would be identical. One line, refused.
+   */
+  if (Buffer.compare(Buffer.from(ownPublic), Buffer.from(opts.peerEphemeralPublic)) === 0) {
+    throw new Error(
+      "KEYAGREE: the peer's ephemeral public key is identical to our own — the peer contributed " +
+      "nothing to the agreement. Refusing: this is a reflection, not a handshake.",
+    );
+  }
+  /**
    * Both public keys bound into `info`, in CANONICAL (sorted) order.
    *
    * Sorted rather than by role, because the two daemons reach this point from different code paths
@@ -191,11 +296,16 @@ export function deriveSessionSecrets(opts: {
   ikm.set(shared, 0);
   ikm.set(extra, shared.length);
 
+  const transcript = opts.pqTranscript ?? new Uint8Array(0);
   const info = (label: Uint8Array): Uint8Array => {
-    const out = new Uint8Array(label.length + first.length + second.length);
+    const out = new Uint8Array(label.length + first.length + second.length + transcript.length);
     out.set(label, 0);
     out.set(first, label.length);
     out.set(second, label.length + first.length);
+    // TRAILING, so the label remains recoverable as info[0 : len-64-|transcript|] for a caller that
+    // knows the transcript length. It is empty today; when a hybrid fills it, both sides supply the
+    // same bytes or they diverge — which is the safe direction.
+    out.set(transcript, label.length + first.length + second.length);
     return out;
   };
 

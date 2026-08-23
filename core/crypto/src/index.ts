@@ -66,6 +66,7 @@ export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./cont
 // hybrid-PQ hook built in, producing both the content key and the content-hash salt.
 export {
   generateSessionEphemeral,
+  destroySessionEphemeral,
   deriveSessionSecrets,
   SESSION_KEY_BYTES,
   SESSION_SALT_BYTES,
