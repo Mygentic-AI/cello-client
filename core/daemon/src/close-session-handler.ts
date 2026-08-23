@@ -1332,13 +1332,36 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           // started yet", which a freshly booted daemon reports for every session. The genuinely
           // permanent case (the relay released the session) has its own reason,
           // `seal_carry_empty`, raised inside the escalation where it is actually known.
+          /**
+           * ⚠️ "USUALLY LOCAL AND TEMPORARY" IS NOT TRUE OF EVERY REASON, AND THE ONES IT IS FALSE
+           * FOR ARE THE ONES DESIGNED TO FAIL LOUD — review pass 2, MEDIUM-4.
+           *
+           * The sentence below was fixed text wrapped around whatever reason arrived. That is right
+           * for `standing_receiver_unavailable` and a relay this daemon cannot reach. It is wrong
+           * for the client-side seal-payload guards, which fire only on a deterministic defect that
+           * will never clear — and the operator was being sent to `cello_start_agent`, `cello_status`
+           * and an endless retry for a bug in this daemon.
+           *
+           * A guard built to fail loud, converted back into "try again later" by the sentence that
+           * reports it. Enumerated, never pattern-matched: a substring rule would absorb the next
+           * reason nobody has considered, which is the same collapse in a new coat.
+           */
+          const NON_RETRYABLE_SEAL_SUBMIT_REASONS: ReadonlySet<string> = new Set([
+            "seal_payload_not_carried",
+            "seal_payload_unbound",
+            "seal_payload_invalid",
+            "content_not_permitted_for_leaf_kind",
+          ]);
           return {
             ok: false,
             reason: uni.reason,
-            guidance:
-              `This session holds a bilateral commitment, but no notarization could be requested for it: ${uni.reason}. ` +
-              `That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). ` +
-              `The conversation is intact either way; retry cello_close_session once the daemon reports healthy.`,
+            guidance: NON_RETRYABLE_SEAL_SUBMIT_REASONS.has(uni.reason)
+              ? `This session holds a bilateral commitment, but no notarization could be requested for it: ${uni.reason}. ` +
+                `This one is NOT transient and retrying will not clear it — it is a defect in this daemon's seal path, refused locally before anything was sent. ` +
+                `The conversation is intact and nothing was disclosed. Report the reason code above; the daemon log carries the detail under session.relay.submit.*.`
+              : `This session holds a bilateral commitment, but no notarization could be requested for it: ${uni.reason}. ` +
+                `That is usually local and temporary — an agent that is not started yet (cello_start_agent), or a relay this daemon cannot currently reach (cello_status). ` +
+                `The conversation is intact either way; retry cello_close_session once the daemon reports healthy.`,
           };
         }
         if (uni.ok) return uni;

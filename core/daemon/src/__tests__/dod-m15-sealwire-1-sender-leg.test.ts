@@ -155,6 +155,21 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
      *
      * So this recomputes `SHA-256(0x02 ‖ payload)` from the bytes that actually went out and compares
      * it to the `content_hash` inside the signed Structure 1 of the same frame.
+     *
+     * ⚠️ THIS ALONE WAS HOLLOW, AND REVIEW PASS 2 SAID SO. It binds bytes the TEST supplied to a
+     * hash the TEST supplied, so it proves the frame carries what it was given — not that the
+     * production derivation gives the right thing. Making the parameter required catches an OMITTED
+     * argument; nothing caught a SUBSTITUTED one. A manager that re-derives the payload rather than
+     * passing the one it hashed compiles cleanly and was green here.
+     *
+     * Closed in TWO places rather than by widening this test:
+     *   - `submitLeaf` now re-derives and compares before sending, so the mismatch is a LOCAL
+     *     refusal (`seal_payload_unbound`) on the machine that caused it — asserted in the next
+     *     test — instead of an accusation published against a relay three hops away.
+     *   - and the manager's own derivation is covered end to end by `m8c-away-1.test.ts`, which
+     *     drives `submitSealLeaf` through a real `AgentRelayClient`. MEASURED: substituting a
+     *     re-derived payload at `session-node-manager.ts` turns that test red. Named here so the
+     *     coverage is findable, because it lives in a file about something else entirely.
      */
     const { client, relay, sid } = await connectedClient();
     const { payload, contentHash } = sealFor(sid);
@@ -187,6 +202,72 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
       Buffer.from(decoded!.session_id).equals(Buffer.from(sid)),
       "a payload naming another session is refused by the relay before it ever reaches the directory",
     ).toBe(true);
+  });
+
+  it("★★ AN UNBOUND OR NON-PAYLOAD CTRL LEAF IS REFUSED LOCALLY — pass 2, HIGH-1 and MEDIUM-1", async () => {
+    /**
+     * ⚠️ TWO PROPERTIES THE PARAMETER'S OWN JUSTIFICATION RESTS ON, AND NEITHER WAS ENFORCED.
+     *
+     * The justification for letting the client hand the relay leaf content at all is that a SEAL
+     * payload is `[session_id, final_root, close_timestamp, "PENDING"]` — four values the relay
+     * already knows. The code checked `leafKind === CTRL` and nothing else, so:
+     *
+     *   1. **Arbitrary bytes on a ctrl leaf were transmitted.** Four kilobytes of the operator's
+     *      text would have crossed the wire to the relay and been refused only there — after the
+     *      disclosure the local guard exists to prevent. The relay learned this exact lesson at its
+     *      own review one file over; I wrote the weaker version anyway.
+     *   2. **A payload that does not hash to the signed `content_hash` was transmitted.** This is
+     *      the worse one. The directory reports it as `seal_payload_unbound`, whose guidance reads
+     *      *"the relay is the only party on that path — treat this as relay tampering."* A
+     *      client-side derivation slip would be published as a named accusation against a relay
+     *      operator who did nothing.
+     *
+     * Both are refused here now, before the frame is built.
+     */
+    const { client, relay, sid } = await connectedClient();
+    const { payload, contentHash } = sealFor(sid);
+
+    // Authenticated first — a client that cannot send refuses everything for free, and both
+    // assertions below would then be measuring the handshake. (Same trap as the two tests above.)
+    const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
+    await authenticate(relay);
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    expect((await warmup).ok, "the client must be able to send, or the refusals below prove nothing").toBe(true);
+    const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
+
+    // (1) A real payload, but paired with someone else's hash — the substituted-argument shape that
+    //     the required-parameter change could not catch.
+    const unbound = await client.submitLeaf(relay.node, sid, new Uint8Array(32).fill(0xab), LEAF_KIND_CTRL, payload);
+    expect(unbound.ok, "a payload that does not hash to the signed content_hash must not be sent").toBe(false);
+    expect(
+      unbound.ok === false ? unbound.reason : "",
+      "and it must name the CLIENT's mistake — the directory would name the relay's innocence as guilt",
+    ).toBe("seal_payload_unbound");
+
+    // (2) Bytes that hash correctly but are not a SEAL payload at all — the operator's content
+    //     wearing a ctrl leaf. Hashed here so the refusal is unambiguously about the CONTENT,
+    //     not about the binding checked above.
+    const operatorText = new TextEncoder().encode("the merger price is 4.2m, do not forward this");
+    const textHash = new Uint8Array(
+      createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(operatorText).digest(),
+    );
+    const notAPayload = await client.submitLeaf(relay.node, sid, textHash, LEAF_KIND_CTRL, operatorText);
+    expect(notAPayload.ok, "arbitrary bytes on a ctrl leaf are still the operator's content").toBe(false);
+    expect(notAPayload.ok === false ? notAPayload.reason : "").toBe("seal_payload_invalid");
+
+    // (3) A well-formed payload for a DIFFERENT session — a replay, caught before the wire.
+    const otherSession = sealFor(new Uint8Array(16).fill(0x99));
+    const replay = await client.submitLeaf(relay.node, sid, otherSession.contentHash, LEAF_KIND_CTRL, otherSession.payload);
+    expect(replay.ok, "a payload naming another session must not be sent for this one").toBe(false);
+    expect(replay.ok === false ? replay.reason : "").toBe("seal_payload_invalid");
+
+    expect(
+      relay.sentFrames.filter((f) => f["type"] === "hash_submit").length - framesBefore,
+      "NOTHING may go out — the operator's text in case (2) is the whole reason this guard is local",
+    ).toBe(0);
+    client.close();
+
+    void contentHash;
   });
 
   it("★★ CONTENT ON A NON-CTRL LEAF IS REFUSED LOCALLY — before the operator's words leave the machine", async () => {

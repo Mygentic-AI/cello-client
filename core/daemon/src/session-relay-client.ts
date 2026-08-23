@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeSealPayload } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -933,6 +933,54 @@ export class AgentRelayClient {
       });
       return { ok: false, reason: "seal_payload_not_carried" };
     }
+    if (contentBytes !== null) {
+      /**
+       * ⚠️ THE BYTES MUST BE A SEAL PAYLOAD FOR THIS SESSION, AND THEY MUST HASH TO THE HASH BEING
+       * SIGNED — review pass 2, MEDIUM-1 and HIGH-1. The kind check alone was not the property this
+       * parameter's whole justification rests on.
+       *
+       * The justification is: *"the payload is [session_id, final_root, close_timestamp, "PENDING"]
+       * and the relay already knows all four, so nothing is disclosed."* The code enforced
+       * `leafKind === CTRL` and nothing else — so a caller passing a ctrl leaf with four kilobytes
+       * of the operator's text would have transmitted it, and been refused only at the relay, AFTER
+       * it crossed the wire to the party that must not have it. That is the precise harm the local
+       * guard exists to prevent, and the relay learned this same lesson at its own review (H1 in
+       * `relay-frames.ts`) one file over. I wrote the weaker version anyway.
+       *
+       * THE HASH BINDING IS THE MORE IMPORTANT HALF, and it closes a mutant that survived pass 1's
+       * type hardening. Making the parameter required catches an OMITTED argument; it cannot catch a
+       * SUBSTITUTED one. A caller that re-derives the payload instead of passing the one it hashed
+       * — a second `encodeSealPayload` call, a fresh `Date.now()` — compiles, and the mismatch
+       * surfaces at the directory as `seal_payload_unbound`, whose guidance reads *"someone between
+       * them and here altered or fabricated the payload — the relay is the only party on that path.
+       * Treat this as relay tampering, not a version mismatch."*
+       *
+       * **A client-side derivation slip would be published as a named accusation against a healthy
+       * relay operator.** Checking it here makes it a local refusal on the machine that caused it.
+       */
+      const rederived = new Uint8Array(
+        createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(contentBytes).digest(),
+      );
+      if (!Buffer.from(rederived).equals(Buffer.from(contentHash))) {
+        this.#logger.error("session.relay.submit.seal_payload_unbound", {
+          relayPeerId: this.#relayPeerId,
+          impact: "the seal leaf was NOT sent. The payload does not hash to the content_hash this leaf signs, so the directory would have reported it as RELAY TAMPERING — a named accusation against a node that did nothing wrong.",
+          guidance: "Pass the SAME bytes that produced contentHash. Re-deriving the payload at the call site produces a different close_timestamp and breaks the binding.",
+        });
+        return { ok: false, reason: "seal_payload_unbound" };
+      }
+      const decoded = decodeSealPayload(contentBytes);
+      if (!decoded || !Buffer.from(decoded.session_id).equals(Buffer.from(sessionId))) {
+        this.#logger.error("session.relay.submit.seal_payload_invalid", {
+          relayPeerId: this.#relayPeerId,
+          impact: "the submit was NOT sent. Only a SEAL payload for THIS session may be disclosed to the relay — arbitrary bytes on a ctrl leaf are still the operator's content, and a payload for another session is a replay.",
+          guidance: decoded
+            ? "The payload names a different session than the one being submitted."
+            : "The bytes are not a decodable SEAL payload. Build them with encodeSealPayload.",
+        });
+        return { ok: false, reason: "seal_payload_invalid" };
+      }
+    }
     // Chain on the prior submit so only one is outstanding at a time (FIFO). The ack
     // carries no session_id, so concurrent submits on one stream would be ambiguous.
     const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind, contentBytes));
@@ -1075,13 +1123,27 @@ export class AgentRelayClient {
       /**
        * `DOD-M15-SEALWIRE-1` bullets 3+4 — the SEAL payload, and ONLY on a ctrl leaf.
        *
-       * Spread so it is absent rather than `undefined` when there is nothing to carry: an explicit
-       * `content_bytes: undefined` encodes as a present CBOR key, and the relay's guard refuses a
-       * present-but-unusable value by voiding the whole frame. That would turn every ordinary
-       * message into a refused submit.
+       * ⚠️ MY REASON FOR THE SPREAD WAS MEASURABLY WRONG, AND THE TRUE RISK IS THE OPPOSITE ONE —
+       * review pass 2, MEDIUM-3, corrected rather than deleted.
        *
-       * `submitLeaf` has already established that this is set if and only if `leafKind` is ctrl —
-       * both directions refused there, at ERROR, before anything reaches the wire.
+       * It said an explicit `content_bytes: undefined` *"encodes as a present CBOR key, and the
+       * relay's guard refuses a present-but-unusable value by voiding the whole frame — that would
+       * turn every ordinary message into a refused submit."* Measured through the production encoder:
+       * the key IS emitted (0xf7), but it decodes back to `undefined`, so the relay's guard never
+       * fires and the frame is **accepted with no payload**.
+       *
+       * So the mutation does not produce a loud federation-wide refusal. It produces a silent
+       * `not_carried` at the directory — exactly the silent downgrade this whole unit exists to kill,
+       * and a far worse outcome than the one I warned about. Writing the scarier consequence would
+       * have sent the next reader hunting an availability bug instead of a mute one.
+       *
+       * The spread is still correct, and the ANCHOR test is what pins it: `"content_bytes" in frame`
+       * is TRUE for the `undefined` mutant precisely because the key is present, so that assertion —
+       * not the relay — is what catches this.
+       *
+       * `submitLeaf` has already established that this is set if and only if `leafKind` is ctrl, and
+       * that the bytes are a SEAL payload for this session hashing to the signed `content_hash` —
+       * every direction refused there, at ERROR, before anything reaches the wire.
        */
       ...(contentBytes !== null ? { content_bytes: contentBytes } : {}),
     }) as Uint8Array;
