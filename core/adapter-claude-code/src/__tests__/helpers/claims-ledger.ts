@@ -222,6 +222,179 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "`singleton-lock.ts` states the rule the old version broke: every stale-lock heuristic is an " +
       "attempt to guess what only the kernel knows.",
   },
+
+  // ─── README.md — the public repo's front page. Swept by DOD-M15-LEDGER-1, → Entry S1. ─────────
+  //
+  // The most exposed surface in the milestone now that AUDIT-ME.md is deleted: it is the first
+  // thing an evaluator with a coding agent reads, and every claim in it is checkable in minutes.
+
+  {
+    surface: "README.md",
+    claim: "Headline: 'relayed as encrypted blobs the relay cannot read'",
+    matches: 2,
+    verdict: "true",
+    evidence:
+      "The relay is a blind witness by construction, not by policy. It is bound to a session with " +
+      "both participants' pubkeys and receives signed content HASHES, and verifying a signature " +
+      "against a known pubkey never requires reading content — which is why the corroboration work " +
+      "in `DOD-M15-CORROBORATE-1` can be added without weakening this. Live content additionally " +
+      "travels inside libp2p's Noise session, so the relay is carrying ciphertext it holds no key " +
+      "for. Scope kept honest: this says the relay cannot read CONTENT. It does see who talks to " +
+      "whom, when, how often and how big — disclosed as a bounded property by `DOD-M15-DISCLOSE-1` " +
+      "rather than left for a reader to discover.",
+  },
+  {
+    surface: "README.md",
+    claim: "'ONE encrypted database' / 'the encrypted database' / 'inside the encrypted DB' (four places)",
+    matches: 4,
+    verdict: "true",
+    evidence:
+      "Whole-file SQLCipher, and the claim is stronger than it looks because there is no second " +
+      "home for key material to leak into: `db-identity-store.ts` keeps the Ed25519 seed, the " +
+      "FROST share, the ML-DSA keypair and the registration record in the `agents` table and its " +
+      "header states 'There is no flat-file home for any of it.' The daemon opens the file through " +
+      "`sqlcipher-db.ts`, and this project forbids `node:sqlite` repo-wide precisely because it " +
+      "stores plaintext — the eslint rule is the enforcement, not the comment.",
+  },
+  {
+    surface: "README.md",
+    claim: "Close produces 'a tamper-evident seal — bilateral when the counterparty is there to co-sign, unilateral when they are not, and the receipt says which.'",
+    matches: 1,
+    verdict: "corrected",
+    evidence:
+      "Said 'a tamper-evident bilateral seal', which promises the good case as the guarantee. " +
+      "`seal-escalation.ts:219` returns `seal_type: \"unilateral\"` when the counterparty never " +
+      "comes back, and `close-session-handler.ts:379` carries that variant on the success type — " +
+      "so the wire already distinguishes them and the README was the only surface still " +
+      "universalising. The IDENTICAL overclaim was corrected at the CLI surface by an earlier " +
+      "entry in this file; leaving the public front page contradicting `cello --help` is worse " +
+      "than either wording alone. Two further instances of the same word fixed in the same pass: " +
+      "the tools list's 'close and bilaterally seal' and the sealed-receipt description.",
+  },
+  {
+    surface: "README.md",
+    claim: "sealed-receipt: 'the notarized seal, and whether it is bilateral or unilateral'",
+    matches: 1,
+    verdict: "corrected",
+    evidence:
+      "Said 'the notarized bilateral seal' — false for exactly the receipt an operator is most " +
+      "likely to be holding when something went wrong, which is the same failure mode the CLI's " +
+      "own sealed-receipt summary was corrected for earlier in this file. `seal_type` is present " +
+      "on both the escalation and close-handler success variants, so the receipt can state which " +
+      "kind it is rather than the description promising the stronger kind.",
+  },
+  {
+    surface: "README.md",
+    claim: "'Not yet implemented — registered but the daemon returns not_implemented': inclusion-proof",
+    matches: 1,
+    verdict: "corrected",
+    evidence:
+      "THE CLAIM WAS FALSE IN THE UNDERSTATING DIRECTION, which is the case a claims audit is " +
+      "least likely to look for — and it was the most consequential instance in the file. The " +
+      "block listed `backup · restore · inclusion-proof`, but the daemon's not_implemented stub " +
+      "loop at `daemon.ts:3926` covers exactly ONE tool, `cello_get_inclusion_proof`. `backup` and " +
+      "`restore` are fully built (`registry.ts:345,375` call `createBackup`/`restoreBackup`; " +
+      "`DOD-M15-BACKUP-1` is closed and reviewed). So the README told operators 'Don't build on " +
+      "these yet' about the only feature that prevents permanent identity loss — five lines under " +
+      "its own sentence 'losing them means losing your identity', which also still said automated " +
+      "backup was unimplemented. Both places corrected; inclusion-proof stays listed because it " +
+      "genuinely is the one tool in that stub loop.",
+  },
+  {
+    surface: "README.md",
+    claim: "Read-before-write: \"You can't reply to something you never saw.\"",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "`session-content-handlers.ts:246` returns `reason: \"session_not_current\"` on the send " +
+      "path when unread inbound content exists, so the refusal is real code and not a convention. " +
+      "`vocabulary.ts:297` records that the reason string is a stable contract scripts branch on. " +
+      "The adapter's own `_fetch_content` docstring documents the live consequence of the gate " +
+      "(session 9bc456f6, 2026-08-07: a reply refused and lost because the connection had not " +
+      "drained), which is evidence the gate fires in production rather than only in tests.",
+  },
+  {
+    surface: "README.md",
+    claim: "'the cello_* tools remain available for the things a conversation cannot do'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Not a security claim — an operational statement about which verbs exist outside the bridge's " +
+      "delivery path, and it is checkable because it names them. All four are registered MCP tools " +
+      "in `cello-mcp.ts`: `cello_initiate_session`, `cello_close_session`, `cello_status`, " +
+      "`cello_sessions`. Counted rather than waved through because 'cannot' is claim vocabulary " +
+      "wherever it appears, and because a list of verbs is exactly the kind of prose that goes " +
+      "stale silently when a tool is renamed — the defect that shipped in the connect tarball's " +
+      "SKILL.md once already.",
+  },
+  {
+    surface: "README.md",
+    claim: "Bridge: 'the daemon's security gateway screens inbound content on the same path either way… not whether they are screened.'",
+    matches: 2,
+    verdict: "true",
+    evidence:
+      "The bridge does not introduce a second ingest path. `session-node-manager.ts:6326` calls " +
+      "`securityGateway.screenInbound(content, …)` inside the content-ingest routine every inbound " +
+      "message passes through, and the Hermes adapter reaches content only by calling " +
+      "`cello_receive` on its own daemon socket (`assets.ts` `_fetch_content`, whose docstring " +
+      "calls them 'the peer's screened words'). The gateway is also non-optional: `daemon.ts:365` " +
+      "refuses to start without one (INV-9) rather than defaulting to a permissive stub. NOTE the " +
+      "bound this row does NOT assert: it says screening RUNS on this path, not that screening is " +
+      "complete — the semantic layer is still uninstallable (`DOD-M15-SCREENINSTALL-1`) and that " +
+      "scope is stated separately in the Contacts section.",
+  },
+  {
+    surface: "README.md",
+    claim: "session_scope peer: 'two customers must never end up in one context'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "`assets.ts` `_chat_id_for` returns `agent_name + \"/\" + counterparty` under `peer` scope, " +
+      "and its docstring states the counterparty key is the PUBKEY, 'Never the moniker: a moniker " +
+      "is a mutable display label and reusable after retirement' — the project's stable-key rule " +
+      "applied in the one place where getting it wrong silently MERGES two customers' contexts, " +
+      "which is the exact harm the sentence promises against. Correctly scoped in the README too: " +
+      "the default `agent` scope deliberately shares one conversation and the text says so.",
+  },
+  {
+    surface: "README.md",
+    claim: "'a setting you cannot see in the command you just typed is a setting you will be surprised by later'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Design rationale, and the behaviour it describes is real: `install-hermes.ts:171` calls " +
+      "`upsertEnvLine(envPath, \"CELLO_SESSION_SCOPE\", sessionScope)` on every run with the " +
+      "resolved value, so omitting a flag rewrites the default rather than preserving a previous " +
+      "install's value. The adapter also refuses a typo instead of falling back — `_invalid_settings` " +
+      "rejects an unknown scope, whose docstring says 'session_scope: pear' must not quietly run " +
+      "as the default.",
+  },
+  {
+    surface: "README.md",
+    claim: "'A session name is private to you — never sent to the counterparty, the relay, or the directory'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Verified STRUCTURALLY rather than by inspection of send sites, which is what makes it hold " +
+      "against future edits: `session_name` appears in no wire type in `core/protocol-types/src`, " +
+      "so there is no field for it to travel in. It is a local column on the sessions table " +
+      "(`session-node-manager.ts`), documented as never entering a frame, the transcript, the seal " +
+      "or a Merkle leaf. Re-confirmed here rather than inherited from the earlier prose ledger row.",
+  },
+  {
+    surface: "README.md",
+    claim: "contact set-moniker: 'YOUR pet name for THEM (they cannot spoof it)'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "The claim needs checking precisely because a peer's OWN moniker does cross the wire — " +
+      "`protocol-types/src/moniker.ts` calls it 'a WIRE CONTRACT: the moniker crosses the wire on " +
+      "the session offer'. What makes the sentence true is that the two are separate columns and " +
+      "the inbound path cannot reach the local one: `recordOfferedMoniker` " +
+      "(`session-node-manager.ts:2413`) writes only `last_offered_moniker` and the notice queue, " +
+      "under a docstring stating 'The stored local pet name (contacts.moniker) is SACROSANCT'. A " +
+      "peer renaming itself raises a NOTICE to the operator; it never edits what they see.",
+  },
 ];
 
 /**

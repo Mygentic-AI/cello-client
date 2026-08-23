@@ -196,7 +196,12 @@ function surfaceTexts(): Map<string, string> {
  * line, plus two surfaces that were not being read at all.
  */
 const UNADJUDICATED_BASELINE: Record<string, number> = {
-  "README.md": 19,
+  // Paid down 19 → 2 by `DOD-M15-LEDGER-1` (→ Entry S1). The two that remain are ONE sentence —
+  // the headline's "bilaterally-sealed … both parties can independently verify". It is held back
+  // deliberately: it is false today (`DOD-M15-SEALWIRE-1` is what makes it true) and its
+  // replacement wording is outward-facing copy, which is Andre's call under M15-PROCEDURE §2f.
+  // Adjudicating it now would be exactly the laundering this file's own note below warns about.
+  "README.md": 2,
   "core/adapter-claude-code/SKILL.md": 30,
   "core/cli/src/registry.ts (operator-facing strings)": 37,
   "plugins/cello/agents/cello-receptionist.md": 8,
