@@ -296,10 +296,12 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the WRITE side is wired too", () => {
     try {
       await close({ session_id: SESSION3 }, "c1");
       expect(
-        store.get(AGENT3, SESSION3)?.reason,
+        store.get(AGENT3, SESSION3),
         "the stale verdict survived the retry, so the agent is told the seal is dead while its " +
-          "replacement ceremony is running — a stale reading presented as current",
-      ).not.toBe("a_previous_failure");
+          "replacement ceremony is running — a stale reading presented as current. " +
+          "(Asserting ABSENCE, not merely 'not the old reason': `.not.toBe(...)` would have passed " +
+          "if clear() had been replaced by a record() of something else — review §4.)",
+      ).toBeUndefined();
       await Promise.allSettled(backgroundSeals);
     } finally {
       if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];

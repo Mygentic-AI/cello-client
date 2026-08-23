@@ -9631,6 +9631,39 @@ export class SessionNodeManager {
 
     const record = this.getSessionRecord(agentName, sessionId);
     if (!record) return { ok: false, reason: "session_not_found" };
+    /**
+     * A REVIVED SESSION GETS ITS SEAL CHANCES BACK — `DOD-M15-SEAL-FAILED-TERMINAL-1` review
+     * MEDIUM-6, and without this a receipt can be lost permanently and silently.
+     *
+     * `restart_seal_gave_up_at` is written when the restart resolver exhausts its attempts, and
+     * NOTHING ever cleared it. Its stated purpose is narrow — *"a machine restarting ~6 times a day
+     * must not re-run five ceremonies against a hopeless session on every boot"* — and a session
+     * being revived is the opposite of hopeless: something is talking to it again.
+     *
+     * The path it closes: resolver gives up → the column is stamped → the session is REVIVED and
+     * carries live traffic → it is closed → the background ceremony dies → the in-memory failure
+     * marker is lost at the next restart → `listRestartOrphanedSessions` excludes the row forever on
+     * this column → and `listExpiredUnrevivableSessions` explicitly INCLUDES
+     * `restart_seal_gave_up_at IS NOT NULL`, so the revival sweep force-abandons it. Receipt gone,
+     * with no surface having ever said so.
+     *
+     * Bounded, because revival is not a boot-loop: it takes a live counterparty or an operator read.
+     */
+    // One statement, gated in SQL rather than on a field: `SessionRecord` does not carry this column
+    // and widening the type to read it once would spread it through every consumer. `changes` tells
+    // us whether it actually cleared, so the log stays a signal instead of firing on every revival.
+    const clearedGaveUp = this.#db
+      ?.prepare(
+        "UPDATE sessions SET restart_seal_gave_up_at = NULL, restart_seal_gave_up_reason = NULL " +
+        "WHERE agent_id = ? AND session_id = ? AND restart_seal_gave_up_at IS NOT NULL",
+      )
+      .run(this.resolveAgentId(agentName), sessionId);
+    if ((clearedGaveUp?.changes ?? 0) > 0) {
+      this.#logger.info("session.restart_seal.gave_up.cleared", {
+        agentName, sessionId,
+        impact: "this session is eligible for restart-seal recovery again — it is being revived, so it is not hopeless.",
+      });
+    }
     if (record.status === "sealed" || record.status === "abandoned" || record.status === "seal_interrupted_pending") {
       return {
         ok: false,

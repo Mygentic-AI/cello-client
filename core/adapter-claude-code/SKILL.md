@@ -166,8 +166,15 @@ cello_close_session({ cello_session_id: "<hex>", session_name: "Q3 budget review
 
 cello_sealed_receipt({ cello_session_id: "<hex>" })
 → { ok: false, reason: "seal_in_progress" }     # still running — wait and ask again, this is NOT a failure
+→ { ok: false, reason: "seal_failed", seal_failure_reason: "..." }   # it ran and produced no receipt
 → the notarized bilateral receipt both sides agree on
 ```
+
+`seal_failed` is not "still running" and not data loss. Your commitment is durable and the
+conversation is intact — the receipt was simply not produced. **Read `seal_failure_reason` before
+acting:** if it names the counterparty not having closed yet, the fix is to wait; if it names
+something about your own daemon (an agent not started, a directory it cannot reach — check
+`cello_status`), fix that and call `cello_close_session` again.
 
 **The close does NOT return `sealed_root`.** It answers as soon as your SEAL commitment is durable,
 because the ceremony waits for the counterparty to close too and can legitimately take up to eleven

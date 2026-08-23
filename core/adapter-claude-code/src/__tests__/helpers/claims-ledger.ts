@@ -184,6 +184,32 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "on nobody's list, which is why the scanner enumerates package.json#files.",
   },
   {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "seal_failed: 'Your commitment is durable and the conversation is intact — the receipt was simply not produced.'",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "DOD-M15-SEAL-FAILED-TERMINAL-1. Both halves are properties of code, not reassurance. " +
+      "DURABLE: the close only reaches the background ceremony after `submitSealLeaf` succeeds — " +
+      "the SEAL ctrl leaf is posted to the relay witness before the caller is answered, and a " +
+      "re-close recovers that same leaf rather than posting a second one " +
+      "(`#recoverOwnSealCtrlLeaf`), which is why a retry is safe. INTACT: a failed ceremony writes " +
+      "nothing to the transcript and does not change session status — the session stays `active` " +
+      "with its leaves, which is exactly why the restart seal resolver can still notarize it on a " +
+      "later boot. The one operation that DOES destroy the receipt is force-abandon, and the same " +
+      "guidance names it as the thing not to do.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "seal_failed: same sentence, plugin copy",
+    matches: 1,
+    verdict: "true",
+    evidence:
+      "Same text and same evidence as the tarball SKILL.md row above. Carried on BOTH surfaces for " +
+      "the same reason the backup rows are: the tarball copy is the one every hand-kept audit " +
+      "missed, so an entry that covers only the source copy leaves the shipped one unadjudicated.",
+  },
+  {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "restore: 'Refusing without proof is deliberate — this operation replaces your agent.'",
     matches: 1,

@@ -26,6 +26,22 @@
  * It also avoids a client-side schema migration, which this milestone treats as expensive on its own
  * terms — unrecoverable on an operator's machine if it goes wrong, and owed its own reviewed unit.
  * That is a real saving, but it is the second reason, not the first.
+ *
+ * ─── The two populations the restart does NOT retry (review MEDIUM-6) ──────────────────────────
+ *
+ * The argument above holds for an ordinary conversation, and that was verified rather than assumed.
+ * `listRestartOrphanedSessions` excludes two shapes, and this docstring used to imply neither
+ * existed:
+ *
+ *   `message_count > 0` — a closed session that carried no messages is never retried. Harmless: no
+ *   receipt was obtainable over nothing.
+ *
+ *   `restart_seal_gave_up_at IS NULL` — a session the resolver already exhausted. This one WAS a
+ *   real hole: nothing ever cleared that column, so a gave-up session that was later revived, used,
+ *   and closed could lose its in-memory marker at restart, be excluded from recovery forever, and
+ *   then be force-abandoned by the revival sweep (which explicitly includes `IS NOT NULL`) — a
+ *   receipt permanently forfeited with no surface ever saying so. `reviveSessionNode` now clears it:
+ *   a session something is talking to again is not the "hopeless session" the column was written for.
  */
 
 export interface SealFailure {
