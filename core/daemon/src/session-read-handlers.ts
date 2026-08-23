@@ -30,6 +30,19 @@ export interface SessionReadDeps {
   NO_CURRENT_AGENT_RESPONSE: unknown;
   /** MONIKER-5: pet name ?? offered ?? fingerprint — the same resolution the doorbell uses. */
   resolveWho: (agentName: string, pubkeyHex: string, sessionIdHex: string) => { who: string; whoKnown: boolean };
+  /**
+   * Is a seal ceremony in flight for this session — `DOD-M15-CLOSEWAIT-1` review HIGH-2.
+   *
+   * `cello_status` has carried this since `DOD-M12B-CLOSE-SILENT-WAIT-1`; the session LIST never
+   * did, and before CLOSEWAIT-1 nobody could observe the gap because the caller was blocked for the
+   * whole ceremony. Now "committed, notarizing in the background" is the normal state for up to
+   * eleven minutes — and without this the agent's own session list is byte-identical to a session it
+   * never closed. The likely agent response is to close again, which lands on a refusal.
+   *
+   * The DoD's own counterbalance clause requires it: *"the session must keep reading as sealing
+   * until it is not."*
+   */
+  isSealing: (agentName: string, sessionId: string) => boolean;
   /** Never vaults a cursor/watermark past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   safeWatermarkAdvance: (agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
@@ -61,6 +74,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance, attendanceCount,
     reapDeadHalfOpenSessions,
       frontierMismatches,
+      isSealing,
 } = deps;
 
   // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
@@ -174,12 +188,43 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
           }
         }
       }
-      // The session is THIS agent's — it simply has no seal certificate yet.
+      /**
+       * IS THE CEREMONY STILL RUNNING? — `DOD-M15-CLOSEWAIT-1` review HIGH-1.
+       *
+       * `not_sealed_yet` used to mean one thing, because the close blocked until the ceremony ended:
+       * if you were reading this, nothing was in flight. CLOSEWAIT-1 made "committed, notarizing in
+       * the background" the normal state for up to eleven minutes, and this answer could not tell
+       * that apart from "it finished and failed" — while the daemon knew, in the very maps
+       * `cello_status` already reads.
+       *
+       * Worse, the remedy below became UNREACHABLE by the same change: it says *"close it and
+       * confirm it reports sealed"*, and a close can no longer report sealed on this path. The two
+       * surfaces contradicted each other — the close said an empty answer means "still running, not
+       * failed", this one called it a known daemon defect.
+       */
+      if (isSealing(agentName, sessionId)) {
+        return {
+          ok: false,
+          reason: "seal_in_progress",
+          seal_status: "committed",
+          guidance:
+            "The seal ceremony for this session is RUNNING RIGHT NOW — this is not a failure and " +
+            "there is nothing to retry. Your SEAL commitment is recorded; the receipt appears here " +
+            "once the counterparty co-closes, or after the escalation to a unilateral seal. Wait and " +
+            "call cello_sealed_receipt again. Do NOT close again (it will be refused as already in " +
+            "progress) and do NOT use { force: true } — forcing ABANDONS the session and forfeits " +
+            "the receipt this ceremony is about to produce.",
+        };
+      }
+
+      // The session is THIS agent's — it simply has no seal certificate yet, and no ceremony is
+      // running for it either.
       return {
         ok: false,
         reason: "not_sealed_yet",
         guidance:
-          "This session exists but is not sealed yet. Close it with cello_close_session and confirm it reports sealed (or wait for the counterparty to co-seal), then retry. " +
+          "This session exists but is not sealed yet, and no seal ceremony is currently running for it. " +
+          "Close it with cello_close_session (it will answer immediately with seal_status \"committed\" and notarize in the background), then retry this once that finishes. " +
           "IF cello_close_session ALREADY reported session_already_sealed, do not close again — both answers are true and they point at each other. The seal completion never reached this side, so no local certificate exists and none can be produced here. " +
           "Do NOT use { force: true } to break out: it PERMANENTLY forfeits this side's half, and a receipt you cannot yet verify is still recoverable where a forfeited one never is. Leave the session as it is and tell the operator the session id and the counterparty's pubkey — this is a known daemon defect (the seal completion is pushed with no pull twin), not an error they caused.",
       };
@@ -320,6 +365,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       ...resolveWho(row.agent_name, row.counterparty_pubkey, row.session_id),
       status: row.status,
       category,
+      // Review HIGH-2: present only while a ceremony is actually in flight, so it stays a signal.
+      ...(isSealing(row.agent_name, row.session_id) ? { sealing: true } : {}),
       messageCount,
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString(),

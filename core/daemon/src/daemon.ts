@@ -3892,6 +3892,12 @@ async function startDaemonHoldingLock(
     logger,
     sessionNodeManager,
     loadedAgents,
+    // DOD-M15-CLOSEWAIT-1 review HIGH-2: the SAME predicate cello_status uses, so the two surfaces
+    // cannot disagree about whether a ceremony is in flight. Both maps, because either can be the
+    // one running — pendingSealWaiters is the active close, sealInterruptedInProgress the interrupted.
+    isSealing: (agentName, sessionId) =>
+      pendingSealWaiters.has(sealKey(agentName, sessionId)) ||
+      sealInterruptedInProgress.has(sealKey(agentName, sessionId)),
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
@@ -4559,7 +4565,22 @@ async function startDaemonHoldingLock(
             logger.error("document.delivery.seal_failed", { agent, sessionId, reason: "close_handler_missing", correlationId });
             return;
           }
-          const sealed = (await close({ session_id: sessionId, agent }, `doc-delivery-${correlationId}`)) as
+          /**
+           * `wait_for_seal: true` — DOD-M15-CLOSEWAIT-1 review MEDIUM-5.
+           *
+           * This is NOT an IPC caller. It is an in-process worker awaiting the close for a session
+           * it opened itself, and the `ok !== true` check below is the only thing that ever reports
+           * a failed document-delivery seal. The new default answers `ok: true` at COMMITMENT, so
+           * without this flag that check could never fire for a ceremony failure again — §16.4's
+           * "the autonomous session still carries the seal" would rest on a detached task nobody
+           * awaited, retried or reported on.
+           *
+           * The whole point of answering early is that a human is watching a terminal. Nobody is
+           * watching this one, so it takes the blocking form — which also stops each delivery
+           * leaving a detached ceremony holding a visiting connection for up to eleven minutes,
+           * overlapping instead of serialising.
+           */
+          const sealed = (await close({ session_id: sessionId, agent, wait_for_seal: true }, `doc-delivery-${correlationId}`)) as
             { ok?: boolean; reason?: string } | undefined;
           if (sealed?.ok !== true) {
             // `cello_close_session` has distinct failure codes — session_already_sealed,
