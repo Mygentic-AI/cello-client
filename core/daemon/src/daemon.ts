@@ -4192,7 +4192,11 @@ async function startDaemonHoldingLock(
       return { error: "no_current_agent", guidance: "Select an agent with cello_use_agent, or pass agentName." };
     }
     const agentId = sessionNodeManager.resolveAgentId(agentName);
-    retryQueue.enqueueAwaitingContent(agentId, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"));
+    // The fault-injection IPC seam. It states all three trailing values explicitly rather than
+    // relying on defaults (B2b-1 pass-2 F1): `undefined` for the ordering record and the algorithm
+    // is what this path genuinely has — it injects a bare queued entry — and saying so keeps the
+    // seam honest about what it is producing rather than inheriting whatever the signature assumed.
+    retryQueue.enqueueAwaitingContent(agentId, sessionId, Buffer.from(contentHashHex, "hex"), Buffer.from(contentHex, "hex"), undefined, undefined, undefined);
     return { queued: true, awaitingDepth: retryQueue.getAwaitingDepth(agentId, sessionId) };
   });
 

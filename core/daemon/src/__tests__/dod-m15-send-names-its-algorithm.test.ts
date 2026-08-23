@@ -30,6 +30,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import { decode } from "cbor-x";
 import { readFile } from "node:fs/promises";
 import { CONTENT_HASH_ALGS, contentHashFor } from "../wire-content-hash.js";
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 
 const SID = "7a".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
@@ -57,7 +58,7 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     const { hash, alg } = fx.snm.contentHashForSession("alice", SID, CONTENT);
-    await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", undefined, alg);
+    await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", LEAF_KIND_MSG, alg);
     await wait(200);
 
     const frame = sentFrames(node).find((f) => f["type"] === "content_frame");
@@ -81,7 +82,7 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     const { hash, alg } = fx.snm.contentHashForSession("alice", SID, CONTENT);
-    await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", undefined, alg);
+    await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr", LEAF_KIND_MSG, alg);
     await wait(200);
 
     const frame = sentFrames(node).find((f) => f["type"] === "content_frame")!;

@@ -1099,7 +1099,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
     | null = null;
 
   constructor(opts: {
@@ -1223,7 +1223,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -8104,7 +8104,15 @@ export class SessionNodeManager {
    * `unref`'d so an in-flight wait never keeps the daemon process (or a test runner)
    * alive on its own.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): void {
+  /**
+   * `contentHashAlg` is `string | undefined`, NOT optional — B2b-1 pass-2 F1.
+   *
+   * The previous fix applied this shape to `#parkContent` and left its SIBLING on the same code path
+   * optional, so dropping the argument here compiled clean and no test could see it — the TTF park
+   * route reads this map, and a v2 envelope omits the field entirely whenever the value is `sha256`,
+   * which is every value in play today. That re-opened the exact finding the fix closed.
+   */
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#k(agentName, sessionId);
     let bySession = this.#awaitingAck.get(ackKey);

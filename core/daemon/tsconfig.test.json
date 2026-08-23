@@ -24,6 +24,13 @@
     "src"
   ],
   "files": [
+    // `DOD-M15-SEALWIRE-1` B2b-1 pass-2 F3. Both are NEW and clean, which is this list's stated
+    // admission criterion — and both contained a real type error the gate could not see: they
+    // passed `undefined` for `leafKind`, which is now `number`, and it was silently rebuilt one hop
+    // below by `submitMessageHash`'s own default. A test file outside this allowlist is a file where
+    // "the mutants are typecheck failures now" is not true.
+    "src/__tests__/dod-m15-send-names-its-algorithm.test.ts",
+    "src/__tests__/dod-m15-retry-queue-column-upgrade.test.ts",
     "src/__tests__/msg-020-revival-bound.test.ts",
     "src/__tests__/msg-021-session-seed.test.ts",
     "src/__tests__/msg-022-session-rebuild.test.ts",

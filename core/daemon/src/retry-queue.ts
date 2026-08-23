@@ -615,7 +615,7 @@ export class RetryQueue {
    * what `resolveContentHashAlg` reads as "predates the field", and that distinction is the one B1
    * and B2a each had to restore after it was collapsed.
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): boolean {
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);

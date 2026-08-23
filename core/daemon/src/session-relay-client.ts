@@ -829,7 +829,13 @@ export class AgentRelayClient {
     node: CelloNode,
     sessionId: Uint8Array,
     contentHash: Uint8Array,
-    leafKind: number = LEAF_KIND_MSG,
+    /**
+     * REQUIRED — `DOD-M15-SEALWIRE-1` B2b-1 pass-2 F3. This default was the last one on the path,
+     * and it is the reason a test passing `undefined` for `leafKind` looked correct: the value was
+     * silently rebuilt as MESSAGE one hop below the parameter the fix had just made required. Its
+     * one production caller always passes explicitly, so the default was dead and misleading.
+     */
+    leafKind: number,
   ): Promise<SubmitResult> {
     return this.submitLeaf(node, sessionId, contentHash, leafKind);
   }

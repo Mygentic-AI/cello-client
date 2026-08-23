@@ -46,7 +46,8 @@ import { readFile } from "node:fs/promises";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
 import { RetryQueue } from "../retry-queue.js";
-import type { DaemonDatabase, Logger } from "../types.js";
+import type { Logger } from "../types.js";
+import type { DaemonDatabase } from "../sqlcipher-db.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger;
 
@@ -118,12 +119,15 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
      */
     const revived = new RetryQueue(db as unknown as DaemonDatabase, silent);
     revived.loadFromDb();
-    let seen: { contentHashAlg?: string } | null = null;
+    // Typed through a mutable holder rather than a bare `let`: TypeScript narrows a `let` assigned
+    // only inside a callback to `never` at the read, which is a real error this file could not see
+    // until it joined the typechecked allowlist (B2b-1 pass-2 F3).
+    const seen: { value: { contentHashAlg?: string } | null } = { value: null };
     await revived.drainAwaitingToPark("id-alice", sessionId, async (entry) => {
-      seen = entry;
+      seen.value = entry;
       return { parked: true };
     });
-    return seen;
+    return seen.value;
   }
 
   it("★ the algorithm survives enqueue → restart → the backstop's own read", async () => {
@@ -166,7 +170,23 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
       // a `[^)]*` group stops at the wrong one and reports a forwarded argument as missing.
       const start = root.indexOf(`${hook}: (`);
       expect(start, `${hook} must exist in daemon.ts`).toBeGreaterThan(-1);
-      const body = root.slice(start, root.indexOf("\n    },", start));
+      /**
+       * ⚠️ THE SLICE IS BOUNDED — B2b-1 pass-2 F2, and it was proven vacuous without this.
+       *
+       * Reindent that closing brace by two spaces (or wrap the enqueue in a `try`, which puts a `}`
+       * in front of the anchor) and `indexOf` slides to the NEXT match: the body grew 298 → 1002
+       * chars, swallowed the sibling hook, and every assertion below passed **with the argument
+       * deleted** — satisfied by the other hook's line. Green, blind, guarding nothing.
+       *
+       * A missing anchor is worse still: `slice(start, -1)` returns the rest of the file.
+       */
+      const end = root.indexOf("\n    },", start);
+      expect(end, `${hook}'s closing brace must be findable — an unbounded slice guards nothing`).toBeGreaterThan(start);
+      expect(
+        end - start,
+        `${hook}'s body is ${end - start} chars — too long to be one hook, so the slice has run past it into another`,
+      ).toBeLessThan(600);
+      const body = root.slice(start, end);
 
       expect(body, `${hook} must still call enqueueAwaitingContent`).toContain("enqueueAwaitingContent");
       const params = body.slice(body.indexOf("("), body.indexOf(")"));
@@ -184,7 +204,7 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
     // meaning legacy. Filling in the literal would erase the distinction B1 and B2a each restored.
     const db = freshQueueDb();
     const rq = new RetryQueue(db as unknown as DaemonDatabase, silent);
-    rq.enqueueAwaitingContent("id-alice", "s2", new Uint8Array(32).fill(0xb2), new TextEncoder().encode("hi"));
+    rq.enqueueAwaitingContent("id-alice", "s2", new Uint8Array(32).fill(0xb2), new TextEncoder().encode("hi"), undefined, undefined, undefined);
 
     const entry = await drainedEntry(db, "s2");
     expect(entry).not.toBeNull();
