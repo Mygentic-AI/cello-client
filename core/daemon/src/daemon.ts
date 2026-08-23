@@ -2061,6 +2061,13 @@ async function startDaemonHoldingLock(
     // SEC-1: sealParkEnvelope is the SOLE producer — it signs (sender's K_local, over the
     // session/recipient/content binding) and seals in one place, so the two park sites cannot drift
     // apart on what gets signed.
+    //
+    // 🚨 `DOD-M15-SEALWIRE-1` PART B2b MUST PASS `contentHashAlg` HERE. These two calls are the ONLY
+    // producers of a park envelope, and neither names an algorithm — so every envelope is v2, which
+    // is exactly right while nothing salts. The moment the send path salts and this does not, the
+    // recipient verifies a salted hash as `sha256`: the entry is refused, not annexed, and the relay
+    // copy is KEPT, so it is pulled and refused again on every drain. The value must be the same one
+    // the direct-path frame carries for this message, not re-derived from the session's own row.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: sessionId,
@@ -2135,6 +2142,13 @@ async function startDaemonHoldingLock(
     // empty after a restart, so arrival order there means a wrong leaf index and a divergent tree.
     // SEC-1: same sole producer as the live hook — the backstop signs from the persisted
     // (sessionId, recipient, contentHash).
+    //
+    // 🚨 `DOD-M15-SEALWIRE-1` PART B2b MUST PASS `contentHashAlg` HERE. These two calls are the ONLY
+    // producers of a park envelope, and neither names an algorithm — so every envelope is v2, which
+    // is exactly right while nothing salts. The moment the send path salts and this does not, the
+    // recipient verifies a salted hash as `sha256`: the entry is refused, not annexed, and the relay
+    // copy is KEPT, so it is pulled and refused again on every drain. The value must be the same one
+    // the direct-path frame carries for this message, not re-derived from the session's own row.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: entry.sessionId,
