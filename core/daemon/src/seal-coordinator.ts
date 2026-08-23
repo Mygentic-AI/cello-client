@@ -185,6 +185,14 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               });
             }
             logger.error("session.sealed.root.mismatch", {
+              /**
+               * `agentName` — review pass 1 on bullet 8, H2. Both verdict events carried only
+               * `sessionId`, and ONE DAEMON CAN HOST BOTH ENDS OF ONE SESSION (`DOD-LOOP-1`
+               * loopback). Two verdicts then land under the same key, indistinguishable, and a
+               * reader — or a journey scraping the log — attributes one end's answer to the other.
+               * It is also why `j-loopback` could not use the new journey assertion at all.
+               */
+              agentName,
               sessionId: sidHex,
               certifiedRoot: rootHex,
               ownRoot: rootCheck.ownRootHex,
@@ -202,6 +210,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             return;
           }
           logger.info("session.sealed.root.checked", {
+            agentName,
             sessionId: sidHex,
             verdict: rootCheck.verdict,
             ...(rootCheck.verdict === "cannot_judge" ? { reason: rootCheck.reason } : {}),
