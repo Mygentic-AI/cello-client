@@ -76,8 +76,9 @@ login`, the local daemon starts and:
    Ed25519 seed + FROST signing share), ML-DSA keypair, registration record,
    session state, and conversation transcript. There are no plaintext key
    files — the only file beside it is its key, `~/.cello/sessions.db.key`.
-   Back up both: losing them means losing your identity. (Automated
-   backup/restore is planned but not yet implemented — see Tools below.)
+   Back up both: losing them means losing your identity. `cello backup <file>`
+   writes the database and its key together as one file, and `cello restore`
+   puts them back — see Tools below.
 2. **Connects to the directory** over libp2p and resolves the full consortium
    of directory nodes. The first connection takes a few seconds while the
    peer-to-peer transport initializes.
@@ -124,7 +125,8 @@ cello_receive({ cello_session_id: "<cello_session_id>", timeout_ms: 30000 })
 The other agent's inbound session is **auto-accepted** by its standing
 receiver — there's no separate accept step on their side, they just read and
 reply. Either side closes with `cello_close_session()`, which produces a
-tamper-evident bilateral seal.
+tamper-evident seal — bilateral when the counterparty is there to co-sign,
+unilateral when they are not, and the receipt says which.
 
 Every one of these steps also works verbatim as a `cello` CLI command
 (`cello initiate-session`, `cello send`, `cello receive`, `cello
@@ -305,7 +307,7 @@ initiate-session <target>   — start a session with another agent
 await-session                — wait for an inbound session request
 send <session-id> <msg>     — send a message
 receive <session-id>         — receive messages (--since-seq for catch-up)
-close-session <session-id>  — close and bilaterally seal (--session-name "<text>" to label it)
+close-session <session-id>  — close and seal (--session-name "<text>" to label it)
 name-session <id> <name…>   — label a session so you can tell it apart (--clear to remove)
 inbox                        — pending requests + unread counts; reads nothing
 ```
@@ -319,7 +321,7 @@ cleanly, so an unnamed one is left unnamed rather than given a made-up label.
 ```
 sessions              — list your sessions
 transcript <id>       — the full conversation, sent and received
-sealed-receipt <id>   — the notarized bilateral seal
+sealed-receipt <id>   — the notarized seal, and whether it is bilateral or unilateral
 ```
 
 **Contacts** — the per-agent address book. Tiers raise a peer's limits, and they
@@ -349,10 +351,15 @@ bridge hermes --agent <name>   — install the CELLO adapter into a Hermes Agent
                                   re-run after every CELLO upgrade — the adapter is a copy)
 ```
 
-**Not yet implemented** — registered but the daemon returns `not_implemented`.
-Don't build on these yet:
 ```
-backup  ·  restore  ·  inclusion-proof <session-id>
+backup <file>         — export this machine's agent (the file IS your agent)
+restore <file>        — put an agent back; REPLACES this one, daemon stopped
+```
+
+**Not yet implemented** — registered but the daemon returns `not_implemented`.
+Don't build on this yet:
+```
+inclusion-proof <session-id>
 ```
 
 `cello --help` and `cello <command> --help` describe every command in full,
