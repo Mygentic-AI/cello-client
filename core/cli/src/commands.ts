@@ -380,14 +380,24 @@ export async function register(
   // bare Usage dump, never a pointless DKG round-trip to a generic dkg_failed for an obviously
   // malformed token. Client-side because a typo'd token and a missing one are knowable without the
   // directory. (Unknown-agent stays the daemon's job — it already returns a good agent_not_found.)
+  // DOD-M15-CLIJSON-1: the FAILURE branches emit JSON too, with the prose intact in `guidance` on
+  // stderr. These four are the ones a person scripting onboarding actually hits — an unset $TOKEN,
+  // a daemon that is not up — and prose on stdout breaks their pipe with a byte-offset parse error
+  // that hides the real problem. Same defect as the success path, one branch over.
+  const fail = (reason: string, guidance: string): CommandResult => ({
+    exitCode: 1,
+    output: JSON.stringify({ ok: false, reason, guidance }, null, 2),
+    guidance,
+  });
+
   if (!agent) {
-    return { exitCode: 1, output: "You didn't name an agent to register. Usage: cello register-agent <agent> <pre-auth-token>. See your agents with 'cello status'." };
+    return fail("missing_agent_name", "You didn't name an agent to register. Usage: cello register-agent <agent> <pre-auth-token>. See your agents with 'cello status'.");
   }
   if (!preAuthToken) {
-    return {
-      exitCode: 1,
-      output: `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register-agent ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register-agent ${agent}\nThe token is single-use and expires in 24 hours.`,
-    };
+    return fail(
+      "missing_preauth_token",
+      `You're missing the pre-auth token. Get a single-use token from the CELLO Operations Agent on Telegram, then run:\n  cello register-agent ${agent} <token>\nor set it in the environment:\n  CELLO_PREAUTH_TOKEN=<token> cello register-agent ${agent}\nThe token is single-use and expires in 24 hours.`,
+    );
   }
   // Client-side gate on the STABLE brand prefix only (real tokens are "CELLO-" + 33 base58 chars).
   // Checking just the prefix catches the common typo (pasting the literal words "CELLO_PREAUTH_TOKEN")
@@ -411,16 +421,16 @@ export async function register(
   // must never become a second authority on whether a capability is valid.
   const looksLikeCapability = hasCapabilityShape(preAuthToken);
   if (!looksLikeCapability && !preAuthToken.startsWith("CELLO-") && !preAuthToken.startsWith("DEV-")) {
-    return {
-      exitCode: 1,
-      output: "That doesn't look like a pre-auth token or capability — tokens start with 'CELLO-' followed by 33 characters, and a capability is a long base64url blob. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the value itself?) Get one from the CELLO Operations Agent on Telegram, then retry.",
-    };
+    return fail(
+      "malformed_preauth_token",
+      "That doesn't look like a pre-auth token or capability — tokens start with 'CELLO-' followed by 33 characters, and a capability is a long base64url blob. (Did you paste the words 'CELLO_PREAUTH_TOKEN' instead of the value itself?) Get one from the CELLO Operations Agent on Telegram, then retry.",
+    );
   }
 
   const lockFilePath = join(celloDir, "daemon.lock");
   const lock = await readLock(lockFilePath);
   if (!lock) {
-    return { exitCode: 1, output: "No daemon running. Run 'cello login' first, then retry registration." };
+    return fail("daemon_not_running", "No daemon running. Run 'cello login' first, then retry registration.");
   }
 
   try {
@@ -459,7 +469,7 @@ export async function register(
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    return { exitCode: 1, output: `Failed to register: ${message}` };
+    return fail("register_failed", `Failed to register: ${message}`);
   }
 }
 

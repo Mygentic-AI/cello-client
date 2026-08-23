@@ -61,9 +61,15 @@ export const USAGE =
   "\n" +
   "Run 'cello <command> --help' for details on any command.\n" +
   // Scoped deliberately: only the parity commands (jsonOut) honor the full §3 contract — JSON on
-  // stdout, structured error on stderr. The older commands (login, register-agent, …) still print
-  // human text, and their failures go to stdout. Claiming the contract for EVERY command would be a
-  // promise the binary does not keep, made to precisely the reader who would script against it.
+  // stdout, structured error on stderr. Some older commands (login, logout, backup, …) still print
+  // human text. Claiming the contract for EVERY command would be a promise the binary does not
+  // keep, made to precisely the reader who would script against it.
+  //
+  // DOD-M15-CLIJSON-1: this sentence USED to name `register-agent` among the human-text commands,
+  // and that is no longer true — it prints JSON on stdout and its guidance on stderr, on BOTH the
+  // success and failure paths. Leaving the old wording would have told the one reader it is
+  // addressed to — someone deciding whether to script onboarding — not to, about the command that
+  // now supports it.
   "The session and agent commands (agents, use-agent, initiate-session, send, receive, close-session,\n" +
   "…) print JSON and exit non-zero on failure, so any bash-capable agent can drive CELLO with no MCP\n" +
   "dependency. Where a command has an MCP tool, it carries the SAME name: cello send ↔ cello_send.";
