@@ -23,6 +23,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { CONTENT_HASH_ALGS, wireContentHash } from "../wire-content-hash.js";
+import { evaluateSealUpgrade } from "../seal-upgrade.js";
 import { deriveSessionSalt, saltedContentHash, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
@@ -32,6 +33,7 @@ const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const CONTENT = new TextEncoder().encode("the number is 4200");
 const PEER_HALF = new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x5c);
+const SID2 = "ab".repeat(32);
 
 function contentFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
@@ -200,13 +202,18 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
       fx = await startTwoConnectionFixture({ dirPrefix: `cello-alg-sec-${c.alg.slice(0, 6)}-` });
       await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
-      expect(fx.snm.getSealUpgradeReadiness("alice", SID).tampered, "precondition").toBe(false);
+      expect(fx.snm.getSealUpgradeReadiness("alice", SID).unverifiable, "precondition").toBeNull();
       await fx.snm.ingestReceivedContent("alice", SID, CONTENT, c.hash(), "corr", undefined, c.alg);
 
+      const readiness = fx.snm.getSealUpgradeReadiness("alice", SID);
       expect(
-        fx.snm.getSealUpgradeReadiness("alice", SID).tampered,
+        readiness.unverifiable,
         "content we could not verify must block co-signing, whatever the reason we could not",
-      ).toBe(true);
+      ).not.toBeNull();
+      // ...and it must carry WHY, not just whether — review F-A. A boolean here is what let the
+      // seal-upgrade consumer call an ordinary version skew a tamper.
+      expect(readiness.unverifiable, "an ordinary refusal is not a tamper claim").toBe("unverifiable");
+      expect(evaluateSealUpgrade(readiness).proceed, "and the kernel still refuses").toBe(false);
     }, 60_000);
   }
 
@@ -230,25 +237,115 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
     expect(String(failure.ctx!.impact)).toMatch(/claim by the sender|not covered by any signature/i);
   }, 60_000);
 
-  it("★ TAMPERED never downgrades — a later junk algorithm cannot clear an alarm already raised", async () => {
-    /**
-     * Otherwise a sender caught altering content clears its own alarm by sending one more frame with
-     * a junk algorithm name, and the seal auto-completes. The mark is one value per session, so
-     * without an explicit rule the last writer wins.
-     */
-    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-down-" });
+  /**
+   * ⚠️ THESE THREE REPLACE ONE TEST WHOSE DECISIVE ASSERTION NEVER RAN — review F-B.
+   *
+   * It read `if (skipped.length > 0) expect(...)`, and `skipped` was ALWAYS empty: the auto-ack gate
+   * has one production call site, inside the relay leaf handler behind
+   * `leaf_kind === CTRL && !authored_by_us`, and the test only called `ingestReceivedContent`. So
+   * the entire `content_tamper` vs `content_verification_unavailable` branch had no coverage
+   * anywhere in the repo, and two mutants on it survived the full 4382-test gate — including
+   * deleting the non-downgrade rule the test was named for.
+   *
+   * A conditional assertion is a wish. These drive the real gate and assert unconditionally.
+   */
+  it("★ a REAL tamper reaches the gate as content_tamper — the alarm the AC-008 rule keys on", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-alarm-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     await fx.snm.ingestReceivedContent(
       "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr",
     );
-    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr2", undefined, "junk-v1");
+    fx.snm.runAutoAcknowledgeGateForTest("alice", SID);
 
-    expect(fx.snm.getSealUpgradeReadiness("alice", SID).tampered).toBe(true);
     const skipped = fx.eventsNamed("session.seal.autoack.skipped");
-    if (skipped.length > 0) {
-      expect(skipped.at(-1)!.ctx!.reason, "the tamper label must survive").toBe("content_tamper");
-    }
+    expect(skipped.length, "the gate must refuse to auto-co-sign").toBe(1);
+    expect(skipped[0]!.ctx!.reason).toBe("content_tamper");
+  }, 60_000);
+
+  it("★ a VERSION SKEW reaches the same gate under a different name — refused, not alarmed", async () => {
+    /**
+     * The counterbalance, and the whole reason the label exists. Both refuse; only one is a security
+     * claim. Emitting `content_tamper` for an honest peer on a newer build teaches an operator to
+     * dismiss the alarm that matters.
+     *
+     * The name is also deliberately NOT `content_unverifiable` — that string is reserved for the
+     * deferred "parked content unrecoverable" case, and reusing it would make the two
+     * indistinguishable in the log the day that lands.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-skew-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, "junk-v1");
+    fx.snm.runAutoAcknowledgeGateForTest("alice", SID);
+
+    const skipped = fx.eventsNamed("session.seal.autoack.skipped");
+    expect(skipped.length, "it must still refuse — the gate is binary").toBe(1);
+    expect(skipped[0]!.ctx!.reason).toBe("content_verification_unavailable");
+    expect(skipped[0]!.ctx!.reason, "an honest newer build must not raise the tamper alarm").not.toBe("content_tamper");
+  }, 60_000);
+
+  it("★ TAMPERED never downgrades — in BOTH orderings, and the second is the attacker's", async () => {
+    /**
+     * Ordering one is the obvious one: caught altering content, then send a junk algorithm name to
+     * clear the alarm. Ordering two is the one review F-B pointed out was untested and is the one an
+     * attacker would actually choose — send the cheap innocent-looking junk frame FIRST, then tamper,
+     * hoping the earlier benign mark sticks.
+     *
+     * Asserting both is what pins the rule rather than the sequence I happened to think of.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-down-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.createSession(SID2, "alice", "bobpubkeyhex", PEER);
+
+    // Tamper, then junk. The junk must NOT overwrite the tamper mark.
+    await fx.snm.ingestReceivedContent(
+      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr",
+    );
+    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr2", undefined, "junk-v1");
+    fx.snm.runAutoAcknowledgeGateForTest("alice", SID);
+    expect(
+      fx.eventsNamed("session.seal.autoack.skipped").at(-1)!.ctx!.reason,
+      "a junk algorithm name must not clear an alarm already raised",
+    ).toBe("content_tamper");
+
+    // Junk, then tamper — on a separate session so the two orderings cannot mask each other.
+    await fx.snm.ingestReceivedContent("alice", SID2, CONTENT, wireContentHash(CONTENT), "corr3", undefined, "junk-v1");
+    await fx.snm.ingestReceivedContent(
+      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr4",
+    );
+    fx.snm.runAutoAcknowledgeGateForTest("alice", SID2);
+    expect(
+      fx.eventsNamed("session.seal.autoack.skipped").at(-1)!.ctx!.reason,
+      "a tamper after a benign refusal must UPGRADE the mark, not be absorbed by it",
+    ).toBe("content_tamper");
+  }, 60_000);
+
+  it("★ the seal-UPGRADE consumer draws the same distinction — the one the first fix missed", async () => {
+    /**
+     * Review F-A. The gate was made binary and the label moved into the log — in ONE consumer.
+     * `evaluateSealUpgrade` had only a boolean to read, so it called every cause `content_tamper`,
+     * at ERROR, with no guidance: an honest newer build raised a security alarm on B's reconnect.
+     * That is the same defect the earlier fix was written to remove, at the consumer it did not check.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-upg-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.createSession(SID2, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "c", undefined, "junk-v1");
+    await fx.snm.ingestReceivedContent(
+      "alice", SID2, CONTENT, wireContentHash(new TextEncoder().encode("different")), "c",
+    );
+
+    const skew = evaluateSealUpgrade(fx.snm.getSealUpgradeReadiness("alice", SID));
+    const tamper = evaluateSealUpgrade(fx.snm.getSealUpgradeReadiness("alice", SID2));
+    // BOTH refuse — the kernel is unchanged and that is non-negotiable.
+    expect(skew.proceed).toBe(false);
+    expect(tamper.proceed).toBe(false);
+    // And they refuse by DIFFERENT names, which is what decides ERROR-vs-WARN and what the operator
+    // is sent to look for.
+    expect(skew.proceed === false && skew.refuseReason).toBe("content_verification_unavailable");
+    expect(tamper.proceed === false && tamper.refuseReason).toBe("content_tamper");
   }, 60_000);
 });
 

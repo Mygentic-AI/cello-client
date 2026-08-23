@@ -31,20 +31,42 @@ function toU8(v: unknown): Uint8Array | null {
   return v instanceof Uint8Array ? v : Buffer.isBuffer(v) ? new Uint8Array(v as Buffer) : null;
 }
 
-/** Verifiability of a session for B to ratify a unilateral seal — the SAME bar as the auto-ack. */
-export interface SealUpgradeReadiness { known: boolean; tampered: boolean }
+/**
+ * Verifiability of a session for B to ratify a unilateral seal — the SAME bar as the auto-ack.
+ *
+ * `unverifiable` carries WHY, not just whether — `DOD-M15-SEALWIRE-1` part B1, review F-A.
+ *
+ * It was `tampered: boolean`, which was true while a hash mismatch was the only way to fail the
+ * cross-check. B1 added two more, and BOTH ARE ORDINARY: a peer on a newer build naming an
+ * algorithm this daemon cannot reproduce, and a salted frame arriving before the salt agreement
+ * landed. A boolean forces this file to call all three a tamper.
+ */
+export interface SealUpgradeReadiness {
+  known: boolean;
+  /** `null` when the content verified. Otherwise WHY it could not be verified. */
+  unverifiable: "tampered" | "unverifiable" | null;
+}
 
 /**
  * THE KERNEL DECISION. B may sign its ratification ONLY when it genuinely possesses + integrity-
  * verified the content behind R1. A session B has no record of (content_unrecoverable) or whose
- * content cross-check flagged tamper (content_tamper) is REFUSED. Verified-but-disliked content is
- * NOT a refusal — disagreement ≠ unverifiable.
+ * content it could not verify is REFUSED. Verified-but-disliked content is NOT a refusal —
+ * disagreement ≠ unverifiable.
+ *
+ * ⚠️ THE REFUSAL IS THE SAME FOR BOTH CAUSES; ONLY THE NAME DIFFERS. Never ratify content you could
+ * not verify — that is binary and it is the kernel. But `content_tamper` is a SECURITY claim, and
+ * emitting it for an honest peer on a newer build is the defect this split exists to remove: an
+ * alarm that fires on the benign case teaches an operator to dismiss the one that matters.
  */
 export function evaluateSealUpgrade(
   readiness: SealUpgradeReadiness,
-): { proceed: true } | { proceed: false; refuseReason: "content_unrecoverable" | "content_tamper" } {
+): { proceed: true } | {
+  proceed: false;
+  refuseReason: "content_unrecoverable" | "content_tamper" | "content_verification_unavailable";
+} {
   if (!readiness.known) return { proceed: false, refuseReason: "content_unrecoverable" };
-  if (readiness.tampered) return { proceed: false, refuseReason: "content_tamper" };
+  if (readiness.unverifiable === "tampered") return { proceed: false, refuseReason: "content_tamper" };
+  if (readiness.unverifiable) return { proceed: false, refuseReason: "content_verification_unavailable" };
   return { proceed: true };
 }
 
@@ -97,9 +119,25 @@ export async function attemptSealUpgrade(
     await deps.recoverContent(deps.agentName).catch(() => { /* per-relay errors logged inside */ });
     const decision = evaluateSealUpgrade(deps.getReadiness(deps.agentName, sessionIdHex));
     if (!decision.proceed) {
-      // KERNEL refusal. content_tamper is a SECURITY event (ERROR); content_unrecoverable is WARN.
+      /**
+       * KERNEL refusal. ERROR is reserved for the SECURITY case (review F-A): `content_tamper` is
+       * the only one of the three that says someone altered something. A version skew and a missing
+       * salt are WARN — they refuse just as hard, and paging on them would be crying wolf.
+       */
       const level = decision.refuseReason === "content_tamper" ? "error" : "warn";
-      deps.logger[level]("session.seal.upgrade.refused", { sessionId: sessionIdHex, reason: decision.refuseReason });
+      deps.logger[level]("session.seal.upgrade.refused", {
+        sessionId: sessionIdHex,
+        reason: decision.refuseReason,
+        // The refusal used to carry a bare reason and nothing else, so an operator paging on
+        // `content_tamper` was sent hunting an attacker with no next step. Both fields are now
+        // present for every cause, and neither asserts what the counterparty did.
+        impact: "this side refused to countersign the other party's seal, because it could not verify the content behind it. Nothing was signed. The transcript you already hold is unaffected.",
+        guidance: decision.refuseReason === "content_tamper"
+          ? "A message on this session failed its integrity check. Look for session.content.cross_check.failed with reason content_hash_mismatch. Do NOT ratify this seal; confirm out of band with your counterparty before starting a new session."
+          : decision.refuseReason === "content_verification_unavailable"
+            ? "A message on this session could not be checked — usually their CELLO build is newer than this one, sometimes the salt agreement had not completed. Look for session.content.cross_check.failed just above; its reason names which. Upgrading this daemon and starting a new session is the normal remedy. This is not evidence anyone did anything wrong."
+            : "This side holds no record of the content behind their seal, so there is nothing to ratify against. Start a new session; nothing was signed.",
+      });
       return { sent: false, reason: decision.refuseReason };
     }
 

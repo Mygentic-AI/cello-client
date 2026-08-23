@@ -65,6 +65,7 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
+import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import {
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
@@ -82,6 +83,15 @@ import {
 const AUTOACK_BROKER_GRACE_MS = 30_000;
 
 const MAX_REFUSED_PARKED_ENTRIES = 512;
+/**
+ * Per-session cap on remembered unreadable-algorithm frames (`DOD-M15-SEALWIRE-1` part B1).
+ *
+ * Fed by a REMOTE party — a peer on a newer build refuses every frame it sends — so it needs a
+ * bound for the same reason `MAX_REFUSED_PARKED_ENTRIES` does. Small on purpose: the entries exist
+ * only to reconcile a refusal with its park-route redelivery, which happens within seconds, and
+ * losing an old one costs a log line rather than correctness.
+ */
+const MAX_UNREADABLE_ALG_FRAMES = 64;
 
 /**
  * DOD-M12B-ACK-1 — inbound `/cello/content/1.0.0` streams allowed per connection.
@@ -873,14 +883,19 @@ export class SessionNodeManager {
   // for every gate to remember to consult, and the one that gets forgotten is the one that matters.
   #contentDesynced = new Map<string, "tampered" | "unverifiable">();
   /**
-   * Sessions where a frame named a content-hash algorithm this build cannot read, and the name it
-   * used — review F2. Read only by the park-recovery path, to say out loud when a frame refused on
-   * the direct path comes back through the store-and-forward route and is verified as `sha256`.
+   * Frames refused because they named a content-hash algorithm this build cannot read, keyed by
+   * session → the refused frame's content hash → the name it used. Review F2, corrected by F-D.
    *
-   * Bounded by the session set and cleared with the rest of the session's caches: one short string
-   * per affected session, never per frame.
+   * ⚠️ KEYED BY THE FRAME, NOT THE SESSION, and the first version was keyed by the session. That
+   * made it fire on the NORMAL case: after one junk-alg frame, every subsequent park recovery on
+   * that session logged a WARN forever, for entirely unrelated messages — and the text asserted the
+   * two events were "the same message arriving twice by different routes", which nothing had
+   * established. A warning that fires on the benign steady state is not a signal.
+   *
+   * Hash-keyed, the claim becomes a fact and the event fires exactly once per affected message: the
+   * entry is removed the moment it is reconciled.
    */
-  #unreadableAlgSeen = new Map<string, string>();
+  #unreadableAlgSeen = new Map<string, Map<string, string>>();
   // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
   // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
   // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
@@ -6046,14 +6061,23 @@ export class SessionNodeManager {
    * completeness check (the `desynced` reason) requires the deferred MSG-001-3b canonical-sequence
    * reconciliation — same documented limitation as the UP-2 gate above.
    */
-  getSealUpgradeReadiness(agentName: string, sessionId: string): { known: boolean; tampered: boolean } {
+  getSealUpgradeReadiness(agentName: string, sessionId: string): SealUpgradeReadiness {
     const record = this.getSessionRecord(agentName, sessionId);
     return {
       known: !!record,
-      // Review F1: `tampered` is TRUE for BOTH marks. B must never ratify a unilateral seal over
-      // content it could not verify, and the reason it could not is irrelevant to that decision —
-      // only to what the operator is told. The label lives in the log; the gate is binary.
-      tampered: this.#contentDesynced.has(this.#k(agentName, sessionId)),
+      /**
+       * THE REASON TRAVELS WITH THE VERDICT — review F-A, correcting review F1's fix.
+       *
+       * F1 made the gate binary and moved the label into the log, and I did that in ONE consumer.
+       * This struct feeds a second one (`evaluateSealUpgrade`), which had only a boolean to read and
+       * therefore called every cause `content_tamper` — at ERROR, with no guidance. An honest peer on
+       * a newer build raised a security alarm on B's reconnect: exactly the harm the F1 fix was
+       * written to remove, reached through the consumer it did not check.
+       *
+       * Returning the LABEL rather than a boolean is what makes that impossible to reintroduce: a
+       * caller cannot flatten what it never receives flat.
+       */
+      unverifiable: this.#contentDesynced.get(this.#k(agentName, sessionId)) ?? null,
     };
   }
 
@@ -6086,13 +6110,25 @@ export class SessionNodeManager {
     // Only an ACTIVE session auto-acks. A committed/sealing/sealed/interrupted session is out of
     // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
     if (!record || record.status !== "active") return;
-    // SI-002 verifiability gate: never auto-sign a session whose content we could not verify.
-    // Today the ONLY tracked unverifiable cause is a content_hash mismatch = TAMPER (#contentDesynced
-    // is set only there). Genuine tamper is a SECURITY event — log it at ERROR with the distinct
-    // reason `content_tamper` so the AC-008 tamper alarm can fire (it keys on that reason). The other
-    // two specced reasons — `desynced` (B's tree is behind the canonical sealed tail) and
-    // `content_unverifiable` (parked content unrecoverable) — require the MSG-001-3b canonical-
-    // sequence reconciliation that is deferred; they are reserved for that follow-on.
+    /**
+     * SI-002 verifiability gate: never auto-sign a session whose content we could not verify.
+     *
+     * ⚠️ THIS COMMENT SAID THE OPPOSITE UNTIL `DOD-M15-SEALWIRE-1` part B1 (review F-C). It read
+     * *"Today the ONLY tracked unverifiable cause is a content_hash mismatch = TAMPER"*, which was
+     * true when a mismatch was the only way to fail the cross-check and is false now: B1 added an
+     * unreadable algorithm name and a salted frame with no salt, and **both are ordinary**.
+     *
+     * Genuine tamper is a SECURITY event — ERROR, reason `content_tamper`, which is what the AC-008
+     * alarm keys on. The other two must NOT wear that name, or the alarm fires on an honest peer
+     * running a newer build and the operator learns to dismiss it.
+     *
+     * 🚨 AND `content_unverifiable` IS RESERVED — DO NOT REUSE IT HERE. It is specced for *parked
+     * content unrecoverable*, one of the two reasons (with `desynced`, B's tree behind the canonical
+     * sealed tail) awaiting the deferred MSG-001-3b canonical-sequence reconciliation. B1's first
+     * attempt emitted exactly that string for a different condition, which would have made the two
+     * indistinguishable in the log the day the follow-on landed. Hence
+     * `content_verification_unavailable`, deliberately distinct.
+     */
     const unverifiable = this.#contentDesynced.get(ackKey);
     if (unverifiable) {
       /**
@@ -6108,7 +6144,7 @@ export class SessionNodeManager {
        */
       this.#logger.error("session.seal.autoack.skipped", {
         sessionId,
-        reason: unverifiable === "tampered" ? "content_tamper" : "content_unverifiable",
+        reason: unverifiable === "tampered" ? "content_tamper" : "content_verification_unavailable",
         correlationId,
       });
       // AC-002: the verifiability gate refused — surface counterparty_closing to B's agent as a
@@ -6231,6 +6267,26 @@ export class SessionNodeManager {
    * could clear its own alarm by sending one more frame with a junk algorithm name, and the seal
    * would auto-complete.
    */
+  /**
+   * Remember that THIS frame was refused for naming an unreadable algorithm, so the park path can
+   * say so if the same message comes back the other way (review F2/F-D).
+   *
+   * BOUNDED, and it has to be: a peer that keeps sending unreadable frames would otherwise grow this
+   * without limit, and it is fed entirely by a remote party. The cap is per session and it drops the
+   * OLDEST entry — losing one only costs a missing reconciliation line, whereas an unbounded map fed
+   * by a counterparty is the leak class this codebase has already caught twice.
+   */
+  #noteUnreadableAlgFrame(agentName: string, sessionId: string, contentHash: Uint8Array, declaredAlg: string): void {
+    const key = this.#k(agentName, sessionId);
+    let byHash = this.#unreadableAlgSeen.get(key);
+    if (!byHash) { byHash = new Map(); this.#unreadableAlgSeen.set(key, byHash); }
+    if (byHash.size >= MAX_UNREADABLE_ALG_FRAMES) {
+      const oldest = byHash.keys().next();
+      if (!oldest.done) byHash.delete(oldest.value);
+    }
+    byHash.set(Buffer.from(contentHash).toString("hex"), declaredAlg);
+  }
+
   #markContentUnverifiable(agentName: string, sessionId: string, why: "tampered" | "unverifiable"): void {
     const key = this.#k(agentName, sessionId);
     if (why === "unverifiable" && this.#contentDesynced.get(key) === "tampered") return;
@@ -6335,7 +6391,7 @@ export class SessionNodeManager {
       // against, so `content_hash_mismatch` here would be an exit-point label standing in for
       // "their build is newer than ours" (Invariant 2). Refused by its own name instead.
       this.#markContentUnverifiable(agentName, sessionId, "unverifiable");
-      this.#unreadableAlgSeen.set(this.#k(agentName, sessionId), algResolved.value);
+      this.#noteUnreadableAlgFrame(agentName, sessionId, contentHash, algResolved.value);
       this.#logger.error("session.content.cross_check.failed", {
         sessionId, correlationId,
         reason: "content_hash_alg_unknown",
@@ -8377,13 +8433,17 @@ export class SessionNodeManager {
      * logged instead — the two events become one story, and B2 removes the ambiguity for real by
      * putting the name in the envelope.
      */
-    const priorAlgRefusal = this.#unreadableAlgSeen.get(this.#k(agentName, sessionId));
-    if (priorAlgRefusal) {
+    // Fires ONLY for the exact message that was refused, and only once — review F-D.
+    const byHash = this.#unreadableAlgSeen.get(this.#k(agentName, sessionId));
+    const priorDeclaredAlg = byHash?.get(contentHashHex);
+    if (priorDeclaredAlg !== undefined) {
+      byHash!.delete(contentHashHex);
+      if (byHash!.size === 0) this.#unreadableAlgSeen.delete(this.#k(agentName, sessionId));
       this.#logger.warn("content.recover.alg_refusal_reconciled", {
         agentName, sessionId, correlationId,
-        contentHash: Buffer.from(contentHash).toString("hex"),
-        priorDeclaredAlg: priorAlgRefusal,
-        impact: "a frame on this session was refused earlier because it named an algorithm this build cannot read; this recovered copy carries no algorithm name and is being verified as sha256. If it verifies, the two events are the same message arriving twice by different routes — not a resolved problem.",
+        contentHash: contentHashHex,
+        priorDeclaredAlg,
+        impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content hash has now arrived via the relay park, where no algorithm name travels and it is verified as sha256. The refusal did not hold: the message is being delivered by the other route.",
       });
     }
     return await this.ingestReceivedContent(
@@ -8584,6 +8644,24 @@ export class SessionNodeManager {
    * production writes rather than a parallel one, so a test cannot pass against state the daemon
    * never reads.
    */
+  /**
+   * Test seam: run the auto-acknowledge gate, exactly as the counterparty's SEAL ctrl leaf does.
+   *
+   * `DOD-M15-SEALWIRE-1` part B1, review F-B. The gate has ONE production call site — inside the
+   * relay leaf handler, behind `leaf_kind === CTRL && !authored_by_us` — so reaching it from a test
+   * needs a live relay client delivering a real ctrl leaf. The consequence was measured: my
+   * "tampered never downgrades" test wrapped its decisive assertion in
+   * `if (skipped.length > 0)`, which was ALWAYS FALSE, so the whole `content_tamper` vs
+   * `content_verification_unavailable` branch had no coverage anywhere in the repo and two mutants
+   * on it survived the full gate.
+   *
+   * It calls the REAL private method rather than reproducing its logic, so a test cannot pass
+   * against a decision production does not make.
+   */
+  runAutoAcknowledgeGateForTest(agentName: string, sessionId: string, correlationId = "test"): void {
+    this.#maybeAutoAcknowledgeSeal(agentName, sessionId, correlationId);
+  }
+
   setSaltContributionForTest(agentName: string, sessionId: string, contribution: Uint8Array): void {
     this.#saltContributions.set(this.#k(agentName, sessionId), contribution);
   }

@@ -150,9 +150,11 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     expect(B.events.find((e) => e.event === "session.content.received")).toBeDefined();
 
     // DOD-UP-1: content cross-checked cleanly → the session is verifiable, so B's upgrade gate is
-    // ready to ratify a unilateral seal (known, not tampered).
+    // ready to ratify a unilateral seal (known, nothing unverifiable).
+    // DOD-M15-SEALWIRE-1 part B1 (review F-A): `tampered: boolean` became `unverifiable: label|null`,
+    // because a refusal can now be an ordinary version skew and must not be reported as a tamper.
     const readiness = B.manager.getSealUpgradeReadiness("bob", SID);
-    expect(readiness.tampered).toBe(false);
+    expect(readiness.unverifiable).toBeNull();
     expect(readiness.known).toBe(true);
 
     // A: the delivery-ACK round-trips back over the same muxed connection and resolves the
@@ -198,8 +200,10 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(0);
 
     // DOD-UP-1 KERNEL: a tampered cross-check makes the session unverifiable — B must NOT ratify a
-    // unilateral seal for it (getSealUpgradeReadiness.tampered = true → the upgrade gate refuses).
-    expect(B.manager.getSealUpgradeReadiness("bob", SID).tampered).toBe(true);
+    // unilateral seal for it (the upgrade gate refuses on any non-null `unverifiable`).
+    // The LABEL is asserted, not just the refusal: a hash mismatch is the one cause that is a
+    // security claim, and B1 added two that are not (review F-A).
+    expect(B.manager.getSealUpgradeReadiness("bob", SID).unverifiable).toBe("tampered");
 
     // And A never gets an ACK (no delivery for tampered content) — its awaiting-ACK stays
     // armed (it is the TTF/recovery path's job, not this seam's, to drain it).

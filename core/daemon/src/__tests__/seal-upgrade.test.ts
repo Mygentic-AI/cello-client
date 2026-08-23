@@ -64,7 +64,7 @@ function attemptDeps(over: Partial<AttemptSealUpgradeDeps>): { deps: AttemptSeal
   const sent: Record<string, unknown>[] = [];
   const deps: AttemptSealUpgradeDeps = {
     logger, agentName: "agentB", agentPubkeyHex: bHex,
-    getReadiness: () => ({ known: true, tampered: false }),
+    getReadiness: () => ({ known: true, unverifiable: null }),
     getContentLeafCount: () => 10,
     recoverContent: async () => { /* no-op */ },
     getKeyProvider: () => keyB,
@@ -78,22 +78,27 @@ const UNI_FRAME = (): Record<string, unknown> => ({ session_id: SID, sealed_root
 
 describe("DOD-UP-1: evaluateSealUpgrade (pure gate)", () => {
   it("refuses unknown (content_unrecoverable) and tampered (content_tamper); proceeds when verified", () => {
-    expect(evaluateSealUpgrade({ known: false, tampered: false })).toEqual({ proceed: false, refuseReason: "content_unrecoverable" });
-    expect(evaluateSealUpgrade({ known: true, tampered: true })).toEqual({ proceed: false, refuseReason: "content_tamper" });
-    expect(evaluateSealUpgrade({ known: true, tampered: false })).toEqual({ proceed: true });
+    expect(evaluateSealUpgrade({ known: false, unverifiable: null })).toEqual({ proceed: false, refuseReason: "content_unrecoverable" });
+    expect(evaluateSealUpgrade({ known: true, unverifiable: "tampered" })).toEqual({ proceed: false, refuseReason: "content_tamper" });
+    // DOD-M15-SEALWIRE-1 part B1 (review F-A): a cause that is NOT a tamper refuses just as hard and
+    // must NOT wear the tamper name. `tampered: boolean` could not express this, so this consumer
+    // called an honest peer on a newer build a security event, at ERROR, on B's reconnect.
+    expect(evaluateSealUpgrade({ known: true, unverifiable: "unverifiable" }))
+      .toEqual({ proceed: false, refuseReason: "content_verification_unavailable" });
+    expect(evaluateSealUpgrade({ known: true, unverifiable: null })).toEqual({ proceed: true });
   });
 });
 
 describe("DOD-UP-1 KERNEL: attemptSealUpgrade refuses unless B genuinely possesses + verified content", () => {
   it("content_tamper → NO seal_upgrade_request sent (the kernel refusal)", async () => {
-    const { deps, sent } = attemptDeps({ getReadiness: () => ({ known: true, tampered: true }) });
+    const { deps, sent } = attemptDeps({ getReadiness: () => ({ known: true, unverifiable: "tampered" as const }) });
     const r = await attemptSealUpgrade(deps, SID_HEX, UNI_FRAME());
     expect(r).toEqual({ sent: false, reason: "content_tamper" });
     expect(sent).toHaveLength(0);
   });
 
   it("content_unrecoverable (session unknown) → NO request sent", async () => {
-    const { deps, sent } = attemptDeps({ getReadiness: () => ({ known: false, tampered: false }) });
+    const { deps, sent } = attemptDeps({ getReadiness: () => ({ known: false, unverifiable: null }) });
     const r = await attemptSealUpgrade(deps, SID_HEX, UNI_FRAME());
     expect(r).toEqual({ sent: false, reason: "content_unrecoverable" });
     expect(sent).toHaveLength(0);
