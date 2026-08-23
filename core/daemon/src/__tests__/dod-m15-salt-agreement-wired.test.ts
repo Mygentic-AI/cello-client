@@ -70,12 +70,16 @@ describe("DOD-M15-SEALWIRE-1 part A: an inbound contribution reaches the agreeme
      * peer's contribution verbatim, or a hash of one half, or random bytes — every one of which
      * leaves the counterparty deriving something else and every message discarded unread.
      *
-     * We cannot see the daemon's own contribution from out here, so we prove it the way the
-     * counterparty does: send back a fingerprint computed over the bytes that landed in the ROW, and
-     * require the daemon to answer `fingerprint_match`. That closes the loop the far side actually
-     * walks — stored salt → announced digest → the peer's comparison — and no mutant that writes
-     * something other than the agreed salt survives it, because the digest it confirms against is
-     * derived from the row rather than from anything it kept in memory.
+     * ⚠️ THIS TEST DOES NOT PROVE THE SALT IS THE AGREED VALUE, and its previous docblock claimed
+     * it did — review F2. Both sides of the comparison below come from the same row, so the daemon
+     * could store 32 random bytes and still answer `fingerprint_match`. What it proves is
+     * SELF-CONSISTENCY: the digest the daemon confirms against is derived from what it stored, not
+     * from something it kept only in memory. That is worth keeping and it is all it is.
+     *
+     * The property this unit exists for — that the TWO daemons compute the same value — cannot be
+     * checked from here, because this side never sees the daemon's own half. It is checked in
+     * `dod-m15-salt-announce-on-connect.test.ts`, where a real peer connection puts that half on
+     * the wire and the test derives the salt independently from both.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-b-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
@@ -203,12 +207,16 @@ describe("DOD-M15-SEALWIRE-1 part A: a disagreement stops the session, loudly", 
     expect(guidance, "and it must still say the transcript survived").toMatch(/cello_transcript/);
   }, 60_000);
 
-  it("★ a fingerprint we cannot possibly match freezes as STATE_DIVERGENT, not as a mismatch", async () => {
+  it("★ a peer fingerprint we cannot match REPAIRS — one dropped frame must not kill a live session", async () => {
     /**
-     * The restart case from the side whose record is gone. It matters that these two reasons stay
-     * apart: a mismatch means the two sides computed different values and points at a version skew,
-     * while divergence means one side simply has nothing — nobody's build is wrong and there is
-     * nothing to compare. Collapsing them would send an operator to look for a bug that is not there.
+     * This test asserted the opposite until review F1, and it was wrong because the code was.
+     *
+     * The state is reached by nothing exotic: our connect-time announce failed while theirs landed,
+     * so they derived and stored a salt and we never saw their half. Freezing here destroyed a
+     * healthy session over a single dropped frame — to defend a value that nothing consumes.
+     *
+     * Re-offering our half is what asks them for theirs, and `deriveSessionSalt` sorts its inputs,
+     * so the two converge on identical bytes.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-e-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
@@ -217,10 +225,34 @@ describe("DOD-M15-SEALWIRE-1 part A: a disagreement stops the session, loudly", 
     await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ fingerprint: saltFingerprint(theirSalt) }), PEER);
     await wait(400);
 
+    expect(fx.eventsNamed("session.salt.repair").length, "the out-of-step side must re-offer its half").toBe(1);
+    expect(fx.eventsNamed("session.salt.disagreement").length, "and must NOT refuse").toBe(0);
+    expect(fx.eventsNamed("session.salt.frozen").length).toBe(0);
+    // The session is still usable, which is the point — a frozen one is not revivable.
+    const revived = await fx.snm.reviveSessionNode("alice", SID, "after-repair");
+    expect((revived as { reason?: string }).reason ?? "", "a repaired session must not be frozen").not.toMatch(/frozen/);
+  }, 60_000);
+
+  it("★ our OWN broken random source is not reported as the counterparty's fault", async () => {
+    /**
+     * Review F3, at the level the operator actually meets it. `deriveSessionSalt` refuses our own
+     * all-zero half specifically so a broken local RNG is not blamed on the peer — and one catch
+     * mapping every throw to one peer-blaming reason undid that at the guidance layer, producing an
+     * instruction to raise it with the counterparty OUT OF BAND for a defect on this machine.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-i-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    fx.snm.setSaltContributionForTest("alice", SID, new Uint8Array(SALT_CONTRIBUTION_BYTES));
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(400);
+
     const disagreements = fx.eventsNamed("session.salt.disagreement");
     expect(disagreements.length).toBe(1);
-    expect(disagreements[0]!.ctx!.reason).toBe("salt_state_divergent");
-    expect(fx.eventsNamed("session.salt.frozen").length).toBe(1);
+    expect(disagreements[0]!.ctx!.reason).toBe("salt_own_contribution_degenerate");
+    const guidance = String(disagreements[0]!.ctx!.guidance);
+    expect(guidance, "it must say the problem is here").toMatch(/THIS MACHINE/);
+    expect(guidance, "and must NOT send them to accuse their counterparty").not.toMatch(/OUT OF BAND/);
   }, 60_000);
 
   it("★ a frame claiming BOTH states is refused before anything is derived", async () => {

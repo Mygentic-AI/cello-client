@@ -27,7 +27,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNode, CELLO_CONTENT_PROTOCOL_ID, type CelloNode } from "@cello-protocol/transport";
-import { generateKeypair, SALT_CONTRIBUTION_BYTES, SALT_FINGERPRINT_BYTES } from "@cello-protocol/crypto";
+import {
+  generateKeypair, deriveSessionSalt, saltFingerprint,
+  SALT_CONTRIBUTION_BYTES, SALT_FINGERPRINT_BYTES,
+} from "@cello-protocol/crypto";
 import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
@@ -204,5 +207,23 @@ describe("DOD-M15-SEALWIRE-1 part A: the announcement rides a real connection", 
     const fingerprint = announced["fingerprint"] as Uint8Array;
     expect(fingerprint.length).toBe(SALT_FINGERPRINT_BYTES);
     expect(fingerprint.length).toBeLessThan(SALT_CONTRIBUTION_BYTES);
+
+    /**
+     * ★ THE SINGLE MOST IMPORTANT ASSERTION IN THE UNIT, and until review F2 it did not exist.
+     *
+     * The wired file checked the stored salt by sending back a fingerprint DERIVED FROM THE ROW —
+     * so both sides of that comparison came from the same row, and the daemon could have stored 32
+     * random bytes and still answered `fingerprint_match`. It proved self-consistency, which any
+     * bytes satisfy. The one property the whole feature exists for — that the two daemons compute
+     * the SAME value — was untested.
+     *
+     * This is the counterparty's actual computation, done here independently: we hold both halves
+     * (theirs came off the wire, ours we chose), so we can derive the salt ourselves and check that
+     * what the daemon published is a digest of THAT. A daemon storing anything else fails here.
+     */
+    const theirHalf = inbox[0]!["contribution"] as Uint8Array;
+    expect(Buffer.from(fingerprint).toString("hex")).toBe(
+      Buffer.from(saltFingerprint(deriveSessionSalt(theirHalf, ours))).toString("hex"),
+    );
   }, 60_000);
 });

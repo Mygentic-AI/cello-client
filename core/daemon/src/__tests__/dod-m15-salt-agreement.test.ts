@@ -41,17 +41,23 @@ describe("Decision #8: two fresh sides converge on one salt", () => {
       .toBe(Buffer.from(AGREED).toString("hex"));
   });
 
-  it("★ BOTH SIDES REACH THE SAME BYTES — the test the whole exchange exists to make true", () => {
+  it("★ BOTH SIDES REACH THE SAME BYTES — run from each side, against an INDEPENDENT derivation", () => {
     /**
-     * Run the machine from each side's point of view, with the roles swapped. This is the property
-     * a per-side test cannot see: `deriveSessionSalt` sorts its inputs, so a side-agnostic
-     * derivation is exactly what makes "who sent first" irrelevant. If the machine ever passed its
-     * own contribution and the peer's in a role-dependent order, one of these two would move.
+     * The first version of this test compared the two sides against EACH OTHER and claimed that a
+     * role-dependent argument order would move one of them. That claim was false — review F12 —
+     * because `deriveSessionSalt` sorts its inputs, so both orders return the same bytes and the
+     * comparison was a tautology. The arg-swap mutant it was supposed to catch is caught by the
+     * blame-direction test instead.
+     *
+     * What is left worth asserting is the real property: each side reaches the value an outside
+     * observer computes from the two halves, so neither side's result depends on it having been the
+     * one that "went first".
      */
+    const independent = Buffer.from(deriveSessionSalt(OURS, THEIRS)).toString("hex");
     const us = onPeerSaltFrame({ ownSalt: null, ownContribution: OURS, frame: { contribution: THEIRS } });
     const them = onPeerSaltFrame({ ownSalt: null, ownContribution: THEIRS, frame: { contribution: OURS } });
-    expect(us.action === "derive_and_announce" && Buffer.from(us.salt).toString("hex"))
-      .toBe(them.action === "derive_and_announce" ? Buffer.from(them.salt).toString("hex") : "different");
+    expect(us.action === "derive_and_announce" && Buffer.from(us.salt).toString("hex")).toBe(independent);
+    expect(them.action === "derive_and_announce" && Buffer.from(them.salt).toString("hex")).toBe(independent);
   });
 
   it("★ the announcement carries the FINGERPRINT, never the salt — and the salt's bytes are absent", () => {
@@ -97,35 +103,149 @@ describe("Decision #10: a fingerprint that disagrees stops the session", () => {
   });
 });
 
-describe("Decision #8: the two states that cannot converge say so", () => {
-  it("★ we hold a salt and the peer offers a contribution — unrecoverable, and refused", () => {
-    /**
-     * The restart case, from the side whose record SURVIVED. The peer is starting the agreement
-     * over, which means their salt is gone; ours cannot be re-derived for them, because the salt is
-     * a one-way function of two contributions and neither of us keeps the inputs.
-     *
-     * Answering with our fingerprint would be worse than refusing: they would compare it against a
-     * salt they do not have, and the session would sit in a half-agreed state whose only symptom is
-     * discarded messages.
-     */
+describe("Decision #8: two sides out of step REPAIR rather than die — review F1", () => {
+  /**
+   * These three replace three tests that asserted the opposite, and the tests were wrong because
+   * the code was.
+   *
+   * The off-diagonal cells used to freeze the session, justified by a claim in the module header
+   * that turned out to be false: *"neither party keeps the inputs once it has the output."* We keep
+   * ours — for the life of the session node — and `deriveSessionSalt` sorts its arguments, so a
+   * side holding a salt can re-send its half and the peer lands on byte-identical bytes.
+   *
+   * That mattered because reaching the off-diagonal takes nothing exotic: one side's announce
+   * failing while the other's lands does it. So **one dropped frame destroyed a live session**, to
+   * defend a value that nothing consumes yet.
+   */
+  it("★ we hold a salt and the peer offers a contribution — we re-offer OUR HALF, not a refusal", () => {
     const action = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: OURS, frame: { contribution: THEIRS } });
-    expect(action.action).toBe("freeze");
-    expect(action.action === "freeze" && action.reason).toBe(SALT_FREEZE_REASONS.STATE_DIVERGENT);
+    expect(action.action).toBe("repair");
+    expect(
+      action.action === "repair" && Buffer.from(action.frame.contribution!).toString("hex"),
+      "the repair must send the half our salt was built from, or the peer lands on a different salt",
+    ).toBe(Buffer.from(OURS).toString("hex"));
+    expect(action.action === "repair" && action.frame.fingerprint, "one field, never both").toBeUndefined();
   });
 
-  it("★ we hold NO salt and the peer announces a fingerprint — the same divergence, other side", () => {
+  it("★ THE REPAIR ACTUALLY CONVERGES — the peer derives the salt we already hold", () => {
+    /**
+     * The assertion that makes the repair worth having rather than merely non-fatal. Run the peer's
+     * side of it: they receive our half and derive. If the result were not our stored salt, we would
+     * have "repaired" them onto a different value — the silent disagreement that is worse than the
+     * freeze this replaced.
+     */
+    const ourRepair = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: OURS, frame: { contribution: THEIRS } });
+    if (ourRepair.action !== "repair") throw new Error("expected repair");
+    const peerSide = onPeerSaltFrame({
+      ownSalt: null, ownContribution: THEIRS, frame: { contribution: ourRepair.frame.contribution! },
+    });
+    expect(peerSide.action).toBe("derive_and_announce");
+    expect(peerSide.action === "derive_and_announce" && Buffer.from(peerSide.salt).toString("hex"))
+      .toBe(Buffer.from(AGREED).toString("hex"));
+  });
+
+  it("★ we hold NO salt and the peer announces a fingerprint — we re-offer our half, which asks for theirs", () => {
     const action = onPeerSaltFrame({ ownSalt: null, ownContribution: OURS, frame: { fingerprint: saltFingerprint(AGREED) } });
-    expect(action.action).toBe("freeze");
-    expect(action.action === "freeze" && action.reason).toBe(SALT_FREEZE_REASONS.STATE_DIVERGENT);
+    expect(action.action).toBe("repair");
+    expect(action.action === "repair" && Buffer.from(action.frame.contribution!).toString("hex"))
+      .toBe(Buffer.from(OURS).toString("hex"));
   });
 
-  it("★ BOTH SIDES REACH THE SAME VERDICT on a divergence — neither one limps on", () => {
-    // A refusal only one side makes leaves the other sending into a session that is gone. Both
-    // halves of the divergent pair must freeze, or the loud failure is only half loud.
-    const survivor = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: OURS, frame: { contribution: THEIRS } });
-    const restarted = onPeerSaltFrame({ ownSalt: null, ownContribution: THEIRS, frame: { fingerprint: saltFingerprint(AGREED) } });
-    expect(survivor.action).toBe("freeze");
-    expect(restarted.action).toBe("freeze");
+  it("★ the ONE state that truly cannot converge: we hold a salt and our half is GONE", () => {
+    /**
+     * A restart after the salt was stored but before both sides confirmed. `null` here is not "we
+     * didn't look" — the caller never mints a fresh half for a session that already has a salt,
+     * precisely so this state stays distinguishable. Minting one would let us repair the peer onto
+     * a DIFFERENT salt with both sides believing they had agreed, which is the outcome worse than
+     * refusing.
+     */
+    const action = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: null, frame: { contribution: THEIRS } });
+    expect(action.action).toBe("freeze");
+    expect(action.action === "freeze" && action.reason).toBe(SALT_FREEZE_REASONS.STATE_DIVERGENT);
+    expect(action.action === "freeze" && action.detail).toMatch(/no longer hold the half/);
+  });
+
+  it("★ a genuine MISMATCH still tells the peer before stopping — Decision #10 wants both sides to refuse", () => {
+    /**
+     * The peer holds everything needed to run this identical comparison and has simply not been
+     * given our side of it. Without the notice the session just stops answering: our operator gets
+     * a full explanation and theirs gets silence.
+     */
+    const otherSalt = deriveSessionSalt(OURS, new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0xc3));
+    const action = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: OURS, frame: { fingerprint: saltFingerprint(otherSalt) } });
+    if (action.action !== "freeze") throw new Error("expected freeze");
+    expect(action.notifyPeer?.fingerprint, "the peer must be handed our digest before we go").toBeDefined();
+    expect(Buffer.from(action.notifyPeer!.fingerprint!).toString("hex"))
+      .toBe(Buffer.from(saltFingerprint(AGREED)).toString("hex"));
+    // And that notice must drive the peer to the SAME verdict, or the symmetry is decorative.
+    const peerVerdict = onPeerSaltFrame({
+      ownSalt: otherSalt, ownContribution: OURS, frame: { fingerprint: action.notifyPeer!.fingerprint! },
+    });
+    expect(peerVerdict.action).toBe("freeze");
+    expect(peerVerdict.action === "freeze" && peerVerdict.reason).toBe(SALT_FREEZE_REASONS.FINGERPRINT_MISMATCH);
+  });
+
+  it("★ the mismatch DETAIL prints both digests in hex, not their lengths", () => {
+    /**
+     * Review F5. It printed only lengths, so the ordinary case — two 8-byte digests that differ —
+     * told the operator *"ours is 8 bytes, theirs was 8"*, which reads as an equality on the one
+     * failure Decision #10 exists to make debuggable. Both values are one-way and both already
+     * crossed the wire in the clear.
+     */
+    const otherSalt = deriveSessionSalt(OURS, new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0xc3));
+    const action = onPeerSaltFrame({ ownSalt: AGREED, ownContribution: OURS, frame: { fingerprint: saltFingerprint(otherSalt) } });
+    if (action.action !== "freeze") throw new Error("expected freeze");
+    expect(action.detail).toContain(Buffer.from(saltFingerprint(AGREED)).toString("hex"));
+    expect(action.detail).toContain(Buffer.from(saltFingerprint(otherSalt)).toString("hex"));
+  });
+});
+
+describe("Decision #8: a LOCAL defect is never reported as the counterparty's — review F3", () => {
+  /**
+   * `deriveSessionSalt` throws for FOUR conditions and two of them are local: our own wrong length
+   * and our own all-zero. `session-salt.ts` added the second one specifically so the operator whose
+   * machine is broken is not told their counterparty did it — and a single catch mapping all four
+   * to one peer-blaming reason handed that accusation straight back at the guidance layer.
+   *
+   * It was also a surviving mutant: swapping the two arguments in the derive call left every reason
+   * code and every message-regex passing while every degenerate refusal blamed the wrong party.
+   */
+  it("★ OUR OWN all-zero half is its own reason, and its guidance says the machine is ours", () => {
+    const action = onPeerSaltFrame({
+      ownSalt: null, ownContribution: new Uint8Array(SALT_CONTRIBUTION_BYTES), frame: { contribution: THEIRS },
+    });
+    expect(action.action).toBe("freeze");
+    expect(action.action === "freeze" && action.reason).toBe(SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE);
+    expect(SALT_FREEZE_GUIDANCE[SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE]).toMatch(/THIS MACHINE/);
+    expect(
+      SALT_FREEZE_GUIDANCE[SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE],
+      "it must tell them NOT to raise it with their counterparty",
+    ).toMatch(/not your counterparty|they did nothing/i);
+  });
+
+  it("★ our own WRONG-LENGTH half is local too", () => {
+    const action = onPeerSaltFrame({ ownSalt: null, ownContribution: new Uint8Array(8), frame: { contribution: THEIRS } });
+    expect(action.action === "freeze" && action.reason).toBe(SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE);
+  });
+
+  it("★ THE BLAME DIRECTION IS PINNED — the arg-swap mutant dies here", () => {
+    /**
+     * Swap the arguments in the derive call and this pair inverts: a degenerate PEER half would
+     * report `OWN_CONTRIBUTION_DEGENERATE` and vice versa. Asserting both directions in one test is
+     * what makes the swap detectable — either alone still passes, because both messages contain
+     * "all zeros".
+     */
+    const peerBad = onPeerSaltFrame({
+      ownSalt: null, ownContribution: OURS, frame: { contribution: new Uint8Array(SALT_CONTRIBUTION_BYTES) },
+    });
+    const ownBad = onPeerSaltFrame({
+      ownSalt: null, ownContribution: new Uint8Array(SALT_CONTRIBUTION_BYTES), frame: { contribution: THEIRS },
+    });
+    expect(peerBad.action === "freeze" && peerBad.reason).toBe(SALT_FREEZE_REASONS.CONTRIBUTION_DEGENERATE);
+    expect(ownBad.action === "freeze" && ownBad.reason).toBe(SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE);
+    // And the operator-facing text points opposite ways, which is the part that actually matters.
+    expect(SALT_FREEZE_GUIDANCE[SALT_FREEZE_REASONS.CONTRIBUTION_DEGENERATE]).toMatch(/OUT OF BAND/);
+    expect(SALT_FREEZE_GUIDANCE[SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE]).not.toMatch(/OUT OF BAND/);
   });
 });
 
@@ -220,11 +340,21 @@ describe("every reason an operator can be shown has something for them to DO", (
   });
 
   it("★ the guidance never tells the reader to retry the thing that cannot work", () => {
-    // The lesson refusal-reasons.ts already paid for: an affordance that resolves to nothing is
-    // worse than none, because they will try to follow it. A frozen session is not retryable —
-    // only a NEW session is.
+    /**
+     * The lesson `refusal-reasons.ts` already paid for: an affordance that resolves to nothing is
+     * worse than none, because they will try to follow it. A frozen session is not retryable — only
+     * a NEW session is.
+     *
+     * Review F11: this matched the single literal "retry this session", so "try again",
+     * "reconnect and it will resolve" and "wait for them to come back" all sailed through. The
+     * pattern now covers the phrasings someone would actually write.
+     */
     for (const reason of Object.values(SALT_FREEZE_REASONS)) {
-      expect(SALT_FREEZE_GUIDANCE[reason], `${reason} tells them to retry`).not.toMatch(/retry this session/i);
+      expect(
+        SALT_FREEZE_GUIDANCE[reason], `${reason} points the operator at something that cannot work`,
+      ).not.toMatch(/try again|retry|reconnect|wait for them|wait for the/i);
+      // The move that DOES work has to be named, or the refusal is a dead end.
+      expect(SALT_FREEZE_GUIDANCE[reason], `${reason} names no way forward`).toMatch(/new session|another session/i);
     }
   });
 });

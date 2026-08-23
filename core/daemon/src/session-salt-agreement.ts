@@ -22,18 +22,36 @@
  * that can pick the branch is a sender that can steer the agreement. Both malformed shapes are
  * refused rather than resolved.
  *
- * ─── The four combinations, all of them terminal ───────────────────────────────────────────────
+ * ─── The four combinations ─────────────────────────────────────────────────────────────────────
  *
  *                          peer sent CONTRIBUTION            peer sent FINGERPRINT
- *   we hold NO salt        derive, persist, announce ours    ✗ STATE_DIVERGENT
- *   we HOLD a salt         ✗ STATE_DIVERGENT                 compare → confirmed | ✗ MISMATCH
+ *   we hold NO salt        derive, persist, announce ours    REPAIR: re-offer our half
+ *   we HOLD a salt         REPAIR: re-offer our half         compare → confirmed | ✗ MISMATCH
+ *                          (✗ DIVERGENT if our half is gone)
  *
- * The two divergent cells are the restart case seen from each side, and they **cannot be repaired
- * by retrying**. The salt is a one-way function of two contributions and neither party keeps the
- * inputs once it has the output — so a side whose record survived cannot re-derive it for a side
- * whose record is gone, and cannot accept theirs either. Answering with our fingerprint would be
- * strictly worse than refusing: they would compare it against a salt they do not have, and the
- * session would sit half-agreed with no symptom but discarded messages.
+ * ⚠️ THE OFF-DIAGONAL CELLS USED TO FREEZE THE SESSION, AND THAT WAS WRONG — review F1, and the
+ * justification written here for it was **false**.
+ *
+ * It said the salt "cannot be repaired by retrying… neither party keeps the inputs once it has the
+ * output." We DO keep our input: `#saltContributions` holds our half for the life of the session
+ * node, and `deriveSessionSalt` sorts its two arguments — so a side that holds a salt can simply
+ * re-send its own half and the peer derives **byte-identical** bytes.
+ *
+ * That mattered because the off-diagonal is not the exotic state the old text described. It is
+ * reached by ANY of:
+ *   - one side's connect-time announce failing (`#sendSaltFrame` logs and gives up until the next
+ *     connect) while the other's lands;
+ *   - one side's persist failing, so it re-offers a contribution while the other has stored one;
+ *   - a teardown between the two derives.
+ * **A single dropped frame therefore destroyed a live session** — a refusal that breaks availability
+ * to defend a value nothing has consumed yet. Repairing costs one frame and always converges.
+ *
+ * The cell is genuinely unrepairable in exactly one case, and the code now CHECKS it rather than
+ * assuming it: we hold a salt read back from the row, and our half is **gone** — evicted by a
+ * teardown, or never in this process at all after a restart. `ownContribution` is `null` there, and
+ * only there, because the caller never mints a fresh half for a session that already has a salt.
+ * Minting one would be worse than freezing: the peer would derive a DIFFERENT salt from it and both
+ * sides would believe they had agreed.
  *
  * ─── Why a refusal, and why it has to be loud ──────────────────────────────────────────────────
  *
@@ -59,7 +77,13 @@
  * without inheriting its union.
  */
 
-import { deriveSessionSalt, saltFingerprint, SALT_FINGERPRINT_BYTES } from "@cello-protocol/crypto";
+import { deriveSessionSalt, saltFingerprint, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
+
+function isAllZero(b: Uint8Array): boolean {
+  let acc = 0;
+  for (const x of b) acc |= x;
+  return acc === 0;
+}
 
 /**
  * The salt-agreement frame, as it rides `/cello/content/1.0.0`.
@@ -83,10 +107,20 @@ export interface SaltAgreementFrame {
 export const SALT_FREEZE_REASONS = {
   /** Both sides hold a salt and the digests differ. */
   FINGERPRINT_MISMATCH: "salt_fingerprint_mismatch",
-  /** One side holds a salt and the other does not — no retry converges. */
+  /** We hold a salt and our own half is gone, so the peer cannot be brought back to it. */
   STATE_DIVERGENT: "salt_state_divergent",
   /** The peer's contribution was all-zero, the wrong length, or our own echoed back. */
   CONTRIBUTION_DEGENERATE: "salt_contribution_degenerate",
+  /**
+   * OUR OWN half is degenerate — a broken or patched random source on THIS machine.
+   *
+   * Separate from `CONTRIBUTION_DEGENERATE` because the two send the operator to different places,
+   * and collapsing them undid a fix one layer down (review F3). `session-salt.ts` deliberately
+   * refuses our own all-zero half with *"this is a LOCAL defect… not something the peer did"*,
+   * precisely so the operator whose machine is broken is not told their counterparty did it — and
+   * mapping both throws to one peer-blaming reason handed that accusation straight back.
+   */
+  OWN_CONTRIBUTION_DEGENERATE: "salt_own_contribution_degenerate",
   /** The frame carried both fields or neither, so the sender's state is unreadable. */
   FRAME_MALFORMED: "salt_frame_malformed",
 } as const;
@@ -104,17 +138,27 @@ export type SaltFreezeReason = (typeof SALT_FREEZE_REASONS)[keyof typeof SALT_FR
  */
 export const SALT_FREEZE_GUIDANCE: Record<SaltFreezeReason, string> = {
   [SALT_FREEZE_REASONS.FINGERPRINT_MISMATCH]:
-    "STOPPED ON PURPOSE. You and your counterparty agreed different values for this session's " +
-    "content salt, so from here every message either of you sent would be discarded by the other " +
-    "with nothing said about it. Nothing was lost and nothing was tampered with — the two sides " +
-    "simply did not end up with the same value, which usually means one of you is running an older " +
-    "build. Compare versions with them, then start a new session.",
+    "STOPPED ON PURPOSE. You and your counterparty ended up with different values for this " +
+    "session's content salt, so from here every message either of you sent would be discarded by " +
+    "the other with nothing said about it. Nothing was lost and nothing was tampered with. Two " +
+    "things cause it: one of you is running an older build, or one side restarted midway through " +
+    "opening the session and came back without the half it had already sent. Check the log for " +
+    "session.salt.persist.failed or session.salt.announce.failed on either machine — if you see " +
+    "one, it was the restart and there is nothing to fix. Otherwise compare versions. Either way, " +
+    "start a new session.",
   [SALT_FREEZE_REASONS.STATE_DIVERGENT]:
-    "STOPPED ON PURPOSE. One side of this session still holds its content salt and the other has " +
-    "started over without one, which happens when a daemon comes back without its database. The " +
-    "two cannot be brought back into agreement: the salt is derived from two random halves that " +
-    "neither side keeps once it has the result. Nothing is broken and neither of you did anything " +
+    "STOPPED ON PURPOSE. This side holds the session's content salt but no longer holds the random " +
+    "half it was built from, so your counterparty — who is starting the agreement over — cannot be " +
+    "brought back to the same value. This happens when a daemon restarts after the salt was stored " +
+    "but before both sides had confirmed it. Nothing is broken and neither of you did anything " +
     "wrong. Start a new session; the transcript of this one is unaffected and still readable.",
+  [SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE]:
+    "STOPPED ON PURPOSE, AND THE PROBLEM IS ON THIS MACHINE — not your counterparty's. The random " +
+    "half this side generated for the session's content salt came out empty or the wrong size, " +
+    "which means the random source this daemon is using is broken or has been modified. Do not " +
+    "raise this with your counterparty; they did nothing. Check this machine's CELLO build and its " +
+    "system random source before opening another session, because every session it opens has the " +
+    "same defect.",
   [SALT_FREEZE_REASONS.CONTRIBUTION_DEGENERATE]:
     "STOPPED ON PURPOSE. Your counterparty's half of this session's content salt was empty, the " +
     "wrong size, or a copy of your own. Accepting it would have meant one side alone deciding a " +
@@ -137,16 +181,24 @@ export type SaltAgreementAction =
   | { action: "derive_and_announce"; salt: Uint8Array; fingerprint: Uint8Array }
   /** The peer's digest matches ours. Agreed; nothing more to send. */
   | { action: "confirmed" }
-  /** Stop the session, with a reason the operator can act on. */
-  | { action: "freeze"; reason: SaltFreezeReason; detail: string };
+  /**
+   * The two sides are out of step but CAN converge: re-send the exact frame given. Review F1 —
+   * this replaces two freezes that a single dropped frame could trigger.
+   */
+  | { action: "repair"; frame: SaltAgreementFrame; detail: string }
+  /**
+   * Stop the session, with a reason the operator can act on.
+   *
+   * `notifyPeer`, when present, is a frame to put on the wire BEFORE tearing down, so the
+   * counterparty reaches the same verdict instead of discovering the session by its absence. Only
+   * the fingerprint mismatch carries one: it is the sole refusal where the peer holds everything it
+   * needs to run the identical comparison and has simply not been given our side of it.
+   */
+  | { action: "freeze"; reason: SaltFreezeReason; detail: string; notifyPeer?: SaltAgreementFrame };
 
-function isTimingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
-  // Length first — a differing length IS a disagreement (see the wrong-width case below), and
-  // comparing a common prefix would let two sides that agree on half their digest call it a match.
+function digestsEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
-  let acc = 0;
-  for (let i = 0; i < a.length; i++) acc |= a[i]! ^ b[i]!;
-  return acc === 0;
+  return Buffer.from(a).equals(Buffer.from(b));
 }
 
 /**
@@ -163,10 +215,53 @@ export function ownSaltFrame(state: { ownSalt: Uint8Array | null; ownContributio
   return { contribution: state.ownContribution };
 }
 
-/** Decide what an inbound salt frame means. See the four-cell table in the header. */
+/**
+ * `isTimingSafeEqual` was the name; constant time is NOT required here and never was.
+ *
+ * Review F13: nothing pinned the constant-time property and nothing needs it — both operands are
+ * 8-byte one-way digests that the two sides have already exchanged in the clear, so there is no
+ * secret for a timing signal to leak. A name asserting a property nothing checks is the same defect
+ * as a comment asserting one, so the name says what the function does instead.
+ *
+ * The LENGTH check is the load-bearing half and is pinned by a test: a differing width IS a
+ * disagreement, and comparing a common prefix would let two sides that agree on half their digest
+ * call it a match.
+ */
+
+/**
+ * OUR OWN half, checked before it is used — review F3.
+ *
+ * `deriveSessionSalt` refuses four conditions and TWO OF THEM ARE LOCAL: our own wrong length and
+ * our own all-zero. A single `catch` around it mapped all four to one peer-blaming reason, which
+ * handed the operator an out-of-band accusation of their counterparty for a broken RNG on their own
+ * machine — undoing, at the guidance layer, the exact fix `session-salt.ts` added for it.
+ *
+ * Checking here means the primitive's throw can only ever be about the PEER's half by the time it
+ * is caught. It also kills a mutant the tests could not see: swapping the two arguments in the
+ * derive call left every reason code and every message-regex passing while every degenerate refusal
+ * blamed the wrong party.
+ */
+function ownHalfDefect(ownContribution: Uint8Array): string | null {
+  if (ownContribution.length !== SALT_CONTRIBUTION_BYTES) {
+    return `our own salt contribution is ${ownContribution.length} bytes rather than ${SALT_CONTRIBUTION_BYTES}. This is a LOCAL defect, not something the peer did.`;
+  }
+  if (isAllZero(ownContribution)) {
+    return "our own salt contribution is all zeros, so this side contributed nothing. This is a LOCAL defect — a broken or patched random source — not something the peer did.";
+  }
+  return null;
+}
+
+/**
+ * Decide what an inbound salt frame means. See the four-cell table in the header.
+ *
+ * `ownContribution` is `null` ONLY in the one state that cannot be repaired: we hold a salt read
+ * back from the row and the half it was built from is gone. The caller never mints a fresh half for
+ * a session that already has a salt — minting one would let us "repair" the peer onto a DIFFERENT
+ * salt, with both sides believing they had agreed.
+ */
 export function onPeerSaltFrame(state: {
   ownSalt: Uint8Array | null;
-  ownContribution: Uint8Array;
+  ownContribution: Uint8Array | null;
   frame: SaltAgreementFrame;
 }): SaltAgreementAction {
   const hasContribution = state.frame.contribution instanceof Uint8Array;
@@ -184,41 +279,72 @@ export function onPeerSaltFrame(state: {
 
   if (state.ownSalt) {
     if (hasContribution) {
+      // THE REPAIR (review F1). The peer is starting over; ours is a one-way function of two halves
+      // and `deriveSessionSalt` SORTS them, so re-sending our half lands them on byte-identical
+      // bytes. Freezing here destroyed live sessions over a single dropped frame.
+      if (!state.ownContribution) {
+        return {
+          action: "freeze",
+          reason: SALT_FREEZE_REASONS.STATE_DIVERGENT,
+          detail:
+            "we hold this session's salt but no longer hold the half it was built from — a teardown or a restart evicted it — so the peer, who is starting over, cannot be brought back to the same value. " +
+            "Offering a freshly minted half instead would put them on a DIFFERENT salt with both sides believing they had agreed.",
+        };
+      }
       return {
-        action: "freeze",
-        reason: SALT_FREEZE_REASONS.STATE_DIVERGENT,
-        detail:
-          "we hold this session's salt and the peer is offering a fresh contribution, which means theirs is gone. " +
-          "It cannot be re-derived for them — the salt is a one-way function of two contributions and neither side keeps the inputs.",
+        action: "repair",
+        frame: { contribution: state.ownContribution },
+        detail: "the peer is starting the agreement over; re-sending our half lands them on the salt we already hold",
       };
     }
-    if (isTimingSafeEqual(saltFingerprint(state.ownSalt), state.frame.fingerprint!)) {
+    if (digestsEqual(saltFingerprint(state.ownSalt), state.frame.fingerprint!)) {
       return { action: "confirmed" };
     }
     return {
       action: "freeze",
       reason: SALT_FREEZE_REASONS.FINGERPRINT_MISMATCH,
+      // BOTH DIGESTS IN HEX (review F5). This printed only lengths, so in the ordinary case — two
+      // 8-byte digests that differ — the operator was told "ours is 8 bytes, theirs was 8", which
+      // reads as an equality. Both values are one-way, public, and already crossed the wire.
       detail:
-        `the peer's salt fingerprint does not match ours (ours is ${SALT_FINGERPRINT_BYTES} bytes, ` +
-        `theirs was ${state.frame.fingerprint!.length}); every message from here would be discarded unread by one side or the other`,
+        `the peer's salt fingerprint does not match ours: ours ${Buffer.from(saltFingerprint(state.ownSalt)).toString("hex")}, ` +
+        `theirs ${Buffer.from(state.frame.fingerprint!).toString("hex")}. Every message from here would be discarded unread by one side or the other.`,
+      // The peer holds everything needed to run this same comparison and has not been given our
+      // side of it. Without this it learns nothing — the session simply stops answering.
+      notifyPeer: { fingerprint: saltFingerprint(state.ownSalt) },
     };
   }
 
-  if (hasFingerprint) {
+  // From here we hold no salt, so we are going to use our own half — check it before the primitive
+  // does, so a local defect cannot be reported as the peer's (review F3).
+  if (!state.ownContribution) {
     return {
       action: "freeze",
-      reason: SALT_FREEZE_REASONS.STATE_DIVERGENT,
-      detail:
-        "the peer already holds this session's salt and we do not, so we cannot reproduce it: the contributions it was derived from are gone on both sides. " +
-        "Announcing anything back would leave the session half-agreed, whose only symptom is discarded messages.",
+      reason: SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE,
+      detail: "this side holds neither a salt nor a contribution for the session, so it has nothing to agree with",
+    };
+  }
+  const localDefect = ownHalfDefect(state.ownContribution);
+  if (localDefect) {
+    return { action: "freeze", reason: SALT_FREEZE_REASONS.OWN_CONTRIBUTION_DEGENERATE, detail: localDefect };
+  }
+
+  if (hasFingerprint) {
+    // THE MIRROR REPAIR. They hold a salt, we do not. Re-offering our half is what prompts them to
+    // send theirs back, and then we derive the value they already have.
+    return {
+      action: "repair",
+      frame: { contribution: state.ownContribution },
+      detail: "the peer already holds a salt and we do not; re-offering our half is what asks them for theirs",
     };
   }
 
   try {
-    // The primitive owns every degeneracy rule — length, all-zero, reflection — and owns the
-    // WORDING too. Its refusals explain what a zero contribution means for both parties; replacing
-    // that with a code of our own would be exit-point substitution (Invariant 2), destroying the
-    // only explanation that exists at the only moment anyone will read it.
+    // The primitive owns every rule about the PEER's half — length, all-zero, reflection — and owns
+    // the WORDING too. Its refusals explain what a zero contribution means for both parties;
+    // replacing that with a code of our own would be exit-point substitution (Invariant 2),
+    // destroying the only explanation that exists at the only moment anyone will read it. Our own
+    // half was cleared above, so anything thrown here is about theirs.
     const salt = deriveSessionSalt(state.ownContribution, state.frame.contribution!);
     return { action: "derive_and_announce", salt, fingerprint: saltFingerprint(salt) };
   } catch (err: unknown) {

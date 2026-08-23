@@ -51,7 +51,7 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { verify, buildMerkleTree, merkleRoot, generateSaltContribution } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
@@ -8377,11 +8377,57 @@ export class SessionNodeManager {
   }
 
   /**
+   * Our half for a session, **without minting one** — review F1, and the distinction is the whole
+   * safety of the repair.
+   *
+   * A session that already holds a salt must never mint a fresh half. If it did, the repair would
+   * offer the peer a half the stored salt was NOT derived from, they would compute a different salt,
+   * and both sides would believe they had agreed — silently, which is the one outcome worse than
+   * refusing. So `null` from here means exactly "we hold a salt and the half behind it is gone",
+   * and that is the only state the agreement is allowed to call unrepairable.
+   */
+  #ownSaltHalf(agentName: string, sessionId: string): Uint8Array | null {
+    return this.#saltContributions.get(this.#k(agentName, sessionId)) ?? null;
+  }
+
+  /**
+   * Test seam: force this session's own salt half, so the LOCAL-defect path is reachable.
+   *
+   * `generateSaltContribution` cannot produce a degenerate half, which is the point of it — so the
+   * only way to exercise "our own random source is broken" end-to-end is to stand in for the broken
+   * source. Named `…ForTest` like every other seam in this file, and it writes the same map
+   * production writes rather than a parallel one, so a test cannot pass against state the daemon
+   * never reads.
+   */
+  setSaltContributionForTest(agentName: string, sessionId: string, contribution: Uint8Array): void {
+    this.#saltContributions.set(this.#k(agentName, sessionId), contribution);
+  }
+
+  /**
+   * The pair the agreement reasons over: our salt, and the half that goes with it.
+   *
+   * Minting is deliberate and conditional. With NO salt we are certain to need a half — to offer, or
+   * to derive with — so minting here is what makes the exchange work at all. WITH a salt we must
+   * never mint; see `#ownSaltHalf`.
+   */
+  #saltState(agentName: string, sessionId: string): { ownSalt: Uint8Array | null; ownContribution: Uint8Array | null } {
+    const ownSalt = this.#getSessionSalt(agentName, sessionId);
+    return {
+      ownSalt,
+      ownContribution: ownSalt
+        ? this.#ownSaltHalf(agentName, sessionId)
+        : this.#saltContributionFor(agentName, sessionId),
+    };
+  }
+
+  /**
    * This session's agreed salt, or null. Reads the durable row through a cache, because Decision #8
    * persists it for exactly one reason: *"a restart silently splits the transcript"* if the lookup
    * misses and a fresh salt is minted.
    *
-   * A read failure returns null WITH a log rather than throwing. Null here means "we hold no salt",
+   * A read failure returns null WITH a log rather than throwing — except the bare `!this.#db` guard,
+   * which is this file's convention at 60+ sites and only reachable during shutdown. Null means
+   * "we hold no salt",
    * which drives the agreement to offer a contribution — and against a peer that does hold one that
    * is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a diagnosis, not
    * in a session that quietly hashes under the wrong value.
@@ -8397,6 +8443,22 @@ export class SessionNodeManager {
         .get(this.#requireAgentId(agentName), sessionId) as { content_salt?: Uint8Array | null } | undefined;
       const stored = row?.content_salt;
       if (!stored || stored.length === 0) return null;
+      /**
+       * A WRONG-WIDTH ROW IS NOT A SALT — review F8.
+       *
+       * Any non-empty blob used to be accepted, so a truncated row became "our salt", the digests
+       * then differed, and the operator was told *"one of you is running an older build — compare
+       * versions with them"*: sent to their counterparty over corruption on their own disk. Refusing
+       * it here makes this side hold NO salt, which re-offers a contribution and repairs.
+       */
+      if (stored.length !== SESSION_SALT_BYTES) {
+        this.#logger.error("session.salt.read.failed", {
+          agentName, sessionId, storedBytes: stored.length, expected: SESSION_SALT_BYTES,
+          reason: "wrong_width",
+          impact: "the stored salt is the wrong size, so it is not used; this session is treated as holding no salt and will re-agree one with the counterparty rather than comparing a corrupt value and blaming their build",
+        });
+        return null;
+      }
       const salt = new Uint8Array(stored);
       this.#sessionSalts.set(key, salt);
       return salt;
@@ -8418,7 +8480,17 @@ export class SessionNodeManager {
    * silent split it exists to prevent, one restart later.
    */
   #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
-    if (!this.#db) return false;
+    if (!this.#db) {
+      // NOT a silent return — review F7. The other two persist failures each emit an event, so a
+      // derive that could not store because the handle is closed was the ONE salt path producing no
+      // record at all. Only reachable during shutdown, which is exactly when a lone unexplained
+      // gap in the log is hardest to account for later.
+      this.#logger.error("session.salt.persist.failed", {
+        agentName, sessionId, reason: "db_closed",
+        impact: "the salt was NOT stored and is not announced; the agreement stays open and re-runs on the next connect",
+      });
+      return false;
+    }
     try {
       /**
        * THE ROW COUNT IS THE CHECK, and without it this method reported success for a write that
@@ -8466,10 +8538,13 @@ export class SessionNodeManager {
    * where an unanswered agreement becomes a session that cannot send and needs a bounded wait with
    * a named failure. Do not carry this comment forward unchanged into that unit.
    */
-  async #sendSaltFrame(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
+  async #sendSaltFrame(agentName: string, sessionId: string, correlationId?: string, override?: SaltAgreementFrame): Promise<void> {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) return;
-    const frame = ownSaltFrame({
+    // `override` is the repair and the mismatch notice: a frame the AGREEMENT chose, which is not
+    // the one our current state would produce. A side that holds a salt normally announces a
+    // fingerprint — the repair has it send its CONTRIBUTION instead, which is the whole mechanism.
+    const frame = override ?? ownSaltFrame({
       ownSalt: this.#getSessionSalt(agentName, sessionId),
       ownContribution: this.#saltContributionFor(agentName, sessionId),
     });
@@ -8493,7 +8568,11 @@ export class SessionNodeManager {
     } catch (err: unknown) {
       this.#logger.warn("session.salt.announce.failed", {
         agentName, sessionId, correlationId, error: extractErrorMessage(err),
-        impact: "the counterparty was not told our salt state on this attempt; we re-announce on every reconnect, and nothing hashes with the salt yet, so no message is affected",
+        // Review F1: this used to end "so no message is affected", which was FALSE in the situation
+        // it fires in — a one-sided announce is exactly what put the two sides out of step, and the
+        // peer used to freeze the session over it. It converges now, so the claim is true again;
+        // it is stated with its reason rather than as a bare reassurance.
+        impact: "the counterparty was not told our salt state on this attempt. We re-announce on every reconnect, and a side that is out of step re-offers its half rather than refusing, so the agreement converges from here; nothing hashes with the salt yet, so no message is affected.",
       });
       if (saltStream !== undefined) {
         try { saltStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
@@ -8508,11 +8587,7 @@ export class SessionNodeManager {
     frame: SaltAgreementFrame,
     correlationId?: string,
   ): Promise<void> {
-    const action = onPeerSaltFrame({
-      ownSalt: this.#getSessionSalt(agentName, sessionId),
-      ownContribution: this.#saltContributionFor(agentName, sessionId),
-      frame,
-    });
+    const action = onPeerSaltFrame({ ...this.#saltState(agentName, sessionId), frame });
     if (action.action === "confirmed") {
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "fingerprint_match",
@@ -8524,7 +8599,25 @@ export class SessionNodeManager {
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "derived",
       });
-      await this.#sendSaltFrame(agentName, sessionId, correlationId);
+      // `void`, not `await` — review F10. This runs inside the INBOUND content-stream handler, so
+      // awaiting an outbound `newStream` here lets a stalled dial hold up the stream we are reading.
+      // The connect-side call is `void`-ed for the same reason and this is now consistent with it.
+      void this.#sendSaltFrame(agentName, sessionId, correlationId);
+      return;
+    }
+    if (action.action === "repair") {
+      /**
+       * THE REPAIR — review F1. The two sides are out of step and CAN converge, so re-send our half
+       * rather than destroying the session.
+       *
+       * At INFO because it is a real event an operator may need to correlate with a
+       * `session.salt.announce.failed` or `session.salt.persist.failed` on either machine, and
+       * because a session that repairs REPEATEDLY is a signal even though each repair is benign.
+       */
+      this.#logger.info("session.salt.repair", {
+        agentName, sessionId, correlationId, detail: action.detail,
+      });
+      void this.#sendSaltFrame(agentName, sessionId, correlationId, action.frame);
       return;
     }
     // `detail` is the primitive's own sentence wherever the primitive produced it — never a code of
@@ -8536,6 +8629,21 @@ export class SessionNodeManager {
       detail: action.detail,
       guidance: SALT_FREEZE_GUIDANCE[action.reason],
     });
+    /**
+     * TELL THE PEER BEFORE TEARING DOWN — review F1's mirror.
+     *
+     * Only the fingerprint mismatch carries a notice, and only it can: the peer holds everything
+     * needed to run the identical comparison and has simply not been given our side of it. Without
+     * this the session stops answering and the far operator gets no reason at all, while ours gets a
+     * full explanation — Decision #10 asks for BOTH sides to refuse by name.
+     *
+     * Awaited, unlike the other sends, because `destroySessionNode` on the next line takes the node
+     * away and an un-awaited write would race its own transport. A failure is already handled
+     * inside — the refusal here has happened either way.
+     */
+    if (action.notifyPeer) {
+      await this.#sendSaltFrame(agentName, sessionId, correlationId, action.notifyPeer);
+    }
     await this.#freezeSession(agentName, sessionId, action.reason, {
       event: "session.salt.frozen",
       observation: `the salt agreement could not be completed with this counterparty: ${action.detail}`,

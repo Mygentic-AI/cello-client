@@ -578,6 +578,26 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       // Invariant 4: the refusal names what remains open, and does not send them to a dead end.
       expect(revived.ok === false && String(revived.guidance)).toMatch(/cello_transcript/);
       expect(revived.ok === false && String(revived.guidance)).toMatch(/cello_close_session/);
+      /**
+       * THE EXPLANATION ITSELF, not just the affordances — `DOD-M15-SEALWIRE-1` part A, review F6.
+       *
+       * `#frozenSessions` became a Map so a second kind of freeze (a salt disagreement) could carry
+       * its own words instead of borrowing these. That moved this guidance from a literal inside
+       * `reviveSessionNode` to a parameter supplied by the freezing site — and nothing asserted it
+       * afterwards. Blanking it left every test green while the operator got a refusal that opened
+       * mid-sentence with no reason in it at all.
+       *
+       * Both halves are pinned because both are load-bearing: WHAT was observed, and the explicit
+       * refusal to conclude who did it.
+       */
+      expect(
+        revived.ok === false && String(revived.guidance),
+        "the identity refusal must still say what was observed",
+      ).toMatch(/counterparty's key/);
+      expect(
+        revived.ok === false && String(revived.guidance),
+        "and must still decline to conclude it was them — the signal cannot tell impersonation from our own fallback",
+      ).toMatch(/Cause undetermined/);
     });
 
     it("does NOT freeze when the counterparty cannot be resolved — 'could not tell' is not 'refuted'", async () => {
