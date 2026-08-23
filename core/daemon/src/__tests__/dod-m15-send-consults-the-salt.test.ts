@@ -292,6 +292,101 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
     ).toMatch(/not connected|offline/i);
   }, 60_000);
 
+  it("★ OUR OWN write failing does not blame the counterparty — and does not cost five seconds", async () => {
+    /**
+     * ⚠️ THE BEHAVIOUR CHANGE FROM REVIEW PASS 1, AND IT HAD NO TEST UNTIL THIS ONE.
+     *
+     * I defended NOT settling the waiter on a failed persist twice. Both defences were wrong. The
+     * old code left the send holding for the full five seconds and then routed it through the
+     * timeout, whose guidance says to go and check the counterparty's build version — for a fault
+     * that is this machine's own disk.
+     *
+     * Two things must be true now, and the second is the one an operator feels: the reason names
+     * OUR write, and the send does not pay the bound for a question already answered.
+     *
+     * The persist is made to fail the way production fails it — the session row is gone, so the
+     * `UPDATE` matches nothing and `changes !== 1`. Not a stub: `#persistSessionSalt`'s real
+     * no_session_row branch runs.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-persistfail-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    fx.snm.markSaltAgreementPendingForTest("alice", SID);
+
+    const agentId = (fx.snm.getDb().prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+    fx.snm.getDb().prepare("DELETE FROM sessions WHERE agent_id = ? AND session_id = ?").run(agentId, SID);
+
+    const started = process.hrtime.bigint();
+    const hashing = fx.snm.contentHashForSession("alice", SID, BODY);
+    setTimeout(() => { void fx!.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER); }, 100);
+    const { alg } = await hashing;
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+    expect(alg, "the salt was never stored, so the message must hash unsalted").toBe(CONTENT_HASH_ALGS.SHA256);
+    expect(
+      elapsedMs,
+      "and it must NOT sit out the full bound — the agreement was answered, our own write is what failed, and five seconds of first-message latency is what the operator actually feels",
+    ).toBeLessThan(2_000);
+
+    const said = fx.eventsNamed("session.content.unsalted");
+    expect(said.length).toBe(1);
+    expect(
+      said[0]!.ctx!["reason"],
+      "the fault is local — reporting this as a timeout sends the operator to ask a counterparty who answered perfectly",
+    ).toBe("our_persist_failed");
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "and the guidance must say so in words, not just in a code",
+    ).toMatch(/THIS side|local, not theirs/i);
+    /**
+     * ⚠️ FORBIDDING THE WORD "upgrade" WAS WRONG, and the first version of this assertion did it —
+     * the same mistake as forbidding "relay" in the park-error test. *"Do not ask them to upgrade"*
+     * is the single most useful sentence here, because telling the counterparty to upgrade is
+     * precisely the wrong move this reason exists to prevent. What must not appear is the
+     * INSTRUCTION; the prohibition of it is the point.
+     */
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "it must actively steer them AWAY from their counterparty's build, not merely avoid mentioning it",
+    ).toMatch(/Do not ask them to upgrade/i);
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "and must name the event that identifies the failed write, so the operator has somewhere to go",
+    ).toMatch(/session\.salt\.persist\.failed/);
+  }, 60_000);
+
+  it("★ an announce that never left releases the send immediately, rather than making it wait out the bound", async () => {
+    /**
+     * Review Finding 3's other half. Registering the pending BEFORE the dial closes the window where
+     * a send finds nothing pending — but it opens a new one: if the dial itself fails, the frame
+     * never left and there is nothing coming back, so a send holding on that agreement would wait the
+     * full five seconds for an answer that cannot arrive.
+     *
+     * The catch settles it. This is the offline-mid-connect case, and the cost of getting it wrong is
+     * five seconds on every first message to a counterparty whose connection just dropped.
+     */
+    const node = new FakeNode({ newStreamFails: true });
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-announcefail-", node: node as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    node.firePeerConnect(PEER);
+    await wait(100);
+
+    expect(
+      fx.eventsNamed("session.salt.announce.failed").length,
+      "precondition: the announce must actually have failed, or this test is measuring the happy path",
+    ).toBeGreaterThan(0);
+
+    const started = process.hrtime.bigint();
+    const { alg } = await fx.snm.contentHashForSession("alice", SID, BODY);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+
+    expect(alg).toBe(CONTENT_HASH_ALGS.SHA256);
+    expect(
+      elapsedMs,
+      "a frame that never left has no answer coming — holding the send for the bound is five seconds spent on a certainty",
+    ).toBeLessThan(2_000);
+  }, 60_000);
+
   it("★ HASHING closes adoption — the window the row cannot see", async () => {
     /**
      * ⚠️ Decision #8 says before the first leaf is HASHED. `#saltAdoptionClosed` counts leaves, held
