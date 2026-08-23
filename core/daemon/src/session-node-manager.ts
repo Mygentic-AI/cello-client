@@ -18,7 +18,10 @@
 // The daemon DB is SQLCipher (whole-file AES-256 at rest), never `node:sqlite`. `DaemonDatabase` is
 // the thin varargs surface; `openEncryptedDatabase` opens with a PRAGMA key and `resolveDbKey`
 // manages the single plaintext key file.
-import { wireContentHash } from "./wire-content-hash.js";
+// `wireContentHash` is gone from this file on purpose: its ONE use was the receive-path cross-check,
+// which now goes through `contentHashFor` so the comparison runs under the algorithm the sender
+// named. A direct call here would be a hash computed without asking what the frame said (part B1).
+import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
   onPeerSaltFrame,
@@ -6192,6 +6195,15 @@ export class SessionNodeManager {
      * session has no relay witness (relay-degraded): see the announced fallback below.
      */
     canonicalSeqIn?: number,
+    /**
+     * DOD-M15-SEALWIRE-1 part B1 — the algorithm the SENDER named on the frame, verbatim.
+     *
+     * `undefined` means the frame carried no name, which is a peer that predates the field and is
+     * the one case we may safely assume `sha256` for. It is threaded through rather than read off
+     * the session, because whether a hash is salted is a fact about the FRAME and its sender, never
+     * about what this side happens to hold.
+     */
+    contentHashAlgIn?: string | null,
   ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
@@ -6239,12 +6251,57 @@ export class SessionNodeManager {
       return { ok: false, reason: "session_committed" };
     }
 
-    const computed = wireContentHash(content);
+    /**
+     * DOD-M15-SEALWIRE-1 part B1 — VERIFY UNDER THE ALGORITHM THE SENDER NAMED.
+     *
+     * Three outcomes and they must stay apart, because two of them are version differences and only
+     * the third is evidence of tampering. Collapsing them is how a routine skew becomes a security
+     * incident in the operator's log, and how a real tamper gets dismissed as a skew.
+     */
+    const algResolved = resolveContentHashAlg(contentHashAlgIn);
+    if (!algResolved.ok) {
+      // A NAME WE CANNOT READ. Not a legacy peer — an unreadable one. There is no value to compare
+      // against, so `content_hash_mismatch` here would be an exit-point label standing in for
+      // "their build is newer than ours" (Invariant 2). Refused by its own name instead.
+      this.#logger.error("session.content.cross_check.failed", {
+        sessionId, correlationId,
+        reason: "content_hash_alg_unknown",
+        declaredAlg: algResolved.value,
+        impact: "the counterparty hashed this message with an algorithm this build cannot reproduce, so the content was NOT ingested and NOT shown. This is a version difference, not tampering — nothing was altered and nobody did anything wrong.",
+        guidance: "Their CELLO build is newer than this one. Upgrade this daemon, or ask them which version they are on. Do not treat this as a security event.",
+      });
+      return { ok: false, reason: "content_hash_alg_unknown" };
+    }
+    let computed: Uint8Array;
+    try {
+      computed = contentHashFor(content, {
+        alg: algResolved.alg,
+        // The salt is OURS — the sender's frame never carries one, and could not be trusted if it
+        // did. A salted frame we hold no salt for throws below and is refused by name.
+        salt: this.#getSessionSalt(agentName, sessionId),
+      });
+    } catch (err: unknown) {
+      // Reached when the peer named the salted algorithm and this side holds no salt for the
+      // session — the agreement never completed, or its record is gone. Distinct from a mismatch
+      // for the same reason as above: nothing was tampered with, we simply cannot check it.
+      this.#logger.error("session.content.cross_check.failed", {
+        sessionId, correlationId,
+        reason: "content_hash_salt_unavailable",
+        declaredAlg: algResolved.alg,
+        detail: extractErrorMessage(err),
+        impact: "the counterparty salted this message's hash and this side holds no salt for the session, so the content was NOT ingested and NOT shown. Nothing was altered.",
+        guidance: "The salt agreement did not complete on this side. Close this session and start a new one; the transcript up to here is intact.",
+      });
+      return { ok: false, reason: "content_hash_salt_unavailable" };
+    }
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     if (Buffer.from(computed).toString("hex") !== contentHashHex) {
       this.#logger.warn("session.content.cross_check.failed", {
         sessionId,
         reason: "content_hash_mismatch",
+        // WHICH algorithm the comparison ran under. Without it, a mismatch is unfalsifiable from the
+        // log: an operator cannot tell "the bytes were altered" from "we checked it the wrong way".
+        declaredAlg: algResolved.alg,
         correlationId,
       });
       // M7-UPGRADE-002 (SI-002): a tamper makes this session's content unverifiable — the
@@ -8211,7 +8268,23 @@ export class SessionNodeManager {
       correlationId,
     });
 
-    return await this.ingestReceivedContent(agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined);
+    /**
+     * DOD-M15-SEALWIRE-1 part B1 — RECOVERED-FROM-PARK CONTENT CARRIES NO ALGORITHM NAME, and that
+     * is correct today rather than an oversight.
+     *
+     * The park envelope has no field for one, so this passes `undefined`, which resolves to
+     * `sha256`. In part B1 that is exactly right and provably so: **no sender salts yet**, so every
+     * parked entry in existence was hashed unsalted.
+     *
+     * ⚠️ PART B2 MUST FIX THIS BEFORE ANY SENDER SALTS. The moment a sender does, a message that
+     * takes the park route instead of the direct one is verified under the wrong algorithm and
+     * refused as `content_hash_mismatch` — a tamper report for a message that merely went the long
+     * way round. `park-envelope.ts` needs the field, which is a wire change on the envelope, which
+     * is why it belongs to the unit that turns salting on rather than this one.
+     */
+    return await this.ingestReceivedContent(
+      agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined, undefined,
+    );
   }
 
   /**
@@ -9161,7 +9234,19 @@ export class SessionNodeManager {
       }
       // AC-001: carry the sender's correlationId from the frame into the receive
       // path so both sides log the same flow id (never re-minted on receipt).
-      const ingest = await this.ingestReceivedContent(agentName, sessionId, contentBytes, contentHash, correlationId, framedSeq ?? undefined);
+      /**
+       * DOD-M15-SEALWIRE-1 part B1 — the algorithm the sender named, taken from the FRAME.
+       *
+       * Read as `unknown` and passed through verbatim, deliberately: `resolveContentHashAlg` is the
+       * one place that decides what a value means, and it distinguishes ABSENT (a peer predating
+       * the field — verify as `sha256`) from a non-string or an unreadable name (refuse by name).
+       * Coercing here would collapse that distinction and turn a version skew into a tamper report.
+       */
+      const declaredAlg = frame["content_hash_alg"];
+      const ingest = await this.ingestReceivedContent(
+        agentName, sessionId, contentBytes, contentHash, correlationId, framedSeq ?? undefined,
+        declaredAlg === undefined ? undefined : (declaredAlg as string | null),
+      );
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
       // rejected ingest (tamper / not-active) produces NO ACK, so the sender's TTF
