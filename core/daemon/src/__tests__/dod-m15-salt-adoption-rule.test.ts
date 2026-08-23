@@ -101,11 +101,36 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
 
     const refused = fx.eventsNamed("session.salt.adoption.refused");
     expect(refused.length, "declining a protection must be announced").toBe(1);
-    expect(refused[0]!.ctx!.leafCount, "and must say how far in the session already was").toBeGreaterThan(0);
+    expect(
+      refused[0]!.level,
+      "the side that DECLINED a protection warns; the side merely learning of it must not",
+    ).toBe("warn");
+    expect(
+      String(refused[0]!.ctx!.detail),
+      "it must say WHY this side cannot adopt — the frontier, not just that it refused",
+    ).toMatch(/already hashed content/i);
     expect(
       String(refused[0]!.ctx!.impact),
-      "it must say the session stays unsalted for its LIFE, not merely that this attempt failed",
-    ).toMatch(/for the life of|remains unsalted|stays unsalted/i);
+      "it must say neither side will use one, not merely that this attempt failed",
+    ).toMatch(/neither side will use|for the life of|stays unsalted/i);
+    expect(
+      String(refused[0]!.ctx!.guidance),
+      "and must name the move that DOES work",
+    ).toMatch(/start a new session/i);
+
+    /**
+     * ⚠️ THE PEER MUST BE TOLD — review F2, and this is the assertion the whole redesign turns on.
+     *
+     * A local refusal alone lets the two sides reach OPPOSITE verdicts, both correctly: the very
+     * first message of a session is a leaf on the receiver before it is one on the sender, who is
+     * still inside its own `await`. One adopts, one refuses, and nothing on the wire or in either row
+     * records the disagreement — which, once salting is on, is a one-way dead conversation rather
+     * than a weaker hash.
+     */
+    expect(
+      fx.eventsNamed("session.salt.announced").length,
+      "the refusal must reach the WIRE — a peer that is not told will adopt a salt this side can never verify",
+    ).toBeGreaterThan(0);
   }, 60_000);
 
   it("★ the session STAYS usable — refusing the salt must not refuse the conversation", async () => {

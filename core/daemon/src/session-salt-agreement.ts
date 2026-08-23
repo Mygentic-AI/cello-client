@@ -104,7 +104,34 @@ export interface SaltAgreementFrame {
   contribution?: Uint8Array;
   /** Present iff the sender HOLDS a salt. Never the salt itself (Decision #10). */
   fingerprint?: Uint8Array;
+  /**
+   * Present iff the sender has CLOSED adoption — it has already hashed content under the unsalted
+   * rule, so it can never adopt a salt for this session (Decision #8).
+   *
+   * ⚠️ THIS FIELD EXISTS BECAUSE ADOPTION IS BILATERAL AND THE LEAF COUNT IS LOCAL — review B2b-2 F2.
+   * The two sides reach their frontier at different instants: the very first message of a session is
+   * a leaf on the RECEIVER before it is one on the sender, who is still inside its own `await`. So
+   * one side can adopt while the other refuses, **both correctly**, and nothing on the wire or in
+   * either row records the disagreement. Once salting is on that is not a weaker hash — it is a
+   * one-way dead conversation, every frame from the salted side refused as
+   * `content_hash_salt_unavailable` and never shown.
+   *
+   * It also restores TERMINATION (review F1). `derive_and_announce` is the only transition that lets
+   * a saltless side finish, and the adoption guard removes it — so without this the two sides trade
+   * `repair` frames forever, one new stream each per round trip against libp2p's per-protocol cap.
+   *
+   * The value is a short reason, not a boolean, so the peer's log can say WHY the other side closed.
+   */
+  adoptionClosed?: string;
 }
+
+/**
+ * The state a peer announced that ends the agreement without a salt — Decision #8, review F1/F2.
+ *
+ * NOT a freeze. Both sides simply stay unsalted, which is exactly as verifiable as every session
+ * shipped before the salt existed. The point is that they agree on it.
+ */
+export const SALT_ADOPTION_CLOSED = "adoption_closed" as const;
 
 /** The CLOSED set of reasons a salt disagreement stops a session. */
 export const SALT_FREEZE_REASONS = {
@@ -182,6 +209,13 @@ export const SALT_FREEZE_GUIDANCE: Record<SaltFreezeReason, string> = {
 export type SaltAgreementAction =
   /** We derived the salt. The caller persists it and sends the returned fingerprint. */
   | { action: "derive_and_announce"; salt: Uint8Array; fingerprint: Uint8Array }
+  /**
+   * Neither side will hold a salt for this session, and BOTH now know it. Terminal, and deliberately
+   * not a freeze: the session keeps working with the unsalted hash every build has always used.
+   * `announce` is a frame to send iff the peer has not already told us — so the exchange ends rather
+   * than echoing.
+   */
+  | { action: "adoption_closed"; detail: string; announce?: SaltAgreementFrame }
   /** The peer's digest matches ours. Agreed; nothing more to send. */
   | { action: "confirmed" }
   /**
@@ -280,6 +314,14 @@ export function onPeerSaltFrame(state: {
   ownSalt: Uint8Array | null;
   ownContribution: Uint8Array | null;
   /**
+   * THIS side can no longer adopt a salt — it has already hashed content unsalted (Decision #8).
+   *
+   * Passed in rather than inferred, because it is the caller that can count a frontier. When true,
+   * every branch that would have derived instead announces `adoption_closed`: that is what stops the
+   * two sides silently disagreeing (F2) and what restores a terminal state for a saltless side (F1).
+   */
+  ownAdoptionClosed?: boolean;
+  /**
    * TERMINATION — review F14, and the repair did not have it.
    *
    * `(hold a salt) + (peer contribution) → emit a contribution, state unchanged` is a FIXED POINT
@@ -301,6 +343,37 @@ export function onPeerSaltFrame(state: {
 }): SaltAgreementAction {
   const hasContribution = state.frame.contribution instanceof Uint8Array;
   const hasFingerprint = state.frame.fingerprint instanceof Uint8Array;
+
+  const hasClosed = typeof state.frame.adoptionClosed === "string";
+
+  /**
+   * THE PEER HAS CLOSED ADOPTION — terminal for both, and it takes precedence over every other
+   * branch, including the malformed-shape check below. A peer that can never adopt is not offering a
+   * contribution and not comparing a fingerprint; there is nothing left to agree.
+   *
+   * We answer once IFF we have not already closed ourselves, so the exchange ends rather than
+   * echoing. Both sides then hold no salt and both KNOW it, which is the whole point — the failure
+   * this replaces was two sides reaching opposite verdicts with nothing on the wire saying so.
+   */
+  if (hasClosed) {
+    return {
+      action: "adoption_closed",
+      detail: `the counterparty has already hashed content in this session and cannot adopt a salt (${state.frame.adoptionClosed}); neither side will use one`,
+      ...(state.ownAdoptionClosed ? {} : { announce: { adoptionClosed: "peer_closed_first" } }),
+    };
+  }
+
+  /**
+   * WE have closed adoption. Say so instead of deriving, whatever the peer sent — otherwise we
+   * refuse silently, they adopt, and every message they send afterwards is unverifiable here.
+   */
+  if (state.ownAdoptionClosed) {
+    return {
+      action: "adoption_closed",
+      detail: "this side has already hashed content in this session, so no salt can be adopted; telling the peer so they do not adopt one either",
+      announce: { adoptionClosed: "already_hashing" },
+    };
+  }
 
   if (hasContribution === hasFingerprint) {
     return {

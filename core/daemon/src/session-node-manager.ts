@@ -8901,36 +8901,46 @@ export class SessionNodeManager {
    * a loud `salt_state_divergent` refusal, which is the whole point of Decision #10, into the
    * silent split it exists to prevent, one restart later.
    */
-  #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
-    /**
-     * ⚠️ ADOPTION IS ONLY OPEN BEFORE THE FIRST LEAF — Decision #8, `DOD-M15-SEALWIRE-1` part B2b-2.
-     *
-     * *"Agreed at session open, BEFORE the first leaf is hashed. Every leaf uses the same salt."*
-     * Once `contentHashForSession` consults the salt, that question is answered fresh on every send —
-     * so a salt adopted after messages already exist would hash leaves 1..n under one rule and n+1..
-     * under another, in one session, with nothing recording where the change happened. **Neither half
-     * is then verifiable by a single rule**, which is worse than the correlation weakness the salt
-     * exists to remove.
-     *
-     * THIS GUARD IS WHAT REMOVES A SCHEMA CHANGE. Without it, "is this session salted?" would need a
-     * durable per-session flag — a column, a migration, and an entry in the rebuild DDL, which is
-     * where this milestone has now silently lost data twice. With it, the question is decided once
-     * and `content_salt IS NULL` answers it forever.
-     *
-     * Refusing costs this session a weaker content hash for its whole life, and that is the right
-     * trade — an unsalted transcript is exactly as verifiable as every transcript shipped to date —
-     * but it is announced, because silently declining a protection is how the rest of this
-     * milestone's defects looked.
-     */
-    const leafCount = this.getSessionTree(agentName, sessionId).size();
-    if (leafCount > 0) {
-      this.#logger.warn("session.salt.adoption.refused", {
-        agentName, sessionId, leafCount,
-        impact: "this session already has leaves hashed under the unsalted rule, so the salt was NOT adopted — it stays unsalted FOR THE LIFE of the session. Adopting now would hash the rest of the conversation differently and leave a transcript that neither rule can verify end to end.",
-        guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
-      });
-      return false;
+  /**
+   * Is this session past the point where a salt can be adopted? — Decision #8, part B2b-2.
+   *
+   * ⚠️ THE PREDICATE IS "HAS ANYTHING BEEN HASHED", NOT "IS THERE A LEAF" — review F5. A leaf is
+   * APPENDED after `await sendContent(...)` returns, so a message can be hashed, put on the wire, and
+   * still be invisible to `tree.size()`. Adopting inside that window makes leaf 0 unsalted and the
+   * rest salted — the exact split this exists to prevent, with the guard green.
+   *
+   * ⚠️ HELD CONTENT COUNTS, AND MUST BE HYDRATED FIRST — review F6. `#ensureHeldRestored` is lazy and
+   * is not called at session-node creation, so a revived session whose first inbound frame is the
+   * salt frame reads a frontier that excludes durable `held_content` rows — rows already hashed
+   * unsalted, which `#releaseHeld` will append moments later. Every other frontier reader in this
+   * file hydrates first, for this reason. `release: false`, because a salt frame must never deliver
+   * messages as a side effect.
+   *
+   * ⚠️ "CANNOT TELL" IS CLOSED, NOT OPEN. `#requireAgentId` throws for a retired agent, and inferring
+   * "zero leaves" from a failure to count them is how a guard becomes a formality. The cost of
+   * refusing is an unsalted session; the cost of permitting is a transcript neither rule can verify.
+   */
+  #saltAdoptionClosed(agentName: string, sessionId: string): { closed: boolean; leafCount: number; why: string } {
+    try {
+      this.#ensureHeldRestored(agentName, sessionId, { release: false });
+    } catch { /* hydration is best-effort; the counts below still refuse on their own failure */ }
+    try {
+      const key = this.#k(agentName, sessionId);
+      const leaves = this.getSessionTree(agentName, sessionId).size();
+      const held = this.#heldContent.get(key)?.size ?? 0;
+      const inFlight = this.#awaitingAck.get(key)?.size ?? 0;
+      const total = leaves + held + inFlight;
+      return {
+        closed: total > 0,
+        leafCount: total,
+        why: `leaves=${leaves} held=${held} awaiting_ack=${inFlight}`,
+      };
+    } catch (err: unknown) {
+      return { closed: true, leafCount: -1, why: `frontier_unreadable: ${extractErrorMessage(err)}` };
     }
+  }
+
+  #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
     if (!this.#db) {
       // NOT a silent return — review F7. The other two persist failures each emit an event, so a
       // derive that could not store because the handle is closed was the ONE salt path producing no
@@ -8943,6 +8953,38 @@ export class SessionNodeManager {
       return false;
     }
     try {
+      /**
+       * ORDER MATTERS HERE, and getting it wrong cost three findings — review F3, F4, F7.
+       *
+       * The adoption guard used to run FIRST, above `!this.#db` and outside this `try`. That:
+       *   - short-circuited the `salt_already_stored` discrimination below, so a session that DOES
+       *     hold a valid salt was told it "stays unsalted FOR THE LIFE of the session" after a
+       *     transient read failure — a refusal asserting something false about the row (F4);
+       *   - put `getSessionTree`'s `#requireAgentId` throw outside the `try`, where it surfaced as
+       *     *"the stream read failed"* instead of a named salt-persist failure (F7).
+       *
+       * So the row's own state is established first, and only a session with no salt at all reaches
+       * the adoption question.
+       */
+      const existingRow = this.#db
+        .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
+        .get(this.#requireAgentId(agentName), sessionId) as { n: number | null } | undefined;
+      if (existingRow?.n === SESSION_SALT_BYTES) {
+        this.#logger.error("session.salt.persist.failed", {
+          agentName, sessionId, reason: "salt_already_stored",
+          impact: "this session already has a salt and it was NOT replaced — Decision #8 is one salt per session. Reaching here means a read failure made this side believe it had none; the stored salt is intact, nothing was announced, and the agreement re-runs against it on the next connect.",
+        });
+        return false;
+      }
+      const adoption = this.#saltAdoptionClosed(agentName, sessionId);
+      if (adoption.closed) {
+        this.#logger.warn("session.salt.adoption.refused", {
+          agentName, sessionId, reason: "already_hashing", leafCount: adoption.leafCount, frontier: adoption.why,
+          impact: "this session has already hashed content under the unsalted rule, so the salt was NOT adopted — it stays unsalted FOR THE LIFE of the session. Adopting now would hash the rest of the conversation differently and leave a transcript that neither rule can verify end to end.",
+          guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
+        });
+        return false;
+      }
       /**
        * THE ROW COUNT IS THE CHECK, and without it this method reported success for a write that
        * stored nothing.
@@ -8980,6 +9022,10 @@ export class SessionNodeManager {
         // WHICH of the two it was. "No row" is a broken session record; "a salt is already there" is
         // this guard doing its job, and telling an operator the row is missing when it is not would
         // send them to look at the wrong thing.
+        // The `salt_already_stored` case is decided above now, before the adoption question, so
+        // reaching here with a valid salt in the row is not possible. Re-read anyway rather than
+        // assume: a wrong-width blob also fails the predicate and must not be reported as a missing
+        // row, which would send the operator to look at session state for a corrupt value.
         const existing = this.#db
           .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
           .get(this.#requireAgentId(agentName), sessionId) as { n: number | null } | undefined;
@@ -9057,6 +9103,7 @@ export class SessionNodeManager {
         session_id: sessionId,
         ...(frame.contribution ? { contribution: frame.contribution } : {}),
         ...(frame.fingerprint ? { fingerprint: frame.fingerprint } : {}),
+        ...(frame.adoptionClosed ? { adoption_closed: frame.adoptionClosed } : {}),
       }) as Uint8Array));
       await stream.close();
       this.#logger.debug("session.salt.announced", {
@@ -9089,6 +9136,10 @@ export class SessionNodeManager {
     const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
     const action = onPeerSaltFrame({
       ...this.#saltState(agentName, sessionId),
+      // Review F2: the frontier is what decides whether THIS side can still adopt, and only the
+      // caller can count it. Without this the state machine derives, the persist refuses, and the
+      // peer never learns — which is how the two sides end up on opposite verdicts.
+      ownAdoptionClosed: this.#saltAdoptionClosed(agentName, sessionId).closed,
       // Keyed on the peer's BYTES, not on a repair counter: a genuinely NEW half from the peer must
       // still get our contribution back, and only an identical re-offer is the loop (review F14).
       alreadyRepairedAgainstPeerHalf: peerHalfHex !== null && this.#saltRepairedAgainst.get(key) === peerHalfHex,
@@ -9109,6 +9160,47 @@ export class SessionNodeManager {
       // awaiting an outbound `newStream` here lets a stalled dial hold up the stream we are reading.
       // The connect-side call is `void`-ed for the same reason and this is now consistent with it.
       void this.#sendSaltFrame(agentName, sessionId, correlationId);
+      return;
+    }
+    if (action.action === "adoption_closed") {
+      /**
+       * Terminal, and NOT a freeze — review F1/F2. Both sides stay unsalted, which is exactly as
+       * verifiable as every session shipped before the salt existed; the thing that was broken was
+       * them disagreeing about it silently.
+       *
+       * INFO rather than WARN: this is a settled outcome, not a fault. The WARN that says a
+       * protection was declined is `session.salt.adoption.refused`, emitted where the refusal is
+       * decided; repeating it here would fire on the peer's side too, for a session that never had
+       * the option.
+       */
+      /**
+       * WHICH SIDE DECLINED decides the level, and it is not decoration.
+       *
+       * If WE closed, an operator has lost a protection they could otherwise have had, and the
+       * actionable fact is *"start a new session if you want it"* — that is a WARN, and it keeps
+       * `session.salt.adoption.refused` meaning what it has always meant.
+       *
+       * If we are merely LEARNING the peer closed, nothing about this machine is at fault and there
+       * is nothing for its operator to do. Logging that at WARN would fire on the innocent side of
+       * every such session and train them to ignore the name.
+       */
+      const weClosed = action.announce?.adoptionClosed === "already_hashing";
+      const shared = {
+        agentName, sessionId, correlationId, detail: action.detail,
+        impact: "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
+      };
+      if (weClosed) {
+        this.#logger.warn("session.salt.adoption.refused", {
+          ...shared,
+          reason: "already_hashing",
+          guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
+        });
+      } else {
+        this.#logger.info("session.salt.adoption.closed", shared);
+      }
+      if (action.announce) {
+        void this.#sendSaltFrame(agentName, sessionId, correlationId, action.announce);
+      }
       return;
     }
     if (action.action === "repair") {
@@ -9511,9 +9603,13 @@ export class SessionNodeManager {
       if (frame["type"] === "session_salt_agreement") {
         const contribution = frame["contribution"];
         const fingerprint = frame["fingerprint"];
+        const adoptionClosed = frame["adoption_closed"];
         await this.#handleSaltFrame(agentName, sessionId, {
           ...(contribution instanceof Uint8Array ? { contribution } : {}),
           ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
+          // A non-string stays ABSENT rather than being coerced, exactly like the other two: the
+          // decision function refuses a shape it cannot read, and must never be handed a `"42"`.
+          ...(typeof adoptionClosed === "string" && adoptionClosed.length > 0 ? { adoptionClosed } : {}),
         }, correlationId);
         return;
       }
