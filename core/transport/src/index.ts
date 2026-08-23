@@ -20,7 +20,12 @@ export {
   DECLARED_MAX_INCOMING_PENDING,
   DECLARED_INBOUND_UPGRADE_TIMEOUT_MS,
 } from "./node.js";
-export type { ResolvedConnectionLimits, IdleConnectionCandidate } from "./node.js";
+export type {
+  ResolvedConnectionLimits,
+  IdleConnectionCandidate,
+  IdleReapEvent,
+  ConnectionCounts,
+} from "./node.js";
 export type { ResolvedConnectionMonitorConfig } from "./node.js";
 export type { CelloNode, CreateNodeOptions, CelloStreamHandler } from "./types.js";
 export type {

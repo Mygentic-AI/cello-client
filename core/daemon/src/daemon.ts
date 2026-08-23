@@ -39,6 +39,8 @@ import type {
   ActiveSessionInfo,
   SealReadinessView,
   DirectorySignalingState,
+  // DOD-M15-IDLE-CONNS-1 — the factory logs what the idle sweep did.
+  Logger,
 } from "./types.js";
 import { loadAgents, type LoadedAgent } from "./agent-loader.js";
 import { RestartSealResolver } from "./restart-seal-resolver.js";
@@ -65,7 +67,15 @@ import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { ContentParkClient } from "./content-park-client.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
-import { createNode, SignalingManager, type ConnectResult, type CelloNode } from "@cello-protocol/transport";
+import {
+  createNode,
+  SignalingManager,
+  type ConnectResult,
+  type CelloNode,
+  // DOD-M15-IDLE-CONNS-1 — what the idle sweep reports when it acts, and its per-sweep census.
+  type IdleReapEvent,
+  type ConnectionCounts,
+} from "@cello-protocol/transport";
 import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
@@ -193,6 +203,18 @@ const SESSION_NODE_KEY_STUB = {
 
 // Production session node factory — wraps createNode from @cello-protocol/transport
 export class ProductionSessionNodeFactory implements ISessionNodeFactory {
+  /**
+   * DOD-M15-IDLE-CONNS-1 — OPTIONAL, and optional for one reason only: this factory is constructed
+   * with no arguments in four existing tests, and requiring a logger would turn them into type
+   * errors for a unit that has nothing to do with them.
+   *
+   * The cost is stated rather than hidden: with no logger, a reaped connection is silent, which is
+   * exactly the "guard nobody hears" this milestone has found four times. `startDaemon` passes one
+   * — that is the production path — and the sweep only runs on nodes this factory builds as
+   * receivers, so the silent case is a test-only fixture.
+   */
+  constructor(private readonly logger?: Logger) {}
+
   async createNode(config: SessionNodeConfig) {
     // DOD-NAT-REACHABILITY-1: the STANDING RECEIVER — the node that accepts every
     // inbound session — must bind a ROUTABLE interface by default. The old
@@ -231,30 +253,108 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
       // for every node that is not session-scoped.
       ...(config.transportPrivateKey ? { transportPrivateKey: config.transportPrivateKey } : {}),
       /**
-       * DOD-M15-IDLE-CONNS-1 — the idle sweep runs on the STANDING RECEIVER only.
+       * DOD-M15-IDLE-CONNS-1 — the idle sweep is armed on the node that STARTS as a standing
+       * receiver.
        *
-       * That is the one node accepting dials from a peer it did not choose. A session node's
-       * counterparty is speaking to it by definition, and the directory-signaling node's
-       * connections are ones it dialled out — sweeping either would hang up links whose liveness
-       * another subsystem already owns.
+       * **It is NOT "the standing receiver only", and an earlier version of this comment said so
+       * and was false.** `acceptSession` does not build a new node: it moves this same `CelloNode`
+       * from `#standingReceivers` into `#activeNodes`, so the interval keeps running after
+       * promotion, against the session's own counterparty. Review measured the consequence — the
+       * counterparty was hung up mid-conversation and the next send failed with `no_connection`,
+       * with nothing anywhere naming the local sweep.
+       *
+       * That is survivable only because the spared predicate below names the counterparty. The
+       * arrangement is deliberate now rather than accidental: one node, one interval, and the gate
+       * decides who is off-limits as it narrows.
        */
-      ...(isReceiver ? { idleConnectionReaper: {} } : {}),
+      ...(isReceiver
+        ? {
+            idleConnectionReaper: {
+              /**
+               * C3 — THE GUARD IS HEARD. A hang-up that tells nobody is indistinguishable from the
+               * thing simply not happening, and review measured what that costs: the operator's
+               * next send returns `no_connection`, `session.transport.redial.unavailable` says
+               * "every send parks until they re-establish", and not one word in that chain names a
+               * `setInterval` on their own machine.
+               *
+               * WARN and CONTINUE, deliberately: this is resource bounding, not a security event.
+               * Nothing is refused and no session state changes — so it is loud, and it does not
+               * block (Invariant 2's own distinction).
+               */
+              onReaped: (e: IdleReapEvent) => {
+                if (e.reason === "never_carried_a_stream") {
+                  this.logger?.warn("session.node.connection.reaped", {
+                    sessionId: config.sessionId,
+                    peerId: e.peerId,
+                    ageMs: e.ageMs,
+                    observation:
+                      "an inbound connection was hung up after never carrying a stream since it opened",
+                    impact:
+                      "no session state changed and nothing was refused; if this peer returns it must dial again",
+                  });
+                  return;
+                }
+                // A sweep that cannot do its job is a different event and must not read as one that
+                // did. `hangUp`'s `invalid_peer_id` is a NAMED reason written so a malformed id is
+                // not read as a connection problem — preserved here rather than flattened.
+                this.logger?.error("session.node.connection.reap_failed", {
+                  sessionId: config.sessionId,
+                  peerId: e.peerId,
+                  reason: e.reason,
+                  error: e.error,
+                  impact:
+                    "an idle connection was NOT closed; it continues to hold a slot against the connection cap",
+                });
+              },
+              /**
+               * C4 — THE COUNT THE DoD ASKS FOR, and the reason this callback exists at all.
+               *
+               * The line says *"measure a healthy daemon's connection count first"*, and nothing in
+               * the tree reported one — not `cello_status`, not the CLI, not the log. Exposing the
+               * CAPS without the COUNT would have been a capability nothing reads, which is this
+               * milestone's own "no consumer, no ship". DEBUG because it is a census on a timer,
+               * not an event: it exists to be greppable when a cap is finally tuned.
+               */
+              onObserved: (c: ConnectionCounts) => {
+                this.logger?.debug("transport.connections.observed", {
+                  sessionId: config.sessionId,
+                  total: c.total,
+                  inbound: c.inbound,
+                  neverSpoke: c.neverSpoke,
+                  maxConnections: c.maxConnections,
+                });
+              },
+            },
+          }
+        : {}),
     }).then((node) => {
       /**
-       * SPARE WHAT REACHABILITY DEPENDS ON — the same list `DOD-M15-FRAME-1`'s promotion-time
-       * eviction sweep spares, and for the reason its comment already gives: *"Relay peers sit on
-       * this list because reservation refreshes ride them, and hanging one up would cost the agent
-       * its inbound reachability to remove a peer that cannot speak the content protocol anyway."*
+       * SPARE WHAT REACHABILITY DEPENDS ON — two things, and the second was missing.
        *
-       * A reservation connection is IDLE BY NATURE between refreshes, which is exactly the shape
-       * the sweep hunts — so without this the reaper would take a NAT'd agent offline and report
-       * nothing. The predicate READS the gater on every sweep rather than capturing the set once:
-       * reservations are lost and retaken constantly (2,675 `reservation.lost` in one daemon's log),
-       * so a list frozen at build time is wrong within minutes.
+       * **The reserved relay.** The same list `DOD-M15-FRAME-1`'s eviction sweep spares, for the
+       * reason its comment gives: reservation refreshes ride those peers, and hanging one up costs
+       * the agent its inbound reachability. A reservation is IDLE BY NATURE between refreshes,
+       * which is exactly the shape the sweep hunts.
+       *
+       * **The peer the gate currently names.** `getAllowedPeerId()` is the admitted dialer before
+       * promotion and the counterparty after it. Without this the sweep reaps the one peer the
+       * session exists for.
+       *
+       * READ LIVE on every sweep, never captured: reservations are lost and retaken constantly
+       * (2,675 `reservation.lost` in one daemon's log) and `#allowedPeerId` changes at offer,
+       * promotion and refusal. A set frozen at build time is wrong within minutes.
+       *
+       * WHAT IS LEFT TO REAP, stated because a guard with no population is theatre: a peer that was
+       * admitted by an offer which was then refused or expired. `closeInbound()` returns
+       * `#allowedPeerId` to null, and libp2p never re-runs a gater against a connection that
+       * already exists — so that peer stays attached, named by nobody, speaking nothing. That is
+       * the connection this unit removes.
        */
       const gater = config.connectionGater;
       if (isReceiver && gater) {
-        node.setIdleReaperSpared((peerId) => gater.isAllowedOutboundPeer(peerId));
+        node.setIdleReaperSpared(
+          (peerId) => gater.isAllowedOutboundPeer(peerId) || gater.getAllowedPeerId() === peerId,
+        );
       }
       return node;
     });
@@ -405,7 +505,7 @@ async function startDaemonHoldingLock(
   logger.info("security.gateway.connected", { mode: securityGateway.mode });
 
   const sessionNodeManager = new SessionNodeManager({
-    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(),
+    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(logger),
     logger,
     dbPath: join(celloDir, "sessions.db"),
     contentTtfMs: config.contentTtfMs,
