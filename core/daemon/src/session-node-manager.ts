@@ -26,6 +26,7 @@ import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
   onPeerSaltFrame,
   ownSaltFrame,
+  SALT_ADOPTION_LABELS,
   SALT_FREEZE_GUIDANCE,
   type SaltAgreementFrame,
 } from "./session-salt-agreement.js";
@@ -6480,7 +6481,12 @@ export class SessionNodeManager {
         // Review F6: `#getSessionSalt` returns null for THREE conditions and only one of them wants
         // a close. A read failure and a corrupt row both leave us holding no salt, which is exactly
         // what makes the agreement re-offer a contribution and repair itself on the next connect.
-        guidance: "Look for session.salt.read.failed or session.salt.persist.failed just before this. If either is present the salt agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If neither is, the agreement never completed with this counterparty: close the session and start a new one. Either way the transcript up to here is intact.",
+        //
+        // The adoption refusal is the FOURTH, added with the Decision #8 guard, and it is the only
+        // one that does not repair: this side declined the salt permanently for this session, so
+        // waiting for a reconnect is exactly the wrong advice. Leaving it out of this list would
+        // have sent an operator to look for a read failure that is not there and never will be.
+        guidance: "Look for session.salt.adoption.refused first: if it is there, this side declined the salt because the session had already hashed messages, that is permanent for this session, and reconnecting will NOT fix it — close the session and start a new one. Otherwise look for session.salt.read.failed or session.salt.persist.failed. If either is present the agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If none of the three is present, the agreement never completed with this counterparty: close the session and start a new one. In every case the transcript up to here is intact.",
       });
       return { ok: false, reason: "content_hash_salt_unavailable" };
     }
@@ -8920,7 +8926,7 @@ export class SessionNodeManager {
    * "zero leaves" from a failure to count them is how a guard becomes a formality. The cost of
    * refusing is an unsalted session; the cost of permitting is a transcript neither rule can verify.
    */
-  #saltAdoptionClosed(agentName: string, sessionId: string): { closed: boolean; leafCount: number; why: string } {
+  #saltAdoptionClosed(agentName: string, sessionId: string): { closed: boolean; label: string; leafCount: number; why: string } {
     try {
       this.#ensureHeldRestored(agentName, sessionId, { release: false });
     } catch { /* hydration is best-effort; the counts below still refuse on their own failure */ }
@@ -8932,11 +8938,19 @@ export class SessionNodeManager {
       const total = leaves + held + inFlight;
       return {
         closed: total > 0,
+        // The label crosses the WIRE, so it carries no counts and no error text — only which of the
+        // two refusals this is. The counts stay in `why`, which stays local.
+        label: SALT_ADOPTION_LABELS.ALREADY_HASHING,
         leafCount: total,
         why: `leaves=${leaves} held=${held} awaiting_ack=${inFlight}`,
       };
     } catch (err: unknown) {
-      return { closed: true, leafCount: -1, why: `frontier_unreadable: ${extractErrorMessage(err)}` };
+      return {
+        closed: true,
+        label: SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE,
+        leafCount: -1,
+        why: `frontier_unreadable: ${extractErrorMessage(err)}`,
+      };
     }
   }
 
@@ -9108,7 +9122,14 @@ export class SessionNodeManager {
       await stream.close();
       this.#logger.debug("session.salt.announced", {
         agentName, sessionId, correlationId,
-        state: frame.fingerprint ? "holds_salt" : "offering_contribution",
+        /**
+         * THREE STATES, not two. This read `fingerprint ? holds_salt : offering_contribution`, which
+         * was exhaustive until the adoption refusal put a third frame on the wire — and a refusal
+         * carries no fingerprint, so it logged as `offering_contribution`: the log claiming we asked
+         * for a salt at the exact moment we told the peer we were declining one. An operator reading
+         * the pair would see an offer that was never answered and go looking for a dropped frame.
+         */
+        state: frame.adoptionClosed ? "adoption_closed" : frame.fingerprint ? "holds_salt" : "offering_contribution",
       });
     } catch (err: unknown) {
       this.#logger.warn("session.salt.announce.failed", {
@@ -9134,12 +9155,15 @@ export class SessionNodeManager {
   ): Promise<void> {
     const key = this.#k(agentName, sessionId);
     const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
+    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
     const action = onPeerSaltFrame({
       ...this.#saltState(agentName, sessionId),
       // Review F2: the frontier is what decides whether THIS side can still adopt, and only the
       // caller can count it. Without this the state machine derives, the persist refuses, and the
       // peer never learns — which is how the two sides end up on opposite verdicts.
-      ownAdoptionClosed: this.#saltAdoptionClosed(agentName, sessionId).closed,
+      ownAdoption: adoption.closed
+        ? { closed: true, label: adoption.label, why: adoption.why }
+        : { closed: false },
       // Keyed on the peer's BYTES, not on a repair counter: a genuinely NEW half from the peer must
       // still get our contribution back, and only an identical re-offer is the loop (review F14).
       alreadyRepairedAgainstPeerHalf: peerHalfHex !== null && this.#saltRepairedAgainst.get(key) === peerHalfHex,
@@ -9168,32 +9192,40 @@ export class SessionNodeManager {
        * verifiable as every session shipped before the salt existed; the thing that was broken was
        * them disagreeing about it silently.
        *
-       * INFO rather than WARN: this is a settled outcome, not a fault. The WARN that says a
-       * protection was declined is `session.salt.adoption.refused`, emitted where the refusal is
-       * decided; repeating it here would fire on the peer's side too, for a session that never had
-       * the option.
-       */
-      /**
        * WHICH SIDE DECLINED decides the level, and it is not decoration.
        *
-       * If WE closed, an operator has lost a protection they could otherwise have had, and the
-       * actionable fact is *"start a new session if you want it"* — that is a WARN, and it keeps
-       * `session.salt.adoption.refused` meaning what it has always meant.
+       * If WE closed, an operator has lost a protection they could otherwise have had, and there is
+       * something they can do about it — that is a WARN under `session.salt.adoption.refused`, which
+       * keeps meaning what it has always meant.
        *
        * If we are merely LEARNING the peer closed, nothing about this machine is at fault and there
        * is nothing for its operator to do. Logging that at WARN would fire on the innocent side of
        * every such session and train them to ignore the name.
        */
-      const weClosed = action.announce?.adoptionClosed === "already_hashing";
       const shared = {
         agentName, sessionId, correlationId, detail: action.detail,
         impact: "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
       };
-      if (weClosed) {
+      if (adoption.closed) {
+        /**
+         * ⚠️ TWO REFUSALS, TWO DIFFERENT THINGS TO DO — and this used to report both as
+         * `already_hashing`.
+         *
+         * A session that has already sent messages is the feature working: the fix is a new session,
+         * and it will work. A frontier this side could not READ is local storage trouble: a new
+         * session will refuse in exactly the same way, so sending the operator to open one is
+         * sending them somewhere that cannot help. `frontier` carries the counts (or the error) so
+         * the two are separable from the log alone.
+         */
+        const unreadable = adoption.label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE;
         this.#logger.warn("session.salt.adoption.refused", {
           ...shared,
-          reason: "already_hashing",
-          guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
+          reason: adoption.label,
+          leafCount: adoption.leafCount,
+          frontier: adoption.why,
+          guidance: unreadable
+            ? "This side could not read its own message frontier, so it refused the salt rather than risk hashing half the session one way and half the other. Starting a new session will NOT help — it will refuse the same way. Look for session.content.held.restore.failed or other storage errors around this line; the conversation still works and every message is intact, it is just unsalted."
+            : "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
         });
       } else {
         this.#logger.info("session.salt.adoption.closed", shared);

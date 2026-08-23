@@ -31,6 +31,7 @@ import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
 import * as lp from "it-length-prefixed";
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 
 const SID = "9c".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
@@ -84,6 +85,89 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
       storedSalt(fx),
       "adopting a salt after the first leaf splits the transcript — half verifiable by one rule, half by another",
     ).toBeNull();
+
+    /**
+     * ⚠️ THE ROW IS NOT THE WHOLE STATE — a mutant made `#saltAdoptionClosed` return `{closed:true}`
+     * unconditionally and this file stayed green on this test, because "no salt on disk" is exactly
+     * what an unconditional refusal produces too.
+     *
+     * `session.salt.agreed` is the event that says this side considers itself salted, and it fires
+     * from the memory cache, not from the row. Pinning it to zero is what separates *"the guard
+     * refused"* from *"the write happened to fail"*: the first is the behaviour Decision #8 asks
+     * for, the second is a bug wearing its result.
+     */
+    expect(
+      fx.eventsNamed("session.salt.agreed").length,
+      "the session must not BELIEVE it is salted either — an empty column with an agreed salt in memory is the split transcript, one restart later",
+    ).toBe(0);
+  }, 60_000);
+
+  it("★ HELD content closes adoption too — a hold is content already hashed, it is just not in the tree yet", async () => {
+    /**
+     * ⚠️ WRITTEN BECAUSE A MUTANT SURVIVED. Dropping `held` from the frontier sum — counting only
+     * `leaves + awaiting_ack` — left every test in this file green.
+     *
+     * A hold is a message whose content hash is ALREADY COMPUTED, sitting at a slot ahead of the
+     * tail waiting for the gap to fill. Counting only what has landed in the tree therefore reads
+     * "nothing hashed yet" for a session that has hashed several messages, adopts a salt, and then
+     * releases those holds into a tree where the leaves around them were hashed the other way. That
+     * is precisely the split transcript Decision #8 exists to prevent, arriving by the one route
+     * that looks empty from the tree.
+     *
+     * It is also the review-F6 case in a different disguise: the frontier is not `tree.size()`.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-adopt-held-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    // A send assigned slot 3 with an empty tail: ahead of the frontier, so it is HELD, not appended.
+    const placed = fx.snm.placeOwnLeaf("alice", SID, "ab".repeat(32), new TextEncoder().encode("held, and already hashed"), 3, "corr-held");
+    expect(placed, "precondition: the send must actually be HELD, not appended").toMatchObject({ placed: false });
+    expect(fx.snm.getSessionTree("alice", SID).size(), "precondition: and the TREE must still look empty — that is the trap").toBe(0);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+    await wait(300);
+
+    expect(
+      storedSalt(fx),
+      "a session with held content has already hashed messages — adopting now splits the transcript when those holds release",
+    ).toBeNull();
+    expect(
+      fx.eventsNamed("session.salt.adoption.refused").length,
+      "and the refusal must be announced for this route exactly as for the tree route",
+    ).toBe(1);
+  }, 60_000);
+
+  it("★ a frontier that cannot be READ refuses — 'cannot tell' must never mean 'nothing hashed yet'", async () => {
+    /**
+     * ⚠️ ALSO WRITTEN BECAUSE A MUTANT SURVIVED. Flipping the catch to `closed: false` — treating an
+     * unreadable frontier as an empty one — left this file green.
+     *
+     * This is the shape of guard failure that is hardest to see in review, because the code still
+     * reads like a guard. A failed count is not zero. Inferring "no leaves" from "I could not count
+     * the leaves" turns the one check standing between a session and a split transcript into a
+     * formality that opens itself on exactly the disk trouble that should make it most careful.
+     *
+     * The corruption modelled here is narrow on purpose: the leaf table is gone, the `sessions` row
+     * is not. So the salt path gets all the way past its own reads and fails only at the frontier —
+     * which is the case the catch was written for, rather than a database that is broken everywhere.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-adopt-unreadable-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    fx.snm.getDb().exec("DROP TABLE session_tree_leaves");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+    await wait(300);
+
+    expect(
+      storedSalt(fx),
+      "an unreadable frontier cannot rule out already-hashed content, so the salt must NOT be adopted",
+    ).toBeNull();
+    const refused = fx.eventsNamed("session.salt.adoption.refused");
+    expect(refused.length, "and it must say so rather than declining in silence").toBe(1);
+    expect(
+      String(refused[0]!.ctx!["frontier"]),
+      "the operator has to be able to tell 'I refused because you had messages' from 'I refused because I could not look' — they are different problems with different fixes",
+    ).toMatch(/frontier_unreadable/);
   }, 60_000);
 
   it("★ the refusal is LOUD and says what the session loses, not just that it declined", async () => {
@@ -127,10 +211,11 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
      * records the disagreement — which, once salting is on, is a one-way dead conversation rather
      * than a weaker hash.
      */
+    const announced = fx.eventsNamed("session.salt.announced");
     expect(
-      fx.eventsNamed("session.salt.announced").length,
-      "the refusal must reach the WIRE — a peer that is not told will adopt a salt this side can never verify",
-    ).toBeGreaterThan(0);
+      announced.map((e) => e.ctx!["state"]),
+      "the refusal must reach the WIRE as a REFUSAL — a peer told 'offering_contribution' will keep offering, and a peer told nothing will adopt a salt this side can never verify",
+    ).toContain("adoption_closed");
   }, 60_000);
 
   it("★ the session STAYS usable — refusing the salt must not refuse the conversation", async () => {
@@ -146,11 +231,42 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
     await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
     await wait(300);
 
+    expect(
+      fx.eventsNamed("session.salt.adoption.refused").length,
+      "precondition — without the refusal actually firing, everything below passes vacuously on a session that was never asked to refuse anything",
+    ).toBe(1);
     expect(fx.eventsNamed("session.salt.frozen").length, "a refused adoption must NOT freeze the session").toBe(0);
+
+    /**
+     * ⚠️ NOT "it did not freeze" — THE CONVERSATION HAS TO STILL MOVE.
+     *
+     * Review: the original test asserted an absence and a revive, and both are satisfied by a
+     * session that has quietly stopped being able to send. The refusal is upstream of
+     * `contentHashForSession`, and the failure this guards against is that a refused session takes
+     * the salted branch anyway, throws `content_hash_salt_unavailable` on its own send, and dies
+     * without ever emitting a freeze.
+     *
+     * So: send a real message, and receive one. That is the product working.
+     */
     const revived = await fx.snm.reviveSessionNode("alice", SID);
     expect(
       (revived as { reason?: string }).reason ?? "",
       "and the session must still be revivable — this is a weaker hash, not a broken conversation",
     ).not.toMatch(/frozen/);
+
+    const body = new TextEncoder().encode("the conversation continues, just unsalted");
+    const { hash, alg } = fx.snm.contentHashForSession("alice", SID, body);
+    expect(alg, "a refused session must hash the way it already hashed — naming a salted algorithm it holds no salt for is how every peer starts refusing it").toBe("sha256");
+    await expect(
+      fx.snm.sendContent("alice", SID, body, hash, "corr-after-refusal", LEAF_KIND_MSG, alg),
+      "an unsalted session must still SEND — a refusal that silently ends the conversation is worse than the correlation weakness it avoids",
+    ).resolves.not.toThrow();
+
+    const before = fx.snm.getSessionTree("alice", SID).size();
+    fx.seedReceived("alice", SID, "and it can still receive");
+    expect(
+      fx.snm.getSessionTree("alice", SID).size(),
+      "and must still INGEST — the transcript keeps growing under the rule it started with",
+    ).toBeGreaterThan(before);
   }, 60_000);
 });

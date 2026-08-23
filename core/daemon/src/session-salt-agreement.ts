@@ -133,6 +133,18 @@ export interface SaltAgreementFrame {
  */
 export const SALT_ADOPTION_CLOSED = "adoption_closed" as const;
 
+/**
+ * WHY a side cannot adopt — a wire value, so it is a named constant rather than a literal typed out
+ * at each site. Two refusals reach the same terminal state and want different operator responses:
+ * `already_hashing` is the session working as designed and the fix is to start a new one;
+ * `frontier_unreadable` is local storage trouble and starting a new session will not fix it.
+ */
+export const SALT_ADOPTION_LABELS = {
+  ALREADY_HASHING: "already_hashing",
+  FRONTIER_UNREADABLE: "frontier_unreadable",
+  PEER_CLOSED_FIRST: "peer_closed_first",
+} as const;
+
 /** The CLOSED set of reasons a salt disagreement stops a session. */
 export const SALT_FREEZE_REASONS = {
   /** Both sides hold a salt and the digests differ. */
@@ -316,11 +328,20 @@ export function onPeerSaltFrame(state: {
   /**
    * THIS side can no longer adopt a salt — it has already hashed content unsalted (Decision #8).
    *
-   * Passed in rather than inferred, because it is the caller that can count a frontier. When true,
+   * Passed in rather than inferred, because it is the caller that can count a frontier. When closed,
    * every branch that would have derived instead announces `adoption_closed`: that is what stops the
    * two sides silently disagreeing (F2) and what restores a terminal state for a saltless side (F1).
+   *
+   * ⚠️ THE REASON IS PART OF THE STATE, not a detail of the log line — and it is a UNION rather than
+   * an optional string on purpose. The refusal used to hardcode `already_hashing`, which is one of
+   * TWO ways to reach it: the other is a frontier this side could not read at all. Reporting a disk
+   * that will not answer as "you already sent messages" points the operator at a session they cannot
+   * fix instead of a database they can, and tells the counterparty something untrue about them.
+   *
+   * Making it a union means a caller cannot say `closed` without saying WHY. An optional field with
+   * a default would compile at every call site that forgot, and read as though it had been decided.
    */
-  ownAdoptionClosed?: boolean;
+  ownAdoption?: { closed: false } | { closed: true; label: string; why: string };
   /**
    * TERMINATION — review F14, and the repair did not have it.
    *
@@ -358,8 +379,11 @@ export function onPeerSaltFrame(state: {
   if (hasClosed) {
     return {
       action: "adoption_closed",
-      detail: `the counterparty has already hashed content in this session and cannot adopt a salt (${state.frame.adoptionClosed}); neither side will use one`,
-      ...(state.ownAdoptionClosed ? {} : { announce: { adoptionClosed: "peer_closed_first" } }),
+      // NOT "they have already hashed content" — that is only one of their two reasons, and the
+      // label they sent says which. Asserting the wrong one about a counterparty is how an operator
+      // ends up asking a peer to change something that was never the problem.
+      detail: `the counterparty cannot adopt a salt for this session (${state.frame.adoptionClosed}); neither side will use one`,
+      ...(state.ownAdoption?.closed ? {} : { announce: { adoptionClosed: SALT_ADOPTION_LABELS.PEER_CLOSED_FIRST } }),
     };
   }
 
@@ -367,11 +391,11 @@ export function onPeerSaltFrame(state: {
    * WE have closed adoption. Say so instead of deriving, whatever the peer sent — otherwise we
    * refuse silently, they adopt, and every message they send afterwards is unverifiable here.
    */
-  if (state.ownAdoptionClosed) {
+  if (state.ownAdoption?.closed) {
     return {
       action: "adoption_closed",
-      detail: "this side has already hashed content in this session, so no salt can be adopted; telling the peer so they do not adopt one either",
-      announce: { adoptionClosed: "already_hashing" },
+      detail: `this side cannot adopt a salt for this session (${state.ownAdoption.why}), so no salt is adopted; telling the peer so they do not adopt one either`,
+      announce: { adoptionClosed: state.ownAdoption.label },
     };
   }
 
