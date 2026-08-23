@@ -61,25 +61,28 @@
  * Said here because the file's own headline is "CELLO owns its own confidentiality guarantee", and a
  * reader could otherwise conclude MITM is covered. It is not, yet.
  *
- * ─── Two outputs, one agreement — AND TWO DIFFERENT LIFETIMES ─────────────────────────────────
+ * ─── ONE OUTPUT. The salt used to live here, and that was the defect. ─────────────────────────
  *
- * Decisions Carried #6 (Andre, 2026-08-23), recorded before `SEALWIRE-1` encodes anything:
+ * This module produced a content-hash salt as a second HKDF output, and Andre corrected it before
+ * `SEALWIRE-1` encoded anything (Decisions Carried #8, superseding the "one agreement, two outputs"
+ * bullet). The two are unrelated goals that merely both need a shared secret:
  *
- *   **The message key NEVER touches disk** and is destroyed at session close. That is the forward
- *   secrecy, and `destroySessionEphemeral` is what makes it real.
+ *   the **envelope key** stops the relay reading messages in flight and MUST be destroyed at close;
+ *   the **session salt** stops anyone holding stored hashes from confirming a guessed message and
+ *   MUST survive for the life of the session.
  *
- *   **The content salt IS a durable record field**, stored like any other column. It is not a key —
- *   it decrypts nothing, and HKDF is one-way, so holding it does not lead back to the shared secret
- *   or the message key. Storing it does not weaken forward secrecy, and NOT storing it would make an
- *   operator's own transcript unverifiable: the content hash is recomputed from plaintext on the
- *   receive path and again for any later check, and salted it is underivable without the salt.
+ * **Deriving both from one secret tied "must be forgotten" to "must be kept forever."** Everything
+ * that followed — salt epochs, per-leaf epoch attribution, lockstep switching, and my own Decision
+ * #7 ruling all of that — was a symptom of the coupling, not a requirement. The salt now lives in
+ * `session-salt.ts`, agreed in the SAME exchange from both sides' random contributions, and none of
+ * those consequences exist.
  *
- * ⚠️ CALLED "per-session" BELOW AND THAT IS NOT SETTLED: if a revived session RE-KEYS (Decisions
- * Carried #5), the salt changes mid-session, so it is per KEY EPOCH rather than per session. Whether
- * a session may hold more than one salt is an open call flagged for Andre — do not encode a
- * one-salt-per-session assumption into a schema or a wire format on the strength of this comment.
+ * ─── The remaining output, and its lifetime ───────────────────────────────────────────────────
  *
- * The two outputs come from the same agreement under different HKDF `info` labels. They must never be EQUAL: the salt travels wherever a content hash
+ **The envelope key NEVER touches disk** and is destroyed at session close. That is the forward
+ * secrecy, and `destroySessionEphemeral` is what makes it real. A revived session RE-KEYS (Decisions
+ * Carried #5) — and because the salt no longer rides on this secret, re-keying no longer disturbs
+ * the transcript's verifiability. They must never be EQUAL: the salt travels wherever a content hash
  * does and the relay sees it, so a salt that equalled the key would hand the key to everyone who can
  * see a hash. Domain separation by label is what keeps them independent.
  */
@@ -91,7 +94,6 @@ import { sha256 } from "@noble/hashes/sha2.js";
 /** X25519 keys and the derived outputs are all 32 bytes. */
 const X25519_KEY_BYTES = 32;
 export const SESSION_KEY_BYTES = 32;
-export const SESSION_SALT_BYTES = 32;
 
 const ENC = new TextEncoder();
 /**
@@ -100,7 +102,6 @@ const ENC = new TextEncoder();
  * the same bytes.
  */
 const INFO_CONTENT_KEY = ENC.encode("cello/session/v1/content-key");
-const INFO_CONTENT_SALT = ENC.encode("cello/session/v1/content-salt");
 
 export interface SessionEphemeral {
   /** X25519 secret. The caller MUST destroy this at session close — that is what forward secrecy is. */
@@ -110,10 +111,14 @@ export interface SessionEphemeral {
 }
 
 export interface SessionSecrets {
-  /** AEAD key for message content (consumed by the `content-seal.ts` AES-256-GCM pattern). */
+  /**
+   * AEAD key for message content (consumed by the `content-seal.ts` AES-256-GCM pattern).
+   *
+   * The ONLY output. It never touches disk and is destroyed at session close — see
+   * `destroySessionEphemeral`. The content-hash salt is NOT here: it is agreed separately in
+   * `session-salt.ts`, because its lifetime is the opposite of this one's.
+   */
   contentKey: Uint8Array;
-  /** Per-session salt for content hashing, so a relay cannot confirm a guessed short message. */
-  contentSalt: Uint8Array;
 }
 
 /**
@@ -337,8 +342,5 @@ export function deriveSessionSecrets(opts: {
     return out;
   };
 
-  return {
-    contentKey: hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_KEY), SESSION_KEY_BYTES),
-    contentSalt: hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_SALT), SESSION_SALT_BYTES),
-  };
+  return { contentKey: hkdf(sha256, ikm, opts.sessionId, info(INFO_CONTENT_KEY), SESSION_KEY_BYTES) };
 }

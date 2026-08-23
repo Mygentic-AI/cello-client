@@ -72,6 +72,7 @@ export {
   saltedContentHash,
   SALT_CONTRIBUTION_BYTES,
   SALT_FINGERPRINT_BYTES,
+  SESSION_SALT_BYTES,
 } from "./session-salt.js";
 
 // DOD-M15-KEYAGREE-1: CELLO's own per-session key agreement — ephemeral-ephemeral X25519 with the
@@ -81,7 +82,6 @@ export {
   destroySessionEphemeral,
   deriveSessionSecrets,
   SESSION_KEY_BYTES,
-  SESSION_SALT_BYTES,
   type SessionEphemeral,
   type SessionSecrets,
 } from "./session-key-agreement.js";

@@ -44,7 +44,6 @@ import {
   generateSessionEphemeral,
   deriveSessionSecrets,
   SESSION_KEY_BYTES,
-  SESSION_SALT_BYTES,
 } from "../session-key-agreement.js";
 
 const SESSION_ID = new Uint8Array(16).fill(7);
@@ -73,10 +72,9 @@ function handshake(opts: { sessionId?: Uint8Array; extraA?: Uint8Array; extraB?:
 }
 
 describe("DOD-M15-KEYAGREE-1: both sides agree, and nobody else can", () => {
-  it("★ the two sides derive the SAME key and salt from opposite halves", () => {
+  it("★ the two sides derive the SAME key from opposite halves", () => {
     const { fromA, fromB } = handshake();
     expect(Buffer.from(fromA.contentKey)).toEqual(Buffer.from(fromB.contentKey));
-    expect(Buffer.from(fromA.contentSalt)).toEqual(Buffer.from(fromB.contentSalt));
   });
 
   it("★ the derivation is ORDER-INDEPENDENT — neither side needs to know who initiated", () => {
@@ -93,16 +91,20 @@ describe("DOD-M15-KEYAGREE-1: both sides agree, and nobody else can", () => {
     expect(Buffer.from(one.contentKey)).toEqual(Buffer.from(two.contentKey));
   });
 
-  it("★ the key and the salt are DIFFERENT — the salt is disclosed, the key must not be", () => {
+  it("★ this agreement produces ONE output — the salt is not derived here", () => {
     /**
-     * The content-hash salt travels wherever a content hash does; the relay sees it. Deriving both
-     * from one agreement is right, but deriving them to the same VALUE would hand the sealing key to
-     * everyone who can see a hash.
+     * Decisions Carried #8. The salt used to be a second HKDF output of this function, and that
+     * coupling tied "must be forgotten" (the key, destroyed at close) to "must be kept forever" (the
+     * salt, which the transcript needs for its whole life). It lives in `session-salt.ts` now,
+     * agreed in the same exchange from both sides' contributions.
+     *
+     * Asserted rather than left to the header, so a future reader who adds a second output has to
+     * delete a test that says why it was removed.
      */
     const { fromA } = handshake();
-    expect(Buffer.from(fromA.contentKey)).not.toEqual(Buffer.from(fromA.contentSalt));
-    expect(fromA.contentKey).toHaveLength(SESSION_KEY_BYTES);
-    expect(fromA.contentSalt).toHaveLength(SESSION_SALT_BYTES);
+    expect(Object.keys(fromA)).toEqual(["contentKey"]);
+    expect(fromA.contentKey).toHaveLength(32);
+    expect(SESSION_KEY_BYTES).toBe(32);
   });
 
   it("★ a THIRD party with both public keys cannot derive it — this is the whole point", () => {
@@ -287,10 +289,7 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
       out.set(l, 0); out.set(first, l.length); out.set(second, l.length + 32);
       return out;
     };
-    return {
-      contentKey: hkdfRef(ikm, sessionId, withBind("cello/session/v1/content-key"), 32),
-      contentSalt: hkdfRef(ikm, sessionId, withBind("cello/session/v1/content-salt"), 32),
-    };
+    return { contentKey: hkdfRef(ikm, sessionId, withBind("cello/session/v1/content-key"), 32) };
   }
 
   // Fixed inputs so the case is deterministic and reviewable, not whatever randomness produced.
@@ -310,15 +309,6 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     ).toBe(Buffer.from(want.contentKey).toString("hex"));
   });
 
-  it("★ contentSalt matches too — it is DERIVED, not a constant", () => {
-    // Closes the mutant where contentSalt was a hardcoded fill(1) and every test still passed.
-    const pkB = x25519.getPublicKey(SK_B);
-    const got = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID });
-    expect(Buffer.from(got.contentSalt).toString("hex")).toBe(
-      Buffer.from(expected(SK_A, pkB, SID).contentSalt).toString("hex"),
-    );
-  });
-
   it("★ the PQ extra secret is mixed in exactly as the spec says", () => {
     const pkB = x25519.getPublicKey(SK_B);
     const extra = new Uint8Array(48).fill(0x44);
@@ -336,28 +326,9 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     const pkB = x25519.getPublicKey(SK_B);
     const got = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID });
     expect(got.contentKey).toHaveLength(32);
-    expect(got.contentSalt).toHaveLength(32);
     expect(SESSION_KEY_BYTES, "and the exported constant must agree with reality").toBe(32);
-    expect(SESSION_SALT_BYTES).toBe(32);
   });
 
-  it("★ the content SALT gets the same scrutiny as the key: session-bound and third-party-safe", () => {
-    // F2: the salt had only three weak assertions, so a constant satisfied all of them. Its stated
-    // purpose is that a relay cannot confirm a guessed short message — which requires it to vary by
-    // session and be underivable by anyone else.
-    const pkB = x25519.getPublicKey(SK_B);
-    const s1 = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: new Uint8Array(16).fill(1) });
-    const s2 = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: new Uint8Array(16).fill(2) });
-    expect(
-      Buffer.from(s1.contentSalt),
-      "a salt that does not vary by session lets a relay build ONE rainbow table and confirm " +
-        "guessed short messages across every conversation forever",
-    ).not.toEqual(Buffer.from(s2.contentSalt));
-
-    const eve = generateSessionEphemeral();
-    const guess = deriveSessionSecrets({ ownEphemeralSecret: eve.secretKey, peerEphemeralPublic: pkB, sessionId: new Uint8Array(16).fill(1) });
-    expect(Buffer.from(s1.contentSalt)).not.toEqual(Buffer.from(guess.contentSalt));
-  });
 });
 
 describe("DOD-M15-KEYAGREE-1: the findings the review found in the code", () => {
