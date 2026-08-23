@@ -48,6 +48,19 @@
  * work."* A parameter that is accepted and ignored reads as done and is not, so a test proves a
  * different extra secret produces a different key.
  *
+ * ─── WHAT THIS DOES NOT DEFEND AGAINST, stated plainly (review F6) ─────────────────────────────
+ *
+ * The ephemerals here are UNAUTHENTICATED. That is sufficient against the threat the DoD line names
+ * — harvest-now-decrypt-later, i.e. a PASSIVE recorder, which is what a relay storing traffic is.
+ *
+ * It is NOT sufficient against an ACTIVE on-path relay, which can substitute both ephemerals and
+ * read everything. Nothing in this API takes an identity key, so there is nowhere to bind the
+ * ephemeral to the peer. `DOD-M15-EPHEMERAL-AUTH-1` carries that: the ephemeral public must be
+ * signed with the agent's Ed25519 identity and the peer's verified before deriving.
+ *
+ * Said here because the file's own headline is "CELLO owns its own confidentiality guarantee", and a
+ * reader could otherwise conclude MITM is covered. It is not, yet.
+ *
  * ─── Two outputs, one agreement ────────────────────────────────────────────────────────────────
  *
  * The message-sealing key and the per-session content-hash salt come from the same agreement under
