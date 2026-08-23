@@ -100,6 +100,38 @@ describe("DOD-M15-SEALWIRE-1 part A: an inbound contribution reaches the agreeme
     expect(fx.eventsNamed("session.salt.frozen").length, "and must not have frozen").toBe(0);
   }, 60_000);
 
+  it("★ a salt that FAILED TO STORE is never announced as agreed", async () => {
+    /**
+     * The last surviving mutant of the revert test: drop the caller's `if (!persisted) return` and
+     * everything stayed green, because nothing could make the persist report failure — an `UPDATE`
+     * matching no row returns `changes: 0` rather than throwing, and the method took its success
+     * branch on a write that stored nothing.
+     *
+     * Why it matters more than a missing row: announcing the fingerprint tells the counterparty the
+     * agreement is DONE. They stop offering a contribution and start comparing. We hold the salt in
+     * memory only, so the next restart loses it — and the two sides come back as one holding a salt
+     * and one not, which the agreement correctly refuses as `salt_state_divergent`. The loud failure
+     * still happens; it just happens a restart late, on a session both sides believed was settled.
+     *
+     * The unreachable-row case is reproduced here the way production reaches it: a session whose row
+     * is gone while the node is still live.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-salt-wire-h-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    fx.snm.getDb().prepare("DELETE FROM sessions WHERE session_id = ?").run(SID);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_CONTRIBUTION }), PEER);
+    await wait(300);
+
+    const failed = fx.eventsNamed("session.salt.persist.failed");
+    expect(failed.length, "a write that stored nothing must say so").toBe(1);
+    expect(failed[0]!.ctx!.reason).toBe("no_session_row");
+    expect(
+      fx.eventsNamed("session.salt.agreed").length,
+      "agreement must not be claimed for a salt that is not on disk",
+    ).toBe(0);
+  }, 60_000);
+
   it("★ a STRANGER cannot seed this session's salt", async () => {
     /**
      * A session node is a promoted standing receiver, and a standing receiver admitted everyone; a

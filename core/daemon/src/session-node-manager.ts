@@ -8420,9 +8420,31 @@ export class SessionNodeManager {
   #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
     if (!this.#db) return false;
     try {
-      this.#db
+      /**
+       * THE ROW COUNT IS THE CHECK, and without it this method reported success for a write that
+       * stored nothing.
+       *
+       * An `UPDATE` that matches no row does not throw — it returns `changes: 0`. So a session whose
+       * row is missing (retired agent, a row that failed to write at creation, an id that does not
+       * line up) took the success branch, cached the salt in memory, and announced our fingerprint
+       * to the counterparty. Agreement confirmed, nothing on disk, and the failure surfaces at the
+       * next restart as the divergence this whole design exists to make loud — except one restart
+       * late and with both sides believing they had agreed.
+       *
+       * Found by a mutant that removed the caller's `if (!persisted) return`: the suite stayed green,
+       * because nothing could produce a false from here.
+       */
+      const written = this.#db
         .prepare("UPDATE sessions SET content_salt = ? WHERE agent_id = ? AND session_id = ?")
         .run(Buffer.from(salt), this.#requireAgentId(agentName), sessionId);
+      if (Number(written.changes) !== 1) {
+        this.#logger.error("session.salt.persist.failed", {
+          agentName, sessionId, changes: Number(written.changes),
+          reason: "no_session_row",
+          impact: "the salt was NOT stored — no session row matched — so it is not announced either; the agreement stays open rather than being confirmed against a value that exists only in memory",
+        });
+        return false;
+      }
       this.#sessionSalts.set(this.#k(agentName, sessionId), salt);
       return true;
     } catch (err: unknown) {
