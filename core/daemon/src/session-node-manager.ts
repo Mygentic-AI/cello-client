@@ -21,6 +21,12 @@
 import { wireContentHash } from "./wire-content-hash.js";
 import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
+  onPeerSaltFrame,
+  ownSaltFrame,
+  SALT_FREEZE_GUIDANCE,
+  type SaltAgreementFrame,
+} from "./session-salt-agreement.js";
+import {
   type DaemonDatabase,
   openEncryptedDatabase,
   resolveDbKey,
@@ -45,7 +51,7 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { verify, buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
+import { verify, buildMerkleTree, merkleRoot, generateSaltContribution } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
@@ -816,6 +822,21 @@ export class SessionNodeManager {
   // session and re-admitted the same peer. NOT cleared by `#evictSessionCaches`: the freeze is a
   // fact about the session, not about the node that was torn down to enforce it.
   #frozenSessions = new Set<string>();
+  /**
+   * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement's two pieces of per-session state.
+   *
+   * `#saltContributions` — OUR random half, MINTED ONCE PER SESSION. This being a map rather than a
+   * fresh call at each send is the whole correctness of the exchange: we re-announce on every
+   * counterparty connect, and a contribution regenerated per reconnect would have both sides
+   * deriving against a moving value with the fingerprints never settling — a session that
+   * reconnects and still disagrees, which reads as a network fault rather than a bug here.
+   *
+   * `#sessionSalts` — a CACHE over `sessions.content_salt`, which is the durable copy. Both are
+   * cleared by `#evictSessionCaches`: the contribution is worthless once a salt exists, and the
+   * salt is re-read from the row on revival, which is exactly what Decision #8 persists it for.
+   */
+  #saltContributions = new Map<string, Uint8Array>();
+  #sessionSalts = new Map<string, Uint8Array>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -3543,6 +3564,21 @@ export class SessionNodeManager {
           correlationId,
         });
       }
+      /**
+       * DOD-M15-SEALWIRE-1 bullet 6 (part A) — ANNOUNCE OUR SALT STATE, here and nowhere else.
+       *
+       * This is the only hook that fires on BOTH sides for every way a session's direct path comes
+       * up: the initiator's first dial, the responder's inbound connection, every reconnect, and a
+       * revived node. `newStream` never dials — it only finds an already-open connection — so a
+       * send placed at `createSessionNode` would be an announcement to a peer that is not attached
+       * yet, and the responder's half has no dial of its own to hang one on at all.
+       *
+       * Fire-and-forget: a failed announcement must not turn a peer-connect handler into a rejected
+       * promise, and there is nothing to await it. We re-announce on the next connect, and
+       * `#handleSaltFrame` answers a peer contribution on a connection that is provably up — so a
+       * single lost frame does not strand the agreement.
+       */
+      void this.#sendSaltFrame(agentName, sessionId, correlationId);
     });
     node.onPeerDisconnect((peerId: string) => {
       if (!isCounterparty(peerId)) {
@@ -4099,6 +4135,19 @@ export class SessionNodeManager {
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
     this.#witnessedSeq.delete(key);
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 6 (part A) — both salt maps are CACHES and both go.
+     *
+     * The salt is re-read from `sessions.content_salt` on revival, which is the reason Decision #8
+     * persists it. The contribution is worthless once a salt exists, and if none was agreed yet, a
+     * revival minting a fresh one is correct: the peer either also holds nothing (both re-derive
+     * from the two current halves and reach the same bytes), or it derived against our old half
+     * while we were down — in which case the agreement refuses by name, which is the outcome
+     * Decision #10 asks for. What must never happen is a NEW contribution mid-session without a
+     * teardown, and that is why `#saltContributionFor` mints once rather than per send.
+     */
+    this.#saltContributions.delete(key);
+    this.#sessionSalts.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
@@ -8294,32 +8343,237 @@ export class SessionNodeManager {
    * from a party the accusing client does not control, which is `DOD-M15-CORROBORATE-1` (the relay
    * holds the sender's signed hash independently and never routes it through the receiver).
    */
+  /**
+   * DOD-M15-SEALWIRE-1 bullet 6 (part A) — THE SALT AGREEMENT, the I/O half.
+   *
+   * The decisions live in `session-salt-agreement.ts` as a pure function; everything here is the
+   * three things that function cannot do: read and write the durable row, put a frame on the wire,
+   * and stop a session.
+   *
+   * ─── Where a contribution may travel, and it is the one rule that cannot be fixed later ───────
+   *
+   * `/cello/content/1.0.0` ONLY. It rides circuit-relay-v2 carrying its own Noise session, so a
+   * relay forwarding it sees ciphertext. It must never be added to `session_offer` /
+   * `session_offer_accept` or anything a DIRECTORY brokers — and that is the trap, because the only
+   * round trip at session open today runs on the directory's signaling stream, which makes it the
+   * obvious place to put one. A session that shipped it there could not be repaired: the relay
+   * would already hold the salt and every hash it protects.
+   */
+  #saltContributionFor(agentName: string, sessionId: string): Uint8Array {
+    const key = this.#k(agentName, sessionId);
+    let contribution = this.#saltContributions.get(key);
+    if (!contribution) {
+      contribution = generateSaltContribution();
+      this.#saltContributions.set(key, contribution);
+    }
+    return contribution;
+  }
+
+  /**
+   * This session's agreed salt, or null. Reads the durable row through a cache, because Decision #8
+   * persists it for exactly one reason: *"a restart silently splits the transcript"* if the lookup
+   * misses and a fresh salt is minted.
+   *
+   * A read failure returns null WITH a log rather than throwing. Null here means "we hold no salt",
+   * which drives the agreement to offer a contribution — and against a peer that does hold one that
+   * is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a diagnosis, not
+   * in a session that quietly hashes under the wrong value.
+   */
+  #getSessionSalt(agentName: string, sessionId: string): Uint8Array | null {
+    const key = this.#k(agentName, sessionId);
+    const cached = this.#sessionSalts.get(key);
+    if (cached) return cached;
+    if (!this.#db) return null;
+    try {
+      const row = this.#db
+        .prepare("SELECT content_salt FROM sessions WHERE agent_id = ? AND session_id = ?")
+        .get(this.#requireAgentId(agentName), sessionId) as { content_salt?: Uint8Array | null } | undefined;
+      const stored = row?.content_salt;
+      if (!stored || stored.length === 0) return null;
+      const salt = new Uint8Array(stored);
+      this.#sessionSalts.set(key, salt);
+      return salt;
+    } catch (err: unknown) {
+      this.#logger.error("session.salt.read.failed", {
+        agentName, sessionId, error: extractErrorMessage(err),
+        impact: "this session is treated as holding no salt, so it will offer a fresh contribution; against a counterparty that still holds theirs the agreement refuses by name rather than hashing under a value only one side has",
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Persist the agreed salt, and DO NOT ANNOUNCE ONE WE FAILED TO STORE.
+   *
+   * The caller sends its fingerprint only if this returns true. A salt held in memory and not on
+   * disk would confirm agreement to the counterparty and then be gone at the next restart — turning
+   * a loud `salt_state_divergent` refusal, which is the whole point of Decision #10, into the
+   * silent split it exists to prevent, one restart later.
+   */
+  #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
+    if (!this.#db) return false;
+    try {
+      this.#db
+        .prepare("UPDATE sessions SET content_salt = ? WHERE agent_id = ? AND session_id = ?")
+        .run(Buffer.from(salt), this.#requireAgentId(agentName), sessionId);
+      this.#sessionSalts.set(this.#k(agentName, sessionId), salt);
+      return true;
+    } catch (err: unknown) {
+      this.#logger.error("session.salt.persist.failed", {
+        agentName, sessionId, error: extractErrorMessage(err),
+        impact: "the salt was NOT stored, so it is not announced to the counterparty either; the agreement stays open rather than being confirmed against a value that would vanish at the next restart",
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Announce our state to the counterparty: a contribution if we hold no salt, a fingerprint if we
+   * do. Called on every counterparty connect — first connection, reconnect and revival alike — and
+   * on receiving a peer contribution.
+   *
+   * Best-effort by design, and that is safe ONLY in part A. Nothing hashes with the salt yet, so a
+   * frame that never lands costs nothing today; part B, which moves the content hash onto it, is
+   * where an unanswered agreement becomes a session that cannot send and needs a bounded wait with
+   * a named failure. Do not carry this comment forward unchanged into that unit.
+   */
+  async #sendSaltFrame(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) return;
+    const frame = ownSaltFrame({
+      ownSalt: this.#getSessionSalt(agentName, sessionId),
+      ownContribution: this.#saltContributionFor(agentName, sessionId),
+    });
+    // Held outside the try so the catch can retire a stream that was opened and then failed to
+    // write — the same leak, and the same fix, as `#sendDeliveryAck`.
+    let saltStream: Stream | undefined;
+    try {
+      const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      saltStream = stream;
+      stream.send(lp.encode.single(encodeCbor({
+        type: "session_salt_agreement",
+        session_id: sessionId,
+        ...(frame.contribution ? { contribution: frame.contribution } : {}),
+        ...(frame.fingerprint ? { fingerprint: frame.fingerprint } : {}),
+      }) as Uint8Array));
+      await stream.close();
+      this.#logger.debug("session.salt.announced", {
+        agentName, sessionId, correlationId,
+        state: frame.fingerprint ? "holds_salt" : "offering_contribution",
+      });
+    } catch (err: unknown) {
+      this.#logger.warn("session.salt.announce.failed", {
+        agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        impact: "the counterparty was not told our salt state on this attempt; we re-announce on every reconnect, and nothing hashes with the salt yet, so no message is affected",
+      });
+      if (saltStream !== undefined) {
+        try { saltStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
+      }
+    }
+  }
+
+  /** Apply one inbound salt-agreement frame. The verdict is the pure function's; this executes it. */
+  async #handleSaltFrame(
+    agentName: string,
+    sessionId: string,
+    frame: SaltAgreementFrame,
+    correlationId?: string,
+  ): Promise<void> {
+    const action = onPeerSaltFrame({
+      ownSalt: this.#getSessionSalt(agentName, sessionId),
+      ownContribution: this.#saltContributionFor(agentName, sessionId),
+      frame,
+    });
+    if (action.action === "confirmed") {
+      this.#logger.info("session.salt.agreed", {
+        agentName, sessionId, correlationId, via: "fingerprint_match",
+      });
+      return;
+    }
+    if (action.action === "derive_and_announce") {
+      if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) return;
+      this.#logger.info("session.salt.agreed", {
+        agentName, sessionId, correlationId, via: "derived",
+      });
+      await this.#sendSaltFrame(agentName, sessionId, correlationId);
+      return;
+    }
+    // `detail` is the primitive's own sentence wherever the primitive produced it — never a code of
+    // ours substituted for it (Invariant 2). `guidance` is what the operator can DO, and it comes
+    // from the total map so a reason can never reach a log without one.
+    this.#logger.error("session.salt.disagreement", {
+      agentName, sessionId, correlationId,
+      reason: action.reason,
+      detail: action.detail,
+      guidance: SALT_FREEZE_GUIDANCE[action.reason],
+    });
+    await this.#freezeSession(agentName, sessionId, action.reason, {
+      event: "session.salt.frozen",
+      observation: `the salt agreement could not be completed with this counterparty: ${action.detail}`,
+      impact: "the session was stopped rather than left to hash under a value the two sides do not share; no message was lost and the transcript is unaffected — only a NEW session moves this forward",
+    }, correlationId);
+  }
+
   async #freezeOnIdentityFailure(
     agentName: string,
     sessionId: string,
     reason: string,
     correlationId?: string,
   ): Promise<void> {
-    // Review F1: MARK BEFORE TEARING DOWN. `destroySessionNode` writes `interrupted`, which is the
-    // revivable status — if the mark landed after, a read racing the teardown could revive the
-    // session out from under the freeze.
-    this.#frozenSessions.add(this.#k(agentName, sessionId));
-    this.#logger.error("session.content.identity.frozen", {
-      agentName, sessionId, reason, correlationId,
+    await this.#freezeSession(agentName, sessionId, reason, {
+      event: "session.content.identity.frozen",
       observation: "a frame failed to verify against the expected counterparty's key; the session was frozen defensively; cause undetermined",
       // Review F1: this said "no further content will be accepted on this session", which was FALSE
       // as shipped — the next read revived it. It is true now, and it says how it is true, because
       // an operator who reads "frozen" and then watches the session work again learns to distrust
       // the log rather than the session.
       impact: "the content was NOT ingested, NOT displayed and NOT attributed to anyone; the session will not be revived by a read or a send, and only a close or a fresh session moves it now",
+    }, correlationId);
+  }
+
+  /**
+   * Stop a session and refuse to revive it. Shared by the identity freeze and the salt
+   * disagreement, because the MECHANISM is identical — mark, then tear down — while the two have
+   * nothing else in common and must not describe each other. An identity failure is evidence about
+   * the counterparty; a salt disagreement is usually two builds that do not match, and telling an
+   * operator their counterparty failed a key check when they did not is worse than saying nothing.
+   * Hence the caller supplies both sentences.
+   */
+  async #freezeSession(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    narrative: { event: string; observation: string; impact: string },
+    correlationId?: string,
+  ): Promise<void> {
+    // Review F1: MARK BEFORE TEARING DOWN. `destroySessionNode` writes `interrupted`, which is the
+    // revivable status — if the mark landed after, a read racing the teardown could revive the
+    // session out from under the freeze.
+    this.#frozenSessions.add(this.#k(agentName, sessionId));
+    // The EVENT NAME is the caller's, not this method's. Both freezes share a mechanism and nothing
+    // else, and a salt disagreement logged under `…identity.frozen` would tell an operator their
+    // counterparty failed a key check when they did not — a worse outcome than saying nothing.
+    this.#logger.error(narrative.event, {
+      agentName, sessionId, reason, correlationId,
+      observation: narrative.observation,
+      // Review F1: the identity path's impact line said "no further content will be accepted on this
+      // session", which was FALSE as shipped — the next read revived it. It is true now, and it says
+      // how it is true, because an operator who reads "frozen" and then watches the session work
+      // again learns to distrust the log rather than the session.
+      impact: narrative.impact,
     });
     try {
-      // `"error"` maps to DB status `interrupted`, which is the SAME row an ordinary
-      // counterparty-gone teardown writes — so the freeze is currently distinguishable in the log
-      // and in behaviour, but not in the session record. That is a real gap against this unit's own
-      // clause and it is carried as `DOD-M15-FREEZE-STATUS-1` rather than claimed: the sessions
-      // table has no reason/detail column, and adding one is a client-side migration that belongs in
-      // its own reviewed unit rather than riding along inside this one.
+      /**
+       * `"error"` maps to DB status `interrupted`, which is the SAME row an ordinary
+       * counterparty-gone teardown writes — so a freeze is distinguishable in the log and in
+       * behaviour, but not in the session record.
+       *
+       * ⚠️ THIS COMMENT USED TO SAY THE COLUMNS DID NOT EXIST. They do now: `frozen_at` and
+       * `frozen_reason` were added to `sessions` by the salt migration, which carried them for
+       * `DOD-M15-FREEZE-STATUS-1` so that two lanes would not both edit this file's migration list.
+       * What is still missing is a WRITER — that is `FREEZE-STATUS-1`'s work and it belongs to the
+       * other lane, so nothing here fills them in. The gap is unchanged; only the reason for it is.
+       */
       await this.destroySessionNode(agentName, sessionId, "error");
     } catch (err: unknown) {
       // The refusal already happened — the content did not ingest. A teardown failure must not
@@ -8572,6 +8826,29 @@ export class SessionNodeManager {
         // Left as a bare dispatch on purpose: a second copy of a guard is a second thing to keep in
         // step, and the one that drifts is the one nobody is reading.
         void this.retireOnCounterpartyAbandon(agentName, sessionId, correlationId);
+        return;
+      }
+
+      /**
+       * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement.
+       *
+       * Placed BELOW the shared peer/session gate deliberately, which is the whole reason that gate
+       * was lifted above the dispatch: a new frame type is protected by construction rather than
+       * having to remember to opt in. A stranger's salt frame is refused before it reaches here, so
+       * nothing about this session's salt can be steered by a peer that is not its counterparty.
+       *
+       * The fields are read defensively into the frame shape rather than cast: an inbound value is
+       * whatever a peer chose to encode, and `onPeerSaltFrame` refuses both-fields and neither-field
+       * by name — so a non-Uint8Array in either slot must arrive at that function as ABSENT, not as
+       * a present-but-wrong value it would then try to use.
+       */
+      if (frame["type"] === "session_salt_agreement") {
+        const contribution = frame["contribution"];
+        const fingerprint = frame["fingerprint"];
+        await this.#handleSaltFrame(agentName, sessionId, {
+          ...(contribution instanceof Uint8Array ? { contribution } : {}),
+          ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
+        }, correlationId);
         return;
       }
 
