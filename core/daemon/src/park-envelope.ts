@@ -30,7 +30,7 @@ import { decode as cborDecode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
-import { CONTENT_HASH_ALGS } from "./wire-content-hash.js";
+import { CONTENT_HASH_ALGS, isKnownContentHashAlg } from "./wire-content-hash.js";
 
 /**
  * Compare an identity key (raw bytes) against a stored hex pubkey — on BYTES, never on the hex
@@ -67,9 +67,20 @@ export const PARK_ENVELOPE_VERSION = 2;
  *
  * ⚠️ EMITTED ONLY WHEN THE ALGORITHM IS NOT THE DEFAULT, and that is the whole compatibility story.
  * Every envelope this build produces today is still v2, because nothing salts — so no current peer
- * sees a version it cannot read. The gate is structural rather than a promise: a salted envelope can
- * only be addressed to a peer that completed the salt agreement, and a build able to do that
- * necessarily contains this decoder.
+ * sees a version it cannot read.
+ *
+ * 🚨 AND THE GATE IS A PUBLISHING FACT, NOT A STRUCTURAL ONE — review B2a F6 corrected this. The
+ * header used to claim *"a salted envelope can only be addressed to a peer that completed the salt
+ * agreement, and a build able to do that necessarily contains this decoder."* **False as stated:**
+ * the salt agreement landed several commits before this decoder, so any build cut from that interval
+ * has the agreement and not the decoder. On such a peer a v3 envelope matches no decode branch,
+ * falls through to the bare-content v1 shape, and `authenticateParkedEntry` refuses it as
+ * `unsigned_envelope` — the ATTACKER shape — the entry is never confirm-deleted, and it re-pulls
+ * forever. Exactly the failure this unit exists to prevent.
+ *
+ * What is true, and checkable: **no published build has the salt agreement without this decoder** —
+ * nothing in that interval is tagged. Part B2b must therefore gate salting on a real peer-capability
+ * signal rather than inferring capability from "they completed the salt agreement".
  *
  * Why the algorithm is NOT in the signed statement: `parkSig` covers `(session_id, recipient_pubkey,
  * content_hash)` — the HASH, not the name of the function that produced it. Adding the name would
@@ -141,13 +152,37 @@ export function encodeParkEnvelope(args: {
     args.senderPubkey,
     args.parkSig,
   ];
-  // The DEFAULT algorithm stays on v2 even when named explicitly. A caller that starts passing the
-  // algorithm through would otherwise push every envelope to a version older peers cannot read,
-  // without anyone having decided to.
-  if (!args.contentHashAlg || args.contentHashAlg === CONTENT_HASH_ALGS.SHA256) {
+  /**
+   * The DEFAULT algorithm stays on v2 even when named explicitly. A caller that starts passing the
+   * algorithm through would otherwise push every envelope to a version older peers cannot read,
+   * without anyone having decided to.
+   *
+   * ABSENT is `undefined`/`null` ONLY, never "falsy" — review B2a F4. `!args.contentHashAlg` also
+   * caught the EMPTY STRING, which is the collapse `resolveContentHashAlg` documents as forbidden
+   * and which this file's own `contentHashAlg` doc cites B1 for. A caller whose variable is `""`
+   * would have emitted a v2 envelope labelled sha256-by-absence, and the recipient would report a
+   * tamper on a message nobody touched.
+   */
+  const alg = args.contentHashAlg;
+  if (alg === undefined || alg === null || alg === CONTENT_HASH_ALGS.SHA256) {
     return encodeCbor([PARK_ENVELOPE_VERSION, ...base]) as Uint8Array;
   }
-  return encodeCbor([PARK_ENVELOPE_VERSION_ALG, ...base, args.contentHashAlg]) as Uint8Array;
+  /**
+   * REFUSE TO EMIT A NAME WE CANNOT READ OURSELVES — the producer-side mirror of what
+   * `contentHashFor` already does, and it costs nothing to have.
+   *
+   * Without it a caller can seal an envelope every peer refuses — including this build — with no
+   * signal at the sender at all: the message parks, is pulled, is refused, is kept, and repeats.
+   * A throw here is a developer error at the moment it is made, rather than a silent mail loop.
+   */
+  if (!isKnownContentHashAlg(alg)) {
+    throw new Error(
+      `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${alg}", which this ` +
+      "build cannot itself reproduce. The recipient would refuse it and keep re-pulling it forever, " +
+      "and nothing at the sender would say why.",
+    );
+  }
+  return encodeCbor([PARK_ENVELOPE_VERSION_ALG, ...base, alg]) as Uint8Array;
 }
 
 /**

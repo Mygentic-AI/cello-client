@@ -28,7 +28,7 @@ import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
 import { decodeParkEnvelope } from "./park-envelope.js";
-import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
+import { contentHashFor, resolveContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -189,6 +189,16 @@ export function createContentPark(deps: ContentParkDeps) {
         let annexed = false;
         let screenedOut = false;
         let screenDeferred = false;
+        /**
+         * WHY the entry is stuck, for the caller — review B2a F5.
+         *
+         * Every non-annexing branch fell through to one `annex_write_failed`, at the very line whose
+         * comment forbids exactly this: *"name why the entry is STUCK, not why ingest refused it."*
+         * The annex write was never attempted in any of these cases. Four distinct causes shared a
+         * label that named none of them, and the pre-existing hash-mismatch branch — a genuine
+         * tamper — was one of the four.
+         */
+        let annexRefusal: string | null = null;
         try {
           const env = decodeParkEnvelope(unsealed);
           /**
@@ -206,36 +216,77 @@ export function createContentPark(deps: ContentParkDeps) {
            * `session-node-manager.ts`'s `recoverParkedEntry`; both were changed together, because
            * fixing one and leaving the other is how this defect was created.
            */
+          /**
+           * TWO CAUSES, TWO REFUSALS — review B2a F2, and the first version collapsed them.
+           *
+           * "We cannot read the algorithm name" and "we hold no salt" are structurally different and
+           * they send the operator to different places. One guidance string served both, and for the
+           * salt case both halves of it were wrong: the counterparty's version is irrelevant, and
+           * *"delivered once this daemon can verify it"* is a promise this daemon cannot keep — the
+           * salt row is not coming back, so the entry loops on every drain forever.
+           *
+           * The DIRECT path already splits these (`content_hash_alg_unknown` vs
+           * `content_hash_salt_unavailable`, B1 review F6). Collapsing them here undid, on the park
+           * route, a distinction already paid for on the other one.
+           *
+           * It is not an edge case: `DOD-M15-SEALWIRE-1`'s own pass-1 F9 records that a park-only
+           * session never agrees a salt, because the announcement hangs off `onPeerConnect`. So a
+           * null salt is the DEFAULT for exactly the sessions whose content arrives this way.
+           */
           const alg = resolveContentHashAlg(env.contentHashAlg);
+          const sessionSalt = alg.ok
+            ? sessionNodeManager.getSessionContentSalt(recipientAgent.name, e.sessionIdHex)
+            : null;
           let computed: Uint8Array | null = null;
-          let algFailure: string | null = null;
+          // Discriminated BEFORE the call rather than recovered from a thrown string, so the two
+          // causes are branches rather than message-matching.
+          let algFailure: null | { reason: "annex_alg_unknown" | "annex_salt_unavailable"; detail: string } = null;
           if (!alg.ok) {
             // A name this build cannot read. NOT a hash mismatch: there is no value to compare
             // against, and reporting it as one would be a tamper claim for a version difference —
             // the same substitution `DOD-M15-SEALWIRE-1` part B1 removed on the direct path.
-            algFailure = `content_hash_alg_unknown (${alg.value})`;
+            algFailure = { reason: "annex_alg_unknown", detail: `the sender named "${alg.value}"` };
+          } else if (alg.alg !== CONTENT_HASH_ALGS.SHA256 && !sessionSalt) {
+            algFailure = {
+              reason: "annex_salt_unavailable",
+              detail: `the sender used ${alg.alg} and this side holds no salt for the session`,
+            };
           } else {
             try {
               computed = contentHashFor(env.content, {
                 alg: alg.alg,
                 // OUR salt for the session. The envelope never carries one and could not be trusted
                 // if it did — the salt is the shared secret that makes the hash unguessable.
-                salt: sessionNodeManager.getSessionContentSalt(recipientAgent.name, e.sessionIdHex),
+                salt: sessionSalt,
               });
             } catch (err: unknown) {
-              algFailure = err instanceof Error ? err.message : String(err);
+              // Unreachable given the two checks above; kept so a future algorithm that throws for a
+              // third reason cannot fall through into the mismatch branch and be called a tamper.
+              algFailure = { reason: "annex_alg_unknown", detail: extractErrorMessage(err) };
             }
           }
           if (algFailure !== null) {
-            logger.error("content.recover.annex.unverifiable", {
-              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
-              declaredAlg: env.contentHashAlg ?? "(absent)",
-              detail: algFailure,
-              impact: "this parked message could not be CHECKED — not that it failed a check. It was not annexed and the relay copy is kept, so nothing is lost. Nothing here says the sender did anything wrong.",
-              guidance: "Usually their CELLO build is newer than this one: ask which version they run, and upgrade. The message stays on the relay and is delivered once this daemon can verify it.",
-              correlationId,
-            });
+            annexRefusal = algFailure.reason;
+            logger.error(
+              algFailure.reason === "annex_salt_unavailable"
+                ? "content.recover.annex.salt_unavailable"
+                : "content.recover.annex.alg_unknown",
+              {
+                sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+                declaredAlg: env.contentHashAlg ?? "(absent)",
+                detail: algFailure.detail,
+                impact: "this parked message could not be CHECKED — not that it failed a check. It was not annexed and the relay copy is kept, so nothing is lost. Nothing here says the sender did anything wrong.",
+                guidance: algFailure.reason === "annex_salt_unavailable"
+                  // Lifted from the direct path's equivalent, because the operator needs the same
+                  // answer wherever the message arrived. Deliberately does NOT promise delivery:
+                  // without the salt this entry cannot be verified on any future drain either.
+                  ? "The salt agreement never completed on this side for this session — look for session.salt.read.failed or session.salt.persist.failed. Their build is NOT the problem; do not ask them to upgrade. This message will keep being re-pulled and re-refused until the session is closed, so close it and start a new one."
+                  : "Their CELLO build is newer than this one: ask which version they run, and upgrade. The message stays on the relay and is delivered once this daemon can read that algorithm.",
+                correlationId,
+              },
+            );
           } else if (Buffer.from(computed!).toString("hex") !== e.contentHashHex) {
+            annexRefusal = "annex_hash_mismatch";
             logger.error("content.recover.annex.hash_mismatch", {
               sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
               // The algorithm the comparison RAN UNDER. Without it a mismatch is unfalsifiable from
@@ -284,6 +335,7 @@ export function createContentPark(deps: ContentParkDeps) {
             }
           }
         } catch (err: unknown) {
+          annexRefusal = "annex_decode_failed";
           logger.error("content.recover.annex.decode_failed", {
             sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
             impact: "envelope could not be decoded — NOT annexed, relay copy kept",
@@ -314,11 +366,14 @@ export function createContentPark(deps: ContentParkDeps) {
         } else if (screenDeferred) {
           refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_screen_unavailable" });
         } else {
-          // The annex failed and said so. Keep the relay copy — it is now the only one.
-          // Review F7: name why the entry is STUCK, not why ingest refused it. Surfacing
-          // `session_committed` here sends the operator to look at session state when the fault is
-          // in the annex write.
-          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_write_failed" });
+          // Keep the relay copy — it is now the only one. Review F7: name why the entry is STUCK,
+          // not why ingest refused it. `annexRefusal` carries the branch that actually stopped it;
+          // the bare `annex_write_failed` fallback is now only what it says — the annex write ran
+          // and failed.
+          refusals.push({
+            contentHash: e.contentHashHex, sessionId: e.sessionIdHex,
+            reason: annexRefusal ?? "annex_write_failed",
+          });
         }
       } else {
         // M12-P18: content for a session WE REFUSED can be swept — deleting it acts on our own

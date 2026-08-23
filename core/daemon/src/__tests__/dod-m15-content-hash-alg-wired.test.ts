@@ -24,7 +24,11 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { CONTENT_HASH_ALGS, wireContentHash } from "../wire-content-hash.js";
 import { evaluateSealUpgrade } from "../seal-upgrade.js";
-import { deriveSessionSalt, saltedContentHash, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
+import { sealParkEnvelope } from "../park-envelope.js";
+import { contentHashFor } from "../wire-content-hash.js";
+import {
+  deriveSessionSalt, saltedContentHash, generateKeypair, SALT_CONTRIBUTION_BYTES,
+} from "@cello-protocol/crypto";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 
@@ -346,6 +350,84 @@ describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detec
     // is sent to look for.
     expect(skew.proceed === false && skew.refuseReason).toBe("content_verification_unavailable");
     expect(tamper.proceed === false && tamper.refuseReason).toBe("content_tamper");
+  }, 60_000);
+});
+
+describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  /**
+   * ⚠️ THE SECOND VERIFIER, and review B2a F3 measured that it was wired with no test at all:
+   * changing `recoverParkedEntry`'s algorithm argument back to `undefined` left the entire suite
+   * green, because every park fixture in the tree is v2 — for which `contentHashFor` and the old
+   * hardcoded `sha256` return identical bytes.
+   *
+   * A message takes one of two routes, and the park route is the one taken precisely when the direct
+   * one failed. Verifying it under the wrong algorithm refuses it, keeps the relay copy, and pulls it
+   * again on the next drain — forever.
+   */
+  async function parkedEntry(agent: string, sessionId: string, alg: string, salt: Uint8Array | null) {
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const recipientPub = await recipient.getPublicKey();
+    const contentHash = contentHashFor(CONTENT, { alg, salt });
+    const sealed = await sealParkEnvelope({
+      signer: sender, sessionIdHex: sessionId, recipientPubkey: recipientPub,
+      content: CONTENT, contentHash,
+      ...(alg === CONTENT_HASH_ALGS.SHA256 ? {} : { contentHashAlg: alg }),
+    });
+    const plaintext = await recipient.openContentSeal!(sealed);
+    return { agent, sessionId, plaintext: plaintext!, contentHash, recipientPub, sender };
+  }
+
+  it("★ a SALTED parked entry verifies under its own algorithm, not under sha256", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-a-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_HALF }), PEER);
+    await wait(200);
+    const salt = agreedSalt(fx);
+
+    const e = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.HMAC_SALT_V1, salt);
+    // The counterparty must be the envelope's signer, or the entry is refused on identity long
+    // before the algorithm matters — which would make this test pass for the wrong reason.
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
+
+    const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, e.contentHash, "corr");
+    expect(
+      res.ok,
+      `a salted parked entry must verify: ${JSON.stringify(res)}`,
+    ).toBe(true);
+  }, 60_000);
+
+  it("★ the same entry is REFUSED when this side holds no salt — by name, not as a tamper", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-b-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const someSalt = deriveSessionSalt(PEER_HALF, new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x77));
+    const e = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.HMAC_SALT_V1, someSalt);
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
+
+    const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, e.contentHash, "corr");
+    expect(res.ok).toBe(false);
+    expect(
+      res.ok === false && res.reason,
+      "the algorithm must come from the ENVELOPE — verifying as sha256 would report a tamper",
+    ).toBe("content_hash_salt_unavailable");
+  }, 60_000);
+
+  it("★ an UNSALTED (v2) parked entry still verifies — every peer in existence today", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-c-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const e = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.SHA256, null);
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
+
+    const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, e.contentHash, "corr");
+    expect(res.ok, `a v2 entry must keep working: ${JSON.stringify(res)}`).toBe(true);
   }, 60_000);
 });
 

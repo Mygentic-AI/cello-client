@@ -8431,25 +8431,43 @@ export class SessionNodeManager {
      * logged instead — the two events become one story, and B2 removes the ambiguity for real by
      * putting the name in the envelope.
      */
-    // Fires ONLY for the exact message that was refused, and only once — review F-D.
-    const byHash = this.#unreadableAlgSeen.get(this.#k(agentName, sessionId));
-    const priorDeclaredAlg = byHash?.get(contentHashHex);
-    if (priorDeclaredAlg !== undefined) {
-      byHash!.delete(contentHashHex);
-      if (byHash!.size === 0) this.#unreadableAlgSeen.delete(this.#k(agentName, sessionId));
-      this.#logger.warn("content.recover.alg_refusal_reconciled", {
-        agentName, sessionId, correlationId,
-        contentHash: contentHashHex,
-        priorDeclaredAlg,
-        impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content hash has now arrived via the relay park, where no algorithm name travels and it is verified as sha256. The refusal did not hold: the message is being delivered by the other route.",
-      });
-    }
-    return await this.ingestReceivedContent(
+    /**
+     * ⚠️ LOGGED AFTER THE INGEST, NOT BEFORE IT — review B2a F1, and the previous version of this
+     * block ANNOUNCED A DELIVERY THAT DOES NOT HAPPEN.
+     *
+     * It fired on a memo hit and said *"the message is being delivered by the other route"*, which
+     * was true-by-construction only while the park path passed `undefined` for the algorithm. Part
+     * B2a made the park path carry `env.contentHashAlg` — so a peer that names an unreadable
+     * algorithm on the direct path AND parks the same content as v3 with the same name is refused
+     * AGAIN here, re-arms the memo, is never confirm-deleted, and repeats on every drain. An
+     * unbounded stream of warnings asserting a delivery that never occurs, drowning the real
+     * reconciliation when the sender eventually re-parks as v2.
+     *
+     * The claim is only sound once the ingest has actually succeeded, so it is made there.
+     */
+    const memoKey = this.#k(agentName, sessionId);
+    const priorDeclaredAlg = this.#unreadableAlgSeen.get(memoKey)?.get(contentHashHex);
+    const result = await this.ingestReceivedContent(
       agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
       // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
       // `sha256` and is exactly right for a peer that predates the field.
       env.contentHashAlg,
     );
+    if (priorDeclaredAlg !== undefined && result.ok) {
+      // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
+      // refusal even when the recovery fails, so the next genuine reconciliation says nothing.
+      const byHash = this.#unreadableAlgSeen.get(memoKey);
+      byHash?.delete(contentHashHex);
+      if (byHash && byHash.size === 0) this.#unreadableAlgSeen.delete(memoKey);
+      this.#logger.warn("content.recover.alg_refusal_reconciled", {
+        agentName, sessionId, correlationId,
+        contentHash: contentHashHex,
+        priorDeclaredAlg,
+        recoveredAlg: env.contentHashAlg ?? "(absent → sha256)",
+        impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content has now been accepted via the relay park under an algorithm this build CAN read. The refusal did not hold: the message was delivered by the other route.",
+      });
+    }
+    return result;
   }
 
   /**
