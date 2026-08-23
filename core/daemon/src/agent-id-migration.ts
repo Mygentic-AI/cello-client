@@ -248,6 +248,16 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
   },
 ] as const;
 
+/**
+ * The tables this migration rebuilds, derived from `REKEY_TARGETS` rather than written out again.
+ *
+ * Exported for the guards (`dod-m15-migration-guard-1`), which must cover exactly what the
+ * migration touches. A hand-typed copy over there would silently get SHORTER than this list the day
+ * an eighth table is added — so the one table nobody remembered to guard would be the one table
+ * nobody checks, which is the shape of every escape this migration has already had.
+ */
+export const REKEYED_TABLES: readonly string[] = REKEY_TARGETS.map((t) => t.table);
+
 export interface AgentIdMigrationResult {
   readonly migrated: boolean;
   /** Rows copied, per rebuilt table. Absent tables are omitted. */

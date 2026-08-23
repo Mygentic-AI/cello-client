@@ -10,10 +10,28 @@
  * then re-added EMPTY seconds later by the same `ALTER`. Nothing throws. Every check afterwards
  * shows the column present. Only the DATA is gone, and only for people who upgraded.
  *
- * It has happened four times: `read_at`, `diverged_at`, `content_salt`, and `retry_queue`'s signed
- * ordering record. The last one is the one to hold on to — without it the recipient places recovered
- * content at its ARRIVAL index instead of its witnessed sequence, the two transcripts part, and the
- * session can never seal bilaterally again.
+ * It has happened three times — `read_at`, `diverged_at`, `content_salt` — each caught before
+ * shipping by the sibling guard, which covers `sessions` and nothing else.
+ *
+ * ─── ONE CLAIM THAT IS REPEATED IN THIS REPO AND IS NOT TRUE ───────────────────────────────────
+ *
+ * `retry_queue`'s `structure1_cbor` / `structure2_cbor` are described in `agent-id-migration.ts`
+ * and in this line's own DoD as a fourth instance and "a live data-loss bug". **Nobody ever lost
+ * an ordering record.** Checked against history rather than reasoned from the code:
+ *
+ *   - the re-key shipped `173d34f`, 2026-07-10, and is ONE-SHOT (`needsRekey` is false forever once
+ *     `agent_id` exists);
+ *   - `structure1_cbor` shipped `6cea544`, 2026-08-05, four weeks LATER;
+ *   - `RetryQueue` is constructed exactly once, at `daemon.ts:1905`, after `initialize()`.
+ *
+ * So the only database on which `retry_queue` is ever rebuilt predates the column by a month and
+ * has nothing to lose. The intersection copy drops nothing; the constructor then adds the column
+ * empty, correctly.
+ *
+ * **The guard is still worth having, and the reason is the interesting part:** what makes that loss
+ * unreachable is the ORDER of two calls, and that order is held in place by a comment
+ * (`retry-queue.ts`, "Do not reorder") rather than by any mechanism. The DDL entry and this replay
+ * are what turn a convention into something that fails loudly when it is broken.
  *
  * ─── Why the existing guard could not catch it ─────────────────────────────────────────────────
  *
@@ -37,9 +55,12 @@
  *   `agent_name`-keyed table at the moment the re-key runs.**
  *
  * `sessions`' columns and `contacts.moniker` are added by ALTERs that run BEFORE the re-key in the
- * same boot. `retry_queue`'s are added by a constructor that runs after — but on the second boot of
- * an old database they are already there, because a previous boot added them. All of those must be
- * in the DDL.
+ * same boot, so they must be in the DDL.
+ *
+ * `retry_queue`'s are replayed before it here too, and that models a state no shipped version can
+ * actually produce (see above). Deliberately conservative: it holds the invariant that the "do not
+ * reorder" comment asserts, so moving that constructor ahead of the re-key fails HERE instead of on
+ * an operator's machine.
  *
  * `contacts`' four tier columns must NOT be, and this is the trap: `migrateContactsAddTierMetadata`
  * runs AFTER the re-key and gates a ONE-TIME grandfather on the columns not existing yet — it
@@ -57,9 +78,10 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
-import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
+import { migrateSessionTablesToAgentId, REKEYED_TABLES } from "../agent-id-migration.js";
 import { migrateContactsAddTierMetadata, TIER } from "../contacts-tier-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
+import { addColumnIfMissing } from "../column-birth.js";
 import type { DaemonDatabase } from "../sqlcipher-db.js";
 import type { Logger } from "../types.js";
 
@@ -74,10 +96,13 @@ function stripComments(text: string): string {
   return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
-const SEVEN = [
-  "sessions", "seal_interrupted_artifacts", "session_tree_leaves",
-  "transcript", "message_watermarks", "contacts", "retry_queue",
-] as const;
+/**
+ * Taken from the migration, NOT typed out again. A local copy gets shorter than the migration's
+ * list the day an eighth table is added, and it never goes red doing it — so the one table nobody
+ * remembered to guard would be the one table nobody checks. That is the shape of every escape this
+ * migration has already had, and a guard is the last place to reproduce it.
+ */
+const SEVEN = REKEYED_TABLES;
 
 /**
  * The pre-migration schema as REMOVE-001 left it: seven children keyed on the mutable `agent_name`.
@@ -125,8 +150,29 @@ const LEGACY_DDL = `
  */
 function literalAlters(text: string, table: string): string[] {
   const out: string[] = [];
-  const re = new RegExp(`ALTER TABLE ${table} ADD COLUMN ([^"'\`]+)`, "g");
-  for (const m of stripComments(text).matchAll(re)) out.push(m[1]!.trim());
+  /**
+   * The capture runs to the END OF THE STRING LITERAL, not to the first quote.
+   *
+   * It used to be `([^"'\`]+)`, which stops dead at a quote — so
+   * `ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'` parsed as
+   * `origin TEXT NOT NULL DEFAULT`, which is a SQL syntax error, which the replay then swallowed.
+   * The column was never added, never seeded, never checked, and the guard stayed green. That exact
+   * shape is already written twice in the file this parses (`held_content.origin`); the next one to
+   * land on a rebuilt table would have been invisible.
+   */
+  const inner = new RegExp(`^ALTER TABLE ${table} ADD COLUMN (.+)$`, "i");
+  // Find whole JS string literals first, then read the SQL out of one. Scanning for the SQL
+  // directly cannot know where the statement ends, which is how the quoted-DEFAULT case was lost.
+  for (const m of stripComments(text).matchAll(/(["'`])((?:\\.|(?!\1)[\s\S])*)\1/g)) {
+    const sql = m[2]!.trim().replace(/\s+/g, " ");
+    const hit = inner.exec(sql);
+    if (hit === null) continue;
+    const ddl = hit[1]!.trim();
+    // A template hole (`${col.name}`) means the column names are DATA, not text — a different
+    // parser's job. Skipping it here silently would be a hole, so it is asserted separately.
+    if (ddl.includes("${")) continue;
+    out.push(ddl);
+  }
   return out;
 }
 
@@ -140,8 +186,22 @@ function retryQueueAlters(text: string): string[] {
   expect(loop, "retry-queue.ts no longer adds columns by the `${col.name} ${col.type}` template — " +
     "this parser is now reading a shape that does not exist, and would report ZERO columns to " +
     "replay, which is a silent pass. Update the parser before updating the loop.").toBe(true);
+  /**
+   * Scoped to the `for (const col of [ … ])` array that feeds the ALTER, not the whole file. An
+   * unscoped match would pick up any unrelated `{ name, type }` object added later and invent a
+   * column, failing with a message that sends the reader to the wrong place.
+   */
+  const arrayStart = stripped.indexOf("for (const col of [");
+  expect(arrayStart, "retry-queue.ts no longer feeds its ALTER from a `for (const col of [` array")
+    .toBeGreaterThan(-1);
+  const arrayEnd = stripped.indexOf("]", arrayStart);
+  const array = stripped.slice(arrayStart, arrayEnd);
+
   const out: string[] = [];
-  for (const m of stripped.matchAll(/\{\s*name:\s*"(\w+)",\s*type:\s*"(\w+)"\s*\}/g)) {
+  // `type` captures to the closing quote, not one word: a column declared
+  // `{ name: "priority", type: "INTEGER NOT NULL DEFAULT 0" }` parsed as NOTHING under `(\w+)`,
+  // and a parser that matches nothing is a guard that passes.
+  for (const m of array.matchAll(/\{\s*name:\s*"([^"]+)",\s*type:\s*"([^"]+)"\s*\}/g)) {
     out.push(`${m[1]!} ${m[2]!}`);
   }
   return out;
@@ -227,12 +287,61 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
       "no retry_queue columns parsed out of retry-queue.ts — same silent-pass risk",
     ).toBeGreaterThan(0);
 
+    /**
+     * ─── THE REPLAY IS LOUD. A BARE `catch {}` HERE MADE THIS WHOLE FILE A DECORATION ──────────
+     *
+     * It used to be `try { … } catch { /* already present *​/ }`, which cannot tell "already
+     * present" from "the parser handed me broken SQL". A mis-parsed column then failed to apply,
+     * was never seeded, was never checked — and the test passed. That is the precise anti-pattern
+     * `column-birth.ts` exists to condemn, committed inside the guard whose whole thesis is that a
+     * checker which silently matches nothing reports success either way.
+     *
+     * `addColumnIfMissing` swallows ONLY `duplicate column name` and rethrows everything else.
+     */
     for (const [table, ddls] of Object.entries(alters)) {
       for (const ddl of ddls) {
-        try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`); }
-        catch { /* already present in the legacy DDL above */ }
+        addColumnIfMissing(db as unknown as DaemonDatabase, silentLogger(), {
+          table,
+          column: ddl.split(/\s+/)[0]!,
+          sql: `ALTER TABLE ${table} ADD COLUMN ${ddl}`,
+        });
       }
     }
+
+    /**
+     * ─── THE INVERSE ASSERTION: every column the MIGRATION knows about must have been replayed ──
+     *
+     * The floors above (`> 5`, `> 0`) are weak: they catch a parser that breaks completely, not one
+     * that quietly returns fewer columns than it should. And the seeded map is built from whatever
+     * the replay managed to add, so a parser miss SHRINKS the loop rather than reddening it — the
+     * hand-maintained-list hollow shape, one level down.
+     *
+     * So the coverage is measured against what the system itself declares. Run the migration on an
+     * EMPTY legacy database to obtain the pinned target schema without exporting it, then require
+     * every one of its columns to be present on the table this test is about to seed. A column the
+     * pinned DDL carries and the replay missed is a column this test silently stopped checking.
+     */
+    const pinnedProbe = legacyDb();
+    migrateSessionTablesToAgentId(pinnedProbe as unknown as DaemonDatabase, silentLogger());
+    const unreplayed: string[] = [];
+    for (const t of SEVEN) {
+      const replayed = new Set(columnsOf(db, t).map((c) => c.name));
+      for (const c of columnsOf(pinnedProbe, t)) {
+        // `agent_id` is created BY the migration; it is not something the replay could add.
+        if (c.name === "agent_id" || replayed.has(c.name)) continue;
+        unreplayed.push(`${t}.${c.name}`);
+      }
+    }
+    pinnedProbe.close();
+    expect(
+      unreplayed,
+      `The pinned DDL carries these columns but the replay never added them, so this test does NOT ` +
+        `check them:\n  ${unreplayed.join("\n  ")}\n\n` +
+        `Either the source parser stopped recognising the ALTER that adds one — the failure this ` +
+        `guard is most likely to have — or the column is genuinely added after the re-key, in ` +
+        `which case it must NOT be in the pinned DDL at all. Do not silence this by seeding the ` +
+        `column by hand: the point is that the replay comes from the source.`,
+    ).toEqual([]);
 
     // 2. Write a distinguishable value into EVERY column of EVERY rebuilt table.
     const seeded = new Map<string, Map<string, unknown>>();
@@ -355,13 +464,25 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
       "retry-queue.ts": "replayed BEFORE the re-key — its constructor runs later, but on the second boot of an old database the columns are already present",
       "contacts-tier-migration.ts": "deliberately NOT replayed: runs AFTER the re-key, and its columns must NOT be in the pinned DDL — see the grandfather test above",
       "agent-id-migration.ts": "the migration under test; its ALTERs are the rebuild's own",
+      "trust-signal-store.ts":
+        "flagged by the VARIABLE-table rule, and checked rather than waved through: its list is " +
+        "[\"wallet_trust_signals\", \"contact_trust_signals\"] — neither is rebuilt. Re-read that " +
+        "list before trusting this entry; it is the list, not the file, that makes it safe.",
     };
 
     const files: string[] = [];
     for (const entry of readdirSync(SRC)) {
       if (!entry.endsWith(".ts")) continue;
       const text = stripComments(readFileSync(join(SRC, entry), "utf8"));
-      if (SEVEN.some((t) => new RegExp(`ALTER TABLE ${t} ADD COLUMN`).test(text))) files.push(entry);
+      if (SEVEN.some((t) => new RegExp(`ALTER TABLE ${t} ADD COLUMN`).test(text))) { files.push(entry); continue; }
+      /**
+       * A VARIABLE table name is flagged too, and it must be: `ALTER TABLE ${table} ADD COLUMN` is
+       * already written in this codebase (`trust-signal-store.ts`, over a list). A police that only
+       * reads literal names cannot tell whether that list contains a rebuilt table, and the answer
+       * can change without this file being touched. Flagging is the conservative direction — a
+       * false positive costs one line in the map below; a false negative costs an operator's data.
+       */
+      if (/ALTER TABLE \$\{\w+\} ADD COLUMN/.test(text)) files.push(entry);
     }
 
     const unknown = files.filter((f) => !(f in READ_BY_THIS_GUARD));
