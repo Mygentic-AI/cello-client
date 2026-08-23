@@ -1322,6 +1322,46 @@ export class SessionNodeManager {
     for (const ddl of [
       "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
       "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
+      /**
+       * Decisions Carried #8 — THE SESSION SALT, persisted.
+       *
+       * Agreed once at session open from BOTH sides' random contributions, and unchanged for the
+       * life of the session. It is NOT a key: it decrypts nothing, and it is what lets this
+       * operator's own transcript stay verifiable — the content hash is recomputed from stored
+       * plaintext on the receive path and again for any later check, and salted it is underivable
+       * without this value.
+       *
+       * PERSISTED because the alternative is silent corruption: on re-key after a restart the
+       * lookup is "does this session already have a salt? yes → use it, no → agree one". If it is
+       * not stored the lookup fails, a fresh salt is minted, and the restart splits the transcript
+       * at the point of the crash — every leaf before it becomes unverifiable, with nothing saying
+       * so. That is the exact defect the per-session design removes, re-entered through a crash.
+       *
+       * NULL for every session opened before this column existed; those keep the unsalted hash.
+       */
+      "ALTER TABLE sessions ADD COLUMN content_salt BLOB",
+      /**
+       * DOD-M15-FREEZE-STATUS-1 — carried here for the OTHER LANE (`CELLO_Support`), agreed in
+       * session `e3adcaa7…`. Two lanes must not both edit this file (§2e, one file two branches), so
+       * the columns land in one migration and every line of behaviour stays on their side. Nothing
+       * in this lane reads or writes them.
+       *
+       *   `frozen_at`     epoch-ms when `#freezeOnIdentityFailure` fired. NULL = never frozen.
+       *   `frozen_reason` the `reason` already passed to that method. NULL iff `frozen_at` is NULL.
+       *
+       * ⚠️ THE WRITE MUST LAND BEFORE `destroySessionNode`, NOT AFTER — FRAME-1 review F1's
+       * ordering, and the reason the in-memory `#frozenSessions.add` already sits before the
+       * teardown. `destroySessionNode` writes `interrupted`, which is the REVIVABLE status, so a
+       * durable mark landing after it lets a read race the teardown and revive the session out from
+       * under the freeze — the disk reproducing the bug the memory mark was moved early to fix.
+       *
+       * Why it earns a slot rather than waiting: `#frozenSessions` is memory-only today, so a
+       * restart UN-FREEZES a session that was frozen because a party signed with a key that was not
+       * the counterparty's. The next read revives it and re-admits that peer, while the log still
+       * says the session will not be revived.
+       */
+      "ALTER TABLE sessions ADD COLUMN frozen_at INTEGER",
+      "ALTER TABLE sessions ADD COLUMN frozen_reason TEXT",
       // MSG-001-3b (MSG-2 startup-flush): persist the session's relay endpoint so the
       // crash-backstop flush can deposit un-acked content after a restart, when the
       // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
