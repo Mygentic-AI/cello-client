@@ -1816,11 +1816,57 @@ export class SessionNodeManager {
     sessionIdHex: string,
     certifiedRoot: Uint8Array,
     certifiedLeafCount: number,
-  ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string } | { verdict: "cannot_judge"; reason: string } {
+  ): { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string } {
     const carry = this.getSealCarry(agentPubkeyHex, sessionIdHex);
     if (carry.length === 0) return { verdict: "cannot_judge", reason: "no_carry" };
+
+    /**
+     * COMPLETENESS IS ESTABLISHED FROM THE CARRY'S OWN EVIDENCE, NEVER FROM THE CERTIFICATE.
+     *
+     * Review F3, and the first cut had this exactly backwards. It gated on
+     * `carry.length !== certifiedLeafCount`, where `certifiedLeafCount` is a field the DIRECTORY
+     * chooses and signs — so the party being checked controlled whether it was checked. A directory
+     * certifying a root over a different conversation had only to state a `leaf_count` that did not
+     * match, and the client answered "cannot judge" and accepted. The signature still verified,
+     * because the count is signed inside the same TBS.
+     *
+     * That is the hole §2b names in as many words: *"an attacker who wants to evade a mismatch check
+     * simply never supplies a checkable proof. Treating 'we could not tell' as harmless is the
+     * hole."* I defended against a false POSITIVE and left the false NEGATIVE one field away.
+     *
+     * The carry can answer the question by itself. A complete bilateral leaf set is:
+     *   - sequences contiguous from 1 — no gap where a leaf this daemon never saw would sit; and
+     *   - exactly two SEAL ctrl leaves, from two DISTINCT senders — which is what a bilateral seal
+     *     is, and is the condition that says the counterparty's closing leaf has landed here.
+     * Both predicates already exist in `seal-escalation.ts`; this reuses their shape rather than
+     * inventing a second opinion about the same question.
+     *
+     * When the carry IS self-evidently complete, a `leaf_count` that disagrees is no longer "I
+     * cannot tell" — it is the certificate describing a different leaf set, which is a MISMATCH.
+     */
+    const sequences = carry.map((l) => l.sequenceNumber).sort((a, b) => a - b);
+    const contiguousFromOne = sequences.every((n, i) => n === i + 1);
+    const ctrlSenders = new Set(
+      carry.filter((l) => l.leafKind === LEAF_KIND_CTRL).map((l) => l.senderPubkeyHex),
+    );
+    const selfEvidentlyComplete = contiguousFromOne && ctrlSenders.size === 2;
+
+    if (!selfEvidentlyComplete) {
+      return {
+        verdict: "cannot_judge",
+        reason: contiguousFromOne
+          ? `carry_incomplete: ${ctrlSenders.size} of 2 SEAL ctrl leaves witnessed here`
+          : `carry_noncontiguous: hold ${carry.length} leaves with a gap in the relay sequence`,
+      };
+    }
     if (carry.length !== certifiedLeafCount) {
-      return { verdict: "cannot_judge", reason: `carry_incomplete: hold ${carry.length}, certificate covers ${certifiedLeafCount}` };
+      // The carry proves itself complete and the certificate claims a different size, so the
+      // certificate is over a different leaf set. Accusing is correct here.
+      return {
+        verdict: "mismatch",
+        ownRootHex: null, // no root computed — the sets differ in SIZE, which is decisive on its own
+        detail: `leaf_count_disagrees: this daemon holds a provably complete ${carry.length}-leaf set, the certificate claims ${certifiedLeafCount}`,
+      };
     }
     const inputs: LeafInput[] = [];
     for (const leaf of carry) {
@@ -1840,7 +1886,7 @@ export class SessionNodeManager {
     const ownRootHex = Buffer.from(ownRoot).toString("hex");
     return Buffer.compare(Buffer.from(ownRoot), Buffer.from(certifiedRoot)) === 0
       ? { verdict: "match" }
-      : { verdict: "mismatch", ownRootHex };
+      : { verdict: "mismatch", ownRootHex, detail: "root_disagrees: same leaf count, different leaves or different order" };
   }
 
   getSealCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {

@@ -161,6 +161,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               sessionId: sidHex,
               certifiedRoot: rootHex,
               ownRoot: rootCheck.ownRootHex,
+              detail: rootCheck.detail,
               leafCount,
               impact:
                 "the directory signed a root over a leaf set this daemon does not hold. The signature " +

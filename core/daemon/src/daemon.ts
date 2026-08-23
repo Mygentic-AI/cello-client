@@ -875,6 +875,10 @@ async function startDaemonHoldingLock(
       agentName,
       persistence: getPersistence(agentName),
       agentPubkeyHex,
+      // DOD-M15-SEALWIRE-1 bullet 2 (review F1): the co-sign path must check the root before this
+      // agent's key endorses it. Same predicate as the receiving path — one implementation, so the
+      // two halves cannot drift about what a mismatch is.
+      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
       keyProvider: agentKeyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -887,6 +891,10 @@ async function startDaemonHoldingLock(
       agentName,
       persistence: getPersistence(agentName),
       agentPubkeyHex,
+      // DOD-M15-SEALWIRE-1 bullet 2 (review F1): the co-sign path must check the root before this
+      // agent's key endorses it. Same predicate as the receiving path — one implementation, so the
+      // two halves cannot drift about what a mismatch is.
+      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
       keyProvider: agentKeyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -951,6 +959,8 @@ async function startDaemonHoldingLock(
       agentName: agent.name,
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
+      // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
+      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
       keyProvider: agent.keyProvider,
       getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -962,6 +972,8 @@ async function startDaemonHoldingLock(
       agentName: agent.name,
       persistence: getPersistence(agent.name),
       agentPubkeyHex: agent.pubkey,
+      // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
+      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
       keyProvider: agent.keyProvider,
       getNode: noSharedDirectoryNode,
       getDirectoryEndpoint: getFailoverEndpoint,
@@ -2725,6 +2737,8 @@ async function startDaemonHoldingLock(
       agentName,
       persistence: getPersistence(agentName),
       agentPubkeyHex: loaded.pubkey,
+      // DOD-M15-SEALWIRE-1 bullet 2 (review F1): gate the co-signature on the root check.
+      verifyCertifiedRoot: (pub, sid, root, leaves) => sessionNodeManager.verifyCertifiedRoot(pub, sid, root, leaves),
       keyProvider: loaded.keyProvider,
       getNode: entry.getNode,
       getDirectoryEndpoint: getFailoverEndpoint,

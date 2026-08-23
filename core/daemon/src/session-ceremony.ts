@@ -194,6 +194,24 @@ export interface CeremonyWiringDeps {
   persistence: DaemonRegistrationPersistence;
   agentPubkeyHex: string;
   /**
+   * DOD-M15-SEALWIRE-1 bullet 2 — THE CO-SIGNING HALF, which the line calls the worst moment:
+   * *"your key signs a root you never checked."*
+   *
+   * Review F1: the first cut installed the root check only on the RECEIVING path
+   * (`seal-coordinator.ts`), and left this one — where this agent's FROST key actually endorses the
+   * root — untouched. A directory certifying a root over a different leaf set still got the
+   * initiator's signature on it, and the resulting artifact is durable, valid and non-repudiable.
+   * The receiving-side check then runs AFTER that signature already exists.
+   *
+   * Required, not optional: an unwired check here is the defect this bullet exists to close.
+   */
+  verifyCertifiedRoot: (
+    agentPubkeyHex: string,
+    sessionIdHex: string,
+    certifiedRoot: Uint8Array,
+    certifiedLeafCount: number,
+  ) => { verdict: "match" } | { verdict: "mismatch"; ownRootHex: string | null; detail: string } | { verdict: "cannot_judge"; reason: string };
+  /**
    * SEC-2: the agent's K_local signer — authenticates every FROST commit/sign request the ceremony
    * sends to the directory (the directory verifies it against agentPubkeyHex before touching its share).
    */
@@ -529,6 +547,36 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
             return; // refuse to co-sign — the directory gets no signature for an inflated cert
           }
         }
+      }
+
+      /**
+       * DO NOT SIGN A ROOT THIS AGENT HAS NOT CHECKED — bullet 2's co-signing half (review F1).
+       *
+       * Same predicate as the receiving path, deliberately: one implementation, so the two halves
+       * cannot drift into disagreeing about what counts as a mismatch.
+       *
+       * `cannot_judge` REFUSES here, where the accept path tolerates it — and the asymmetry is the
+       * point. Accepting an unverifiable certificate keeps a receipt that already exists; SIGNING an
+       * unverifiable one manufactures a new, durable, non-repudiable claim with this agent's key on
+       * it. The safe default is opposite in each direction: tolerate on the way in, refuse on the way
+       * out.
+       */
+      const rootCheck = deps.verifyCertifiedRoot(deps.agentPubkeyHex, sidHex, sealedRoot, leafCount);
+      if (rootCheck.verdict !== "match") {
+        deps.logger.error("session.seal.ceremony.abort", {
+          agentName: deps.agentName, sessionId: sidHex,
+          reason: rootCheck.verdict === "mismatch" ? "root_mismatch" : "root_unverifiable",
+          detail: rootCheck.verdict === "mismatch" ? rootCheck.detail : rootCheck.reason,
+          ...(rootCheck.verdict === "mismatch" && rootCheck.ownRootHex ? { ownRoot: rootCheck.ownRootHex } : {}),
+          impact:
+            "this agent REFUSED to co-sign. Signing would have put its key on a notarization it " +
+            "cannot confirm describes this conversation — a durable, valid, non-repudiable claim " +
+            "about a transcript it never checked. The session is not sealed; nothing is lost.",
+          guidance:
+            "Compare the leaf count with the counterparty and check the directory and relay logs for " +
+            "this session id. Do NOT force-abandon: that forfeits the receipt permanently.",
+        });
+        return; // refuse to co-sign — the directory gets no signature for a root we cannot verify
       }
 
       const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, timestamp), legForHash);
