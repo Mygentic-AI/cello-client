@@ -1,11 +1,13 @@
 /**
  * THE SESSION SALT — Decisions Carried #8, #9, #10 (Andre, 2026-08-23).
  *
- * ⚠️ STAGE, NOT A FINISHED FEATURE (review F10). This module has NO PRODUCTION CALLER yet, and
- * `sessions.content_salt` has no writer and no reader. `DOD-M15-SEALWIRE-1` owns the wire and cannot
- * be split, so the primitive, the column and the migration land first. Every sentence below that
- * describes exchanging, storing or looking up a salt describes what SEALWIRE-1 WILL do — not what
- * the running system does today.
+ * ⚠️ AGREED AND STORED, BUT NOTHING HASHES WITH IT YET. `session-salt-agreement.ts` now calls
+ * `deriveSessionSalt` and `saltFingerprint`, and `sessions.content_salt` has both a writer and a
+ * reader — so this is no longer the orphan primitive the previous revision of this header described.
+ * What is still outstanding is the half that makes it load-bearing: `wire-content-hash.ts` is
+ * untouched and `saltedContentHash` has NO production caller, so no message's hash depends on any of
+ * this. `DOD-M15-SEALWIRE-1` part B is what moves the content hash onto it, and until then every
+ * sentence below about defending a hash describes what the salt is FOR, not what it currently does.
  *
  * ─── Why this is a separate file from the key agreement ────────────────────────────────────────
  *
