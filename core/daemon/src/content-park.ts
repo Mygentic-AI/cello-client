@@ -457,12 +457,17 @@ export function createContentPark(deps: ContentParkDeps) {
     const relays = sessionNodeManager.getAgentRelayEndpoints(agentName);
     if (relays.length === 0) return;
     let total = 0;
+    let refusedTotal = 0;
+    const refusedReasons: Record<string, number> = {};
     let failed = 0;
     for (const r of relays) {
       try {
         const res = await recoverParkedFromRelay(agent, r.relayPeerId, r.relayAddrs);
         if (res.ok) {
           total += res.recovered;
+          // F3: tally by reason so the unattended drain reports refusals it would otherwise swallow.
+          refusedTotal += res.refused;
+          for (const r2 of res.refusals) refusedReasons[r2.reason] = (refusedReasons[r2.reason] ?? 0) + 1;
         } else {
           // Review #2: a non-ok result (signing_key_unavailable / cannot_unseal / the precise
           // no-receiver cause) was previously silent — log the reason so a run where every relay
@@ -480,7 +485,14 @@ export function createContentPark(deps: ContentParkDeps) {
     }
     // Emit the completion event UNCONDITIONALLY — not only when total > 0 — so a clean "nothing
     // parked" run is observable, and distinct from an all-failed run.
-    logger.info("content.recover.auto.completed", { agentName, trigger, recovered: total, relayCount: relays.length, failedRelays: failed });
+    // `refusedReasons` for the same reason as above (F3): the drain is the path that runs
+    // unattended, so if a refusal is invisible here it is invisible altogether. Counts by reason
+    // rather than per-entry, so a mailbox full of one fault does not become a wall of log.
+    logger.info("content.recover.auto.completed", {
+      agentName, trigger, recovered: total, relayCount: relays.length, failedRelays: failed,
+      refused: refusedTotal,
+      ...(Object.keys(refusedReasons).length > 0 ? { refusedReasons } : {}),
+    });
   }
 
 
@@ -552,7 +564,19 @@ export function createContentPark(deps: ContentParkDeps) {
         const wireReason = noReceiver.has(res.reason) ? "standing_receiver_unavailable" : res.reason;
         return { ok: false, reason: wireReason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
       }
-      return { ok: true, recovered: res.recovered, pulled: res.pulled };
+      /**
+       * `refusals` REACHES THE CALLER — review B2a pass-2 F3, "no consumer, no ship".
+       *
+       * `recoverParkedFromRelay` has always returned it and both callers dropped it: this handler
+       * returned only `{recovered, pulled}`, and `drainOnce` reads only `res.recovered`. So every
+       * refusal reason computed in that loop reached nothing but a vitest assertion — including the
+       * four this milestone added to tell a version skew from a tamper from a storage fault.
+       *
+       * Which made the pass-1 F5 fix a label with no reader, and three of its tests assertions on a
+       * channel nobody could observe. An operator seeing `{recovered: 0, pulled: 3}` had three
+       * messages evaporate with the explanation only in the daemon log.
+       */
+      return { ok: true, recovered: res.recovered, pulled: res.pulled, refused: res.refused, refusals: res.refusals };
     });
   }
 

@@ -8466,6 +8466,13 @@ export class SessionNodeManager {
      *
      * Leaving the memo ARMED on `held` is deliberate: the release path re-enters ingest, which is
      * when delivery actually happens, and the claim becomes true there.
+     *
+     * ⚠️ THE `screenedOut` CLAUSE IS UNREACHABLE TODAY and is kept anyway — said out loud so nobody
+     * reads it as covered. A terminal inbound block needs a detector the shipping security gateway
+     * does not wire, so it returns only `allow` and a fail-closed non-terminal `block`. Measured: a
+     * mutant dropping just that clause SURVIVES the suite. It stays because the day a detector is
+     * wired, this line is the difference between an all-clear and a permanent silent discard — and
+     * finding that then costs more than the clause costs now.
      */
     if (priorDeclaredAlg !== undefined && result.ok && result.held !== true && result.screenedOut !== true) {
       // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
