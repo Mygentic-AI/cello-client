@@ -270,9 +270,26 @@ export function startRosterSweep(opts: {
     if (stopped) return;
     try {
       await sweep();
+      /**
+       * RE-CHECK AFTER THE AWAIT — review F10, partial.
+       *
+       * A sweep takes up to ~16 s with a node down, so a `stop()` landing mid-sweep is ordinary,
+       * not exotic. Without this the completing sweep still fires its callbacks and still logs,
+       * against a daemon that has already reported itself stopped — which in-process means writing
+       * through a logger whose test has finished, and in production means status side effects after
+       * teardown.
+       *
+       * This does NOT abort the outbound probes: `fetchBootstrapResult` owns a per-request
+       * AbortController for its own deadline and takes no external signal, so cancelling them means
+       * threading one through `manifestNodesToEndpoints`. Carried as
+       * `DOD-M15-SWEEP-ABORT-1` rather than done here — the probes are read-only GETs against
+       * `/bootstrap` and the process is exiting; what mattered was not acting on the result.
+       */
+      if (stopped) return;
       consecutive = 0;
       onSweepSuccess?.();
     } catch (err: unknown) {
+      if (stopped) return;
       consecutive++;
       onSweepError?.({
         event: "directory.roster.sweep.failed",

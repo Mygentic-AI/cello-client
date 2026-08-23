@@ -568,3 +568,48 @@ describe("DOD-M15-STALEROSTER-1: a sweep that measured nothing does not report s
     ).toMatch(/keeps whatever reading it already had/i);
   }, 30_000);
 });
+
+describe("DOD-M15-STALEROSTER-1: a sweep completing after shutdown acts on nothing", () => {
+  it("★ a sweep still running when stop() lands does not fire callbacks or log", async () => {
+    /**
+     * Review F10. A sweep takes up to ~16s with a node down and the cycle is 90-180s, so a stop()
+     * arriving mid-sweep is ordinary rather than exotic. Before this, the completing sweep still ran
+     * its callbacks and still logged — against a daemon that had already reported itself stopped.
+     * In-process that means writing through a logger whose test has finished.
+     */
+    let pending: (() => Promise<void>) | null = null;
+    const sched = {
+      scheduleNext(fn: () => Promise<void>) { pending = fn; },
+      cancel() { pending = null; },
+      async fire() { const f = pending; pending = null; if (f) await f(); },
+      get armed() { return pending !== null; },
+    };
+
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const onSweepError = vi.fn();
+    const onSweepSuccess = vi.fn();
+    let stop: (() => void) | null = null;
+
+    stop = startRosterSweep({
+      scheduler: sched,
+      // The sweep throws, AND the daemon stops while it is in flight.
+      sweep: async () => { stop?.(); throw new Error("network gone"); },
+      logger,
+      onSweepError,
+      onSweepSuccess,
+    });
+
+    await sched.fire();
+
+    expect(
+      onSweepError,
+      "a sweep that failed after shutdown wrote its error into the status surface of a daemon " +
+        "that no longer exists",
+    ).not.toHaveBeenCalled();
+    expect(
+      logger.error,
+      "and logged through a logger whose owner has already torn down",
+    ).not.toHaveBeenCalled();
+    expect(sched.armed, "and it must not re-arm a stopped sweep").toBe(false);
+  });
+});

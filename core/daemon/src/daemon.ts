@@ -396,16 +396,20 @@ async function startDaemonHoldingLock(
   /**
    * DOD-M15-STALEROSTER-1 — keep measuring directory reachability even when nothing is wrong.
    *
-   * The sweep's only caller was the roster-aware endpoint resolver, which runs on the FAILOVER
-   * path. So the daemon measured only while it was unhealthy, and RECOVERING was precisely what
-   * stopped it from ever noticing it had recovered: the last failing reading became permanent for
-   * the life of the process. Measured twice, on two machines — node failures from minutes past
+   * Every existing caller of the sweep is ACTIVITY-driven — ceremonies, session setup,
+   * `cello_refresh`, the seal broker. So an IDLE daemon never re-measures, and sitting idle is what
+   * a daemon does between conversations: the reading it was seeded with at boot is the reading it
+   * still has an hour later. Measured twice, on two machines — node failures from minutes past
    * displayed while `curl` reached all three nodes in 37–184 ms.
    *
-   * Skipped when there is no manifest provider: with no verified manifest there are no nodes to
-   * probe, `resolveConsortiumRoster` returns null immediately, and a timer that can only ever
-   * re-measure nothing is noise. That case is not silent — it is the `never_measured` reading, which
-   * says so in `cello_status`.
+   * (An earlier version of this comment said the sweep had ONE caller, the failover path, and that
+   * recovering was what stopped the measurement. That was wrong — there are ten — and it is
+   * corrected here rather than deleted because believing it is why the concurrent-sweep race in
+   * `consortium-bootstrap.ts` went unnoticed until review.)
+   *
+   * Skipped when there is no manifest provider: there is no node roster to enumerate, so a timer
+   * that can only ever re-measure nothing is noise. That case is NOT silent — `cello_status`
+   * reports `measurement: "not_configured"` and says why.
    */
   /** REVIEW F4: the last sweep failure, surfaced in `cello_status` alongside the log line. */
   let lastRosterSweepError: RosterFreshness["last_sweep_error"] | undefined;
@@ -3442,10 +3446,15 @@ async function startDaemonHoldingLock(
 
   // ─── MCP-001: cello_status (per-connection perspective) ───
   /**
-   * The directory-reachability block for `cello_status`, or undefined when every node resolves.
+   * The directory-reachability block for `cello_status`.
    *
-   * Reports the LAST resolve sweep. An empty list is not proof of health — it also means no sweep
-   * has run yet — so the shape says which nodes failed and why rather than asserting "all good".
+   * `undefined` — i.e. silence — is reserved for ONE state: a reading taken recently enough to
+   * speak for the present, which found nothing wrong. Every other combination emits, including an
+   * EMPTY node list, because an empty list is not proof of health: it also means nothing has
+   * looked, or looked too long ago to say. `DOD-M15-STALEROSTER-1`.
+   *
+   * So presence of this block does NOT mean nodes are failing. Read `measurement` first —
+   * `current` | `stale` | `never` | `not_configured` — and only then the node list.
    */
   function unresolvedNodesForStatus(): { directory_endpoints_unresolved: unknown } | undefined {
     const failures = getUnresolvedNodes();
