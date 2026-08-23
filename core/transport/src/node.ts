@@ -379,13 +379,9 @@ class CelloNodeImpl implements CelloNode {
     const now = Date.now();
     const connections = this.getConnections();
 
-    // Record activity BEFORE judging, and prune ids for connections that have gone. A connection
-    // seen carrying a stream even once is never a candidate again — that is the fix for the defect
-    // review measured, where a live conversation was reaped because its per-message streams
-    // happened to be closed at the instant of the sweep.
-    const live = new Set(connections.map((c) => c.id));
-    for (const id of this.#everCarriedStream) if (!live.has(id)) this.#everCarriedStream.delete(id);
-    for (const c of connections) if (c.streamCount > 0) this.#everCarriedStream.add(c.id);
+    // Record activity BEFORE judging. A connection seen carrying a stream even once is never a
+    // candidate again, whatever libp2p later does with its closed streams.
+    recordStreamActivity(this.#everCarriedStream, connections);
 
     // C4: the count the DoD asks for, reported every sweep. Emitted BEFORE any hang-up so the
     // number describes what was observed, not what survived.
@@ -857,18 +853,24 @@ export const DECLARED_INBOUND_UPGRADE_TIMEOUT_MS = 10_000;
  *
  * ─── THIS MEASURES "NEVER SPOKE", NOT "IS QUIET RIGHT NOW" ─────────────────────────────────────
  *
- * The first version of this compared `now - openedAt` and ANDed it with `streamCount === 0` at the
- * instant of the sweep. **Review ran it and it hung up a live conversation.** CELLO content streams
- * are per-message and ephemeral — one stream per frame, opened and closed — so a busy session sits
- * at zero streams almost all of the time. With a 1000ms grace and a stream exchanged every 400ms,
- * the connection was reaped at t≈1200ms and the next send failed with `No open connection to peer`.
+ * The first version compared `now - openedAt` and ANDed it with `streamCount === 0` at the instant
+ * of the sweep — i.e. it measured connection AGE and sampled business. Review flagged that as
+ * fatal on the grounds that CELLO content streams are per-message and ephemeral, so a busy session
+ * would sit at zero streams almost all of the time and be reaped mid-conversation.
  *
- * That is worse than the gap it closes: every session would die on a 90-second timer, and every
- * diagnostic downstream names the network for what is a `setInterval` on the operator's own machine.
+ * **MEASURED BEFORE ACCEPTING IT, and the stated mechanism does NOT reproduce on libp2p@3.3.2.**
+ * A stream closed by the dialer stays in the listener's `connection.streams` — `streamCount` was
+ * still 1 after 10s (25 samples, 400ms apart), and under the reviewer's own scenario (a stream
+ * every 400ms, 1000ms grace) it CLIMBED 1→8 across 3.2s and nothing was reaped. So the specific
+ * claim "a busy session sits at zero streams" is false here, and the reported hang-up at t≈1200ms
+ * did not occur when the scenario was re-run against that predicate.
  *
- * So the judgement is now **has this connection EVER carried a stream** — the literal reading of
- * the DoD's "authenticates to nothing". A connection that has ever spoken is never a candidate
- * again, however quiet it goes.
+ * **The fix stays anyway, and the reason is the honest one:** the old predicate was correct only
+ * BECAUSE libp2p happens to retain closed streams. That is an implementation detail of a
+ * dependency, undocumented and free to change in a patch release — precisely the kind of inherited
+ * behaviour the other half of this unit exists to stop relying on. `hasEverCarriedStream` is the
+ * literal reading of the DoD's "authenticates to nothing" and it holds whatever libp2p does with
+ * closed streams.
  */
 export const IDLE_CONNECTION_GRACE_MS = 90_000;
 
@@ -953,6 +955,25 @@ export interface IdleConnectionCandidate {
  *    between refreshes, which is exactly the shape hunted here — a reaper without it takes an
  *    agent's inbound reachability away and reports nothing.
  */
+/**
+ * Fold this sweep's observation into the activity set: mark anything carrying a stream, and forget
+ * connections that have gone.
+ *
+ * EXTRACTED so it can be attacked directly. Mutation testing showed that deleting the recording
+ * left every test green, because no live test can reach the state where it matters — libp2p retains
+ * closed streams, so `streamCount` does not fall back to 0 within any window a test can wait for.
+ * The bit is still the thing that makes the judgement independent of that libp2p behaviour, so it
+ * needs coverage that does not depend on it.
+ */
+export function recordStreamActivity(
+  seen: Set<string>,
+  connections: readonly { id: string; streamCount: number }[],
+): void {
+  const live = new Set(connections.map((c) => c.id));
+  for (const id of seen) if (!live.has(id)) seen.delete(id);
+  for (const c of connections) if (c.streamCount > 0) seen.add(c.id);
+}
+
 export function selectIdleConnections(args: {
   connections: readonly IdleConnectionCandidate[];
   now: number;

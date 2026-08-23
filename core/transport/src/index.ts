@@ -13,6 +13,7 @@ export { resolveConnectionMonitorConfig, WAN_PING_TIMEOUT_FLOOR_MS } from "./nod
 export {
   resolveConnectionLimits,
   selectIdleConnections,
+  recordStreamActivity,
   IDLE_CONNECTION_GRACE_MS,
   IDLE_CONNECTION_SWEEP_MS,
   DECLARED_MAX_CONNECTIONS,

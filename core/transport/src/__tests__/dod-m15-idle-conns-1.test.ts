@@ -38,6 +38,7 @@ import {
   createNode,
   resolveConnectionLimits,
   selectIdleConnections,
+  recordStreamActivity,
   IDLE_CONNECTION_GRACE_MS,
   DECLARED_MAX_CONNECTIONS,
   DECLARED_INBOUND_CONNECTION_THRESHOLD,
@@ -326,6 +327,27 @@ describe("I4b: a connection that HAS spoken is never a candidate again", () => {
       hasEverCarriedStream: () => false,
     });
     expect(picked).toEqual(["p"]);
+  });
+
+  it("records a connection that is carrying a stream, and forgets one that has gone", () => {
+    /**
+     * THE COVERAGE MUTATION TESTING PROVED WAS MISSING. Deleting the recording left every other
+     * test green, because no LIVE test can reach the state where it matters: libp2p retains closed
+     * streams, so `streamCount` never falls back to 0 inside any window a test can wait for
+     * (measured: still 1 after 10s, 25 samples). The bit exists precisely so the judgement does not
+     * depend on that libp2p behaviour — so it needs a test that does not depend on it either.
+     */
+    const seen = new Set<string>();
+    recordStreamActivity(seen, [{ id: "a", streamCount: 1 }, { id: "b", streamCount: 0 }]);
+    expect([...seen]).toEqual(["a"]);
+
+    // "b" spoke later; "a" is still remembered.
+    recordStreamActivity(seen, [{ id: "a", streamCount: 0 }, { id: "b", streamCount: 2 }]);
+    expect([...seen].sort()).toEqual(["a", "b"]);
+
+    // "a" has gone — its id must not accumulate on a long-lived node forever.
+    recordStreamActivity(seen, [{ id: "b", streamCount: 0 }]);
+    expect([...seen]).toEqual(["b"]);
   });
 
   it("reaps exactly AT the grace boundary, not one tick later", () => {
