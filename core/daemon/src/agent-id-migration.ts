@@ -204,6 +204,27 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
     // old semantics for them while giving each agent its own namespace.
     table: "retry_queue",
     backfill: "nullable",
+    /**
+     * ⚠️ THREE COLUMNS WERE MISSING FROM THE DDL BELOW, AND TWO OF THEM WERE A LIVE DATA-LOSS BUG.
+     *
+     * `retry-queue.ts`'s constructor adds `structure1_cbor` and `structure2_cbor` by idempotent
+     * `ALTER TABLE`, and this DDL omitted them — so the rebuild copied the INTERSECTION and dropped
+     * both, exactly as the header at the top of this file warns. They reappear seconds later,
+     * because that constructor re-adds them AFTER this migration runs, which is what made it quiet:
+     * the schema looks right afterwards and only the DATA is gone.
+     *
+     * What that costs: those columns are the relay's signed ordering record, carried so a parked
+     * entry is self-ordering on recovery. Without it the recipient places the content at its ARRIVAL
+     * index rather than its witnessed sequence, the two trees part, and the session can no longer
+     * seal bilaterally — on the one boot that carries the upgrade.
+     *
+     * `content_hash_alg` is `DOD-M15-SEALWIRE-1` part B2b's own column, added here in the same edit
+     * as the two it would otherwise have joined. It is why the omission was found at all.
+     *
+     * The existing guard could not see it: `dod-agent-id-joinkey-migration` replays the inline ALTERs
+     * in the real boot order, but only the `sessions` ones — `retry_queue`'s live in a different file
+     * and run from a different constructor.
+     */
     createSql: (t) => `
       CREATE TABLE ${t} (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -215,7 +236,10 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         attempts        INTEGER NOT NULL DEFAULT 1,
         position        INTEGER NOT NULL,
         awaiting_ack    INTEGER NOT NULL DEFAULT 0,
-        content_hash_hex TEXT
+        content_hash_hex TEXT,
+        structure1_cbor BLOB,
+        structure2_cbor BLOB,
+        content_hash_alg TEXT
       )`,
     indexSql: (t) => [
       `CREATE INDEX IF NOT EXISTS retry_queue_by_session_position ON ${t}(session_id, position ASC)`,

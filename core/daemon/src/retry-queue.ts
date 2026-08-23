@@ -111,15 +111,32 @@ export class RetryQueue {
         awaiting_ack    INTEGER NOT NULL DEFAULT 0,
         content_hash_hex TEXT,
         structure1_cbor BLOB,
-        structure2_cbor BLOB
+        structure2_cbor BLOB,
+        content_hash_alg TEXT
       )
     `);
     // Idempotent add for databases created before M12-P12. SQLite has no ADD COLUMN IF NOT EXISTS,
     // so the duplicate-column error is the expected no-op on an already-migrated DB; any OTHER
     // error is a real failure and must not be swallowed.
-    for (const col of ["structure1_cbor", "structure2_cbor"]) {
+    /**
+     * 🚨 A COLUMN ADDED HERE NEEDS A SECOND ENTRY, in `agent-id-migration.ts`'s `retry_queue`
+     * `createSql`. That rebuild copies the INTERSECTION of the old and new column lists, so a column
+     * this loop adds and that DDL omits is DROPPED on the one boot where a legacy database migrates
+     * — and then re-added EMPTY by this very loop, which is what makes it silent.
+     *
+     * It has happened: `structure1_cbor` and `structure2_cbor` were missing from that DDL from the
+     * day they were added until `DOD-M15-SEALWIRE-1` part B2b found it.
+     */
+    for (const col of [
+      { name: "structure1_cbor", type: "BLOB" },
+      { name: "structure2_cbor", type: "BLOB" },
+      // DOD-M15-SEALWIRE-1 part B2b: which content-hash algorithm this queued message was hashed
+      // under. The crash-backstop park producer has no other source for it — the frame is gone by
+      // the time it runs — and re-parking under the wrong one gets the message refused.
+      { name: "content_hash_alg", type: "TEXT" },
+    ]) {
       try {
-        this.#db.exec(`ALTER TABLE retry_queue ADD COLUMN ${col} BLOB`);
+        this.#db.exec(`ALTER TABLE retry_queue ADD COLUMN ${col.name} ${col.type}`);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (!/duplicate column name/i.test(msg)) throw err;
