@@ -62,6 +62,18 @@ export { buildRelayRegistrationTbs, verifyRelayRegistrationSignature } from "./r
 
 // M7-MSG-001: recipient content sealed box (E2E encryption for parked content)
 export { sealToRecipient, openSealed, CONTENT_SEAL_OVERHEAD_BYTES } from "./content-seal.js";
+// Decisions Carried #8/#9/#10: the SESSION SALT — agreed in the same exchange as the envelope key
+// but NOT derived from it, because the key must be destroyed at close and the salt must survive the
+// session. Both sides contribute; HMAC for the salted content hash; a fingerprint for the open check.
+export {
+  generateSaltContribution,
+  deriveSessionSalt,
+  saltFingerprint,
+  saltedContentHash,
+  SALT_CONTRIBUTION_BYTES,
+  SALT_FINGERPRINT_BYTES,
+} from "./session-salt.js";
+
 // DOD-M15-KEYAGREE-1: CELLO's own per-session key agreement — ephemeral-ephemeral X25519 with the
 // hybrid-PQ hook built in, producing both the content key and the content-hash salt.
 export {
