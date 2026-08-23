@@ -147,6 +147,36 @@ export interface CreateNodeOptions {
      */
     pingTimeoutMinMs?: number;
   };
+
+  /**
+   * DOD-M15-IDLE-CONNS-1 — override the DECLARED connection-manager limits for this node.
+   *
+   * Omit it and the declared block applies. Values live in `resolveConnectionLimits`; they are
+   * libp2p's own defaults adopted deliberately, so this changes nothing today and makes a future
+   * libp2p bump visible instead of silent. A relay legitimately carries far more connections than
+   * an operator's laptop, which is what the override is for.
+   */
+  connectionLimits?: {
+    maxConnections?: number;
+    inboundConnectionThreshold?: number;
+    maxIncomingPendingConnections?: number;
+    inboundUpgradeTimeout?: number;
+  };
+
+  /**
+   * DOD-M15-IDLE-CONNS-1 — run the idle-connection sweep on this node.
+   *
+   * OPT-IN, and deliberately so: the node that needs it is the one accepting inbound dials from
+   * peers it did not choose (the standing receiver). A directory-signaling node's connections are
+   * ones it dialled, and a relay's clients are governed by the reservation TTL — sweeping either
+   * would hang up links their own subsystem is responsible for.
+   */
+  idleConnectionReaper?: {
+    /** Silence allowed before an inbound connection is hung up. Default `IDLE_CONNECTION_GRACE_MS`. */
+    graceMs?: number;
+    /** How often to look. Default `IDLE_CONNECTION_SWEEP_MS`. */
+    sweepIntervalMs?: number;
+  };
 }
 
 // ─── StreamHandler ──────────────────────────────────────────────────────────
@@ -245,7 +275,40 @@ export interface CelloNode {
      * defaulted, because inventing "open" here would recreate the blindness it exists to remove.
      */
     muxerStatus?: string;
+    /**
+     * DOD-M15-IDLE-CONNS-1. Who dialled whom. The reaper only ever touches `inbound`: an outbound
+     * connection is an errand this agent started, and hanging one up cancels our own work.
+     */
+    direction: "inbound" | "outbound";
+    /** Epoch-ms the connection opened, from libp2p's own timeline. The reaper's clock. */
+    openedAt: number;
+    /** Live streams on this connection. Zero is what "authenticates to nothing" actually looks like. */
+    streamCount: number;
   }>;
+
+  /**
+   * The connection-manager limits libp2p was given — the SAME object, not a rebuilt copy.
+   *
+   * Answerable at runtime for the reason the DoD line insists on: a cap set without measurement
+   * breaks reachability, and until this existed there was no way to measure a healthy daemon's
+   * connection count at all.
+   */
+  getConnectionLimits(): {
+    maxConnections: number;
+    inboundConnectionThreshold: number;
+    maxIncomingPendingConnections: number;
+    inboundUpgradeTimeout: number;
+  };
+
+  /**
+   * Name the peers the idle sweep must never hang up — the relay this node holds a live
+   * reservation with, and the directory.
+   *
+   * A reservation connection is idle BY NATURE between refreshes, which is precisely the shape the
+   * sweep hunts. Reaping it costs the agent every NAT'd inbound session it would have received,
+   * silently. Settable rather than fixed at construction because the reserved relay changes.
+   */
+  setIdleReaperSpared(isSpared: (peerId: string) => boolean): void;
 
   /**
    * DOD-M12-CONN-EVICT-1: drop every connection to this peer.
