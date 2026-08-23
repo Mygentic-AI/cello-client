@@ -30,7 +30,10 @@
  * as delivered, leaves it unacked, and asks again on the capped backoff.
  */
 
-import { wireContentHash } from "./wire-content-hash.js";
+// `wireContentHash` is no longer imported here: every outbound hash in this file now comes from
+// `SessionNodeManager.contentHashForSession`, which returns the hash and its ALGORITHM together
+// (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
+// recording — how it was made, which is the state that made a version skew look like a tamper.
 import { reachabilityFromDiscovery, DiscoveryUnavailableError } from "./document-reachability.js";
 import type { DiscoveryOutcome } from "./cross-node-negotiation.js";
 import { LEAF_KIND_DOC } from "./session-relay-client.js";
@@ -68,6 +71,17 @@ export interface DocumentTransportDeps {
     peerAgentId: string,
     correlationId: string,
   ): Promise<{ ok: true; sessionId: string } | { ok: false; reason: string; guidance?: string }>;
+  /**
+   * `SessionNodeManager.contentHashForSession` — the ONE place that decides how this session's
+   * outbound content is hashed, returning the hash and its algorithm together (`DOD-M15-SEALWIRE-1`
+   * part B2b). Injected rather than imported so this module keeps its single dependency on the
+   * manager, and so a test cannot compute a hash the manager would not.
+   */
+  contentHashForSession(
+    agentName: string,
+    sessionId: string,
+    content: Uint8Array,
+  ): { hash: Uint8Array; alg: string };
   /** `SessionNodeManager.sendContent`. */
   sendContent(
     agentName: string,
@@ -77,6 +91,8 @@ export interface DocumentTransportDeps {
     correlationId: string,
     /** The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below. */
     leafKind?: number,
+    /** `DOD-M15-SEALWIRE-1` part B2b — the algorithm `contentHash` was produced under. */
+    contentHashAlg?: string,
   ): Promise<
     // DOD-M12B-INDEX-1: `sequenceNumber` is the relay's position for this frame, carried so the
     // leaf can be placed there rather than at the tail. Absent when no relay answered.
@@ -236,8 +252,13 @@ export function createDocumentDeliveryTransport(
       // and the peer discarded it at the authenticity check before the document layer was ever
       // consulted. Found by two real daemons; no in-process test could see it, because both sides
       // of those compute the hash with the same function.
-      const hash = wireContentHash(bytes);
-      const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND);
+      // B2b: one decision point for the hash AND its algorithm. This site is the reason that matters
+      // — it is one of the two that got the ORIGINAL hash expression wrong, and the failure was
+      // invisible from here (see the paragraph above). Four sites independently deciding whether to
+      // salt would be that same defect with a worse outcome: a message hashed one way and labelled
+      // another is refused by every peer, including a correct one.
+      const { hash, alg } = deps.contentHashForSession(deps.agentName, session.sessionId, bytes);
+      const sent = await deps.sendContent(deps.agentName, session.sessionId, bytes, hash, correlationId, input.leafKind ?? DOCUMENT_LEAF_KIND, alg);
       // DOD-MP-SESSION-RETIRE-1 — a working send breaks the run; a terminal-ish answer extends it.
       //
       // `relayRefusal` IS CHECKED FIRST, and that is the whole unit. The fully-sealed case answers

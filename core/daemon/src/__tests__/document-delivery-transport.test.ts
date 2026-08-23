@@ -5,6 +5,7 @@
  * bypass — all exercised through `sendBytes`, the one send that survives.
  */
 
+import { wireContentHash } from "../wire-content-hash.js";
 import { describe, it, expect } from "vitest";
 import {
   createDocumentDeliveryTransport,
@@ -45,6 +46,17 @@ function newTransport(over: Partial<DocumentTransportDeps> = {}) {
     // DOD-M12B-INDEX-1: the hook now reports whether the leaf actually made it into the chain —
     // a held one has not, and `document.frame.sent` must not read the same for both.
     appendLeaf: () => ({ placed: true, leafIndex: 0 }),
+    /**
+     * `DOD-M15-SEALWIRE-1` part B2b. The transport now asks ONE place how this session's content is
+     * hashed, rather than computing it itself — so the hash and the algorithm it is labelled with
+     * cannot disagree. The fixture mirrors production's current answer (`sha256`) rather than
+     * inventing one, because a stub that returned something else would be asserting a state the
+     * daemon never produces.
+     */
+    contentHashForSession: (_a: string, _s: string, content: Uint8Array) => ({
+      hash: wireContentHash(content),
+      alg: "sha256",
+    }),
     sendContent: async (_a, sessionId) => {
       sends.push({ sessionId });
       return { ok: true, delivered: true };
@@ -180,7 +192,18 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
   it("opens a FRESH session after repeated relay_session_gone, and destroys nothing", async () => {
     const t = newTransport({
       activeSessionsWith: () => ["stuck-session"],
-      sendContent: async (_a, sessionId) =>
+      /**
+     * `DOD-M15-SEALWIRE-1` part B2b. The transport now asks ONE place how this session's content is
+     * hashed, rather than computing it itself — so the hash and the algorithm it is labelled with
+     * cannot disagree. The fixture mirrors production's current answer (`sha256`) rather than
+     * inventing one, because a stub that returned something else would be asserting a state the
+     * daemon never produces.
+     */
+    contentHashForSession: (_a: string, _s: string, content: Uint8Array) => ({
+      hash: wireContentHash(content),
+      alg: "sha256",
+    }),
+    sendContent: async (_a, sessionId) =>
         sessionId === "stuck-session" ? relayGoneButDelivered : { ok: true as const, delivered: true as const },
     });
 
@@ -206,7 +229,18 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
     let gone = true;
     const t = newTransport({
       activeSessionsWith: () => ["flaky"],
-      sendContent: async () =>
+      /**
+     * `DOD-M15-SEALWIRE-1` part B2b. The transport now asks ONE place how this session's content is
+     * hashed, rather than computing it itself — so the hash and the algorithm it is labelled with
+     * cannot disagree. The fixture mirrors production's current answer (`sha256`) rather than
+     * inventing one, because a stub that returned something else would be asserting a state the
+     * daemon never produces.
+     */
+    contentHashForSession: (_a: string, _s: string, content: Uint8Array) => ({
+      hash: wireContentHash(content),
+      alg: "sha256",
+    }),
+    sendContent: async () =>
         gone ? relayGoneButDelivered : { ok: true as const, delivered: true as const },
     });
     await t.transport.sendBytes(sendInput());
@@ -223,7 +257,18 @@ describe("DOD-MP-SESSION-RETIRE-1 — delivery stops REUSING a session that keep
   it("an OFFLINE peer never condemns the session", async () => {
     const t = newTransport({
       activeSessionsWith: () => ["s"],
-      sendContent: async () => ({ ok: false as const, reason: "transport_unavailable", error: "away" }),
+      /**
+     * `DOD-M15-SEALWIRE-1` part B2b. The transport now asks ONE place how this session's content is
+     * hashed, rather than computing it itself — so the hash and the algorithm it is labelled with
+     * cannot disagree. The fixture mirrors production's current answer (`sha256`) rather than
+     * inventing one, because a stub that returned something else would be asserting a state the
+     * daemon never produces.
+     */
+    contentHashForSession: (_a: string, _s: string, content: Uint8Array) => ({
+      hash: wireContentHash(content),
+      alg: "sha256",
+    }),
+    sendContent: async () => ({ ok: false as const, reason: "transport_unavailable", error: "away" }),
     });
     for (let i = 0; i < 4; i++) await t.transport.sendBytes(sendInput());
     // Otherwise every sweep against a sleeping counterparty opens a new session, each sealed moments

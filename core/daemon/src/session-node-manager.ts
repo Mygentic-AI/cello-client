@@ -21,7 +21,7 @@
 // `wireContentHash` is gone from this file on purpose: its ONE use was the receive-path cross-check,
 // which now goes through `contentHashFor` so the comparison runs under the algorithm the sender
 // named. A direct call here would be a hash computed without asking what the frame said (part B1).
-import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
+import { contentHashFor, resolveContentHashAlg, CONTENT_HASH_ALGS, type ContentHashAlg } from "./wire-content-hash.js";
 import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
   onPeerSaltFrame,
@@ -1097,7 +1097,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
     | null = null;
 
   constructor(opts: {
@@ -1221,7 +1221,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -1296,7 +1296,7 @@ export class SessionNodeManager {
    * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
    * result — the deposit itself and its logging are unchanged either way.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): Promise<ParkAttempt> {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): Promise<ParkAttempt> {
     // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
     // the live hook refuses (before any deposit), with the same event and the same `cause`.
     if (this.#parkFaultRemaining > 0) {
@@ -1331,6 +1331,9 @@ export class SessionNodeManager {
         // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
         structure1Cbor,
         structure2Cbor,
+        // B2b: the park route must name the same algorithm the direct frame did, or the recipient
+        // verifies the same message two different ways depending on which route it took.
+        contentHashAlg,
       });
       // DOD-LEAVEMSG-1 (reviewer HIGH fix): check the TYPED result, not just "didn't throw" — the
       // production hook's own failure branches (standing receiver unavailable, relay explicitly
@@ -5558,6 +5561,15 @@ export class SessionNodeManager {
      * document exclusions were dead while every document leaf arrived here as a message.
      */
     leafKind: number = LEAF_KIND_MSG,
+    /**
+     * `DOD-M15-SEALWIRE-1` part B2b — the algorithm `contentHash` was produced under, taken from
+     * `contentHashForSession` by the caller that computed the hash.
+     *
+     * Passed rather than re-derived HERE, deliberately: re-deriving would ask "how would this
+     * session hash something now?", and the answer can differ from how THIS message was actually
+     * hashed. A hash and its label must travel together or the peer refuses a message nobody touched.
+     */
+    contentHashAlg: string = CONTENT_HASH_ALGS.SHA256,
   ): Promise<
     // DOD-M12B-INDEX-1: `sequenceNumber` is the position the relay assigned this message, carried
     // out so the caller can place its leaf THERE rather than at whatever the tail happens to be.
@@ -5758,6 +5770,10 @@ export class SessionNodeManager {
         // prev_root (order). Omitted if the relay was unreachable — receiver falls back to the witness.
         structure1_cbor: orderingS1,
         structure2_cbor: orderingS2,
+        // DOD-M15-SEALWIRE-1 part B2b: HOW `content_hash` was produced. An older peer ignores an
+        // unknown CBOR key, so emitting it is safe for every build in existence; a newer one reads
+        // it and verifies under the named algorithm instead of assuming.
+        content_hash_alg: contentHashAlg,
       }) as Uint8Array;
       // Injected dial failure — thrown from inside the try so it lands in exactly the catch the
       // real connection_lost lands in, and the whole downstream path (untrack → park → durable
@@ -5822,7 +5838,7 @@ export class SessionNodeManager {
         ...this.#streamCensus(entry.node, entry.counterpartySessionPeerId),
         correlationId,
       });
-      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
@@ -8747,6 +8763,35 @@ export class SessionNodeManager {
    * is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a diagnosis, not
    * in a session that quietly hashes under the wrong value.
    */
+  /**
+   * THE ONE PLACE THAT DECIDES HOW A SESSION'S OUTBOUND CONTENT IS HASHED —
+   * `DOD-M15-SEALWIRE-1` part B2b.
+   *
+   * Returns the hash AND the algorithm that produced it, together, because the two must not be
+   * decided separately. `wire-content-hash.ts` exists for exactly this reason and says so in its own
+   * header: the expression was written out at five call sites, the two added last got it wrong, and
+   * the failure was invisible — *"the send succeeds, `parked: false`, the sender's log says the frame
+   * left, and the receiver discards it at the authenticity check."* It took two real daemons.
+   *
+   * There are FOUR outbound sites (`session-content-handlers.ts`, two in `daemon.ts`,
+   * `document-delivery-transport.ts`). Once salting is switchable, each of them independently
+   * deciding whether to salt is that defect again with a worse failure mode — a message hashed one
+   * way and LABELLED another is refused by every peer, including a correct one.
+   *
+   * ⚠️ IT RETURNS `sha256` TODAY, ALWAYS. Part B2b is deliberately two steps: thread the value
+   * end to end while it is the one that cannot break anything, prove the plumbing, and only then
+   * change what it decides. The same receiver-first ordering B1 and B2a used, applied to the sender.
+   * The salt is read but not yet used — `getSessionContentSalt` is what B2b-2 switches on.
+   */
+  contentHashForSession(
+    agentName: string,
+    sessionId: string,
+    content: Uint8Array,
+  ): { hash: Uint8Array; alg: ContentHashAlg } {
+    const alg = CONTENT_HASH_ALGS.SHA256;
+    return { hash: contentHashFor(content, { alg, salt: null }), alg };
+  }
+
   /**
    * PUBLIC read of a session's agreed salt — `DOD-M15-SEALWIRE-1` part B2a.
    *

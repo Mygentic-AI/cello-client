@@ -9,7 +9,10 @@
  * appends to the daemon-owned tree; cello_receive advances the per-connection cursor and the durable
  * watermark. Splitting them would put the cursor's writer and its reader in different modules.
  */
-import { wireContentHash } from "./wire-content-hash.js";
+// `wireContentHash` is no longer imported here: every outbound hash in this file now comes from
+// `SessionNodeManager.contentHashForSession`, which returns the hash and its ALGORITHM together
+// (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
+// recording — how it was made, which is the state that made a version skew look like a tamper.
 import { randomUUID } from "node:crypto";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
@@ -350,7 +353,18 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // hash binds — the transcript records what was actually sent, not the pre-redaction draft.
     const modified = outboundVerdict.disposition === "redact" && outboundVerdict.content !== undefined;
     const sendBytes = modified ? new Uint8Array(outboundVerdict.content as Uint8Array) : contentBytes;
-    const contentHash = wireContentHash(sendBytes);
+    /**
+     * `DOD-M15-SEALWIRE-1` part B2b — the hash and its ALGORITHM come from one decision point.
+     *
+     * Four outbound sites compute a content hash. Each of them independently deciding whether to
+     * salt is the defect `wire-content-hash.ts` was created to end (its header: the expression was
+     * written out five times, the last two got it wrong, and it took two live daemons to find),
+     * with a worse failure mode — a message hashed one way and LABELLED another is refused by every
+     * peer, including a correct one.
+     */
+    const { hash: contentHash, alg: contentHashAlg } = sessionNodeManager.contentHashForSession(
+      record.agent_name, sessionId, sendBytes,
+    );
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
     // ─── DOD-COATTEND-SENDWINDOW-1 (§4): re-check the gate, in the same synchronous window as the
@@ -429,7 +443,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     sendInFlight.set(inFlightKey, Date.now());
     let sendResult: Awaited<ReturnType<typeof sessionNodeManager.sendContent>>;
     try {
-      sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId);
+      sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId, undefined, contentHashAlg);
     } finally {
       sendInFlight.delete(inFlightKey);
     }

@@ -29,6 +29,7 @@
  * Only the client never said the word.
  */
 
+import { wireContentHash } from "../wire-content-hash.js";
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { LEAF_KIND_MSG, LEAF_KIND_CTRL, LEAF_KIND_DOC, LEAF_KIND_REJECT } from "../session-relay-client.js";
@@ -58,7 +59,18 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
       sealSession: async () => {},
       activeSessionsWith: () => ["session-1"],
       openSession: async () => ({ ok: true, sessionId: "session-1" }) as never,
-      sendContent: async (
+      /**
+     * `DOD-M15-SEALWIRE-1` part B2b. The transport now asks ONE place how this session's content is
+     * hashed, rather than computing it itself — so the hash and the algorithm it is labelled with
+     * cannot disagree. The fixture mirrors production's current answer (`sha256`) rather than
+     * inventing one, because a stub that returned something else would be asserting a state the
+     * daemon never produces.
+     */
+    contentHashForSession: (_a: string, _s: string, content: Uint8Array) => ({
+      hash: wireContentHash(content),
+      alg: "sha256",
+    }),
+    sendContent: async (
         _agent: string,
         _sessionId: string,
         _content: Uint8Array,

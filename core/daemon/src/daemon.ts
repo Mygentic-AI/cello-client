@@ -116,7 +116,10 @@ import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { isDocumentFrame } from "./document-frame-router.js";
 import { INBOUND_INJECTION_BLOCKED } from "@cello-protocol/gateway";
 import { registerDocumentHandlers } from "./document-handlers.js";
-import { wireContentHash } from "./wire-content-hash.js";
+// `wireContentHash` is no longer imported here: every outbound hash in this file now comes from
+// `SessionNodeManager.contentHashForSession`, which returns the hash and its ALGORITHM together
+// (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
+// recording — how it was made, which is the state that made a version skew look like a tamper.
 import { DocumentPublish } from "./document-publish.js";
 import { createDocumentDeliveryTransport } from "./document-delivery-transport.js";
 import { ReconcileScheduler } from "./document-reconcile-scheduler.js";
@@ -1418,9 +1421,10 @@ async function startDaemonHoldingLock(
           // FRONT precisely so [[WRAP]] keeps the end position the counterparty's detector anchors on.
           const rejectText = markAsAutoReply("This inbox only accepts one message per visit. Closing. [[WRAP]]");
           const rejectBytes = new TextEncoder().encode(rejectText);
-          const rejectHash = wireContentHash(rejectBytes);
+          // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
+          const reject = sessionNodeManager.contentHashForSession(agentName, sessionId, rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
-          const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(rejectHash), randomUUID());
+          const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(reject.hash), randomUUID(), undefined, reject.alg);
           // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
           // either way the relay already witnessed its sequence. This caller is the sharpest case
           // of the three: the seal is initiated immediately below, so a hole here does not merely
@@ -1428,7 +1432,7 @@ async function startDaemonHoldingLock(
           // counterparty will still receive content at. The roots then cannot agree, and the
           // session is unsealable for good.
           if (sendResult.ok || sendResult.durable) {
-            const rejectHashHex = Buffer.from(rejectHash).toString("hex");
+            const rejectHashHex = Buffer.from(reject.hash).toString("hex");
             // DOD-M12B-INDEX-1: at the relay's position, not the tail. This is the riskiest append
             // in the codebase for that — the seal is initiated a few lines below, so a leaf at the
             // wrong index does not merely stall the far side, it seals a tree the counterparty can
@@ -1636,8 +1640,9 @@ async function startDaemonHoldingLock(
       const contentBytes = new TextEncoder().encode(
         markAsAutoReply(new TextDecoder().decode(screenedBytes)),
       );
-      const contentHash = wireContentHash(contentBytes);
-      const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(contentHash), randomUUID());
+      // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
+      const away = sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
+      const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), undefined, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
         // away period — clear the guard so the next inbound arrival retries the ack.
@@ -1651,7 +1656,7 @@ async function startDaemonHoldingLock(
         });
         return;
       }
-      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      const contentHashHex = Buffer.from(away.hash).toString("hex");
       if (!sendResult.ok) {
         // M12-P13 (found live 2026-08-05, M12 Entry 89): the reply is durably queued and already
         // owns the sequence the relay witnessed for it, so its leaf MUST be committed here. Without
@@ -2027,7 +2032,7 @@ async function startDaemonHoldingLock(
     return null;
   });
 
-  sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor }) => {
+  sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       const reason = "standing_receiver_unavailable";
@@ -2073,6 +2078,9 @@ async function startDaemonHoldingLock(
       recipientPubkey,
       contentHash: contentHashBytes,
       content,
+      // The algorithm the DIRECT frame named for this same message. The park copy must claim what
+      // the message actually is, not what this side would choose for it now.
+      contentHashAlg,
       structure1Cbor,
       structure2Cbor,
     });
@@ -4794,8 +4802,16 @@ async function startDaemonHoldingLock(
         // transport asked for 0x04, the composition root threw it away, and every document leaf
         // still reached the relay as a MESSAGE. Verified on live traffic: daemon 0.0.145 shipped
         // the fix everywhere except here and the wire was unchanged.
-        sendContent: (agent, sessionId, content, contentHash, correlationId, leafKind) =>
-          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId, leafKind),
+        //
+        // ⚠️ AND `contentHashAlg` IS THE SECOND PARAMETER THIS ADAPTER MUST NOT DROP. The note above
+        // is about `leafKind`, which this wrapper silently swallowed while every other caller passed
+        // it — a thin pass-through is exactly where a new argument goes missing, because nothing
+        // about the call site looks wrong afterwards. B2b's failure mode if it happens again: the
+        // document path sends a salted hash labelled `sha256`, and every peer refuses it.
+        sendContent: (agent, sessionId, content, contentHash, correlationId, leafKind, contentHashAlg) =>
+          sessionNodeManager.sendContent(agent, sessionId, content, contentHash, correlationId, leafKind, contentHashAlg),
+        contentHashForSession: (agent, sessionId, content) =>
+          sessionNodeManager.contentHashForSession(agent, sessionId, content),
         // The `0x04` doc leaf for a frame WE sent — the same step `cello_send` takes after its own
         // successful send. See the comment at the call site for why this is delivery-critical and
         // not audit bookkeeping.
