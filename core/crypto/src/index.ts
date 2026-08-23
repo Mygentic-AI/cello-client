@@ -76,7 +76,8 @@ export {
 } from "./session-salt.js";
 
 // DOD-M15-KEYAGREE-1: CELLO's own per-session key agreement — ephemeral-ephemeral X25519 with the
-// hybrid-PQ hook built in, producing both the content key and the content-hash salt.
+// hybrid-PQ hook built in. ONE output, the envelope key: the salt is agreed separately above
+// (Decisions Carried #8), because the key is destroyed at close and the salt outlives the session.
 export {
   generateSessionEphemeral,
   destroySessionEphemeral,

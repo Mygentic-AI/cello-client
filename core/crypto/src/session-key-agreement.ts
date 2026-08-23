@@ -23,8 +23,12 @@
  *     2. REFUSE if shared is all-zero                               # RFC 7748 §6.1
  *     3. ikm   = shared || extra?                                   # the PQ hook
  *     4. bind  = sort(ownPk, peerPk)                                # canonical, role-independent
- *     5. key   = HKDF-SHA256(ikm, salt=sessionId, info="cello/session/v1/content-key"  || bind, 32)
- *        csalt = HKDF-SHA256(ikm, salt=sessionId, info="cello/session/v1/content-salt" || bind, 32)
+ *     5. key   = HKDF-SHA256(ikm, salt=sessionId, info="cello/session/v1/content-key" || bind, 32)
+ *
+ *   THERE IS NO SECOND OUTPUT. This block used to specify a `csalt` derived from the same secret;
+ *   the salt is agreed INDEPENDENTLY in `session-salt.ts` (Decisions Carried #8). Re-deriving it
+ *   here brings back everything #7 was retracted for — epochs, per-leaf attribution, lockstep
+ *   switching.
  *
  * RFCs: X25519 — RFC 7748. HKDF — RFC 5869. (The AEAD that consumes the key is NIST SP 800-38D,
  * in `content-seal.ts`, which is the in-tree pattern this extends.)
