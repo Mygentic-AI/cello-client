@@ -9,16 +9,25 @@
  * matching column set says nothing about the VALUES: a rebuild can create the column and copy no
  * data into it, and every existing assertion would still pass.
  *
- * For this column that distinction is the whole risk. A salt that survives as NULL is **worse than
- * never having had one**:
+ ─── ⚠️ WHAT THIS TEST ACTUALLY GUARDS, corrected after review (F8) ───────────────────────────
  *
- *   - every leaf hashed under the old salt becomes permanently unverifiable, because the hash cannot
- *     be recomputed from the stored plaintext without it; and
- *   - the "does this session already have a salt?" lookup then answers NO, mints a fresh one, and
- *     splits the transcript at the upgrade — silently, with the session looking healthy.
+ * The header used to sell a scarier story than the code can produce: that a dropped salt makes the
+ * "does this session already have a salt?" lookup mint a fresh one and split the transcript. **That
+ * lookup does not exist yet** (`SEALWIRE-1` will build it), and the fixture's state is unreachable
+ * in production anyway — `needsRekey` returns true only when `sessions` lacks `agent_id`, and any
+ * build able to WRITE `content_salt` also contains the agent-id migration and runs it first in the
+ * same `initialize()`. So "no agent_id AND a populated content_salt" cannot occur on an operator's
+ * machine.
  *
- * That is the exact failure persisting the salt was meant to prevent, delivered by the migration
- * that carries it. So this asserts the BYTES.
+ * The REAL harm of omitting a column from the rebuild is more mundane and still worth a guard: the
+ * ALTER has already run that boot, so it will not re-run — the process continues with the column
+ * ABSENT, and the first statement naming `content_salt` fails with `no such column` on every send in
+ * a salted session until the daemon is restarted.
+ *
+ * The test earns its place because it SURVIVES THE REVERT TEST: remove `content_salt` from
+ * `createSql` and the SELECT throws `no such column`. That is genuine regression coverage of the
+ * omission — via the column's existence rather than its values — and the value assertions cost
+ * nothing on top. Kept, with the story corrected rather than the test deleted.
  *
  * ─── And it covers the other lane's columns too ────────────────────────────────────────────────
  *

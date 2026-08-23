@@ -1331,11 +1331,12 @@ export class SessionNodeManager {
        * plaintext on the receive path and again for any later check, and salted it is underivable
        * without this value.
        *
-       * PERSISTED because the alternative is silent corruption: on re-key after a restart the
-       * lookup is "does this session already have a salt? yes → use it, no → agree one". If it is
-       * not stored the lookup fails, a fresh salt is minted, and the restart splits the transcript
-       * at the point of the crash — every leaf before it becomes unverifiable, with nothing saying
-       * so. That is the exact defect the per-session design removes, re-entered through a crash.
+       * PERSISTED because the alternative is silent corruption. ⚠️ FUTURE TENSE, deliberately
+       * (review F10): NOTHING WRITES OR READS THIS COLUMN YET. `DOD-M15-SEALWIRE-1` will add the
+       * contribution exchange and the lookup — "does this session already have a salt? yes → use it,
+       * no → agree one" — and without the column that lookup would fail after a restart, mint a
+       * fresh salt, and split the transcript at the crash: every leaf before it unverifiable, with
+       * nothing saying so. The column lands now because it must exist before the code that needs it.
        *
        * NULL for every session opened before this column existed; those keep the unsalted hash.
        */

@@ -1,6 +1,12 @@
 /**
  * THE SESSION SALT — Decisions Carried #8, #9, #10 (Andre, 2026-08-23).
  *
+ * ⚠️ STAGE, NOT A FINISHED FEATURE (review F10). This module has NO PRODUCTION CALLER yet, and
+ * `sessions.content_salt` has no writer and no reader. `DOD-M15-SEALWIRE-1` owns the wire and cannot
+ * be split, so the primitive, the column and the migration land first. Every sentence below that
+ * describes exchanging, storing or looking up a salt describes what SEALWIRE-1 WILL do — not what
+ * the running system does today.
+ *
  * ─── Why this is a separate file from the key agreement ────────────────────────────────────────
  *
  * It used to be a second output of `deriveSessionSecrets`, and that was the defect. The envelope key
