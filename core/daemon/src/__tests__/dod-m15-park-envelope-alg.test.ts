@@ -97,6 +97,35 @@ describe("the envelope version is chosen by the algorithm, not bumped for everyo
     expect(decoded.contentHashAlg).toBe(CONTENT_HASH_ALGS.HMAC_SALT_V1);
   });
 
+  it("★ the EMPTY STRING is refused, not folded into 'absent' — review B2a F4", () => {
+    /**
+     * `!args.contentHashAlg` was true for `undefined`, `null` AND `""`. `resolveContentHashAlg`
+     * documents that conflation as forbidden — an empty string is a peer that sent a name we cannot
+     * read, not a peer that sent no name — and this file's own `contentHashAlg` doc cites B1 for it.
+     * The decoder honoured the rule; the encoder re-introduced it on the producer side.
+     *
+     * A caller whose algorithm variable is `""` would have emitted a v2 envelope labelled
+     * sha256-by-absence, and the recipient would report a TAMPER on a message nobody touched.
+     *
+     * ⚠️ This test exists because the mutant survived. My own mutation loop reported it CAUGHT, and
+     * re-running it alone showed 36 tests green — a false negative in the harness, which is the same
+     * class of error as a conditional assertion: the check ran and its answer was not what I read.
+     */
+    expect(() => encodeParkEnvelope({
+      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
+      contentHashAlg: "",
+    })).toThrow(/cannot itself reproduce/);
+  });
+
+  it("★ a name this build cannot read is refused at the PRODUCER, not left to the recipient", () => {
+    // Without this the sender seals an envelope every peer refuses — including itself — and nothing
+    // at the sending end says so: the message parks, is pulled, is refused, is kept, and repeats.
+    expect(() => encodeParkEnvelope({
+      content: CONTENT, senderPubkey: new Uint8Array(32).fill(1), parkSig: new Uint8Array(64).fill(2),
+      contentHashAlg: "hmac-sha512-salt-v9",
+    })).toThrow(/cannot itself reproduce/);
+  });
+
   it("★ a v2 envelope decodes with NO algorithm — absent, not defaulted to a string", () => {
     /**
      * `undefined` is what `resolveContentHashAlg` reads as "a peer that predates the field", which is
