@@ -27,9 +27,9 @@ import { evaluateSealUpgrade } from "../seal-upgrade.js";
 import { sealParkEnvelope } from "../park-envelope.js";
 import { contentHashFor } from "../wire-content-hash.js";
 import {
-  deriveSessionSalt, saltedContentHash, generateKeypair, SALT_CONTRIBUTION_BYTES,
+  deriveSessionSalt, saltedContentHash, generateKeypair, sealToRecipient, SALT_CONTRIBUTION_BYTES,
 } from "@cello-protocol/crypto";
-import { encodeCbor } from "@cello-protocol/protocol-types";
+import { encodeCbor, buildParkContentTbs } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 
 const SID = "ef".repeat(32);
@@ -383,6 +383,30 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
     return { agent, sessionId, plaintext: plaintext!, contentHash, recipientPub, sender };
   }
 
+  /**
+   * A parked entry naming an algorithm this build cannot read — hand-rolled, because
+   * `encodeParkEnvelope` correctly refuses to produce one (part B2a, review F4). It models a peer on
+   * a FUTURE build, which is the only way these bytes ever exist.
+   *
+   * ⚠️ If the producer guard ever moves, regenerate this by hand rather than reaching for the real
+   * producer — the fixture's whole point is being something we cannot make.
+   */
+  async function parkedEntryRaw(agent: string, sessionId: string, alg: string) {
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const recipientPub = await recipient.getPublicKey();
+    const contentHash = wireContentHash(CONTENT);
+    const parkSig = await sender.sign(buildParkContentTbs(sessionId, recipientPub, contentHash));
+    const envelope = encodeCbor([
+      3, CONTENT, null, null, await sender.getPublicKey(), parkSig, alg,
+    ]) as Uint8Array;
+    const plaintext = await recipient.openContentSeal!(sealToRecipient(recipientPub, envelope));
+    return {
+      agent, sessionId, plaintext: plaintext!, contentHash, recipientPub,
+      senderHex: Buffer.from(await sender.getPublicKey()).toString("hex"),
+    };
+  }
+
   it("★ a SALTED parked entry verifies under its own algorithm, not under sha256", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-alg-a-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
@@ -460,21 +484,40 @@ describe("DOD-M15-SEALWIRE-1 part B2a: the PARK route carries the algorithm too"
       "an unrelated recovery must not announce someone else's reconciliation",
     ).toBe(0);
 
-    // Now the REFUSED message arrives by the park route, re-parked without the unreadable name.
-    const e = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.SHA256, null);
-    const sameHash = wireContentHash(CONTENT);
+    /**
+     * A FAILED recovery of the refused message. Deterministic, not incidental: the entry is re-parked
+     * still naming the unreadable algorithm, so ingest refuses it again and `result.ok` is false.
+     *
+     * ⚠️ THIS BRANCH IS WHY THE TEST EXISTS, and my first version could not reach it. I wrote
+     * `if (res.ok) … else …`, which adapts to whatever happens — the same conditional assertion the
+     * B1 review caught and that I had criticised in writing an hour earlier. Re-running the mutant
+     * individually is what exposed it: reverting the predicate to a bare memo hit SURVIVED, because
+     * the test only ever took the success branch.
+     */
+    const stillUnreadable = await parkedEntryRaw("alice", SID, "hmac-sha512-salt-v9");
     fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
-      .run(Buffer.from(await e.sender.getPublicKey()).toString("hex"), SID);
-    const res = await fx.snm.recoverParkedEntry("alice", SID, e.recipientPub, e.plaintext, sameHash, "c3");
-    const announced = fx.eventsNamed("content.recover.alg_refusal_reconciled").length;
+      .run(stillUnreadable.senderHex, SID);
+    const failed = await fx.snm.recoverParkedEntry(
+      "alice", SID, stillUnreadable.recipientPub, stillUnreadable.plaintext, wireContentHash(CONTENT), "c3",
+    );
+    expect(failed.ok, "precondition: this recovery must FAIL").toBe(false);
+    expect(
+      fx.eventsNamed("content.recover.alg_refusal_reconciled").length,
+      "a FAILED recovery must never announce that the message was delivered — it fires every drain, forever",
+    ).toBe(0);
 
-    if (res.ok) {
-      expect(announced, "a real delivery of the refused message must be reported exactly once").toBe(1);
-    } else {
-      // F1's fix: the block used to fire on the memo hit alone, announcing a delivery that had not
-      // happened — once per drain, forever, because the entry is never confirm-deleted.
-      expect(announced, "a FAILED recovery must never announce that the message was delivered").toBe(0);
-    }
+    // And the memo must still be ARMED, or the next attempt — the one that works — says nothing.
+    const good = await parkedEntry("alice", SID, CONTENT_HASH_ALGS.SHA256, null);
+    fx.snm.getDb().prepare("UPDATE sessions SET counterparty_pubkey = ? WHERE session_id = ?")
+      .run(Buffer.from(await good.sender.getPublicKey()).toString("hex"), SID);
+    const delivered = await fx.snm.recoverParkedEntry(
+      "alice", SID, good.recipientPub, good.plaintext, wireContentHash(CONTENT), "c4",
+    );
+    expect(delivered.ok, "precondition: this recovery must SUCCEED").toBe(true);
+    expect(
+      fx.eventsNamed("content.recover.alg_refusal_reconciled").length,
+      "the real delivery must be reported exactly once, and only now",
+    ).toBe(1);
   }, 60_000);
 
   it("a v2 parked entry still verifies — REGRESSION GUARD, not coverage of this change", async () => {
