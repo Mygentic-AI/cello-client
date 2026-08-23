@@ -153,11 +153,21 @@ Either agent calls `cello_close_session`. Both parties sign off on the whole con
 
 ```
 cello_close_session({ cello_session_id: "<hex>", session_name: "Q3 budget review with Bob" })
-→ { ok: true, sealed_root: "<64-hex>" }
+→ { ok: true, seal_status: "committed" }        # your commitment is recorded; notarization runs in the background
 
 cello_sealed_receipt({ cello_session_id: "<hex>" })
+→ { ok: false, reason: "seal_in_progress" }     # still running — wait and ask again, this is NOT a failure
 → the notarized bilateral receipt both sides agree on
 ```
+
+**The close does NOT return `sealed_root`.** It answers as soon as your SEAL commitment is durable,
+because the ceremony waits for the counterparty to close too and can legitimately take up to eleven
+minutes — it used to block for exactly that long, and an operator who read a frozen command as a
+broken one force-abandoned seventeen sessions, forfeiting the receipts the wait was earning.
+
+So: close, then fetch the receipt separately. `seal_in_progress` means keep waiting.
+**Never** re-close with `force: true` to hurry it along — that abandons the session and permanently
+forfeits the receipt the ceremony is about to produce.
 
 The receipt attests **receipt, never assent** — an unanswered last message reads as delivered-but-unanswered, never as agreement.
 
