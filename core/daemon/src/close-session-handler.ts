@@ -104,10 +104,18 @@ export interface CloseSessionDeps {
   registerBackgroundSeal?: (p: Promise<unknown>) => void;
   /**
    * DOD-M15-SEAL-FAILED-TERMINAL-1: record/clear the last background ceremony failure, so
-   * `cello_sealed_receipt` can tell a DEAD seal from a slow one. Optional for embedders and test
-   * harnesses; the daemon always passes it.
+   * `cello_sealed_receipt` can tell a DEAD seal from a slow one.
+   *
+   * REQUIRED, not optional — review HIGH-3. Optionality made a missing wiring silent: deleting the
+   * daemon's `getSealFailure` line left tests, lint and typecheck all green while the whole unit was
+   * inert. There is exactly one composition root, so optionality buys nothing and costs the compiler
+   * the ability to catch a wiring that was never done. (`RestartSealResolverDeps.markGaveUp` makes
+   * the same argument in its own docstring.)
    */
-  sealFailures?: { record: (a: string, s: string, reason: string, at: string) => void; clear: (a: string, s: string) => void };
+  sealFailures: {
+    record: (a: string, s: string, reason: string, at: string, kind: "unresolved" | "threw") => void;
+    clear: (a: string, s: string) => void;
+  };
   // ── the seal cluster (seal-coordinator.ts) ──
   sealKey: (agentName: string, sessionId: string) => string;
   sealInterruptedInProgress: Set<string>;
@@ -578,6 +586,17 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       }
       const told = notice.told;
       await sessionNodeManager.abandonSession(record.agent_name, sessionId);
+      /**
+       * FORGET ANY SEAL FAILURE — review MEDIUM-5.
+       *
+       * An abandoned session is TERMINAL: there is no ceremony to retry and no receipt to obtain.
+       * Leaving the marker made two surfaces contradict each other — `cello_sealed_receipt` reported
+       * `seal_failed` and told the agent to *"call cello_close_session again"*, while
+       * `cello_close_session` refused with `session_abandoned` and *"it is terminal… it cannot be
+       * closed."* A refused loop, and exactly the contradicting-surfaces pair the previous unit's
+       * review flagged, reintroduced one unit later.
+       */
+      sealFailures.clear(record.agent_name, sessionId);
       logger.info("session.force_abandoned", {
         agentName: record.agent_name,
         sessionId,
@@ -1162,6 +1181,17 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           }
         };
 
+        /**
+         * A NEW CEREMONY IS STARTING, so any previous failure verdict is now false.
+         *
+         * ABOVE the `waitForSeal` branch — review MEDIUM-4. It used to sit below, so the clear ran
+         * only on the handed-off path: a blocking re-close (which the MCP tool exposes and the
+         * document-delivery seal uses) left the old marker in place, and a stale `seal_failed` from
+         * half an hour earlier was then reported as the current state. That is `STALEROSTER-1`'s
+         * defect, in the store whose own docstring says it avoids it.
+         */
+        sealFailures.clear(rec.agent_name, sid);
+
         if (waitForSeal) return await finishSeal();
 
         handedOff = true;
@@ -1170,10 +1200,6 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          * rejection — and must not be silent either: the operator has already been told the seal is
          * running, so a failure they never hear about is the worst of both worlds.
          */
-        // DOD-M15-SEAL-FAILED-TERMINAL-1: a NEW ceremony is starting, so any previous failure verdict
-        // is now false. Clearing on START (not only on success) is what stops the documented remedy —
-        // re-close — from being reported as still-dead while it runs.
-        sealFailures?.clear(rec.agent_name, sid);
         const tail = finishSeal();
         /**
          * TRACKED FOR SHUTDOWN — review MEDIUM-6.
@@ -1193,19 +1219,31 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           (result) => {
             const r = result as { ok?: boolean; reason?: string };
             if (r?.ok) {
-              sealFailures?.clear(rec.agent_name, sid);
+              sealFailures.clear(rec.agent_name, sid);
               logger.info("session.seal.background.completed", { sessionId: sid, agentName: rec.agent_name, correlationId });
             }
-            else logger.warn("session.seal.background.unresolved", {
+            else {
+              /**
+               * THE BRANCH PRODUCTION ACTUALLY TAKES — review HIGH-1.
+               *
+               * `escalateToUnilateralSeal` contains zero `throw`s: all nine of its failure paths
+               * RESOLVE with `{ ok: false, reason }`. So recording only in the `.catch` below meant
+               * every ordinary dead ceremony went unrecorded and `cello_sealed_receipt` kept
+               * answering `not_sealed_yet` — the very answer this unit exists to replace. The log
+               * line three lines down said so out loud the whole time.
+               */
+              sealFailures.record(rec.agent_name, sid, r?.reason ?? "seal_unresolved", new Date().toISOString(), "unresolved");
+              logger.warn("session.seal.background.unresolved", {
               sessionId: sid, agentName: rec.agent_name, correlationId, reason: r?.reason,
               impact: "the close already answered; this session holds a durable commitment but has no receipt yet.",
-              guidance: "cello_sealed_receipt stays empty until this resolves; a daemon restart resumes it.",
-            });
+              guidance: "cello_sealed_receipt now reports seal_failed with this reason; a daemon restart also retries it.",
+              });
+            }
           },
           (err: unknown) => {
             // RECORDED FOR THE RESPONSE, not only the log. The caller already holds `ok: true`, so a
             // failure that lives only in daemon.log is one the agent has no way to discover.
-            sealFailures?.record(rec.agent_name, sid, err instanceof Error ? err.message : String(err), new Date().toISOString());
+            sealFailures.record(rec.agent_name, sid, err instanceof Error ? err.message : String(err), new Date().toISOString(), "threw");
             logger.error("session.seal.background.failed", {
             sessionId: sid, agentName: rec.agent_name, correlationId,
             error: err instanceof Error ? err.message : String(err),

@@ -53,6 +53,10 @@ function harness(sealReady: Readiness, status = "interrupted") {
 
   registerCloseSessionHandler({
     handlers,
+    // Required since DOD-M15-SEAL-FAILED-TERMINAL-1 review HIGH-3. The force-abandon path clears any
+    // recorded seal failure — an abandoned session is terminal, so a lingering marker would have
+    // cello_sealed_receipt telling the agent to re-close while cello_close_session refuses it.
+    sealFailures: { record: () => {}, clear: () => {} },
     logger: {
       debug() {}, info(e, c) { events.push({ event: e, context: c ?? {} }); },
       warn(e, c) { events.push({ event: e, context: c ?? {} }); }, error() {},

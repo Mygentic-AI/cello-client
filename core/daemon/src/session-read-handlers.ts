@@ -17,7 +17,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { validateSessionName } from "./session-name.js";
 import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-mismatch.js";
-import { describeSealFailed } from "./seal-failure-store.js";
+import { describeSealFailed, type SealFailure } from "./seal-failure-store.js";
 
 export interface SessionReadDeps {
   /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
@@ -50,7 +50,12 @@ export interface SessionReadDeps {
    * Checked AFTER `isSealing` — a running ceremony outranks an old verdict, because a re-close is
    * the remedy and its marker is cleared on start.
    */
-  getSealFailure?: (agentName: string, sessionId: string) => { reason: string; at: string } | undefined;
+  /**
+   * REQUIRED — review HIGH-3. As an optional dep, deleting the daemon's wiring for it left tests,
+   * lint and typecheck green while the whole unit was inert. One composition root; make the
+   * compiler catch it.
+   */
+  getSealFailure: (agentName: string, sessionId: string) => SealFailure | undefined;
   /** Never vaults a cursor/watermark past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   safeWatermarkAdvance: (agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
@@ -230,7 +235,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
        * above. Ordering is load-bearing: `isSealing` was checked first, so a re-close that started a
        * fresh ceremony reports as running rather than as the old failure.
        */
-      const failure = getSealFailure?.(agentName, sessionId);
+      const failure = getSealFailure(agentName, sessionId);
       if (failure) return describeSealFailed({ sessionId, failure });
 
       // The session is THIS agent's — it simply has no seal certificate yet, no ceremony is running

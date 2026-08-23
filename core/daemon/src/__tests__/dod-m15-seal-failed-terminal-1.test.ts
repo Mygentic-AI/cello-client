@@ -39,14 +39,14 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: remembering a dead ceremony", () => {
 
   it("★ a recorded failure survives the read — that is the whole point", () => {
     const s = new SealFailureStore();
-    s.record(AGENT, SESSION, "directory_unreachable", AT);
+    s.record(AGENT, SESSION, "directory_unreachable", AT, "unresolved");
     expect(s.get(AGENT, SESSION)?.reason).toBe("directory_unreachable");
     expect(s.get(AGENT, SESSION)?.reason, "reading must not consume it").toBe("directory_unreachable");
   });
 
   it("★ clearing forgets it, because a new ceremony makes the old verdict false", () => {
     const s = new SealFailureStore();
-    s.record(AGENT, SESSION, "directory_unreachable", AT);
+    s.record(AGENT, SESSION, "directory_unreachable", AT, "unresolved");
     s.clear(AGENT, SESSION);
     expect(
       s.get(AGENT, SESSION),
@@ -62,7 +62,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: remembering a dead ceremony", () => {
      * would let one end's failed ceremony report the other end's seal as dead.
      */
     const s = new SealFailureStore();
-    s.record("agent-a", SESSION, "directory_unreachable", AT);
+    s.record("agent-a", SESSION, "directory_unreachable", AT, "unresolved");
     expect(s.get("agent-b", SESSION), "the other end's seal is a different ceremony").toBeUndefined();
   });
 
@@ -78,13 +78,31 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: remembering a dead ceremony", () => {
 });
 
 describe("DOD-M15-SEAL-FAILED-TERMINAL-1: what the agent is told", () => {
-  const failed = () => describeSealFailed({ sessionId: SESSION, failure: { reason: "ceremony_exhausted", at: AT } });
+  const failed = () => describeSealFailed({ sessionId: SESSION, failure: { reason: "ceremony_exhausted", at: AT, kind: "threw" } });
 
   it("★ it is NOT ok, and says failed rather than pending", () => {
     const d = failed();
     expect(d["ok"]).toBe(false);
     expect(d["reason"]).toBe("seal_failed");
     expect(d["seal_status"]).toBe("failed");
+  });
+
+  it("★ a RESOLVED failure reads as 'unresolved', not as an error — review HIGH-1", () => {
+    /**
+     * The distinction the first cut could not make, and the reason it closed almost none of the gap:
+     * `escalateToUnilateralSeal` has ZERO throws, so all nine real failure paths RESOLVE. Recording
+     * only in the `.catch` meant every ordinary dead ceremony went unrecorded.
+     *
+     * They also need different words. An exception is usually a local fault; a resolved failure is
+     * most often "the counterparty has not closed yet", which is not an error at all.
+     */
+    const d = describeSealFailed({ sessionId: SESSION, failure: { reason: "seal_unilateral_timeout", at: AT, kind: "unresolved" } });
+    expect(d["seal_status"]).toBe("unresolved");
+    expect(
+      String(d["guidance"]),
+      "it must tell the agent to READ the reason before acting — waiting is right for a " +
+        "counterparty who has not closed, and wrong for a local fault",
+    ).toMatch(/seal_counterparty_pending|other side has not closed/i);
   });
 
   it("★ it carries the UPSTREAM cause, not a label invented here", () => {
@@ -134,7 +152,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
   const AGENT2 = "agent-a";
   const SESSION2 = "cd".repeat(16);
 
-  async function readHandlerWith(failure: { reason: string; at: string } | undefined, sealing: boolean) {
+  async function readHandlerWith(failure: { reason: string; at: string; kind: "unresolved" | "threw" } | undefined, sealing: boolean) {
     const { registerSessionReadHandlers } = await import("../session-read-handlers.js");
     const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
     registerSessionReadHandlers({
@@ -164,7 +182,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
   }
 
   it("★ a recorded failure reaches cello_sealed_receipt as seal_failed", async () => {
-    const h = await readHandlerWith({ reason: "directory_below_threshold", at: AT }, false);
+    const h = await readHandlerWith({ reason: "directory_below_threshold", at: AT, kind: "unresolved" }, false);
     const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
     expect(
       res["reason"],
@@ -180,7 +198,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
      * prefer "running" — belt and braces, because getting this backwards tells an operator their
      * retry is dead while it is working, and the retry is the remedy this unit's own guidance names.
      */
-    const h = await readHandlerWith({ reason: "stale_verdict", at: AT }, true);
+    const h = await readHandlerWith({ reason: "stale_verdict", at: AT, kind: "unresolved" }, true);
     const res = (await h({ session_id: SESSION2 }, "c1")) as Record<string, unknown>;
     expect(res["reason"], "a running ceremony must win over a remembered failure").toBe("seal_in_progress");
   });
@@ -272,7 +290,7 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the WRITE side is wired too", () => {
 
   it("★ starting a NEW ceremony clears a previous failure — the retry must not read as dead", async () => {
     const { close, store, backgroundSeals } = await closeWith({ throwInTail: false });
-    store.record(AGENT3, SESSION3, "a_previous_failure", "2026-01-01T00:00:00.000Z");
+    store.record(AGENT3, SESSION3, "a_previous_failure", "2026-01-01T00:00:00.000Z", "unresolved");
     const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
     process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
     try {

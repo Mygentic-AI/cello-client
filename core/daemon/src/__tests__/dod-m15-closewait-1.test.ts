@@ -153,6 +153,7 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
     registerCloseSessionHandler({
       handlers,
       logger: { info: rec, warn: rec, error: rec, debug: () => {} },
+      sealFailures: { record: () => {}, clear: () => {} },
       registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
       sessionNodeManager: {
         getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "active" }),
@@ -284,6 +285,7 @@ describe("DOD-M15-CLOSEWAIT-1: the background ceremony is announced and tracked"
     registerCloseSessionHandler({
       handlers,
       logger: { info: rec, warn: rec, error: rec, debug: () => {} },
+      sealFailures: { record: () => {}, clear: () => {} },
       registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
       sessionNodeManager: {
         getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "active" }),
