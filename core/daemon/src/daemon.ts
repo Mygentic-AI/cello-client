@@ -2062,12 +2062,11 @@ async function startDaemonHoldingLock(
     // session/recipient/content binding) and seals in one place, so the two park sites cannot drift
     // apart on what gets signed.
     //
-    // 🚨 `DOD-M15-SEALWIRE-1` PART B2b MUST PASS `contentHashAlg` HERE. These two calls are the ONLY
-    // producers of a park envelope, and neither names an algorithm — so every envelope is v2, which
-    // is exactly right while nothing salts. The moment the send path salts and this does not, the
-    // recipient verifies a salted hash as `sha256`: the entry is refused, not annexed, and the relay
-    // copy is KEPT, so it is pulled and refused again on every drain. The value must be the same one
-    // the direct-path frame carries for this message, not re-derived from the session's own row.
+    // `DOD-M15-SEALWIRE-1` PART B2b — the algorithm is threaded through, and it is the value THIS
+    // MESSAGE was hashed under, never one re-derived from the session's current row. Whether a hash
+    // is salted is a fact about the message that was sent; what this side holds now says nothing
+    // about it. Still `sha256` everywhere, because no send path salts yet — the plumbing is proven
+    // carrying the value that cannot break anything, and only then does the value change.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: sessionId,
@@ -2143,18 +2142,20 @@ async function startDaemonHoldingLock(
     // SEC-1: same sole producer as the live hook — the backstop signs from the persisted
     // (sessionId, recipient, contentHash).
     //
-    // 🚨 `DOD-M15-SEALWIRE-1` PART B2b MUST PASS `contentHashAlg` HERE. These two calls are the ONLY
-    // producers of a park envelope, and neither names an algorithm — so every envelope is v2, which
-    // is exactly right while nothing salts. The moment the send path salts and this does not, the
-    // recipient verifies a salted hash as `sha256`: the entry is refused, not annexed, and the relay
-    // copy is KEPT, so it is pulled and refused again on every drain. The value must be the same one
-    // the direct-path frame carries for this message, not re-derived from the session's own row.
+    // `DOD-M15-SEALWIRE-1` PART B2b — the algorithm is threaded through, and it is the value THIS
+    // MESSAGE was hashed under, never one re-derived from the session's current row. Whether a hash
+    // is salted is a fact about the message that was sent; what this side holds now says nothing
+    // about it. Still `sha256` everywhere, because no send path salts yet — the plumbing is proven
+    // carrying the value that cannot break anything, and only then does the value change.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: entry.sessionId,
       recipientPubkey,
       contentHash: contentHashBytes,
       content: entry.contentBlob,
+      // The queued row's own record of how it was hashed. `undefined` for a row written before the
+      // column existed, which resolves to `sha256` — exactly what such a row actually used.
+      contentHashAlg: entry.contentHashAlg,
       structure1Cbor: entry.structure1Cbor,
       structure2Cbor: entry.structure2Cbor,
     });

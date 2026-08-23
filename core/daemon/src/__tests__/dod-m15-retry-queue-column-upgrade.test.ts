@@ -44,6 +44,7 @@ import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
+import { RetryQueue } from "../retry-queue.js";
 import type { DaemonDatabase, Logger } from "../types.js";
 
 const silent: Logger = { debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger;
@@ -78,6 +79,83 @@ function legacyDbWithOrderingRecord(): DatabaseSync {
   ).run(S1, S2, "hmac-sha256-salt-v1");
   return db;
 }
+
+describe("the queued row REMEMBERS how its message was hashed", () => {
+  /**
+   * The reason the column exists, and it is a round trip rather than a schema check: the
+   * crash-backstop park producer runs at the NEXT BOOT, when the frame that carried the algorithm is
+   * long gone. If the value does not survive `enqueue → persist → restart → hydrate`, that producer
+   * has nothing to name, and re-parking under the wrong algorithm gets the message refused by the
+   * recipient and re-pulled on every drain.
+   *
+   * Re-deriving it from the session's current row is the wrong answer and is why this is stored:
+   * whether a hash is salted is a fact about the MESSAGE THAT WAS SENT, and what this side holds now
+   * says nothing about it.
+   */
+  function freshQueueDb(): DatabaseSync {
+    const db = new DatabaseSync(":memory:");
+    ensureIdentitySchema(db as unknown as DaemonDatabase);
+    db.prepare(
+      `INSERT INTO agents (agent_id, agent_name, k_local_seed, k_local_pubkey, state, created_at, updated_at)
+       VALUES ('id-alice','alice',x'00','pub-alice','created',1,1)`,
+    ).run();
+    return db;
+  }
+
+  /**
+   * Reads the entry the way the BACKSTOP PRODUCER does — through `drainAwaitingToPark`, whose
+   * `parkFn` receives it — rather than through a test-only accessor. A seam that hands back the
+   * in-memory object would pass even if the value never reached the row, which is the whole thing
+   * being tested.
+   */
+  async function drainedEntry(db: DatabaseSync, sessionId: string) {
+    /**
+     * A SECOND instance over the same handle, then `loadFromDb()` — which is the restart, and the
+     * explicit call matters. The constructor only creates the table and its indexes; hydration is a
+     * separate step the daemon runs before the IPC socket opens. A fixture that skipped it saw an
+     * empty queue and would have "proved" the value was lost.
+     */
+    const revived = new RetryQueue(db as unknown as DaemonDatabase, silent);
+    revived.loadFromDb();
+    let seen: { contentHashAlg?: string } | null = null;
+    await revived.drainAwaitingToPark("id-alice", sessionId, async (entry) => {
+      seen = entry;
+      return { parked: true };
+    });
+    return seen;
+  }
+
+  it("★ the algorithm survives enqueue → restart → the backstop's own read", async () => {
+    const db = freshQueueDb();
+    const rq = new RetryQueue(db as unknown as DaemonDatabase, silent);
+    expect(
+      rq.enqueueAwaitingContent(
+        "id-alice", "s1", new Uint8Array(32).fill(0xa1), new TextEncoder().encode("hello"),
+        undefined, undefined, "hmac-sha256-salt-v1",
+      ),
+      "precondition: the enqueue must succeed",
+    ).toBe(true);
+
+    const entry = await drainedEntry(db, "s1");
+    expect(entry, "the row must hydrate at all").not.toBeNull();
+    expect(
+      entry!.contentHashAlg,
+      "without this the backstop re-parks under sha256 and the recipient refuses every copy",
+    ).toBe("hmac-sha256-salt-v1");
+  });
+
+  it("★ a message enqueued with NO algorithm hydrates as ABSENT, not as the sha256 string", async () => {
+    // `undefined` is what `resolveContentHashAlg` reads as "predates the field" — the only value
+    // meaning legacy. Filling in the literal would erase the distinction B1 and B2a each restored.
+    const db = freshQueueDb();
+    const rq = new RetryQueue(db as unknown as DaemonDatabase, silent);
+    rq.enqueueAwaitingContent("id-alice", "s2", new Uint8Array(32).fill(0xb2), new TextEncoder().encode("hi"));
+
+    const entry = await drainedEntry(db, "s2");
+    expect(entry).not.toBeNull();
+    expect(entry!.contentHashAlg).toBeUndefined();
+  });
+});
 
 describe("the agent-id rebuild carries every column retry-queue.ts adds", () => {
   it("★ the ORDERING RECORD survives — losing it silently splits the transcript on upgrade", () => {

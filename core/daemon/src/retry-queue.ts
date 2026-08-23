@@ -52,6 +52,18 @@ export interface AwaitingContentEntry {
    *  ARRIVAL index instead of its witnessed sequence, and the session tree diverges at seal.
    *  Nullable: rows written before this column existed, and the agent-less direct-retry rows,
    *  legitimately have none. */
+  /**
+   * `DOD-M15-SEALWIRE-1` part B2b — WHICH content-hash algorithm `contentHashHex` was produced
+   * under, so a RE-park names the same one the original frame did.
+   *
+   * The crash-backstop producer has no other source: it runs at the next boot, the frame is long
+   * gone, and re-deriving it from the session's current row would be a fact about what THIS side
+   * holds now, not about how this message was actually hashed.
+   *
+   * Nullable, and `undefined` is meaningful rather than a gap — it is what `resolveContentHashAlg`
+   * reads as "predates the field", the only value meaning legacy. Never defaulted to `"sha256"`.
+   */
+  contentHashAlg?: string;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
   queuedAt: number;
@@ -170,7 +182,7 @@ export class RetryQueue {
    */
   loadFromDb(): void {
     const rows = this.#db
-      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor FROM retry_queue ORDER BY session_id, position ASC")
+      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, content_hash_alg FROM retry_queue ORDER BY session_id, position ASC")
       .all() as unknown as Array<{
         session_id: string;
         agent_id: string | null;
@@ -181,6 +193,7 @@ export class RetryQueue {
         position: number;
         awaiting_ack: number;
         content_hash_hex: string | null;
+        content_hash_alg: string | null;
         structure1_cbor: Buffer | null;
         structure2_cbor: Buffer | null;
       }>;
@@ -210,6 +223,7 @@ export class RetryQueue {
           contentBlob: this.#openBlob(Uint8Array.from(row.content_blob)),
           // M12-P12 (F2): the ordering record is NOT sealed — it is the relay's own signed record,
           // already public to the relay, and it must be readable to re-seal the park envelope.
+          contentHashAlg: row.content_hash_alg ?? undefined,
           structure1Cbor: row.structure1_cbor ? Uint8Array.from(row.structure1_cbor) : undefined,
           structure2Cbor: row.structure2_cbor ? Uint8Array.from(row.structure2_cbor) : undefined,
           queuedAt: row.queued_at,
@@ -591,7 +605,17 @@ export class RetryQueue {
    * indistinguishable from a successful enqueue at the call site, which is how a leaf could be
    * committed for content that no longer existed anywhere.
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): boolean {
+  /**
+   * `contentHashAlg` — `DOD-M15-SEALWIRE-1` part B2b. WHICH algorithm `contentHash` was produced
+   * under, carried because the crash-backstop park producer has NO OTHER SOURCE for it: it runs at
+   * the next boot, long after the frame is gone, and re-parking under the wrong algorithm gets the
+   * message refused by the recipient and re-pulled forever.
+   *
+   * Optional and stored as NULL when absent, never defaulted to the literal `"sha256"` — absent is
+   * what `resolveContentHashAlg` reads as "predates the field", and that distinction is the one B1
+   * and B2a each had to restore after it was collapsed.
+   */
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);
@@ -622,12 +646,13 @@ export class RetryQueue {
     try {
       this.#db
         .prepare(
-          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`,
+          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, content_hash_alg)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
         )
         .run(sessionId, agentId, contentHashHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, position, contentHashHex,
              structure1Cbor ? Buffer.from(structure1Cbor) : null,
-             structure2Cbor ? Buffer.from(structure2Cbor) : null);
+             structure2Cbor ? Buffer.from(structure2Cbor) : null,
+             contentHashAlg ?? null);
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);
       this.#logger.error("message.retry.persist.failed", {
@@ -641,7 +666,7 @@ export class RetryQueue {
     }
 
     this.#positionCounters.set(ak, position);
-    q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, queuedAt, position });
+    q.push({ agentId, sessionId, contentHashHex, contentBlob, structure1Cbor, structure2Cbor, contentHashAlg, queuedAt, position });
     return true;
   }
 
