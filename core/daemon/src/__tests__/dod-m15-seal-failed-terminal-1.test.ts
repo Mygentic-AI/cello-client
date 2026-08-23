@@ -191,3 +191,101 @@ describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the daemon actually wires the store", 
     expect(res["reason"]).toBe("not_sealed_yet");
   });
 });
+
+describe("DOD-M15-SEAL-FAILED-TERMINAL-1: the WRITE side is wired too", () => {
+  /**
+   * The revert test caught this: my wiring test injected `getSealFailure` directly, so it proved the
+   * READER consults the store and said nothing about the WRITER filling it. Deleting the `record`
+   * call in the detached tail — and deleting the `clear` on ceremony start — both stayed green.
+   *
+   * One layer up from the gap I had just written a comment about avoiding.
+   */
+  const AGENT3 = "agent-a";
+  const SESSION3 = "ef".repeat(16);
+
+  async function closeWith(opts: { throwInTail: boolean }) {
+    const { registerCloseSessionHandler } = await import("../close-session-handler.js");
+    const { SealFailureStore: Store } = await import("../seal-failure-store.js");
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    const store = new Store();
+    const backgroundSeals: Array<Promise<unknown>> = [];
+
+    registerCloseSessionHandler({
+      handlers,
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      sealFailures: store,
+      registerBackgroundSeal: (p: Promise<unknown>) => { backgroundSeals.push(p); },
+      sessionNodeManager: {
+        getSessionRecord: () => ({ agent_name: AGENT3, agent_id: "aid", session_id: SESSION3, status: "active" }),
+        submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 1, reportedRootHex: "aa".repeat(32) }),
+        getSealCarry: () => [],
+        getSealCertificate: () => null,
+        resolveAgentId: () => "aid",
+        setSessionName: () => {},
+        sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
+      },
+      getConnState: () => ({ currentAgent: AGENT3 }),
+      resolveCurrentAgent: () => AGENT3,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      // The seam that makes the TAIL throw: the escalation asks for the signing key.
+      getKeyProvider: opts.throwInTail
+        ? () => { throw new Error("key vault locked"); }
+        : () => ({ getPublicKey: async () => new Uint8Array(32) }),
+      signalingFor: () => ({ status: "connected" }),
+      sendOver: async () => ({ ok: true }),
+      waitForSignalingConnected: async () => true,
+      openVisitingConnection: () => null,
+      crossNodeBrokerBySession: new Map<string, string>(),
+      sealKey: (a: string, s: string) => `${a}\x1f${s}`,
+      sealInterruptedInProgress: new Set<string>(),
+      pendingSealWaiters: new Map(),
+      pendingUnilateralWaiters: new Map(),
+      resolveConsortiumRoster: async () => [],
+      unilateralTimeoutMs: 10,
+      handleSealInterruptedFlow: async () => ({ ok: false, reason: "unused" }),
+      handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
+    } as never);
+
+    return { close: handlers.get("cello_close_session")!, store, backgroundSeals };
+  }
+
+  it("★ a tail that THROWS records the failure in the store", async () => {
+    const { close, store, backgroundSeals } = await closeWith({ throwInTail: true });
+    const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
+    try {
+      const res = (await close({ session_id: SESSION3 }, "c1")) as Record<string, unknown>;
+      expect(res["seal_status"], "PRECONDITION: the handed-off path").toBe("committed");
+      await Promise.allSettled(backgroundSeals);
+      const rec = store.get(AGENT3, SESSION3);
+      expect(
+        rec,
+        "the background ceremony threw and nothing was recorded, so cello_sealed_receipt still " +
+          "cannot tell a dead seal from a slow one — the whole point of this unit",
+      ).toBeDefined();
+      expect(rec?.reason, "and the upstream cause must survive, not a label").toContain("key vault locked");
+    } finally {
+      if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = prev;
+    }
+  }, 30_000);
+
+  it("★ starting a NEW ceremony clears a previous failure — the retry must not read as dead", async () => {
+    const { close, store, backgroundSeals } = await closeWith({ throwInTail: false });
+    store.record(AGENT3, SESSION3, "a_previous_failure", "2026-01-01T00:00:00.000Z");
+    const prev = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "20";
+    try {
+      await close({ session_id: SESSION3 }, "c1");
+      expect(
+        store.get(AGENT3, SESSION3)?.reason,
+        "the stale verdict survived the retry, so the agent is told the seal is dead while its " +
+          "replacement ceremony is running — a stale reading presented as current",
+      ).not.toBe("a_previous_failure");
+      await Promise.allSettled(backgroundSeals);
+    } finally {
+      if (prev === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = prev;
+    }
+  }, 30_000);
+});
