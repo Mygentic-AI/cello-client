@@ -102,6 +102,17 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         -- legacy database upgrades, and a dropped divergence reads as HEALTHY — exactly the
         -- failure the column was added to prevent, reintroduced by the migration that carries it.
         diverged_at INTEGER,
+        -- Decisions Carried #8 — the session salt. Omitting it here drops the salt on the one boot
+        -- a legacy database upgrades, and a dropped salt is WORSE than no salt: every leaf hashed
+        -- under it becomes unverifiable, and the "does this session already have one?" lookup then
+        -- mints a fresh salt and splits the transcript silently. Same trap as diverged_at above.
+        content_salt BLOB,
+        -- DOD-M15-FREEZE-STATUS-1, carried for CELLO_Support's lane. Dropping these on upgrade would
+        -- un-freeze a session frozen because a party signed with a key that was not the
+        -- counterparty's — the failure that column exists to survive, reintroduced by the migration
+        -- that carries it.
+        frozen_at INTEGER,
+        frozen_reason TEXT,
         PRIMARY KEY (agent_id, session_id)
       )`,
     indexSql: () => [],
