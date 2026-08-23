@@ -537,3 +537,37 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the warning window is pinned to someth
     ).toBeLessThan(0.02);
   });
 });
+
+describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the remedy matches where the manifest came from", () => {
+  /**
+   * Review F5, and the revert test proved it was unheld: making every origin take the "rotate the
+   * file" branch left the whole suite green.
+   *
+   * This is Invariant 2's third check — does the remedy WORK? On the bundled path there is no file
+   * and no poll, so "rotate the manifest" is not an action that operator can perform, and the
+   * workaround they reach for instead silently disables directory identity authentication.
+   */
+  const expired = () => classifyManifestValidity(manifest({ expires: at(-2 * DAY) }), NOW);
+
+  it("★ the BUNDLED path is told to upgrade the package, and warned off the trap", () => {
+    const g = String(describeManifestValidity(expired(), "bundled")?.["manifest_validity_guidance"]);
+    expect(g, "there is no file to replace on this path").toMatch(/upgrade the @cello-protocol\/connect/i);
+    expect(
+      g,
+      "and it must name the workaround that must NOT be used — repointing CELLO_DIRECTORY_URL " +
+        "starts the daemon with directory identity authentication switched off, so a stuck operator " +
+        "would 'fix' a security warning by disabling a security control",
+    ).toMatch(/Do NOT repoint CELLO_DIRECTORY_URL/i);
+    expect(g, "and must not tell them to replace a file that does not exist").not.toMatch(
+      /Replace the manifest file/i,
+    );
+  });
+
+  it("★ the FILE path is told to replace the file", () => {
+    const g = String(describeManifestValidity(expired(), "file")?.["manifest_validity_guidance"]);
+    expect(g).toMatch(/Replace the manifest file at CELLO_CONSORTIUM_MANIFEST/i);
+    expect(g, "and must not send a file-path operator chasing a package upgrade").not.toMatch(
+      /upgrade the @cello-protocol\/connect/i,
+    );
+  });
+});

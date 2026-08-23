@@ -96,7 +96,6 @@ export type ManifestValidity =
 export function classifyManifestValidity(
   manifest: Pick<ConsortiumManifest, "not_before" | "expires"> | null | undefined,
   nowMs: number,
-  warningMs: number = MANIFEST_EXPIRY_WARNING_MS,
 ): ManifestValidity {
   if (!manifest) return { state: "not_configured" };
 
@@ -138,7 +137,11 @@ export function classifyManifestValidity(
 
   const remainingMs = expiresMs - nowMs;
   const secondsRemaining = Math.floor(remainingMs / 1000);
-  return remainingMs <= warningMs
+  // The constant directly, not an injectable parameter — review F9. A `warningMs` argument had no
+  // caller anywhere, and it was the ONE seam by which the two surfaces could ever disagree: the
+  // status path could not pass a custom window while the watch could. An unused knob whose only
+  // possible effect is drift between two readings of the same fact.
+  return remainingMs <= MANIFEST_EXPIRY_WARNING_MS
     ? { state: "expiring_soon", expires: manifest.expires, secondsRemaining }
     : { state: "valid", expires: manifest.expires, secondsRemaining };
 }
@@ -260,13 +263,12 @@ export function startManifestValidityWatch(opts: {
   getManifest: () => Pick<ConsortiumManifest, "not_before" | "expires"> | null | undefined;
   logger: ManifestValidityLogger;
   now?: () => number;
-  warningMs?: number;
 }): () => ManifestValidity {
-  const { getManifest, logger, now = Date.now, warningMs = MANIFEST_EXPIRY_WARNING_MS } = opts;
+  const { getManifest, logger, now = Date.now } = opts;
   let lastReported: string | null = null;
 
   return (): ManifestValidity => {
-    const v = classifyManifestValidity(getManifest(), now(), warningMs);
+    const v = classifyManifestValidity(getManifest(), now());
     const key =
       v.state === "not_configured" ? "not_configured"
       : v.state === "not_yet_valid" || v.state === "unreadable_window" ? `${v.state}:${v.notBefore}`
