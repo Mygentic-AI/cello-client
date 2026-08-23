@@ -131,12 +131,30 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // (content AND the control leaves the seal itself appends). `content_leaf_count` is the
       // messages, and it is the one comparable to a transcript length — conflating them would make
       // the check drift by the number of ctrl leaves and read as a defect when nothing is wrong.
-      const leaves = sessionNodeManager.getSessionTree(agentName, sessionId).leaves();
+      const tree = sessionNodeManager.getSessionTree(agentName, sessionId);
+      const leaves = tree.leaves();
       return {
         ok: true,
         session_id: sessionId,
         session_name: sessionName,
         sealed_root: cert.sealed_root,
+        /**
+         * DOD-M15-SEALWIRE-1 bullet 8: THIS SIDE'S OWN ROOT, computed from its own leaves — never
+         * copied from the certificate.
+         *
+         * `sealed_root` above is the CERTIFICATE's root. Every spine journey asserted that both
+         * parties' `sealed_root` matched, and that assertion is hollow: both sides read the same
+         * field out of the same certificate, so it stays green **even if the directory certified a
+         * root over a completely different leaf set than the one either party actually holds**. It
+         * proves the two clients received identical bytes, which was never the question.
+         *
+         * The question is whether the certificate covers THIS party's conversation. Only a root
+         * derived locally can answer that, and until now nothing exposed one — so no test could
+         * make the assertion, which is why ten of them made the weaker one instead.
+         *
+         * Read-only and derived: `rootHex()` recomputes from the stored leaves.
+         */
+        local_tree_root: tree.rootHex(),
         leaf_count: leaves.length,
         content_leaf_count: leaves.filter((l) => l.kind === "msg").length,
         legibility: cert.legibility,
