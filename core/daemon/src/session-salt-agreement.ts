@@ -3,12 +3,15 @@
  * Decisions Carried #8 (both sides contribute, one salt per session, persisted) and #10 (a mismatch
  * must be loud).
  *
- * ⚠️ PART A OF TWO, AND THE SPLIT IS DELIBERATE. This module and its caller AGREE a salt and store
- * it. **Nothing hashes with it yet** — `wire-content-hash.ts` is untouched, so a peer running an
- * older build that never answers a salt frame costs exactly nothing today. Part B moves
- * `wireContentHash` onto `saltedContentHash`, adds the wire version discriminator, and holds the
- * first send until the salt is agreed; from that moment an unanswered agreement is a session that
- * cannot send, which is why it is not this unit.
+ * ⚠️ PART A OF THE SALT WORK, AND THE SPLIT IS DELIBERATE. This module and its caller AGREE a salt
+ * and store it.
+ *
+ * **NO SENDER SALTS YET**, which is what makes an unanswered agreement free: a peer on an older
+ * build that never replies costs nothing today. (An earlier revision of this line said
+ * `wire-content-hash.ts` is untouched — that is no longer true. Part B1 shipped the RECEIVE half:
+ * it reads a `content_hash_alg` off the frame and can verify a salted hash. The outbound half, part
+ * B2, is what moves the send sites onto `saltedContentHash` and holds the first send until the salt
+ * is agreed — and from that moment an unanswered agreement IS a session that cannot send.)
  *
  * ─── The frame, and why exactly one field is present ───────────────────────────────────────────
  *

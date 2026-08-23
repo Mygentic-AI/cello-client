@@ -1,13 +1,19 @@
 /**
  * THE SESSION SALT — Decisions Carried #8, #9, #10 (Andre, 2026-08-23).
  *
- * ⚠️ AGREED AND STORED, BUT NOTHING HASHES WITH IT YET. `session-salt-agreement.ts` now calls
- * `deriveSessionSalt` and `saltFingerprint`, and `sessions.content_salt` has both a writer and a
- * reader — so this is no longer the orphan primitive the previous revision of this header described.
- * What is still outstanding is the half that makes it load-bearing: `wire-content-hash.ts` is
- * untouched and `saltedContentHash` has NO production caller, so no message's hash depends on any of
- * this. `DOD-M15-SEALWIRE-1` part B is what moves the content hash onto it, and until then every
- * sentence below about defending a hash describes what the salt is FOR, not what it currently does.
+ * ⚠️ AGREED, STORED, AND VERIFIABLE — BUT NO SENDER SALTS YET. Two revisions of this header have
+ * now been overtaken, so it states the boundary precisely rather than a slogan:
+ *
+ *   `session-salt-agreement.ts` calls `deriveSessionSalt` and `saltFingerprint`; `content_salt` has
+ *   a writer and a reader; and `wire-content-hash.ts` DOES import `saltedContentHash` — the RECEIVE
+ *   path will verify a frame that names `hmac-sha256-salt-v1` (`DOD-M15-SEALWIRE-1` part B1).
+ *
+ *   What no code in this build does is SEND one. Every send site still calls `wireContentHash`, so
+ *   no message's hash depends on a salt yet, and part B2 is what flips that.
+ *
+ * The distinction matters to anyone auditing reachability: the salted path is live inbound and dead
+ * outbound. A reader who takes "nothing hashes with it" from an older revision of this header would
+ * wrongly conclude the salted branch cannot execute in production at all.
  *
  * ─── Why this is a separate file from the key agreement ────────────────────────────────────────
  *

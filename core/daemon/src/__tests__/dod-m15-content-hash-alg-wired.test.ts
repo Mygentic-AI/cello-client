@@ -104,7 +104,19 @@ describe("DOD-M15-SEALWIRE-1 part B1: a version skew is not a tamper", () => {
     const failure = fx.eventsNamed("session.content.cross_check.failed").at(-1)!;
     // The unreadable NAME has to reach the log, or the operator cannot tell which build to chase.
     expect(failure.ctx!.declaredAlg).toBe("hmac-sha512-salt-v9");
-    expect(String(failure.ctx!.impact), "it must say plainly that this is not tampering").toMatch(/version difference, not tampering/);
+    /**
+     * ⚠️ THIS ASSERTION USED TO REQUIRE THE OPPOSITE, and it was wrong — review F1.
+     *
+     * It pinned the phrase "version difference, not tampering". That reads as reassurance and it is
+     * inferred entirely from `content_hash_alg`, a field NO SIGNATURE COVERS — so in the one case
+     * that matters it is inferred from the attacker. The message may say what we could not do; it
+     * may not say what the sender did.
+     */
+    expect(String(failure.ctx!.impact)).toMatch(/could not be verified/);
+    expect(
+      String(failure.ctx!.impact),
+      "the refusal must not certify the sender's innocence from an unsigned field",
+    ).not.toMatch(/nothing was altered|nobody did anything wrong/i);
     expect(String(failure.ctx!.guidance), "and give them something to do").toMatch(/[Uu]pgrade/);
   }, 60_000);
 
@@ -124,7 +136,13 @@ describe("DOD-M15-SEALWIRE-1 part B1: a version skew is not a tamper", () => {
     );
     expect(res.ok).toBe(false);
     expect(res.ok === false && res.reason).toBe("content_hash_salt_unavailable");
-    expect(String(fx.eventsNamed("session.content.cross_check.failed").at(-1)!.ctx!.impact)).toMatch(/Nothing was altered/);
+    // Same correction as above: "Nothing was altered" is not knowable from here. What IS knowable,
+    // and what the operator needs, is that we could not check and that the seal will not auto-close.
+    const saltFailure = fx.eventsNamed("session.content.cross_check.failed").at(-1)!;
+    expect(String(saltFailure.ctx!.impact)).toMatch(/could not be verified/);
+    expect(String(saltFailure.ctx!.impact)).toMatch(/will not auto-co-sign/);
+    // Review F6: three conditions leave us holding no salt and only one of them wants a close.
+    expect(String(saltFailure.ctx!.guidance), "it must name the self-repairing case first").toMatch(/repairs itself|re-runs on the next reconnect/);
   }, 60_000);
 
   it("★ a REAL tamper is still reported as a tamper, and now says which algorithm it checked", async () => {
@@ -143,6 +161,94 @@ describe("DOD-M15-SEALWIRE-1 part B1: a version skew is not a tamper", () => {
     expect(res.ok).toBe(false);
     expect(res.ok === false && res.reason).toBe("content_hash_mismatch");
     expect(fx.eventsNamed("session.content.cross_check.failed").at(-1)!.ctx!.declaredAlg).toBe(CONTENT_HASH_ALGS.SHA256);
+  }, 60_000);
+});
+
+describe("DOD-M15-SEALWIRE-1 part B1: a refusal must not switch the tamper detector off", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  /**
+   * ⚠️ THE FINDING THIS BLOCK EXISTS FOR — review F1, and it was a security defect I shipped.
+   *
+   * `content_hash_alg` rides the frame ENVELOPE, which no signature covers: the sender's signature
+   * is over `structure1_cbor`, which binds `content_hash` and nothing else. So the field is an
+   * unauthenticated CLAIM by whoever sent the frame.
+   *
+   * Before B1, every frame failing the cross-check reached `#contentDesynced`, which gates
+   * auto-co-signing and unilateral ratification. My two new branches returned BEFORE it. So:
+   *
+   *   sign hash H → send bytes that are not H's preimage → add `content_hash_alg: "anything-v9"`
+   *   → the receiver refuses politely, records nothing, tells the operator "do not treat this as a
+   *     security event" → and AUTO-CO-SIGNS at close.
+   *
+   * One unsigned string turned the tamper detector off. Nothing in the original unit asserted on
+   * `#contentDesynced` at all, so moving the mark between branches was a mutant that survived
+   * everything.
+   */
+  const CASES: Array<{ name: string; alg: string; hash: () => Uint8Array }> = [
+    { name: "an unreadable algorithm name", alg: "anything-v9", hash: () => wireContentHash(CONTENT) },
+    {
+      name: "a salted claim on a session with no salt",
+      alg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      hash: () => saltedContentHash(deriveSessionSalt(PEER_HALF, new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x33)), CONTENT),
+    },
+  ];
+
+  for (const c of CASES) {
+    it(`★ ${c.name} still blocks the auto-seal — a refusal is not an excuse`, async () => {
+      fx = await startTwoConnectionFixture({ dirPrefix: `cello-alg-sec-${c.alg.slice(0, 6)}-` });
+      await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+      expect(fx.snm.getSealUpgradeReadiness("alice", SID).tampered, "precondition").toBe(false);
+      await fx.snm.ingestReceivedContent("alice", SID, CONTENT, c.hash(), "corr", undefined, c.alg);
+
+      expect(
+        fx.snm.getSealUpgradeReadiness("alice", SID).tampered,
+        "content we could not verify must block co-signing, whatever the reason we could not",
+      ).toBe(true);
+    }, 60_000);
+  }
+
+  it("★ but it is NOT reported as a tamper — an honest newer build must not raise a security alarm", async () => {
+    /**
+     * The counterbalance, named before the fix was written. Making both branches block the seal is
+     * only half right: labelling an ordinary version difference `content_tamper` would train an
+     * operator to dismiss the one alarm that means something.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-label-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr", undefined, "anything-v9");
+
+    const failure = fx.eventsNamed("session.content.cross_check.failed").at(-1)!;
+    expect(
+      String(failure.ctx!.impact),
+      "it must not assert what the sender did — that is inferred from an unsigned field",
+    ).not.toMatch(/nothing was altered|nobody did anything wrong/i);
+    expect(String(failure.ctx!.guidance)).not.toMatch(/Do not treat this as a security event/i);
+    // It must say the field is a claim, so nobody reads the refusal as proof of innocence.
+    expect(String(failure.ctx!.impact)).toMatch(/claim by the sender|not covered by any signature/i);
+  }, 60_000);
+
+  it("★ TAMPERED never downgrades — a later junk algorithm cannot clear an alarm already raised", async () => {
+    /**
+     * Otherwise a sender caught altering content clears its own alarm by sending one more frame with
+     * a junk algorithm name, and the seal auto-completes. The mark is one value per session, so
+     * without an explicit rule the last writer wins.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-sec-down-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.ingestReceivedContent(
+      "alice", SID, CONTENT, wireContentHash(new TextEncoder().encode("different")), "corr",
+    );
+    await fx.snm.ingestReceivedContent("alice", SID, CONTENT, wireContentHash(CONTENT), "corr2", undefined, "junk-v1");
+
+    expect(fx.snm.getSealUpgradeReadiness("alice", SID).tampered).toBe(true);
+    const skipped = fx.eventsNamed("session.seal.autoack.skipped");
+    if (skipped.length > 0) {
+      expect(skipped.at(-1)!.ctx!.reason, "the tamper label must survive").toBe("content_tamper");
+    }
   }, 60_000);
 });
 
@@ -216,6 +322,44 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
       failures.length,
       "holding a salt must not make us reject a peer that did not use one — the frame decides, not our row",
     ).toBe(0);
+  }, 60_000);
+
+  it("★ an explicit CBOR null in the field is LEGACY, and a number is refused as a non-string", async () => {
+    /**
+     * The seventh mutant, and it survived all twenty tests: change the frame read from a pass-through
+     * to `String(declaredAlg)`. The pure tests exercise `resolveContentHashAlg(null)` and
+     * `resolveContentHashAlg(42)` DIRECTLY, and every wired test put a string in the field — so
+     * nothing covered the boundary where an arbitrary CBOR value crosses into the resolver.
+     *
+     * Both halves of the mutant are wrong in ways that matter. `null` is legacy-equivalent and must
+     * be accepted; coerced it becomes `"null"` and the peer is refused. A number must be reported as
+     * `(number)` so the operator sees a SHAPE problem; coerced it becomes the plausible-looking
+     * `"42"`, which reads like a real algorithm name they should go and look up.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-j-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    // Explicit null — a peer that encoded the field but left it empty. Legacy, so it must ingest.
+    await fx.snm.handleContentFrameForTest(
+      "alice", SID, contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: null }), PEER,
+    );
+    await wait(300);
+    expect(
+      fx.eventsNamed("session.content.cross_check.failed").length,
+      "an explicit null must mean the same as an absent field, not the string \"null\"",
+    ).toBe(0);
+
+    // A number — not a name at all. Refused, and the log must say it was the wrong SHAPE.
+    await fx.snm.handleContentFrameForTest(
+      "alice", SID, contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }), PEER,
+    );
+    await wait(300);
+    const failure = fx.eventsNamed("session.content.cross_check.failed").at(-1);
+    expect(failure!.ctx!.reason).toBe("content_hash_alg_unknown");
+    expect(
+      failure!.ctx!.declaredAlg,
+      "a coerced \"42\" reads like a real algorithm name; the operator must see it was not a string at all",
+    ).toBe("(number)");
   }, 60_000);
 
   it("★ an unknown algorithm arriving on the REAL stream is refused there too", async () => {

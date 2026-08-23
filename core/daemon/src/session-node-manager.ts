@@ -860,7 +860,27 @@ export class SessionNodeManager {
   // M7-UPGRADE-002: sessions whose content integrity could NOT be verified (a content_hash
   // mismatch = tamper was observed). The auto-acknowledge gate (SI-002) refuses to auto-co-sign
   // for a desynced session — B must never blind-sign a tail it cannot verify. Keyed by sessionId hex.
-  #contentDesynced = new Set<string>();
+  //
+  // DOD-M15-SEALWIRE-1 part B1 (review F1): a MAP, not a Set, and the value is the whole fix.
+  //
+  // It was a Set because a content_hash mismatch was the only way in, so "present" could mean
+  // "tampered". B1 added two more ways for a frame to fail verification — an algorithm we cannot
+  // read, and a salted frame we hold no salt for — and BOTH ARE ORDINARY. An honest peer on a newer
+  // build produces the first. So the gate must still fire (never sign content you could not verify)
+  // while the LABEL must not accuse anyone: `unverifiable` is not `tampered`.
+  //
+  // One structure with two labels rather than two sets, deliberately: a second set is a second thing
+  // for every gate to remember to consult, and the one that gets forgotten is the one that matters.
+  #contentDesynced = new Map<string, "tampered" | "unverifiable">();
+  /**
+   * Sessions where a frame named a content-hash algorithm this build cannot read, and the name it
+   * used — review F2. Read only by the park-recovery path, to say out loud when a frame refused on
+   * the direct path comes back through the store-and-forward route and is verified as `sha256`.
+   *
+   * Bounded by the session set and cleared with the rest of the session's caches: one short string
+   * per affected session, never per frame.
+   */
+  #unreadableAlgSeen = new Map<string, string>();
   // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
   // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
   // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
@@ -4148,6 +4168,7 @@ export class SessionNodeManager {
     this.#sessionLiveness.delete(key);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
+    this.#unreadableAlgSeen.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
@@ -6029,6 +6050,9 @@ export class SessionNodeManager {
     const record = this.getSessionRecord(agentName, sessionId);
     return {
       known: !!record,
+      // Review F1: `tampered` is TRUE for BOTH marks. B must never ratify a unilateral seal over
+      // content it could not verify, and the reason it could not is irrelevant to that decision —
+      // only to what the operator is told. The label lives in the log; the gate is binary.
       tampered: this.#contentDesynced.has(this.#k(agentName, sessionId)),
     };
   }
@@ -6069,10 +6093,22 @@ export class SessionNodeManager {
     // two specced reasons — `desynced` (B's tree is behind the canonical sealed tail) and
     // `content_unverifiable` (parked content unrecoverable) — require the MSG-001-3b canonical-
     // sequence reconciliation that is deferred; they are reserved for that follow-on.
-    if (this.#contentDesynced.has(ackKey)) {
+    const unverifiable = this.#contentDesynced.get(ackKey);
+    if (unverifiable) {
+      /**
+       * DOD-M15-SEALWIRE-1 part B1 (review F1) — THE GATE FIRES FOR BOTH, THE ALARM ONLY FOR ONE.
+       *
+       * `content_tamper` is what the AC-008 alarm keys on, and it must keep meaning what it says. A
+       * frame we could not verify because the peer named an algorithm this build cannot read is an
+       * ordinary version difference; raising a tamper alarm for it would train an operator to
+       * dismiss the alarm, which costs more than the skew.
+       *
+       * But the REFUSAL TO AUTO-SIGN is identical in both cases and non-negotiable: SI-002 is "never
+       * auto-sign a session whose content we could not verify", and "could not" covers both.
+       */
       this.#logger.error("session.seal.autoack.skipped", {
         sessionId,
-        reason: "content_tamper",
+        reason: unverifiable === "tampered" ? "content_tamper" : "content_unverifiable",
         correlationId,
       });
       // AC-002: the verifiability gate refused — surface counterparty_closing to B's agent as a
@@ -6181,6 +6217,26 @@ export class SessionNodeManager {
    *
    * @returns the appended leaf index (as sequenceNumber) on success.
    */
+  /**
+   * Mark this session's content unverifiable — review F1, and every path that fails the cross-check
+   * must come through here.
+   *
+   * It gates `getSealUpgradeReadiness().tampered` and the auto-acknowledge check, i.e. whether this
+   * agent's key signs anything covering content it could not check. Three refusal paths reach it and
+   * they carry different labels, because what the operator is told must differ; **what the gate does
+   * must not.**
+   *
+   * TAMPERED NEVER DOWNGRADES. A session that has already seen a hash mismatch stays `tampered` even
+   * if a later frame merely names an unreadable algorithm — otherwise a sender that had been caught
+   * could clear its own alarm by sending one more frame with a junk algorithm name, and the seal
+   * would auto-complete.
+   */
+  #markContentUnverifiable(agentName: string, sessionId: string, why: "tampered" | "unverifiable"): void {
+    const key = this.#k(agentName, sessionId);
+    if (why === "unverifiable" && this.#contentDesynced.get(key) === "tampered") return;
+    this.#contentDesynced.set(key, why);
+  }
+
   async ingestReceivedContent(
     agentName: string,
     sessionId: string,
@@ -6258,17 +6314,37 @@ export class SessionNodeManager {
      * the third is evidence of tampering. Collapsing them is how a routine skew becomes a security
      * incident in the operator's log, and how a real tamper gets dismissed as a skew.
      */
+    /**
+     * ⚠️ `content_hash_alg` IS NOT COVERED BY ANY SIGNATURE — review F1, and it shapes both branches
+     * below.
+     *
+     * The sender's signature is over `structure1_cbor`, which binds `content_hash`. It does NOT bind
+     * the frame envelope, so this field is an unauthenticated CLAIM by whoever sent the frame. That
+     * is fine for choosing how to verify — a wrong choice simply fails — but it means neither branch
+     * may state, as fact, anything it learned only from this field.
+     *
+     * It also means both branches MUST mark the session unverifiable. Before B1 every frame that
+     * failed the cross-check reached `#contentDesynced`, which gates auto-co-signing and unilateral
+     * ratification. Returning early here would have let a sender bypass the tamper detector by
+     * appending one unsigned string: sign hash H, send different bytes, add an unreadable algorithm
+     * name, and the receiver refuses politely, records nothing, and auto-co-signs at seal time.
+     */
     const algResolved = resolveContentHashAlg(contentHashAlgIn);
     if (!algResolved.ok) {
       // A NAME WE CANNOT READ. Not a legacy peer — an unreadable one. There is no value to compare
       // against, so `content_hash_mismatch` here would be an exit-point label standing in for
       // "their build is newer than ours" (Invariant 2). Refused by its own name instead.
+      this.#markContentUnverifiable(agentName, sessionId, "unverifiable");
+      this.#unreadableAlgSeen.set(this.#k(agentName, sessionId), algResolved.value);
       this.#logger.error("session.content.cross_check.failed", {
         sessionId, correlationId,
         reason: "content_hash_alg_unknown",
         declaredAlg: algResolved.value,
-        impact: "the counterparty hashed this message with an algorithm this build cannot reproduce, so the content was NOT ingested and NOT shown. This is a version difference, not tampering — nothing was altered and nobody did anything wrong.",
-        guidance: "Their CELLO build is newer than this one. Upgrade this daemon, or ask them which version they are on. Do not treat this as a security event.",
+        // States only what is KNOWN. The old wording said "nothing was altered and nobody did
+        // anything wrong" and "Do not treat this as a security event" — both inferred from the
+        // unsigned field, i.e. from the attacker in the case that matters.
+        impact: "this message could not be verified, so it was NOT ingested and NOT shown. The algorithm name is a claim by the sender and is not covered by any signature, so it does not establish what they actually did. This session will not auto-co-sign at close.",
+        guidance: "Almost always their CELLO build is newer than this one: ask which version they are running, and upgrade. If they are on the SAME version as you, that explanation does not hold and the frame was malformed or crafted — do not close the session by auto-acknowledgement.",
       });
       return { ok: false, reason: "content_hash_alg_unknown" };
     }
@@ -6284,13 +6360,19 @@ export class SessionNodeManager {
       // Reached when the peer named the salted algorithm and this side holds no salt for the
       // session — the agreement never completed, or its record is gone. Distinct from a mismatch
       // for the same reason as above: nothing was tampered with, we simply cannot check it.
+      this.#markContentUnverifiable(agentName, sessionId, "unverifiable");
       this.#logger.error("session.content.cross_check.failed", {
         sessionId, correlationId,
         reason: "content_hash_salt_unavailable",
         declaredAlg: algResolved.alg,
         detail: extractErrorMessage(err),
-        impact: "the counterparty salted this message's hash and this side holds no salt for the session, so the content was NOT ingested and NOT shown. Nothing was altered.",
-        guidance: "The salt agreement did not complete on this side. Close this session and start a new one; the transcript up to here is intact.",
+        // "Nothing was altered" was the same mistake as the branch above: it is not knowable from
+        // here. What IS knowable is that we could not check.
+        impact: "this message could not be verified — the sender says it is salted and this side holds no salt for the session — so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
+        // Review F6: `#getSessionSalt` returns null for THREE conditions and only one of them wants
+        // a close. A read failure and a corrupt row both leave us holding no salt, which is exactly
+        // what makes the agreement re-offer a contribution and repair itself on the next connect.
+        guidance: "Look for session.salt.read.failed or session.salt.persist.failed just before this. If either is present the salt agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If neither is, the agreement never completed with this counterparty: close the session and start a new one. Either way the transcript up to here is intact.",
       });
       return { ok: false, reason: "content_hash_salt_unavailable" };
     }
@@ -6307,7 +6389,7 @@ export class SessionNodeManager {
       // M7-UPGRADE-002 (SI-002): a tamper makes this session's content unverifiable — the
       // auto-acknowledge gate must never auto-co-sign it. The session stays alive (DOD-MSG-7),
       // but the responder seal now requires the agent's explicit decision, not an auto-ack.
-      this.#contentDesynced.add(this.#k(agentName, sessionId));
+      this.#markContentUnverifiable(agentName, sessionId, "tampered");
       return { ok: false, reason: "content_hash_mismatch" };
     }
 
@@ -8276,12 +8358,34 @@ export class SessionNodeManager {
      * `sha256`. In part B1 that is exactly right and provably so: **no sender salts yet**, so every
      * parked entry in existence was hashed unsalted.
      *
-     * ⚠️ PART B2 MUST FIX THIS BEFORE ANY SENDER SALTS. The moment a sender does, a message that
-     * takes the park route instead of the direct one is verified under the wrong algorithm and
-     * refused as `content_hash_mismatch` — a tamper report for a message that merely went the long
-     * way round. `park-envelope.ts` needs the field, which is a wire change on the envelope, which
-     * is why it belongs to the unit that turns salting on rather than this one.
+     * ⚠️ PART B2 MUST FIX THIS BEFORE ANY SENDER SALTS, and at BOTH sites: here, and the independent
+     * verifier in `content-park.ts` (see the block there). The moment a sender salts, a message that
+     * takes the park route instead of the direct one is verified under the wrong algorithm — a
+     * tamper report for a message that merely went the long way round. `park-envelope.ts` needs the
+     * field, which is a wire change on the envelope, which is why it belongs to the unit that turns
+     * salting on rather than this one.
+     *
+     * ─── AND THE REFUSAL DOES NOT HOLD — review F2 ────────────────────────────────────────────
+     *
+     * A direct-path refusal sends no delivery ACK, so the sender's TTF backstop parks the message
+     * and it arrives here seconds later, where `undefined` means `sha256` and it may well succeed.
+     * A frame refused BY NAME on one path is then accepted on the other, with nothing tying the two
+     * together in the log — an operator sees an ERROR and, ten seconds on, a healthy delivery.
+     *
+     * That is not repaired by refusing here as well: today's park entry genuinely IS `sha256`, and
+     * refusing it would drop good mail. What is wrong is the SILENCE, so the reconciliation is
+     * logged instead — the two events become one story, and B2 removes the ambiguity for real by
+     * putting the name in the envelope.
      */
+    const priorAlgRefusal = this.#unreadableAlgSeen.get(this.#k(agentName, sessionId));
+    if (priorAlgRefusal) {
+      this.#logger.warn("content.recover.alg_refusal_reconciled", {
+        agentName, sessionId, correlationId,
+        contentHash: Buffer.from(contentHash).toString("hex"),
+        priorDeclaredAlg: priorAlgRefusal,
+        impact: "a frame on this session was refused earlier because it named an algorithm this build cannot read; this recovered copy carries no algorithm name and is being verified as sha256. If it verifies, the two events are the same message arriving twice by different routes — not a resolved problem.",
+      });
+    }
     return await this.ingestReceivedContent(
       agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined, undefined,
     );
