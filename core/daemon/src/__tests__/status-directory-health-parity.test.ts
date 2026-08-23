@@ -146,9 +146,28 @@ describe("launch triage item 6 — a daemon that cannot reach a directory must n
     // this test exists for, which is both surfaces being silent.
     expect(cli["directory_endpoints_unresolved"]).toBeDefined();
     expect(mcp["directory_endpoints_unresolved"]).toBeDefined();
-    // The defect was a parity gap: the block existed on one surface only. Asserting both carry the
-    // same value is what stops it reopening on whichever surface a future change forgets.
-    expect(mcp["directory_endpoints_unresolved"]).toEqual(cli["directory_endpoints_unresolved"]);
+    /**
+     * The defect was a parity gap: the block existed on one surface only. Asserting both carry the
+     * same value is what stops it reopening on whichever surface a future change forgets.
+     *
+     * `age_seconds` is EXCLUDED, and deliberately — `DOD-M15-STALEROSTER-1` made it a live
+     * measurement recomputed from `Date.now()` on every read, so two sequential IPC round-trips
+     * that straddle a second boundary would differ by one and redden this gate at random. That is
+     * a flake I introduced; excluding the one derived field keeps the parity claim exact for
+     * everything that is actually a property of the surface. `checked_at` is the same instant on
+     * both reads and stays in the comparison, so a surface that dropped the timestamp still fails.
+     */
+    const withoutAge = (v: unknown): unknown => {
+      const { age_seconds: _ignored, ...rest } = v as Record<string, unknown>;
+      return rest;
+    };
+    expect(withoutAge(mcp["directory_endpoints_unresolved"])).toEqual(
+      withoutAge(cli["directory_endpoints_unresolved"]),
+    );
+    // And the excluded field must still be PRESENT on both — dropping it from one surface is the
+    // same parity defect this test exists for, just in the field the comparison had to skip.
+    expect(typeof (mcp["directory_endpoints_unresolved"] as Record<string, unknown>)["age_seconds"])
+      .toBe(typeof (cli["directory_endpoints_unresolved"] as Record<string, unknown>)["age_seconds"]);
   }, 30_000);
 
   it("the block is populated from STARTUP, before any ceremony has run", async () => {

@@ -518,3 +518,53 @@ describe("DOD-M15-STALEROSTER-1: a slower sweep cannot overwrite a newer reading
     ).toContain("directory.roster.sweep.superseded");
   }, 30_000);
 });
+
+describe("DOD-M15-STALEROSTER-1: a sweep that measured nothing does not report success", () => {
+  it("★ no verified manifest is stated, not silently treated as a clean sweep", async () => {
+    /**
+     * Review F13 (pre-existing, surfaced by this unit). `resolveConsortiumRoster` returned null
+     * before the write AND before any log when there was no current manifest, so "there was nothing
+     * to probe" and "everything probed fine" produced identical observable behaviour: no failures,
+     * no error, no change to the reading.
+     *
+     * That was harmless while the only callers were activity-driven and had their own error paths.
+     * It stops being harmless the moment a background timer calls it every 90 seconds: the sweep
+     * ticks forever, never throws, never moves the reading, and reports nothing at all. A sweep that
+     * succeeds at doing nothing is the silent-fallback shape this milestone keeps finding.
+     */
+    const { createConsortiumRouting } = await import("../consortium-bootstrap.js");
+    const warned: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const routing = createConsortiumRouting({
+      manifestProvider: {
+        loadAndVerify: async () => null,
+        // No CURRENT manifest — the state the early return exists for.
+        getCurrentManifest: () => null,
+        updateManifest: () => {},
+      },
+      logger: {
+        debug: () => {},
+        info: () => {},
+        warn: (event: string, ctx?: Record<string, unknown>) => warned.push({ event, ctx: ctx ?? {} }),
+        error: () => {},
+      },
+    } as never);
+
+    const before = routing.getUnresolvedSweptAt();
+    const result = await routing.resolveConsortiumRoster();
+
+    expect(result, "no manifest means no roster — null, not an empty success").toBeNull();
+    expect(
+      routing.getUnresolvedSweptAt(),
+      "and the reading must NOT be stamped as freshly measured: nothing was measured",
+    ).toBe(before);
+    expect(
+      warned.map((w) => w.event),
+      "a sweep that measured nothing must say so — otherwise the background timer succeeds every " +
+        "90 seconds forever while the reading never moves, and nothing anywhere records why",
+    ).toContain("directory.roster.sweep.no_manifest");
+    expect(
+      String(warned[0]?.ctx["impact"]),
+      "and it must name the consequence, not just the condition",
+    ).toMatch(/keeps whatever reading it already had/i);
+  }, 30_000);
+});
