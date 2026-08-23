@@ -20,7 +20,12 @@
  *   Note: signer_pubkey is NOT in the TBS — it is derived from DKG and embedded in the frame.
  *
  * SealPayload: canonical CBOR of [session_id, final_root, close_timestamp, "PENDING"].
- * content_hash = SHA-256(0x00 || SealPayload).
+ * content_hash = SHA-256(0x02 || SealPayload) — 0x02 is LEAF_KIND_CTRL.
+ *
+ * ⚠️ THIS LINE SAID `0x00` AND THE PRODUCER USES `0x02`. Found by review of `DOD-M15-SEALWIRE-1`
+ * bullets 3+4. It is the header of the file that DEFINES this payload, so anyone building a second
+ * verifier from it builds one whose hash never matches — and they would look for the fault in their
+ * own code, because the definition said otherwise.
  *
  * computeGenesisPrevRoot: deterministic genesis prev_root for a two-party session.
  *
