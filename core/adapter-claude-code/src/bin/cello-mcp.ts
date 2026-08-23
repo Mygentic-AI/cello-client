@@ -547,12 +547,17 @@ server.tool("cello_receive", "Receive a message from an active session. With sin
 server.tool("cello_close_session", "Close a session. Answers as soon as your SEAL commitment is durable (seal_status: \"committed\") and runs the notarization in the BACKGROUND — it does NOT return sealed_root. Fetch the receipt separately with cello_sealed_receipt; a seal_in_progress answer there means the ceremony is still running, which is not a failure. Pass force:true ONLY to abandon a half-open session that can never be sealed — a handshake the counterparty never joined, whose normal close hangs/rejects on the seal; force marks it terminal locally with no seal so it leaves the open list. Name the session while you close it: you have just had the conversation, so this is the moment you know what it was.", {
   cello_session_id: z.string().describe("Session ID to close"),
   force: z.boolean().optional().describe("Force-abandon a provably unsealable half-open session (no bilateral seal). Do NOT use on a healthy session — it forfeits the notarized receipt."),
+  wait_for_seal: z.boolean().optional().describe("Block until the seal ceremony finishes and return the result, instead of answering at commitment. Can take up to eleven minutes while it waits for the counterparty — only use it in an unattended script that genuinely needs the receipt in one call. An interactive agent should leave this off and fetch the receipt with cello_sealed_receipt."),
   session_name: z.string().nullable().optional().describe("A short human-readable label for this conversation, e.g. 'Q3 budget review with Bob'. PRIVATE TO YOU: never sent to the counterparty, the relay, or the directory. Optional — leave it out if you cannot describe the session accurately; an unnamed session is a signal it did not close cleanly, so do not invent one."),
   agent: z.string().optional().describe("Agent whose session to close (defaults to the current agent)"),
-}, async ({ cello_session_id: session_id, force, session_name, agent }) => {
+}, async ({ cello_session_id: session_id, force, session_name, agent, wait_for_seal }) => {
   const result = await proxy.call("cello_close_session", {
     session_id,
     ...(force ? { force } : {}),
+    // DOD-M15-CLOSEWAIT-1 review MEDIUM-7: the shim builds its params explicitly, so an escape
+    // hatch the daemon offers is unreachable unless it is forwarded here. It was declared, honoured
+    // by the daemon, and callable by nobody — "no consumer, no ship" applies to an affordance too.
+    ...(wait_for_seal ? { wait_for_seal } : {}),
     // `session_name` is forwarded whenever the key is PRESENT, including an explicit null — the
     // truthiness shortcut used for `force`/`agent` would silently drop it.
     ...(session_name !== undefined ? { session_name } : {}),
