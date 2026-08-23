@@ -394,7 +394,10 @@ export function onPeerSaltFrame(state: {
   if (state.ownAdoption?.closed) {
     return {
       action: "adoption_closed",
-      detail: `this side cannot adopt a salt for this session (${state.ownAdoption.why}), so no salt is adopted; telling the peer so they do not adopt one either`,
+      // The LABEL and the WHY, in that order: the label is the word an operator scans for, the why
+      // is the counts (or the error) behind it. A detail carrying only counts is unreadable, and one
+      // carrying only the label cannot be checked against the session it describes.
+      detail: `this side cannot adopt a salt for this session (${state.ownAdoption.label}: ${state.ownAdoption.why}), so no salt is adopted; telling the peer so they do not adopt one either`,
       announce: { adoptionClosed: state.ownAdoption.label },
     };
   }

@@ -191,8 +191,12 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
     ).toBe("warn");
     expect(
       String(refused[0]!.ctx!.detail),
-      "it must say WHY this side cannot adopt — the frontier, not just that it refused",
-    ).toMatch(/already hashed content/i);
+      "it must name WHICH refusal this is — already_hashing and frontier_unreadable want opposite responses from the operator",
+    ).toMatch(/already_hashing/);
+    expect(
+      String(refused[0]!.ctx!.detail),
+      "and carry the counts behind it, so the claim can be checked against the session rather than taken on trust",
+    ).toMatch(/leaves=\d+/);
     expect(
       String(refused[0]!.ctx!.impact),
       "it must say neither side will use one, not merely that this attempt failed",
