@@ -99,7 +99,7 @@ import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transpor
 import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
-import { createSealCoordinator } from "./seal-coordinator.js";
+import { createSealCoordinator, type SealCompletion } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
@@ -1354,8 +1354,11 @@ async function startDaemonHoldingLock(
             if (sealInterruptedInProgress.has(sk)) return;
             sealInterruptedInProgress.add(sk);
             try {
-              let resolveSeal!: (c: { rootHex: string; legibility?: unknown }) => void;
-              const sealedP = new Promise<{ rootHex: string; legibility?: unknown }>((r) => { resolveSeal = r; });
+              // DOD-M15-SEALWIRE-1 bullet 2 (review F4): SealCompletion is now a union — a refused
+              // certificate resolves the waiter rather than dropping it, so this path must handle it
+              // too rather than treating a refusal as a seal.
+              let resolveSeal!: (c: SealCompletion) => void;
+              const sealedP = new Promise<SealCompletion>((r) => { resolveSeal = r; });
               pendingSealWaiters.set(sk, resolveSeal);
 
               const submit = await sessionNodeManager.submitSealLeaf(agentName, sessionId, correlationId);
@@ -1384,6 +1387,19 @@ async function startDaemonHoldingLock(
               pendingSealWaiters.delete(sk);
 
               if (sealedCompletion !== null) {
+                // DOD-M15-SEALWIRE-1 bullet 2 (review F4): a REFUSED certificate resolves the waiter
+                // now rather than being dropped, so this path must tell the two apart — logging a
+                // refusal as "sealed" would be the silent acceptance the whole bullet exists to stop.
+                if ("refused" in sealedCompletion) {
+                  logger.error("session.away.inbox.oneshot.seal_refused", {
+                    agentName, sessionId, reason: sealedCompletion.reason, detail: sealedCompletion.detail,
+                    impact:
+                      "the away auto-seal was REFUSED: the directory returned a validly signed root " +
+                      "that does not describe this conversation. The session is NOT sealed and nothing " +
+                      "was signed with this agent's key.",
+                  });
+                  return;
+                }
                 logger.info("session.away.inbox.oneshot.sealed", { agentName, sessionId, sealedRoot: sealedCompletion.rootHex });
                 return;
               }

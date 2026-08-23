@@ -29,8 +29,21 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { DbRegistrationPersistence } from "./db-identity-store.js";
 import type { Logger } from "./types.js";
 
-/** M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility certificate. */
-export type SealCompletion = { rootHex: string; legibility?: unknown };
+/**
+ * M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility certificate.
+ *
+ * DOD-M15-SEALWIRE-1 bullet 2 (review F4) added the REFUSED shape. A root mismatch used to log and
+ * `return`, leaving the waiter unresolved — so the close sat out its eleven-minute wait, escalated,
+ * and told the operator *"the counterparty has not closed"* about a counterparty who had closed and
+ * whose certificate this daemon had just refused. Three failures in one sentence: it names a party
+ * the code never checked, the remedy cannot work (the seal frame is delivered once), and the one
+ * thing actually detected appears nowhere the operator looks.
+ *
+ * A detection whose only consumer is a log line is not a control.
+ */
+export type SealCompletion =
+  | { rootHex: string; legibility?: unknown }
+  | { refused: true; reason: string; detail: string; ownRootHex: string | null };
 
 /**
  * SESSION-002 / M8B FINDING-3: a unilateral seal carries the legibility certificate so the close
@@ -157,6 +170,20 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             agentPubkeyHex, sidHex, sealedRootBytes, leafCount,
           );
           if (rootCheck.verdict === "mismatch") {
+            /**
+             * RESOLVE THE WAITER AS REFUSED — review F4. Dropping it left the caller to time out and
+             * be told something false. The close now answers with what actually happened.
+             */
+            const waiter = pendingSealWaiters.get(sealKey(agentName, sidHex));
+            if (waiter) {
+              pendingSealWaiters.delete(sealKey(agentName, sidHex));
+              waiter({
+                refused: true,
+                reason: "seal_root_mismatch",
+                detail: rootCheck.detail,
+                ownRootHex: rootCheck.ownRootHex,
+              });
+            }
             logger.error("session.sealed.root.mismatch", {
               sessionId: sidHex,
               certifiedRoot: rootHex,

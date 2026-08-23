@@ -1115,6 +1115,39 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         const sealedCompletion = await Promise.race([sealedP, timeoutP]);
         clearTimeout(timer);
         pendingSealWaiters.delete(sealKey(record.agent_name, sessionId));
+        /**
+         * THE CERTIFICATE WAS REFUSED — `DOD-M15-SEALWIRE-1` bullet 2 (review F4).
+         *
+         * The seal arrived, its signature verified, and its root did not describe this conversation.
+         * Before this the coordinator logged and dropped the waiter, so control fell through to the
+         * eleven-minute timeout and the operator was told the counterparty had not closed — about a
+         * counterparty who had, and whose certificate had just been refused here.
+         *
+         * Answered immediately instead, with what was actually detected. NOT retryable, and it says
+         * so: `session_sealed` is delivered once, so a retry re-enters the same wait and then finds
+         * the relay session gone.
+         */
+        if (sealedCompletion !== null && "refused" in sealedCompletion) {
+          logger.error("session.seal.refused", {
+            sessionId, agentName: record.agent_name, correlationId,
+            reason: sealedCompletion.reason, detail: sealedCompletion.detail,
+          });
+          return {
+            ok: false,
+            reason: sealedCompletion.reason,
+            seal_status: "refused",
+            ...(sealedCompletion.ownRootHex ? { own_root: sealedCompletion.ownRootHex } : {}),
+            guidance:
+              "The directory returned a VALIDLY SIGNED seal whose root does not describe this " +
+              `conversation (${sealedCompletion.detail}). This daemon refused it: the session is NOT ` +
+              "marked sealed, your transcript is untouched, and nothing was signed with your key. " +
+              "Do NOT retry the close — the seal notification is delivered once, so a retry waits the " +
+              "full window and then finds the relay session gone. Do NOT force-abandon either: that " +
+              "permanently forfeits any receipt. Compare the leaf count and the message list with your " +
+              "counterparty, and report the session id — this is a directory or relay fault, not " +
+              "something you did.",
+          };
+        }
         if (sealedCompletion !== null) {
           logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
           crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
