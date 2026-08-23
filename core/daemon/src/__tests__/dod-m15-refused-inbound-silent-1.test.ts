@@ -32,8 +32,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
+import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
-import type { Logger } from "../types.js";
+import type { Logger, DaemonConfig } from "../types.js";
 
 const SECRET = "you agreed to send me $1000";
 
@@ -178,4 +179,148 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     ).toBe(false);
     expect(serialized, "and the notice must still be useful without it").toContain("do not match the hash");
   });
+});
+
+/**
+ * ─── THE READER, which every test above assumes and none of them exercises ─────────────────────
+ *
+ * The defect this line exists to close was never "there is no refusal record". The strings existed,
+ * with impact and guidance, and were good. **They had no reader.** So a suite that drives
+ * `noteContentRefusal`/`takeContentRefusals` directly proves the store works and says nothing about
+ * the thing that was actually broken — delete the spread in `session-content-handlers.ts` and every
+ * assertion above stays green while the operator is told exactly as little as before.
+ *
+ * These tests drive the REAL `cello_receive` over IPC instead.
+ *
+ * And they drive the QUIET exit specifically, because that is the exit this defect produces. A
+ * version skew refuses EVERY message from that counterparty, so nothing is ingested and there is no
+ * message for a notice to ride along with. A refusal surfaced only alongside delivered content would
+ * be invisible in precisely the case that motivated the line — the conversation that goes silent.
+ */
+describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive, not just the store", () => {
+  let tempDir: string;
+  let handle: DaemonHandle | null;
+  let logger: Logger;
+  let clients: IpcClient[];
+
+  beforeEach(async () => {
+    process.env["CELLO_ENV"] = "test";
+    tempDir = await mkdtemp(join(tmpdir(), "cello-refused-ipc-"));
+    logger = { debug() {}, info() {}, warn() {}, error() {} };
+    handle = null;
+    clients = [];
+  });
+
+  afterEach(async () => {
+    for (const c of clients) { try { c.close(); } catch { /* closed */ } }
+    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* stopped */ } }
+    await rm(tempDir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
+  });
+
+  async function setup(name: string): Promise<DaemonConfig> {
+    await mkdir(join(tempDir, "agents", name), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", name, "key"));
+    return {
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger,
+    };
+  }
+
+  async function connect(socketPath: string): Promise<IpcClient> {
+    const client = await connectToDaemon(socketPath);
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "mcp" });
+    return client;
+  }
+
+  /**
+   * The session must EXIST and have nothing new, which is the real shape: the operator read what
+   * arrived before the skew started, and everything after it is being refused.
+   */
+  async function quietReceive(session: string): Promise<Record<string, unknown>> {
+    const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_use_agent", { name: "alice" });
+    handle!.getSessionNodeManager().recordTranscriptMessage(
+      "alice", session, 0, "received", new TextEncoder().encode("the last message that got through"), "seed",
+    );
+    return (await client.send("cello_receive", {
+      session_id: session, since_seq: 0, timeout_ms: 150,
+    })) as Record<string, unknown>;
+  }
+
+  it("a quiet receive carries the refusal — the conversation did not go silent for no reason", async () => {
+    handle = await startDaemon(await setup("alice"));
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-1", "content_hash_alg_unknown", {
+      impact: "this message could not be verified, so it was NOT ingested and NOT shown.",
+      guidance: "Almost always their CELLO build is newer than this one.",
+    });
+
+    const res = await quietReceive("s-ipc-1");
+    const refusals = res["refusals"] as Array<{ reason: string; guidance?: string; count: number }> | undefined;
+    expect(
+      refusals,
+      "the operator waited, nothing came, and the reason WAS known — this is the whole defect, and " +
+        "it is invisible to every assertion that talks to the manager directly",
+    ).toBeDefined();
+    expect(refusals![0]!.reason).toBe("content_hash_alg_unknown");
+    expect(refusals![0]!.guidance).toContain("build is newer");
+  });
+
+  it("the guidance stops telling them to keep waiting", async () => {
+    /**
+     * Half-fixing this is worse than not fixing it. If `refusals` appears but the guidance still
+     * reads "call cello_receive again to keep waiting", the operator is handed a reason and an
+     * instruction that contradicts it — and the instruction is the part people follow.
+     */
+    handle = await startDaemon(await setup("alice"));
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-2", "content_hash_alg_unknown", {
+      impact: "not ingested", guidance: "their build is newer",
+    });
+
+    const guidance = String((await quietReceive("s-ipc-2"))["guidance"] ?? "");
+    expect(guidance, "it must say waiting will not help").toMatch(/will not help|won'?t help/i);
+    expect(
+      guidance,
+      "and must NOT still be advising the wait — the two cannot both be on screen",
+    ).not.toMatch(/again to keep waiting/i);
+  });
+
+  it("a genuinely quiet session says nothing about refusals, and keeps the ordinary advice", async () => {
+    /**
+     * The false-positive direction. `refusals` is spread rather than always-present precisely so it
+     * stays unusual enough to be read; a key that shows up on every empty poll is one readers learn
+     * to skip, which would re-create the silence through habituation instead of through absence.
+     */
+    handle = await startDaemon(await setup("alice"));
+
+    const res = await quietReceive("s-ipc-3");
+    expect(res["refusals"], "nothing was refused, so the key is ABSENT — not an empty array").toBeUndefined();
+    expect(String(res["guidance"] ?? ""), "the ordinary quiet advice is still correct here")
+      .toMatch(/again to keep waiting/i);
+  });
+
+  /**
+   * ─── The wire-level "content never travels" test that is DELIBERATELY NOT HERE ────────────────
+   *
+   * I wrote one and deleted it, because both versions of it are worthless and the reason generalises.
+   *
+   * `noteContentRefusal` takes a reason, an impact and a guidance. **It is never handed the content**
+   * — that is the protection, and it lives at the two PRODUCERS in `session-node-manager.ts`, which
+   * pass fixed strings. So a wire-level test can only:
+   *   - pass `SECRET` in `impact` and assert it does not come back — which **FAILS**, correctly:
+   *     `impact` is passed through verbatim and no layer can launder a caller that puts content in
+   *     it; or
+   *   - strip `SECRET` before passing it and assert it is absent — which **passes unconditionally**
+   *     and tests my own test setup. That is what my first draft did.
+   *
+   * The property is asserted where it is enforceable: over the whole serialized notice in the store
+   * suite above. Restating it here would add a green line and no coverage — the exact shape this
+   * milestone keeps finding, and worth a comment rather than a silent omission.
+   */
 });
