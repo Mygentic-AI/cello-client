@@ -16,7 +16,10 @@
  * access before initialization". Separating construction from registration is what makes a module's
  * POSITION IN THE FILE stop mattering, which is the whole reason startDaemon could be taken apart.
  */
-import { randomUUID, createHash } from "node:crypto";
+// `createHash` is gone: the annex verifier's hardcoded `sha256(0x00 ‖ content)` became
+// `contentHashFor`, so this file no longer computes a content hash without asking which algorithm
+// the sender used (`DOD-M15-SEALWIRE-1` part B2a).
+import { randomUUID } from "node:crypto";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
@@ -25,6 +28,7 @@ import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
 import { decodeParkEnvelope } from "./park-envelope.js";
+import { contentHashFor, resolveContentHashAlg } from "./wire-content-hash.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -188,27 +192,55 @@ export function createContentPark(deps: ContentParkDeps) {
         try {
           const env = decodeParkEnvelope(unsealed);
           /**
-           * ⚠️ THE SECOND CONTENT-HASH VERIFIER, AND IT HARDCODES `sha256` —
-           * `DOD-M15-SEALWIRE-1` part B1, review F3.
+           * ⚠️ THE SECOND CONTENT-HASH VERIFIER — `DOD-M15-SEALWIRE-1` part B1 review F3, closed by
+           * part B2a.
            *
            * This check exists on its own (review F5: `parkSig` does not cover `env.content`, and
            * this branch returns before `ingestReceivedContent`'s own cross-check ever runs), so it
            * is NOT covered by B1's discriminator. Correct today and provably so — **no sender salts
            * in this build**, so every parked entry in existence was hashed `sha256(0x00 ‖ content)`.
            *
-           * 🚨 PART B2 MUST COME HERE TOO, and the cost of missing it is specific: a salted parked
-           * entry fails this comparison, logs `content.recover.annex.hash_mismatch` — *"content does
-           * not match its attested hash"* — is NOT annexed, and **the relay copy is kept**, which
-           * re-creates the repeated re-pull loop this code was written to end. A tamper report and a
-           * retry storm, for a message whose only sin was taking the park route.
-           *
-           * The other B2 site is `session-node-manager.ts`'s `recoverParkedEntry`. Both need the
-           * park envelope to carry the algorithm name, which is a wire change on the envelope.
+           * ✅ FIXED IN PART B2a. The envelope carries the algorithm from v3 onward and this check
+           * now runs under it, so the re-pull loop it would otherwise have caused — refuse, keep the
+           * relay copy, pull again, refuse again — cannot happen. The other site is
+           * `session-node-manager.ts`'s `recoverParkedEntry`; both were changed together, because
+           * fixing one and leaving the other is how this defect was created.
            */
-          const computed = createHash("sha256").update(new Uint8Array([0x00])).update(env.content).digest();
-          if (Buffer.from(computed).toString("hex") !== e.contentHashHex) {
+          const alg = resolveContentHashAlg(env.contentHashAlg);
+          let computed: Uint8Array | null = null;
+          let algFailure: string | null = null;
+          if (!alg.ok) {
+            // A name this build cannot read. NOT a hash mismatch: there is no value to compare
+            // against, and reporting it as one would be a tamper claim for a version difference —
+            // the same substitution `DOD-M15-SEALWIRE-1` part B1 removed on the direct path.
+            algFailure = `content_hash_alg_unknown (${alg.value})`;
+          } else {
+            try {
+              computed = contentHashFor(env.content, {
+                alg: alg.alg,
+                // OUR salt for the session. The envelope never carries one and could not be trusted
+                // if it did — the salt is the shared secret that makes the hash unguessable.
+                salt: sessionNodeManager.getSessionContentSalt(recipientAgent.name, e.sessionIdHex),
+              });
+            } catch (err: unknown) {
+              algFailure = err instanceof Error ? err.message : String(err);
+            }
+          }
+          if (algFailure !== null) {
+            logger.error("content.recover.annex.unverifiable", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              declaredAlg: env.contentHashAlg ?? "(absent)",
+              detail: algFailure,
+              impact: "this parked message could not be CHECKED — not that it failed a check. It was not annexed and the relay copy is kept, so nothing is lost. Nothing here says the sender did anything wrong.",
+              guidance: "Usually their CELLO build is newer than this one: ask which version they run, and upgrade. The message stays on the relay and is delivered once this daemon can verify it.",
+              correlationId,
+            });
+          } else if (Buffer.from(computed!).toString("hex") !== e.contentHashHex) {
             logger.error("content.recover.annex.hash_mismatch", {
               sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              // The algorithm the comparison RAN UNDER. Without it a mismatch is unfalsifiable from
+              // the log: "the bytes were altered" and "we checked it the wrong way" look identical.
+              declaredAlg: env.contentHashAlg ?? "(absent → sha256)",
               impact: "content does not match its attested hash — NOT annexed, relay copy kept",
               correlationId,
             });

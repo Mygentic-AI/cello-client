@@ -35,6 +35,16 @@ function makeHarness(verdict: ScreenVerdict, ciphertext: Uint8Array, contentHash
     standingReceiverAbsenceReason: () => "none",
     recoverParkedEntry: async () => ({ ok: false as const, reason: "session_committed" }),
     recordSealedAnnex: (_a: string, _s: string, _h: string, content: Uint8Array) => { annexed.push({ content }); return true; },
+    /**
+     * `DOD-M15-SEALWIRE-1` part B2a. The annex verifier now asks the session for its content salt,
+     * because a v3 park envelope names a salted algorithm and this check runs BEFORE
+     * `ingestReceivedContent` is ever reached.
+     *
+     * `null` is the honest answer for these fixtures: they park v2 envelopes, which carry no
+     * algorithm and are verified as `sha256`, where the salt is unused. Returning bytes here would
+     * make the stub claim a state its envelopes do not match.
+     */
+    getSessionContentSalt: () => null,
   };
 
   const park = createContentPark({

@@ -30,6 +30,7 @@ import { decode as cborDecode } from "cbor-x";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { verify, sealToRecipient, type KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs } from "@cello-protocol/protocol-types";
+import { CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 
 /**
  * Compare an identity key (raw bytes) against a stored hex pubkey — on BYTES, never on the hex
@@ -61,6 +62,34 @@ export function pubkeyMatchesHex(pubkey: Uint8Array, storedHex: string | undefin
 /** Current envelope version. v1 (unsigned) is decodable but NEVER acceptable — see authenticate(). */
 export const PARK_ENVELOPE_VERSION = 2;
 
+/**
+ * v3 — a v2 envelope plus the CONTENT-HASH ALGORITHM (`DOD-M15-SEALWIRE-1` part B2a).
+ *
+ * ⚠️ EMITTED ONLY WHEN THE ALGORITHM IS NOT THE DEFAULT, and that is the whole compatibility story.
+ * Every envelope this build produces today is still v2, because nothing salts — so no current peer
+ * sees a version it cannot read. The gate is structural rather than a promise: a salted envelope can
+ * only be addressed to a peer that completed the salt agreement, and a build able to do that
+ * necessarily contains this decoder.
+ *
+ * Why the algorithm is NOT in the signed statement: `parkSig` covers `(session_id, recipient_pubkey,
+ * content_hash)` — the HASH, not the name of the function that produced it. Adding the name would
+ * change `buildParkContentTbs`, a cross-repo type, for no security gain. An attacker who flips the
+ * name cannot make altered content verify, because the recomputed hash must still equal the SIGNED
+ * one; a flip can only turn an acceptance into a REFUSAL. `dod-m15-park-envelope-alg.test.ts` pins
+ * that, because "only a refusal" is a claim rather than a hope.
+ */
+export const PARK_ENVELOPE_VERSION_ALG = 3;
+
+/**
+ * The versions that carry a sender signature and may therefore be authenticated.
+ *
+ * A SET, not a single constant, and the difference is mail loss. `authenticateParkedEntry` refused
+ * anything whose version was not the one `PARK_ENVELOPE_VERSION` names — so bumping that constant to
+ * 3 would have turned every v2 envelope sitting in every relay mailbox into `unsigned_envelope`:
+ * store-and-forward mail destroyed, and reported as an attack.
+ */
+const SIGNED_ENVELOPE_VERSIONS = new Set<number>([PARK_ENVELOPE_VERSION, PARK_ENVELOPE_VERSION_ALG]);
+
 export interface ParkEnvelope {
   /** 1 = legacy/unsigned (bare content or the pre-SEC-1 shape). 2 = signed. */
   version: number;
@@ -70,8 +99,17 @@ export interface ParkEnvelope {
   structure2Cbor?: Uint8Array;
   /** SEC-1 — the sender's identity key. Present only on v2. */
   senderPubkey?: Uint8Array;
-  /** SEC-1 — Ed25519 over buildParkContentTbs(...). Present only on v2. */
+  /** SEC-1 — Ed25519 over buildParkContentTbs(...). Present on v2 and v3. */
   parkSig?: Uint8Array;
+  /**
+   * The algorithm the sender used for `content_hash`. Present only on v3.
+   *
+   * ABSENT rather than defaulted to `"sha256"`, deliberately: `resolveContentHashAlg` reads absent as
+   * "a peer that predates the field", and that is the only value meaning legacy. Filling in the
+   * literal here would work today while erasing the distinction between "they said sha256" and "they
+   * said nothing" — the same collapse B1's empty-string case exists to prevent.
+   */
+  contentHashAlg?: string;
 }
 
 export type ParkAuthFailure =
@@ -93,15 +131,23 @@ export function encodeParkEnvelope(args: {
   parkSig: Uint8Array;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
+  /** Omit, or pass the default, to emit a v2 envelope every current peer can read. */
+  contentHashAlg?: string;
 }): Uint8Array {
-  return encodeCbor([
-    PARK_ENVELOPE_VERSION,
+  const base = [
     args.content,
     args.structure1Cbor ?? null,
     args.structure2Cbor ?? null,
     args.senderPubkey,
     args.parkSig,
-  ]) as Uint8Array;
+  ];
+  // The DEFAULT algorithm stays on v2 even when named explicitly. A caller that starts passing the
+  // algorithm through would otherwise push every envelope to a version older peers cannot read,
+  // without anyone having decided to.
+  if (!args.contentHashAlg || args.contentHashAlg === CONTENT_HASH_ALGS.SHA256) {
+    return encodeCbor([PARK_ENVELOPE_VERSION, ...base]) as Uint8Array;
+  }
+  return encodeCbor([PARK_ENVELOPE_VERSION_ALG, ...base, args.contentHashAlg]) as Uint8Array;
 }
 
 /**
@@ -124,6 +170,8 @@ export async function sealParkEnvelope(args: {
   content: Uint8Array;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
+  /** The algorithm behind `contentHash`. Omit for the default; see `PARK_ENVELOPE_VERSION_ALG`. */
+  contentHashAlg?: string;
 }): Promise<Uint8Array> {
   const senderPubkey = await args.signer.getPublicKey();
   const parkSig = await args.signer.sign(
@@ -135,6 +183,7 @@ export async function sealParkEnvelope(args: {
     structure2Cbor: args.structure2Cbor,
     senderPubkey,
     parkSig,
+    contentHashAlg: args.contentHashAlg,
   });
   // The signature rides INSIDE the seal — the relay (the adversary) never sees it, so it can neither
   // strip nor forge it. INV-3 is untouched: the relay still holds only ciphertext.
@@ -149,6 +198,20 @@ export async function sealParkEnvelope(args: {
 export function decodeParkEnvelope(plaintext: Uint8Array): ParkEnvelope {
   try {
     const arr = cborDecode(plaintext) as unknown[];
+    // v3 first: a v2 envelope plus the content-hash algorithm as a 7th element.
+    if (Array.isArray(arr) && arr.length === 7 && arr[0] === PARK_ENVELOPE_VERSION_ALG && arr[1] instanceof Uint8Array) {
+      return {
+        version: PARK_ENVELOPE_VERSION_ALG,
+        content: arr[1],
+        structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
+        structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
+        senderPubkey: arr[4] instanceof Uint8Array ? arr[4] : undefined,
+        parkSig: arr[5] instanceof Uint8Array ? arr[5] : undefined,
+        // A non-string here stays ABSENT rather than being coerced. `resolveContentHashAlg` refuses
+        // a name it cannot read; it must never be handed a `"42"` that looks like one.
+        contentHashAlg: typeof arr[6] === "string" ? arr[6] : undefined,
+      };
+    }
     if (Array.isArray(arr) && arr.length === 6 && arr[0] === PARK_ENVELOPE_VERSION && arr[1] instanceof Uint8Array) {
       return {
         version: PARK_ENVELOPE_VERSION,
@@ -194,7 +257,7 @@ export function authenticateParkedEntry(args: {
 
   // 1. Unsigned (v1 envelope, or raw bare content) — the shape an attacker sends, and the shape the
   //    pre-SEC-1 daemon ingested without a single check. Refused outright.
-  if (env.version !== PARK_ENVELOPE_VERSION || !env.senderPubkey || !env.parkSig) {
+  if (!SIGNED_ENVELOPE_VERSIONS.has(env.version) || !env.senderPubkey || !env.parkSig) {
     return { ok: false, reason: "unsigned_envelope" };
   }
 

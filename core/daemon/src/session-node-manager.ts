@@ -8414,12 +8414,10 @@ export class SessionNodeManager {
      * `sha256`. In part B1 that is exactly right and provably so: **no sender salts yet**, so every
      * parked entry in existence was hashed unsalted.
      *
-     * ⚠️ PART B2 MUST FIX THIS BEFORE ANY SENDER SALTS, and at BOTH sites: here, and the independent
-     * verifier in `content-park.ts` (see the block there). The moment a sender salts, a message that
-     * takes the park route instead of the direct one is verified under the wrong algorithm — a
-     * tamper report for a message that merely went the long way round. `park-envelope.ts` needs the
-     * field, which is a wire change on the envelope, which is why it belongs to the unit that turns
-     * salting on rather than this one.
+     * ✅ FIXED IN PART B2a, at BOTH sites: here, and the independent verifier in `content-park.ts`.
+     * The envelope carries the algorithm from v3 onward, and a v2 envelope's absent field resolves to
+     * `sha256` — which is what a peer predating the field actually used. Every envelope this build
+     * emits is still v2, because nothing salts yet.
      *
      * ─── AND THE REFUSAL DOES NOT HOLD — review F2 ────────────────────────────────────────────
      *
@@ -8447,7 +8445,10 @@ export class SessionNodeManager {
       });
     }
     return await this.ingestReceivedContent(
-      agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined, undefined,
+      agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
+      // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
+      // `sha256` and is exactly right for a peer that predates the field.
+      env.contentHashAlg,
     );
   }
 
@@ -8707,6 +8708,20 @@ export class SessionNodeManager {
    * is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a diagnosis, not
    * in a session that quietly hashes under the wrong value.
    */
+  /**
+   * PUBLIC read of a session's agreed salt — `DOD-M15-SEALWIRE-1` part B2a.
+   *
+   * `content-park.ts` runs a SECOND, independent content-hash verifier (the park signature does not
+   * cover the envelope content, so it checks before `ingestReceivedContent` is ever reached), and it
+   * hardcoded `sha256`. It needs the salt to verify a v3 envelope, and it is outside this class.
+   *
+   * Read-only and cache-backed, so exposing it adds no way to CHANGE the salt from outside — the
+   * only writer remains `#persistSessionSalt`, behind the one-salt-per-session predicate.
+   */
+  getSessionContentSalt(agentName: string, sessionId: string): Uint8Array | null {
+    return this.#getSessionSalt(agentName, sessionId);
+  }
+
   #getSessionSalt(agentName: string, sessionId: string): Uint8Array | null {
     const key = this.#k(agentName, sessionId);
     const cached = this.#sessionSalts.get(key);
