@@ -2,6 +2,12 @@
  * M8B FINDING-1 (Brief 1) — unilateral seal escalation must survive a RETRY close.
  *
  * Root cause under test (daemon.ts close flow, relay-witness path): the unilateral
+ * DOD-M15-CLOSEWAIT-1: every close here passes `wait_for_seal: true`. The default contract now
+ * answers on COMMITMENT and finishes the ceremony in the background, which is right for an operator
+ * and useless for these tests — they assert what the ceremony PRODUCES, so they want the blocking
+ * form. That is the case the opt-in exists for, and it is the honest fix: weakening these to accept
+ * a committed response would delete the coverage rather than adapt it.
+ *
  * escalation was reachable ONLY on the same cello_close_session call that first
  * submitted the SEAL leaf. A retry hit the #responderSealSubmitted idempotency mark,
  * got `responder_seal_already_submitted` WITHOUT the reportedRootHex/sequenceNumber
@@ -293,7 +299,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
 
   it("F20: the too-early reply's remaining_seconds reaches the seal_counterparty_pending guidance", async () => {
     const { client, sig } = await setupSessionWithDeadCounterparty();
-    const closeP = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     const uni = await waitFor(() => sig.outbound.find((f) => f["type"] === "seal_unilateral"), 10_000);
     expect(uni, "close must escalate to a seal_unilateral frame").not.toBeNull();
     sig.inject!({ type: "seal_unilateral_too_early", session_id: SID_BYTES, remaining_seconds: 42 });
@@ -308,7 +314,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     const { h, client, sig, relay, alicePubkey } = await setupSessionWithDeadCounterparty();
 
     // ── Close #1 (inside grace): escalates, directory replies too_early.
-    const close1P = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
+    const close1P = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     const uni1 = await waitFor(() => sig.outbound.find((f) => f["type"] === "seal_unilateral"), 10_000);
     expect(uni1, "close #1 must escalate to a seal_unilateral frame").not.toBeNull();
     sig.inject!({ type: "seal_unilateral_too_early", session_id: SID_BYTES, remaining_seconds: 42 });
@@ -318,7 +324,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
 
     // ── Close #2 (retry — the live-deadlock path): the SEAL leaf is already submitted;
     //    the daemon MUST still escalate, re-using the FIRST submit's reported_root.
-    const close2P = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
+    const close2P = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     const uni2 = await waitFor(() => sig.outbound.filter((f) => f["type"] === "seal_unilateral")[1], 10_000);
     if (!uni2) {
       // RED against 0.0.20: no second frame is ever sent and the close degrades to
@@ -397,7 +403,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     expect(autoAcked, "auto-ack must submit our responder SEAL leaf").toBe(true);
 
     // ── Explicit close during the bilateral window; the directory seals bilaterally.
-    const closeP = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     await wait(100); // let the close register its waiter inside the (5s) bilateral window
     const bilateralRoot = "ab".repeat(32);
     sig.inject!({ type: "session_sealed", session_id: SID_BYTES, sealed_root: new Uint8Array(Buffer.from(bilateralRoot, "hex")) });
@@ -411,8 +417,8 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
 
   it("two concurrent closes submit exactly ONE relay SEAL ctrl leaf (idempotency preserved)", async () => {
     const { client, sig, relay } = await setupSessionWithDeadCounterparty();
-    const closeA = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
-    const closeB = client.send("cello_close_session", { session_id: SID_HEX }) as Promise<Record<string, unknown>>;
+    const closeA = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
+    const closeB = client.send("cello_close_session", { session_id: SID_HEX, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     // Answer the (single) escalation so closeA resolves.
     await waitFor(() => sig.outbound.find((f) => f["type"] === "seal_unilateral"), 10_000);
     sig.inject!({ type: "seal_unilateral_too_early", session_id: SID_BYTES, remaining_seconds: 10 });
@@ -469,7 +475,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     });
     await waitFor(() => (relay.ctrlSubmits().length >= 1 ? true : undefined), 10_000);
 
-    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME }) as Promise<Record<string, unknown>>;
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     await wait(100);
     const bilateralRoot = "ab".repeat(32);
     sig.inject!({ type: "session_sealed", session_id: SID_BYTES, sealed_root: new Uint8Array(Buffer.from(bilateralRoot, "hex")) });
@@ -488,7 +494,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
   it("AC-A7 (unilateral): the name persists on the escalation path too, and rides no seal_unilateral frame", async () => {
     const { h, client, sig, relay } = await setupSessionWithDeadCounterparty();
 
-    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME }) as Promise<Record<string, unknown>>;
+    const closeP = client.send("cello_close_session", { session_id: SID_HEX, session_name: NONCE_NAME, wait_for_seal: true }) as Promise<Record<string, unknown>>;
     const uni = await waitFor(() => sig.outbound.find((f) => f["type"] === "seal_unilateral"), 10_000);
     expect(uni, "close must escalate to a seal_unilateral frame").not.toBeNull();
 

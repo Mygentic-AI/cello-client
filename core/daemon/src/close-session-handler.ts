@@ -51,6 +51,7 @@ import { validateSessionName } from "./session-name.js";
 import type { SealFlowResult, ActiveSealResult } from "./seal-flows.js";
 import type { SealCompletion, UnilateralResult } from "./seal-coordinator.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
+import { describeSealCommitted } from "./close-commitment.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 
@@ -915,6 +916,16 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       // seal handlers) for the duration of the seal, then release it in finally. Same-node sessions have
       // no entry here and use the home stream unchanged.
       let sealBrokerConn: { mgr: SignalingManager; stop: (reason: string) => Promise<void> } | null = null;
+      // DOD-M15-CLOSEWAIT-1: set when the seal tail is handed to a background task, so the enclosing
+      // finally does not release a broker connection that ceremony still needs.
+      let handedOff = false;
+      /**
+       * The caller may still ASK to block. Default is the new contract (answer on commitment);
+       * `wait_for_seal: true` restores the inline behaviour for a script that genuinely wants the
+       * receipt in one call and will wait up to eleven minutes for it. Opt-IN rather than opt-out,
+       * because the default has to be the one that does not freeze an interactive operator.
+       */
+      const waitForSeal = params?.["wait_for_seal"] === true;
       try {
         // Memory only, deliberately. An ACTIVE session has not been through the restart that
         // empties the broker map, so the entry is there when it is needed — and a lookup here would
@@ -1024,8 +1035,26 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // long this can legitimately take, and what forcing costs.
         logger.warn("session.seal.awaiting_counterparty", {
           sessionId, agentName: record.agent_name, deadlineMs: bilateralTimeoutMs, correlationId,
-          impact: `this close will not answer for up to ${Math.round(bilateralTimeoutMs / 60_000)} minutes while it waits for the counterparty, then it escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
+          impact: `the seal is waiting for the counterparty for up to ${Math.round(bilateralTimeoutMs / 60_000)} minutes, then escalates to a unilateral seal and produces a real receipt. It is working. Do NOT force-abandon it — that forfeits the receipt this wait is earning.`,
         });
+
+        /**
+         * DOD-M15-CLOSEWAIT-1 — THE TAIL, EXTRACTED SO IT CAN OUTLIVE THE RESPONSE.
+         *
+         * Everything from here to the escalation is "wait for the counterparty, then escalate if
+         * they never came". It ran inline, which is why the caller sat on a frozen command for up to
+         * eleven minutes while it worked correctly — and why one operator force-abandoned seventeen
+         * sessions, forfeiting the exact receipts the wait was earning.
+         *
+         * Extracting it changes nothing about WHAT is signed or in what order: same race, same
+         * escalation, same leaf. It changes only who waits for it. (Decisions Carried #4.)
+         *
+         * `rec`/`sid` are captured because TypeScript discards the narrowing of `record` and
+         * `sessionId` inside a nested function.
+         */
+        const rec = record;
+        const sid = sessionId;
+        const awaitSealAndEscalate = async (): Promise<unknown> => {
         let timer!: ReturnType<typeof setTimeout>;
         const timeoutP = new Promise<null>((r) => { timer = setTimeout(() => r(null), bilateralTimeoutMs); });
         const sealedCompletion = await Promise.race([sealedP, timeoutP]);
@@ -1067,14 +1096,70 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
         // seal. The body now lives in escalateToUnilateralSeal so the INTERRUPTED branch can reach
         // it too — it never could, and that is why an interrupted session could not get a receipt.
-        return await escalateToUnilateralSeal(record, sessionId, escalation, correlationId);
+        return await escalateToUnilateralSeal(rec, sid, escalation, correlationId);
+        };
+
+        /**
+         * OWNERSHIP OF THE BROKER CONNECTION MOVES WITH THE TAIL.
+         *
+         * This is the one genuinely dangerous part of the change. The enclosing `finally` releases
+         * `sealBrokerConn`; if it ran while the tail was still going, the background seal would lose
+         * its transport mid-ceremony. So the tail releases it itself, and the enclosing `finally` is
+         * told to stand down via `handedOff`.
+         */
+        const finishSeal = async (): Promise<unknown> => {
+          try {
+            return await awaitSealAndEscalate();
+          } finally {
+            if (sealBrokerConn) {
+              try { await sealBrokerConn.stop("seal-complete"); }
+              catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId: sid, reason: err instanceof Error ? err.message : String(err) }); }
+              sealBrokerConn = null;
+            }
+            sealInterruptedInProgress.delete(sealKey(rec.agent_name, sid));
+          }
+        };
+
+        if (waitForSeal) return await finishSeal();
+
+        handedOff = true;
+        /**
+         * Detached deliberately, and never awaited. A rejection must not become an unhandled
+         * rejection — and must not be silent either: the operator has already been told the seal is
+         * running, so a failure they never hear about is the worst of both worlds.
+         */
+        void finishSeal().then(
+          (result) => {
+            const r = result as { ok?: boolean; reason?: string };
+            if (r?.ok) logger.info("session.seal.background.completed", { sessionId: sid, agentName: rec.agent_name, correlationId });
+            else logger.warn("session.seal.background.unresolved", {
+              sessionId: sid, agentName: rec.agent_name, correlationId, reason: r?.reason,
+              impact: "the close already answered; this session holds a durable commitment but has no receipt yet.",
+              guidance: "cello_sealed_receipt stays empty until this resolves; a daemon restart resumes it.",
+            });
+          },
+          (err: unknown) => logger.error("session.seal.background.failed", {
+            sessionId: sid, agentName: rec.agent_name, correlationId,
+            error: err instanceof Error ? err.message : String(err),
+            impact: "the close already answered ok; the notarization did NOT complete and no receipt exists.",
+            guidance: "The commitment is durable — a daemon restart resolves it via the restart seal resolver.",
+          }),
+        );
+        return describeSealCommitted({ sessionId: sid, deadlineMs: bilateralTimeoutMs });
       } finally {
         // Fix #1: release the transient broker seal-connection (best-effort; the seal result stands).
-        if (sealBrokerConn) {
-          try { await sealBrokerConn.stop("seal-complete"); }
-          catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+        //
+        // DOD-M15-CLOSEWAIT-1: skipped when the tail was handed to a background task, which owns
+        // this cleanup itself. Releasing here would pull the transport out from under a ceremony
+        // still in flight — the one way this change could corrupt a seal rather than merely report
+        // it differently.
+        if (!handedOff) {
+          if (sealBrokerConn) {
+            try { await sealBrokerConn.stop("seal-complete"); }
+            catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+          }
+          sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
         }
-        sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
     }
 
