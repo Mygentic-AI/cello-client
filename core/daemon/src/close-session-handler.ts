@@ -102,6 +102,12 @@ export interface CloseSessionDeps {
    * absent the tail is genuinely untracked, which is why the daemon always passes it.
    */
   registerBackgroundSeal?: (p: Promise<unknown>) => void;
+  /**
+   * DOD-M15-SEAL-FAILED-TERMINAL-1: record/clear the last background ceremony failure, so
+   * `cello_sealed_receipt` can tell a DEAD seal from a slow one. Optional for embedders and test
+   * harnesses; the daemon always passes it.
+   */
+  sealFailures?: { record: (a: string, s: string, reason: string, at: string) => void; clear: (a: string, s: string) => void };
   // ── the seal cluster (seal-coordinator.ts) ──
   sealKey: (agentName: string, sessionId: string) => string;
   sealInterruptedInProgress: Set<string>;
@@ -128,7 +134,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
     handlers, logger, sessionNodeManager, getConnState, resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE, getKeyProvider, signalingFor, sendOver, waitForSignalingConnected,
     openVisitingConnection, runDiscoveryLookup, crossNodeBrokerBySession, sealKey, sealInterruptedInProgress,
-    registerBackgroundSeal,
+    registerBackgroundSeal, sealFailures,
     pendingSealWaiters, pendingUnilateralWaiters, handleSealInterruptedFlow, handleActiveSealFlow,
     recoverParkedContent,
   } = deps;
@@ -1164,6 +1170,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          * rejection — and must not be silent either: the operator has already been told the seal is
          * running, so a failure they never hear about is the worst of both worlds.
          */
+        // DOD-M15-SEAL-FAILED-TERMINAL-1: a NEW ceremony is starting, so any previous failure verdict
+        // is now false. Clearing on START (not only on success) is what stops the documented remedy —
+        // re-close — from being reported as still-dead while it runs.
+        sealFailures?.clear(rec.agent_name, sid);
         const tail = finishSeal();
         /**
          * TRACKED FOR SHUTDOWN — review MEDIUM-6.
@@ -1182,19 +1192,27 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         void tail.then(
           (result) => {
             const r = result as { ok?: boolean; reason?: string };
-            if (r?.ok) logger.info("session.seal.background.completed", { sessionId: sid, agentName: rec.agent_name, correlationId });
+            if (r?.ok) {
+              sealFailures?.clear(rec.agent_name, sid);
+              logger.info("session.seal.background.completed", { sessionId: sid, agentName: rec.agent_name, correlationId });
+            }
             else logger.warn("session.seal.background.unresolved", {
               sessionId: sid, agentName: rec.agent_name, correlationId, reason: r?.reason,
               impact: "the close already answered; this session holds a durable commitment but has no receipt yet.",
               guidance: "cello_sealed_receipt stays empty until this resolves; a daemon restart resumes it.",
             });
           },
-          (err: unknown) => logger.error("session.seal.background.failed", {
+          (err: unknown) => {
+            // RECORDED FOR THE RESPONSE, not only the log. The caller already holds `ok: true`, so a
+            // failure that lives only in daemon.log is one the agent has no way to discover.
+            sealFailures?.record(rec.agent_name, sid, err instanceof Error ? err.message : String(err), new Date().toISOString());
+            logger.error("session.seal.background.failed", {
             sessionId: sid, agentName: rec.agent_name, correlationId,
             error: err instanceof Error ? err.message : String(err),
             impact: "the close already answered ok; the notarization did NOT complete and no receipt exists.",
             guidance: "The commitment is durable — a daemon restart resolves it via the restart seal resolver.",
-          }),
+            });
+          },
         );
         return describeSealCommitted({ sessionId: sid, deadlineMs: bilateralTimeoutMs });
       } finally {

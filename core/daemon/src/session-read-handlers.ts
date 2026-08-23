@@ -17,6 +17,7 @@ import type { ConnState } from "./contact-handlers.js";
 import { classifySession, type SessionCategory } from "./session-category.js";
 import { validateSessionName } from "./session-name.js";
 import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-mismatch.js";
+import { describeSealFailed } from "./seal-failure-store.js";
 
 export interface SessionReadDeps {
   /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
@@ -43,6 +44,13 @@ export interface SessionReadDeps {
    * until it is not."*
    */
   isSealing: (agentName: string, sessionId: string) => boolean;
+  /**
+   * DOD-M15-SEAL-FAILED-TERMINAL-1: the last background ceremony failure, if one is remembered.
+   *
+   * Checked AFTER `isSealing` — a running ceremony outranks an old verdict, because a re-close is
+   * the remedy and its marker is cleared on start.
+   */
+  getSealFailure?: (agentName: string, sessionId: string) => { reason: string; at: string } | undefined;
   /** Never vaults a cursor/watermark past a hole in the delivered sequence. */
   safeCursorAdvance: (connectionId: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
   safeWatermarkAdvance: (agentName: string, sessionId: string, deliveredSeqs: ReadonlySet<number>) => void;
@@ -74,7 +82,7 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     NO_CURRENT_AGENT_RESPONSE, resolveWho, safeCursorAdvance, safeWatermarkAdvance, attendanceCount,
     reapDeadHalfOpenSessions,
       frontierMismatches,
-      isSealing,
+      isSealing, getSealFailure,
 } = deps;
 
   // ─── M7-SESSION-004 (AC-005/AC-006): read the sealed certificate's legibility ───
@@ -217,8 +225,16 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
         };
       }
 
-      // The session is THIS agent's — it simply has no seal certificate yet, and no ceremony is
-      // running for it either.
+      /**
+       * DOD-M15-SEAL-FAILED-TERMINAL-1 — a ceremony that DIED, which is neither of the two states
+       * above. Ordering is load-bearing: `isSealing` was checked first, so a re-close that started a
+       * fresh ceremony reports as running rather than as the old failure.
+       */
+      const failure = getSealFailure?.(agentName, sessionId);
+      if (failure) return describeSealFailed({ sessionId, failure });
+
+      // The session is THIS agent's — it simply has no seal certificate yet, no ceremony is running
+      // for it, and none is remembered as having failed.
       return {
         ok: false,
         reason: "not_sealed_yet",

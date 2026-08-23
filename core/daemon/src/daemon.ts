@@ -50,6 +50,7 @@ import { renderForSurface } from "./vocabulary.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
 import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
 import { describeDirectoryAuth, directoryAuthRequired } from "./directory-auth-posture.js";
+import { SealFailureStore } from "./seal-failure-store.js";
 import {
   startRosterSweep,
   classifyRosterReading,
@@ -1181,6 +1182,14 @@ async function startDaemonHoldingLock(
    * every other one.
    */
   const backgroundSeals = new Set<Promise<unknown>>();
+  /**
+   * DOD-M15-SEAL-FAILED-TERMINAL-1 — the last background seal failure per session.
+   *
+   * In memory on purpose: a restart makes "failed" the WRONG answer, because the boot sweep plus the
+   * restart seal resolver retry the session. A marker whose lifetime is the process matches the
+   * lifetime of the condition it describes.
+   */
+  const sealFailures = new SealFailureStore();
   // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
   // the call site so it names the specific away agent.
   // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
@@ -3765,6 +3774,7 @@ async function startDaemonHoldingLock(
     // DOD-M15-CLOSEWAIT-1 review MEDIUM-6: a detached seal tail is registered here so stop() can
     // drain it, like every other background worker. Self-evicting, so a long-running daemon does not
     // accumulate settled promises.
+    sealFailures,
     registerBackgroundSeal: (p) => {
       backgroundSeals.add(p);
       void p.finally(() => backgroundSeals.delete(p));
@@ -3913,6 +3923,9 @@ async function startDaemonHoldingLock(
     isSealing: (agentName, sessionId) =>
       pendingSealWaiters.has(sealKey(agentName, sessionId)) ||
       sealInterruptedInProgress.has(sealKey(agentName, sessionId)),
+    // DOD-M15-SEAL-FAILED-TERMINAL-1: the SAME store the close handler writes, so a failure recorded
+    // by the detached tail is the one the receipt surface reads.
+    getSealFailure: (agentName, sessionId) => sealFailures.get(agentName, sessionId),
     getConnState: (connectionId) => perConnectionState.get(connectionId),
     resolveCurrentAgent,
     NO_CURRENT_AGENT_RESPONSE,
