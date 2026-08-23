@@ -2240,6 +2240,15 @@ export class SessionNodeManager {
     direction: "sent" | "received",
     plaintext: Uint8Array,
     correlationId?: string,
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5: the VERIFIED authorship proof, when there is one.
+     *
+     * Optional because there legitimately is not always one — the ordering decode can fail SOFT and
+     * the message is still ingested via hash-dedup. Optional is NOT the same as unremarked: absence
+     * is written into the row as `attribution = 'local_session_state'`, so a reader can tell a row
+     * whose author was proven from one whose author was assumed. That distinction is the bullet.
+     */
+    authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
   ): boolean {
     if (!this.#db) return false;
     try {
@@ -2247,10 +2256,16 @@ export class SessionNodeManager {
       const blob = Buffer.from(plaintext);
       this.#db
         .prepare(
-          `INSERT OR IGNORE INTO transcript (agent_id, session_id, sequence, direction, blob, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT OR IGNORE INTO transcript
+             (agent_id, session_id, sequence, direction, blob, created_at, sender_pubkey, sender_sig, attribution)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(agentId, sessionId, sequence, direction, blob, Date.now());
+        .run(
+          agentId, sessionId, sequence, direction, blob, Date.now(),
+          authorship ? Buffer.from(authorship.senderPubkey).toString("hex") : null,
+          authorship ? Buffer.from(authorship.senderSig) : null,
+          authorship ? "verified_signature" : "local_session_state",
+        );
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
       return true;
     } catch (err: unknown) {
@@ -6603,6 +6618,16 @@ export class SessionNodeManager {
      * about what this side happens to hold.
      */
     contentHashAlgIn?: string | null,
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5: the VERIFIED authorship proof for this message, when the caller
+     * has one. The caller is the only place that has it — `#recordFrameOrdering` verifies the
+     * signature against the key inside the sender's own signed bytes and matches the signer to this
+     * session's counterparty, and that result reaches here or nowhere.
+     *
+     * Optional, because the soft decode-failure path ingests without it. The row records which it
+     * was, so absence is never silent.
+     */
+    verifiedAuthorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
   ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
@@ -7109,7 +7134,7 @@ export class SessionNodeManager {
     // agent (screenedOut); a delivered message buffers + leafs via #appendVerifiedContent.
     const leafIndex = terminalBlock
       ? this.appendSessionLeaf(agentName, sessionId, "msg", contentHashHex, correlationId).leafIndex
-      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId, content).leafIndex;
+      : this.#appendVerifiedContent(agentName, sessionId, deliverContent, contentHashHex, senderPubkey, correlationId, content, verifiedAuthorship).leafIndex;
 
     // DOD-COATTEND-1 (review F2): the plaintext failed to reach the transcript, and since Tier 1 the
     // transcript IS the delivery path — so this message can never be handed to any session. Report
@@ -7549,6 +7574,16 @@ export class SessionNodeManager {
      * neither can see.
      */
     originalContent?: Uint8Array,
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5: threaded from `ingestReceivedContent`, which is the only place
+     * that has it — `#recordFrameOrdering` verified this signature against the pubkey inside the
+     * sender's own signed bytes and matched the signer to this session's counterparty. It reaches
+     * the transcript row from here or not at all.
+     *
+     * Undefined on the held-release and soft-fallback paths; the row records that as
+     * `local_session_state` rather than leaving it indistinguishable from a proven one.
+     */
+    verifiedAuthorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
   ): { leafIndex: number } {
     // M14 / DOD-DOC-INBOUND-2 — DOCUMENT FRAMES DIVERGE HERE, and the three-way split is the whole
     // contract:
@@ -7605,7 +7640,13 @@ export class SessionNodeManager {
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
     // relay/directory never see this plaintext, only the hash).
-    const durable = this.recordTranscriptMessage(agentName, sessionId, leafIndex, "received", content, correlationId);
+    const durable = this.recordTranscriptMessage(
+      agentName, sessionId, leafIndex, "received", content, correlationId,
+      // DOD-M15-SEALWIRE-1 bullet 5: present only when the ordering record verified AND the signer
+      // matched this session's counterparty. Undefined on the soft fallback, which the row records
+      // as `local_session_state` rather than leaving indistinguishable.
+      verifiedAuthorship,
+    );
     const recvKey = this.#k(agentName, sessionId);
     if (!durable) {
       // The leaf is committed and the plaintext is not. Delivery reads the transcript, so this
@@ -10009,7 +10050,18 @@ export class SessionNodeManager {
     // the relay a precondition for reading mail), while IDENTITY may never be. A bad signature, or
     // a signature by a key that is not this session's counterparty, is an identity failure that the
     // sender supplied and that we verified — not an absence we could not resolve.
-  ): { seq: number | null; fatal?: { reason: string } } {
+  ): {
+    seq: number | null;
+    fatal?: { reason: string };
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5. Present ONLY on the verified path — the signature checked
+     * against the pubkey inside the sender's own signed bytes, and the signer matched to this
+     * session's counterparty. Absent everywhere else, including the SOFT decode-failure fallback,
+     * so a caller cannot mistake "we did not check" for "it did not verify".
+     */
+    senderPubkey?: Uint8Array;
+    senderSig?: Uint8Array;
+  } {
     try {
       const s1 = decode(structure1Cbor) as unknown[];
       const s2 = decode(structure2Cbor) as unknown[];
@@ -10084,7 +10136,19 @@ export class SessionNodeManager {
         source,
         correlationId,
       });
-      return { seq: seq - 1 };
+      /**
+       * DOD-M15-SEALWIRE-1 bullet 5: return the VERIFIED proof, not just the position.
+       *
+       * Three lines above, `verify(s1Pubkey, structure1Cbor, s2Sig)` has already passed and the
+       * signer has been matched to this session's counterparty. That is the strongest statement
+       * this daemon ever makes about who wrote a message — and until now it was made, used to
+       * decide a sequence number, and then discarded. The transcript row that outlives it recorded
+       * only a direction.
+       *
+       * Returned rather than stashed, for the same reason `seq` is: a caller that has to go looking
+       * for it in a side map is a caller that will not.
+       */
+      return { seq: seq - 1, senderPubkey: s1Pubkey, senderSig: s2Sig };
     } catch (err: unknown) {
       this.#logger.warn("session.content.ordering.decode_failed", {
         sessionId,
@@ -10300,6 +10364,14 @@ export class SessionNodeManager {
       const s1Cbor = frame["structure1_cbor"];
       const s2Cbor = frame["structure2_cbor"];
       let framedSeq: number | null = null;
+      /**
+       * DOD-M15-SEALWIRE-1 bullet 5. Set ONLY when the ordering record verified — the signature
+       * checked against the pubkey inside the sender's own signed bytes AND the signer matched this
+       * session's counterparty. It is deliberately NOT set on the two soft paths below (no record
+       * supplied; decode failed), because on those the author is attested by local session state
+       * and the transcript row must say so rather than imply a proof it does not have.
+       */
+      let verifiedAuthorship: { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined;
       if (s1Cbor instanceof Uint8Array && s2Cbor instanceof Uint8Array) {
         const ordering = this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
         if (ordering.fatal) {
@@ -10307,6 +10379,9 @@ export class SessionNodeManager {
           return;
         }
         framedSeq = ordering.seq;
+        if (ordering.senderPubkey !== undefined && ordering.senderSig !== undefined) {
+          verifiedAuthorship = { senderPubkey: ordering.senderPubkey, senderSig: ordering.senderSig };
+        }
       } else {
         /**
          * Review F3 — THE WEAKER GUARANTEE MUST NOT BE INDISTINGUISHABLE FROM THE STRONGER ONE.
@@ -10342,6 +10417,7 @@ export class SessionNodeManager {
       const ingest = await this.ingestReceivedContent(
         agentName, sessionId, contentBytes, contentHash, correlationId, framedSeq ?? undefined,
         declaredAlg === undefined ? undefined : (declaredAlg as string | null),
+        verifiedAuthorship,
       );
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
