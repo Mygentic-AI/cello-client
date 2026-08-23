@@ -172,10 +172,26 @@ export function createSealFlows(deps: SealFlowDeps) {
   //   compared against either party's transcript, on any path except the unilateral one.
   //
   //   Two comments deferring to each other is how the gap survived review: each half reads as a
-  //   considered decision to check elsewhere, and there is no elsewhere. `DOD-M15-SEALWIRE-1` moves
-  //   the bilateral root into the content-hash domain and makes the comparison a one-line check the
-  //   client can actually perform; until it lands, this layer's leafCount check is the ONLY
-  //   bilateral agreement there is, and it agrees on counts rather than on contents.
+  //   considered decision to check elsewhere, and there is no elsewhere.
+  //
+  //   ⚠️ UPDATE — "until it lands" HAS LANDED, and leaving that clause would now under-claim a
+  //   protection that exists. `DOD-M15-SEALWIRE-1` bullets 1 and 2 shipped: the bilateral certified
+  //   root moved into the content-hash domain, and `verifyCertifiedRoot` rebuilds this
+  //   side's OWN root from its carried leaves and compares it to the certificate, returning
+  //   match / mismatch / cannot_judge rather than accepting on trust.
+  //
+  //   A stale comment that under-claims is less dangerous than one that over-claims — nobody is
+  //   left trusting a check that is not there — but it is not harmless: a reader takes it as a live
+  //   gap and either re-implements the comparison or writes it up as outstanding. This milestone has
+  //   a whole line (`DOD-M15-CLAIM-COMMENTS-1`) about comments whose claims stopped being true, and
+  //   the comment that line produced is the one that went stale.
+  //
+  //   What remains true HERE, at the seal-INTERRUPTED layer: root agreement is still deliberately
+  //   not compared, for the reason given above — concurrent bidirectional traffic legitimately
+  //   diverges the two local orders until the relay's canonical sequence exists, so comparing roots
+  //   at this point would reject honest sessions. leafCount is still the bilateral check available
+  //   at THIS layer. The root comparison lives where the certificate does, which is the right place
+  //   for it and is no longer nowhere.
   //
   //   Both sides bind over their OWN tree root + size (SI-001) whenever a non-empty tree exists —
   //   e.g. reloaded from session_tree_leaves after a restart. Only sessions with no persisted tree
