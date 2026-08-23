@@ -48,6 +48,7 @@ import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
+import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity } from "./manifest-validity.js";
 import {
   startRosterSweep,
   classifyRosterReading,
@@ -417,6 +418,21 @@ async function startDaemonHoldingLock(
    */
   /** REVIEW F4: the last sweep failure, surfaced in `cello_status` alongside the log line. */
   let lastRosterSweepError: RosterFreshness["last_sweep_error"] | undefined;
+
+  /**
+   * DOD-M15-MANIFEST-EXPIRY-LIVE-1 — re-check the trust anchor's validity while the daemon runs.
+   *
+   * The window is enforced at STARTUP and nowhere else. The manifest poll's expiry check looks at
+   * the manifest being FETCHED, never the one held, so a daemon past its expiry keeps polling, keeps
+   * correctly refusing expired replacements, and keeps using the lapsed anchor it already has.
+   *
+   * Rides the roster sweep rather than owning a timer: that tick already fires every 90–180 s on
+   * exactly the path where a manifest provider exists.
+   */
+  const checkManifestValidity = startManifestValidityWatch({
+    getManifest: () => manifestProvider?.getCurrentManifest() ?? null,
+    logger,
+  });
   const rosterSweepScheduler = manifestProvider
     ? config.rosterSweepScheduler ??
       new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
@@ -427,7 +443,13 @@ async function startDaemonHoldingLock(
         // FAST_PROBE is deliberately NOT used here. It exists because the failover resolver runs
         // inside the 10 s signaling wait; nothing waits on this sweep, so it can afford the
         // patient probe and give the more trustworthy answer.
-        sweep: () => resolveConsortiumRoster(),
+        sweep: async () => {
+          // DOD-M15-MANIFEST-EXPIRY-LIVE-1: the anchor's validity is re-checked on the same tick.
+          // BEFORE the probe, so an expired manifest is reported even on a cycle where every node
+          // is unreachable and the roster resolve throws.
+          checkManifestValidity();
+          return resolveConsortiumRoster();
+        },
         logger,
         // REVIEW F4: the failure reaches the agent's response, not just the log. Without this a
         // sweep failing every cycle is invisible for the first two or three failures, because the
@@ -2289,6 +2311,12 @@ async function startDaemonHoldingLock(
       //
       // Omitted entirely when nothing is failing, so a healthy status stays quiet.
       ...(unresolvedNodesForStatus() ?? {}),
+      // DOD-M15-MANIFEST-EXPIRY-LIVE-1: contributes NOTHING while the manifest is comfortably in
+      // window. A field present on every status read for the years a manifest is valid is furniture,
+      // not a warning, and it teaches the reader to skip the block that matters.
+      ...(describeManifestValidity(
+        classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
+      ) ?? {}),
       // M8B F14 (fix 5): per-agent standing-receiver readiness, so a deaf agent (online but
       // no armed receiver) is visible in cello_status instead of hiding behind the ANY-agent
       // aggregate below (kept for backward compatibility).
@@ -3540,6 +3568,12 @@ async function startDaemonHoldingLock(
       //
       // Omitted entirely when nothing is failing, so a healthy status stays quiet.
       ...(unresolvedNodesForStatus() ?? {}),
+      // DOD-M15-MANIFEST-EXPIRY-LIVE-1: contributes NOTHING while the manifest is comfortably in
+      // window. A field present on every status read for the years a manifest is valid is furniture,
+      // not a warning, and it teaches the reader to skip the block that matters.
+      ...(describeManifestValidity(
+        classifyManifestValidity(manifestProvider?.getCurrentManifest() ?? null, Date.now()),
+      ) ?? {}),
       agents: getAgentsForConnection(connectionId),
       // M-1 PULL: live MCP clients must see interrupted sessions too, exactly as
       // the daemon-wide getStatus() surfaces them.
