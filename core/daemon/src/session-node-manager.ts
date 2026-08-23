@@ -5923,6 +5923,10 @@ export class SessionNodeManager {
           this.#logger.warn("session.relay.hash.submit.failed", {
             sessionId,
             reason: witnessed.reason,
+            // The relay's own words about what happened, when it sent any. `reason` is the class and
+            // this is the cause — without it a refusal reaches the operator as a bare code, which is
+            // the state this field existed to end and never actually did.
+            ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }),
             correlationId,
           });
           relayRefusal = witnessed.reason;

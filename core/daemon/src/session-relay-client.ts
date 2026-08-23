@@ -144,7 +144,24 @@ export type SubmitResult =
       structure1_cbor?: Uint8Array;
       structure2_cbor?: Uint8Array;
     }
-  | { ok: false; reason: string };
+  | {
+      ok: false;
+      reason: string;
+      /**
+       * The relay's own words about what went wrong — `relay-types.ts`'s stated invariant is
+       * *"`reason` is the class, `detail` is what happened."*
+       *
+       * ⚠️ THAT INVARIANT HAD NEVER BEEN TRUE END TO END. The relay composed a `detail` on every
+       * `hash_submit_error`, and this client read `reason` and **dropped it on the floor** — so the
+       * only sentence naming a cause never reached an operator. It defeats two things at once:
+       * `DOD-M15-SEALWIRE-1`'s refusal detail (which rule, which leaf kind), and
+       * `DOD-M15-TERMINAL-REASON-1`'s F6, where `detail` exists specifically to carry the
+       * DIRECTORY's refusal cause out from behind a `seal_refused`.
+       *
+       * Optional, because an older relay sends none.
+       */
+      detail?: string;
+    };
 type AckResolver = (r: SubmitResult) => void;
 
 export interface AgentRelayClientOpts {
@@ -590,7 +607,10 @@ export class AgentRelayClient {
       );
     } else if (type === "hash_submit_error") {
       const reason = typeof frame["reason"] === "string" ? frame["reason"] : "relay_rejected";
-      this.#settlePending({ ok: false, reason });
+      // Carry the relay's `detail` through — see `SubmitResult`. Reading the class and discarding
+      // what happened is how a refusal arrives as a bare code with no cause attached to it.
+      const detail = typeof frame["detail"] === "string" ? frame["detail"] : undefined;
+      this.#settlePending({ ok: false, reason, ...(detail ? { detail } : {}) });
     } else if (type === "assignment_ok") {
       // The relay verified + recorded our client-presented assignment.
       const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
