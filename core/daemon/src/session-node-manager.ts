@@ -6589,6 +6589,81 @@ export class SessionNodeManager {
     byHash.set(Buffer.from(contentHash).toString("hex"), declaredAlg);
   }
 
+  /**
+   * ─── DOD-M15-REFUSED-INBOUND-SILENT-1: refusals the RECEIVING operator can actually see ───────
+   *
+   * Every inbound refusal already logs a `reason`, an `impact` and a `guidance` — and they are
+   * good. They had no reader. From the receiving operator's chair a refused message simply never
+   * arrives: the conversation goes quiet with a full explanation sitting in a file they have no
+   * reason to open, and they conclude the other person stopped replying.
+   *
+   * `content_hash_alg_unknown` is why this matters more than it sounds. It is a VERSION SKEW, so it
+   * affects every message from that counterparty, permanently — not a rare one-off.
+   *
+   * **DEDUPLICATED PER SESSION PER REASON, and that is the design, not an optimisation.** A skewed
+   * peer turns one problem into a flood: the first refusal of a kind is the signal, the ninetieth is
+   * noise that trains the operator to ignore the surface. `count` keeps the scale visible without
+   * repeating the alert.
+   *
+   * **NEVER carries the content.** It failed verification; surfacing it is the injection path the
+   * cross-check exists to close. The operator learns that a message was refused and why — never
+   * what it said.
+   *
+   * In memory, deliberately: a restart re-signalling a still-broken peer is correct behaviour, not
+   * duplication, and durability here would buy nothing the next refusal does not.
+   */
+  #contentRefusals = new Map<string, Map<string, { reason: string; impact?: string; guidance?: string; firstAt: number; count: number; surfaced: boolean }>>();
+
+  /** Record an inbound refusal for the operator. First of its kind per session is the signal. */
+  noteContentRefusal(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    detail?: { impact?: string; guidance?: string },
+  ): void {
+    const key = this.#k(agentName, sessionId);
+    let perSession = this.#contentRefusals.get(key);
+    if (!perSession) {
+      perSession = new Map();
+      this.#contentRefusals.set(key, perSession);
+    }
+    const existing = perSession.get(reason);
+    if (existing) {
+      existing.count += 1;
+      return;
+    }
+    perSession.set(reason, {
+      reason,
+      impact: detail?.impact,
+      guidance: detail?.guidance,
+      firstAt: Date.now(),
+      count: 1,
+      surfaced: false,
+    });
+  }
+
+  /**
+   * Drain the refusals this operator has not been shown yet, and mark them shown.
+   *
+   * Draining rather than peeking: a refusal the operator has seen once must not re-announce on
+   * every subsequent read, or the surface becomes the flood the dedup above exists to prevent.
+   * `count` still grows underneath, so a later reader can ask how many without being told again.
+   */
+  takeContentRefusals(
+    agentName: string,
+    sessionId: string,
+  ): Array<{ reason: string; impact?: string; guidance?: string; count: number }> {
+    const perSession = this.#contentRefusals.get(this.#k(agentName, sessionId));
+    if (!perSession) return [];
+    const out: Array<{ reason: string; impact?: string; guidance?: string; count: number }> = [];
+    for (const notice of perSession.values()) {
+      if (notice.surfaced) continue;
+      notice.surfaced = true;
+      out.push({ reason: notice.reason, impact: notice.impact, guidance: notice.guidance, count: notice.count });
+    }
+    return out;
+  }
+
   #markContentUnverifiable(agentName: string, sessionId: string, why: "tampered" | "unverifiable"): void {
     const key = this.#k(agentName, sessionId);
     if (why === "unverifiable" && this.#contentDesynced.get(key) === "tampered") return;
@@ -6714,6 +6789,13 @@ export class SessionNodeManager {
         impact: "this message could not be verified, so it was NOT ingested and NOT shown. The algorithm name is a claim by the sender and is not covered by any signature, so it does not establish what they actually did. This session will not auto-co-sign at close.",
         guidance: "Almost always their CELLO build is newer than this one: ask which version they are running, and upgrade. If they are on the SAME version as you, that explanation does not hold and the frame was malformed or crafted — do not close the session by auto-acknowledgement.",
       });
+      // DOD-M15-REFUSED-INBOUND-SILENT-1: the SAME strings the log just carried, to the operator.
+      // This reason is a version skew, so it affects every message from that counterparty — without
+      // this the conversation goes permanently quiet and they conclude the peer stopped replying.
+      this.noteContentRefusal(agentName, sessionId, "content_hash_alg_unknown", {
+        impact: "this message could not be verified, so it was NOT ingested and NOT shown. The algorithm name is a claim by the sender and is not covered by any signature, so it does not establish what they actually did. This session will not auto-co-sign at close.",
+        guidance: "Almost always their CELLO build is newer than this one: ask which version they are running, and upgrade. If they are on the SAME version as you, that explanation does not hold and the frame was malformed or crafted — do not close the session by auto-acknowledgement.",
+      });
       return { ok: false, reason: "content_hash_alg_unknown" };
     }
     let computed: Uint8Array;
@@ -6763,6 +6845,14 @@ export class SessionNodeManager {
       // auto-acknowledge gate must never auto-co-sign it. The session stays alive (DOD-MSG-7),
       // but the responder seal now requires the agent's explicit decision, not an auto-ack.
       this.#markContentUnverifiable(agentName, sessionId, "tampered");
+      // DOD-M15-REFUSED-INBOUND-SILENT-1. Deliberately does NOT include the content or the hashes:
+      // it failed verification, and showing it is the injection path this cross-check closes.
+      this.noteContentRefusal(agentName, sessionId, "content_hash_mismatch", {
+        impact:
+          "a message arrived whose bytes do not match the hash the sender committed to, so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
+        guidance:
+          "Either the message was altered in transit or the sender's record is wrong. Ask the counterparty to resend. Do not close this session by auto-acknowledgement — seal it only by an explicit decision.",
+      });
       return { ok: false, reason: "content_hash_mismatch" };
     }
 
