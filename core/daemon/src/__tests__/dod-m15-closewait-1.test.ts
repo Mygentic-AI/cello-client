@@ -41,7 +41,7 @@
  *     during the background wait finishes on its next start rather than orphaning the session.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { CLOSE_COMMITTED_GUIDANCE, describeSealCommitted } from "../close-commitment.js";
 
 describe("DOD-M15-CLOSEWAIT-1: the committed answer cannot be mistaken for a sealed one", () => {
@@ -118,4 +118,138 @@ describe("DOD-M15-CLOSEWAIT-1: the committed answer cannot be mistaken for a sea
       String(describeSealCommitted({ sessionId: "x", deadlineMs: 660_000 })["guidance"]),
     );
   });
+});
+
+/**
+ * THE ORDERING GUARD — the most dangerous part of this unit, and the revert test found it untested.
+ *
+ * Deleting the `handedOff` check from the enclosing `finally` left every test green. That check is
+ * the only thing stopping the close from releasing the broker's seal connection while the background
+ * ceremony is still using it — which would not merely report the seal differently, it would break it
+ * mid-flight. A guard nobody hears is not a guard.
+ */
+describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () => {
+  const AGENT = "agent-a";
+  const SESSION = "ab".repeat(16);
+
+  /** Builds a cross-node ACTIVE close whose seal never resolves, so the tail stays in flight. */
+  async function harness() {
+    const { registerCloseSessionHandler } = await import("../close-session-handler.js");
+    const handlers = new Map<string, (p: Record<string, unknown>, c: string) => Promise<unknown>>();
+    const stop = vi.fn(async () => {});
+    const crossNodeBrokerBySession = new Map<string, string>([[`${AGENT}:${SESSION}`, "gcp-usc1"]]);
+
+    registerCloseSessionHandler({
+      handlers,
+      logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      sessionNodeManager: {
+        getSessionRecord: () => ({ agent_name: AGENT, agent_id: "aid", session_id: SESSION, status: "active" }),
+        // A successful submit is what puts the flow into the bilateral wait — the tail under test.
+        submitSealLeaf: async () => ({ ok: true as const, sequenceNumber: 1, reportedRootHex: "aa".repeat(32) }),
+        getSealCarry: () => [],
+        getSealCertificate: () => null,
+        resolveAgentId: () => "aid",
+        setSessionName: () => {},
+        sealReadiness: () => ({ ready: true, treeSize: 1, highWaterSeq: 0, heldCount: 0, missingLeaves: 0, heldOwn: 0, heldReceived: 0, diverged: false }),
+      },
+      getConnState: () => ({ currentAgent: AGENT }),
+      resolveCurrentAgent: () => AGENT,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      getKeyProvider: () => ({ getPublicKey: async () => new Uint8Array(32) }),
+      signalingFor: () => ({ status: "connected" }),
+      sendOver: async () => ({ ok: true }),
+      waitForSignalingConnected: async () => true,
+      openVisitingConnection: () => ({ mgr: {}, stop }),
+      crossNodeBrokerBySession,
+      sealKey: (a: string, s: string) => `${a}\x1f${s}`,
+      sealInterruptedInProgress: new Set<string>(),
+      pendingSealWaiters: new Map(),
+      pendingUnilateralWaiters: new Map(),
+      resolveConsortiumRoster: async () => [{ nodeId: "gcp-usc1", peerId: "12D3KooWBroker", multiaddr: "/ip4/10.10.1.25/tcp/4000" }],
+      unilateralTimeoutMs: 10,
+      handleSealInterruptedFlow: async () => ({ ok: false, reason: "unused" }),
+      handleActiveSealFlow: async () => ({ ok: false, reason: "unused" }),
+    } as never);
+
+    return { close: handlers.get("cello_close_session")!, stop };
+  }
+
+  it("★ the close returns WITHOUT releasing the broker connection the background seal still needs", async () => {
+    /**
+     * The failure this pins: the enclosing `finally` runs when the close returns, and with the
+     * `handedOff` guard removed it calls `stop("seal-complete")` on a connection the background
+     * ceremony is still holding. The seal loses its transport mid-flight — a corrupted seal, not a
+     * differently-reported one.
+     *
+     * The seal is never resolved here, so the tail is still in flight when the assertion runs, which
+     * is exactly the window that matters.
+     */
+    const { close, stop } = await harness();
+    const bilateral = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "600000"; // long, so the tail cannot finish
+    try {
+      const res = (await close({ session_id: SESSION }, "conn-1")) as Record<string, unknown>;
+      expect(res["seal_status"], "PRECONDITION: this must be the committed (handed-off) path").toBe("committed");
+      expect(
+        stop,
+        "the close released the broker's seal connection on its way out, while the background " +
+          "ceremony was still using it — the seal loses its transport mid-flight",
+      ).not.toHaveBeenCalled();
+    } finally {
+      if (bilateral === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = bilateral;
+    }
+  }, 30_000);
+
+  it("★ and the background owner DOES release it once the ceremony finishes", async () => {
+    /**
+     * The other half of the ownership move, and the revert test found it missing: deleting the
+     * release from the background tail left everything green, because the "not released early" test
+     * asserts an absence and the blocking test is served by the enclosing finally.
+     *
+     * So nothing proved the handed-off path ever releases at all — a connection leak per close, on
+     * the DEFAULT path, invisible until a long-running daemon runs out of them.
+     */
+    const { close, stop } = await harness();
+    const bilateral = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "10"; // let the tail finish on its own
+    try {
+      const res = (await close({ session_id: SESSION }, "conn-1")) as Record<string, unknown>;
+      expect(res["seal_status"], "PRECONDITION: the handed-off path").toBe("committed");
+      // Give the detached tail room to finish. It has a 10 ms bilateral wait and a 10 ms unilateral.
+      for (let i = 0; i < 100 && stop.mock.calls.length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      expect(
+        stop,
+        "the background ceremony finished and never released the broker connection — one leaked " +
+          "connection per close, on the default path",
+      ).toHaveBeenCalled();
+    } finally {
+      if (bilateral === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = bilateral;
+    }
+  }, 30_000);
+
+  it("★ but the BLOCKING form still releases it, because there is no background owner", async () => {
+    /**
+     * The counterexample, and what stops the fix from becoming a connection leak: when the caller
+     * waits, the tail finishes inline and must release the connection exactly as before. Asserting
+     * only the first half would pass an implementation that never releases at all.
+     */
+    const { close, stop } = await harness();
+    const bilateral = process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+    process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = "10"; // resolve fast, then escalate and finish
+    try {
+      await close({ session_id: SESSION, wait_for_seal: true }, "conn-1");
+      expect(
+        stop,
+        "the blocking path finished the ceremony inline and never released the broker connection — " +
+          "the ownership move turned into a leak",
+      ).toHaveBeenCalled();
+    } finally {
+      if (bilateral === undefined) delete process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"];
+      else process.env["CELLO_SEAL_BILATERAL_TIMEOUT_MS"] = bilateral;
+    }
+  }, 30_000);
 });
