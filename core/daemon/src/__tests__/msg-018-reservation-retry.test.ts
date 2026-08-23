@@ -64,6 +64,7 @@ class ReservationNode extends FakeNode {
    *  the reservation as lost on its very next tick and rebuilds forever — which is the fixture
    *  lying, not the code churning. */
   override getConnections(): Array<{
+    id: string;
     peerId: string;
     encryption: string | undefined;
     status: string;
@@ -75,7 +76,7 @@ class ReservationNode extends FakeNode {
     // holding that connection open — and outbound is one of the four things the idle sweep spares.
     // Saying "inbound" here would make the fixture describe a connection this agent never makes.
     return this.granted
-      ? [{ peerId: "12D3KooWRelay", encryption: "noise", status: "open", direction: "outbound", openedAt: 0, streamCount: 0 }]
+      ? [{ id: "relay-conn", peerId: "12D3KooWRelay", encryption: "noise", status: "open", direction: "outbound", openedAt: 0, streamCount: 0 }]
       : [];
   }
 }
@@ -201,6 +202,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
     class IdlessCircuitNode extends ReservationNode {
       override listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/4001/p2p-circuit"]; }
       override getConnections(): Array<{
+        id: string;
         peerId: string;
         encryption: string | undefined;
         status: string;
@@ -208,7 +210,7 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
         openedAt: number;
         streamCount: number;
       }> {
-        return [{ peerId: "12D3KooWRelay", encryption: "noise", status: "open", direction: "outbound", openedAt: 0, streamCount: 0 }];
+        return [{ id: "relay-conn", peerId: "12D3KooWRelay", encryption: "noise", status: "open", direction: "outbound", openedAt: 0, streamCount: 0 }];
       }
     }
     const { logger } = makeLogger();

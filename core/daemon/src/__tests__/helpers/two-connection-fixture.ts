@@ -44,6 +44,7 @@ export class FakeNode implements Partial<CelloNode> {
   // DOD-M15-IDLE-CONNS-1 widened the shape: direction/openedAt/streamCount are what the idle
   // sweep judges a connection on. Empty here, so this fixture asserts nothing about reaping.
   getConnections(): Array<{
+    id: string;
     peerId: string;
     encryption: string | undefined;
     status: string;
