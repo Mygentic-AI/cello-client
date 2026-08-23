@@ -61,10 +61,25 @@
  * Said here because the file's own headline is "CELLO owns its own confidentiality guarantee", and a
  * reader could otherwise conclude MITM is covered. It is not, yet.
  *
- * ─── Two outputs, one agreement ────────────────────────────────────────────────────────────────
+ * ─── Two outputs, one agreement — AND TWO DIFFERENT LIFETIMES ─────────────────────────────────
  *
- * The message-sealing key and the per-session content-hash salt come from the same agreement under
- * different HKDF `info` labels. They must never be EQUAL: the salt travels wherever a content hash
+ * Decisions Carried #6 (Andre, 2026-08-23), recorded before `SEALWIRE-1` encodes anything:
+ *
+ *   **The message key NEVER touches disk** and is destroyed at session close. That is the forward
+ *   secrecy, and `destroySessionEphemeral` is what makes it real.
+ *
+ *   **The content salt IS a durable record field**, stored like any other column. It is not a key —
+ *   it decrypts nothing, and HKDF is one-way, so holding it does not lead back to the shared secret
+ *   or the message key. Storing it does not weaken forward secrecy, and NOT storing it would make an
+ *   operator's own transcript unverifiable: the content hash is recomputed from plaintext on the
+ *   receive path and again for any later check, and salted it is underivable without the salt.
+ *
+ * ⚠️ CALLED "per-session" BELOW AND THAT IS NOT SETTLED: if a revived session RE-KEYS (Decisions
+ * Carried #5), the salt changes mid-session, so it is per KEY EPOCH rather than per session. Whether
+ * a session may hold more than one salt is an open call flagged for Andre — do not encode a
+ * one-salt-per-session assumption into a schema or a wire format on the strength of this comment.
+ *
+ * The two outputs come from the same agreement under different HKDF `info` labels. They must never be EQUAL: the salt travels wherever a content hash
  * does and the relay sees it, so a salt that equalled the key would hand the key to everyone who can
  * see a hash. Domain separation by label is what keeps them independent.
  */
