@@ -40,6 +40,35 @@
  * (The envelope key already has this property structurally: X25519 ephemeral-ephemeral combines both
  * secrets, and `session-key-agreement.ts` refuses the small-order point that is the one way a peer
  * could force a degenerate result. Same guarantee, different mechanism.)
+ *
+ * ─── 🚨 THE SECRECY HERE IS THE CHANNEL'S, NOT THE CONSTRUCTION'S ──────────────────────────────
+ *
+ * The single most important thing about this module, and it does NOT resemble the envelope key.
+ *
+ * The key is a DH secret: a passive relay holding both public keys cannot compute it, and
+ * `dod-m15-keyagree-1.test.ts` pins exactly that. **The salt is a function of two values that are
+ * SENT.** Anyone who can read both contributions derives it with the same public HKDF label. There
+ * is no "a third party cannot derive it" test in this module, and there cannot be one.
+ *
+ * So "one honest participant is enough" carries a precondition that must never be dropped:
+ * unpredictable **to anyone who cannot read the exchange**.
+ *
+ * ─── THEREFORE, a rule for `DOD-M15-SEALWIRE-1`, which owns the wire ──────────────────────────
+ *
+ *   The contributions MUST be exchanged on the peer-to-peer `/cello/content/1.0.0` stream. It rides
+ *   circuit-relay-v2 carrying its own Noise session, so a relay forwarding it sees ciphertext.
+ *
+ *   They MUST NEVER appear in `session_offer` / `session_offer_accept`, or anything else a
+ *   DIRECTORY brokers. **That is the trap:** today the ONLY round trip at session open runs on the
+ *   directory's signaling stream (`session-ceremony.ts`), so it is the natural, obvious place to put
+ *   a contribution — one round trip, at open, before any leaf — and it is precisely the channel
+ *   Decision #8 forbids. Nothing about this function protects the salt if that rule is broken, and
+ *   a session that shipped that way cannot be repaired afterwards: the relay already holds the salt
+ *   and the hashes.
+ *
+ * Residual, and it now covers TWO values rather than one: the contributions are unauthenticated,
+ * exactly like the ephemerals, so an ACTIVE on-path attacker who substitutes both sides defeats the
+ * salt as well as the key. That is `DOD-M15-EPHEMERAL-AUTH-1`.
  */
 
 import { hkdf } from "@noble/hashes/hkdf.js";
