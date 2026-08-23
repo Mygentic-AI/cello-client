@@ -18,6 +18,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 import { mkdtemp, rm, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -855,14 +856,14 @@ describe("M8C-AWAY-1: away response", () => {
        */
       const sid = Buffer.from(SID_HEX, "hex");
       const msg1 = new TextEncoder().encode("hello [[OVER]]");
-      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg1));
+      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg1, LEAF_KIND_MSG));
       await snm.ingestReceivedContent("alice", SID_HEX, msg1, msgLeafHash(msg1), "c1");
       await wait(100);
       expect(events.find((e) => e.event === "session.away.response.sent")).toBeDefined();
 
       // Second message: triggers the relay-mediated seal path.
       const msg2 = new TextEncoder().encode("hello again [[OVER]]");
-      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg2));
+      await fakeRelayClient.submitMessageHash(relayAwareNode as never, sid, msgLeafHash(msg2, LEAF_KIND_MSG));
       await snm.ingestReceivedContent("alice", SID_HEX, msg2, msgLeafHash(msg2), "c2");
       await wait(100);
 

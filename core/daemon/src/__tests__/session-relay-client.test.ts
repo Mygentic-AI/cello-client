@@ -202,7 +202,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     client.registerSession(Buffer.from(sidB).toString("hex"), relay.node);
 
     // Drive the relay's challenge → auth_ok so the client authenticates on first submit.
-    const submit1 = client.submitMessageHash(relay.node, sidA, new Uint8Array(32).fill(1));
+    const submit1 = client.submitMessageHash(relay.node, sidA, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -214,7 +214,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
 
     // Now session B's FIRST submit. Its own relay counter is 0, so it must send last_seen_seq 0
     // — NOT session A's 5. With the old agent-global #lastSeen this would be 5 → relay rejects.
-    const submit2 = client.submitMessageHash(relay.node, sidB, new Uint8Array(32).fill(2));
+    const submit2 = client.submitMessageHash(relay.node, sidB, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "hash_submit_ack", sequence_number: 1 });
     expect((await submit2).ok).toBe(true);
@@ -242,7 +242,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     const sid = new Uint8Array(16).fill(0x0c);
     client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
 
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(9));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(9, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -302,7 +302,7 @@ describe("AgentRelayClient: client_record_assignment (FED-OPTIONB-SETUP-001)", (
     await tick();
 
     // A submit now — the session is already recorded, so #doSubmit's #doRecord is a no-op (no 2nd frame).
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "hash_submit_ack", sequence_number: 1 });
     expect((await submit).ok).toBe(true);
@@ -397,7 +397,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
     await tick();
 
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -429,7 +429,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
     await tick();
 
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -470,7 +470,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     relay.push({ type: "assignment_invalid", reason: "directory_signature_invalid" });
     await tick();
 
-    const result = await client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(5));
+    const result = await client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(5, LEAF_KIND_MSG));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toBe("relay_assignment_rejected");
     // No doomed hash_submit went on the wire, and no re-present storm.
@@ -501,7 +501,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     const recordsAfterRegister = relay.sentFrames.filter((f) => f["type"] === "client_record_assignment").length;
     expect(recordsAfterRegister).toBe(1); // the session IS recorded
 
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(4));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(4, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "hash_submit_error", reason: "session_not_found" });
     await tick();
@@ -530,7 +530,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     relay.push({ type: "assignment_ok" });
     await tick();
 
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(3));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(3, LEAF_KIND_MSG));
     await tick();
     // `session_sealed` is a TERMINAL answer — retrying it would be pointless traffic masking a real
     // state. NOTE: this is NOT the shape of the 2 post-seal failures in the live log; those reported
@@ -582,7 +582,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
     // The content hash that will be inside Structure1 (the submit produces it from this).
     const contentHash = new Uint8Array(32).fill(1);
-    const submit = client.submitMessageHash(relay.node, sid, contentHash);
+    const submit = client.submitMessageHash(relay.node, sid, contentHash, LEAF_KIND_MSG);
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -639,7 +639,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     client.registerSession(sidHex, relay.node, (_frame) => { leafDelivered = true; });
 
     // Authenticate the stream (leaf_deliver requires an active stream).
-    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2));
+    const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
@@ -700,7 +700,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
     // Submit own leaf → ack captures it WITH receipt.
     const contentHash = new Uint8Array(32).fill(3);
-    const submit = client.submitMessageHash(relay.node, sid, contentHash);
+    const submit = client.submitMessageHash(relay.node, sid, contentHash, LEAF_KIND_MSG);
     await tick();
     relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
     await tick();
