@@ -344,3 +344,196 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the DAEMON surfaces it, not just the m
     ).toMatch(/KEEPS RUNNING/i);
   }, 30_000);
 });
+
+describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the gaps the review found in these tests", () => {
+  let dir: string;
+  let handle: DaemonHandle | null = null;
+
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "m15-expiry-gaps-")); });
+  afterEach(async () => {
+    if (handle) await handle.stop("test_cleanup").catch(() => {});
+    handle = null;
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function controllable() {
+    let pending: (() => Promise<void>) | null = null;
+    return {
+      scheduleNext(fn: () => Promise<void>) { pending = fn; },
+      cancel() { pending = null; },
+      async fire() { const f = pending; pending = null; if (f) await f(); },
+    };
+  }
+
+  async function boot(heldExpires: string, heldNotBefore?: string) {
+    const nodes = [{ nodeId: "n1", pubkey: "b".repeat(64), region: "r", provider: "p", endpoint: "http://127.0.0.1:1" }];
+    const signatures = [{ officerIndex: 0, signature: "c".repeat(128) }];
+    const okNotBefore = new Date(Date.now() - 400 * DAY).toISOString();
+    const atBoot = { version: 1, not_before: okNotBefore, expires: new Date(Date.now() + 400 * DAY).toISOString(), nodes, signatures };
+    const held = { version: 1, not_before: heldNotBefore ?? okNotBefore, expires: heldExpires, nodes, signatures };
+    let booted = false;
+    const events: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const sched = controllable();
+    handle = await startDaemon({
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: dir,
+      socketPath: join(dir, "daemon.sock"),
+      lockFilePath: join(dir, "daemon.lock"),
+      maxConnections: 8,
+      version: "0.0.1-test",
+      logger: {
+        debug() {}, info() {},
+        warn: (event: string, ctx?: Record<string, unknown>) => events.push({ event, ctx: ctx ?? {} }),
+        error: (event: string, ctx?: Record<string, unknown>) => events.push({ event, ctx: ctx ?? {} }),
+      },
+      manifestProvider: {
+        loadAndVerify: async () => atBoot,
+        getCurrentManifest: () => (booted ? held : atBoot),
+        updateManifest: () => {},
+      },
+      manifestRootKeys: ["a".repeat(64)],
+      manifestThreshold: 1,
+      rosterSweepScheduler: sched,
+      fetchFn: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
+    } as unknown as DaemonConfig);
+    booted = true;
+    return { events, sched };
+  }
+
+  it("★ F1: the SWEEP TICK calls the check — the only unprompted signal there is", async () => {
+    /**
+     * Deleting `checkManifestValidity()` from the sweep left all sixteen tests green, because the
+     * daemon-level ones read `cello_status`, which computes validity independently, and no tick ever
+     * fired inside a 31 ms test.
+     *
+     * What that left unproven is the half that works when nobody is looking. The status field
+     * requires an operator to run a command; the LOG LINE is the durable record and the only thing
+     * that fires on its own — and in production it is delivered exclusively by that one deletable
+     * line. My own test-file header claimed the wiring was asserted. It was asserted for the status
+     * field and not for this.
+     */
+    const { events, sched } = await boot(new Date(Date.now() - 2 * DAY).toISOString());
+
+    expect(
+      events.map((e) => e.event),
+      "PRECONDITION: nothing should have fired before the first tick",
+    ).not.toContain("directory.auth.manifest.expired.live");
+
+    await sched.fire();
+
+    expect(
+      events.map((e) => e.event),
+      "the daemon never re-checked its trust anchor on the sweep tick, so the ONLY unprompted " +
+        "signal that a live daemon is running on an expired manifest never fires. An operator who " +
+        "does not happen to run cello_status is never told at all.",
+    ).toContain("directory.auth.manifest.expired.live");
+  }, 30_000);
+
+  it("★ F2: the CLI status surface carries it too, not just the MCP one", async () => {
+    /**
+     * Two separate spread sites. `cello_status` is the MCP handler; `status` is what `cello status`
+     * calls from the CLI, and it JSON-stringifies the whole response, so the fields do reach the
+     * operator. Only the MCP one was asserted — deleting the CLI spread was green.
+     *
+     * Scenario: an operator with no MCP client attached, 40 days past expiry, runs `cello status`
+     * and sees a roster block reporting `current` with nothing about the anchor.
+     */
+    await boot(new Date(Date.now() - 40 * DAY).toISOString());
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "cli" });
+    const cli = (await c.send("status", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(
+      cli["manifest_expired"],
+      "`cello status` — the surface an operator without an MCP client uses — said nothing about a " +
+        "trust anchor that lapsed 40 days ago",
+    ).toBe(true);
+    expect(String(cli["manifest_validity_guidance"])).toMatch(/no longer|NO ASSURANCE/i);
+  }, 30_000);
+
+  it("★ F8: the not_yet_valid path is reachable at RUNTIME, and now says so", async () => {
+    /**
+     * Review F8: nothing exercised this state past the classifier. It is reachable exactly one way —
+     * startup and the poll both REFUSE a not-yet-valid manifest, so the only live route is the clock
+     * moving BACKWARD past `not_before`: a wrong RTC, a VM resume, NTP not yet synced. Which is
+     * precisely the case the guidance was written for, and precisely the case nothing tested.
+     */
+    const { events, sched } = await boot(
+      new Date(Date.now() + 400 * DAY).toISOString(),
+      new Date(Date.now() + 10 * DAY).toISOString(), // window opens in the future = clock went back
+    );
+    await sched.fire();
+
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "mcp" });
+    const status = (await c.send("cello_status", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(status["manifest_not_yet_valid"]).toBe(true);
+    expect(
+      String(status["manifest_validity_guidance"]),
+      "the overwhelmingly likely cause is this machine's clock, and the guidance must say so first",
+    ).toMatch(/clock/i);
+    expect(events.map((e) => e.event)).toContain("directory.auth.manifest.not.yet.valid.live");
+  }, 30_000);
+
+  it("★ F3 end-to-end: a MALFORMED not_before is reported, not waved through as valid", async () => {
+    const { events, sched } = await boot(
+      new Date(Date.now() + 400 * DAY).toISOString(),
+      "2026-13-01T00:00:00Z", // month thirteen
+    );
+    await sched.fire();
+
+    const c = await connectToDaemon(join(dir, "daemon.sock"));
+    await c.send("ipc.connect", { clientType: "mcp" });
+    const status = (await c.send("cello_status", {})) as Record<string, unknown>;
+    c.close();
+
+    expect(
+      status["manifest_window_unreadable"],
+      "a manifest whose not_before does not parse was classified as VALID and reported nothing — " +
+        "the fail-open this unit's own comment claimed was impossible",
+    ).toBe(true);
+    expect(
+      String(status["manifest_validity_guidance"]),
+      "and it must say MALFORMED rather than stale — a different problem with a different fix",
+    ).toMatch(/MALFORMED|cannot be parsed/i);
+    expect(events.map((e) => e.event)).toContain("directory.auth.manifest.window.unreadable");
+  }, 30_000);
+});
+
+describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the warning window is pinned to something real", () => {
+  it("★ F7: the window must outlast the gap between two checks", async () => {
+    /**
+     * Review F7. Every test expressed its input as `MANIFEST_EXPIRY_WARNING_MS ± DAY`, so the
+     * relationships held at ANY value: raising 7 days to 365 left the whole suite green while making
+     * the warning fire for the final YEAR of the bundled manifest's four-year window — furniture,
+     * the exact anti-pattern this file's own comment names.
+     *
+     * Same shape as the fix one unit earlier, where one extra zero on the sweep interval was
+     * likewise invisible.
+     */
+    const { ROSTER_SWEEP_INTERVAL_MS } = await import("../roster-freshness.js");
+    const worstGapBetweenChecksMs = ROSTER_SWEEP_INTERVAL_MS * 2 + 20_000;
+    expect(
+      MANIFEST_EXPIRY_WARNING_MS,
+      "the warning window is shorter than the worst gap between two checks, so a manifest could " +
+        "pass from valid to expired without any tick ever observing expiring_soon — the warning " +
+        "would simply never fire",
+    ).toBeGreaterThan(worstGapBetweenChecksMs);
+  });
+
+  it("★ F7: and must be a small fraction of the shipped manifest's own window", async () => {
+    const { BUNDLED_CONSORTIUM_MANIFEST } = await import("../bundled-consortium-manifest.js");
+    const windowMs =
+      Date.parse(BUNDLED_CONSORTIUM_MANIFEST.expires) - Date.parse(BUNDLED_CONSORTIUM_MANIFEST.not_before);
+    expect(
+      MANIFEST_EXPIRY_WARNING_MS / windowMs,
+      `The warning window is ${((MANIFEST_EXPIRY_WARNING_MS / windowMs) * 100).toFixed(1)}% of the ` +
+        "shipped manifest's entire validity period. A warning that is on for a meaningful fraction " +
+        "of a manifest's life is furniture, not a warning, and it teaches the operator to skip the " +
+        "block that matters.",
+    ).toBeLessThan(0.02);
+  });
+});
