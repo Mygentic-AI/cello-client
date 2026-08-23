@@ -7468,11 +7468,20 @@ export class SessionNodeManager {
     // Review HIGH-2: NOT `(highWaterSeq + 1) - treeSize`. That subtraction silently assumes the
     // relay's sequence space and this tree's index space count the same things, and they do not:
     // `relay-node.ts` increments seq_counter for EVERY accepted leaf including CTRL (0x02), while
-    // `appendSessionLeaf` is only ever called with "msg" — `submitSealLeaf` deliberately computes
-    // its root without mutating the durable tree. So one seal ctrl leaf offsets the two spaces
-    // permanently, and any msg witnessed afterwards would read as a missing leaf FOREVER. That is a
-    // false positive, and a false positive here is worse than the bug it guards: it makes a healthy
+    // NOTHING APPENDS A CTRL LEAF TO THIS TREE — `submitSealLeaf` deliberately computes its root
+    // without mutating the durable tree. So one seal ctrl leaf offsets the two spaces permanently,
+    // and any msg witnessed afterwards would read as a missing leaf FOREVER. That is a false
+    // positive, and a false positive here is worse than the bug it guards: it makes a healthy
     // session unsealable, leaving force-abandon (no receipt) as the only exit. `seal-upgrade.ts`
+    //
+    // ⚠️ THIS SENTENCE USED TO READ *"`appendSessionLeaf` is only ever called with 'msg'"*, AND THAT
+    // WAS FALSE WHEN IT WAS WRITTEN — corrected, not deleted, per review pass 1 F8. Line ~7730
+    // appends "doc", and `WritableSessionTreeLeafKind` permits "ctrl" outright, so the type does not
+    // enforce it either. Doc leaves are harmless to this subtraction because they are witnessed by
+    // the relay too (LEAF_KIND_DOC) and counted in BOTH spaces; the load-bearing property is only
+    // ever about CTRL. Stating it as "msg only" made a narrower claim than the code supports and a
+    // stronger one than it holds — so a reader checking it would find a counter-example, conclude
+    // the reasoning was stale, and be one step from "fixing" the subtraction back.
     // already documents the same `leaf_count - 1` offset.
     //
     // `#witnessedSeq` answers the question directly instead of inferring it. It gains an entry when
