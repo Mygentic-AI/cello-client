@@ -230,6 +230,33 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
       // than passed as undefined) when absent, keeping createNode's "generate a fresh key" default
       // for every node that is not session-scoped.
       ...(config.transportPrivateKey ? { transportPrivateKey: config.transportPrivateKey } : {}),
+      /**
+       * DOD-M15-IDLE-CONNS-1 — the idle sweep runs on the STANDING RECEIVER only.
+       *
+       * That is the one node accepting dials from a peer it did not choose. A session node's
+       * counterparty is speaking to it by definition, and the directory-signaling node's
+       * connections are ones it dialled out — sweeping either would hang up links whose liveness
+       * another subsystem already owns.
+       */
+      ...(isReceiver ? { idleConnectionReaper: {} } : {}),
+    }).then((node) => {
+      /**
+       * SPARE WHAT REACHABILITY DEPENDS ON — the same list `DOD-M15-FRAME-1`'s promotion-time
+       * eviction sweep spares, and for the reason its comment already gives: *"Relay peers sit on
+       * this list because reservation refreshes ride them, and hanging one up would cost the agent
+       * its inbound reachability to remove a peer that cannot speak the content protocol anyway."*
+       *
+       * A reservation connection is IDLE BY NATURE between refreshes, which is exactly the shape
+       * the sweep hunts — so without this the reaper would take a NAT'd agent offline and report
+       * nothing. The predicate READS the gater on every sweep rather than capturing the set once:
+       * reservations are lost and retaken constantly (2,675 `reservation.lost` in one daemon's log),
+       * so a list frozen at build time is wrong within minutes.
+       */
+      const gater = config.connectionGater;
+      if (isReceiver && gater) {
+        node.setIdleReaperSpared((peerId) => gater.isAllowedOutboundPeer(peerId));
+      }
+      return node;
     });
   }
 }

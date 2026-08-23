@@ -41,7 +41,16 @@ export class FakeNode implements Partial<CelloNode> {
   async dial(_a: string): Promise<{ peerId: string }> { return { peerId: "remote" }; }
   async handle(_p: string, _h: unknown): Promise<void> {}
   getProtocols(): string[] { return []; }
-  getConnections(): Array<{ peerId: string; encryption: string | undefined; status: string }> { return []; }
+  // DOD-M15-IDLE-CONNS-1 widened the shape: direction/openedAt/streamCount are what the idle
+  // sweep judges a connection on. Empty here, so this fixture asserts nothing about reaping.
+  getConnections(): Array<{
+    peerId: string;
+    encryption: string | undefined;
+    status: string;
+    direction: "inbound" | "outbound";
+    openedAt: number;
+    streamCount: number;
+  }> { return []; }
   async hangUp(_peerId: string): Promise<void> {}
   onPeerConnect(_h: (p: string) => void): void {}
   onPeerDisconnect(_h: (p: string) => void): void {}
