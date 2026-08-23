@@ -197,9 +197,22 @@ class CelloNodeImpl implements CelloNode {
   #connectionLimits: ResolvedConnectionLimits = resolveConnectionLimits({});
   /** The idle-connection sweep, when this node runs one. Cleared in stop() so it cannot outlive it. */
   #idleReaperTimer: ReturnType<typeof setInterval> | null = null;
-  #idleReaperConfig: { graceMs: number; sweepIntervalMs: number } | null = null;
-  /** Peers the reaper must never hang up — the reserved relay and the directory. */
+  #idleReaperConfig: {
+    graceMs: number;
+    sweepIntervalMs: number;
+    onReaped?: (event: IdleReapEvent) => void;
+    onObserved?: (counts: ConnectionCounts) => void;
+  } | null = null;
+  /** Peers the reaper must never hang up — the reserved relay and the named counterparty. */
   #idleReaperSpared: (peerId: string) => boolean = () => false;
+  /**
+   * Connection ids observed carrying at least one stream. The activity bit F1 was missing.
+   *
+   * Keyed on CONNECTION id, not peer id: a peer may hold several connections and the question is
+   * about this one. Pruned to live connections on every sweep so a long-lived node does not
+   * accumulate ids for connections that closed months ago.
+   */
+  readonly #everCarriedStream = new Set<string>();
 
   constructor(
     libp2p: Libp2p,
@@ -330,7 +343,12 @@ class CelloNodeImpl implements CelloNode {
    * Arm the idle sweep. The TIMER does not start here — `start()` starts it, so a node that is
    * built and never started leaves no interval behind, and a stop()/start() cycle gets a fresh one.
    */
-  enableIdleReaper(config: { graceMs: number; sweepIntervalMs: number }): void {
+  enableIdleReaper(config: {
+    graceMs: number;
+    sweepIntervalMs: number;
+    onReaped?: (event: IdleReapEvent) => void;
+    onObserved?: (counts: ConnectionCounts) => void;
+  }): void {
     this.#idleReaperConfig = config;
   }
 
@@ -338,7 +356,17 @@ class CelloNodeImpl implements CelloNode {
     const config = this.#idleReaperConfig;
     if (config === null || this.#idleReaperTimer !== null) return;
     this.#idleReaperTimer = setInterval(() => {
-      void this.#sweepIdleConnections();
+      // Review F5: `getConnections()` and `isSpared` both sit outside the try below, and `isSpared`
+      // reaches into the daemon's gater. An unhandled rejection here takes the whole daemon down —
+      // a hazard `session-node-manager.ts` already names in exactly those words.
+      void this.#sweepIdleConnections().catch((err: unknown) => {
+        config.onReaped?.({
+          peerId: "",
+          ageMs: 0,
+          reason: "sweep_failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
     }, config.sweepIntervalMs);
     // Node keeps the event loop alive for a pending interval; a daemon that has stopped serving
     // must still be able to exit.
@@ -348,19 +376,63 @@ class CelloNodeImpl implements CelloNode {
   async #sweepIdleConnections(): Promise<void> {
     const config = this.#idleReaperConfig;
     if (config === null) return;
+    const now = Date.now();
+    const connections = this.getConnections();
+
+    // Record activity BEFORE judging, and prune ids for connections that have gone. A connection
+    // seen carrying a stream even once is never a candidate again — that is the fix for the defect
+    // review measured, where a live conversation was reaped because its per-message streams
+    // happened to be closed at the instant of the sweep.
+    const live = new Set(connections.map((c) => c.id));
+    for (const id of this.#everCarriedStream) if (!live.has(id)) this.#everCarriedStream.delete(id);
+    for (const c of connections) if (c.streamCount > 0) this.#everCarriedStream.add(c.id);
+
+    // C4: the count the DoD asks for, reported every sweep. Emitted BEFORE any hang-up so the
+    // number describes what was observed, not what survived.
+    config.onObserved?.({
+      total: connections.length,
+      inbound: connections.filter((c) => c.direction === "inbound").length,
+      neverSpoke: connections.filter(
+        (c) => c.direction === "inbound" && !this.#everCarriedStream.has(c.id),
+      ).length,
+      maxConnections: this.#connectionLimits.maxConnections,
+    });
+
+    const oldestByPeer = new Map<string, number>();
+    for (const c of connections) {
+      const prior = oldestByPeer.get(c.peerId);
+      if (prior === undefined || c.openedAt < prior) oldestByPeer.set(c.peerId, c.openedAt);
+    }
+
     const doomed = selectIdleConnections({
-      connections: this.getConnections(),
-      now: Date.now(),
+      connections,
+      now,
       isSpared: this.#idleReaperSpared,
+      hasEverCarriedStream: (id) => this.#everCarriedStream.has(id),
       graceMs: config.graceMs,
     });
     for (const peerId of doomed) {
       try {
         await this.hangUp(peerId);
-      } catch {
-        // The peer may have gone on its own between selection and hang-up; that is the outcome we
-        // wanted either way. Swallowed rather than logged because this class has no logger and a
-        // throw here would kill the sweep for every other connection in the same pass.
+        // Review F3: a hang-up that tells nobody is indistinguishable from the thing simply not
+        // happening — which is what the operator concludes when their next send returns
+        // `no_connection` and nothing anywhere names the local sweep.
+        config.onReaped?.({
+          peerId,
+          ageMs: now - (oldestByPeer.get(peerId) ?? now),
+          reason: "never_carried_a_stream",
+        });
+      } catch (err: unknown) {
+        // NOT swallowed. `hangUp` throws a NAMED `invalid_peer_id` written precisely so a malformed
+        // id is not read as a connection problem; an empty catch destroys that distinction and
+        // returns this code to the error substitution it was written to prevent. Reported and the
+        // loop continues, so one bad peer does not cancel the sweep for every other connection.
+        config.onReaped?.({
+          peerId,
+          ageMs: now - (oldestByPeer.get(peerId) ?? now),
+          reason: "hangup_failed",
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     }
   }
@@ -460,6 +532,7 @@ class CelloNodeImpl implements CelloNode {
   }
 
   getConnections(): Array<{
+    id: string;
     peerId: string;
     encryption: string | undefined;
     remoteAddr?: string;
@@ -470,6 +543,8 @@ class CelloNodeImpl implements CelloNode {
     streamCount: number;
   }> {
     return this.#libp2p.getConnections().map((c) => ({
+      // Per-CONNECTION id. A peer may hold several and the activity bit is about one of them.
+      id: c.id,
       peerId: c.remotePeer.toString(),
       encryption: c.encryption,
       // DOD-M15-IDLE-CONNS-1: the three fields a reaper needs, and the three an operator needs to
@@ -778,17 +853,44 @@ export const DECLARED_MAX_INCOMING_PENDING = 10;
 export const DECLARED_INBOUND_UPGRADE_TIMEOUT_MS = 10_000;
 
 /**
- * How long an inbound connection may carry NO stream before it is reaped.
+ * How long an inbound connection that has NEVER carried a stream may live.
  *
- * 90s, and the reasoning matters more than the number. The legitimate inbound dialer is a
- * counterparty an offer already named, and it opens its first stream immediately — the dial and the
- * content stream are the same act. A minute and a half is far past that and far short of anything
- * a slow network explains, so a connection still silent at 90s is one nothing is using.
+ * ─── THIS MEASURES "NEVER SPOKE", NOT "IS QUIET RIGHT NOW" ─────────────────────────────────────
+ *
+ * The first version of this compared `now - openedAt` and ANDed it with `streamCount === 0` at the
+ * instant of the sweep. **Review ran it and it hung up a live conversation.** CELLO content streams
+ * are per-message and ephemeral — one stream per frame, opened and closed — so a busy session sits
+ * at zero streams almost all of the time. With a 1000ms grace and a stream exchanged every 400ms,
+ * the connection was reaped at t≈1200ms and the next send failed with `No open connection to peer`.
+ *
+ * That is worse than the gap it closes: every session would die on a 90-second timer, and every
+ * diagnostic downstream names the network for what is a `setInterval` on the operator's own machine.
+ *
+ * So the judgement is now **has this connection EVER carried a stream** — the literal reading of
+ * the DoD's "authenticates to nothing". A connection that has ever spoken is never a candidate
+ * again, however quiet it goes.
  */
 export const IDLE_CONNECTION_GRACE_MS = 90_000;
 
 /** How often the sweep runs. A third of the grace period, so nothing lives much past it. */
 export const IDLE_CONNECTION_SWEEP_MS = 30_000;
+
+/** What the sweep reports when it acts, or fails to. Consumed by the daemon's logger. */
+export interface IdleReapEvent {
+  peerId: string;
+  ageMs: number;
+  reason: "never_carried_a_stream" | "hangup_failed" | "sweep_failed";
+  error?: string;
+}
+
+/** The connection census, emitted every sweep — the measurement the DoD line demands. */
+export interface ConnectionCounts {
+  total: number;
+  inbound: number;
+  /** Inbound connections that have not carried a stream since they opened. */
+  neverSpoke: number;
+  maxConnections: number;
+}
 
 /** The connection-manager block handed to libp2p, resolved once. */
 export interface ResolvedConnectionLimits {
@@ -819,6 +921,8 @@ export function resolveConnectionLimits(opts: {
 
 /** What the reaper needs to judge one connection. */
 export interface IdleConnectionCandidate {
+  /** libp2p's per-CONNECTION id. A peer may hold several; the activity bit is per connection. */
+  id: string;
   peerId: string;
   direction: "inbound" | "outbound";
   streamCount: number;
@@ -832,32 +936,46 @@ export interface IdleConnectionCandidate {
  *
  *  - **Anything carrying a stream.** That is the definition of in use.
  *  - **Anything inside the grace period.** A connection is silent for a moment on every dial.
- *  - **Every OUTBOUND connection.** This node chose those — the content-park deposit and pull, the
- *    restart-seal submission to a prior session's relay. Reaping one cancels our own errand to
- *    bound someone else's connection. The gater draws the same inbound/outbound line for the same
- *    reason (`#standingReceiverOutbound`).
- *  - **Whatever `isSpared` names.** In production that is the relay this node holds a live
- *    reservation with, and the directory. A relay reservation is IDLE BY NATURE between refreshes,
- *    which is exactly the shape hunted here — so a reaper without this predicate would take an
- *    agent's inbound reachability away and report nothing. That is the one trade this milestone
- *    forbids.
+ *  - **Every INBOUND connection that has ever carried a stream** (see the grace constant). A peer
+ *    that has spoken is not "authenticating to nothing", however quiet it is now.
+ *  - **Every OUTBOUND connection** — as a SELECTION rule. This node chose those: the content-park
+ *    deposit and pull, the restart-seal submission to a prior session's relay. Reaping one cancels
+ *    our own errand to bound someone else's connection. **Note the honest bound:** `hangUp` is
+ *    PEER-scoped and drops every connection to that peer, so a peer holding one idle inbound AND
+ *    one live outbound connection loses both. Nothing reaches that state today (the gater denies
+ *    inbound from any peer that is not the named counterparty or the reserved relay, and both are
+ *    spared), but the rule is "outbound connections are never SELECTED", not "outbound connections
+ *    are never closed". This project has already paid once for a comment claiming the stronger
+ *    version — `session-node-manager.ts` records a sweep that hung up the content-park dials and
+ *    surfaced as `relay_unavailable`, a transport label for a local decision.
+ *  - **Whatever `isSpared` names.** In production: the relay this node holds a live reservation
+ *    with, and the counterparty the gate currently names. A relay reservation is IDLE BY NATURE
+ *    between refreshes, which is exactly the shape hunted here — a reaper without it takes an
+ *    agent's inbound reachability away and reports nothing.
  */
 export function selectIdleConnections(args: {
   connections: readonly IdleConnectionCandidate[];
   now: number;
   isSpared: (peerId: string) => boolean;
+  /** Has this CONNECTION carried a stream at any point since it opened? Never a candidate if so. */
+  hasEverCarriedStream: (connectionId: string) => boolean;
   graceMs?: number;
 }): string[] {
   const grace = args.graceMs ?? IDLE_CONNECTION_GRACE_MS;
-  return args.connections
+  const doomed = args.connections
     .filter(
       (c) =>
         c.direction === "inbound" &&
         c.streamCount === 0 &&
+        !args.hasEverCarriedStream(c.id) &&
         args.now - c.openedAt >= grace &&
         !args.isSpared(c.peerId),
     )
     .map((c) => c.peerId);
+  // DEDUPLICATED because `hangUp` is PEER-scoped: two idle connections to one peer would otherwise
+  // yield the same id twice and hang it up twice. Harmless but noisy, and it would double-count in
+  // whatever the caller reports.
+  return [...new Set(doomed)];
 }
 
 export function resolveConnectionMonitorConfig(opts: {
@@ -976,6 +1094,12 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     node.enableIdleReaper({
       graceMs: opts.idleConnectionReaper.graceMs ?? IDLE_CONNECTION_GRACE_MS,
       sweepIntervalMs: opts.idleConnectionReaper.sweepIntervalMs ?? IDLE_CONNECTION_SWEEP_MS,
+      // Forwarded EXPLICITLY. The first version of this call built the config from the two numbers
+      // and silently dropped both callbacks, so the daemon's logging and its connection census were
+      // declared, honoured by the node, and reachable by nobody — the same shape as `wait_for_seal`
+      // being declared, honoured and never forwarded by the shim.
+      ...(opts.idleConnectionReaper.onReaped ? { onReaped: opts.idleConnectionReaper.onReaped } : {}),
+      ...(opts.idleConnectionReaper.onObserved ? { onObserved: opts.idleConnectionReaper.onObserved } : {}),
     });
   }
   return node;

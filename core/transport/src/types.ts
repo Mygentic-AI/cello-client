@@ -17,6 +17,8 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { ConnectionGater, Stream } from "@libp2p/interface";
 import type { Dialability, Unsubscribe } from "./autonat.js";
 import type { ResolvedConnectionMonitorConfig as ConnectionMonitorPolicy } from "./node.js";
+// DOD-M15-IDLE-CONNS-1 — the sweep's report and its per-sweep census.
+import type { IdleReapEvent, ConnectionCounts } from "./node.js";
 
 // ─── Options ────────────────────────────────────────────────────────────────
 
@@ -172,10 +174,23 @@ export interface CreateNodeOptions {
    * would hang up links their own subsystem is responsible for.
    */
   idleConnectionReaper?: {
-    /** Silence allowed before an inbound connection is hung up. Default `IDLE_CONNECTION_GRACE_MS`. */
+    /**
+     * How long a connection that has NEVER carried a stream may live. Default
+     * `IDLE_CONNECTION_GRACE_MS`. NOT an idle timer: a connection that has ever spoken is never a
+     * candidate again, because CELLO's per-message streams leave a busy session at zero streams
+     * almost all of the time.
+     */
     graceMs?: number;
     /** How often to look. Default `IDLE_CONNECTION_SWEEP_MS`. */
     sweepIntervalMs?: number;
+    /**
+     * Told when a connection is hung up, and when a sweep or a hang-up FAILS. Without it the reaper
+     * is a guard nobody hears — the operator's next send returns `no_connection` and nothing names
+     * the local timer that caused it.
+     */
+    onReaped?: (event: IdleReapEvent) => void;
+    /** Told the connection census every sweep — the count the DoD line requires before any tuning. */
+    onObserved?: (counts: ConnectionCounts) => void;
   };
 }
 
@@ -264,6 +279,8 @@ export interface CelloNode {
    * tell "dead muxer on a live socket" from "dead through" — see hangUp (DOD-M12-CONN-EVICT-1).
    */
   getConnections(): Array<{
+    /** libp2p's per-CONNECTION id — a peer may hold several, and the activity bit is per connection. */
+    id: string;
     peerId: string;
     encryption: string | undefined;
     remoteAddr?: string;
@@ -301,12 +318,12 @@ export interface CelloNode {
   };
 
   /**
-   * Name the peers the idle sweep must never hang up — the relay this node holds a live
-   * reservation with, and the directory.
+   * Name the peers the idle sweep must never hang up — the relay this node holds a live reservation
+   * with, and the peer the gate currently names (the admitted dialer, then the counterparty).
    *
    * A reservation connection is idle BY NATURE between refreshes, which is precisely the shape the
-   * sweep hunts. Reaping it costs the agent every NAT'd inbound session it would have received,
-   * silently. Settable rather than fixed at construction because the reserved relay changes.
+   * sweep hunts. And the node is REUSED across promotion, so without the second the sweep reaps the
+   * counterparty mid-conversation. Settable rather than fixed at construction because both change.
    */
   setIdleReaperSpared(isSpared: (peerId: string) => boolean): void;
 

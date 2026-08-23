@@ -199,14 +199,17 @@ describe("I3: a connection carries what a reaper needs to judge it", () => {
 });
 
 describe("I4: the reaper closes a silent peer and SPARES the ones reachability depends on", () => {
-  const base = { direction: "inbound" as const, streamCount: 0, openedAt: 0 };
+  const base = { id: "c1", direction: "inbound" as const, streamCount: 0, openedAt: 0 };
+  /** Default: nothing has ever spoken. Tests that care override it. */
+  const neverSpoke = () => false;
 
   it("selects an inbound connection that has opened no stream past the grace period", () => {
     const now = 60_000;
     const picked = selectIdleConnections({
-      connections: [{ ...base, peerId: "silent", openedAt: now - IDLE_CONNECTION_GRACE_MS - 1 }],
+      connections: [{ ...base, id: "c-silent", peerId: "silent", openedAt: now - IDLE_CONNECTION_GRACE_MS - 1 }],
       now,
       isSpared: () => false,
+      hasEverCarriedStream: neverSpoke,
     });
     expect(picked).toEqual(["silent"]);
   });
@@ -214,9 +217,10 @@ describe("I4: the reaper closes a silent peer and SPARES the ones reachability d
   it("does NOT select a connection that is carrying a stream, however old", () => {
     const now = 10_000_000;
     const picked = selectIdleConnections({
-      connections: [{ ...base, peerId: "busy", openedAt: 0, streamCount: 1 }],
+      connections: [{ ...base, id: "c-busy", peerId: "busy", openedAt: 0, streamCount: 1 }],
       now,
       isSpared: () => false,
+      hasEverCarriedStream: neverSpoke,
     });
     expect(picked).toEqual([]);
   });
@@ -224,9 +228,10 @@ describe("I4: the reaper closes a silent peer and SPARES the ones reachability d
   it("does NOT select a connection still inside the grace period", () => {
     const now = 60_000;
     const picked = selectIdleConnections({
-      connections: [{ ...base, peerId: "new", openedAt: now - IDLE_CONNECTION_GRACE_MS + 1 }],
+      connections: [{ ...base, id: "c-new", peerId: "new", openedAt: now - IDLE_CONNECTION_GRACE_MS + 1 }],
       now,
       isSpared: () => false,
+      hasEverCarriedStream: neverSpoke,
     });
     expect(picked).toEqual([]);
   });
@@ -244,11 +249,12 @@ describe("I4: the reaper closes a silent peer and SPARES the ones reachability d
     const now = 10_000_000;
     const picked = selectIdleConnections({
       connections: [
-        { ...base, peerId: "relay", openedAt: 0 },
-        { ...base, peerId: "stranger", openedAt: 0 },
+        { ...base, id: "c-relay", peerId: "relay", openedAt: 0 },
+        { ...base, id: "c-stranger", peerId: "stranger", openedAt: 0 },
       ],
       now,
       isSpared: (p) => p === "relay",
+      hasEverCarriedStream: neverSpoke,
     });
     expect(picked).toEqual(["stranger"]);
   });
@@ -259,11 +265,79 @@ describe("I4: the reaper closes a silent peer and SPARES the ones reachability d
     // inbound/outbound distinction for the same reason.
     const now = 10_000_000;
     const picked = selectIdleConnections({
-      connections: [{ ...base, peerId: "errand", direction: "outbound", openedAt: 0 }],
+      connections: [{ ...base, id: "c-errand", peerId: "errand", direction: "outbound", openedAt: 0 }],
       now,
       isSpared: () => false,
+      hasEverCarriedStream: neverSpoke,
     });
     expect(picked).toEqual([]);
+  });
+});
+
+describe("I4b: a connection that HAS spoken is never a candidate again", () => {
+  /**
+   * THE TEST WHOSE ABSENCE LET THE DEFECT THROUGH, and review found it by RUNNING the reaper: with
+   * a 1000ms grace and a stream exchanged every 400ms, the connection was hung up at t≈1200ms and
+   * the next send failed with `No open connection to peer`.
+   *
+   * The cause was that the predicate compared `now - openedAt` and ANDed it with "zero streams at
+   * this instant". CELLO content streams are per-message and ephemeral — one stream per frame — so
+   * a busy session sits at zero streams almost all of the time. The old I5 test hid this by holding
+   * ONE stream open for the entire window, which is the shape no real session ever has.
+   */
+  const base = { id: "c1", direction: "inbound" as const, streamCount: 0, openedAt: 0 };
+
+  it("spares a connection that carried a stream earlier and is quiet NOW", () => {
+    const picked = selectIdleConnections({
+      connections: [{ ...base, id: "c-chatty", peerId: "counterparty" }],
+      now: 10_000_000,
+      isSpared: () => false,
+      // It spoke once, at some point. That is the whole question.
+      hasEverCarriedStream: (id) => id === "c-chatty",
+    });
+    expect(picked, "a connection that has spoken was reaped for being quiet").toEqual([]);
+  });
+
+  it("still reaps a sibling connection to the SAME peer that never spoke", () => {
+    // The bit is per CONNECTION, not per peer — otherwise one live connection would shelter any
+    // number of dead ones opened by the same peer.
+    const picked = selectIdleConnections({
+      connections: [
+        { ...base, id: "c-spoke", peerId: "p" },
+        { ...base, id: "c-silent", peerId: "p" },
+      ],
+      now: 10_000_000,
+      isSpared: () => false,
+      hasEverCarriedStream: (id) => id === "c-spoke",
+    });
+    expect(picked).toEqual(["p"]);
+  });
+
+  it("returns each peer once even when several of its connections qualify", () => {
+    // `hangUp` is peer-scoped, so duplicates would hang the same peer up twice and double-count in
+    // whatever the caller reports.
+    const picked = selectIdleConnections({
+      connections: [
+        { ...base, id: "a", peerId: "p" },
+        { ...base, id: "b", peerId: "p" },
+      ],
+      now: 10_000_000,
+      isSpared: () => false,
+      hasEverCarriedStream: () => false,
+    });
+    expect(picked).toEqual(["p"]);
+  });
+
+  it("reaps exactly AT the grace boundary, not one tick later", () => {
+    // The boundary tests either side used GRACE ± 1, so flipping `>=` to `>` survived both.
+    const now = 1_000_000;
+    const picked = selectIdleConnections({
+      connections: [{ ...base, id: "c-exact", peerId: "p", openedAt: now - IDLE_CONNECTION_GRACE_MS }],
+      now,
+      isSpared: () => false,
+      hasEverCarriedStream: () => false,
+    });
+    expect(picked).toEqual(["p"]);
   });
 });
 
@@ -292,6 +366,125 @@ describe("I5: the reaper is WIRED — a real node closes a real idle connection"
 
     const closed = await waitUntil(() => listener.getConnections().length === 0, 5000);
     expect(closed, "the idle inbound connection was never reaped").toBe(true);
+  });
+
+  it("leaves a connection alone that carried a stream and then went QUIET — the real session shape", async () => {
+    /**
+     * THE PROBE REVIEW RAN, AS A TEST. This is what a CELLO conversation actually looks like: a
+     * stream per message, opened and closed, with silence in between. The previous version of this
+     * suite only covered a stream held open for the whole window — a shape no session ever has —
+     * and the reaper hung up a live conversation at t≈1200ms with a 1000ms grace.
+     *
+     * Reverting the `hasEverCarriedStream` clause turns this red while every other test stays
+     * green, which is precisely the coverage that was missing.
+     */
+    const PROTO = "/cello/idle-quiet/1.0.0";
+    const listener = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      idleConnectionReaper: { graceMs: 300, sweepIntervalMs: 100 },
+    });
+    await listener.handle(PROTO, async () => {});
+    const dialer = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+    });
+    const addr = listener.listenAddresses().find((a) => a.includes("/p2p/"));
+    if (!addr) throw new Error("listener has no addressed multiaddr");
+    const peerId = (await dialer.dial(addr)).peerId;
+
+    // One message, then close it — exactly what `newStream` does per frame.
+    const stream = await dialer.newStream(peerId, PROTO);
+    await stream.close();
+    expect(await waitUntil(() => listener.getConnections().length > 0, 5000)).toBe(true);
+
+    // Now go quiet for well past the grace, with many sweeps in between.
+    await wait(1500);
+    expect(
+      listener.getConnections().length,
+      "a connection that had already carried a stream was reaped for going quiet — this is the " +
+        "defect that killed a live conversation",
+    ).toBeGreaterThan(0);
+  });
+
+  it("tells somebody when it reaps — the guard is heard", async () => {
+    // Invariant 2: a hang-up nobody hears is indistinguishable from the thing not happening, and
+    // the operator is left reading `no_connection` with nothing naming the local timer.
+    const seen: Array<{ peerId: string; reason: string }> = [];
+    const listener = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      idleConnectionReaper: {
+        graceMs: 300,
+        sweepIntervalMs: 100,
+        onReaped: (e) => { seen.push({ peerId: e.peerId, reason: e.reason }); },
+      },
+    });
+    const dialer = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+    });
+    const addr = listener.listenAddresses().find((a) => a.includes("/p2p/"));
+    if (!addr) throw new Error("listener has no addressed multiaddr");
+    await dialer.dial(addr);
+
+    expect(await waitUntil(() => seen.length > 0, 5000), "nothing was told about the reap").toBe(true);
+    // Name the value — "it was called" is the shadow.
+    expect(seen[0]!.reason).toBe("never_carried_a_stream");
+    expect(seen[0]!.peerId).toBe(dialer.getPeerId());
+  });
+
+  it("reports the connection census every sweep — the count the DoD asks for", async () => {
+    // C4. Exposing the CAPS without the COUNT would be a capability nothing reads.
+    const counts: Array<{ total: number; inbound: number; neverSpoke: number }> = [];
+    const listener = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      idleConnectionReaper: {
+        graceMs: 60_000, // long, so nothing is reaped while we watch
+        sweepIntervalMs: 100,
+        onObserved: (c) => { counts.push({ total: c.total, inbound: c.inbound, neverSpoke: c.neverSpoke }); },
+      },
+    });
+    const dialer = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+    });
+    const addr = listener.listenAddresses().find((a) => a.includes("/p2p/"));
+    if (!addr) throw new Error("listener has no addressed multiaddr");
+    await dialer.dial(addr);
+
+    expect(await waitUntil(() => counts.some((c) => c.inbound === 1), 5000)).toBe(true);
+    const observed = counts.find((c) => c.inbound === 1)!;
+    expect(observed.total).toBeGreaterThanOrEqual(1);
+    expect(observed.neverSpoke).toBe(1);
+  });
+
+  it("stops sweeping once the node is stopped", async () => {
+    // A timer that outlives its node keeps a "stopped" daemon working, and — per the unhandled
+    // rejection route — can take the process down from a node nobody is using.
+    const seen: string[] = [];
+    const listener = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      idleConnectionReaper: {
+        graceMs: 50,
+        sweepIntervalMs: 50,
+        onObserved: () => { seen.push("swept"); },
+      },
+    });
+    await waitUntil(() => seen.length > 0, 3000);
+    await listener.stop();
+    const after = seen.length;
+    await wait(400); // several sweep intervals
+    expect(seen.length, "the sweep kept running after stop()").toBe(after);
   });
 
   it("leaves a connection alone while a stream is open on it", async () => {
