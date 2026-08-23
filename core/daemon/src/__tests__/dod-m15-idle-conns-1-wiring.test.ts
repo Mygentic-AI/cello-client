@@ -64,10 +64,114 @@ describe("W1: only the standing receiver runs the idle sweep", () => {
   });
 
   it("does NOT arm it on an ephemeral session node", async () => {
-    // A session node's counterparty is speaking to it by definition. Sweeping there would hang up
-    // a live conversation's transport on a timer that has nothing to do with the conversation.
+    // The node a session DIALS OUT on. Note what this does NOT cover — see the promotion test
+    // below, which is the half that matters and which this test was originally used to license.
     const { opts } = await captureNodeOptions({ sessionId: "s2", nodeType: "session" });
     expect(opts["idleConnectionReaper"]).toBeUndefined();
+  });
+
+  it("spares the counterparty once the gate names one — the node is REUSED across promotion", async () => {
+    /**
+     * THE TEST THAT WAS MISSING, and review found the defect by reading the promotion path:
+     * `acceptSession` does not build a new node, it moves the SAME `CelloNode` from
+     * `#standingReceivers` into `#activeNodes`. So the interval armed here keeps running after
+     * promotion, against the session's own counterparty.
+     *
+     * The earlier "does NOT arm it on a session node" test above was used to license the claim
+     * that this cannot happen. It covers the OUTBOUND node type only; the inbound half never goes
+     * through that branch. A green test proving less than it looks.
+     */
+    const gater = new SessionConnectionGater({
+      sessionId: "s5",
+      allowedPeerId: null,
+      logger: silentLogger,
+    });
+    const { node } = await captureNodeOptions({
+      sessionId: "s5",
+      nodeType: "standing_receiver",
+      connectionGater: gater,
+    });
+    const setSpared = (node as unknown as { setIdleReaperSpared: ReturnType<typeof vi.fn> })
+      .setIdleReaperSpared;
+    const isSpared = setSpared.mock.calls[0]![0] as (p: string) => boolean;
+
+    // Unclaimed: nobody is named, so nobody is spared on that basis.
+    expect(isSpared("12D3KooWCounterparty")).toBe(false);
+    // An offer names the dialer (pre-promotion) — already off-limits from here.
+    gater.admitInboundPeer("12D3KooWCounterparty");
+    expect(isSpared("12D3KooWCounterparty"), "the admitted dialer was not spared").toBe(true);
+    // Promotion narrows to the same peer as the session's counterparty.
+    gater.setAllowedPeer("12D3KooWCounterparty");
+    expect(
+      isSpared("12D3KooWCounterparty"),
+      "the session counterparty was not spared — the sweep would hang it up mid-conversation",
+    ).toBe(true);
+    // And a refused offer returns them to reapable, which is the population this unit exists for.
+    gater.closeInbound();
+    expect(
+      isSpared("12D3KooWCounterparty"),
+      "a peer whose offer was withdrawn stayed spared, leaving the reaper with no target at all",
+    ).toBe(false);
+  });
+});
+
+describe("W3: a reap is heard, and a failed reap is not mistaken for a successful one", () => {
+  it("logs the reap at WARN with an impact line, and a failure at ERROR", async () => {
+    // Invariant 2. The operator's next send returns `no_connection` and
+    // `session.transport.redial.unavailable` says "every send parks until they re-establish" —
+    // neither names the local timer. This log line is the only thing that does.
+    const lines: Array<{ level: string; event: string; fields: Record<string, unknown> }> = [];
+    const logger = {
+      debug: (event: string, fields: Record<string, unknown>) => { lines.push({ level: "debug", event, fields }); },
+      info: () => {},
+      warn: (event: string, fields: Record<string, unknown>) => { lines.push({ level: "warn", event, fields }); },
+      error: (event: string, fields: Record<string, unknown>) => { lines.push({ level: "error", event, fields }); },
+    } as unknown as Logger;
+
+    const transport = await import("@cello-protocol/transport");
+    const seen: Array<Record<string, unknown>> = [];
+    const spy = vi.spyOn(transport, "createNode");
+    spy.mockImplementation(async (opts: Record<string, unknown>) => {
+      seen.push(opts);
+      return { setIdleReaperSpared: vi.fn(), stop: async () => {} } as never;
+    });
+    try {
+      await new ProductionSessionNodeFactory(logger).createNode({
+        sessionId: "s6",
+        nodeType: "standing_receiver",
+      });
+    } finally {
+      spy.mockRestore();
+    }
+
+    const reaper = seen[0]!["idleConnectionReaper"] as {
+      onReaped: (e: { peerId: string; ageMs: number; reason: string; error?: string }) => void;
+      onObserved: (c: { total: number; inbound: number; neverSpoke: number; maxConnections: number }) => void;
+    };
+
+    reaper.onReaped({ peerId: "12D3KooWGone", ageMs: 91_000, reason: "never_carried_a_stream" });
+    const warn = lines.find((l) => l.event === "session.node.connection.reaped");
+    expect(warn, "the reap was not logged").toBeDefined();
+    expect(warn!.level).toBe("warn");
+    expect(warn!.fields["peerId"]).toBe("12D3KooWGone");
+    // The impact line is the half an operator acts on, so assert it exists rather than that the
+    // call happened — "it did not fail" is the shadow assertion.
+    expect(String(warn!.fields["impact"])).toContain("no session state changed");
+
+    // A sweep that could NOT do its job must not read as one that did.
+    reaper.onReaped({ peerId: "bad", ageMs: 0, reason: "hangup_failed", error: "invalid_peer_id" });
+    const err = lines.find((l) => l.event === "session.node.connection.reap_failed");
+    expect(err, "a failed hang-up was silent").toBeDefined();
+    expect(err!.level).toBe("error");
+    // The NAMED reason survives rather than being flattened into a generic message — the whole
+    // point of `invalid_peer_id` existing.
+    expect(err!.fields["error"]).toBe("invalid_peer_id");
+
+    reaper.onObserved({ total: 3, inbound: 2, neverSpoke: 1, maxConnections: 300 });
+    const census = lines.find((l) => l.event === "transport.connections.observed");
+    expect(census, "the connection census was never emitted").toBeDefined();
+    expect(census!.fields["neverSpoke"]).toBe(1);
+    expect(census!.fields["maxConnections"]).toBe(300);
   });
 });
 
