@@ -1134,8 +1134,14 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          *
          * This is the one genuinely dangerous part of the change. The enclosing `finally` releases
          * `sealBrokerConn`; if it ran while the tail was still going, the background seal would lose
-         * its transport mid-ceremony. So the tail releases it itself, and the enclosing `finally` is
-         * told to stand down via `handedOff`.
+         * the connection it is waiting on. So the tail releases it itself, and the enclosing
+         * `finally` stands down via `handedOff`.
+         *
+         * PRECISELY WHAT IS LOST, corrected after review: not a corrupted seal. The escalation goes
+         * over the HOME stream, so it still completes. What this connection carries is the
+         * `seal_verified` / `session_sealed` push for a CROSS-NODE bilateral seal — so releasing it
+         * early silently downgrades every cross-node close from a bilateral receipt to a unilateral
+         * one, eleven minutes later. Quieter than corruption, and still worth the guard.
          */
         const finishSeal = async (): Promise<unknown> => {
           try {

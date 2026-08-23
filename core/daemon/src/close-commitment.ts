@@ -15,7 +15,20 @@
  * ─── The contract (Decisions Carried #4, decided before this code) ─────────────────────────────
  *
  * ANSWER ON COMMITMENT, NOT ON NOTARIZATION. Nothing about what is signed, by whom, or in what
- * order changes; only the IPC response stops waiting for it.
+ * order changes; only the response stops waiting for it.
+ *
+ * ─── Crash safety, CORRECTED after review ──────────────────────────────────────────────────────
+ *
+ * I wrote that a daemon dying mid-wait is covered because `RestartSealResolver` resolves
+ * `seal_interrupted_pending`. **The conclusion holds; that mechanism is not the one.** During the
+ * background wait the row is still `status = 'active'` — nothing writes `seal_interrupted_pending`
+ * on this path.
+ *
+ * What actually covers it: the boot sweep flips `active → interrupted, interrupted_by = 'local'`,
+ * which is branch (1) of `listRestartOrphanedSessions`, and the resolver seals it from there. Two
+ * preconditions ride along and are worth knowing: `message_count > 0` (a never-messaged session is
+ * a dead handshake and is deliberately not sealed) and `restart_seal_gave_up_at IS NULL` (a session
+ * already exhausted is not retried forever).
  *
  * ─── The counterbalance this file exists to hold ───────────────────────────────────────────────
  *
@@ -25,7 +38,9 @@
  *
  *   - carries NO `sealed_root` and NO `sealed` field — there is nothing notarized yet to name;
  *   - says `seal_status: "committed"`, a word that is not "closed" and not "sealed";
- *   - names `cello_get_sealed_receipt`, or the status is one an agent can do nothing with;
+ *   - names `cello_sealed_receipt` — the TOOL, not the internal IPC method `cello_get_sealed_receipt`.
+ *     The vocabulary audit caught that slip here: naming the wrong one hands the operator a dead
+ *     command. Without the verb at all, "committed" is a status an agent can do nothing with;
  *   - says the receipt is NOT YET available, so an agent polling immediately does not read an empty
  *     answer as failure;
  *   - warns what `force` costs, because that is the move the 11-minute freeze actually provoked.

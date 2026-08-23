@@ -19,7 +19,7 @@
  *
  * **ANSWER ON COMMITMENT, NOT ON NOTARIZATION.** The close returns as soon as the SEAL leaf is
  * durably submitted. The bilateral wait and the unilateral escalation continue in the background;
- * the receipt is collected with `cello_get_sealed_receipt`.
+ * the receipt is collected with `cello_sealed_receipt`.
  *
  * Nothing about WHAT is signed, by whom, or in what order changes — the same escalation produces the
  * same receipt from the same leaf. Only the IPC response stops waiting for it.
@@ -36,9 +36,12 @@
  *
  * Both safety nets already existed, which is what made this the least-reversing option:
  *   - `cello_get_sealed_receipt` already returns the same certificate.
- *   - `RestartSealResolver` (`DOD-M12B-RESTART-SEAL-1`) already resolves `seal_interrupted_pending`
- *     on boot — a seal commitment nobody asked the directory to notarize — so a daemon that dies
- *     during the background wait finishes on its next start rather than orphaning the session.
+ *   - a daemon that dies during the background wait finishes on its next start rather than
+ *     orphaning the session. **Corrected after review:** this header first credited
+ *     `RestartSealResolver`'s `seal_interrupted_pending` branch. During the background wait the row
+ *     is still `active`, so that branch never sees it. What covers it is the boot sweep flipping
+ *     `active → interrupted, interrupted_by='local'`, which IS a branch the resolver walks. The
+ *     safety net is real; the mechanism I named was not.
  */
 
 import { describe, it, expect, vi } from "vitest";
@@ -187,8 +190,12 @@ describe("DOD-M15-CLOSEWAIT-1: the broker connection outlives the response", () 
     /**
      * The failure this pins: the enclosing `finally` runs when the close returns, and with the
      * `handedOff` guard removed it calls `stop("seal-complete")` on a connection the background
-     * ceremony is still holding. The seal loses its transport mid-flight — a corrupted seal, not a
-     * differently-reported one.
+     * ceremony is still holding.
+     *
+     * What that costs, stated accurately (the first version overstated it): the escalation runs over
+     * the HOME stream and still completes, so the seal is not corrupted. This connection carries the
+     * cross-node bilateral completion push — so losing it silently downgrades every cross-node close
+     * from a bilateral receipt to a unilateral one, eleven minutes later.
      *
      * The seal is never resolved here, so the tail is still in flight when the assertion runs, which
      * is exactly the window that matters.
