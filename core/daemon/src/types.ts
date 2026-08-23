@@ -494,6 +494,15 @@ export interface DaemonConfig {
    * manifest provider exists.
    */
   rosterSweepScheduler?: import("@cello-protocol/transport").IManifestPollScheduler;
+  /**
+   * DOD-M15-STALEROSTER-1: injectable fetch for the directory `/bootstrap` probes.
+   *
+   * Already threaded through `verifyStartupManifest` and `createConsortiumRouting`; it simply had
+   * no way in from the daemon's own config. Without it, "does the background sweep use the PATIENT
+   * probe budget" is unobservable at the wiring level — and a wiring-level blind spot is exactly
+   * what let the whole sweep be deleted with the suite still green. Defaults to global fetch.
+   */
+  fetchFn?: typeof fetch;
 }
 
 // --- Session node types ---

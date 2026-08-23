@@ -357,6 +357,9 @@ async function startDaemonHoldingLock(
     manifestThreshold,
     manifestVersionStore,
     logger,
+    // DOD-M15-STALEROSTER-1: the same injected fetch the sweep uses, so the startup probe and the
+    // background probe are exercised through one seam rather than one being untestable.
+    ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
   });
 
   // ADV-002: an operator who configures manifestProvider has opted INTO manifest enforcement, so a
@@ -391,6 +394,7 @@ async function startDaemonHoldingLock(
       initialUnresolvedNodes: startupUnresolvedNodes,
       initialUnresolvedSweptAt: startupSweptAt,
       logger,
+      ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
     });
 
   /**

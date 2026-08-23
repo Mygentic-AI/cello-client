@@ -613,3 +613,131 @@ describe("DOD-M15-STALEROSTER-1: a sweep completing after shutdown acts on nothi
     expect(sched.armed, "and it must not re-arm a stopped sweep").toBe(false);
   });
 });
+
+describe("DOD-M15-STALEROSTER-1: the background sweep uses the PATIENT probe", () => {
+  it("★ swapping the sweep to FAST_PROBE is caught", async () => {
+    /**
+     * Review F7. Nothing asserted the budget, so changing `resolveConsortiumRoster()` to
+     * `resolveConsortiumRoster(FAST_PROBE)` in the daemon left every test green.
+     *
+     * It matters because the two budgets answer different questions. FAST_PROBE (2 s per attempt)
+     * exists ONLY because the failover resolver runs inside the 10 s signaling wait — it is a
+     * deadline imposed by the caller, not a judgement about how long a healthy node may take.
+     * Nothing waits on the background sweep, so borrowing that deadline would mark a slow but
+     * perfectly healthy node "unresolved" and put it in the operator's status block. This unit
+     * exists to stop the status block lying about node reachability; using the impatient budget
+     * would make it lie in a new direction.
+     *
+     * DOD-M15-BOOTSTRAP-1's own review record notes a budget regression here already "moved rather
+     * than went away" once, which is why this is pinned rather than trusted to a comment.
+     */
+    const { createConsortiumRouting } = await import("../consortium-bootstrap.js");
+    const { PERSISTENT_PROBE } = await import("../directory-bootstrap.js");
+
+    const manifest = {
+      version: 1,
+      not_before: new Date(Date.now() - 3_600_000).toISOString(),
+      expires: new Date(Date.now() + 3_600_000).toISOString(),
+      nodes: [{ nodeId: "n1", pubkey: "b".repeat(64), region: "r", provider: "p", endpoint: "http://127.0.0.1:1" }],
+      signatures: [{ officerIndex: 0, signature: "c".repeat(128) }],
+    };
+
+    // Count probe attempts. PERSISTENT_PROBE allows more attempts than FAST_PROBE, so the attempt
+    // count distinguishes the two budgets without reaching into private state.
+    let attempts = 0;
+    const routing = createConsortiumRouting({
+      manifestProvider: {
+        loadAndVerify: async () => manifest,
+        getCurrentManifest: () => manifest,
+        updateManifest: () => {},
+      },
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      fetchFn: (async () => {
+        attempts++;
+        throw new Error("ECONNREFUSED");
+      }) as unknown as typeof fetch,
+    } as never);
+
+    // Exactly how the daemon calls it for the background sweep: no budget argument, so the
+    // module default (PERSISTENT_PROBE) applies.
+    await routing.resolveConsortiumRoster();
+    const patientAttempts = attempts;
+
+    attempts = 0;
+    const { FAST_PROBE } = await import("../directory-bootstrap.js");
+    await routing.resolveConsortiumRoster(FAST_PROBE);
+    const fastAttempts = attempts;
+
+    expect(
+      PERSISTENT_PROBE.attempts,
+      "PRECONDITION: the two budgets must actually differ in attempts, or this test cannot tell " +
+        "them apart and would pass on the regression it exists to catch",
+    ).toBeGreaterThan(FAST_PROBE.attempts);
+    expect(
+      patientAttempts,
+      "the background sweep is using the impatient budget meant for the failover path's 10 s " +
+        "deadline, so a slow-but-healthy node will be reported unresolved in cello_status",
+    ).toBeGreaterThan(fastAttempts);
+  }, 30_000);
+
+  it("★ and the DAEMON calls it that way — asserted at the wiring, not just the function", async () => {
+    /**
+     * The lesson from the wiring gap this unit already hit once: proving `resolveConsortiumRoster`
+     * defaults to the patient budget says nothing about how the daemon INVOKES it. Mutating
+     * `sweep: () => resolveConsortiumRoster()` to `resolveConsortiumRoster(FAST_PROBE)` leaves the
+     * function-level test above perfectly green.
+     *
+     * So this drives a real daemon tick and counts the probes that actually leave.
+     */
+    const { PERSISTENT_PROBE, FAST_PROBE } = await import("../directory-bootstrap.js");
+    const dir2 = await mkdtemp(join(tmpdir(), "m15-staleroster-budget-"));
+    let pending: (() => Promise<void>) | null = null;
+    const sched = {
+      scheduleNext(fn: () => Promise<void>) { pending = fn; },
+      cancel() { pending = null; },
+      async fire() { const f = pending; pending = null; if (f) await f(); },
+    };
+    const manifest = {
+      version: 1,
+      not_before: new Date(Date.now() - 3_600_000).toISOString(),
+      expires: new Date(Date.now() + 3_600_000).toISOString(),
+      nodes: [{ nodeId: "n1", pubkey: "b".repeat(64), region: "r", provider: "p", endpoint: "http://127.0.0.1:1" }],
+      signatures: [{ officerIndex: 0, signature: "c".repeat(128) }],
+    };
+    let attempts = 0;
+    const h = await startDaemon({
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: dir2,
+      socketPath: join(dir2, "daemon.sock"),
+      lockFilePath: join(dir2, "daemon.lock"),
+      maxConnections: 8,
+      version: "0.0.1-test",
+      logger: { debug() {}, info() {}, warn() {}, error() {} },
+      manifestProvider: {
+        loadAndVerify: async () => manifest,
+        getCurrentManifest: () => manifest,
+        updateManifest: () => {},
+      },
+      manifestRootKeys: ["a".repeat(64)],
+      manifestThreshold: 1,
+      rosterSweepScheduler: sched,
+      fetchFn: (async () => { attempts++; throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
+    } as unknown as DaemonConfig);
+
+    try {
+      attempts = 0; // discard the startup sweep; measure only the BACKGROUND tick
+      await sched.fire();
+      expect(
+        attempts,
+        `The background sweep spent ${attempts} probe attempts on one node. FAST_PROBE allows ` +
+          `${FAST_PROBE.attempts} and PERSISTENT_PROBE allows ${PERSISTENT_PROBE.attempts}: this is ` +
+          "the impatient budget, which exists only because the failover resolver runs inside a 10 s " +
+          "signaling deadline. Nothing waits on this sweep, and borrowing that deadline reports " +
+          "slow-but-healthy nodes as unresolved in cello_status.",
+      ).toBeGreaterThan(FAST_PROBE.attempts);
+    } finally {
+      await h.stop("test_cleanup").catch(() => {});
+      await rm(dir2, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
