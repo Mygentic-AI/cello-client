@@ -103,6 +103,34 @@ export function deriveSessionSalt(ourContribution: Uint8Array, peerContribution:
       `${ourContribution.length}. This is a local defect, not something the peer did.`,
     );
   }
+  /**
+   * OUR OWN all-zero contribution is refused too — review F6, and the asymmetry mattered.
+   *
+   * Without this, a daemon with a broken or patched RNG derives happily while the PEER refuses with
+   * *"the peer's salt contribution is all zeros"* — so the operator whose machine is actually broken
+   * reads a failure that blames their counterparty. `session-key-agreement.ts` already established
+   * the symmetric pattern for lengths ("this is a local defect, not something the peer did"); this
+   * file had it for length and not for zero.
+   */
+  if (isAllZero(ourContribution)) {
+    throw new Error(
+      "SESSION SALT: our OWN salt contribution is all zeros, so this side contributed nothing. This " +
+      "is a LOCAL defect — a broken or patched random source — not something the peer did. Refusing " +
+      "rather than deriving a salt one side chose alone.",
+    );
+  }
+  /**
+   * A REFLECTED contribution — the peer echoing ours back — is refused, matching
+   * `session-key-agreement.ts`'s reflection check. Confidentiality survives (our half is random), so
+   * this is hygiene rather than a break; but the module claims each side can verify its contribution
+   * was used, and nothing was verifying the PEER contributed at all.
+   */
+  if (Buffer.compare(Buffer.from(ourContribution), Buffer.from(peerContribution)) === 0) {
+    throw new Error(
+      "SESSION SALT: the peer's salt contribution is identical to our own — the peer contributed " +
+      "nothing to the agreement. Refusing: this is a reflection, not an exchange.",
+    );
+  }
 
   const [first, second] = Buffer.compare(Buffer.from(ourContribution), Buffer.from(peerContribution)) < 0
     ? [ourContribution, peerContribution]

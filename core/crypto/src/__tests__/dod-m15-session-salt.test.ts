@@ -24,6 +24,8 @@
 
 import { describe, it, expect } from "vitest";
 import { createHash, createHmac } from "node:crypto";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import {
   generateSaltContribution,
   deriveSessionSalt,
@@ -180,5 +182,82 @@ describe("content hash: salted, and HMAC rather than concatenation", () => {
       createHmac("sha256", Buffer.from(salt)).update(Buffer.from(msg)).digest(),
     );
     expect(Buffer.from(saltedContentHash(salt, msg))).not.toEqual(Buffer.from(withoutDomain));
+  });
+});
+
+describe("session salt: the derivation itself is pinned, byte for byte", () => {
+  /**
+   * THE REVIEW MEASURED THIS RATHER THAN ARGUING IT: an implementation using **XOR** instead of
+   * sorted concatenation passes every one of the eight assertions above.
+   *
+   * XOR is commutative, so order-independence holds. Both contributions still "matter". A peer
+   * reusing a fixed contribution still cannot pin the salt. And yet it is catastrophically broken:
+   * **whoever sends SECOND sees the first contribution and sets `b = a XOR target`**, forcing the
+   * salt to any pre-agreed constant — one shared in advance with a colluding relay, identical in
+   * every session, one rainbow table forever. That is precisely the "a single party unilaterally
+   * decides the salt" failure Decision #8 exists to prevent, and the test named "a peer that reuses a
+   * FIXED contribution cannot fix the salt" goes GREEN while it happens.
+   *
+   * The cause is the same one the KEYAGREE review found: every assertion compared the function
+   * against ITSELF. Behavioural properties cannot distinguish two commutative combiners. Only the
+   * bytes can.
+   *
+   * Recomputed independently from the module header's construction rather than snapshotted, because
+   * a snapshot of XOR is XOR with a test.
+   */
+  const A = new Uint8Array(32).fill(0x11);
+  const B = new Uint8Array(32).fill(0x22);
+
+  function expectedSalt(x: Uint8Array, y: Uint8Array): Uint8Array {
+    // sorted(x, y) concatenated — written out here, not imported, so an inverted or absent sort in
+    // the module cannot be inherited by the expectation.
+    const [first, second] = Buffer.compare(Buffer.from(x), Buffer.from(y)) < 0 ? [x, y] : [y, x];
+    const ikm = new Uint8Array(64);
+    ikm.set(first, 0);
+    ikm.set(second, 32);
+    return hkdf(sha256, ikm, new Uint8Array(0), new TextEncoder().encode("cello/session/v1/salt"), 32);
+  }
+
+  it("★ the salt is HKDF over sorted(a)‖sorted(b) — not XOR, not either half alone", () => {
+    expect(
+      Buffer.from(deriveSessionSalt(A, B)).toString("hex"),
+      "the combiner is not sorted concatenation. If it is commutative-but-reversible (XOR), the " +
+        "second mover can force the salt to a value chosen in advance with a colluding relay.",
+    ).toBe(Buffer.from(expectedSalt(A, B)).toString("hex"));
+  });
+
+  it("★ and an XOR combiner is explicitly NOT what this produces", () => {
+    // The concrete mutant the review ran. Pinned by name so it cannot come back quietly.
+    const xored = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) xored[i] = (A[i] as number) ^ (B[i] as number);
+    const xorSalt = hkdf(sha256, xored, new Uint8Array(0), new TextEncoder().encode("cello/session/v1/salt"), 32);
+    expect(Buffer.from(deriveSessionSalt(A, B))).not.toEqual(Buffer.from(xorSalt));
+  });
+
+  it("★ the FINGERPRINT is one-way, asserted as bytes rather than as 'not a substring'", () => {
+    /**
+     * Review F5, also measured: a mutant returning `salt[0..8] XOR 0xff` — the salt's first eight
+     * bytes, trivially invertible — passed all four previous assertions in 20,000 of 20,000 trials.
+     * The fingerprint travels on the wire at session open, so that mutant publishes 64 bits of the
+     * salt to the relay every time.
+     */
+    const salt = deriveSessionSalt(A, B);
+    const want = hkdf(sha256, salt, new Uint8Array(0), new TextEncoder().encode("cello/session/v1/salt-fingerprint"), 8);
+    expect(Buffer.from(saltFingerprint(salt)).toString("hex")).toBe(Buffer.from(want).toString("hex"));
+  });
+});
+
+describe("session salt: refusals are symmetric — a local fault does not blame the peer", () => {
+  it("★ our OWN all-zero contribution is refused, and says it is LOCAL", () => {
+    /**
+     * Review F6. Without this, a daemon with a broken RNG derives happily and the PEER refuses,
+     * so the operator whose machine is broken reads a message blaming their counterparty.
+     */
+    expect(() => deriveSessionSalt(new Uint8Array(32), generateSaltContribution())).toThrow(/LOCAL defect/i);
+  });
+
+  it("★ a REFLECTED contribution — the peer echoing ours — is refused", () => {
+    const ours = generateSaltContribution();
+    expect(() => deriveSessionSalt(ours, Uint8Array.from(ours))).toThrow(/reflection|contributed\s+nothing/i);
   });
 });
