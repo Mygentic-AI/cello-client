@@ -132,6 +132,35 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — the transcript records HOW a message i
     ).toBe("cd".repeat(64));
   });
 
+  it("a SENT row says self_authored — not the same thing as an unproven received row", async () => {
+    /**
+     * Caught by review of the first version of this work, and it is the same defect the column
+     * exists to prevent surviving one layer up, in the enum.
+     *
+     * `local_session_state` originally covered two OPPOSITE rows:
+     *   - one this agent AUTHORED — provenance fully known, merely not third-party-provable; and
+     *   - one RECEIVED on the soft fallback — provenance unknown, nobody's signature checked.
+     *
+     * A reader shown the transcript later could not tell "he wrote this himself" from "something
+     * arrived on a socket and was trusted". Structurally identical rows with different
+     * trustworthiness is precisely what a nullable signature column would have produced, and
+     * refusing that at the column level while allowing it at the value level fixes nothing.
+     */
+    const h = await startWithAgent("alice");
+    const mgr = h.getSessionNodeManager();
+    const enc = new TextEncoder();
+
+    mgr.recordTranscriptMessage("alice", "s-dir", 0, "sent", enc.encode("mine"), "t5");
+    mgr.recordTranscriptMessage("alice", "s-dir", 1, "received", enc.encode("theirs"), "t6");
+
+    const rows = rowsFor("s-dir");
+    expect(
+      rows.map((r) => r.attribution),
+      "an authored row and an unverified received row must NOT share a value — knowing who wrote " +
+        "something and having no idea are different facts about the record",
+    ).toEqual(["self_authored", "local_session_state"]);
+  });
+
   it("THE DISTINCTION: a proven row and an assumed row are told apart by the STORED record alone", async () => {
     /**
      * This is the assertion the bullet is actually about, and the reason the other two are not

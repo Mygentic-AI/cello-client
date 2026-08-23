@@ -1849,7 +1849,7 @@ export class SessionNodeManager {
         -- impossible rather than merely discouraged.
         sender_pubkey TEXT,             -- from INSIDE the sender's signed bytes; NULL unless verified
         sender_sig BLOB,                -- the VERIFIED Structure-2 signature; NULL unless verified
-        attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- 'verified_signature' | 'local_session_state'
+        attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- verified_signature | self_authored | local_session_state
         PRIMARY KEY (agent_id, session_id, sequence, direction)
       )
     `);
@@ -2264,7 +2264,20 @@ export class SessionNodeManager {
           agentId, sessionId, sequence, direction, blob, Date.now(),
           authorship ? Buffer.from(authorship.senderPubkey).toString("hex") : null,
           authorship ? Buffer.from(authorship.senderSig) : null,
-          authorship ? "verified_signature" : "local_session_state",
+          /**
+           * THREE values, not two — caught by CELLO_Coder_1 reviewing the first version, and it was
+           * the same defect this column exists to prevent, surviving one layer up in the enum.
+           *
+           * `local_session_state` covered two OPPOSITE rows: one this agent AUTHORED (provenance
+           * fully known, merely not third-party-provable) and one RECEIVED on the soft fallback
+           * (provenance unknown — something arrived on a socket and was trusted). A reader shown the
+           * transcript later could not separate "he wrote this himself" from "nobody checked".
+           * Structurally identical rows with different trustworthiness is exactly what I refused to
+           * ship when I rejected a nullable signature column.
+           *
+           * No plumbing needed: `direction` already carries the answer at write time.
+           */
+          authorship ? "verified_signature" : direction === "sent" ? "self_authored" : "local_session_state",
         );
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
       return true;
