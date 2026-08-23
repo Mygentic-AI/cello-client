@@ -114,6 +114,60 @@ const MAX_UNREADABLE_ALG_FRAMES = 64;
 const SALT_AGREEMENT_WAIT_MS = 5_000;
 
 /**
+ * WHY a session is hashing unsalted — review Finding 1, and this exists because one sentence was
+ * carrying five different situations.
+ *
+ * `#saltForHashing` returns null for five distinct upstream conditions, and the single guidance
+ * string asserted one of them: *"expected when your counterparty runs a build that predates the salt
+ * agreement… start a new session once they upgrade."* An operator whose counterparty was merely
+ * OFFLINE when they sent their first message — the most common case by far, since a parked first
+ * message unsalts the session by design — read that and went and told a fully up-to-date
+ * counterparty to upgrade.
+ *
+ * That is the `directory_unreachable` shape this project keeps re-learning: the message names the
+ * exit point and points at the wrong machine. A closed set of reasons with its own guidance per
+ * reason is the fix, and a closed set is what stops a sixth condition quietly inheriting a fifth's
+ * explanation.
+ */
+const UNSALTED_REASONS = {
+  /** No agreement was ever started — the counterparty has not connected. The park-only case. */
+  NO_AGREEMENT_STARTED: "no_agreement_started",
+  /** We announced and they did not answer inside the bound. */
+  AGREEMENT_TIMED_OUT: "agreement_timed_out",
+  /** They answered, terminally: they have already hashed content and can never adopt. */
+  PEER_CLOSED_ADOPTION: "peer_closed_adoption",
+  /** The session was torn down while the first send was still waiting. */
+  SESSION_TORN_DOWN: "session_torn_down",
+  /** This side already hashed, leafed, held or has in flight — adoption closed here. */
+  ADOPTION_CLOSED_LOCALLY: "adoption_closed_locally",
+  /** They answered in time and OUR OWN write failed. Nothing about their build is involved. */
+  OUR_PERSIST_FAILED: "our_persist_failed",
+} as const;
+
+type UnsaltedReason = (typeof UNSALTED_REASONS)[keyof typeof UNSALTED_REASONS];
+
+/**
+ * What the operator should DO about each. TOTAL by construction — a `Record` over the union, so a
+ * new reason cannot be added without something for the reader to act on. Same shape, and the same
+ * reason, as `refusal-reasons.ts`: that file exists because a free-form `reason: string` let a new
+ * code slip past every test in its own guard file.
+ */
+const UNSALTED_GUIDANCE: Record<UnsaltedReason, string> = {
+  [UNSALTED_REASONS.NO_AGREEMENT_STARTED]:
+    "Your counterparty was not connected when you sent this, so there was nobody to agree a salt with — most often they are simply offline and this message is going to their relay mailbox. Nothing is wrong with either build. The agreement only runs at session open, so this session stays unsalted even after they come online; a session started while you are both connected will be salted.",
+  [UNSALTED_REASONS.AGREEMENT_TIMED_OUT]:
+    "Your counterparty was connected but did not answer the salt agreement in time. Almost always they are on a build that predates it, in which case this is expected and permanent for this session — start a new session once they upgrade. If you know they are on the same version, look for session.salt.persist.failed on this side and session.salt.announce.failed on either.",
+  [UNSALTED_REASONS.PEER_CLOSED_ADOPTION]:
+    "Your counterparty declined the salt because their side of this session had already hashed messages — their conversation started before yours could agree one. Both builds are fine and both sides know. Start a new session if you want the protection.",
+  [UNSALTED_REASONS.SESSION_TORN_DOWN]:
+    "This session was closed or reset while the message was still being prepared. This line is about the salt only; look for the close or freeze event just before it for what actually happened to the session.",
+  [UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY]:
+    "This session had already hashed or sent messages before a salt could be agreed, so adopting one now would leave half the conversation verifiable by one rule and half by another. That is permanent for this session and both builds are fine. Start a new session if you want the protection.",
+  [UNSALTED_REASONS.OUR_PERSIST_FAILED]:
+    "Your counterparty answered in time and THIS side failed to store the agreed salt — the fault is local, not theirs. Do not ask them to upgrade. Look for session.salt.persist.failed immediately above this line; it names the write that failed.",
+};
+
+/**
  * DOD-M12B-ACK-1 — inbound `/cello/content/1.0.0` streams allowed per connection.
  *
  * libp2p's registrar default is 32, and it enforces the cap AFTER protocol negotiation has already
@@ -905,8 +959,8 @@ export class SessionNodeManager {
    * from durable state, and starts a fresh agreement if it reconnects.
    */
   #saltPending = new Map<string, {
-    settled: Promise<"agreed" | "timeout" | "closed">;
-    resolve: (v: "agreed" | "timeout" | "closed") => void;
+    settled: Promise<"agreed" | "timeout" | "closed" | "persist_failed">;
+    resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed") => void;
     timer: ReturnType<typeof setTimeout>;
     boundMs: number;
   }>();
@@ -8902,18 +8956,6 @@ export class SessionNodeManager {
   }
 
   /**
-   * This session's agreed salt, or null. Reads the durable row through a cache, because Decision #8
-   * persists it for exactly one reason: *"a restart silently splits the transcript"* if the lookup
-   * misses and a fresh salt is minted.
-   *
-   * A read failure returns null WITH a log rather than throwing — except the bare `!this.#db` guard,
-   * which is this file's convention at 60+ sites and only reachable during shutdown. Null means
-   * "we hold no salt",
-   * which drives the agreement to offer a contribution — and against a peer that does hold one that
-   * is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a diagnosis, not
-   * in a session that quietly hashes under the wrong value.
-   */
-  /**
    * THE ONE PLACE THAT DECIDES HOW A SESSION'S OUTBOUND CONTENT IS HASHED —
    * `DOD-M15-SEALWIRE-1` part B2b.
    *
@@ -8945,7 +8987,7 @@ export class SessionNodeManager {
     sessionId: string,
     content: Uint8Array,
   ): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> {
-    const salt = await this.#saltForHashing(agentName, sessionId);
+    const { salt, reason } = await this.#saltForHashing(agentName, sessionId);
     if (salt !== null) {
       const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
       return { hash: contentHashFor(content, { alg, salt }), alg };
@@ -8967,8 +9009,16 @@ export class SessionNodeManager {
      * is covered from the other side, because the peer DID leaf it and closes its own adoption, and
      * the wire state added in unit 1 tells us so.
      */
-    this.#hashedWithoutSalt.add(this.#k(agentName, sessionId));
-    this.#announceUnsaltedOnce(agentName, sessionId);
+    /**
+     * ⚠️ NOT FOR A TORN-DOWN SESSION — review Finding 5. `#evictSessionCaches` settles the wait and
+     * clears both of these sets; a `.add()` afterwards re-populates a map whose eviction has already
+     * run, and the entries then outlive the session they describe. There is also nothing to protect:
+     * a session that no longer exists cannot adopt a salt or split a transcript.
+     */
+    if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN) {
+      this.#hashedWithoutSalt.add(this.#k(agentName, sessionId));
+    }
+    this.#announceUnsaltedOnce(agentName, sessionId, reason ?? UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY);
     const alg = CONTENT_HASH_ALGS.SHA256;
     return { hash: contentHashFor(content, { alg, salt: null }), alg };
   }
@@ -8991,18 +9041,51 @@ export class SessionNodeManager {
    * Only a session with an agreement actually in flight waits, and only until it settles or the
    * bound expires.
    */
-  async #saltForHashing(agentName: string, sessionId: string): Promise<Uint8Array | null> {
+  async #saltForHashing(agentName: string, sessionId: string): Promise<{ salt: Uint8Array | null; reason: UnsaltedReason | null }> {
     const held = this.#getSessionSalt(agentName, sessionId);
-    if (held !== null) return held;
+    if (held !== null) return { salt: held, reason: null };
 
     const key = this.#k(agentName, sessionId);
-    if (this.#saltAdoptionClosed(agentName, sessionId).closed) return null;
+    if (this.#saltAdoptionClosed(agentName, sessionId).closed) {
+      return { salt: null, reason: UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY };
+    }
 
     const pending = this.#saltPending.get(key);
-    if (pending === undefined) return null;
+    if (pending === undefined) return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
 
     const settled = await pending.settled;
-    if (settled === "agreed") return this.#getSessionSalt(agentName, sessionId);
+    if (settled === "agreed") {
+      const agreed = this.#getSessionSalt(agentName, sessionId);
+      // A settled-`agreed` that reads back null is the failed-persist race, not an agreement. Named
+      // as its own reason rather than folded into the timeout — the fault is our own disk, and the
+      // timeout's guidance points at the counterparty's build version.
+      return agreed !== null
+        ? { salt: agreed, reason: null }
+        : { salt: null, reason: UNSALTED_REASONS.OUR_PERSIST_FAILED };
+    }
+    if (settled === "persist_failed") {
+      // Named separately from the timeout on purpose: the peer answered in time and OUR write
+      // failed, so nothing about their build is involved and sending the operator there wastes them.
+      return { salt: null, reason: UNSALTED_REASONS.OUR_PERSIST_FAILED };
+    }
+    if (settled === "closed") {
+      /**
+       * Two very different things reach `closed`, and only one of them is about the counterparty.
+       *
+       * `#handleSaltFrame`'s terminal branch — the peer told us it cannot adopt — is a settled
+       * bilateral outcome and the session is fine. `#evictSessionCaches` — this session is being
+       * torn down underneath us — is not: there is no session left to be unsalted, and a caller that
+       * marks `#hashedWithoutSalt` for it re-populates a map whose eviction has already run
+       * (review Finding 5). `#saltPending` is gone by the time we look, so the live node is what
+       * distinguishes them.
+       */
+      return {
+        salt: null,
+        reason: this.#activeNodes.has(key)
+          ? UNSALTED_REASONS.PEER_CLOSED_ADOPTION
+          : UNSALTED_REASONS.SESSION_TORN_DOWN,
+      };
+    }
     if (settled === "timeout") {
       /**
        * A DECISION, NOT A RETRY. Logged once, here, because this is the moment the session became
@@ -9012,10 +9095,15 @@ export class SessionNodeManager {
       this.#logger.warn("session.salt.agreement.timeout", {
         agentName, sessionId, waitedMs: pending.boundMs,
         impact: "the counterparty did not answer the salt agreement in time, so this session is unsalted FOR ITS LIFE — the message is being sent now rather than held any longer. Nothing is lost and nothing is degraded relative to any shipped release.",
-        guidance: "Most often the counterparty is on a build that predates the salt agreement, in which case this is expected and permanent for this session — a newer one will agree normally. If you know they are on the same version, look for session.salt.announce.failed on either side.",
+        // Review F4: `session.salt.persist.failed` reaches this same timeout by a completely
+        // different route — the peer answered promptly and OUR OWN write failed, so we returned
+        // before announcing and nothing came back. Omitting it sent that operator to ask their
+        // counterparty about a version mismatch that was never involved.
+        guidance: "Most often the counterparty is on a build that predates the salt agreement, in which case this is expected and permanent for this session — a newer one will agree normally. If you know they are on the same version, look for session.salt.persist.failed on THIS side first (our own write failing produces this same timeout), then session.salt.announce.failed on either side.",
       });
+      return { salt: null, reason: UNSALTED_REASONS.AGREEMENT_TIMED_OUT };
     }
-    return null;
+    return { salt: null, reason: UNSALTED_REASONS.AGREEMENT_TIMED_OUT };
   }
 
   /**
@@ -9025,14 +9113,17 @@ export class SessionNodeManager {
    * to build a filter; and the operator who filters it also filters the one session where it meant
    * something. Stated once, with what the session actually loses.
    */
-  #announceUnsaltedOnce(agentName: string, sessionId: string): void {
+  #announceUnsaltedOnce(agentName: string, sessionId: string, reason: UnsaltedReason): void {
     const key = this.#k(agentName, sessionId);
     if (this.#unsaltedAnnounced.has(key)) return;
     this.#unsaltedAnnounced.add(key);
     this.#logger.info("session.content.unsalted", {
       agentName, sessionId,
+      // The REASON is the field that makes this line diagnosable, and it was the missing one. The
+      // impact is the same for all six; what to do about it is not.
+      reason,
       impact: "this session hashes its messages the way every build before this feature did. Nothing is degraded relative to any shipped release and no message is affected — it only means a relay holding the hashes could confirm a guess at a short message in THIS conversation, which a salt would have prevented.",
-      guidance: "Expected when your counterparty runs a build that predates the salt agreement. If you want the protection, both sides need a build that has it, and the agreement runs at session open — so start a new session once they upgrade.",
+      guidance: UNSALTED_GUIDANCE[reason],
     });
   }
 
@@ -9045,8 +9136,8 @@ export class SessionNodeManager {
   #markSaltPending(agentName: string, sessionId: string, boundMs = SALT_AGREEMENT_WAIT_MS): void {
     const key = this.#k(agentName, sessionId);
     if (this.#saltPending.has(key)) return;
-    let resolve: (v: "agreed" | "timeout" | "closed") => void = () => { };
-    const settled = new Promise<"agreed" | "timeout" | "closed">((r) => { resolve = r; });
+    let resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed") => void = () => { };
+    const settled = new Promise<"agreed" | "timeout" | "closed" | "persist_failed">((r) => { resolve = r; });
     const timer = setTimeout(() => this.#settleSaltPending(agentName, sessionId, "timeout"), boundMs);
     // The daemon must be able to exit with this outstanding — a pending agreement is not a reason to
     // hold the process open.
@@ -9055,13 +9146,40 @@ export class SessionNodeManager {
   }
 
   /** Resolve a pending agreement. Idempotent: the first outcome wins and the timer is cleared. */
-  #settleSaltPending(agentName: string, sessionId: string, outcome: "agreed" | "timeout" | "closed"): void {
+  #settleSaltPending(agentName: string, sessionId: string, outcome: "agreed" | "timeout" | "closed" | "persist_failed"): void {
     const key = this.#k(agentName, sessionId);
     const pending = this.#saltPending.get(key);
     if (pending === undefined) return;
     this.#saltPending.delete(key);
     clearTimeout(pending.timer);
     pending.resolve(outcome);
+  }
+
+  /**
+   * THIS SESSION'S UNSALTED HASH NEVER BECAME A MESSAGE — release the permanent closure it caused.
+   *
+   * ⚠️ REVIEW FINDING 3, and it is the opposite of the direction the flag was written to defend.
+   * `#hashedWithoutSalt` closes adoption at hash time, because for a session's first message the
+   * leaf is a network round trip away and every frontier count reads zero in between. Correct — but
+   * `cello_send` has three paths that compute the hash and then produce NOTHING: a sibling send
+   * holding the in-flight claim, the frontier moving under the send, and a non-durable send failure
+   * whose bytes go to a queue with no production consumer.
+   *
+   * In all three the session was permanently unsalted for a message that exists nowhere: no leaf, no
+   * wire, no copy at the peer. And B2b-2 made two of them MORE likely on a first message, because
+   * the five-second wait widens the very window the frontier re-check is watching.
+   *
+   * Only safe because it is called on paths that provably sent nothing. It deliberately does NOT
+   * clear `#unsaltedAnnounced`: the announcement was true when it fired and re-announcing on the
+   * retry would be the per-message flood Decision #15 forbids.
+   */
+  abandonUnsaltedHash(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (!this.#hashedWithoutSalt.delete(key)) return;
+    this.#logger.debug("session.salt.unsalted_hash.abandoned", {
+      agentName, sessionId,
+      impact: "a hash computed unsalted never became a message, so this session can still adopt a salt — without this it would have stayed unsalted for its life over a send that produced nothing",
+    });
   }
 
   /**
@@ -9089,6 +9207,21 @@ export class SessionNodeManager {
     return this.#getSessionSalt(agentName, sessionId);
   }
 
+  /**
+   * This session's agreed salt, or null. Reads the durable row through a cache, because Decision #8
+   * persists it for exactly one reason: *"a restart silently splits the transcript"* if the lookup
+   * misses and a fresh salt is minted.
+   *
+   * A read failure returns null WITH a log rather than throwing — except the bare `!this.#db` guard,
+   * which is this file's convention at 60+ sites and only reachable during shutdown. Null means "we
+   * hold no salt", which drives the agreement to offer a contribution — and against a peer that does
+   * hold one that is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a
+   * diagnosis, not in a session that quietly hashes under the wrong value.
+   *
+   * ⚠️ THIS PARAGRAPH SPENT A UNIT STRANDED 180 LINES AWAY, directly above `contentHashForSession`
+   * and followed by that method's own block — so a reader hovering the hash decision got prose about
+   * salt read failures. Harmless and exactly the kind of drift that makes a comment stop being read.
+   */
   #getSessionSalt(agentName: string, sessionId: string): Uint8Array | null {
     const key = this.#k(agentName, sessionId);
     const cached = this.#sessionSalts.get(key);
@@ -9345,6 +9478,25 @@ export class SessionNodeManager {
       });
       return;
     }
+    /**
+     * ⚠️ REGISTERED BEFORE THE DIAL, NOT AFTER IT — review Finding 2, and this ordering is the whole
+     * of constraint 2 for the case that actually happens.
+     *
+     * This sat after `await newStream(...)`, which negotiates the protocol with the peer and takes
+     * tens to hundreds of milliseconds. A `cello_send` landing inside that interval found nothing
+     * pending, took the park-only exit, hashed unsalted, and **closed adoption for the life of the
+     * session** — a session with a live counterparty and an agreement about to complete. The feature
+     * off forever, and the log telling the operator their counterparty was on an old build.
+     *
+     * That is precisely the failure constraint 2 exists to prevent, arriving by the one route the
+     * implementation did not cover: the gap between deciding to announce and the frame leaving.
+     *
+     * Park-only is untouched — it never reaches this line, because `#sendSaltFrame` returns at the
+     * `!entry` guard above when there is no active node. And a failed announce settles the waiter in
+     * the catch below rather than leaving a send to sit out the full bound for a frame that never
+     * left.
+     */
+    if (!frame.adoptionClosed) this.#markSaltPending(agentName, sessionId);
     // Held outside the try so the catch can retire a stream that was opened and then failed to
     // write — the same leak, and the same fix, as `#sendDeliveryAck`.
     let saltStream: Stream | undefined;
@@ -9359,17 +9511,6 @@ export class SessionNodeManager {
         ...(frame.adoptionClosed ? { adoption_closed: frame.adoptionClosed } : {}),
       }) as Uint8Array));
       await stream.close();
-      /**
-       * B2b-2 constraint 2/5: the agreement is IN FLIGHT from here, and the first send may wait for
-       * it. Registered on a frame that actually LEFT — not at session creation — because that is the
-       * distinction constraint 5 turns on: a park-only session never connects, never announces, and
-       * so must never wait. `#markSaltPending` is a no-op once one is outstanding, so a re-announce
-       * on reconnect does not restart the clock.
-       *
-       * Not registered for a terminal frame: `adoption_closed` says the agreement is over, and
-       * opening a wait for it would make a settled question take the full bound to answer.
-       */
-      if (!frame.adoptionClosed) this.#markSaltPending(agentName, sessionId);
       this.#logger.debug("session.salt.announced", {
         agentName, sessionId, correlationId,
         /**
@@ -9382,13 +9523,27 @@ export class SessionNodeManager {
         state: frame.adoptionClosed ? "adoption_closed" : frame.fingerprint ? "holds_salt" : "offering_contribution",
       });
     } catch (err: unknown) {
+      /**
+       * ⚠️ RELEASE THE WAITER — the frame never left, so there is nothing to wait for.
+       *
+       * Registering before the dial (above) means a failed announce would otherwise leave a first
+       * send holding for the full five seconds against a frame that was never sent. Settling here
+       * makes the failure cost one dial attempt instead of the whole bound, and B2b-2 turned this
+       * from theory into something a user feels: it is the pause before their first message.
+       */
+      this.#settleSaltPending(agentName, sessionId, "timeout");
       this.#logger.warn("session.salt.announce.failed", {
         agentName, sessionId, correlationId, error: extractErrorMessage(err),
         // Review F1: this used to end "so no message is affected", which was FALSE in the situation
         // it fires in — a one-sided announce is exactly what put the two sides out of step, and the
         // peer used to freeze the session over it. It converges now, so the claim is true again;
         // it is stated with its reason rather than as a bare reassurance.
-        impact: "the counterparty was not told our salt state on this attempt. We re-announce on every reconnect, and a side that is out of step re-offers its half rather than refusing, so the agreement converges from here; nothing hashes with the salt yet, so no message is affected.",
+        //
+        // ⚠️ B2b-2 CHANGED THE LAST CLAUSE'S TRUTH. "Nothing hashes with the salt yet" was true for
+        // part A and is now false: a first send waiting on this agreement falls back to sha256 when
+        // it fails, which permanently unsalts the session. Not a message LOST — a protection not
+        // taken, and the sentence has to stop promising otherwise.
+        impact: "the counterparty was not told our salt state on this attempt. We re-announce on every reconnect, and a side that is out of step re-offers its half rather than refusing, so the agreement converges from here. No message is affected, but a first send waiting on this agreement now falls back to an unsalted hash, which is permanent for this session.",
       });
       if (saltStream !== undefined) {
         try { saltStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
@@ -9430,25 +9585,30 @@ export class SessionNodeManager {
     }
     if (action.action === "derive_and_announce") {
       /**
-       * NOT settled on a failed persist, and the reason is narrower than it first looks — measured.
+       * ⚠️ I DEFENDED THE OPPOSITE OF THIS TWICE, AND BOTH DEFENCES WERE WRONG. The code now does
+       * what the "surviving mutant" did; recording that rather than quietly switching, because the
+       * reasoning is the useful part.
        *
-       * A mutant that settles `"agreed"` here SURVIVES the suite, and it deserves to: the waiter
-       * would resolve, `#getSessionSalt` would return null because nothing was stored, and the send
-       * would fall back to `sha256` exactly as it does now. `#persistSessionSalt` logs its own
-       * failure, so the operator is not left without an explanation either. An earlier version of
-       * this comment claimed the release "would hand it a null it would hash unsalted under" — true,
-       * and not a consequence, because that is what the timeout path does too.
+       * A failed persist used to fall through with no settle, so a waiting first send sat out the
+       * FULL FIVE SECONDS and was then told, by the timeout path, to go and check its counterparty's
+       * build version — for a fault that was this machine's own disk.
        *
-       * What the un-settled waiter actually buys is the REMAINDER OF THE BOUND. A failed persist
-       * leaves this side holding no salt, which is the state that makes the agreement re-offer a
-       * contribution; a repair landing inside the remaining seconds still stores one and still
-       * salts this message. Settling early forecloses that for no gain.
+       * Defence #1 said releasing the waiter "would hand it a null it would hash unsalted under."
+       * True, and not a consequence: that is exactly what the timeout does. Defence #2 said the
+       * remaining bound gave a repair a chance to land — and the review showed that essentially
+       * cannot fire. This branch returns BEFORE the announce, so nothing goes out and nothing comes
+       * back; all five of `#sendSaltFrame`'s callers are triggered by a peer connect or an inbound
+       * frame. Only a counterparty reconnect inside those seconds could do it.
        *
-       * Kept for that reason alone, and recorded as a surviving mutant rather than defended as a
-       * caught one.
+       * So the real trade was a rare reconnect-within-five-seconds repair against five seconds of
+       * visible latency on the operator's first message AND a diagnosis pointing at the wrong
+       * machine. The repair loses. Settle immediately under its own name, so `#saltForHashing` can
+       * say *our own write failed* instead of *they did not answer*.
        */
-      if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) return;
-      this.#logger.info("session.salt.agreed", {
+      if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) {
+        this.#settleSaltPending(agentName, sessionId, "persist_failed");
+        return;
+      }      this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "derived",
       });
       this.#settleSaltPending(agentName, sessionId, "agreed");

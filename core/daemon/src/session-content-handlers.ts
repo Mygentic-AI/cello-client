@@ -404,6 +404,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         authority: "sibling_send_in_flight",
         claimHeldMs: Date.now() - claimedAt,
       });
+      // B2b-2 review F3: this send produced NOTHING — no leaf, no wire, no peer copy — so the
+      // unsalted hash computed above must not keep this session unsalted for its life.
+      sessionNodeManager.abandonUnsaltedHash(agentName, sessionId);
       return {
         ok: false,
         reason: "session_moved_under_send",
@@ -420,6 +423,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         authority: "frontier_moved_during_send",
         frontierAtGate, frontierNow,
       });
+      // B2b-2 review F3: nothing was sent, so release the unsalted hash's permanent closure. This
+      // path got MORE likely with B2b-2 — the salt wait widens the interval this check watches.
+      sessionNodeManager.abandonUnsaltedHash(agentName, sessionId);
       return {
         ok: false,
         reason: "session_moved_under_send",
@@ -459,6 +465,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       // awaiting-ACK queue already holds the content and actually drains, so writing here too
       // stored the same plaintext twice and drained neither copy from this table.
       if (!sendResult.durable) {
+        // B2b-2 review F3: a non-durable failure means the message is GONE — it reached no leaf, no
+        // peer, and the queue below has no production consumer. Nothing exists to split a
+        // transcript, so this session must not stay unsalted for its life over it.
+        sessionNodeManager.abandonUnsaltedHash(agentName, sessionId);
         const nonce = randomUUID();
         try {
           retryQueue.enqueue(sessionId, new TextEncoder().encode(nonce), sendBytes);

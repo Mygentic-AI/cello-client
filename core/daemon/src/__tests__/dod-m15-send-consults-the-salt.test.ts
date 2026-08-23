@@ -34,7 +34,8 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { CelloNode } from "@cello-protocol/transport";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
 import { CONTENT_HASH_ALGS, contentHashFor } from "../wire-content-hash.js";
@@ -84,7 +85,7 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
     ).not.toBe(hex(contentHashFor(BODY, { alg: CONTENT_HASH_ALGS.SHA256, salt: null })));
   }, 60_000);
 
-  it("★ a session with NO salt hashes exactly as every shipped build does", async () => {
+  it("PIN (survives a revert of this unit): a session with NO salt hashes exactly as every shipped build does", async () => {
     /**
      * The fallback has to be byte-identical to the old behaviour, not merely "unsalted". A peer on
      * any published build computes plain sha256 and compares; anything else here is a refusal of
@@ -170,7 +171,7 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
     expect(timedOut.length, "the decision must be recorded — this is the moment the session became permanently unsalted").toBe(1);
   }, 60_000);
 
-  it("★ a session with NOTHING pending does not wait at all — the offline-counterparty case", async () => {
+  it("PIN (survives a revert; guards the park-only-waits mutant): a session with NOTHING pending does not wait", async () => {
     /**
      * Constraint 5. A park-only session never agrees a salt, because the announcement hangs off peer
      * connect and there is no connect. Waiting the bound there would pause every message to an
@@ -188,6 +189,107 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
       elapsedMs,
       "with no agreement in flight there is nothing to wait for — pausing here delays every message to an offline counterparty",
     ).toBeLessThan(100);
+  }, 60_000);
+
+  it("★★ THE PRODUCTION PATH registers the agreement — peer connect, no test seam anywhere", async () => {
+    /**
+     * ⚠️ THE REVIEW'S BLOCKING FINDING, AND THE MOST IMPORTANT TEST IN THIS FILE.
+     *
+     * Every other wait test installs the pending agreement through `markSaltAgreementPendingForTest`.
+     * That measures `#saltForHashing`'s waiting correctly — and measures NOTHING about whether a real
+     * session ever reaches the state the seam fakes.
+     *
+     * It did not. `FakeNode.onPeerConnect` discarded its handler, so the daemon's peer-connect path
+     * never ran in any daemon test, and `#sendSaltFrame`'s registration line could be **deleted with
+     * the whole suite still green**. That line is what decides whether the salt feature can ever turn
+     * on in production, so it was the one mutant that mattered and the one nothing could catch.
+     *
+     * This test uses NO seam. A counterparty connects, the daemon announces, a send begins while the
+     * agreement is outstanding, the peer's contribution lands 150ms later, and the message must come
+     * out salted.
+     *
+     * It also covers review Finding 2 by construction: the registration used to happen AFTER
+     * `await newStream(...)`, so a send starting immediately after peer-connect found nothing pending
+     * and permanently unsalted a session whose counterparty was right there.
+     */
+    const node = new FakeNode();
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-real-", node: node as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    // The counterparty comes online. This is the only production trigger for the announcement.
+    node.firePeerConnect(PEER);
+
+    const hashing = fx.snm.contentHashForSession("alice", SID, BODY);
+    setTimeout(() => { void fx!.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER); }, 150);
+    const { alg } = await hashing;
+
+    expect(
+      fx.eventsNamed("session.salt.announced").length,
+      "precondition: peer connect must actually have produced an announcement, or the wait below has nothing to wait for and this test proves nothing",
+    ).toBeGreaterThan(0);
+    expect(
+      alg,
+      "a send starting right after the counterparty connects must WAIT — registering the agreement after the dial leaves this window open, and a message in it unsalts the session permanently",
+    ).toBe(CONTENT_HASH_ALGS.HMAC_SALT_V1);
+  }, 60_000);
+
+  it("★ a send that produced NOTHING does not unsalt the session for its life", async () => {
+    /**
+     * Review Finding 3, and it is the reachable one — the flag was set too eagerly, not too late.
+     *
+     * `cello_send` has three paths that compute the hash and then send nothing: a sibling send
+     * holding the in-flight claim, the frontier moving under the send, and a non-durable failure.
+     * In all three the session was permanently unsalted for a message that exists nowhere — no leaf,
+     * no wire, no copy at the peer. B2b-2 made two of them MORE likely on a first message, because
+     * the five-second wait widens the very interval the frontier re-check is watching.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-abandon-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const { alg } = await fx.snm.contentHashForSession("alice", SID, BODY);
+    expect(alg, "precondition: hashed unsalted, which closes adoption").toBe(CONTENT_HASH_ALGS.SHA256);
+
+    // The send is refused before anything leaves — the caller says so.
+    fx.snm.abandonUnsaltedHash("alice", SID);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+    await wait(300);
+
+    expect(
+      fx.snm.getSessionContentSalt("alice", SID),
+      "nothing was sent, so there is no transcript to split — the session must still be able to adopt a salt",
+    ).not.toBeNull();
+  }, 60_000);
+
+  it("★ the fallback names WHICH of the six reasons it is — one sentence cannot serve five causes", async () => {
+    /**
+     * Review Finding 1, blocking. `#saltForHashing` returns null for six distinct conditions and the
+     * announcement asserted one of them: *"expected when your counterparty runs a build that predates
+     * the salt agreement… start a new session once they upgrade."*
+     *
+     * An operator whose counterparty was merely OFFLINE — the most common case, since a parked first
+     * message unsalts the session by design — read that and went and told a fully up-to-date
+     * counterparty to upgrade. The message named the exit point and pointed at the wrong machine.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-flip-reason-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.contentHashForSession("alice", SID, BODY);
+
+    const said = fx.eventsNamed("session.content.unsalted");
+    expect(said.length).toBe(1);
+    expect(
+      said[0]!.ctx!["reason"],
+      "no agreement was ever started here — the counterparty never connected",
+    ).toBe("no_agreement_started");
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "and the guidance must NOT send this operator to their counterparty's build version, which was never involved",
+    ).not.toMatch(/upgrade/i);
+    expect(
+      String(said[0]!.ctx!["guidance"]),
+      "it must say what actually happened: nobody was there to agree with",
+    ).toMatch(/not connected|offline/i);
   }, 60_000);
 
   it("★ HASHING closes adoption — the window the row cannot see", async () => {

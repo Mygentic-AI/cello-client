@@ -59,7 +59,21 @@ export class FakeNode implements Partial<CelloNode> {
     streamCount: number;
   }> { return []; }
   async hangUp(_peerId: string): Promise<void> {}
-  onPeerConnect(_h: (p: string) => void): void {}
+  /**
+   * ⚠️ THE HANDLER IS CAPTURED, NOT DISCARDED — B2b-2 review, hollow-test finding.
+   *
+   * This was `onPeerConnect(_h) {}`. Throwing the handler away meant the daemon's peer-connect path
+   * never ran in ANY daemon test — and that path is the only production route that registers a
+   * pending salt agreement. The line that does it could be deleted and the whole suite stayed green,
+   * which is to say nothing measured whether the salt feature can ever turn on in production.
+   *
+   * `firePeerConnect` is how a test drives it. Non-breaking: a fixture that never calls it behaves
+   * exactly as before.
+   */
+  #peerConnectHandlers: Array<(p: string) => void> = [];
+  onPeerConnect(h: (p: string) => void): void { this.#peerConnectHandlers.push(h); }
+  /** Drive the real `onPeerConnect` path — what a counterparty coming online does. */
+  firePeerConnect(peerId: string): void { for (const h of this.#peerConnectHandlers) h(peerId); }
   onPeerDisconnect(_h: (p: string) => void): void {}
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
