@@ -351,6 +351,84 @@ describe("DOD-M12B-PENDING-EXIT-1: a seal_interrupted_pending session can finall
     expect(String(res.guidance), "it must point at the local fix").toMatch(/cello_start_agent/);
   });
 
+  it("★★ but a SEAL-PAYLOAD refusal is NOT transient, and must not be answered with 'retry later'", async () => {
+    /**
+     * ⚠️ `DOD-M15-SEALWIRE-1` bullets 3+4, review pass 2, MEDIUM-4. THE SENTENCE ABOVE WAS RIGHT FOR
+     * ITS CASE AND WRAPPED AROUND EVERY OTHER ONE.
+     *
+     * The guidance was fixed text: whatever reason `submitSealLeaf` returned got *"that is usually
+     * local and temporary… retry cello_close_session once the daemon reports healthy."* True for
+     * `standing_receiver_unavailable`, which is the test directly above.
+     *
+     * It is false for the client-side seal-payload guards. Those fire only when this daemon tried to
+     * submit a SEAL leaf whose payload was missing, unbound, or not a seal payload at all — a
+     * deterministic defect in our own code that no amount of waiting clears. **An operator hitting
+     * one was sent to `cello_start_agent`, `cello_status`, and an endless retry loop for a bug in
+     * this daemon.**
+     *
+     * That is the whole point of those guards inverted: they were built to fail LOUD, on the machine
+     * that caused it, precisely so the failure would not be mistaken for someone else's outage — and
+     * the sentence reporting them converted that back into "try again later."
+     *
+     * Asserted on all four reasons, not one, because the set is enumerated in the handler and a
+     * member added there without a matching branch would silently rejoin the transient wording.
+     */
+    for (const reason of [
+      "seal_payload_not_carried",
+      "seal_payload_unbound",
+      "seal_payload_invalid",
+      "content_not_permitted_for_leaf_kind",
+    ]) {
+      const h = harness({
+        status: "seal_interrupted_pending",
+        flow: { ok: false, reason: "unused", guidance: "" },
+        directory: { ok: true, sealedRootHex: SEALED_ROOT },
+        submit: { ok: false, reason },
+      });
+
+      const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
+
+      expect(res.reason, `${reason}: the reason must survive to the operator unchanged`).toBe(reason);
+      expect(
+        String(res.guidance),
+        `${reason}: this will NEVER clear, so telling the operator to retry is telling them to loop forever`,
+      ).not.toMatch(/retry cello_close_session/);
+      expect(
+        String(res.guidance),
+        `${reason}: and it must not be presented as someone else's outage — nothing was sent`,
+      ).not.toMatch(/usually local and temporary/);
+      expect(
+        String(res.guidance),
+        `${reason}: it must say plainly that this is a defect to report, not a state to wait out`,
+      ).toMatch(/NOT transient|defect in this daemon/i);
+    }
+  });
+
+  it("★ the ANCHOR for the branch above — every OTHER reason still gets the transient wording", async () => {
+    /**
+     * Pinned separately because the assertions above are satisfied by a handler that gives the
+     * non-transient wording to EVERYTHING — which would tell an operator whose agent simply is not
+     * started yet that they have hit a daemon defect and should report it, when one
+     * `cello_start_agent` fixes it.
+     *
+     * `relay_unavailable` is the genuinely transient case that is not the one already covered above.
+     */
+    const h = harness({
+      status: "seal_interrupted_pending",
+      flow: { ok: false, reason: "unused", guidance: "" },
+      directory: { ok: true, sealedRootHex: SEALED_ROOT },
+      submit: { ok: false, reason: "relay_unavailable" },
+    });
+
+    const res = (await h.close({ session_id: SESSION }, "conn-1")) as { reason?: string; guidance?: string };
+
+    expect(res.reason).toBe("relay_unavailable");
+    expect(
+      String(res.guidance),
+      "a relay this daemon cannot reach IS transient — sending the operator to report a defect would be worse than the bug the branch fixes",
+    ).toMatch(/retry cello_close_session/);
+  });
+
   it("hands a session BACK to the relay when both parties have posted their SEAL leaf", async () => {
     // The responder-side case. Our leaf plus the counterparty's is TWO ctrl leaves, which the relay
     // reads as both parties having posted — it starts a full BILATERAL seal, a better receipt than
