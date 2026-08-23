@@ -200,9 +200,25 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
      *
      * Asserted as "no frame went out", not merely "returned not-ok": returning an error while still
      * sending would satisfy a weaker assertion and disclose the content anyway.
+     *
+     * ⚠️ THE CLIENT IS AUTHENTICATED FIRST, AND THAT LINE IS THE TEST.
+     *
+     * Without it this passed for the wrong reason. I found it by running the mutant: with the guard
+     * disabled, the refusal came back as `relay_unavailable` after a 5-second auth timeout, and
+     * "nothing went out" was still true — because an unauthenticated client cannot send ANYTHING.
+     * The assertion was measuring the handshake, not the guard. A test whose subject never gets the
+     * chance to fail proves nothing about it.
      */
     const { client, relay, sid } = await connectedClient();
     const { payload } = sealFor(sid);
+
+    // A real message submit that SUCCEEDS — the client is now authenticated with a live stream, so
+    // a frame would genuinely go out if the guard let one.
+    const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
+    await authenticate(relay);
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    expect((await warmup).ok, "the client must be able to send, or the refusals below prove nothing").toBe(true);
+    const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
 
     const msgResult = await client.submitLeaf(relay.node, sid, new Uint8Array(32).fill(1), LEAF_KIND_MSG, payload);
     expect(msgResult.ok, "content on a message leaf must be refused").toBe(false);
@@ -215,7 +231,7 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
     expect(docResult.ok, "and a document leaf's content is the operator's document").toBe(false);
 
     expect(
-      relay.sentFrames.filter((f) => f["type"] === "hash_submit").length,
+      relay.sentFrames.filter((f) => f["type"] === "hash_submit").length - framesBefore,
       "NOTHING may go out — a refusal after transmission has already disclosed the content",
     ).toBe(0);
     client.close();
@@ -239,18 +255,28 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
      * failure an operator can act on, against a quiet one that silently removes the guard the whole
      * milestone was spent building. If a non-seal ctrl leaf is ever added, it must decide explicitly
      * what it carries; it will find out immediately, which is the point.
+     *
+     * Authenticated first, for the same reason as the test above: with the guard disabled the mutant
+     * returned `relay_unavailable` after an auth timeout, and "nothing went out" held because the
+     * client could not send at all. Both halves of that assertion were measuring the handshake.
      */
     const { client, relay, sid } = await connectedClient();
     const { contentHash } = sealFor(sid);
 
-    const result = await client.submitLeaf(relay.node, sid, contentHash, LEAF_KIND_CTRL);
+    const warmup = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(7), LEAF_KIND_MSG);
+    await authenticate(relay);
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    expect((await warmup).ok, "the client must be able to send, or the refusal below proves nothing").toBe(true);
+    const framesBefore = relay.sentFrames.filter((f) => f["type"] === "hash_submit").length;
+
+    const result = await client.submitLeaf(relay.node, sid, contentHash, LEAF_KIND_CTRL, null);
     expect(result.ok, "a SEAL leaf with no payload must not be sent as if it were fine").toBe(false);
     expect(
       result.ok === false ? result.reason : "",
       "and it must name ITSELF — `not_carried` three hops later blames the wrong machine",
     ).toBe("seal_payload_not_carried");
     expect(
-      relay.sentFrames.filter((f) => f["type"] === "hash_submit").length,
+      relay.sentFrames.filter((f) => f["type"] === "hash_submit").length - framesBefore,
       "and no half-formed seal leaf reaches the relay's log",
     ).toBe(0);
     client.close();

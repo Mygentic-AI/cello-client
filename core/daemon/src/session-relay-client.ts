@@ -857,7 +857,11 @@ export class AgentRelayClient {
      */
     leafKind: number,
   ): Promise<SubmitResult> {
-    return this.submitLeaf(node, sessionId, contentHash, leafKind);
+    /**
+     * `null`, and it is now IMPOSSIBLE to omit — see `submitLeaf`'s note on why the parameter is
+     * required. A message leaf's content belongs to the operator and never reaches the relay.
+     */
+    return this.submitLeaf(node, sessionId, contentHash, leafKind, null);
   }
 
   /**
@@ -891,15 +895,26 @@ export class AgentRelayClient {
    *     the relay still acked, and three hops later the directory reported `not_carried` and blamed
    *     the relay's build version — for a value the client never sent. Four reviewed legs shipped
    *     over that silence. A dropped argument now fails on the machine that dropped it.
+   *
+   * ⚠️ REQUIRED, AND `| null` RATHER THAN `?` — THE TYPE IS THE GUARD.
+   *
+   * I first wrote this optional and covered it with tests. Then I ran the revert test that mattered:
+   * drop the argument at the one call site that must pass it, exactly reproducing the original
+   * defect. **All five new tests stayed green.** An optional parameter makes the defect a silent,
+   * type-legal omission — which is precisely how it shipped through four reviews the first time.
+   *
+   * Required means the omission is a COMPILE ERROR, caught by the gate on the machine that made it,
+   * before any test runs. Every caller must now say what this leaf carries, and `submitMessageHash`
+   * says `null` in one visible place instead of by saying nothing at all.
    */
   async submitLeaf(
     node: CelloNode,
     sessionId: Uint8Array,
     contentHash: Uint8Array,
     leafKind: number,
-    contentBytes?: Uint8Array,
+    contentBytes: Uint8Array | null,
   ): Promise<SubmitResult> {
-    if (contentBytes !== undefined && leafKind !== LEAF_KIND_CTRL) {
+    if (contentBytes !== null && leafKind !== LEAF_KIND_CTRL) {
       // Logged at ERROR and returned: a caller reaching this line is trying to hand the relay
       // operator content, and the log must carry it even if the caller swallows the result.
       this.#logger.error("session.relay.submit.content_not_permitted", {
@@ -910,7 +925,7 @@ export class AgentRelayClient {
       });
       return { ok: false, reason: "content_not_permitted_for_leaf_kind" };
     }
-    if (contentBytes === undefined && leafKind === LEAF_KIND_CTRL) {
+    if (contentBytes === null && leafKind === LEAF_KIND_CTRL) {
       this.#logger.error("session.relay.submit.seal_payload_missing", {
         relayPeerId: this.#relayPeerId,
         impact: "the seal leaf was NOT sent. Sending it without its payload produces a certificate the directory cannot check against any participant's signed transcript — silently, and reported downstream as the RELAY being on an old build.",
@@ -955,7 +970,7 @@ export class AgentRelayClient {
    */
   static readonly #SESSION_NOT_FOUND_ATTEMPTS = 3;
 
-  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes?: Uint8Array): Promise<SubmitResult> {
+  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null): Promise<SubmitResult> {
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
     // Snapshotted BEFORE the first attempt, and it is the whole safety of this loop.
     //
@@ -1013,7 +1028,7 @@ export class AgentRelayClient {
     return result;
   }
 
-  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes?: Uint8Array): Promise<SubmitResult> {
+  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
 
@@ -1068,7 +1083,7 @@ export class AgentRelayClient {
        * `submitLeaf` has already established that this is set if and only if `leafKind` is ctrl —
        * both directions refused there, at ERROR, before anything reaches the wire.
        */
-      ...(contentBytes !== undefined ? { content_bytes: contentBytes } : {}),
+      ...(contentBytes !== null ? { content_bytes: contentBytes } : {}),
     }) as Uint8Array;
 
     // Set the resolver synchronously (no await between the in-flight check and the set):
