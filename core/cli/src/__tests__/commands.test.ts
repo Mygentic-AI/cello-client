@@ -491,7 +491,7 @@ describe("cli commands", () => {
     // M8C-ONBOARD-NEXTSTEP-1 (reviewer F1): on SUCCESS the output carries next-step + state
     // legibility. A fake daemon returns ok so the success branch is exercised (a real register
     // needs the directory's DKG). Guards against a regression that drops the guidance.
-    it("appends next-step + state-legibility guidance on a successful registration", async () => {
+    it("puts next-step guidance on STDERR, and NEVER inside the JSON", async () => {
       const socketPath = join(tempDir, "fake-daemon.sock");
       const server: Server = createServer((socket) => {
         socket.on("data", (chunk: Buffer) => {
@@ -509,13 +509,29 @@ describe("cli commands", () => {
       try {
         const result = await register(tempDir, "alice", VALID_TOKEN);
         expect(result.exitCode).toBe(0);
-        expect(result.output).toContain("cello status");     // next step
+
+        /**
+         * DOD-M15-CLIJSON-1 — this used to assert the four cues were in `output`, and passing said
+         * NOTHING about which stream they were on. So the hint sat inside the JSON for months, every
+         * consumer parsing a successful `register-agent` broke, and this guard was green throughout.
+         *
+         * EXACT EQUALITY, not `not.toContain`. A future append to `output` — a warning, a progress
+         * line, a second hint — has to be red here, and a substring assertion cannot do that.
+         */
+        expect(
+          result.output,
+          "stdout must be the JSON result and NOTHING else — a consumer parses this",
+        ).toBe(JSON.stringify({ ok: true, agent_id: "id-1", primary_pubkey: "pk-1" }, null, 2));
+
+        // The hint is KEPT. Same four cues, now asserted on the stream they belong to.
+        const guidance = result.guidance ?? "";
+        expect(guidance).toContain("cello status");     // next step
         // CC-6 (reviewer-aligned copy): readiness is expressed via the REAL cello status output —
         // agent state 'online' + directory_signaling 'connected' (the old "connecting" wording never
         // appeared in that output).
-        expect(result.output).toContain("online");            // state legibility (ready state)
-        expect(result.output).toContain("connected");         // directory_signaling ready
-        expect(result.output).toContain("cello login");       // recovery hint
+        expect(guidance).toContain("online");            // state legibility (ready state)
+        expect(guidance).toContain("connected");         // directory_signaling ready
+        expect(guidance).toContain("cello login");       // recovery hint
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
