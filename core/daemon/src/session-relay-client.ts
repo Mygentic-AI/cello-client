@@ -864,11 +864,63 @@ export class AgentRelayClient {
    * Submit a leaf hash of a given kind (0x00 message / 0x02 control) to the relay. The SEAL
    * ctrl leaf rides this path: two distinct-sender ctrl leaves in the relay's
    * log trigger the directory's FROST notarization (relay `#maybeProcessSeal`).
+   *
+   * ─── `contentBytes` — `DOD-M15-SEALWIRE-1` bullets 3+4, THE SENDER LEG ───────────────────────
+   *
+   * The SEAL leaf's own payload, carried alongside its hash. Without it the directory holds a
+   * SHA-256 pre-image and nothing else, so the client's SIGNED `final_root` — the one value in the
+   * whole seal that the relay cannot produce — is unrecoverable, and every root check the directory
+   * can make compares the relay against itself.
+   *
+   * ⚠️ THIS PARAMETER PUTS LEAF CONTENT ON THE RELAY, AND THE RELAY IS THE PARTY THIS PROTOCOL
+   * EXISTS TO KEEP CONTENT AWAY FROM (INV-3: a forwarding relay sees ciphertext).
+   *
+   * It is safe for a SEAL ctrl leaf and for nothing else. The payload is `[session_id, final_root,
+   * close_timestamp, "PENDING"]` and the relay already knows all four — it assigned the session,
+   * built the tree the root comes from, and stamped the leaf. Nothing is disclosed. That reasoning
+   * stops dead at the next leaf kind: a `msg` leaf's content is the operator's plaintext and a `doc`
+   * leaf's is their document.
+   *
+   * So both directions are REFUSED rather than tidied, and refused HERE rather than at the relay:
+   *
+   *   - content on a non-ctrl leaf → the relay would refuse the whole frame, but only after the
+   *     operator's words had already crossed the wire to the party that must not have them, and the
+   *     refusal would destroy their send rather than protect it.
+   *   - a ctrl leaf with NO payload → this was the actual defect. `submitSealLeaf` computed the
+   *     payload, hashed it, and had nowhere to put it, so it was dropped. The seal still succeeded,
+   *     the relay still acked, and three hops later the directory reported `not_carried` and blamed
+   *     the relay's build version — for a value the client never sent. Four reviewed legs shipped
+   *     over that silence. A dropped argument now fails on the machine that dropped it.
    */
-  async submitLeaf(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
+  async submitLeaf(
+    node: CelloNode,
+    sessionId: Uint8Array,
+    contentHash: Uint8Array,
+    leafKind: number,
+    contentBytes?: Uint8Array,
+  ): Promise<SubmitResult> {
+    if (contentBytes !== undefined && leafKind !== LEAF_KIND_CTRL) {
+      // Logged at ERROR and returned: a caller reaching this line is trying to hand the relay
+      // operator content, and the log must carry it even if the caller swallows the result.
+      this.#logger.error("session.relay.submit.content_not_permitted", {
+        relayPeerId: this.#relayPeerId,
+        leafKind,
+        impact: "the submit was NOT sent. Only a SEAL ctrl leaf may carry its content to the relay; every other leaf kind's content belongs to the operator.",
+        guidance: "Pass contentBytes only with LEAF_KIND_CTRL. If a new leaf kind genuinely needs to disclose its content to the relay, that is a protocol decision, not a call-site one.",
+      });
+      return { ok: false, reason: "content_not_permitted_for_leaf_kind" };
+    }
+    if (contentBytes === undefined && leafKind === LEAF_KIND_CTRL) {
+      this.#logger.error("session.relay.submit.seal_payload_missing", {
+        relayPeerId: this.#relayPeerId,
+        impact: "the seal leaf was NOT sent. Sending it without its payload produces a certificate the directory cannot check against any participant's signed transcript — silently, and reported downstream as the RELAY being on an old build.",
+        guidance: "A ctrl leaf on this path is a SEAL leaf; pass the encodeSealPayload bytes whose SHA-256(0x02 ‖ payload) is the contentHash argument.",
+      });
+      return { ok: false, reason: "seal_payload_not_carried" };
+    }
     // Chain on the prior submit so only one is outstanding at a time (FIFO). The ack
     // carries no session_id, so concurrent submits on one stream would be ambiguous.
-    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind));
+    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind, contentBytes));
     // Keep the chain alive regardless of this submit's outcome.
     this.#submitChain = run.then(() => undefined, () => undefined);
     return run;
@@ -903,7 +955,7 @@ export class AgentRelayClient {
    */
   static readonly #SESSION_NOT_FOUND_ATTEMPTS = 3;
 
-  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
+  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes?: Uint8Array): Promise<SubmitResult> {
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
     // Snapshotted BEFORE the first attempt, and it is the whole safety of this loop.
     //
@@ -922,7 +974,7 @@ export class AgentRelayClient {
     // this must be discriminated on OUR state, not on the relay's reason string.
     const recordedBefore = this.#sessions.get(sessionIdHex)?.recorded === true;
 
-    let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
+    let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
     for (
       let attempt = 1;
       attempt < AgentRelayClient.#SESSION_NOT_FOUND_ATTEMPTS
@@ -944,7 +996,7 @@ export class AgentRelayClient {
         attempt,
         reason: result.reason,
       });
-      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind);
+      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
     }
 
     // The relay lost a session we had successfully recorded — sealed, idle-swept, or restarted.
@@ -961,7 +1013,7 @@ export class AgentRelayClient {
     return result;
   }
 
-  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number): Promise<SubmitResult> {
+  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes?: Uint8Array): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
 
@@ -1005,6 +1057,18 @@ export class AgentRelayClient {
       leaf_kind: leafKind,
       structure1_cbor: structure1,
       sender_signature: signature,
+      /**
+       * `DOD-M15-SEALWIRE-1` bullets 3+4 — the SEAL payload, and ONLY on a ctrl leaf.
+       *
+       * Spread so it is absent rather than `undefined` when there is nothing to carry: an explicit
+       * `content_bytes: undefined` encodes as a present CBOR key, and the relay's guard refuses a
+       * present-but-unusable value by voiding the whole frame. That would turn every ordinary
+       * message into a refused submit.
+       *
+       * `submitLeaf` has already established that this is set if and only if `leafKind` is ctrl —
+       * both directions refused there, at ERROR, before anything reaches the wire.
+       */
+      ...(contentBytes !== undefined ? { content_bytes: contentBytes } : {}),
     }) as Uint8Array;
 
     // Set the resolver synchronously (no await between the in-flight check and the set):

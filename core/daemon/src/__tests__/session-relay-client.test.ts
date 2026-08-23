@@ -10,7 +10,6 @@ import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Encoder, decode } from "cbor-x";
-import * as lp from "it-length-prefixed";
 import { generateKeypair, verify, buildRelayAckTbs, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
 import {
   AgentRelayClient,
@@ -24,62 +23,15 @@ import {
 } from "../session-relay-client.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
-import type { Logger } from "../types.js";
-
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
-
-const noopLogger: Logger = {
-  debug: () => {},
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-} as unknown as Logger;
-
-const fakeNode = { dial: async () => {}, newStream: async () => { throw new Error("no-stream"); } } as never;
+import { makeFakeRelay, tick, noopLogger, fakeNode } from "./relay-client-fake.js";
 
 /**
- * A controllable fake relay stream + node. Captures outbound frames (decoded from the
- * length-prefixed wire) and lets the test push inbound frames the client's reader consumes.
+ * The fake relay rig moved to `relay-client-fake.ts` when the SEALWIRE sender-leg tests needed the
+ * same one. Imported rather than re-declared: two hand-written relay stubs drift, and only one of
+ * them learns about the next appended frame field.
  */
-function makeFakeRelay() {
-  const inbound: Uint8Array[] = [];
-  let notify: (() => void) | null = null;
-  let ended = false;
-  const sentFrames: Record<string, unknown>[] = [];
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
-  const stream = {
-    send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
-      // b is lp.encode.single(cbor) — un-frame it via lp.decode to read the CBOR back.
-      const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
-      void (async () => {
-        for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
-          const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
-          sentFrames.push(decode(u8) as Record<string, unknown>);
-        }
-      })();
-    },
-    close: async () => { ended = true; notify?.(); },
-    async *[Symbol.asyncIterator]() {
-      while (!ended) {
-        while (inbound.length) yield inbound.shift()!;
-        if (ended) return;
-        await new Promise<void>((r) => { notify = r; });
-        notify = null;
-      }
-    },
-  };
-
-  const push = (frame: Record<string, unknown>): void => {
-    const encoded = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
-    inbound.push(encoded instanceof Uint8Array ? encoded : (encoded as { subarray(): Uint8Array }).subarray());
-    notify?.();
-  };
-
-  const node = { dial: async () => {}, newStream: async () => stream } as never;
-  return { node, push, sentFrames };
-}
-
-const tick = () => new Promise((r) => setTimeout(r, 5));
 
 describe("session-relay-client: relay auth payload", () => {
   it("builds SHA-256(domain || nonce || pubkey) — the exact bytes the relay verifies", async () => {
