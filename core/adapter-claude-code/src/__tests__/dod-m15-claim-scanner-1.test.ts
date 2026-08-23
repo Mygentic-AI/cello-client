@@ -44,7 +44,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ADJUDICATED, adjudicatedMatches } from "./helpers/claims-ledger.js";
+import { ADJUDICATED, adjudicatedMatches, rowMatches, countClaimWords } from "./helpers/claims-ledger.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -212,7 +212,12 @@ const UNADJUDICATED_BASELINE: Record<string, number> = {
   //   · "screened" in the attestations text, which refers to screening performed in the PORTAL —
   //     a different repo this lane has not read. The note at the foot of claims-ledger.ts says why
   //     moving it without reading would reproduce the prose ledger's original defect.
-  "core/cli/src/registry.ts (operator-facing strings)": 3,
+  //   · "You cannot attest about yourself." WITHDRAWN from the ledger on review — it had been
+  //     adjudicated true on evidence describing the CONSENT gate, which governs what is presented,
+  //     not who may issue. Nothing in `core/` refuses a self-attestation; either the portal does or
+  //     nothing does. It went back in the backlog rather than staying quietly true, which is why
+  //     this number is 4 and not 3.
+  "core/cli/src/registry.ts (operator-facing strings)": 4,
   "plugins/cello/agents/cello-receptionist.md": 8,
   "plugins/cello/skills/cello/SKILL.md": 29,
   "plugins/cello/skills/documents/SKILL.md": 18,
@@ -338,6 +343,87 @@ describe("DOD-M15-LEDGER-1: an adjudicated claim carries a verdict and evidence"
     expect(
       orphans,
       `These ledger entries name surfaces the scanner does not read: ${orphans.join(", ")}`,
+    ).toEqual([]);
+  });
+
+  /**
+   * ─── THE THREE TESTS THAT MAKE A ROW CORRESPOND TO REALITY ───────────────────────────────────
+   *
+   * A review of `DOD-M15-LEDGER-1` zeroed an entire unswept surface with one invented row and
+   * showed the green run. The two tests above could not object: they check the ledger against
+   * ITSELF, never against the surfaces. These three check it against the text.
+   */
+
+  it("every adjudicated excerpt is text that is actually ON the surface", () => {
+    // The one that kills invented rows. `matches: 18` for "the documents skill's safety properties"
+    // passed every earlier guard because no guard asked whether those words existed anywhere.
+    const missing: string[] = [];
+    const texts = surfaceTexts();
+    for (const a of ADJUDICATED) {
+      const text = texts.get(a.surface);
+      if (text === undefined) continue; // covered by the orphan test below
+      for (const e of a.excerpts) {
+        if (!text.includes(e)) missing.push(`${a.surface}: ${JSON.stringify(e.slice(0, 60))}`);
+      }
+    }
+    expect(
+      missing,
+      `These ledger rows quote text that is not on the surface they name — the claim was reworded, ` +
+        `moved, or never existed: ${missing.join("; ")}. A row that cannot be located cannot be ` +
+        `re-checked by the next reader, which is the whole job of the ledger.`,
+    ).toEqual([]);
+  });
+
+  it("a row accounts for exactly the claim words inside its own excerpts", () => {
+    // Removes the human number entirely. Double-counting, over-counting and the "ONE, not three"
+    // judgement calls all become arithmetic over real text rather than arguments in comments.
+    const wrong: string[] = [];
+    for (const a of ADJUDICATED) {
+      const derived = a.excerpts.reduce((n, e) => n + countClaimWords(e), 0);
+      if (rowMatches(a) !== derived) wrong.push(`${a.claim.slice(0, 50)}: ${rowMatches(a)} vs ${derived}`);
+    }
+    expect(wrong, `Derived counts disagree: ${wrong.join("; ")}`).toEqual([]);
+  });
+
+  it("no two rows account for the same words twice", () => {
+    // The other half of over-accounting, and the one the arithmetic guard could only catch AFTER a
+    // surface went negative. Two rows quoting the same sentence are now visible as the same string.
+    const seen = new Map<string, string>();
+    const dupes: string[] = [];
+    for (const a of ADJUDICATED) {
+      for (const e of a.excerpts) {
+        if (countClaimWords(e) === 0) continue; // accounts for nothing; cannot double-count
+        const key = `${a.surface} ${e}`;
+        const prior = seen.get(key);
+        if (prior !== undefined && prior !== a.claim) dupes.push(`${a.surface}: ${JSON.stringify(e.slice(0, 40))}`);
+        else seen.set(key, a.claim);
+      }
+    }
+    expect(
+      dupes,
+      `These excerpts are claimed by more than one row, so their matches are subtracted twice and ` +
+        `the surface's remainder is understated: ${dupes.join("; ")}`,
+    ).toEqual([]);
+  });
+
+  it("every row says who enforces its claim", () => {
+    // `DOD-M15-CLAIM-SCANNER-1` carried this clause onto LEDGER-1 and the first pass dropped it
+    // silently. It is load-bearing for Invariant 1: without it, a claim held up by the operator's
+    // own rewritable daemon and one held up by the absence of a wire field read identically.
+    const legal = new Set(["structural", "daemon-local", "directory", "nobody-yet"]);
+    const bad = ADJUDICATED.filter((a) => !legal.has(a.enforcedBy)).map((a) => a.claim);
+    expect(bad, `Rows with no usable enforcedBy: ${bad.join("; ")}`).toEqual([]);
+
+    // A `true` verdict enforced by NOBODY is only honest when the claim asserts an absence or
+    // withdraws a property. Anything else is a promise with no mechanism behind it.
+    const unenforcedPromises = ADJUDICATED.filter(
+      (a) => a.verdict === "true" && a.enforcedBy === "nobody-yet" && !/\bNOT\b|\bno\b|\bnot\b/.test(a.claim),
+    ).map((a) => a.claim);
+    expect(
+      unenforcedPromises,
+      `These rows are adjudicated TRUE while nothing enforces them, and they do not read as ` +
+        `disclaimers: ${unenforcedPromises.join("; ")}. A claim nothing enforces is not true — it ` +
+        `is unaudited, and it belongs in the backlog until someone finds the mechanism.`,
     ).toEqual([]);
   });
 

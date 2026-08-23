@@ -443,8 +443,14 @@ export function transcript(celloDir: string, sessionId: string, opts: ParityOpti
 }
 
 /**
- * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt: the notarized bilateral SEAL
- * receipt, the artifact the whole close ceremony exists to produce and the one an arbitrator reads.
+ * `cello sealed-receipt <session-id>` → cello_get_sealed_receipt: the notarized SEAL receipt, the
+ * artifact the whole close ceremony exists to produce and the one an arbitrator reads.
+ *
+ * NOT necessarily bilateral — this said "bilateral" and that was wrong. `seal-escalation.ts:219`
+ * returns `seal_type: "unilateral"` when the counterparty never comes back, and that is exactly the
+ * receipt someone is holding when something went wrong. The response here carries no `seal_type`
+ * either (`session-read-handlers.ts`), so a reader distinguishes the two only via
+ * `legibility.participants[].attestation_mode === "absent"` — see `DOD-M15-UNILATERAL-1`.
  *
  * NOT the same handler as `cello relay-receipts <name>`, which calls cello_get_relay_receipts
  * (per-message relay delivery proofs). The two are routinely conflated; they are different
@@ -710,8 +716,11 @@ export function receive(
 }
 
 /**
- * `cello close-session <session-id> [--force]` → cello_close_session. Normally triggers the bilateral seal
- * ceremony. --force is passed ONLY when asked for (mirroring the shim), since it forfeits the seal.
+ * `cello close-session <session-id> [--force]` → cello_close_session. Triggers the seal ceremony —
+ * bilateral when the counterparty co-signs, unilateral when they never return
+ * (`seal-escalation.ts:219`). This said "the bilateral seal ceremony", which named the good case as
+ * the only case. --force is passed ONLY when asked for (mirroring the shim), since it forfeits the
+ * seal outright.
  */
 export function closeSession(
   celloDir: string,
