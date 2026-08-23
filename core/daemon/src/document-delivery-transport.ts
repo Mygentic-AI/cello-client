@@ -89,10 +89,18 @@ export interface DocumentTransportDeps {
     content: Uint8Array,
     contentHash: Uint8Array,
     correlationId: string,
-    /** The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below. */
-    leafKind?: number,
+    /**
+     * The witnessed DOMAIN — see the note on `DOCUMENT_LEAF_KIND` below.
+     *
+     * ⚠️ REQUIRED, like its two neighbours, and this interface is why. A function of LOWER arity is
+     * assignable to one of higher arity, so an adapter that drops a trailing argument type-checks
+     * silently — which is exactly how this parameter was lost for a whole release
+     * (*"0.0.145 shipped the fix everywhere except here"*). Optional parameters make that assignment
+     * invisible twice over. Required, a dropped argument is a compile error.
+     */
+    leafKind: number,
     /** `DOD-M15-SEALWIRE-1` part B2b — the algorithm `contentHash` was produced under. */
-    contentHashAlg?: string,
+    contentHashAlg: string,
   ): Promise<
     // DOD-M12B-INDEX-1: `sequenceNumber` is the relay's position for this frame, carried so the
     // leaf can be placed there rather than at the tail. Absent when no relay answered.

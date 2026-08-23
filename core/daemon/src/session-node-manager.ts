@@ -59,7 +59,9 @@ import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
-import { AgentRelayClient, LEAF_KIND_CTRL, LEAF_KIND_MSG, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
+// `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
+// (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
@@ -995,7 +997,7 @@ export class SessionNodeManager {
   // `persisted` delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels the
   // timer (content.delivery.acked); TTF expiry hands the content to the park backstop.
   // Keyed sessionId → contentHashHex → entry.
-  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array }>>();
+  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }>>();
   // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
   // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
   #contentTtfMs = 20_000;
@@ -1008,7 +1010,7 @@ export class SessionNodeManager {
   // Injected after construction because RetryQueue is built later in daemon.ts.
   #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
   // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
   // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
@@ -1082,7 +1084,7 @@ export class SessionNodeManager {
   // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
   // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
   // claim durability — nor commit the leaf that claim now authorises.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean) | null = null;
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -1190,8 +1192,8 @@ export class SessionNodeManager {
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array) => boolean;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -5553,14 +5555,25 @@ export class SessionNodeManager {
     sessionId: string,
     content: Uint8Array,
     contentHash: Uint8Array,
-    correlationId?: string,
+    /**
+     * Required alongside the two below — every production caller already passes one, and an optional
+     * parameter in front of a required one is what TypeScript refuses. Making it explicit costs
+     * nothing and removes the last place a positional argument can silently shift.
+     */
+    correlationId: string | undefined,
     /**
      * The DOMAIN this content belongs to, as the relay and the directory will see it. Defaults to
      * MESSAGE so `cello_send` is unchanged; the document path passes 0x04/0x05. Not cosmetic — the
      * directory computes `final_message` and `answered` from the witnessed kind, and both of its
      * document exclusions were dead while every document leaf arrived here as a message.
+     *
+     * ⚠️ ALSO REQUIRED NOW, and for the same reason as `contentHashAlg` below — this parameter is the
+     * precedent, not a bystander. It defaulted to MESSAGE, the document adapter in `daemon.ts`
+     * silently dropped it, and the wire was wrong for a whole release: *"0.0.145 shipped the fix
+     * everywhere except here."* A default that matches the common case makes the omission invisible
+     * at every call site and at typecheck. Every caller states its kind now.
      */
-    leafKind: number = LEAF_KIND_MSG,
+    leafKind: number,
     /**
      * `DOD-M15-SEALWIRE-1` part B2b — the algorithm `contentHash` was produced under, taken from
      * `contentHashForSession` by the caller that computed the hash.
@@ -5568,8 +5581,18 @@ export class SessionNodeManager {
      * Passed rather than re-derived HERE, deliberately: re-deriving would ask "how would this
      * session hash something now?", and the answer can differ from how THIS message was actually
      * hashed. A hash and its label must travel together or the peer refuses a message nobody touched.
+     *
+     * ⚠️ REQUIRED, NOT DEFAULTED — review B2b-1 F4, and the default is what made four mutants
+     * unfalsifiable. It was `= CONTENT_HASH_ALGS.SHA256`, which equals the only value in play today,
+     * so DROPPING THE ARGUMENT AT ANY OF THE FIVE HOPS produced byte-identical output and the whole
+     * 2,800-test daemon suite stayed green. Measured at all four send sites individually.
+     *
+     * A default that equals the current value makes every threading edit invisible until the value
+     * changes — and the day it changes, the dropped argument mislabels the message and every peer
+     * refuses it as a tamper. Required makes a dropped argument a TYPECHECK failure instead of a
+     * test question nobody can answer.
      */
-    contentHashAlg: string = CONTENT_HASH_ALGS.SHA256,
+    contentHashAlg: string,
   ): Promise<
     // DOD-M12B-INDEX-1: `sequenceNumber` is the position the relay assigned this message, carried
     // out so the caller can place its leaf THERE rather than at whatever the tail happens to be.
@@ -5757,7 +5780,7 @@ export class SessionNodeManager {
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
-      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2);
+      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2, contentHashAlg);
       const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,
@@ -5864,7 +5887,10 @@ export class SessionNodeManager {
               impact: "no durable queue is wired — the content is NOT retained and will NOT be retried",
             });
           } else {
-            durable = this.#onParkFailed(agentName, sessionId, hashHex, content, orderingS1, orderingS2);
+            // B2b-1 review F1: the DURABLE writer. Without the 7th argument the column this unit
+            // added has no producer at all — every queued row would carry NULL, and the crash
+            // backstop would re-park a salted message as sha256 and have it refused forever.
+            durable = this.#onParkFailed(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
           }
           if (!durable) {
             if (this.#onParkFailed !== null) {
@@ -8068,7 +8094,7 @@ export class SessionNodeManager {
    * `unref`'d so an in-flight wait never keeps the daemon process (or a test runner)
    * alive on its own.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId?: string, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#k(agentName, sessionId);
     let bySession = this.#awaitingAck.get(ackKey);
@@ -8082,7 +8108,10 @@ export class SessionNodeManager {
     if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref: () => void }).unref();
     // DOD-MSG-4 (2b, review #1): retain the relay's ordering record so a TTF-triggered park carries
     // it too (not only the direct-dial-fail park) — so a TTF-parked entry is self-ordering on recover.
-    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor });
+    // B2b-1 review F2: the algorithm rides WITH the entry. The TTF-expiry park route reads this map
+    // minutes later, in-process, and without it that copy names nothing (= sha256) while the direct
+    // frame named something else — the same message, two claims about what it is, no restart needed.
+    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor, contentHashAlg });
   }
 
   /**
@@ -8135,7 +8164,7 @@ export class SessionNodeManager {
       // M12-P12 (review pass 2): the ordering record travels on THIS path too. It is in hand — the
       // very next statement hands it to #parkContent — and a TTF row written without it re-parks in
       // arrival order, which is the divergent-leaf-index failure the durable columns exist to stop.
-      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
@@ -8148,7 +8177,8 @@ export class SessionNodeManager {
     // Fire-and-forget: unlike sendContent's live caller, nothing here is awaiting an IPC response
     // to shape (the TTF timer fires long after cello_send already returned) — the deposit's own
     // success/failure logging inside #parkContent is the only observability this path needs.
-    void this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor);
+    // B2b-1 review F2 — the THIRD `#parkContent` caller, and the one that was left unthreaded.
+    void this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
   }
 
   /**

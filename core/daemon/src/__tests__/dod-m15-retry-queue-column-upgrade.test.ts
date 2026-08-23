@@ -42,6 +42,7 @@
 
 import { describe, it, expect } from "vitest";
 import { DatabaseSync } from "node:sqlite";
+import { readFile } from "node:fs/promises";
 import { migrateSessionTablesToAgentId } from "../agent-id-migration.js";
 import { ensureIdentitySchema } from "../db-identity-store.js";
 import { RetryQueue } from "../retry-queue.js";
@@ -142,6 +143,40 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
       entry!.contentHashAlg,
       "without this the backstop re-parks under sha256 and the recipient refuses every copy",
     ).toBe("hmac-sha256-salt-v1");
+  });
+
+  it("★ THE PRODUCTION WRITER supplies it — the hooks, not a test calling enqueue directly", async () => {
+    /**
+     * ⚠️ REVIEW B2b-1 F1 — THE COLUMN HAD NO PRODUCTION WRITER AT ALL, and the test above did not
+     * notice because it hands the value straight to `enqueueAwaitingContent`, which nothing in
+     * production does. The reviewer's words: *"it proves a plumbing segment with no upstream."*
+     *
+     * The two real producers are the `onTtf` and `onParkFailed` hooks in `daemon.ts`, and neither
+     * carried the algorithm — so every row would have been written NULL while the commit message
+     * said the producer "passes it". It passed a value nothing supplied.
+     *
+     * This asserts the SHAPE of the wiring at its narrowest point: the hook signature the daemon
+     * installs must accept and forward the 7th argument. A source check, because the behavioural
+     * difference is invisible while every algorithm is `sha256` — which is precisely the condition
+     * that let four other mutants survive.
+     */
+    const root = await readFile(new URL("../daemon.ts", import.meta.url), "utf8");
+    for (const hook of ["onTtf", "onParkFailed"]) {
+      // The whole hook body, not a paren-capture: `resolveAgentId(agentName)` nests parentheses, so
+      // a `[^)]*` group stops at the wrong one and reports a forwarded argument as missing.
+      const start = root.indexOf(`${hook}: (`);
+      expect(start, `${hook} must exist in daemon.ts`).toBeGreaterThan(-1);
+      const body = root.slice(start, root.indexOf("\n    },", start));
+
+      expect(body, `${hook} must still call enqueueAwaitingContent`).toContain("enqueueAwaitingContent");
+      const params = body.slice(body.indexOf("("), body.indexOf(")"));
+      expect(params, `${hook} must ACCEPT contentHashAlg`).toContain("contentHashAlg");
+      const call = body.slice(body.indexOf("enqueueAwaitingContent"));
+      expect(
+        call,
+        `${hook} must FORWARD contentHashAlg — without it the column has no writer and every row is NULL`,
+      ).toContain("contentHashAlg");
+    }
   });
 
   it("★ a message enqueued with NO algorithm hydrates as ABSENT, not as the sha256 string", async () => {

@@ -93,7 +93,7 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
-import { AgentRelayClient, extractErrorMessage } from "./session-relay-client.js";
+import { LEAF_KIND_MSG, AgentRelayClient, extractErrorMessage } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
 import {
@@ -1424,7 +1424,7 @@ async function startDaemonHoldingLock(
           // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
           const reject = sessionNodeManager.contentHashForSession(agentName, sessionId, rejectBytes);
           // Best-effort: a send failure still triggers the seal — we are closing regardless.
-          const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(reject.hash), randomUUID(), undefined, reject.alg);
+          const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, rejectBytes, new Uint8Array(reject.hash), randomUUID(), LEAF_KIND_MSG, reject.alg);
           // M12-P13: commit the leaf when the rejection went out OR when it is durably queued —
           // either way the relay already witnessed its sequence. This caller is the sharpest case
           // of the three: the seal is initiated immediately below, so a hole here does not merely
@@ -1642,7 +1642,7 @@ async function startDaemonHoldingLock(
       );
       // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
       const away = sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
-      const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), undefined, away.alg);
+      const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), LEAF_KIND_MSG, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
         // away period — clear the guard so the next inbound arrival retries the ack.
@@ -1977,15 +1977,20 @@ async function startDaemonHoldingLock(
     onPersisted: (agentName, sessionId, contentHashHex) => {
       retryQueue.markContentAcked(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"));
     },
-    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
+    // `DOD-M15-SEALWIRE-1` B2b-1 review F1 — `contentHashAlg` is the DURABLE WRITER for the column
+    // this unit added. Without it every queued row carries NULL, the crash backstop re-parks a salted
+    // message as sha256, and the recipient refuses it and re-pulls it forever. The commit that added
+    // the column said the producer "passes it"; the producer was passing a value nothing supplied,
+    // because these two hooks were never widened.
+    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg);
     },
     // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
     // TTF timer is already cancelled on this path, so this is the only thing holding the content.
     // M12-P13 (review HIGH-1): the enqueue's own answer is returned, never a bare `true`. A dropped
     // copy that reports success now buys a committed hash-chain leaf for content that is gone.
-    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor) => {
-      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor);
+    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg) => {
+      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg);
     },
   });
 

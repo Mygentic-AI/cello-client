@@ -28,6 +28,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { decode } from "cbor-x";
+import { readFile } from "node:fs/promises";
 import { CONTENT_HASH_ALGS, contentHashFor } from "../wire-content-hash.js";
 
 const SID = "7a".repeat(32);
@@ -110,20 +111,31 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
       .toBe(Buffer.from(contentHashFor(CONTENT, { alg, salt: null })).toString("hex"));
   }, 60_000);
 
-  it("a send with no algorithm argument still names sha256 — REGRESSION GUARD, not coverage", async () => {
+  it("★ the document ADAPTER forwards both trailing arguments — a lower-arity function assigns silently", async () => {
     /**
-     * Named honestly: this is green under every mutant of this unit that keeps the default, because
-     * the default IS `sha256`. It is worth keeping — it is what goes red if the default ever silently
-     * becomes something a current peer cannot read — but it is not evidence for the threading.
+     * Review B2b-1 F3/M1. This replaces a test that asserted `sendContent`'s DEFAULT algorithm — a
+     * default that no longer exists, because it was the defect: it made a dropped argument at any of
+     * five hops produce byte-identical output, and four mutants survived the whole 2,800-test suite.
+     * Both trailing parameters are required now, so three of those four are typecheck failures.
+     *
+     * The fourth is NOT, and this is it. TypeScript assigns a function of LOWER arity to a parameter
+     * of higher arity, silently — so an adapter written `(a, b, c, d, e, leafKind) =>` satisfies a
+     * seven-parameter type and drops the last argument with no error anywhere. That is not
+     * hypothetical: it is how `leafKind` was lost for a whole release, and
+     * `document-leaf-kind-on-the-wire.test.ts` already guards that exact adapter with a source
+     * assertion for exactly this reason.
+     *
+     * A SOURCE check, deliberately — the behaviour is unobservable while every algorithm is `sha256`,
+     * so there is nothing to assert at runtime until the day it is too late.
      */
-    fx = await startTwoConnectionFixture({ dirPrefix: "cello-b2b-default-", node: node = new FakeNode() as unknown as CelloNode });
-    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    const root = await readFile(new URL("../daemon.ts", import.meta.url), "utf8");
+    const adapter = /sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/.exec(root);
+    expect(adapter, "the document transport's sendContent adapter must still be findable").not.toBeNull();
 
-    const { hash } = fx.snm.contentHashForSession("alice", SID, CONTENT);
-    await fx.snm.sendContent("alice", SID, CONTENT, hash, "corr");
-    await wait(200);
-
-    const frame = sentFrames(node).find((f) => f["type"] === "content_frame");
-    expect(frame!["content_hash_alg"]).toBe(CONTENT_HASH_ALGS.SHA256);
+    const [, params, args] = adapter!;
+    for (const name of ["leafKind", "contentHashAlg"]) {
+      expect(params, `the adapter must ACCEPT ${name}`).toContain(name);
+      expect(args, `the adapter must FORWARD ${name} — dropping it type-checks silently`).toContain(name);
+    }
   }, 60_000);
 });

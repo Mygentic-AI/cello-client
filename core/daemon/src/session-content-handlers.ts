@@ -14,6 +14,7 @@
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
 // recording — how it was made, which is the state that made a version skew look like a tamper.
 import { randomUUID } from "node:crypto";
+import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
@@ -443,7 +444,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     sendInFlight.set(inFlightKey, Date.now());
     let sendResult: Awaited<ReturnType<typeof sessionNodeManager.sendContent>>;
     try {
-      sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId, undefined, contentHashAlg);
+      sendResult = await sessionNodeManager.sendContent(record.agent_name, sessionId, sendBytes, new Uint8Array(contentHash), correlationId, LEAF_KIND_MSG, contentHashAlg);
     } finally {
       sendInFlight.delete(inFlightKey);
     }
