@@ -9429,9 +9429,24 @@ export class SessionNodeManager {
       return;
     }
     if (action.action === "derive_and_announce") {
-      // NOT settled on a failed persist: `#persistSessionSalt` returning false means this side holds
-      // no salt, so releasing the waiter here would hand it a null it would hash unsalted under
-      // while the agreement is still open. Let the bound expire instead — that path says so.
+      /**
+       * NOT settled on a failed persist, and the reason is narrower than it first looks — measured.
+       *
+       * A mutant that settles `"agreed"` here SURVIVES the suite, and it deserves to: the waiter
+       * would resolve, `#getSessionSalt` would return null because nothing was stored, and the send
+       * would fall back to `sha256` exactly as it does now. `#persistSessionSalt` logs its own
+       * failure, so the operator is not left without an explanation either. An earlier version of
+       * this comment claimed the release "would hand it a null it would hash unsalted under" — true,
+       * and not a consequence, because that is what the timeout path does too.
+       *
+       * What the un-settled waiter actually buys is the REMAINDER OF THE BOUND. A failed persist
+       * leaves this side holding no salt, which is the state that makes the agreement re-offer a
+       * contribution; a repair landing inside the remaining seconds still stores one and still
+       * salts this message. Settling early forecloses that for no gain.
+       *
+       * Kept for that reason alone, and recorded as a surviving mutant rather than defended as a
+       * caught one.
+       */
       if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) return;
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "derived",
