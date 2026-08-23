@@ -150,6 +150,25 @@ describe("DOD-M15-SEALWIRE-1 part A: a disagreement stops the session, loudly", 
       fx.eventsNamed("session.content.identity.frozen").length,
       "a salt disagreement must NOT be reported as the counterparty failing a key check",
     ).toBe(0);
+
+    /**
+     * THE FREEZE MUST BE THE SESSION ENDING, not a log line.
+     *
+     * Measured with a running mutant: skip the teardown and keep the logging, and every assertion
+     * above still passes. `interrupted` is the REVIVABLE status, so without the freeze mark the
+     * operator's very next `cello_receive` rebuilds the node and the session carries on with two
+     * sides that never agreed a salt — the exact silent-discard loop Decision #10 exists to stop,
+     * with a log line above it claiming otherwise.
+     */
+    const revived = await fx.snm.reviveSessionNode("alice", SID, "revive-attempt");
+    expect(revived.ok, "a frozen session must not come back on the next read").toBe(false);
+    expect((revived as { reason: string }).reason).toBe("session_frozen_salt_contribution_degenerate");
+    // And it must explain ITSELF. The refusal used to be hardcoded to the identity failure, which
+    // would tell this operator their counterparty failed a key check when nobody's key was involved.
+    const guidance = (revived as { guidance: string }).guidance;
+    expect(guidance).toMatch(/OUT OF BAND/);
+    expect(guidance, "a salt refusal must not borrow the identity failure's words").not.toMatch(/counterparty's key/);
+    expect(guidance, "and it must still say the transcript survived").toMatch(/cello_transcript/);
   }, 60_000);
 
   it("★ a fingerprint we cannot possibly match freezes as STATE_DIVERGENT, not as a mismatch", async () => {

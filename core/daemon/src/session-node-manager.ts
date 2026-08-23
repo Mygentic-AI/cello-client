@@ -821,7 +821,14 @@ export class SessionNodeManager {
   // which is the REVIVABLE status, so without this the next `cello_receive` silently rebuilt the
   // session and re-admitted the same peer. NOT cleared by `#evictSessionCaches`: the freeze is a
   // fact about the session, not about the node that was torn down to enforce it.
-  #frozenSessions = new Set<string>();
+  //
+  // DOD-M15-SEALWIRE-1 (part A): a MAP, not a Set, and the value is load-bearing. It was a Set when
+  // the identity freeze was the only freeze, so `reviveSessionNode` could hardcode its refusal —
+  // *"a message failed to verify against the expected counterparty's key"*. A salt disagreement now
+  // freezes through the same path, and that sentence would accuse a counterparty who did nothing:
+  // the ordinary cause is two builds that do not match. The refusal carries the freezing site's own
+  // words instead.
+  #frozenSessions = new Map<string, { reason: string; guidance: string }>();
   /**
    * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement's two pieces of per-session state.
    *
@@ -8511,6 +8518,11 @@ export class SessionNodeManager {
       event: "session.salt.frozen",
       observation: `the salt agreement could not be completed with this counterparty: ${action.detail}`,
       impact: "the session was stopped rather than left to hash under a value the two sides do not share; no message was lost and the transcript is unaffected — only a NEW session moves this forward",
+      reviveReason: `session_frozen_${action.reason}`,
+      // The operator-facing sentence comes from the TOTAL guidance map, so a reason can never reach
+      // this refusal without one — and it is what stops a salt disagreement being reported to them
+      // as their counterparty failing a key check.
+      reviveGuidance: SALT_FREEZE_GUIDANCE[action.reason],
     }, correlationId);
   }
 
@@ -8523,6 +8535,10 @@ export class SessionNodeManager {
     await this.#freezeSession(agentName, sessionId, reason, {
       event: "session.content.identity.frozen",
       observation: "a frame failed to verify against the expected counterparty's key; the session was frozen defensively; cause undetermined",
+      reviveReason: "session_frozen_identity_failure",
+      reviveGuidance:
+        "This session was frozen because a message failed to verify against the expected counterparty's key. " +
+        "Cause undetermined — that signal looks the same whether someone was impersonating your counterparty or CELLO's own delivery mishandled a fallback, so it is recorded as an observation and nothing has been concluded about them.",
       // Review F1: this said "no further content will be accepted on this session", which was FALSE
       // as shipped — the next read revived it. It is true now, and it says how it is true, because
       // an operator who reads "frozen" and then watches the session work again learns to distrust
@@ -8543,13 +8559,22 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     reason: string,
-    narrative: { event: string; observation: string; impact: string },
+    narrative: { event: string; observation: string; impact: string; reviveReason: string; reviveGuidance: string },
     correlationId?: string,
   ): Promise<void> {
     // Review F1: MARK BEFORE TEARING DOWN. `destroySessionNode` writes `interrupted`, which is the
     // revivable status — if the mark landed after, a read racing the teardown could revive the
     // session out from under the freeze.
-    this.#frozenSessions.add(this.#k(agentName, sessionId));
+    //
+    // `reviveReason` is SPELLED OUT by the caller rather than built from `reason`. Deriving it looks
+    // tidier and silently changed a shipped contract: the identity freeze's `reason` is the specific
+    // ordering failure (`bad_signature`, `signer_not_counterparty`), so a derived code would have
+    // turned the stable `session_frozen_identity_failure` into a family of varying strings that no
+    // caller matches. Caught by that path's own test.
+    this.#frozenSessions.set(this.#k(agentName, sessionId), {
+      reason: narrative.reviveReason,
+      guidance: narrative.reviveGuidance,
+    });
     // The EVENT NAME is the caller's, not this method's. Both freezes share a mechanism and nothing
     // else, and a salt disagreement logged under `…identity.frozen` would tell an operator their
     // counterparty failed a key check when they did not — a worse outcome than saying nothing.
@@ -10113,13 +10138,16 @@ export class SessionNodeManager {
      * and for the same reason. The durable column is `DOD-M15-FREEZE-STATUS-1`; the reversibility
      * could not wait for it.
      */
-    if (this.#frozenSessions.has(key)) {
+    const frozen = this.#frozenSessions.get(key);
+    if (frozen) {
+      // The REASON and the GUIDANCE both come from the site that froze it. Hardcoding them here was
+      // correct while an identity failure was the only way in, and became a false accusation the
+      // moment a second one existed — see the note on `#frozenSessions`.
       return {
         ok: false,
-        reason: "session_frozen_identity_failure",
+        reason: frozen.reason,
         guidance:
-          `This session was frozen because a message failed to verify against the expected counterparty's key. It is not revived automatically, and reading or sending will not clear it. ` +
-          `Cause undetermined — that signal looks the same whether someone was impersonating your counterparty or CELLO's own delivery mishandled a fallback, so it is recorded as an observation and nothing has been concluded about them. ` +
+          `${frozen.guidance} It is not revived automatically, and reading or sending will not clear it. ` +
           `Your transcript up to the freeze is intact: cello_transcript ${sessionId} reads it. ` +
           `To end the session and keep what it earned, close it — cello_close_session ${sessionId}. To talk to them again, start a fresh session rather than reviving this one.`,
       };
