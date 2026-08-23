@@ -1298,7 +1298,17 @@ export class SessionNodeManager {
    * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
    * result — the deposit itself and its logging are unchanged either way.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string): Promise<ParkAttempt> {
+  /**
+   * `contentHashAlg` is `string | undefined`, NOT optional — B2b-1 review F4's shape, applied to the
+   * last place it was missing.
+   *
+   * Optional, dropping it at a call site was neither a typecheck error nor a test failure, because
+   * absent silently means `sha256` and that is the only value in play today. Measured: the
+   * direct-dial-fail route's mutant SURVIVED the whole daemon suite. Requiring the argument — even
+   * when its value is `undefined` — forces each of the three callers to state what this message was
+   * hashed under, so a new fourth caller cannot omit it by accident.
+   */
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): Promise<ParkAttempt> {
     // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
     // the live hook refuses (before any deposit), with the same event and the same `cause`.
     if (this.#parkFaultRemaining > 0) {
