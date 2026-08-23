@@ -105,6 +105,69 @@ describe("I2: the node reports the SAME policy object libp2p was given", () => {
   });
 });
 
+describe("I2b: the declared limits actually REACH libp2p", () => {
+  /**
+   * WRITTEN BECAUSE MUTATION TESTING CAUGHT ITS ABSENCE. Deleting `connectionManager:
+   * connectionLimits` from the `createLibp2p` call left all eleven other tests green — I2 asserts
+   * the NODE reports the policy, which is true of a node that never handed it to anybody. The
+   * entire claim of this half of the unit ("declared, not inherited") had no test behind it, and
+   * that is the fifth consecutive unit in this milestone to ship a module nothing proved was
+   * called.
+   *
+   * So this asserts the OUTCOME, not the shadow: set maxConnections to 1, dial in twice, and watch
+   * libp2p enforce it. If the block stops being passed, the limit reverts to 300 and both
+   * connections survive.
+   */
+  it("enforces inboundConnectionThreshold — proving libp2p got the block, not just that we kept a copy", async () => {
+    /**
+     * `inboundConnectionThreshold` is the right knob to prove this on: it is the one an
+     * unauthenticated peer spends directly, and it is enforced at ACCEPT time
+     * (`connection-manager/index.js` — `inboundConnectionRateLimiter.consume(host)` → refuse),
+     * before the Noise handshake, so the outcome is a dial that fails rather than a connection
+     * that is later cleaned up.
+     *
+     * NOT `maxConnections`: pruning there runs through `safelyCloseConnectionIfUnused`, and a
+     * just-opened connection is still carrying identify, so a low cap does not deterministically
+     * shed a fresh connection. My first version of this test assumed it did, went red at baseline
+     * and GREEN under the mutation — an assertion that measured libp2p's pruning policy rather
+     * than whether our block arrived.
+     */
+    const listener = await start({
+      keyProvider: generateKeypair(),
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      nodeType: "session",
+      connectionLimits: { inboundConnectionThreshold: 1 },
+    });
+    const addr = listener.listenAddresses().find((a) => a.includes("/p2p/"));
+    if (!addr) throw new Error("listener has no addressed multiaddr");
+
+    const dialOnce = async (): Promise<boolean> => {
+      const dialer = await start({
+        keyProvider: generateKeypair(),
+        listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+        nodeType: "session",
+      });
+      try {
+        await dialer.dial(addr);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    // First inbound from 127.0.0.1 consumes the single point the threshold allows.
+    expect(await dialOnce(), "the first inbound dial should be admitted").toBe(true);
+    // Everything else from the same host inside the window is refused before Noise. With the block
+    // unpassed the threshold reverts to libp2p's 5 and all of these are admitted.
+    const laterAdmitted = [await dialOnce(), await dialOnce(), await dialOnce()].filter(Boolean).length;
+    expect(
+      laterAdmitted,
+      `inboundConnectionThreshold: 1 was not enforced — ${laterAdmitted} of 3 further dials from ` +
+        `the same host were admitted, so the connectionManager block never reached libp2p`,
+    ).toBe(0);
+  });
+});
+
 describe("I3: a connection carries what a reaper needs to judge it", () => {
   it("reports direction, open time and live stream count per connection", async () => {
     const listener = await start({
