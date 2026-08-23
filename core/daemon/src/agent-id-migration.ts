@@ -160,6 +160,14 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         direction TEXT NOT NULL,
         blob BLOB NOT NULL,
         created_at INTEGER NOT NULL,
+        -- DOD-M15-SEALWIRE-1 bullet 5. THE SECOND ENTRY. session-node-manager adds these by
+        -- inline ALTER before this rebuild runs, and the rebuild copies only the INTERSECTION --
+        -- so omitting them here DELETES a message's authorship proof on the one boot a legacy
+        -- database upgrades, then re-adds the columns empty. A transcript that silently stops
+        -- proving who wrote what is worse than one that never claimed to.
+        sender_pubkey TEXT,
+        sender_sig BLOB,
+        attribution TEXT NOT NULL DEFAULT 'local_session_state',
         PRIMARY KEY (agent_id, session_id, sequence, direction)
       )`,
     indexSql: () => [],

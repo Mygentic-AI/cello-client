@@ -69,6 +69,7 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
+import { addColumnIfMissing } from "./column-birth.js";
 import {
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
@@ -1828,6 +1829,27 @@ export class SessionNodeManager {
         direction TEXT NOT NULL,        -- 'sent' | 'received'
         blob BLOB NOT NULL,             -- readable plaintext bytes (whole-DB SQLCipher-encrypted at rest)
         created_at INTEGER NOT NULL,
+        -- ─── DOD-M15-SEALWIRE-1 bullet 5: the row proves AUTHORSHIP, or says it cannot ──────────
+        --
+        -- Before this, a row was (message, direction) and attribution came entirely from local
+        -- session state: "this arrived on the socket I believed was Bob's". That is fine while the
+        -- transcript is only ever read by its owner, and worthless the moment it is shown to anyone
+        -- else — which is the whole point of a notarized record.
+        --
+        -- sender_sig is the Structure-2 signature, and it is stored ONLY after the receiver has
+        -- already verified it against the pubkey inside the sender's own signed bytes
+        -- (#recordFrameOrdering). A stored signature here is a VERIFIED one, never a claimed one.
+        --
+        -- attribution is NOT NULL ON PURPOSE, and it is the load-bearing column. There is a soft
+        -- path — session.content.ordering.decode_failed falls back to hash-dedup — that ingests a
+        -- message with no verified signature, so rows legitimately without one WILL exist. A
+        -- nullable signature column and nothing else would rebuild the defect this bullet exists to
+        -- fix: a table that IMPLIES every row carries authorship proof, where some carry none and
+        -- nothing distinguishes them. Forcing every writer to name which it is makes silent NULL
+        -- impossible rather than merely discouraged.
+        sender_pubkey TEXT,             -- from INSIDE the sender's signed bytes; NULL unless verified
+        sender_sig BLOB,                -- the VERIFIED Structure-2 signature; NULL unless verified
+        attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- 'verified_signature' | 'local_session_state'
         PRIMARY KEY (agent_id, session_id, sequence, direction)
       )
     `);
@@ -1881,6 +1903,33 @@ export class SessionNodeManager {
         PRIMARY KEY (agent_id, contact_pubkey, signal_hash)
       )
     `);
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5: authorship columns on an EXISTING transcript.
+     *
+     * BEFORE `migrateSessionTablesToAgentId` — the rebuild copies the intersection of old and new
+     * columns, so a column added after it would be dropped on the upgrade boot and re-added empty.
+     * These have their second entry in that migration's pinned DDL; `DOD-M15-MIGRATION-GUARD-1`
+     * fails the build if the two ever disagree.
+     *
+     * `addColumnIfMissing` rather than a bare try/catch: it swallows ONLY `duplicate column name`
+     * and rethrows anything else, so broken DDL cannot be mistaken for "already applied".
+     */
+    // Written as three LITERAL statements rather than a loop over a column array. A loop needs its
+    // own parser in the guard (as retry_queue does); literals are read by the guard's generic one,
+    // so these are replayed automatically and cannot fall outside it.
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "transcript", column: "sender_pubkey",
+      sql: "ALTER TABLE transcript ADD COLUMN sender_pubkey TEXT",
+    });
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "transcript", column: "sender_sig",
+      sql: "ALTER TABLE transcript ADD COLUMN sender_sig BLOB",
+    });
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "transcript", column: "attribution",
+      sql: "ALTER TABLE transcript ADD COLUMN attribution TEXT NOT NULL DEFAULT 'local_session_state'",
+    });
+
     const contactCols = this.#db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>;
     if (!contactCols.some((c) => c.name === "moniker")) {
       this.#db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");

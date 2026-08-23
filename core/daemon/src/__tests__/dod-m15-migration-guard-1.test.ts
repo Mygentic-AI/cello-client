@@ -262,6 +262,9 @@ function altersBeforeRekey(): Record<string, string[]> {
   return {
     sessions: literalAlters(manager, "sessions"),
     contacts: literalAlters(manager, "contacts"),
+    // DOD-M15-SEALWIRE-1 bullet 5 added authorship columns to `transcript`, by literal ALTER in the
+    // same file — so the generic parser reads them and this line is all the guard needed.
+    transcript: literalAlters(manager, "transcript"),
     // NOT from `contacts-tier-migration.ts` — those run AFTER the re-key and must not be present
     // before it. See the header, and the second test below which pins that.
     retry_queue: retryQueueAlters(retry),
@@ -418,6 +421,7 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
     const groundTruth: Record<string, { table: string; file: string }> = {
       sessions: { table: "sessions", file: "session-node-manager.ts" },
       contacts: { table: "contacts", file: "session-node-manager.ts" },
+      transcript: { table: "transcript", file: "session-node-manager.ts" },
     };
     for (const [key, { table, file }] of Object.entries(groundTruth)) {
       const raw = readFileSync(join(SRC, file), "utf8");
