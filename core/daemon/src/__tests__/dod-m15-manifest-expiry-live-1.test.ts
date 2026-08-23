@@ -571,3 +571,31 @@ describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: the remedy matches where the manifest 
     );
   });
 });
+
+describe("DOD-M15-MANIFEST-EXPIRY-LIVE-1: no anchor at all is not the same as a healthy one", () => {
+  it("★ not_configured says so instead of rendering identically to a valid manifest", () => {
+    /**
+     * Found by the NEXT unit's review. `describeManifestValidity` returned `undefined` for both
+     * `valid` and `not_configured`, so a daemon holding no consortium manifest whatsoever looked
+     * byte-identical to one holding a fully valid, in-window trust anchor.
+     *
+     * That is the same defect `STALEROSTER-1` was written to fix — absent and healthy must not look
+     * alike — reintroduced one spread above the code fixing it, in the same status response.
+     */
+    const d = describeManifestValidity(classifyManifestValidity(null, NOW));
+    expect(
+      d,
+      "a daemon with NO trust anchor reported exactly what a daemon with a healthy one reports: " +
+        "nothing. The absence of an expiry warning read as evidence of a good manifest.",
+    ).toBeDefined();
+    expect(d?.["manifest_anchor"]).toBe("none");
+    expect(
+      String(d?.["manifest_validity_guidance"]),
+      "and it must say the silence is not evidence of health",
+    ).toMatch(/not evidence of a healthy/i);
+  });
+
+  it("a VALID manifest still contributes nothing — the rule is not abandoned, only scoped", () => {
+    expect(describeManifestValidity(classifyManifestValidity(manifest(), NOW))).toBeUndefined();
+  });
+});

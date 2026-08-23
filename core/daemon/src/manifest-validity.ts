@@ -181,7 +181,28 @@ export function describeManifestValidity(
   v: ManifestValidity,
   origin: ManifestOrigin = "file",
 ): Record<string, unknown> | undefined {
-  if (v.state === "valid" || v.state === "not_configured") return undefined;
+  /**
+   * `valid` contributes nothing — correct, and the rule this milestone repeats most.
+   *
+   * `not_configured` USED TO collapse into that silence, and it was the same defect one spread
+   * above: a daemon holding NO consortium manifest at all rendered byte-identically to one holding
+   * a fully valid, in-window trust anchor. Found by `DOD-M15-DIRAUTH-1`'s review, which noticed it
+   * is the exact condition that unit was writing 100+ lines to expose — same daemon, same boot.
+   *
+   * "Absent" and "healthy" must not look alike. That is `STALEROSTER-1`'s rule and it applies to the
+   * anchor as much as to the roster reading.
+   */
+  if (v.state === "valid") return undefined;
+  if (v.state === "not_configured") {
+    return {
+      manifest_anchor: "none",
+      manifest_validity_guidance:
+        "There is NO consortium manifest on this daemon, so there is no trust anchor to have a " +
+        "validity window at all — the absence of an expiry warning here is not evidence of a healthy " +
+        "one. Directory identity authentication is off for the same reason; see " +
+        "directory_authentication for what that costs and how to turn it on.",
+    };
+  }
 
   if (v.state === "unreadable_window") {
     return {
