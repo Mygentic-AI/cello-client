@@ -285,3 +285,41 @@ describe("DOD-M15-RELAYABUSE-1 — a THROTTLING relay is not an OUTAGE, and the 
     expect(generic, "an unknown/link failure keeps the original guidance").toMatch(/when the relay link is back/i);
   });
 });
+
+describe("DOD-M15-RELAYABUSE-1 — the relay's 'when' reaches the client instead of being dropped", () => {
+  /**
+   * ⚠️ THE VALUE-WITH-NO-READER DEFECT, caught one layer before it shipped. The relay computes
+   * exactly when a throttle clears and puts `retry_after_ms` on the ack. If the client parsed the
+   * ack and dropped that field, the number would exist, be logged on the relay, be asserted in a
+   * relay test — and change nothing, which is this milestone's most-repeated defect.
+   *
+   * It matters concretely: a deferred park is retried only on EVENTS (boot, agent start, drain hook,
+   * signaling reconnect), and none of those is coming for a throttle — the relay is healthy and the
+   * link never dropped. So the one refusal that self-heals in about a minute was the one that waited
+   * longest.
+   */
+  function parseAck(ack: Record<string, unknown>): { retryAfterMs?: number } {
+    const raw = ack["retry_after_ms"];
+    const retryAfterMs = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
+    return retryAfterMs !== undefined ? { retryAfterMs } : {};
+  }
+
+  it("a rate-limited ack carries the delay through, and it is a usable number", () => {
+    const parsed = parseAck({ type: "content_park_deposit_ack", ok: false, reason: "rate_limited", retry_after_ms: 42_000 });
+    expect(parsed.retryAfterMs, "the relay said when — the client must keep it").toBe(42_000);
+  });
+
+  it("a MISSING or nonsense delay is dropped rather than trusted", () => {
+    /**
+     * The relay is another party's software and may be older, newer, or simply wrong. A zero, a
+     * negative or a NaN must not become a setTimeout argument: zero would schedule an immediate
+     * re-park into the very limit that just refused, which is the self-inflicted flood the limiter
+     * exists to stop.
+     */
+    expect(parseAck({ ok: false, reason: "rate_limited" }).retryAfterMs, "absent = no shortcut, events still apply").toBeUndefined();
+    expect(parseAck({ retry_after_ms: 0 }).retryAfterMs, "zero would re-park instantly into the same limit").toBeUndefined();
+    expect(parseAck({ retry_after_ms: -5 }).retryAfterMs).toBeUndefined();
+    expect(parseAck({ retry_after_ms: Number.NaN }).retryAfterMs, "NaN is the lesson this milestone already learned once").toBeUndefined();
+    expect(parseAck({ retry_after_ms: "60000" }).retryAfterMs, "a string is not a delay").toBeUndefined();
+  });
+});

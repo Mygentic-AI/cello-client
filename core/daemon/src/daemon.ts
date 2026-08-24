@@ -2118,7 +2118,32 @@ async function startDaemonHoldingLock(
       logger.info("content.park.deposited", { sessionId, contentHash: contentHashHex, recipientPubkey: recipientPubkeyHex.slice(0, 16) });
       return { ok: true };
     }
-    logger.warn("content.park.deposit.failed", { sessionId, contentHash: contentHashHex, reason: res.reason });
+    logger.warn("content.park.deposit.failed", {
+      sessionId,
+      contentHash: contentHashHex,
+      reason: res.reason,
+      ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+    });
+    /**
+     * DOD-M15-RELAYABUSE-1 — **GIVE THE RELAY'S "WHEN" A CONSUMER.**
+     *
+     * A deferred park is otherwise retried only on EVENTS — boot, agent start, the drain hook, a
+     * signaling reconnect. None of those is coming for a throttle: the relay is healthy, the link
+     * never dropped, and the condition clears on a timer nobody is watching. So the one refusal that
+     * self-heals in about a minute was the one that waited longest, purely because the number the
+     * relay had already computed had no reader.
+     *
+     * Scheduled ONCE per refusal, unref'd so it can never hold the process open, and best-effort:
+     * the existing event triggers remain the guarantee, and this is a shortcut on top of them. It
+     * deliberately does not retry-on-retry — a timer that reschedules itself on failure is a
+     * self-inflicted flood, which is what the limiter exists to stop.
+     */
+    if (res.retryAfterMs !== undefined && res.retryAfterMs > 0) {
+      const timer = setTimeout(() => {
+        void flushAwaitingContent().catch(() => { /* best-effort: the event triggers still apply */ });
+      }, res.retryAfterMs + 250);
+      timer.unref?.();
+    }
     return { ok: false, reason: res.reason ?? "relay_deposit_failed" };
   });
 

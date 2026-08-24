@@ -81,7 +81,7 @@ export class ContentParkClient {
   async deposit(
     node: CelloNode,
     args: { recipientPubkey: Uint8Array; contentHash: Uint8Array; sessionId: Uint8Array; ciphertext: Uint8Array },
-  ): Promise<{ ok: boolean; reason?: string }> {
+  ): Promise<{ ok: boolean; reason?: string; retryAfterMs?: number }> {
     const stream = await this.#open(node);
     try {
       const iter = this.#iter(stream);
@@ -101,12 +101,27 @@ export class ContentParkClient {
         return { ok: false, reason: "no_deposit_ack" };
       }
       const ok = ack["ok"] === true;
+      /**
+       * DOD-M15-RELAYABUSE-1 — **CARRY THE RELAY'S OWN ANSWER TO "WHEN?".**
+       *
+       * The relay computes exactly when a throttle clears and now puts `retry_after_ms` on the ack.
+       * Dropping it here would make it a value with no reader — the defect this milestone keeps
+       * finding — and it is the one number that decides whether a queued message waits sixty seconds
+       * or waits for an unrelated reconnect that may be minutes away.
+       */
+      const rawRetry = ack["retry_after_ms"];
+      const retryAfterMs = typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry > 0 ? rawRetry : undefined;
       this.#logger.info("content.park.deposit.result", {
         relayPeerId: this.#relayPeerId,
         ok,
         reason: typeof ack["reason"] === "string" ? ack["reason"] : undefined,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
       });
-      return { ok, reason: typeof ack["reason"] === "string" ? (ack["reason"] as string) : undefined };
+      return {
+        ok,
+        reason: typeof ack["reason"] === "string" ? (ack["reason"] as string) : undefined,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+      };
     } finally {
       await stream.close().catch(() => {});
     }
