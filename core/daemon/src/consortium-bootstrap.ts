@@ -456,6 +456,37 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   // could not). Off on the M6 back-compat path (no scheduler), and off without real root keys: a
   // poll that verifies against an empty key set verifies against nothing.
   let stopHttpManifestPoll: (() => void) | undefined;
+  /**
+   * DOD-M15-DIRAUTH-1 (Andre's quick win #3) — **AN EMPTY KEY SET MUST NOT DISABLE THE POLL IN
+   * SILENCE.**
+   *
+   * The condition below is correct and stays correct: a poll that verifies against no keys verifies
+   * against nothing, so it must not run. What was wrong is what happened when that triggered —
+   * nothing at all. The daemon started, looked healthy, and simply never adopted a new manifest
+   * again, which is the failure mode you discover months later when a rotated directory key is not
+   * picked up.
+   *
+   * ⚠️ THE DISTINCTION THAT MAKES THIS SAFE, and the reason it is not a blanket throw: **"no
+   * scheduler" is a legitimate configuration** — the M6 back-compat path deliberately runs without
+   * one, and failing startup there would brick a supported setup. **"Scheduler and provider are
+   * wired, but the keys are empty" is a MISCONFIGURATION** — someone intended verification and
+   * supplied nothing to verify with. Only the second refuses.
+   */
+  if (manifestPollScheduler && manifestProvider) {
+    const keyCount = manifestRootKeys?.length ?? 0;
+    if (keyCount === 0 || !manifestThreshold || manifestThreshold < 1) {
+      const detail = `rootKeys=${String(keyCount)} threshold=${String(manifestThreshold ?? 0)}`;
+      logger.error("directory.manifest.poll.misconfigured", {
+        rootKeyCount: keyCount,
+        threshold: manifestThreshold ?? 0,
+        impact:
+          "the manifest poll is wired but has no key set to verify against, so it would adopt " +
+          "manifests unverified or never adopt one at all — refusing at startup instead of running " +
+          "with directory-key rotation silently dead",
+      });
+      throw new Error(`directory_manifest_poll_misconfigured: ${detail}`);
+    }
+  }
   if (manifestPollScheduler && manifestProvider && manifestRootKeys && manifestRootKeys.length > 0 && manifestThreshold && manifestThreshold >= 1) {
     stopHttpManifestPoll = startHttpManifestPoll({
       scheduler: manifestPollScheduler,
