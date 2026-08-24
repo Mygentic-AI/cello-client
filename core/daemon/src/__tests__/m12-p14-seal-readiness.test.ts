@@ -319,7 +319,7 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
 
     // The relay answers with a position BEHIND our frontier — the documented shape after an
     // unwitnessed append. Nothing is missing, nothing is held; only the direction is wrong.
-    const placed = fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+    const placed = fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0, undefined, "msg", undefined);
     expect(placed, "the fixture must actually diverge").toMatchObject({ placed: true, diverged: true });
 
     const r = fx.snm.sealReadiness("alice", SID);
@@ -336,7 +336,7 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
     // meaningless one. The diverged check has to be read BEFORE that branch.
     await fx.createSession(SID, "alice");
     fx.seedSent("alice", SID, "one");
-    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0, undefined, "msg", undefined);
 
     expect(fx.snm.sealReadinessView("alice", SID)).toEqual({
       state: "unknown",
@@ -357,7 +357,7 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
     // hole shipped — no test drove a REAL manager through a teardown.
     await fx.createSession(SID, "alice");
     fx.seedSent("alice", SID, "one");
-    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0);
+    fx.snm.placeOwnLeaf("alice", SID, "cc".repeat(32), new TextEncoder().encode("late"), 0, undefined, "msg", undefined);
     expect(fx.snm.sealReadiness("alice", SID).diverged, "precondition").toBe(true);
 
     await fx.snm.destroySessionNode("alice", SID, "peer_gone");
@@ -375,7 +375,7 @@ describe("M12-P14: sealReadiness computes from real manager state", () => {
     // worse than the bug it guards, because force-abandon is then the only exit. In-order placement
     // must stay ready.
     await fx.createSession(SID, "alice");
-    const first = fx.snm.placeOwnLeaf("alice", SID, "dd".repeat(32), new TextEncoder().encode("in order"), 0);
+    const first = fx.snm.placeOwnLeaf("alice", SID, "dd".repeat(32), new TextEncoder().encode("in order"), 0, undefined, "msg", undefined);
 
     expect(first).toMatchObject({ placed: true });
     expect(first).not.toHaveProperty("diverged");

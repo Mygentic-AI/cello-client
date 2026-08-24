@@ -45,7 +45,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // Now WE send. The relay assigns position 2. Appending at the tail would put our own message at
     // index 0 — wearing the position that belongs to a message of theirs we have not seen yet.
     const ours = new TextEncoder().encode("ours at 2");
-    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 2, "corr-send");
+    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 2, "corr-send", "msg", undefined);
     expect(placed.placed, "our leaf must not be committed at the wrong index").toBe(false);
     expect(snm.getSessionTree(AGENT, SID).size(), "nothing may be appended while the gap is open").toBe(0);
 
@@ -71,7 +71,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     await snm.ingestReceivedContent(AGENT, SID, theirs, msgLeafHash(theirs), "corr");
 
     const ours = new TextEncoder().encode("something we said");
-    snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 2, "corr-send");
+    snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 2, "corr-send", "msg", undefined);
 
     const theirs0 = new TextEncoder().encode("theirs at 0");
     snm.recordWitnessedSequence(AGENT, SID, hx(msgLeafHash(theirs0)), 0);
@@ -106,7 +106,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // The ordinary case, and the one that must not regress: no gap, so the assigned position IS the
     // tail and the send commits at once. A fix that held everything would break every conversation.
     const ours = new TextEncoder().encode("first thing said");
-    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 0, "corr-send");
+    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 0, "corr-send", "msg", undefined);
     expect(placed.placed).toBe(true);
     expect(placed.placed && placed.leafIndex).toBe(0);
     expect(snm.getSessionTree(AGENT, SID).size()).toBe(1);
@@ -121,7 +121,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // Arrival order is the documented degradation, and this unit must not convert it into a refusal
     // — that would take messaging down whenever the relay is unreachable.
     const ours = new TextEncoder().encode("relay is down");
-    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, undefined, "corr-send");
+    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, undefined, "corr-send", "msg", undefined);
     expect(placed.placed).toBe(true);
     expect(snm.getSessionTree(AGENT, SID).size()).toBe(1);
   }, 60_000);
@@ -140,7 +140,7 @@ describe("DOD-M12B-INDEX-1: the sender's own leaf takes its relay-assigned posit
     // that is complete but skewed, and the operator's own words are worth more than a tidiness the
     // roots cannot recover. What is never done is writing OVER the assigned slot.
     const ours = new TextEncoder().encode("after the skew");
-    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 0, "corr-send");
+    const placed = snm.placeOwnLeaf(AGENT, SID, hx(msgLeafHash(ours)), ours, 0, "corr-send", "msg", undefined);
     expect(placed.placed, "the message must stay in this side's own record").toBe(true);
     expect(placed.placed && placed.diverged, "and it must be reported as diverged, not as an ordinary success").toBe(true);
     expect(placed.placed && placed.leafIndex, "appended at the tail — never over the committed leaf at 0").toBe(2);

@@ -53,6 +53,21 @@
     "src/__tests__/msg-016-sealed-status-lands.test.ts",
     "src/__tests__/msg-017-seal-waiter-key.test.ts",
     "src/__tests__/msg-018-reservation-retry.test.ts",
+    // DOD-M15-SALTSPLIT-1 / SEALWIRE-1: these two were type-BROKEN and nobody could see it.
+    // `placeOwnLeaf` lost its `kind` and `authorship` defaults so a caller must state both, and nine
+    // calls across these two files were left invalid — five passing six arguments, four passing five.
+    // They compiled only because this allowlist did not include them, which is the allowlist doing
+    // its job at the cost of hiding the very breakage the signature change was meant to make loud.
+    // Added here because a required parameter that no compiler checks is a comment.
+    "src/__tests__/msg-007-index-discipline.test.ts",
+    // ⚠️ `m12-p14-seal-readiness.test.ts` is NOT here, and the omission is measured rather than
+    // assumed. Its nine-argument `placeOwnLeaf` calls are fixed in the same commit, but adding the
+    // file surfaces FIVE pre-existing errors that have nothing to do with this unit: four
+    // `implicitly has an 'any' type` on a filter callback, and one real one at line 363 —
+    // `Argument of type '"peer_gone"' is not assignable to parameter of type
+    // '"sealed" | "error" | "interrupted"'`, a test passing a status the function cannot take.
+    // That last one is a genuine finding and it belongs to `DOD-M12B-TESTS-NOT-TYPECHECKED-1`, not
+    // here. Fixing someone else's file to widen my own guard is how a unit stops being reviewable.
     "src/__tests__/helpers/encrypted-db.ts",
     "src/__tests__/helpers/hold-singleton-lock.ts",
     "src/__tests__/helpers/park-relay.ts",
