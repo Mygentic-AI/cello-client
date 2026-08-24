@@ -745,22 +745,49 @@ export class SessionNodeManager {
     // relay swept or sealed it" — can never fire, so the operator is handed a first-message-race
     // label for a swept session.
     /**
-     * DOD-M15-RELAYLEAK-1 (review MEDIUM-5) — **ONLY THE CALL THAT CLAIMED THE REGISTRATION MAY
-     * RELEASE IT.**
+     * DOD-M15-RELAYLEAK-1 — **RE-REGISTERING A SESSION THAT IS ALREADY REGISTERED BLINDS IT.**
      *
-     * Two calls can be in this method for the same session at once — the method's own comment says
-     * two near-simultaneous seal triggers are expected by design. If both released, the second to
-     * finish would unregister the only session and CLOSE the client while the first is still parked
-     * on `await …submitLeaf(...)`, settling that submit with `relay_client_closed`. The operator is
-     * then told to check `cello_status` and their relay for a client **this daemon closed on
-     * itself** — an exit-point label pointing at innocent infrastructure.
+     * `registerSession` REPLACES the entry's `onLeafDeliver` with `onLeafDeliver ?? (() => {})`, and
+     * unlike `assignment` / `recorded` it does NOT carry the existing handler forward. **This path
+     * passes no handler.** So a detached seal on a session that still holds a live registration
+     * would swap that session's inbound leaf delivery for a no-op: the counterparty's leaves keep
+     * arriving at the relay client and are dropped on the floor, while the operator sees a healthy
+     * session that has simply gone quiet.
      *
-     * So the release signal is not "this branch ran", it is "this call ADDED the registration". A
-     * call that finds it already present is a passenger: it uses the client and leaves the closing
-     * to whoever claimed it.
+     * A call that finds the session already registered is therefore a PASSENGER: it uses the client
+     * and touches nothing. It also does not release — ownership is never inferred, only claimed.
+     *
+     * ⚠️ **This is NOT justified by a concurrency race, and an earlier version of this comment said
+     * it was.** Review checked: `#resolveSealTransport` and everything above the first `await` are
+     * synchronous, and a second caller plants/hits `#responderSealSubmitted` and returns
+     * `responder_seal_already_submitted` before ever reaching `submitLeaf`. Two callers cannot be in
+     * the client at once through the only caller, so "the second one closes the client the first is
+     * awaiting" **cannot happen**. The wrong reason mattered: it invites a future reader to delete
+     * this guard as defensive clutter once they notice the race is impossible — taking the
+     * handler-clobbering protection with it.
      */
     const claimedRegistration = !client.hasSession(sessionId);
-    if (claimedRegistration) client.registerSession(sessionId, node);
+    if (claimedRegistration) {
+      client.registerSession(sessionId, node);
+    } else {
+      /**
+       * Review MEDIUM-1 — **A PATH THAT DECLINES TO FIX A LEAK MUST SAY SO.**
+       *
+       * Reaching here means the session is registered on this client while `#activeNodes` holds no
+       * entry for it — and the ways that happens are all orphans: a previous `releaseDetached()`
+       * that threw (loud once, then silent forever after), or a revival that registered and then
+       * failed to hang the client on an entry. Declining to unregister is right — we cannot prove
+       * no live session owns it — but without this line the orphan is invisible, which is the exact
+       * shape this whole line exists to remove.
+       */
+      this.#logger.info("session.seal.transport.registration_shared", {
+        agentName,
+        sessionId,
+        impact:
+          "this seal is using a relay registration it did not create, so it will not release it. If " +
+          "no live session owns that registration the client is held until process exit.",
+      });
+    }
     /**
      * DOD-M15-RELAYLEAK-1 — **`releaseOnDone` IS THE RELEASE SIGNAL, and its absence was the leak.**
      *
@@ -1241,6 +1268,25 @@ export class SessionNodeManager {
    * signature. That is unavoidable: deciding whether bytes are a document frame requires the bytes.
    * The router it calls never logs them.
    */
+  /**
+   * ⚠️ THE RETURN TYPE USED TO DECLARE `ok?: boolean; reason?: string`, AND THE PRODUCER CANNOT
+   * SUPPLY EITHER. Narrowed so reading them is a compile error rather than a silent `undefined`.
+   *
+   * The implementation is `DocumentFrameRouter.routeSync`, whose own return type
+   * (`FrameClassification`) is exactly `{consumed:false} | {consumed:true; kind}` — it has no such
+   * fields at all. The wider shape here was a promise only this declaration made, and it was
+   * assignable precisely because the extra members were optional.
+   *
+   * It is not an oversight in the router: `routeSync` dispatches with `void this.#enqueue(...)`, so
+   * when it returns, the frame has been classified and queued and **no verdict exists yet**. A
+   * synchronous caller cannot be told an asynchronous outcome.
+   *
+   * **The cost of the lie was a wrong lead.** `j-stale-session`'s investigation read those fields'
+   * absence from every log line as "the router returned neither" and filed it as the next thread to
+   * pull. There was no thread: a JSON logger omits `undefined`, so a field that can never be set is
+   * indistinguishable from one that was set to nothing. The verdict lives on
+   * `document.frame.refused`, joined by `correlationId`.
+   */
   #onDocumentFrame:
     | ((
         agentName: string,
@@ -1248,7 +1294,7 @@ export class SessionNodeManager {
         content: Uint8Array,
         senderPubkey: string,
         correlationId?: string,
-      ) => { consumed: boolean; kind?: string; ok?: boolean; reason?: string })
+      ) => { consumed: boolean; kind?: string })
     | null = null;
   /**
    * DOD-DOC-SCREEN-CLASSIFY-1: the classify-only half of the hook above — is this a document
@@ -8383,14 +8429,39 @@ export class SessionNodeManager {
       // Two correct changes, each fine alone, that break where they meet. Caught by running the
       // live enforcers straight after merging main rather than trusting a green unit suite.
       this.#witnessedSeq.get(this.#k(agentName, sessionId))?.delete(contentHashHex);
+      /**
+       * ⚠️ THIS LINE USED TO LOG `ok: routed.ok` AND `reason: routed.reason`, AND NEITHER CAN EVER
+       * BE PRESENT HERE. Removed rather than left, because their absence was read as evidence.
+       *
+       * The producer is `DocumentFrameRouter.routeSync`, and it has four returns — `unshaped`,
+       * `undecodable`, `owner_unresolved`, and the normal path — **none of which sets either
+       * field.** It cannot: the normal path is `void this.#enqueue(...)`, fire-and-forget, so at the
+       * instant this line is written the frame has been CLASSIFIED and QUEUED and nothing has yet
+       * decided whether it will be accepted. The verdict is genuinely not knowable here.
+       *
+       * **What that cost:** `j-stale-session` reported `framesReceived=3 inbound=0`, and the
+       * investigation recorded that `ok` and `reason` were "ABSENT from every line in the run — so
+       * the router returned neither, which is itself the next thread to pull: a routing result that
+       * reports no outcome cannot say whether it accepted or dropped the frame." That thread leads
+       * nowhere. The router did not fail to report an outcome; **it has no outcome to report at this
+       * point in the flow**, and a JSON logger omits an `undefined` field, so a structural absence
+       * looked exactly like a fault. A field that can never be populated is worse than no field.
+       *
+       * **Where the verdict actually lands**, named here so the next reader does not have to find it
+       * the hard way: a refusal is `document.frame.refused` (warn, carrying `kind` + `reason`,
+       * emitted from `#enqueue`'s continuation under the same `correlationId`). Acceptance is
+       * silent on this event. So "was this frame ingested?" is answered by joining on
+       * `correlationId`, never by reading this line alone.
+       */
       this.#logger.info("session.document.received", {
         sessionId,
         senderPubkey,
         contentHashHex,
         sequenceNumber: leafIndex,
         kind: routed.kind,
-        ok: routed.ok,
-        reason: routed.reason,
+        // The verdict is asynchronous. Stated positively so absence is not mistaken for silence.
+        dispatch: "queued",
+        verdictEvent: "document.frame.refused",
         correlationId,
       });
       return { leafIndex };
@@ -13077,8 +13148,17 @@ export class SessionNodeManager {
        * fixed here too: a leak that is only cleaned up by process death is still a leak for every
        * hour the daemon is up.
        */
+      /**
+       * ⚠️ Review MEDIUM-2 — **THE ENTRY IS MATCHED BY IDENTITY, NOT BY KEY.** `reviveSessionNode`
+       * has no in-flight guard: its `if (live) return` is separated from `#activeNodes.set` by the
+       * whole node build, so two revivals for one key can both reach the `set` and the second
+       * overwrites the first. Looking up by key alone would then hand THIS failing revival the
+       * OTHER one's live entry, and detaching it would unregister a running session's leaf handler
+       * — closing the client that session is using if it was the last one on it. Comparing `node`
+       * costs one token and makes "the entry I created" provable rather than assumed.
+       */
       const revivedEntry = this.#activeNodes.get(key);
-      if (revivedEntry) this.#detachSessionRelay(revivedEntry);
+      if (revivedEntry?.node === node) this.#detachSessionRelay(revivedEntry);
       this.#activeNodes.delete(key);
       try {
         await node.stop();

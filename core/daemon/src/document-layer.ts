@@ -240,7 +240,13 @@ export interface DocumentLayer {
     content: Uint8Array,
     senderPubkey: string,
     correlationId?: string,
-  ): { consumed: boolean; kind?: string; ok?: boolean; reason?: string };
+    // ⚠️ NO `ok` / `reason`. This declared them until 2026-08-24 and the implementation never set
+    // either: `routeSync` returns `FrameClassification`, which is `{consumed:false} | {consumed:true;
+    // kind}`, and it dispatches via `void this.#enqueue(...)` — so at the moment it returns, the
+    // frame is classified and queued and nothing has decided its fate. The verdict is emitted later
+    // as `document.frame.refused`, correlated by `correlationId`. Declaring optional fields nobody
+    // can populate made their absence in the log read as a routing fault; it was the type.
+  ): { consumed: boolean; kind?: string };
 }
 
 /**
