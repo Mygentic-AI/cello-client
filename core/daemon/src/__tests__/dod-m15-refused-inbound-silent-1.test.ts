@@ -544,6 +544,50 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     ).toBe(false);
   });
 
+  it("EVERY exit that answers an empty read carries the refusal — not just the quiet one", async () => {
+    /**
+     * ⚠️ Raised from a carried AC to work, on `CELLO_Coder_1`'s argument, and they were right.
+     *
+     * `counterparty_gone` does not merely stay silent. Its guidance says the peer *"may have crashed
+     * or gone offline… call `cello_close_session` to seal"* — **while the daemon holds the real
+     * reason in memory.** A version-skewed peer never gets an ACK, so it eventually drops the direct
+     * path and the operator lands on THAT exit rather than the quiet one I fixed. So the fix could
+     * be pre-empted by an answer that **blames the network for a version fault and then tells them
+     * to seal.** A wrong explanation plus an action is worse than saying nothing.
+     *
+     * Asserted structurally rather than by driving four transport states: every `cello_receive`
+     * return that can answer "nothing arrived" must spread `refusalsField`. Driving `gone`,
+     * `impaired` and `undeliverable` live needs three different transport failures, and a test that
+     * hard to set up is a test that stops being maintained — while the property is about the SHAPE
+     * of the handler: no empty-read exit may answer without checking.
+     */
+    const { readFileSync } = await import("node:fs");
+    const handlerSrc = readFileSync(
+      join(import.meta.dirname, "..", "session-content-handlers.ts"),
+      "utf8",
+    );
+    // Each of these is a distinct way to tell an operator "nothing came" — the exact moment a
+    // refusal explains, and the exact moment they conclude the other person stopped replying.
+    for (const reason of [
+      "counterparty_gone",
+      "delivery_impaired",
+      "content_undeliverable",
+      "session_sealed",
+    ]) {
+      const idx = handlerSrc.indexOf(`"${reason}"`);
+      expect(idx, `${reason} must exist in the handler`).toBeGreaterThan(-1);
+      // Look at the return object this reason sits in, not the whole file — a spread 400 lines away
+      // would otherwise satisfy this and prove nothing about THIS exit.
+      const window = handlerSrc.slice(Math.max(0, idx - 1200), idx + 1200);
+      expect(
+        window.includes("refusalsField("),
+        `the '${reason}' answer tells the operator nothing arrived, so it must carry the refusal ` +
+          `that explains why — otherwise it pre-empts the quiet exit and, worse, offers its own ` +
+          `wrong explanation`,
+      ).toBe(true);
+    }
+  });
+
   it("a genuinely quiet session says nothing about refusals, and keeps the ordinary advice", async () => {
     /**
      * The false-positive direction. `refusals` is spread rather than always-present precisely so it

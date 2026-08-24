@@ -1117,6 +1117,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             content: null,
             reason: "content_undeliverable",
             attendance: attendingNow(agentName),
+            // A local write failure and a refused message look identical from the operator's chair —
+            // nothing arrived. Carrying the refusal here keeps the two distinguishable.
+            ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
             undeliverable_sequences: [...undeliverable],
             guidance: `${undeliverable.length} message(s) arrived but could not be written to the local transcript, so they cannot be delivered — this is a fault on THIS machine (check disk space and ~/.cello permissions; see transcript.message.record.failed in the daemon log), not a quiet counterparty. Do not wait: waiting cannot recover them. Ask the counterparty to resend once the local fault is fixed.`,
           };
@@ -1172,6 +1175,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
               content: null,
               reason: "counterparty_gone",
               liveness: "gone",
+              // Same reasoning as the standalone `counterparty_gone` exit below.
+              ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
               taken_by_sibling: takenDetail,
               attendance,
               guidance: `${missedText} Note the counterparty's session connection has ALSO dropped (liveness: gone), so no more content will arrive and a reply cannot reach them — call cello_close_session to seal the session once you have read the history. If the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.`,
@@ -1198,6 +1203,13 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             ok: true,
             content: null,
             attendance: attendingNow(agentName),
+            // DOD-M15-REFUSED-INBOUND-SILENT-1 — the exit that does not merely stay silent, it
+            // MISLEADS. The guidance below blames the network ("may have crashed or gone offline")
+            // and tells the operator to seal, while the daemon is holding the real reason in memory.
+            // A version-skewed peer never gets an ACK, so it eventually drops the direct path and
+            // lands HERE — pre-empting the quiet exit this line was written to fix. A wrong
+            // explanation plus an action is worse than saying nothing at all.
+            ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
             reason: "counterparty_gone",
             liveness: "gone",
             guidance: "The counterparty's session connection has dropped (liveness: gone) — it may have crashed or gone offline. No more content will arrive on the direct path. Call cello_close_session to seal the session; if the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window.",
@@ -1237,6 +1249,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
             attendance: attendingNow(agentName),
             reason: "delivery_impaired",
             liveness: "impaired",
+            // DOD-M15-REFUSED-INBOUND-SILENT-1, the item I filed POST-LAUNCH as "deferred, not
+            // lost". Taken now instead: it was only safe to spread refusals into an exit once the
+            // notice and its advice travel together (see `refusalsField`), and they do — so this
+            // exit cannot carry the reason without also carrying what to do about it.
+            ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
             ...(impairment ? { impairment } : {}),
             guidance: `Nothing arrived. ${what}${whatNext} Their connection is still up, so content may still arrive and this can clear on its own — call cello_status for this session rather than assuming the counterparty is ignoring you.`,
           };
