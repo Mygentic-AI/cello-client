@@ -196,6 +196,48 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     expect(mgr.takeContentRefusals("alice", "s-scale"), "still inside the same magnitude").toEqual([]);
   });
 
+  it("THE DECLINED PROTECTION: a session says whether its content hashes are salted", async () => {
+    /**
+     * The other half of this DoD line, and deliberately a FIELD rather than an event.
+     *
+     * An unsalted session is exactly as verifiable as every session shipped before salting existed
+     * — nothing is wrong, nothing needs interrupting. What was missing was STATE: nothing let an
+     * operator tell *unsalted because this build predates the feature* from *unsalted because
+     * adoption was refused*, and only the second says anything about their setup.
+     *
+     * Asserted in BOTH directions, because a field that is always false is indistinguishable from
+     * one nothing writes — which is the shape this whole unit keeps producing.
+     */
+    const h = await start();
+    const mgr = h.getSessionNodeManager();
+    const db = mgr.getDb()!;
+    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+    const now = Date.now();
+    const row = (sid: string): void => {
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+      ).run(sid, agentId, "bb".repeat(32), now, now);
+    };
+    row("s-unsalted");
+    row("s-salted");
+    db.prepare("UPDATE sessions SET content_salt = ? WHERE session_id = ?").run(new Uint8Array(32).fill(7), "s-salted");
+
+    const byId = new Map(mgr.getSessionsForAgent("alice").map((s) => [s.session_id, s]));
+    expect(byId.get("s-salted")!.content_hashes_salted, "a salted session says so").toBe(true);
+    expect(
+      byId.get("s-unsalted")!.content_hashes_salted,
+      "and an unsalted one says so too — the point is the DISTINCTION, so a field that is always " +
+        "false would be exactly as useless as no field",
+    ).toBe(false);
+
+    // And the salt itself does not travel to a listing surface that has no use for it.
+    expect(
+      JSON.stringify([...byId.values()]).includes("07070707"),
+      "the raw salt must not be shipped to answer a yes/no question",
+    ).toBe(false);
+  });
+
   it("a DIFFERENT reason in the same session is still delivered", async () => {
     // Deduplication is per REASON, not per session. Suppressing a second, different problem because
     // a first one was already reported would be the dedup causing the very silence it mitigates.

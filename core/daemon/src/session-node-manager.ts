@@ -4423,6 +4423,10 @@ export class SessionNodeManager {
     this.#sessionLiveness.delete(key);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
+    // DOD-M15-REFUSED-INBOUND-SILENT-1: and the unshown refusals. Bounded (a fixed set of reasons
+    // per session) so leaving them was a slow leak rather than a bug — but this list IS the
+    // documented teardown set, and a map that is not in it drifts out of everyone's mental model.
+    this.#contentRefusals.delete(key);
     this.#unreadableAlgSeen.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
@@ -5082,6 +5086,28 @@ export class SessionNodeManager {
    * cello_get_sealed_receipt) depend on — without it an agent has no way to learn
    * its own session ids after a restart or from a fresh MCP connection.
    */
+  /**
+   * DOD-M15-REFUSED-INBOUND-SILENT-1, the DECLINED PROTECTION half — a FIELD, not an alert.
+   *
+   * An unsalted session is exactly as verifiable as every session shipped before salting existed,
+   * so there is nothing to interrupt the operator with and no event to fire. What was missing is
+   * STATE: nothing let anyone tell *"unsalted because this build predates the feature"* from
+   * *"unsalted because adoption was refused"* — and only the second says something about their
+   * setup. The session's own status now answers it, which costs nothing per message and cannot
+   * become a flood.
+   *
+   * The raw salt is dropped on the way out rather than passed through. `SELECT *` was handing the
+   * BLOB to a listing surface that has no use for it; the boolean is the whole question a reader of
+   * this list is asking, and shipping key material to answer a yes/no is not a trade worth making.
+   */
+  #saltStatusOf(row: SessionRecord): SessionRecord {
+    const { content_salt, ...rest } = row as SessionRecord & { content_salt?: Uint8Array | null };
+    return {
+      ...rest,
+      content_hashes_salted: content_salt != null && content_salt.length > 0,
+    } as SessionRecord;
+  }
+
   getSessionsForAgent(agentName: string): SessionRecord[] {
     if (!this.#db) return [];
     // Scoped by the STABLE id. `agent_name` is not a column of `sessions` any more, so it is stamped
@@ -5090,7 +5116,7 @@ export class SessionNodeManager {
     const rows = this.#db
       .prepare("SELECT * FROM sessions WHERE agent_id = ? ORDER BY updated_at DESC")
       .all(this.#requireAgentId(agentName)) as unknown as SessionRecord[];
-    return rows.map((r) => ({ ...r, agent_name: agentName }));
+    return rows.map((r) => ({ ...this.#saltStatusOf(r), agent_name: agentName }));
   }
 
   /**
@@ -5109,7 +5135,8 @@ export class SessionNodeManager {
          FROM sessions s LEFT JOIN agents a ON a.agent_id = s.agent_id
          ORDER BY s.updated_at DESC`,
       )
-      .all() as unknown as SessionRecord[];
+      .all()
+      .map((r) => this.#saltStatusOf(r as SessionRecord)) as unknown as SessionRecord[];
   }
 
   /**

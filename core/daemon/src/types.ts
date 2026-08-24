@@ -537,6 +537,16 @@ export type SessionStatus =
   | "abandoned";
 
 export interface SessionRecord {
+  /**
+   * DOD-M15-REFUSED-INBOUND-SILENT-1 — whether this session's content hashes are salted.
+   *
+   * Deliberately a status field and not an alert: an unsalted session is exactly as verifiable as
+   * every session shipped before salting existed, so nothing is wrong and there is nothing to
+   * interrupt anyone with. It exists so an operator can tell *unsalted because this build predates
+   * the feature* from *unsalted because adoption was refused* — only the second says anything about
+   * their setup. Absent on records that did not come from a listing surface.
+   */
+  content_hashes_salted?: boolean;
   session_id: string;
   /**
    * The STABLE key this row is scoped by. Every `sessions` query joins on this, never on
