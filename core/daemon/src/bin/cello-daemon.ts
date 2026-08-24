@@ -194,7 +194,89 @@ async function main(): Promise<void> {
     if (!restarted.sidecar) throw new Error("the screening process did not come back up");
   };
 
-  const handle = await startDaemon({
+  /**
+   * ⚠️ THE SIGNAL HANDLERS ARE REGISTERED BEFORE `startDaemon` IS AWAITED, AND THE ORDER IS THE BUG.
+   *
+   * `daemon.started` is logged INSIDE `startDaemon` (`daemon.ts`), and the handlers used to be
+   * registered ~50 lines BELOW the `await` that resolves it. So between the daemon announcing it had
+   * started and it being able to handle a shutdown, there was a window in which **SIGTERM's default
+   * action kills the process** — no handler, no `handle.stop()`, no `UPDATE sessions SET status =
+   * 'interrupted'`. The daemon dies claiming nothing and every active session stays `active`.
+   *
+   * ⚠️ THIS IS A PRODUCTION DEFECT, NOT A TEST ARTIFACT, and it is worth being explicit because it
+   * was found through a test. Anything that starts the daemon and stops it promptly — `systemctl
+   * stop` on a slow boot, a supervisor restarting a flapping unit, an operator hitting Ctrl-C
+   * because startup looked stuck — lands in that window. The sessions are then indistinguishable
+   * from ones abandoned mid-conversation, which is the state `interrupted` exists to prevent.
+   *
+   * HOW IT WAS FOUND, because the route matters: `AC-009` failed twice in CI, passed locally twice,
+   * and its message could not say why. Instrumenting both sides — `rowsMarkedInterrupted` on the
+   * daemon, and refusing to treat `code === null` as a clean exit in the test — produced, on the
+   * very next run: *"Daemon was KILLED by SIGTERM rather than exiting — the SIGTERM handler never
+   * ran."* Not a WAL snapshot race, which is what it had been attributed to and "fixed" as once.
+   *
+   * A signal arriving during startup now WAITS for startup to finish and then shuts down properly,
+   * rather than being dropped. The alternative — exiting immediately — would be the same data loss
+   * with a tidier exit code.
+   */
+  let handle: Awaited<ReturnType<typeof startDaemon>> | null = null;
+  let startupFailed = false;
+
+  const shutdown = async (signal: string): Promise<void> => {
+    if (!handle) {
+      // The signal beat startup. Wait for it rather than dying with sessions still marked active —
+      // this is the window that produced the defect above.
+      logger.info("daemon.shutdown.awaiting_startup", {
+        signal,
+        impact: "the signal arrived before startup finished. Waiting for it so sessions are marked interrupted rather than left active by a daemon that died before it could handle a shutdown.",
+      });
+      const deadline = Date.now() + 30_000;
+      while (!handle && !startupFailed && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      if (!handle) {
+        logger.error("daemon.shutdown.startup_never_completed", {
+          signal,
+          startupFailed,
+          impact: "the daemon is exiting without marking any session interrupted, because startup never produced a handle to stop. Sessions left 'active' in the database were not touched by this process.",
+          guidance: "Check the lines above for why startup did not complete — a singleton-lock loss, a security-gateway failure, or a manifest refusal all land here.",
+        });
+        process.exit(1);
+      }
+    }
+    // handle.stop() runs onShutdown (stopSecurityLayer) for us — the teardown lives there so that
+    // `cello logout`, which stops the daemon over IPC and never reaches this handler, tears the
+    // sidecar down too.
+    //
+    // DOD-LOGOUT-EXIT-1: stop()'s onStopped hook exits, so this await does not return while the
+    // hook is wired below — the line after is unreachable in the shipped binary. It is kept so that
+    // removing the hook cannot silently produce a signal path that never exits, which is the state
+    // the IPC path was in before this unit.
+    await handle.stop(signal);
+    process.exit(0);
+  };
+
+  const onSignal = (signal: "SIGTERM" | "SIGINT") => () => {
+    try {
+      shutdown(signal).catch((err: unknown) => {
+        logger.error("daemon.shutdown.failed", {
+          signal,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        process.exit(1);
+      });
+    } catch (err: unknown) {
+      logger.error("daemon.shutdown.failed", {
+        signal,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      process.exit(1);
+    }
+  };
+  process.on("SIGTERM", onSignal("SIGTERM"));
+  process.on("SIGINT", onSignal("SIGINT"));
+
+  handle = await startDaemon({
     celloDir,
     socketPath,
     lockFilePath,
@@ -230,53 +312,6 @@ async function main(): Promise<void> {
     registryPollScheduler: new RandomizedPollScheduler({ minMs: REGISTRY_POLL_MIN_MS, maxMs: REGISTRY_POLL_MAX_MS }),
   });
 
-  const shutdown = async (signal: string): Promise<void> => {
-    // handle.stop() runs onShutdown (stopSecurityLayer) for us — the teardown lives there so that
-    // `cello logout`, which stops the daemon over IPC and never reaches this handler, tears the
-    // sidecar down too.
-    //
-    // DOD-LOGOUT-EXIT-1: stop()'s onStopped hook exits, so this await does not return while the
-    // hook is wired above — the line below is unreachable in the shipped binary. It is kept so that
-    // removing the hook cannot silently produce a signal path that never exits, which is the state
-    // the IPC path was in before this unit.
-    await handle.stop(signal);
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", () => {
-    try {
-      shutdown("SIGTERM").catch((err: unknown) => {
-        logger.error("daemon.shutdown.failed", {
-          signal: "SIGTERM",
-          error: err instanceof Error ? err.message : String(err),
-        });
-        process.exit(1);
-      });
-    } catch (err: unknown) {
-      logger.error("daemon.shutdown.failed", {
-        signal: "SIGTERM",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      process.exit(1);
-    }
-  });
-  process.on("SIGINT", () => {
-    try {
-      shutdown("SIGINT").catch((err: unknown) => {
-        logger.error("daemon.shutdown.failed", {
-          signal: "SIGINT",
-          error: err instanceof Error ? err.message : String(err),
-        });
-        process.exit(1);
-      });
-    } catch (err: unknown) {
-      logger.error("daemon.shutdown.failed", {
-        signal: "SIGINT",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      process.exit(1);
-    }
-  });
 }
 
 main().catch((err: unknown) => {
