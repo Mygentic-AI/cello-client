@@ -1063,7 +1063,7 @@ export class SessionNodeManager {
    * permanently less provable than the identical message that did not, for a reason with nothing to
    * do with authorship.
    */
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind; authorship?: SentAuthorship }>>();
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind; authorship?: SentAuthorship; restoredAcrossRestart?: boolean }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -8680,6 +8680,24 @@ export class SessionNodeManager {
         ...(row.screened_out ? { screenedOut: true } : {}),
         ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
         ...(row.leaf_kind === "doc" ? { kind: "doc" as const } : {}),
+        /**
+         * ⚠️ `restoredAcrossRestart` EXISTS TO NAME A LOSS, NOT TO CHANGE BEHAVIOUR — review pass 2, H1.
+         *
+         * `held_content` has no authorship columns, so a SENT message held behind a gap and released
+         * after a daemon restart comes back with **no signature** — its transcript row records
+         * `self_authored` with no proof, indistinguishable from an unwitnessed send. That is the
+         * defect bullet 5 exists to end, reappearing on the recovery path, and it was silent.
+         *
+         * The proof cannot be reconstructed here: it was made over Structure-1 bytes this process no
+         * longer holds. **So the honest move is to say so, not to fabricate one** — a proof that
+         * cannot be checked, presented as one that can, is worse than the absence.
+         *
+         * Two BLOB columns would close it properly (this table already carries two `ALTER TABLE …
+         * ADD COLUMN` migrations, so the pattern exists). Under a frozen gate a log is additive and
+         * tightenable where a schema change is neither, so this announces the loss now and
+         * `DOD-M15-HELD-AUTHORSHIP-1` carries the column.
+         */
+        restoredAcrossRestart: true,
       });
       restored++;
     }
@@ -8739,6 +8757,25 @@ export class SessionNodeManager {
         // so a dropped transcript write means the operator's OWN message is missing from their own
         // transcript with the chain saying it is there, and nothing anywhere said so.
         // bullet 5: the proof was captured at submit time and rides the held entry — see #heldContent.
+        /**
+         * THE RESTART LOSS, ANNOUNCED — review pass 2, H1. Only for an entry that actually crossed a
+         * restart: an in-memory held entry carries its proof, and an unwitnessed send legitimately
+         * has none, so warning on every absent proof would fire on a designed benign state and bury
+         * the one occurrence that means something.
+         */
+        if (entry.restoredAcrossRestart === true && entry.authorship === undefined) {
+          this.#logger.warn("session.content.released.authorship.lost", {
+            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
+            impact:
+              "this message was held behind a gap, survived a daemon restart, and is now committed with " +
+              "attribution 'self_authored' and NO signature. Its transcript row asserts its author rather " +
+              "than proving one, and is indistinguishable from a send the relay never witnessed.",
+            guidance:
+              "Not recoverable after the fact — the signature covered Structure-1 bytes this process no longer " +
+              "holds, and fabricating one would be worse than the absence. Tracked as DOD-M15-HELD-AUTHORSHIP-1: " +
+              "held_content needs the two proof columns so a restart carries them.",
+          });
+        }
         if (!this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
           this.#logger.error("session.content.released.transcript.failed", {
             agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
