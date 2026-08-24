@@ -54,15 +54,24 @@ const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
  * and predictable — precompute a table of common messages once and read them everywhere. "yes",
  * "approved", a name.
  *
- * ─── Why the tests above do not cover it ──────────────────────────────────────────────────────
+ * ─── SCOPE, corrected on review — this block is defence-in-depth, NOT the coverage ────────────
  *
- * They prove the salted form differs from the unsalted one, and that it is HMAC rather than
- * `SHA-256(salt ‖ content)`. Both true, neither is this: **the correlation property is about two
- * DIFFERENT SESSIONS.** A build could hash under a single global salt, satisfy every assertion in
- * this file, and leave the exposure exactly as it was — one table to precompute instead of none.
+ * I first wrote here that the property had no test. **That was wrong, and it was the claim the DoD
+ * flip rested on.** The chain is covered, in files that predate this block:
+ *   - `core/crypto/…/dod-m15-session-salt.test.ts:62` — two sessions derive DIFFERENT salts
+ *   - `:70` — a peer reusing a FIXED contribution cannot force a shared salt (the global-salt
+ *     adversary itself)
+ *   - `:147` — the same message under different salts hashes differently; its own comment says
+ *     *"this is the whole point of HASHCORRELATE-1"*
+ *   - `dod-m15-content-hash-alg-wired.test.ts:569` — a real session, a real agreed salt, a real
+ *     mismatch when the salt differs
  *
- * The old function is kept in the test as the CONTROL, so this reads as the defect and its removal
- * rather than as an assertion about an implementation detail.
+ * **A single-global-salt build goes red in all of those.** What is true, and all that is claimed
+ * here, is that it would pass every OTHER assertion in THIS file — so the one test below is an
+ * in-file guard against a mutation this file could not otherwise see. It is not the coverage.
+ *
+ * The link none of them covered is a daemon one — that a FRESH contribution is minted per session —
+ * and it lives in `dod-m15-hashcorrelate-1.test.ts`.
  */
 describe("DOD-M15-HASHCORRELATE-1 — the same message in two sessions is not the same bytes", () => {
   const twoSalts = (): [Uint8Array, Uint8Array] => [
@@ -76,17 +85,6 @@ describe("DOD-M15-HASHCORRELATE-1 — the same message in two sessions is not th
     ),
   ];
 
-  it("★ THE EXPOSURE: the old algorithm gives an identical fingerprint in every session", () => {
-    // The control, and the reason this line exists. Two different conversations, one message, one
-    // set of bytes — which is precisely what makes a precomputed table work.
-    const inSessionA = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.SHA256, salt: null });
-    const inSessionB = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.SHA256, salt: null });
-    expect(
-      hex(inSessionA),
-      "this is not a regression to fix — it is the defect, pinned so the fix below has something to be",
-    ).toBe(hex(inSessionB));
-  });
-
   it("★ THE FIX: the same message under two session salts produces two different hashes", () => {
     const [saltA, saltB] = twoSalts();
     const inSessionA = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
@@ -96,21 +94,6 @@ describe("DOD-M15-HASHCORRELATE-1 — the same message in two sessions is not th
       "a relay holding both conversations must not be able to tell these are the same message — " +
         "this is the assertion the correlation exposure is actually about",
     ).not.toBe(hex(inSessionB));
-  });
-
-  it("★ and it is the SALT doing it, not the message — the same salt still matches itself", () => {
-    /**
-     * Without this, the test above passes against a hash that is simply random per call — which
-     * would break dedup, ordering and the tamper check while looking like privacy.
-     */
-    const [saltA] = twoSalts();
-    const once = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
-    const twice = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
-    expect(
-      hex(once),
-      "inside ONE session the same message must still hash identically, or dedup and the tamper " +
-        "cross-check both break — the property is unlinkability ACROSS sessions, not randomness",
-    ).toBe(hex(twice));
   });
 
   it("★ a DIFFERENT message in the same session also differs — the salt has not flattened anything", () => {
