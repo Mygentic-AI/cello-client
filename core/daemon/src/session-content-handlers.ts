@@ -63,11 +63,17 @@ function refusalsField(
   mgr: SessionNodeManager,
   agentName: string,
   sessionId: string,
+  /**
+   * WHO is being shown this. Without it the first window to read consumed the notice for every
+   * other window attending the same agent — the defect the delivery loop below was rewritten to
+   * remove, re-created on a different surface.
+   */
+  consumerId: string,
 ): {
   refusals?: Array<{ reason: string; impact?: string; guidance?: string; count: number }>;
   refusal_guidance?: string;
 } {
-  const refusals = mgr.takeContentRefusals(agentName, sessionId);
+  const refusals = mgr.takeContentRefusals(agentName, sessionId, consumerId);
   return refusals.length > 0 ? { refusals, refusal_guidance: REFUSAL_GUIDANCE } : {};
 }
 
@@ -906,7 +912,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // DOD-M15-REFUSED-INBOUND-SILENT-1: refusals the operator has not been shown yet. Omitted
         // entirely when there are none — an always-present empty array trains readers to skip the
         // field, and this is the field that explains why a conversation went quiet.
-        ...refusalsField(sessionNodeManager, agentName, sessionId),
+        ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
         ...(autoReplyCount > 0 ? { auto_reply_guidance: AUTO_REPLY_GUIDANCE } : {}),
         // AC6 (review F1): the catch-up batch is THE stateless-client door — `cello receive <id>
         // --since-seq -1` is a fresh connection every time, so it never saw a doorbell, and the
@@ -986,7 +992,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // `cello_transcript`, which cannot show a message that was never ingested. The likely
           // sequence is exactly the bad one: skew, silence, the operator gives up and seals, and the
           // explanation becomes unreachable through every door they are pointed at.
-          ...refusalsField(sessionNodeManager, agentName, sessionId),
+          ...refusalsField(sessionNodeManager, agentName, sessionId, connectionId),
           guidance: terminal.unreadCount > 0
             ? `The session has been sealed by both parties. ${terminal.unreadCount} message(s) arrived that were not read live — call cello_transcript to retrieve the full sealed history. No further actions are required on this session.`
             : "The session has been sealed by both parties. The full history is available via cello_transcript. No further actions are required on this session.",
@@ -1252,7 +1258,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
          * again and keep waiting" while their peer's every message is being refused for a version
          * skew is advice that cannot work.
          */
-        const quietRefusals = refusalsField(sessionNodeManager, agentName, sessionId);
+        const quietRefusals = refusalsField(sessionNodeManager, agentName, sessionId, connectionId);
         return {
           ok: true,
           content: null,

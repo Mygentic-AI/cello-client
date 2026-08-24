@@ -142,6 +142,60 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     ).toEqual([]);
   });
 
+  it("TWO WINDOWS both hear it — one reader does not consume the notice for the other", async () => {
+    /**
+     * Two MCP windows attending the same agent is the ordinary case, not an exotic one.
+     *
+     * Under the single `surfaced` flag this replaced, whoever read FIRST consumed the refusal and
+     * the second window was told nothing, permanently — so which window learned why the
+     * conversation went quiet was a race. This is the same defect `takeReceivedContent` had, and the
+     * delivery loop was rewritten specifically to remove it: *"nothing one consumer does mutates
+     * state another consumer reads."* Re-creating it on the refusal surface makes it no less true.
+     */
+    const mgr = (await start()).getSessionNodeManager();
+    mgr.noteContentRefusal("alice", "s-two", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
+
+    expect(mgr.takeContentRefusals("alice", "s-two", "window-1").length, "the first window is told").toBe(1);
+    expect(
+      mgr.takeContentRefusals("alice", "s-two", "window-2").length,
+      "and so is the second — a sibling's read must not have consumed it",
+    ).toBe(1);
+    expect(
+      mgr.takeContentRefusals("alice", "s-two", "window-1"),
+      "while the FIRST window still does not hear it twice",
+    ).toEqual([]);
+  });
+
+  it("a skew that swallows hundreds re-announces — the count finally has a reader", async () => {
+    /**
+     * The old docstring claimed the count kept growing "so a later reader can ask how many without
+     * being told again". There was no later reader: the count incremented under a flag the drain
+     * skipped unconditionally, so 3 refusals became 903 and nothing could say so.
+     *
+     * Re-announcing by ORDER OF MAGNITUDE keeps both properties: the ninetieth refusal is still
+     * silent (that is the flood the dedup exists to stop), but a skew that has now eaten hundreds of
+     * messages is not indistinguishable from one that ate three.
+     */
+    const mgr = (await start()).getSessionNodeManager();
+    const note = (): void =>
+      mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { impact: "x" });
+
+    note();
+    expect(mgr.takeContentRefusals("alice", "s-scale")[0]!.count, "first refusal is the signal").toBe(1);
+
+    for (let i = 0; i < 8; i++) note(); // 9 total — under the next order of magnitude
+    expect(mgr.takeContentRefusals("alice", "s-scale"), "nine is not news").toEqual([]);
+
+    note(); // 10
+    const [again] = mgr.takeContentRefusals("alice", "s-scale");
+    expect(again, "ten times is a different fact about the problem than once").toBeDefined();
+    expect(again!.count).toBe(10);
+    expect(again!.repeat, "and it says it is a repeat, so a reader can present it as an escalation").toBe(true);
+
+    for (let i = 0; i < 89; i++) note(); // 99
+    expect(mgr.takeContentRefusals("alice", "s-scale"), "still inside the same magnitude").toEqual([]);
+  });
+
   it("a DIFFERENT reason in the same session is still delivered", async () => {
     // Deduplication is per REASON, not per session. Suppressing a second, different problem because
     // a first one was already reported would be the dedup causing the very silence it mitigates.
