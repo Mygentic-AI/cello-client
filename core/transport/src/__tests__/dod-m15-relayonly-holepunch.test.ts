@@ -24,12 +24,17 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { generateKeyPair } from "@libp2p/crypto/keys";
 import { createNode } from "../node.js";
 import type { KeyProvider } from "../types.js";
 
 /** The protocol dcutr registers. Absent from `getProtocols()` iff the service was never added. */
 const DCUTR_PROTOCOL_ID = "/libp2p/dcutr";
+
+/** The source under guard — see the announce-filter case for why it is read rather than driven. */
+const NODE_PATH = join(import.meta.dirname, "..", "node.ts");
 
 function keyProvider(): KeyProvider {
   return { getPrivateKey: async () => generateKeyPair("Ed25519") } as unknown as KeyProvider;
@@ -82,4 +87,34 @@ describe("DOD-M15-RELAYONLY-1 — hole-punching is off when the operator asked n
   it("★ explicitly enabled behaves as the default — the flag has no third meaning", async () => {
     expect(await nodeWith({ enabled: true })).toContain(DCUTR_PROTOCOL_ID);
   }, 30_000);
+
+  it("★★★ AND THE ANNOUNCE FILTER IS SET — otherwise identify just TELLS them the address", async () => {
+    /**
+     * ⚠️ THE OTHER HALF, and without it the first half is theatre. Turning dcutr off stops us
+     * UPGRADING a relayed connection to a direct one. It does nothing about `identify`, which hands
+     * a peer our full listen-address set on the FIRST relayed connection — LAN addresses always, and
+     * the AutoNAT-confirmed public one once it is promoted. The counterparty would simply be **told**
+     * the address they could no longer reach by punching.
+     *
+     * ⚠️ ASSERTED AT THE SOURCE, and the limitation is stated rather than hidden: the announce set
+     * is NOT reachable through `CelloNode`'s public surface — it exposes `listenAddresses()`, which
+     * is the LISTEN set, and the filter governs ANNOUNCE. Adding a getter purely so a test could
+     * watch it would be widening production surface to satisfy a test, which is its own defect. So
+     * this pins that the filter is WIRED to the same flag that removes dcutr, and says plainly that
+     * it does not observe a live identify exchange.
+     */
+    const src = readFileSync(NODE_PATH, "utf8");
+    const addresses = src.slice(src.indexOf("    addresses: {"), src.indexOf("    transports: ["));
+    expect(addresses.length, "precondition: the addresses block must be locatable").toBeGreaterThan(0);
+    expect(
+      addresses,
+      "the announce filter must be wired, or identify hands the counterparty the very address the " +
+        "hole-punch flag just stopped them reaching — the control would be theatre",
+    ).toContain("announceFilter");
+    expect(
+      addresses,
+      "and it must hang off the SAME flag as dcutr — two switches for one posture is how half of a " +
+        "control ships enabled",
+    ).toContain("opts.holePunch?.enabled === false");
+  });
 });
