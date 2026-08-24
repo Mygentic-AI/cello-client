@@ -23,10 +23,18 @@
  * ours by publishing addresses they can dial. So the control has two halves, and the second is the
  * one that matters most:
  *
- *   - **Do not dial** — otherwise we hand our IP to the counterparty ourselves.
- *   - **Do not PUBLISH our session addrs** — so there is nothing for them to dial. This half
+ *   - **Dial only the CIRCUIT** — a circuit addr terminates at the relay, so it reveals nothing;
+ *     their direct addr is dropped, because dialling it hands them our IP.
+ *   - **Publish only the CIRCUIT** — so the only route they hold points at the relay. This half
  *     protects the operator **even against a counterparty who ignores the flag**, and that is the
  *     whole point: *a control that depends on the other side honouring it is not a control.*
+ *
+ * ⚠️ **BOTH HALVES SAY "ONLY THE CIRCUIT", NOT "NOTHING", AND THE FIRST BUILD SAID NOTHING.** That
+ * version did not make the operator private — **it took them off the network.** An empty address
+ * array is a MALFORMED frame to the directory, which rejects a `session_request` carrying no
+ * initiator addrs and folds an offer accept only `if (counterparty_session_addrs.length > 0)`, with
+ * no `else`. The operator switched on a privacy control and was told their counterparty was
+ * offline. Review caught it; these tests now pin the difference.
  *
  * ─── The choke point, and why the guard test below exists ─────────────────────────────────────
  *
@@ -54,11 +62,16 @@ import {
   RELAY_ONLY_KEY,
   isRelayOnly,
   publishableEndpoint,
-  shouldDialCounterparty,
+  relayOnlyReachable,
+  dialableAddrs,
 } from "../relay-only.js";
 import { isValidSettingKey, validateSettingValue } from "../agent-settings-keys.js";
 
-const SR = { peerId: "12D3KooWStandingReceiver", addrs: ["/ip4/203.0.113.7/tcp/4001", "/ip4/127.0.0.1/tcp/4001"] };
+/** The operator's own address — the thing that must never leave this machine under relay-only. */
+const DIRECT = "/ip4/203.0.113.7/tcp/4001";
+/** A circuit address: it names the RELAY and our peer id, and discloses nothing about the operator. */
+const CIRCUIT = "/ip4/198.51.100.4/tcp/4001/p2p/12D3KooWRelay/p2p-circuit/p2p/12D3KooWStandingReceiver";
+const SR = { peerId: "12D3KooWStandingReceiver", addrs: [DIRECT, CIRCUIT] };
 
 describe("DOD-M15-RELAYONLY-1 — the setting", () => {
   it("★ is a REAL settings key, so the handler stores it instead of refusing it", () => {
@@ -106,17 +119,43 @@ describe("DOD-M15-RELAYONLY-1 — the setting", () => {
 });
 
 describe("DOD-M15-RELAYONLY-1 — the two halves of the control", () => {
-  it("★★ RELAY-ONLY PUBLISHES NO ADDRESSES — there is nothing left to dial", () => {
+  it("★★ RELAY-ONLY PUBLISHES THE CIRCUIT ADDRESS AND ONLY THAT — not nothing, and not the operator's", () => {
     /**
-     * THE HALF THAT MAKES IT A CONTROL. With no addrs in the assignment, a counterparty who ignores
-     * the flag entirely still has nowhere to connect. The peer id is KEPT: it is the identity the
-     * relay circuit is addressed to, and stripping it would break relay routing — which is the very
-     * path this setting forces everything onto.
+     * ⚠️ THE ASSERTION THAT WAS WRONG IN THE FIRST BUILD, and it is worth stating plainly because
+     * the test header itself carried the false claim: *"the peer id is KEPT… stripping it would
+     * break relay routing"*. **Keeping the peer id does not give a counterparty a route.** In this
+     * codebase the circuit address travels in the very field the first build emptied.
+     *
+     * **An empty address array is not a private frame, it is a MALFORMED one.** The directory
+     * rejects a `session_request` with no initiator addrs, and folds an offer accept only
+     * `if (counterparty_session_addrs.length > 0)` with no `else`. So relay-only-as-shipped did not
+     * make the operator private — it took them OFF THE NETWORK, and told them their counterparty
+     * was offline.
+     *
+     * A circuit multiaddr names the RELAY and our peer id. It is what makes this a routing control
+     * rather than a disconnection.
      */
     const out = publishableEndpoint(SR, true);
     expect(out, "the endpoint still exists — this suppresses addresses, not reachability").not.toBeNull();
-    expect(out!.addrs, "NO addresses may be published under relay-only").toEqual([]);
-    expect(out!.peerId, "the peer id must survive — the relay circuit is addressed to it").toBe(SR.peerId);
+    expect(out!.addrs, "the circuit address must SURVIVE — it is the route, and it names the relay, not us").toEqual([CIRCUIT]);
+    expect(out!.addrs, "and the operator's own address must NOT").not.toContain(DIRECT);
+    expect(out!.addrs.length, "publishing an EMPTY array is what the directory refuses as malformed").toBeGreaterThan(0);
+    expect(out!.peerId, "the peer id rides along, as before").toBe(SR.peerId);
+  });
+
+  it("★★ NO RESERVATION YET is a REFUSAL, never a silent empty publish", () => {
+    /**
+     * The case the first build could not distinguish. An agent with no relay reservation has no
+     * circuit address, so the filtered set is legitimately empty — and publishing that empty set is
+     * exactly the malformed frame above. It must become a loud local refusal instead, because the
+     * alternative surfaces to the operator as "the counterparty is offline": a lie about someone
+     * else's state, caused by a setting on this machine.
+     */
+    const noReservation = { peerId: SR.peerId, addrs: [DIRECT] };
+    expect(relayOnlyReachable(noReservation, true), "no circuit addr = not reachable, and we must SAY so").toBe(false);
+    expect(relayOnlyReachable(SR, true), "with a reservation, reachable").toBe(true);
+    expect(relayOnlyReachable(noReservation, false), "and with the setting off this question does not apply").toBe(true);
+    expect(relayOnlyReachable(null, true), "no standing receiver at all is likewise not reachable").toBe(false);
   });
 
   it("★ and with the setting OFF, the endpoint is untouched — the default path cannot regress", () => {
@@ -128,17 +167,21 @@ describe("DOD-M15-RELAYONLY-1 — the two halves of the control", () => {
     expect(publishableEndpoint(null, false)).toBeNull();
   });
 
-  it("★★ RELAY-ONLY DOES NOT DIAL, even when the assignment carries dialable addresses", () => {
+  it("★★ RELAY-ONLY DIALS THE CIRCUIT AND DROPS THE DIRECT — 'only over the relay', not 'never'", () => {
     /**
-     * THE OTHER HALF, and the one the shipped code gets wrong today: the dial is gated on
-     * `counterpartyAddrs.length > 0` and on nothing else. A counterparty that publishes addresses —
-     * because THEY are not relay-only — would otherwise have us dial them and hand over our IP,
-     * with our own setting on and the operator believing otherwise.
+     * THE OTHER HALF, and the first build got it wrong in the same direction: it refused EVERY
+     * address, including the `/p2p-circuit` one — which is the relay route this setting exists to
+     * force everything onto — and so dropped every session onto the store-and-forward backstop.
+     *
+     * Dialing a circuit addr reveals nothing to the counterparty: it terminates at the relay we
+     * already chose. Dialing their DIRECT addr is what hands them our IP, and that is what must be
+     * refused — the counterparty may not be relay-only themselves, so they will keep advertising one.
      */
-    const addrs = ["/ip4/198.51.100.9/tcp/4001"];
-    expect(shouldDialCounterparty(addrs, true), "relay-only must never dial, however dialable they are").toBe(false);
-    expect(shouldDialCounterparty(addrs, false), "and the ordinary path is unchanged").toBe(true);
-    expect(shouldDialCounterparty([], false), "no addrs is still no dial, as before").toBe(false);
+    const theirs = [DIRECT, CIRCUIT];
+    expect(dialableAddrs(theirs, true), "the circuit survives; the direct one does not").toEqual([CIRCUIT]);
+    expect(dialableAddrs(theirs, false), "and the ordinary path is untouched").toEqual(theirs);
+    expect(dialableAddrs([DIRECT], true), "a counterparty offering only a direct addr is not dialled at all").toEqual([]);
+    expect(dialableAddrs([], false), "no addrs is still no dial, as before").toEqual([]);
   });
 });
 

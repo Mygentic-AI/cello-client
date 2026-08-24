@@ -61,12 +61,34 @@ export interface PublishableEndpoint {
 }
 
 /**
+ * A relay-CIRCUIT multiaddr — the address that discloses nothing about the operator.
+ *
+ * ⚠️ THIS IS THE DISTINCTION THE WHOLE UNIT TURNS ON, and getting it wrong the first time took the
+ * operator OFF THE NETWORK rather than making them private. A `/p2p-circuit` address names the
+ * **RELAY's** address and our peer id. It terminates at the relay. Publishing one tells a
+ * counterparty how to reach us *through* the relay and tells them nothing about where we are;
+ * dialing one reveals us to the relay we already chose, not to them.
+ *
+ * So relay-only is not "no addresses". It is "circuit addresses only".
+ */
+export function isCircuitAddr(addr: string): boolean {
+  return addr.includes("/p2p-circuit");
+}
+
+/**
  * The endpoint as it may leave this machine.
  *
- * Under relay-only the addresses are dropped and **the peer id is KEPT** — it is the identity a
- * relay circuit is addressed to, and stripping it would break the very routing this setting forces
- * everything onto. This suppresses *addresses*, not reachability.
+ * ⚠️ **AN EMPTY ADDRESS ARRAY IS NOT A PRIVATE FRAME, IT IS A MALFORMED ONE.** The first build of
+ * this published `addrs: []` and the directory refuses exactly that on both sides — a
+ * `session_request` whose `initiator_session_addrs` is empty is rejected outright, and a
+ * `session_offer_accept` is only folded in `if (counterparty_session_addrs.length > 0)`, **with no
+ * `else`**, so the accept was silently dropped and the offer waiter never resolved. The operator
+ * switched on a privacy control and was told their counterparty was offline.
  *
+ * So we publish the **circuit-only subset**: enough for the directory to build a real assignment and
+ * for the counterparty to reach us over the relay, and nothing that points at the operator.
+ *
+ * A genuinely empty result is meaningful and is NOT silently published — see `relayOnlyReachable`.
  * A null endpoint stays null: "no standing receiver" and "a receiver at no address" are different
  * facts, and collapsing them would let a caller advertise an endpoint that does not exist.
  */
@@ -76,18 +98,35 @@ export function publishableEndpoint<T extends PublishableEndpoint>(
 ): T | PublishableEndpoint | null {
   if (endpoint === null) return null;
   if (!relayOnly) return endpoint;
-  return { peerId: endpoint.peerId, addrs: [] };
+  return { peerId: endpoint.peerId, addrs: endpoint.addrs.filter(isCircuitAddr) };
 }
 
 /**
- * May we dial the counterparty's advertised session addresses?
+ * Can a relay-only agent actually be reached with what it is about to publish?
  *
- * The ordinary rule is unchanged — dial iff they advertised somewhere to dial. Relay-only refuses
- * regardless of how dialable they are, because the counterparty may not be relay-only themselves:
- * they will still publish addresses, and dialing them would hand over our IP with our own setting
- * switched on.
+ * FALSE means it holds **no relay reservation yet**, so the circuit-only subset is empty. That must
+ * become a LOUD LOCAL REFUSAL rather than an empty publish: an empty publish is refused by the
+ * directory as malformed and surfaces to the operator as "the counterparty is offline", which is a
+ * lie about someone else's state caused by a setting on this machine.
  */
-export function shouldDialCounterparty(addrs: readonly string[], relayOnly: boolean): boolean {
-  if (relayOnly) return false;
-  return addrs.length > 0;
+export function relayOnlyReachable(endpoint: PublishableEndpoint | null, relayOnly: boolean): boolean {
+  if (!relayOnly) return true;
+  if (endpoint === null) return false;
+  return endpoint.addrs.some(isCircuitAddr);
+}
+
+/**
+ * Which of the counterparty's advertised addresses may we dial?
+ *
+ * ⚠️ Returns the FILTERED LIST, not a boolean, because "relay-only" does not mean "do not connect" —
+ * it means "connect only over the circuit". The first build refused every address including the
+ * `/p2p-circuit` one, which is the relay route this setting exists to force everything onto, so it
+ * dropped every session onto the store-and-forward backstop.
+ *
+ * The counterparty may not be relay-only themselves, so they will still advertise direct addresses:
+ * those are dropped, because dialing one hands them our IP with our own setting switched on.
+ */
+export function dialableAddrs(addrs: readonly string[], relayOnly: boolean): string[] {
+  if (!relayOnly) return [...addrs];
+  return addrs.filter(isCircuitAddr);
 }

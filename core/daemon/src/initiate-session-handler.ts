@@ -15,7 +15,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { selectAdvertisedAddress, type ITransportSelector, type SessionNegotiator } from "./transport-selector.js";
 import { TIER } from "./contacts-tier-migration.js";
-import { isRelayOnly, shouldDialCounterparty } from "./relay-only.js";
+import { isRelayOnly, dialableAddrs } from "./relay-only.js";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { IAutoNatService } from "@cello-protocol/transport";
 
@@ -213,16 +213,24 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // counterparty may not be relay-only themselves — they will still advertise addresses, and the
     // gate below is otherwise satisfied by exactly that.
     const relayOnly = isRelayOnly((key) => sessionNodeManager.getSetting(agentName, key));
-    if (relayOnly && counterpartyAddrs.length > 0) {
+    const dialable = dialableAddrs(counterpartyAddrs, relayOnly);
+    if (relayOnly && counterpartyAddrs.length > dialable.length) {
       logger.info("session.initiate.direct_dial.suppressed", {
         sessionId,
-        addrCount: counterpartyAddrs.length,
-        impact: "relay-only is on: routing over the relay and not revealing this node's address",
+        suppressed: counterpartyAddrs.length - dialable.length,
+        dialing: dialable.length,
+        impact:
+          "relay-only is on: dialling only the counterparty's relay-circuit address, which terminates " +
+          "at the relay, and dropping any direct address that would reveal this node's own",
         correlationId,
       });
     }
-    if (shouldDialCounterparty(counterpartyAddrs, relayOnly)) {
-      const connected = await sessionNodeManager.connectToCounterparty(agentName, sessionId, counterpartyAddrs);
+    // ⚠️ THE FILTERED LIST, not a boolean. Relay-only does not mean "do not connect" — it means
+    // "connect only over the circuit". Refusing EVERY address (the first build) also refused the
+    // `/p2p-circuit` one, which is the relay route this setting exists to force everything onto, and
+    // dropped every session onto the store-and-forward backstop.
+    if (dialable.length > 0) {
+      const connected = await sessionNodeManager.connectToCounterparty(agentName, sessionId, dialable);
       if (!connected.ok) {
         logger.warn("session.initiate.connect.failed", {
           sessionId,
