@@ -606,6 +606,19 @@ export const REVIVE_RESERVATION_CANDIDATES = 2;
  */
 export const LEAF_FETCH_GRACE_MS = 2_000;
 
+/**
+ * DOD-M15-SEALWIRE-1 bullet 5, SENT half — our own authorship proof for a message we sent.
+ *
+ * Deliberately the SAME shape as the received half's `verifiedAuthorship`, because the transcript
+ * column pair is the same and a second shape would invite a second meaning. What differs is the
+ * ATTRIBUTION the row records: a sent row is `self_authored` (we PRODUCED this signature), never
+ * `verified_signature` (we CHECKED someone else's). Same bytes, different claim.
+ */
+export interface SentAuthorship {
+  senderPubkey: Uint8Array;
+  senderSig: Uint8Array;
+}
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -5924,8 +5937,20 @@ export class SessionNodeManager {
     // DOD-M12B-INDEX-1: `sequenceNumber` is the position the relay assigned this message, carried
     // out so the caller can place its leaf THERE rather than at whatever the tail happens to be.
     // Absent when no ordering authority answered — the documented relay-degraded case.
-    | { ok: true; delivered: true; sequenceNumber?: number }
-    | { ok: true; delivered: false; parked: true; sequenceNumber?: number }
+    // DOD-M15-SEALWIRE-1 bullet 5, SENT half: `authorship` is OUR OWN signature over the Structure-1
+    // bytes we put on the wire, carried out so the caller can store it on the sent transcript row.
+    //
+    // ⚠️ IT IS RETURNED, NOT STASHED, for the same reason `sequenceNumber` is: the value belongs to
+    // THIS send, and a side map keyed by session would hand a caller the wrong send's signature the
+    // moment two are in flight. It is also paired with the exact `structure1_cbor` it signs —
+    // a signature next to the wrong signed bytes is worse than no signature, because it looks
+    // checkable and fails.
+    //
+    // Absent whenever the relay did not witness this leaf: an unwitnessed send has no Structure 1 on
+    // the wire, so there is nothing signed to store. The row then records `self_authored` with no
+    // proof, which is exactly what happened, rather than implying one.
+    | { ok: true; delivered: true; sequenceNumber?: number; authorship?: SentAuthorship }
+    | { ok: true; delivered: false; parked: true; sequenceNumber?: number; authorship?: SentAuthorship }
     | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string; sequenceNumber?: number }
   > {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
@@ -5951,6 +5976,15 @@ export class SessionNodeManager {
     // the leaf_deliver witness stream / arrival order.
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5, SENT half. Our own Ed25519 signature over `orderingS1`.
+     *
+     * The submit path already computes this — `keyProvider.sign(structure1)` — and puts it on the
+     * wire as `sender_signature`. It was simply never handed back, which is the whole of the defect:
+     * a RECEIVED row could prove its author to a third party and a SENT row could not, so half the
+     * transcript was provable and half was assertion.
+     */
+    let sentAuthorship: SentAuthorship | undefined;
     // DOD-M12B-INDEX-1: the relay's answer to "where does this message go", carried to the caller.
     let assignedSeq: number | undefined;
     // DOD-MP-SESSION-RETIRE-1 — the relay's answer SURVIVES to the caller even when the direct send
@@ -5970,6 +6004,30 @@ export class SessionNodeManager {
         if (witnessed.ok) {
           orderingS1 = witnessed.structure1_cbor;
           orderingS2 = witnessed.structure2_cbor;
+          /**
+           * PAIRED WITH THE BYTES IT SIGNS, in one place, so the two can never be assigned apart.
+           *
+           * ⚠️ THE PUBKEY COMES FROM INSIDE `structure1_cbor`, NOT FROM AN AGENT LOOKUP — the same
+           * source the RECEIVED half uses. A verifier checks the signature against the key in the
+           * signed bytes; storing any other key would produce a row that looks checkable and fails,
+           * and a lookup could drift from what was actually signed (a rotated identity, the wrong
+           * agent resolved by name). Taking it from the signed bytes makes that class impossible.
+           */
+          if (witnessed.structure1_cbor && witnessed.sender_signature) {
+            try {
+              // Structure 1 = [1, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]
+              // — the same decode `#recordFrameOrdering` does for the received half, index 2.
+              const s1 = decode(witnessed.structure1_cbor) as unknown[];
+              const pk = s1[2];
+              if (pk instanceof Uint8Array && pk.length === 32) {
+                sentAuthorship = { senderPubkey: pk, senderSig: witnessed.sender_signature };
+              }
+            } catch {
+              // A decode failure here costs the row its PROOF, never the message. The row then
+              // records `self_authored` with no signature — true, and distinguishable from one that
+              // carries it. Throwing would lose a delivered message over a missing attestation.
+            }
+          }
           // 1-BASED → 0-BASED. The relay numbers the first leaf of a session 1
           // (`relay-node.ts`: `const seq = state.seq_counter + 1`), and this tree is 0-indexed.
           // Every RECEIVE path in this file normalises with -1 and says so; the send path took the
@@ -6152,7 +6210,7 @@ export class SessionNodeManager {
       // on the content hash. A false delivered costs the message.
       await stream.close();
       this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
-      return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+      return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
       this.#markSessionImpaired(agentName, sessionId, { cause: "direct_send", error: err instanceof Error ? err.message : String(err), correlationId });
       if (sendStream !== undefined) {
@@ -6195,7 +6253,7 @@ export class SessionNodeManager {
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
-        return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
+        return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
       // in-memory entry — so without this, NOTHING holds the content and the TTF timer that would
