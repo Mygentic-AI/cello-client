@@ -2064,6 +2064,48 @@ async function startDaemonHoldingLock(
    */
   const parkRetryTimers = new Set<ReturnType<typeof setTimeout>>();
 
+  /**
+   * DOD-M15-RELAYABUSE-1: schedule ONE drain at the delay the relay asked for.
+   *
+   * ⚠️ ONE implementation, used by both park paths. The live-send path and the drain path both need
+   * this and a second copy is how the clamp ends up on only one of them — which is exactly the shape
+   * review found here (the number had a consumer on one path and was dropped on the other).
+   *
+   * CLAMPED, because the value comes from another party's software and an unclamped one inverts the
+   * fix: Node's `setTimeout` holds an int32, so a relay reporting `3_000_000_000` overflows it and
+   * fires in about ONE MILLISECOND — re-parking instantly into the limit that just refused, and
+   * printing a `TimeoutOverflowWarning` from a daemon whose convention forbids console output.
+   */
+  function scheduleParkRetry(retryAfterMs: number, filterAgentName: string | undefined, source: "send" | "drain"): void {
+    const MIN_RETRY_MS = 1_000;
+    const MAX_RETRY_MS = 5 * 60_000;
+    const delay = Math.min(Math.max(retryAfterMs, MIN_RETRY_MS), MAX_RETRY_MS);
+    if (delay !== retryAfterMs) {
+      logger.warn("content.park.retry.clamped", {
+        source,
+        requestedMs: retryAfterMs,
+        usedMs: delay,
+        impact:
+          "the relay asked for a retry delay outside the range this daemon will schedule, so it was " +
+          "clamped — an unclamped value can overflow the timer and fire immediately, which would " +
+          "re-park straight into the limit that just refused",
+      });
+    }
+    logger.info("content.park.retry.scheduled", { source, delayMs: delay, ...(filterAgentName !== undefined ? { agentName: filterAgentName } : {}) });
+    const timer = setTimeout(() => {
+      parkRetryTimers.delete(timer);
+      void flushAwaitingContent(filterAgentName).catch((err: unknown) => {
+        logger.warn("content.park.retry.timer.failed", {
+          source,
+          reason: err instanceof Error ? err.message : String(err),
+          impact: "the scheduled drain threw; the ordinary event triggers (boot, agent start, reconnect) still apply",
+        });
+      });
+    }, delay);
+    timer.unref?.();
+    parkRetryTimers.add(timer);
+  }
+
   sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
@@ -2160,39 +2202,7 @@ async function startDaemonHoldingLock(
        * shortcut, short enough that it stays one. A clamp is announced rather than silent — a relay
        * asking us to wait 35 days is a fact an operator wants.
        */
-      const MIN_RETRY_MS = 1_000;
-      const MAX_RETRY_MS = 5 * 60_000;
-      const requested = res.retryAfterMs;
-      const delay = Math.min(Math.max(requested, MIN_RETRY_MS), MAX_RETRY_MS);
-      if (delay !== requested) {
-        logger.warn("content.park.retry.clamped", {
-          sessionId,
-          requestedMs: requested,
-          usedMs: delay,
-          impact:
-            "the relay asked for a retry delay outside the range this daemon will schedule, so it " +
-            "was clamped — an unclamped value can overflow the timer and fire immediately, which " +
-            "would re-park straight into the limit that just refused",
-        });
-      }
-      logger.info("content.park.retry.scheduled", { sessionId, delayMs: delay, reason: res.reason });
-      /**
-       * Scoped to the AGENT, not global. `flushAwaitingContent` coalesces on its filter, so an
-       * unfiltered call and a per-agent one are different keys and can run concurrently over the
-       * same session — and the drain removes an entry only after a SUCCESSFUL park, so an overlap
-       * can deposit the same entry twice and burn two slots of the very budget that is limited.
-       */
-      const timer = setTimeout(() => {
-        void flushAwaitingContent(agentName).catch((err: unknown) => {
-          logger.warn("content.park.retry.timer.failed", {
-            sessionId,
-            reason: err instanceof Error ? err.message : String(err),
-            impact: "the scheduled drain threw; the ordinary event triggers (boot, agent start, reconnect) still apply",
-          });
-        });
-      }, delay);
-      timer.unref?.();
-      parkRetryTimers.add(timer);
+      scheduleParkRetry(res.retryAfterMs, agentName, "send");
     }
     return { ok: false, reason: res.reason ?? "relay_deposit_failed" };
   });
@@ -2276,7 +2286,12 @@ async function startDaemonHoldingLock(
       logger.info("content.park.deposited", { sessionId: entry.sessionId, contentHash: entry.contentHashHex, source: "startup_flush" });
       return { parked: true };
     }
-    return { parked: false, error: res.reason ?? "deposit_failed" };
+    return {
+      parked: false,
+      error: res.reason ?? "deposit_failed",
+      // DOD-M15-RELAYABUSE-1 review HIGH-2: carry the relay's own "when" out of the DRAIN path too.
+      ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+    };
   };
 
   // Re-park un-acked awaiting content to the relay store-and-forward queue. Runs once pre-IPC
@@ -2334,7 +2349,23 @@ async function startDaemonHoldingLock(
     let parkedTotal = 0;
     for (const s of sessions) {
       try {
-        parkedTotal += await retryQueue.drainAwaitingToPark(s.agentId, s.sessionId, parkFn);
+        parkedTotal += await retryQueue.drainAwaitingToPark(s.agentId, s.sessionId, parkFn, (retryAfterMs) => {
+          /**
+           * DOD-M15-RELAYABUSE-1 review HIGH-2 — **the drain path can now schedule its own
+           * follow-up, which is what makes the retry work for a BACKLOG rather than one message.**
+           *
+           * Before this, only the live send path heard the relay's delay. With a backlog larger than
+           * one rate-limit window, the drain deposited what the window allowed, every remaining item
+           * was refused, and all of them fell back to waiting for an unrelated reconnect — the exact
+           * condition the retry timer was added to remove.
+           *
+           * ONE timer per pass (the drain reports the largest delay it saw, not one per item), and
+           * it deliberately does not chain beyond that: the next pass schedules the next one only if
+           * it is refused again, so a permanently-full relay costs one timer per window rather than
+           * an accelerating stream of them.
+           */
+          scheduleParkRetry(retryAfterMs, filterAgentName, "drain");
+        });
       } catch (err: unknown) {
         logger.error("content.park.flush.failed", {
           sessionId: s.sessionId,
