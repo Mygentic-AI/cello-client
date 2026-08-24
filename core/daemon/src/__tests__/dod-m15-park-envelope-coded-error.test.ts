@@ -154,35 +154,42 @@ describe("DOD-M15-SEALWIRE-1 B2b-2 constraint 6: the park refusal is CODED, not 
      * ⚠️ ONE LAYER OUT FROM THE TEST ABOVE, and the layer that actually matters to a caller.
      *
      * `sendContent` carried `cause` correctly; the IPC boundary then dropped it and answered with
-     * `reason: "session_stream_unavailable"` — an EXIT-POINT label — leaving the real cause inside
-     * the English `guidance`. So an MCP agent wanting to tell "throttled, wait 45 seconds" from
-     * "this counterparty's mailbox is full, another relay will not help" from "this build cannot
-     * seal it" was back to substring-matching prose, which is precisely what `cause` exists to
-     * prevent. Three newly-distinguishable causes had just landed and none reached the agent.
+     * `reason: "session_stream_unavailable"` — a label for WHERE the failure surfaced — leaving the
+     * real cause inside the English `guidance`. So an MCP agent wanting to tell "throttled, wait 45
+     * seconds" from "this counterparty's mailbox is full, another relay will not help" was back to
+     * substring-matching prose, which is precisely what `cause` exists to prevent.
+     *
+     * ⚠️ The first version of this test drove the unreadable-ALGORITHM path over IPC and its own
+     * precondition caught that the send SUCCEEDED — the algorithm is not a caller-supplied IPC
+     * parameter, so that fault is unreachable from outside. Driving a park refusal instead is both
+     * reachable and the cause this unit actually shipped.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-ipc-", node: new FakeNode({ newStreamFails: true }) as unknown as CelloNode });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER, { relay: true });
-    fx.snm.setContentParkHook(realSealHook);
+    // A relay that refuses with a CODE — exactly what the rate limiter produces on the wire.
+    fx.snm.setContentParkHook(async () => ({ ok: false as const, reason: "relay_refused", cause: RELAY_PARK_REFUSALS.RATE_LIMITED, retryAfterMs: 45_000 }));
 
     const client = await fx.connectAs("alice");
     const res = (await client.send("cello_send", {
       session_id: SID,
-      content: "a message whose algorithm this build cannot reproduce",
-      content_hash_alg: "sha3-512-someday",
+      content: "a message the relay is throttling",
     })) as { ok?: boolean; reason?: string; cause?: string; guidance?: string };
 
-    expect(res.ok, "precondition: the send must fail, or nothing below is being tested").toBe(false);
+    expect(res.ok, "precondition: direct delivery fails and the park is refused, so the send must fail").toBe(false);
     expect(
       res.cause,
       "the machine-readable cause must cross the boundary. Without it the agent has only `reason`, " +
         "which names where the failure surfaced rather than what happened, and the real answer is " +
         "buried in a paragraph it would have to parse.",
-    ).toBeDefined();
+    ).toBe(RELAY_PARK_REFUSALS.RATE_LIMITED);
     expect(
       res.reason,
-      "and `reason` is still the exit point — the two are different fields on purpose, not " +
-        "duplicates",
+      "and `reason` remains the exit point — two different questions, two different fields",
     ).not.toBe(res.cause);
+    expect(
+      String(res.guidance ?? ""),
+      "and the prose still quotes the relay's own window rather than guessing",
+    ).toMatch(/about 45 seconds/i);
   }, 60_000);
 
   it("★ and the operator is NOT told the relay refused it, nor that it will re-send itself", async () => {
