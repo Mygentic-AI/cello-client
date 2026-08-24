@@ -6063,11 +6063,15 @@ export class SessionNodeManager {
              * — throwing would lose a delivered message over a missing attestation — but soft and
              * unannounced is the silent-fallback pattern this milestone exists to find.
              */
-            const dropAuthorship = (reason: string, error?: unknown): void => {
+            const dropAuthorship = (reason: string, error?: unknown, extra?: Record<string, unknown>): void => {
               this.#logger.warn("session.sent.authorship.unavailable", {
                 sessionId,
                 agentName,
                 reason,
+                // WHICH ROW lost its proof — review pass 2, M2. Without the sequence an operator knows
+                // a message is unproven and not which one, in a transcript of hundreds.
+                ...(witnessed.ok ? { relaySequence: witnessed.sequence_number } : {}),
+                ...(extra ?? {}),
                 ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
                 impact:
                   "this sent message is recorded with attribution 'self_authored' and NO signature, so the row " +
@@ -6088,10 +6092,38 @@ export class SessionNodeManager {
               // bytes and only truthiness on the signature, so a zero-length one would have stored an
               // uncheckable BLOB. Not reachable today — `sign()` returns 64 — and the asymmetry is
               // the kind that stops being unreachable quietly.
-              if (pk instanceof Uint8Array && pk.length === 32 && witnessed.sender_signature.length === 64) {
-                sentAuthorship = { senderPubkey: pk, senderSig: witnessed.sender_signature };
+              /**
+               * ⚠️ VERIFIED BEFORE IT IS STORED, NOT SHAPE-CHECKED — review pass 2, H2, and this is
+               * worth more than any test of it.
+               *
+               * This used to accept the pair on 32 bytes and 64 bytes. A shape check cannot tell a
+               * real proof from 96 bytes that resemble one, and **nothing downstream ever checks
+               * either**: not at write time, and not at read time, because no production reader of
+               * these columns exists yet. So a wrong Structure-1 index, a wrong key, or a pair from
+               * two different submits would all have been persisted as a row that **looks checkable
+               * to an auditor and fails** — strictly worse than the honest unproven row it replaced.
+               *
+               * The received half has always done this (`#recordFrameOrdering` verifies before
+               * storing and treats a failure as fatal). The sent half did not, and every ingredient
+               * was already in scope on this line.
+               *
+               * What it buys over a test: a wrong index becomes **impossible to persist**. The row
+               * gets NULL, the warn below fires, and it happens in production on the machine that
+               * caused it — not in a suite someone has to remember to write.
+               *
+               * NOT fatal, unlike the received half, and the asymmetry is deliberate: there the
+               * failure means a COUNTERPARTY sent something that does not verify, which is an
+               * identity problem. Here it means our own encoder and decoder disagree — bad, but it
+               * must not cost the operator a delivered message.
+               */
+              if (!(pk instanceof Uint8Array) || pk.length !== 32) {
+                dropAuthorship("pubkey_shape", undefined, { pubkeyLen: pk instanceof Uint8Array ? pk.length : -1 });
+              } else if (witnessed.sender_signature.length !== 64) {
+                dropAuthorship("signature_shape", undefined, { sigLen: witnessed.sender_signature.length });
+              } else if (!verify(pk, witnessed.structure1_cbor, witnessed.sender_signature)) {
+                dropAuthorship("pair_does_not_verify");
               } else {
-                dropAuthorship(pk instanceof Uint8Array ? "pubkey_or_signature_shape" : "pubkey_not_bytes");
+                sentAuthorship = { senderPubkey: pk, senderSig: witnessed.sender_signature };
               }
             } catch (err: unknown) {
               dropAuthorship("structure1_decode_failed", err);
