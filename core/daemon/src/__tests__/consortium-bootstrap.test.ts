@@ -524,20 +524,60 @@ describe("createConsortiumRouting", () => {
     routing.stopHttpManifestPoll?.();
   });
 
-  it("a scheduler with an EMPTY root-key set does not start the poll — it would verify against nothing", () => {
+  it("★★ an EMPTY root-key set now FAILS STARTUP — it used to disable the poll in silence", () => {
+    /**
+     * ⚠️ THIS TEST ASSERTED THE OLD BEHAVIOUR AND WAS CHANGED DELIBERATELY, which is worth saying
+     * out loud because silently rewriting a test to match new code is how a contract gets lost.
+     *
+     * What it checked — that a poll with no keys does not run — is CORRECT and still holds: a poll
+     * that verifies against nothing must not run. What was wrong is what happened instead: nothing.
+     * The daemon started, looked healthy, and never adopted a new manifest again. That surfaces
+     * months later as a rotated directory key that was never picked up, with nothing in the record
+     * saying why.
+     *
+     * So the guard keeps its verdict and gains a voice: it refuses at startup, with the key count
+     * and threshold in the error so the cause is IN the message rather than inferred from it.
+     */
     const logger = makeLogger();
     const scheduler = { scheduleNext: vi.fn(), cancel: vi.fn() };
+
+    expect(
+      () =>
+        createConsortiumRouting({
+          manifestProvider: makeProvider(makeManifest()),
+          manifestVersionStore: makeVersionStore(),
+          manifestRootKeys: [],
+          manifestThreshold: THRESHOLD,
+          manifestPollScheduler: scheduler as never,
+          directoryHttpUrl: "https://directory.example.com",
+          logger,
+        }),
+      "a wired poll with no keys to verify against must REFUSE, not start quietly disabled",
+    ).toThrow(/directory_manifest_poll_misconfigured/);
+
+    expect(scheduler.scheduleNext, "and it must not have started the poll on the way out").not.toHaveBeenCalled();
+  });
+
+  it("★★ but NO SCHEDULER is still legitimate and silent — the back-compat path must not break", () => {
+    /**
+     * ⚠️ THE HALF THAT MAKES THE REFUSAL SAFE, and the reason it is not a blanket throw. The M6
+     * back-compat path deliberately runs with no scheduler at all, and failing startup there would
+     * brick a supported configuration to fix a different problem.
+     *
+     * The distinction is intent: **no scheduler** means nobody asked for a poll. **Scheduler wired
+     * with no keys** means somebody asked for verification and supplied nothing to verify with.
+     * Only the second is a misconfiguration, and only the second refuses.
+     */
+    const logger = makeLogger();
     const routing = createConsortiumRouting({
       manifestProvider: makeProvider(makeManifest()),
       manifestVersionStore: makeVersionStore(),
       manifestRootKeys: [],
       manifestThreshold: THRESHOLD,
-      manifestPollScheduler: scheduler as never,
       directoryHttpUrl: "https://directory.example.com",
       logger,
     });
 
-    expect(scheduler.scheduleNext).not.toHaveBeenCalled();
-    expect(routing.stopHttpManifestPoll).toBeUndefined();
+    expect(routing.stopHttpManifestPoll, "no scheduler = no poll, and that is not an error").toBeUndefined();
   });
 });
