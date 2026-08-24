@@ -111,6 +111,44 @@ describe("DOD-M15-TIERTEXT-1 — the tier descriptions, and the ledger that acco
     ).toBeGreaterThanOrEqual(present);
   });
 
+  it("★ THE REPLACEMENT CLAIM IS TRUE TOO: nothing gates ACCEPTANCE on tier", () => {
+    /**
+     * The corrected text now asserts *"EVERY tier is auto-accepted; tiers govern how much, not
+     * whether"*. A fix that replaces a false claim with an unverified one has moved the problem, so
+     * this pins the new sentence rather than only the absence of the old one.
+     *
+     * The claim is an ABSENCE, so the evidence is one: `isAutoAccept` — the only tier check that
+     * could gate acceptance — has NO PRODUCTION CALLER. `session-node-manager.ts` defines it and its
+     * own docstring says the consumer is the offline mailbox and it is *"defined here as the seam"*.
+     *
+     * **This is the guard that matters if someone later wires it up.** The day acceptance starts
+     * depending on tier, this test goes red — and the description saying tiers do not gate who
+     * reaches you becomes false at the same moment. Better a red test than a quietly-true-again
+     * promise nobody re-reads.
+     *
+     * The other two corrected claims already have behaviour tests and are not duplicated here:
+     * the stranger-pool exemption at `m8c-abuse-1.test.ts` ("a KNOWN+ contact is not part of the
+     * stranger pool"), and finite per-tier caps via `INV-TIER-BOUND`.
+     */
+    const { readdirSync } = require("node:fs") as typeof import("node:fs");
+    const daemonSrc = join(import.meta.dirname, "..", "..", "..", "daemon", "src");
+    const callers: string[] = [];
+    for (const f of readdirSync(daemonSrc).filter((n) => n.endsWith(".ts"))) {
+      const text = readFileSync(join(daemonSrc, f), "utf8");
+      // A CALL, not the definition and not a mention in prose.
+      for (const m of text.matchAll(/\bisAutoAccept\s*\(/g)) {
+        const line = text.slice(0, m.index).split("\n").length;
+        const isDefinition = /isAutoAccept\s*\(agentName: string/.test(text.slice(m.index, m.index + 60));
+        if (!isDefinition) callers.push(`${f}:${line}`);
+      }
+    }
+    expect(
+      callers,
+      "acceptance is now gated on tier somewhere — so 'EVERY tier is auto-accepted; tiers govern " +
+        "how much, not whether' has become FALSE and the description must change with the code",
+    ).toEqual([]);
+  });
+
   it("★ a `true` verdict may not rest on nobody enforcing it", () => {
     /**
      * Carried from `DOD-M15-CLAIM-SCANNER-1` and load-bearing: a claim held up by the operator's own
