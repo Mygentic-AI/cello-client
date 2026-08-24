@@ -24,6 +24,7 @@ import { manifestNodesToEndpoints } from "./directory-bootstrap.js";
 import { DaemonRegistrationContext } from "./registration-context.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { validatorNodes } from "@cello-protocol/protocol-types";
+import { classifyManifestValidity } from "./manifest-validity.js";
 
 export interface RegisterHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -138,6 +139,45 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
       // load-bearing: an empty roster (consortium configured but unreachable) must REFUSE in
       // registration-manager, NOT downgrade to single-node (code-reviewer B1 / fallback-finder).
       const currentManifest = manifestProvider?.getCurrentManifest();
+      /**
+       * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — this consumer PROCEEDS on a lapsed manifest, and that is
+       * now a decision rather than an omission. Written down because the split looked accidental:
+       * `signal-submission` REFUSES on expiry while this, the higher-stakes consumer, did not even
+       * look.
+       *
+       * **Why it proceeds.** Startup already fails closed on an expired manifest, so a lapsed one
+       * exists only inside a LONG-RUNNING daemon. Refusing here sends the operator to the one remedy
+       * `signal-submission`'s own guidance warns against — *"a restart without a REPLACEMENT does not
+       * reload anything: the daemon refuses to come back and every agent goes offline."* So refusing
+       * would brick a running operator to close a window that needs a roster CHANGE to be
+       * exploitable at all: the risk is dealing a share to a validator removed since the manifest
+       * lapsed, not expiry itself.
+       *
+       * **Why `signal-submission` is different, and why "make them consistent" would be wrong.** It
+       * uses the manifest's PORTAL INTAKE KEY, and a rotated key means a message the portal cannot
+       * open and cannot attribute — unattributable poison, its own word, with no error anywhere.
+       * Different field, different failure, different answer.
+       *
+       * **What was actually missing was not the gate — it was the RECORD.** `cello_status` already
+       * reports an expired manifest, so the STATE was visible; nothing said a FROST share had been
+       * dealt against one. That is what this event is.
+       */
+      const manifestValidity = classifyManifestValidity(currentManifest ?? null, Date.now());
+      if (manifestValidity.state === "expired") {
+        logger.warn("registration.manifest.lapsed", {
+          agent: name,
+          expires: manifestValidity.expires,
+          validators: currentManifest ? validatorNodes(currentManifest.nodes).length : 0,
+          impact:
+            "the consortium roster this registration deals FROST shares against came from a manifest " +
+            "whose validity window has closed. If a validator has been removed since it lapsed, a " +
+            "share may be dealt to a node that is no longer authorized to hold one.",
+          guidance:
+            "Registration was NOT blocked — blocking it would strand a running daemon, since startup " +
+            "fails closed on an expired manifest and a restart without a replacement never comes back. " +
+            "Install a current manifest and restart when you can. Check cello_status for the expiry.",
+        });
+      }
       const consortiumRoster = currentManifest
         ? await manifestNodesToEndpoints(validatorNodes(currentManifest.nodes), { logger })
         : null;
