@@ -208,6 +208,18 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — the transcript records HOW a message i
       row!.sender_sig === null ? null : Buffer.from(row!.sender_sig).toString("hex"),
       "the 64-byte signature over the Structure-1 bytes we put on the wire",
     ).toBe("5a".repeat(64));
+
+    /**
+     * THE NEGATIVE, asked for by `CELLO_Coder_1` and right to ask: the bug this ordering prevents
+     * would be introduced by the very change that closes the bullet, so it deserves an assertion
+     * rather than the comment above it. A sent row must never wear the label that means *someone
+     * else wrote this and we checked their key*.
+     */
+    expect(
+      row!.attribution,
+      "a sent row must NEVER be verified_signature — that label means we checked a COUNTERPARTY's " +
+        "key, and there was no counterparty in the act of writing our own message",
+    ).not.toBe("verified_signature");
   });
 
   it("★ a sent row with NO signature is still self_authored, and still carries nothing", async () => {
