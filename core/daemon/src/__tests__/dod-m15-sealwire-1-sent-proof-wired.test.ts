@@ -41,7 +41,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import * as lp from "it-length-prefixed";
 import { Encoder, decode } from "cbor-x";
 import type { CelloNode, Stream } from "@cello-protocol/transport";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, msgLeafHash, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { sentAuthorship } from "../session-content-handlers.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
@@ -243,5 +243,84 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
       rows[0]!.sender_sig,
       "nothing was signed, so nothing is stored — never a placeholder that implies a proof",
     ).toBeNull();
+  });
+
+  it("★★★ THE HELD PATH — the ONE case where placeOwnLeaf's authorship argument is load-bearing", async () => {
+    /**
+     * ⚠️ THIS IS THE TEST BULLET 5 WAS REOPENED FOR, and the reason the previous close was wrong.
+     *
+     * I closed this bullet on a mutation that reddened — and it reddened for the WRONG WRITER.
+     * Removing `authorship` from `recordTranscriptMessage(...)` went red; removing it from
+     * `placeOwnLeaf(..., sentAuthorship(...))` stayed **GREEN with 3 passing**. That is structural,
+     * not a harness gap:
+     *
+     *   - On the DELIVERED path `placeOwnLeaf`'s authorship argument is **dead by construction** —
+     *     the row's proof arrives from the `recordTranscriptMessage` call below it.
+     *   - It is load-bearing in **exactly one case: when the leaf is HELD.** On that path
+     *     `recordTranscriptMessage` never runs, because it sits inside `if (placed.placed)`.
+     *     **The held entry is the only carrier of the proof**, and it had no executing test.
+     *
+     * So this drives the carrier end to end: hold a SENT leaf ahead of the tail, close the gap with
+     * a received message, and read the row `#releaseHeld` writes.
+     *
+     * **Revert test, RUN:** delete `...(authorship ? { authorship } : {})` from the hold in
+     * `placeOwnLeaf` and this goes red while every other test in this file stays green — which is
+     * precisely the blind spot that let the premature close happen.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-sentproof-held-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex");
+
+    const proof = { senderPubkey: new Uint8Array(32).fill(0x11), senderSig: new Uint8Array(64).fill(0x22) };
+    const mine = new TextEncoder().encode("held behind a gap, and still provable");
+
+    // Slot 1 with an empty tail: AHEAD of the frontier, so this is HELD, not appended.
+    const placed = fx.snm.placeOwnLeaf(
+      "alice", SID, Buffer.from(msgLeafHash(mine)).toString("hex"), mine, 1, "corr-held", "msg", proof,
+    );
+    expect(placed, "precondition: the send must actually be HELD — if it appended, this proves nothing")
+      .toMatchObject({ placed: false });
+    expect(sentRows("alice", SID).length, "precondition: and NOTHING is in the transcript yet").toBe(0);
+
+    // Close the gap at slot 0. A just-appended leaf unblocks held arrivals whose turn is now next,
+    // which is what runs `#releaseHeld` — the only path that writes a held SENT message's row.
+    const theirs = new TextEncoder().encode("theirs, at slot zero");
+    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0);
+
+    const rows = sentRows("alice", SID);
+    expect(rows.length, "the held message must now be in the transcript — the gap closed").toBe(1);
+    expect(
+      rows[0]!.sender_sig,
+      "THE ASSERTION THE BULLET IS FOR: the proof must survive the hold. It is carried ONLY by the " +
+        "held entry — `recordTranscriptMessage` never runs on this path — so a null here means " +
+        "placeOwnLeaf's authorship argument is doing nothing, which is exactly what shipped and " +
+        "exactly what the delivered-path mutation could not see.",
+    ).not.toBeNull();
+    expect(rows[0]!.sender_sig!.length, "a 64-byte Ed25519 signature, intact across the hold").toBe(64);
+    expect(rows[0]!.sender_pubkey, "and the key it verifies against").toBe("11".repeat(32));
+    expect(rows[0]!.attribution, "we wrote it, so self_authored — with a proof attached").toBe("self_authored");
+  });
+
+  it("★ and a hold that did NOT carry a proof stores none — the truthful negative", async () => {
+    /**
+     * The pair, and it keeps the assertion above honest: it must be reading a proof that travelled,
+     * not one the release path invents. Same journey, no authorship handed in.
+     *
+     * This is also the shape of the documented restart gap — `held_content` has no authorship
+     * columns, so a SENT message held behind a gap and released AFTER a restart legitimately has no
+     * proof to carry. The daemon says so out loud (`session.content.released.authorship.lost`)
+     * rather than writing a row that implies one.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-sentproof-heldbare-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex");
+
+    const mine = new TextEncoder().encode("held behind a gap, unwitnessed");
+    fx.snm.placeOwnLeaf("alice", SID, Buffer.from(msgLeafHash(mine)).toString("hex"), mine, 1, "corr-held", "msg", undefined);
+
+    const theirs = new TextEncoder().encode("theirs, at slot zero");
+    await fx.snm.ingestReceivedContent("alice", SID, theirs, msgLeafHash(theirs), "corr-recv", 0);
+
+    const rows = sentRows("alice", SID);
+    expect(rows.length, "the held message is still released — no proof is not a reason to lose it").toBe(1);
+    expect(rows[0]!.sender_sig, "nothing was signed, so nothing is stored").toBeNull();
   });
 });
