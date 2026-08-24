@@ -2144,8 +2144,15 @@ async function startDaemonHoldingLock(
     // `DOD-M15-SEALWIRE-1` PART B2b — the algorithm is threaded through, and it is the value THIS
     // MESSAGE was hashed under, never one re-derived from the session's current row. Whether a hash
     // is salted is a fact about the message that was sent; what this side holds now says nothing
-    // about it. Still `sha256` everywhere, because no send path salts yet — the plumbing is proven
-    // carrying the value that cannot break anything, and only then does the value change.
+    // about it.
+    //
+    // ⛔ THIS COMMENT USED TO SAY "Still `sha256` everywhere, because no send path salts yet — the
+    // plumbing is proven carrying the value that cannot break anything, and only then does the value
+    // change." That described B2b, and B2b-2 then CHANGED THE VALUE: a session holding an agreed
+    // salt hashes under `hmac-sha256-salt-v1`, so this path really does carry a salted algorithm
+    // now. Rewritten rather than deleted — a stale reassurance is what `CLAIM-COMMENTS-1` is for,
+    // and on 2026-08-24 a test declared `sha256` on the strength of this sentence and got a tamper
+    // verdict on an honest message.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: sessionId,
@@ -2267,8 +2274,15 @@ async function startDaemonHoldingLock(
     // `DOD-M15-SEALWIRE-1` PART B2b — the algorithm is threaded through, and it is the value THIS
     // MESSAGE was hashed under, never one re-derived from the session's current row. Whether a hash
     // is salted is a fact about the message that was sent; what this side holds now says nothing
-    // about it. Still `sha256` everywhere, because no send path salts yet — the plumbing is proven
-    // carrying the value that cannot break anything, and only then does the value change.
+    // about it.
+    //
+    // ⛔ THIS COMMENT USED TO SAY "Still `sha256` everywhere, because no send path salts yet — the
+    // plumbing is proven carrying the value that cannot break anything, and only then does the value
+    // change." That described B2b, and B2b-2 then CHANGED THE VALUE: a session holding an agreed
+    // salt hashes under `hmac-sha256-salt-v1`, so this path really does carry a salted algorithm
+    // now. Rewritten rather than deleted — a stale reassurance is what `CLAIM-COMMENTS-1` is for,
+    // and on 2026-08-24 a test declared `sha256` on the strength of this sentence and got a tamper
+    // verdict on an honest message.
     const ciphertext = await sealParkEnvelope({
       signer: senderKp,
       sessionIdHex: entry.sessionId,

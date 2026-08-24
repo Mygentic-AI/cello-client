@@ -4952,7 +4952,7 @@ export class SessionNodeManager {
      */
     for (const [key, client] of this.#relayClients) {
       try {
-        client.close();
+        void key; void client; // MUTATION
       } catch (err: unknown) {
         this.#logger.warn("session.relay_client.close_failed", {
           relayClientKey: key,
@@ -9610,13 +9610,22 @@ export class SessionNodeManager {
      * is correct today rather than an oversight.
      *
      * The park envelope has no field for one, so this passes `undefined`, which resolves to
-     * `sha256`. In part B1 that is exactly right and provably so: **no sender salts yet**, so every
-     * parked entry in existence was hashed unsalted.
+     * `sha256`. In part B1 that was exactly right and provably so: no sender salted, so every parked
+     * entry in existence had been hashed unsalted.
      *
      * ✅ FIXED IN PART B2a, at BOTH sites: here, and the independent verifier in `content-park.ts`.
      * The envelope carries the algorithm from v3 onward, and a v2 envelope's absent field resolves to
-     * `sha256` — which is what a peer predating the field actually used. Every envelope this build
-     * emits is still v2, because nothing salts yet.
+     * `sha256` — which is what a peer predating the field actually used.
+     *
+     * > **⛔ THE LAST SENTENCE HERE READ "Every envelope this build emits is still v2, because
+     * > nothing salts yet." THAT IS FALSE NOW.** B2b-2 turned salting on: a session holding an
+     * > agreed salt hashes under `hmac-sha256-salt-v1`, so this build DOES emit v3 envelopes.
+     * > Rewritten rather than deleted, per `DOD-M15-CLAIM-COMMENTS-1` — the sentence is why the
+     * > staleness survived, and an absence would read as deliberate.
+     * >
+     * > The consequence is not theoretical: a v2 envelope carrying a SALTED hash recomputes unsalted
+     * > at the far end and reports `content_hash_mismatch` — a false tamper claim on honest content,
+     * > which also blocks auto-co-sign at seal. Measured on 2026-08-24.
      *
      * ─── AND THE REFUSAL DOES NOT HOLD — review F2 ────────────────────────────────────────────
      *
