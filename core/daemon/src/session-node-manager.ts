@@ -8404,14 +8404,35 @@ export class SessionNodeManager {
     contentHashHex: string,
     sentBytes: Uint8Array,
     assignedSeq: number | undefined,
-    correlationId?: string,
-    kind: WritableSessionTreeLeafKind = "msg",
+    correlationId: string | undefined,
+    /**
+     * ⚠️ NO DEFAULT, for the same reason `authorship` has none.
+     *
+     * `kind = "msg"` meant a caller writing a `doc` or a `ctrl` leaf got a `msg` leaf by saying
+     * nothing, and the tree recorded a leaf kind the author never chose. TypeScript also forbids a
+     * required parameter after a defaulted one, so leaving the default here would have forced
+     * `authorship` back to optional — which is the defect above. Every one of the seven call sites
+     * already passed a kind or wanted "msg"; making it explicit cost nothing and removes a second
+     * silent answer from the same signature.
+     */
+    kind: WritableSessionTreeLeafKind,
     /**
      * DOD-M15-SEALWIRE-1 bullet 5 — the proof for THIS send, so a held row keeps it.
-     * Optional: an unwitnessed send has nothing signed, and a caller that has no proof passes none
-     * rather than a placeholder.
+     *
+     * ⚠️ REQUIRED, AND `undefined` IS A VALID ANSWER — the two are not the same thing.
+     *
+     * This was `authorship?:` for exactly one review cycle, and in that cycle THREE of the seven
+     * call sites omitted it: `daemon.ts` 1440, 1671, 1685 — the away-reply path, which is the
+     * highest-traffic sent-writer in the daemon and the one with no human watching it. All three
+     * had the proof **already in a local variable one line below**, handed to
+     * `recordTranscriptMessage` and not to this method. Nothing went red, because an optional
+     * parameter's whole behaviour on omission is to look deliberate.
+     *
+     * An unwitnessed send genuinely has no proof, so absence must stay expressible. Requiring the
+     * parameter keeps that while making the caller SAY it: omission is now a type error, and
+     * `undefined` is a claim the author made rather than one the signature made for them.
      */
-    authorship?: SentAuthorship,
+    authorship: SentAuthorship | undefined,
   ): { placed: true; leafIndex: number; diverged?: true } | { placed: false; heldAt: number } {
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.

@@ -1437,7 +1437,10 @@ async function startDaemonHoldingLock(
             // in the codebase for that — the seal is initiated a few lines below, so a leaf at the
             // wrong index does not merely stall the far side, it seals a tree the counterparty can
             // never agree with.
-            const placed = sessionNodeManager.placeOwnLeaf(agentName, sessionId, rejectHashHex, rejectBytes, sendResult.sequenceNumber, randomUUID());
+            // The proof travels with the leaf, not only with the transcript row below: when this
+            // append is HELD behind a gap, the `recordTranscriptMessage` call is skipped entirely
+            // and the held entry is the only thing that reaches the row on release.
+            const placed = sessionNodeManager.placeOwnLeaf(agentName, sessionId, rejectHashHex, rejectBytes, sendResult.sequenceNumber, randomUUID(), "msg", sentAuthorship(sendResult));
             if (placed.placed) {
               sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placed.leafIndex, "sent", rejectBytes, randomUUID(), sentAuthorship(sendResult));
             }
@@ -1668,7 +1671,10 @@ async function startDaemonHoldingLock(
         // next arrival would mint a second greeting at a second sequence.
         // DOD-M12B-INDEX-1: the queued reply owns the position the relay witnessed for it, and
         // that is where its leaf goes.
-        const placedQueued = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+        // Witnessed and SIGNED — only the direct hand-off failed — so the proof exists and must
+        // reach the leaf. This is the site `sentAuthorship`'s own comment calls dead-by-construction
+        // under an `ok`-gated read; the same reasoning applies to the leaf, not just the row.
+        const placedQueued = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID(), "msg", sentAuthorship(sendResult));
         if (placedQueued.placed) {
           sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedQueued.leafIndex, "sent", contentBytes, randomUUID(), sentAuthorship(sendResult));
         }
@@ -1682,7 +1688,7 @@ async function startDaemonHoldingLock(
       }
       // DOD-M12B-INDEX-1: the away responder fires while inbound is still arriving, so it is the
       // path most likely to have a gap open under it — exactly where a tail append does damage.
-      const placedReply = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
+      const placedReply = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID(), "msg", sentAuthorship(sendResult));
       if (placedReply.placed) {
         sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedReply.leafIndex, "sent", contentBytes, randomUUID(), sentAuthorship(sendResult));
       }
@@ -4859,6 +4865,12 @@ async function startDaemonHoldingLock(
             assignedSeq,
             correlationId,
             "doc",
+            /**
+             * No proof, and that is the truth rather than an omission: the document transport does
+             * not go through `sendContent`, so no Structure-1 was signed for this frame and there is
+             * nothing witnessed to record. Stated here because the signature now requires an answer.
+             */
+            undefined,
           );
           return { placed: placed.placed, leafIndex: placed.placed ? placed.leafIndex : null };
         },
