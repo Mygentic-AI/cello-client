@@ -10,7 +10,7 @@
  * `node:sqlite` here is the test-file allowance; production is SQLCipher.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import { Buffer } from "node:buffer";
 import * as Y from "yjs";
@@ -78,6 +78,12 @@ async function seatViaExchange(inviter: HandlerFixture, invitee: HandlerFixture,
 async function newFixture(opts: { sendFails?: string } = {}) {
   /** Mutable so a test can fail the first send and succeed the retry — the real recovery sequence. */
   let sendFails = opts.sendFails;
+  /**
+   * DOD-M15-DOCACCEPT-UNBOUNDED-1 — a holder whose send NEVER SETTLES. Added as a knob beside
+   * `sendFails` with a default of `undefined`, so every existing test is untouched: the real fan-out
+   * is sequential and unbounded, and the only way to exercise that is a send that does not answer.
+   */
+  let sendHangs: Promise<void> | undefined;
   const keys = generateKeypair();
   const owner = Buffer.from(await keys.getPublicKey()).toString("hex");
   const peerKeys = generateKeypair();
@@ -115,6 +121,7 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     isPeerReachable: async () => ({ reachable: true, unknownAgent: false }),
     sendBytes: async (input: { peerAgentId: string; bytes: Uint8Array }) => {
       sent.push({ peerAgentId: input.peerAgentId, bytes: input.bytes });
+      if (sendHangs) await sendHangs;
       if (sendFails) return { ok: false as const, reason: sendFails };
       return { ok: true as const, sessionId: "session-1", sessionOpened: true };
     },
@@ -180,6 +187,21 @@ async function newFixture(opts: { sendFails?: string } = {}) {
     },
     peerComesOnline: () => {
       sendFails = undefined;
+    },
+    /**
+     * Make the next holder's send hang until the returned release() is called.
+     *
+     * ⚠️ UNUSED TODAY, and kept deliberately — `DOD-M15-DOCACCEPT-UNBOUNDED-1`. I added it to cover the
+     * new `document.amendment.holder_slow` warn and could not reach `fanOutAmendment` from this
+     * fixture: `cello_doc_write` is not an amendment, and a plain proposal-accept here fans out to
+     * nobody — MEASURED, `sends attempted: []`. The path that fans out is the JOIN accept (an admin
+     * invites a third party), which needs the three-party setup `JOIN-1` builds. Left in place because
+     * the knob is correct and non-breaking; the missing coverage is filed, not forgotten.
+     */
+    holderStopsAnswering: () => {
+      let release!: () => void;
+      sendHangs = new Promise<void>((r) => { release = r; });
+      return () => { sendHangs = undefined; release(); };
     },
   };
 }
