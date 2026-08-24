@@ -888,6 +888,52 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "refuses an unrecognised scope rather than falling back to the default, so a typo cannot " +
       "quietly deliver the shared-context behaviour the sentence warns against.",
   },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "what the relay can see, and what relay-only conceals from a counterparty",
+    excerpts: [
+      "It cannot read anything you say \u2014 content is",
+      "encrypted end to end and the relay only ever handles ciphertext and hashes",
+      "so a counterparty who does not already have your address never learns it.",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "Added by DOD-M15-DISCLOSE-1 bullet 1, and each half is settled by code rather than belief. " +
+      "The relay handling only ciphertext and hashes is structural: the relay's frame types carry a " +
+      "content HASH and a signature, never plaintext, and the relay has no key material with which " +
+      "to read one. 'never learns it' is scoped to a counterparty who does not ALREADY hold the " +
+      "address, and is settled by DOD-M15-RELAYONLY-1: publishableEndpoint filters the published " +
+      "set to circuit addresses, dialableAddrs filters the dialled set the same way, and " +
+      "createNode omits dcutr and applies an announceFilter under holePunch.enabled=false, so " +
+      "neither a hole-punch nor identify discloses it. The four limits that make the sentence true " +
+      "rather than reassuring \u2014 no revocation of a prior disclosure, new sessions only, no " +
+      "concealment from relay or directory, and refusal when no reservation exists \u2014 are " +
+      "stated in the same section rather than left to the reader.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "what the relay can see, and what relay-only conceals from a counterparty",
+    excerpts: [
+      "It cannot read anything you say \u2014 content is",
+      "encrypted end to end and the relay only ever handles ciphertext and hashes",
+      "so a counterparty who does not already have your address never learns it.",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "Added by DOD-M15-DISCLOSE-1 bullet 1, and each half is settled by code rather than belief. " +
+      "The relay handling only ciphertext and hashes is structural: the relay's frame types carry a " +
+      "content HASH and a signature, never plaintext, and the relay has no key material with which " +
+      "to read one. 'never learns it' is scoped to a counterparty who does not ALREADY hold the " +
+      "address, and is settled by DOD-M15-RELAYONLY-1: publishableEndpoint filters the published " +
+      "set to circuit addresses, dialableAddrs filters the dialled set the same way, and " +
+      "createNode omits dcutr and applies an announceFilter under holePunch.enabled=false, so " +
+      "neither a hole-punch nor identify discloses it. The four limits that make the sentence true " +
+      "rather than reassuring \u2014 no revocation of a prior disclosure, new sessions only, no " +
+      "concealment from relay or directory, and refusal when no reservation exists \u2014 are " +
+      "stated in the same section rather than left to the reader.",
+  },
 ];
 
 /**

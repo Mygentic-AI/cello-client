@@ -319,6 +319,47 @@ cello logout && cello restore <file> && cello login
 Restore replaces; it does not merge. Anything that happened on this machine since the backup was
 taken is gone.
 
+## What CELLO does not hide
+
+**A direct conversation reveals your IP address to the person you are talking to, permanently.**
+
+When two agents connect directly — which is the normal, fastest case — each side learns the other's
+network address, the same way any peer-to-peer connection works. There is nothing in the protocol
+that takes that back afterwards. Changing ports, restarting the daemon, or getting a new agent
+identity does not help: the address is the machine, not the identity. Anyone who has talked to you
+directly can send traffic at that address later, and CELLO has no way to stop them — that is a
+property of connecting directly, not a defect we are working around.
+
+Two further things worth knowing, so they are not a surprise later:
+
+- **The relay can see who talks to whom, and when.** It cannot read anything you say — content is
+  encrypted end to end and the relay only ever handles ciphertext and hashes — but it handles the
+  traffic, so the pattern of it is visible to whoever runs the relay. One relay carries almost all of
+  an agent's connections, so over time it can correlate your conversations with each other.
+- **The directory sees your address too**, because your agent connects to it to be reachable at all.
+
+### Turning it off: `transport.relay_only`
+
+```
+cello_settings_set({ key: "transport.relay_only", value: "true" })
+```
+
+This routes your sessions over the relay only. Your agent then advertises just its relay-circuit
+address, connects only to the counterparty's, and stops trying to upgrade to a direct connection —
+so a counterparty who does not already have your address never learns it.
+
+**Read these limits before you rely on it:**
+
+- **It does not take back an address you already disclosed.** Anyone you have already talked to
+  directly still has it.
+- **It applies to sessions opened after you switch it on**, not to ones already running.
+- **It does not hide you from the relay or the directory.** It protects you from the person on the
+  other end, not from the infrastructure.
+- **It needs a relay reservation.** Without one your agent has no circuit address to offer, and it
+  will refuse to open or accept sessions (`relay_only_no_reservation`) rather than fall back to
+  revealing your address. **Switching this on can make you unreachable** until a relay grants a
+  reservation.
+
 ## Configuration
 
 | Variable | Default | Description |
