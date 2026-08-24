@@ -761,10 +761,16 @@ function mapStreamError(
  *     receiver) it probes connected directory nodes for dial-back to determine
  *     dialability; on directory nodes it serves the responder role, answering
  *     dial-back requests. Protocol: /libp2p/autonat/1.0.0.
- *   - dcutr() is included on EVERY node type (DOD-NAT-REACHABILITY-1). The
+ *   - dcutr() is included on every node type BY DEFAULT (DOD-NAT-REACHABILITY-1). The
  *     protocol's inbound peer is the one that STARTS the hole-punch upgrade
  *     (@libp2p/dcutr ignores connections with direction !== 'inbound'), and the
  *     inbound peer of a relayed connection is precisely the standing receiver.
+ *     ⚠️ `opts.holePunch: { enabled: false }` OMITS it (DOD-M15-RELAYONLY-1), and the sentence
+ *     directly above is the reason it had to become optional: if the inbound side starts the
+ *     upgrade, a node whose operator asked never to be directly reachable would hole-punch itself
+ *     into exactly the direct connection they switched the setting on to avoid. Suppressing the
+ *     published address does not cover this — the address a peer cannot be TOLD, a hole-punch
+ *     still REVEALS.
  *   - circuitRelayServer (HOP) is a SERVICE-node capability: included when
  *     nodeType is undefined (directory, relay) or when opts.relayServer.enabled
  *     is set. Client nodes (session / standing_receiver) no longer advertise
@@ -1089,7 +1095,13 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
       // DOD-NAT-REACHABILITY-1: dcutr on every node — the standing receiver is
       // the inbound side of a relayed connection, and the inbound side starts
       // the upgrade. See the header note.
-      dcutr: dcutr(),
+      //
+      // ⚠️ DOD-M15-RELAYONLY-1 made this OPTIONAL, and the reason is the sentence directly above:
+      // if the inbound side starts the upgrade, then a node that must never be directly reachable
+      // will hole-punch itself into exactly the direct connection its operator switched a privacy
+      // setting on to avoid. Suppressing the published address does not help — the address a peer
+      // cannot be TOLD, a hole-punch still REVEALS. Default stays enabled for every other caller.
+      ...(opts.holePunch?.enabled === false ? {} : { dcutr: dcutr() }),
     },
     ...(opts.connectionGater ? { connectionGater: opts.connectionGater } : {}),
     // DOD-M15-IDLE-CONNS-1: declared, not inherited. Same object the node reports.

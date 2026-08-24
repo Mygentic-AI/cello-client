@@ -68,6 +68,23 @@ export interface CreateNodeOptions {
    */
   autonatResponder?: { enabled: boolean };
   /**
+   * DOD-M15-RELAYONLY-1: NAT hole-punching (dcutr). Defaults to ENABLED, which is every existing
+   * caller's behaviour and the right default — a direct connection is faster and cheaper than a
+   * relayed one.
+   *
+   * ⚠️ Set `{ enabled: false }` on a node whose whole purpose is NOT to be directly reachable.
+   * dcutr's job is to UPGRADE a relayed connection to a direct one, and the note beside its
+   * registration says the standing receiver is *"the inbound side of a relayed connection, and the
+   * inbound side starts the upgrade"*. So a relay-only agent would route its session over the relay
+   * exactly as asked, and then hole-punch its way to a direct connection anyway — **disclosing the
+   * very address the setting exists to hide, with no test able to see it, because nothing observes a
+   * live upgrade.**
+   *
+   * Suppressing the published address is therefore not sufficient on its own: the address a peer
+   * cannot be told, a hole-punch can still reveal.
+   */
+  holePunch?: { enabled: boolean };
+  /**
    * CELLO-M7-TRANSPORT-001 / DOD-NAT-REACHABILITY-1: the role of this node,
    * which tunes the libp2p service set:
    *   - 'session'           — ephemeral per-session dialer.
