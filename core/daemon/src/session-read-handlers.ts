@@ -404,6 +404,10 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       ...resolveWho(row.agent_name, row.counterparty_pubkey, row.session_id),
       status: row.status,
       category,
+      // DOD-M15-REFUSED-INBOUND-SILENT-1: surfaced only when NOT salted. `selectSessions` is a
+      // WHITELIST — adding the field to the session record alone left it invisible here, which is
+      // the no-reader defect this whole line is about, reproduced inside the fix for it.
+      ...(row.content_hashes_salted === false ? { contentHashesSalted: false as const } : {}),
       // Review HIGH-2: present only while a ceremony is actually in flight, so it stays a signal.
       ...(isSealing(row.agent_name, row.session_id) ? { sealing: true } : {}),
       messageCount,

@@ -614,6 +614,16 @@ export interface InterruptedSessionInfo {
  * is/was interrupted.
  */
 export interface SessionListEntry {
+  /**
+   * DOD-M15-REFUSED-INBOUND-SILENT-1 — present ONLY when this session's content hashes are NOT
+   * salted, so it stays readable rather than becoming a field on every row that everyone skips.
+   *
+   * Its absence is the healthy, ordinary case. Its presence does not mean anything is wrong — an
+   * unsalted session is exactly as verifiable as every session shipped before salting existed — it
+   * means the operator can tell *unsalted because this build predates the feature* from *unsalted
+   * because adoption was refused*, and only the second says anything about their setup.
+   */
+  contentHashesSalted?: false;
   sessionId: string;
   agentName: string;
   counterpartyPubkey: string;

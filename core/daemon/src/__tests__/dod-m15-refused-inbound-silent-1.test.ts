@@ -462,6 +462,48 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     ).not.toMatch(/again to keep waiting/i);
   });
 
+  it("the salted status reaches cello_list_sessions — the record alone was invisible", async () => {
+    /**
+     * ⚠️ THE SAME DEFECT, A THIRD TIME IN ONE UNIT, and only caught by asking "who reads this?"
+     *
+     * `selectSessions` builds an explicit `SessionListEntry` — it is a WHITELIST, not a passthrough.
+     * So putting `content_hashes_salted` on the session record satisfied a record-level test while
+     * the operator's actual surface showed nothing at all. That is exactly the shape this DoD line
+     * exists to close, reproduced inside the fix for it.
+     *
+     * Surfaced only when NOT salted: absence is the healthy case, and a key on every row is a key
+     * readers learn to skip.
+     */
+    handle = await startDaemon(await setup("alice"));
+    const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const db = handle.getSessionNodeManager().getDb()!;
+    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+    const now = Date.now();
+    for (const sid of ["s-list-unsalted", "s-list-salted"]) {
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+         VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+      ).run(sid, agentId, "bb".repeat(32), now, now);
+    }
+    db.prepare("UPDATE sessions SET content_salt = ? WHERE session_id = ?")
+      .run(new Uint8Array(32).fill(7), "s-list-salted");
+
+    const res = (await client.send("cello_list_sessions", {})) as { sessions?: Array<Record<string, unknown>> };
+    const byId = new Map((res.sessions ?? []).map((s) => [s["sessionId"] as string, s]));
+
+    expect(
+      byId.get("s-list-unsalted")?.["contentHashesSalted"],
+      "an unsalted session must SAY so on the surface the operator actually reads",
+    ).toBe(false);
+    expect(
+      byId.get("s-list-salted") && "contentHashesSalted" in byId.get("s-list-salted")!,
+      "and a salted one carries no key at all — absence is the healthy case, and a field on every " +
+        "row is one readers learn to skip",
+    ).toBe(false);
+  });
+
   it("a genuinely quiet session says nothing about refusals, and keeps the ordinary advice", async () => {
     /**
      * The false-positive direction. `refusals` is spread rather than always-present precisely so it
