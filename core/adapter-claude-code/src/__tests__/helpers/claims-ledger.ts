@@ -895,6 +895,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "It cannot read anything you say \u2014 content is",
       "encrypted end to end and the relay only ever handles ciphertext and hashes",
       "so a counterparty who does not already have your address never learns it.",
+      "It still cannot read it \u2014 but for a",
     ],
     verdict: "true",
     enforcedBy: "structural",
@@ -909,7 +910,15 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "neither a hole-punch nor identify discloses it. The four limits that make the sentence true " +
       "rather than reassuring \u2014 no revocation of a prior disclosure, new sessions only, no " +
       "concealment from relay or directory, and refusal when no reservation exists \u2014 are " +
-      "stated in the same section rather than left to the reader.",
+      "stated in the same section rather than left to the reader. " +
+      "CORRECTED after review verified the relay half exhaustively: the relay package contains NO " +
+      "cipher primitive at all (zero hits for decrypt/aes/chacha/x25519/hkdf across its source), " +
+      "which is why this half is `structural` \u2014 there is no branch to skip because there is no " +
+      "code to run. The same review found the surrounding text overclaimed in the SAFE-FEELING " +
+      "direction twice, and both were fixed rather than softened away: the relay does not INFER the " +
+      "social graph over time, it is handed both participants' identity pubkeys per session; and " +
+      "relay-only's hole-punch and advertisement halves need an agent RESTART, because they are " +
+      "fixed when the network node is built, while the address filtering takes effect immediately.",
   },
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
@@ -918,6 +927,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "It cannot read anything you say \u2014 content is",
       "encrypted end to end and the relay only ever handles ciphertext and hashes",
       "so a counterparty who does not already have your address never learns it.",
+      "It still cannot read it \u2014 but for a",
     ],
     verdict: "true",
     enforcedBy: "structural",
@@ -932,7 +942,15 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "neither a hole-punch nor identify discloses it. The four limits that make the sentence true " +
       "rather than reassuring \u2014 no revocation of a prior disclosure, new sessions only, no " +
       "concealment from relay or directory, and refusal when no reservation exists \u2014 are " +
-      "stated in the same section rather than left to the reader.",
+      "stated in the same section rather than left to the reader. " +
+      "CORRECTED after review verified the relay half exhaustively: the relay package contains NO " +
+      "cipher primitive at all (zero hits for decrypt/aes/chacha/x25519/hkdf across its source), " +
+      "which is why this half is `structural` \u2014 there is no branch to skip because there is no " +
+      "code to run. The same review found the surrounding text overclaimed in the SAFE-FEELING " +
+      "direction twice, and both were fixed rather than softened away: the relay does not INFER the " +
+      "social graph over time, it is handed both participants' identity pubkeys per session; and " +
+      "relay-only's hole-punch and advertisement halves need an agent RESTART, because they are " +
+      "fixed when the network node is built, while the address filtering takes effect immediately.",
   },
 ];
 

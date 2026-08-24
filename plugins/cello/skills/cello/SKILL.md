@@ -332,10 +332,17 @@ property of connecting directly, not a defect we are working around.
 
 Two further things worth knowing, so they are not a surprise later:
 
-- **The relay can see who talks to whom, and when.** It cannot read anything you say — content is
-  encrypted end to end and the relay only ever handles ciphertext and hashes — but it handles the
-  traffic, so the pattern of it is visible to whoever runs the relay. One relay carries almost all of
-  an agent's connections, so over time it can correlate your conversations with each other.
+- **The relay is TOLD who is in every conversation.** It cannot read anything you say — content is
+  encrypted end to end and the relay only ever handles ciphertext and hashes — but the directory
+  hands it both parties' public identity keys with each session, and you authenticate to it with your
+  long-term identity key on one connection that carries all your sessions at once. This is not
+  something it infers over time; it is given a running record of who you talk to and when. In
+  practice one relay is selected for everyone and there is no rotation, so that record is
+  concentrated in one place.
+- **The relay learns the length of each message**, and where a message was parked for an offline
+  recipient it also holds an unsalted hash of the content. It still cannot read it — but for a
+  short or predictable message ("yes", "approved", an amount) it can confirm a guess by hashing
+  candidates.
 - **The directory sees your address too**, because your agent connects to it to be reachable at all.
 
 ### Turning it off: `transport.relay_only`
@@ -352,7 +359,13 @@ so a counterparty who does not already have your address never learns it.
 
 - **It does not take back an address you already disclosed.** Anyone you have already talked to
   directly still has it.
-- **It applies to sessions opened after you switch it on**, not to ones already running.
+- **The address filtering applies to sessions opened after you switch it on**, not to ones already
+  running — and **the hole-punch and advertisement changes need the agent to restart**, because
+  they are fixed when its network node is built. Until you restart, an already-running agent can
+  still be upgraded to a direct connection.
+- **It does not protect you from a counterparty who runs the relay you are using.** Routing through
+  a relay hides your address from the person on the other end; it does not hide it from the relay,
+  and those can be the same party.
 - **It does not hide you from the relay or the directory.** It protects you from the person on the
   other end, not from the infrastructure.
 - **It needs a relay reservation.** Without one your agent has no circuit address to offer, and it
