@@ -35,6 +35,12 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
+import { createHash } from "node:crypto";
+
+/** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
+function msgLeafHash(content: Uint8Array): Uint8Array {
+  return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
+}
 
 const SECRET = "you agreed to send me $1000";
 
@@ -154,6 +160,49 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     mgr.noteContentRefusal("alice", "s-a", "content_hash_mismatch", { impact: "a" });
     expect(mgr.takeContentRefusals("alice", "s-b"), "a quiet session reports nothing").toEqual([]);
     expect(mgr.takeContentRefusals("alice", "s-a").length).toBe(1);
+  });
+
+  it("A REAL refusal produces a notice — the producer leg, not a hand-seeded store", async () => {
+    /**
+     * ⚠️ EVERY OTHER TEST IN THIS FILE SEEDS THE STORE BY HAND, so deleting both
+     * `noteContentRefusal` calls in `session-node-manager.ts` left all of them green. The untested
+     * seam had MOVED rather than closed: it was store-without-reader, and my fix made it
+     * reader-with-hand-fed-store. Nothing proved a real refusal produces a notice at all.
+     *
+     * This drives `ingestReceivedContent` with a hash that does not match the bytes — the actual
+     * tamper path — and asserts the operator hears about it.
+     */
+    const h = await start();
+    const mgr = h.getSessionNodeManager();
+    const sid = "s-producer";
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-refused");
+
+    const content = new TextEncoder().encode(SECRET);
+    const wrongHash = msgLeafHash(new TextEncoder().encode("not what was sent"));
+    const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash);
+    expect(res.ok, "the tampered message must be refused, not ingested").toBe(false);
+
+    const notices = mgr.takeContentRefusals("alice", sid);
+    expect(
+      notices.length,
+      "a REAL refusal must produce a notice — this is the leg every other test in this file skips",
+    ).toBe(1);
+    expect(notices[0]!.reason).toBe("content_hash_mismatch");
+
+    /**
+     * And the content-never-travels property, asserted where it is ENFORCEABLE.
+     *
+     * The version of this test that lived in the store suite passed `impact` strings it wrote
+     * itself and then checked `SECRET` was absent — true for every possible implementation,
+     * including an empty one. Unfalsifiable. Driving the producer with the secret as the actual
+     * refused CONTENT makes it real: it goes red the day someone interpolates the message, or its
+     * bytes, into the notice.
+     */
+    expect(
+      JSON.stringify(notices).includes(SECRET),
+      "the refused content must never reach the operator — it failed verification, so surfacing it " +
+        "is the injection path the cross-check exists to close",
+    ).toBe(false);
   });
 
   it("THE CONTENT NEVER TRAVELS — not in any field of the notice", async () => {
