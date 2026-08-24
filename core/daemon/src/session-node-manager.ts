@@ -13030,6 +13030,23 @@ export class SessionNodeManager {
     // `interrupted` leaves a live, talking session where REVIVAL-BOUND-1's sweep can seal or abandon
     // it. Failing here means tearing the node back down rather than running in that split state.
     if (!this.#updateSessionStatus(agentName, sessionId, "active")) {
+      /**
+       * DOD-M15-RELAYLEAK-1 (review MEDIUM-4) — **THIS TEARDOWN LEAKED THE EXACT THING THE LINE IS
+       * ABOUT, THROUGH A DIFFERENT DOOR.**
+       *
+       * `#reconnectRevivedSessionRelay` above has already called `registerSession` on the cached
+       * relay client and hung it on this entry. Deleting the map key and stopping the node released
+       * the daemon's own objects and left that registration standing with **no owner** — and
+       * `#detachSessionRelay` closes a client only when `!hasSessions()`, so the orphaned
+       * registration held that predicate false for the life of the process. The client, its
+       * authenticated stream and its relay-side reservation were unreachable and immortal.
+       *
+       * The shutdown loop this line added does sweep it at exit, which is precisely why it had to be
+       * fixed here too: a leak that is only cleaned up by process death is still a leak for every
+       * hour the daemon is up.
+       */
+      const revivedEntry = this.#activeNodes.get(key);
+      if (revivedEntry) this.#detachSessionRelay(revivedEntry);
       this.#activeNodes.delete(key);
       try {
         await node.stop();

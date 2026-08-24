@@ -18,6 +18,32 @@
  * that builds and caches a client and calls `registerSession`. Nothing ever unregistered it — and
  * `#detachSessionRelay` closes a client only when `!client.hasSessions()`, so that predicate stayed
  * false **forever** and the client was immortal.
+ *
+ * ─── ⚠️ THE FIRST VERSION OF THIS FILE NEVER REACHED THE CODE IT TESTED ────────────────────────
+ *
+ * Review ran it and captured the actual return: `{"ok":false,"reason":"no_persisted_relay_endpoint"}`
+ * with `builderCalled: 0`. `#resolveSealTransport` needs **three** conditions to take the detached
+ * branch, and the first draft supplied none of them:
+ *
+ *   1. **No live `#activeNodes` entry** for the session — an entry short-circuits to the LIVE branch
+ *      (or to `relay_unavailable`) and never falls through.
+ *   2. **A persisted relay endpoint** on the `sessions` row (`relay_peer_id` + `relay_addrs`).
+ *   3. **A standing receiver** for the agent.
+ *
+ * So `submitSealLeaf` returned *before the `try`*, the builder was never called, nothing was cached
+ * and nothing was registered. One test was red; the other was green **for the wrong reason** and
+ * stayed green with the fix reverted — it asserted `hasSessions() === false`, which was true because
+ * `registerSession` had never run.
+ *
+ * `#setUpDetachedSeal` below builds all three through PRODUCTION entry points, and it builds the
+ * real scenario rather than a convenient one: a session whose node is gone (`destroySessionNode(…,
+ * "interrupted")`) while its relay endpoint survives on the row. **That is precisely the case the
+ * detached path exists for** — a daemon that restarted, marked the session interrupted, and now has
+ * to seal it.
+ *
+ * ⚠️ **Every test here asserts the branch was ENTERED before asserting anything about it.** That is
+ * the guard against this exact regression: if a future change sends the resolver back out through
+ * `no_persisted_relay_endpoint`, these go red on the precondition instead of passing vacuously.
  */
 
 import { describe, it, expect, afterEach } from "vitest";
@@ -25,20 +51,60 @@ import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/
 import type { AgentRelayClient } from "../session-relay-client.js";
 
 const SID = "1d".repeat(32);
+const RELAY_PEER = "12D3KooWRelayForSealLeak000000000000000000000";
+const RELAY_ADDRS = ["/ip4/127.0.0.1/tcp/4001"];
 
 /** A relay client that records what was asked of it and nothing else. */
-function makeFakeRelayClient(): AgentRelayClient & { closed: number; sessions: Set<string> } {
+function makeFakeRelayClient(): AgentRelayClient & {
+  closed: number;
+  sessions: Set<string>;
+  /** Every id ever registered — survives release, so a test can prove registration HAPPENED. */
+  registered: string[];
+} {
   const sessions = new Set<string>();
+  const registered: string[] = [];
   const fake = {
     closed: 0,
     sessions,
-    registerSession(sessionId: string) { sessions.add(sessionId); },
+    registered,
+    registerSession(sessionId: string) { sessions.add(sessionId); registered.push(sessionId); },
     unregisterSession(sessionId: string) { sessions.delete(sessionId); },
     hasSessions() { return sessions.size > 0; },
     close() { (fake as { closed: number }).closed += 1; },
     getLastReaderError() { return undefined; },
   };
-  return fake as unknown as AgentRelayClient & { closed: number; sessions: Set<string> };
+  return fake as unknown as AgentRelayClient & { closed: number; sessions: Set<string>; registered: string[] };
+}
+
+/**
+ * Build the one state in which the DETACHED seal branch is reachable, through production calls.
+ *
+ * Returns the fake client and a `builderCalled` probe. The probe is not decoration: it is what
+ * distinguishes "the fix works" from "the resolver bailed out early and the assertion happened to
+ * hold anyway", which is exactly how the first draft of this file passed.
+ */
+async function setUpDetachedSeal(fx: TwoConnectionFixture): Promise<{
+  client: ReturnType<typeof makeFakeRelayClient>;
+  builderCalled: () => number;
+}> {
+  const client = makeFakeRelayClient();
+  let calls = 0;
+
+  // A session exists on disk...
+  await fx.createSession(SID, "alice");
+  // ...with a relay endpoint recorded on its row, which is what a relay assignment writes and what
+  // the detached path reads back. Seeded the same way msg-022-session-rebuild does it.
+  fx.snm.getDb()
+    .prepare("UPDATE sessions SET relay_peer_id = ?, relay_addrs = ? WHERE session_id = ?")
+    .run(RELAY_PEER, JSON.stringify(RELAY_ADDRS), SID);
+  // ...and its live node is GONE — the interrupted-by-restart state that makes a seal need a
+  // detached transport in the first place. Without this the LIVE branch wins and nothing below runs.
+  await fx.snm.destroySessionNode("alice", SID, "interrupted");
+  // The detached path dials FROM the agent's standing receiver.
+  await fx.snm.ensureStandingReceiverForAgent("alice");
+
+  fx.snm.setDetachedRelayClientBuilder(() => { calls += 1; return client; });
+  return { client, builderCalled: () => calls };
 }
 
 describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the daemon", () => {
@@ -61,13 +127,18 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
      * is exactly why the leak survived.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-relayleak-shutdown-" });
-    const client = makeFakeRelayClient();
-    // Stays "in use" so the detached release leaves it cached — see the note above.
+    const { client, builderCalled } = await setUpDetachedSeal(fx);
+    // Stays "in use" so the release leaves it cached — see the note above.
     (client as unknown as { hasSessions: () => boolean }).hasSessions = () => true;
-    fx.snm.setDetachedRelayClientBuilder(() => client);
 
-    // The production way an entry lands in the cache: a detached seal transport.
-    await fx.snm.submitSealLeaf("alice", SID, new Uint8Array(32).fill(0xab), "corr-cache").catch(() => undefined);
+    await fx.snm.submitSealLeaf("alice", SID, "corr-cache").catch(() => undefined);
+
+    expect(
+      builderCalled(),
+      "PRECONDITION — the detached branch must have been entered and a client cached. If this is 0 " +
+        "the resolver bailed out early (it returned `no_persisted_relay_endpoint` in the first " +
+        "draft) and everything below would pass without the fix existing.",
+    ).toBeGreaterThan(0);
 
     await fx.snm.gracefulShutdown();
 
@@ -87,16 +158,30 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
      * registered one and never removed it, so that condition could never become true — no shutdown,
      * no teardown, no idle sweep would ever close it.
      *
-     * **Revert test:** remove the `finally { releaseDetached(); }` and this goes red. The release is
-     * in a `finally` rather than at each of the three returns precisely so a fourth exit added later
-     * cannot reintroduce the leak.
+     * ⚠️ **`registered` is asserted BEFORE `hasSessions()`, and that ordering is the whole lesson of
+     * this file.** "No session is registered" is trivially true of a path that never registered one,
+     * which is how the first draft stayed green with the fix removed. Proving the registration
+     * happened first is what makes the emptiness afterwards mean the RELEASE ran.
+     *
+     * **Revert test:** remove the `finally { releaseDetached(); }` and this goes red — `registered`
+     * still holds the id, `hasSessions()` is still true. The release is in a `finally` rather than at
+     * each of the three returns precisely so a fourth exit added later cannot reintroduce the leak.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-relayleak-release-" });
-    const client = makeFakeRelayClient();
-    fx.snm.setDetachedRelayClientBuilder(() => client);
+    const { client, builderCalled } = await setUpDetachedSeal(fx);
 
-    // No session node exists for this id, so the resolver must take the DETACHED branch.
-    await fx.snm.submitSealLeaf("alice", SID, new Uint8Array(32).fill(0xab), "corr-leak").catch(() => undefined);
+    await fx.snm.submitSealLeaf("alice", SID, "corr-leak").catch(() => undefined);
+
+    expect(
+      builderCalled(),
+      "PRECONDITION — the detached branch must have been entered; a 0 here means the assertions " +
+        "below are about a path that never ran",
+    ).toBeGreaterThan(0);
+    expect(
+      client.registered,
+      "PRECONDITION — the detached path must actually have REGISTERED the session. Without this, " +
+        "the emptiness asserted next is satisfied by a path that never registered anything at all.",
+    ).toContain(SID);
 
     expect(
       client.hasSessions(),

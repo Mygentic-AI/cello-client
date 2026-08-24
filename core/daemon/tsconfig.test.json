@@ -34,6 +34,7 @@
     // DOD-M15-RELAYONLY-1. New and clean on creation, which is this list's admission criterion —
     // and a privacy control is exactly the kind of unit where "the mutants are typecheck failures
     // now" needs to be true rather than assumed.
+    "src/__tests__/dod-m15-relayleak-1.test.ts",
     "src/__tests__/dod-m15-relayonly-1.test.ts",
     "src/__tests__/dod-m15-salt-adoption-rule.test.ts",
     "src/__tests__/dod-m15-salt-capability-signal.test.ts",
