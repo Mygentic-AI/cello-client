@@ -255,6 +255,10 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
     };
     const sessionNodeManager = {
       getSetting: (_a: string, key: string) => (key === RELAY_ONLY_KEY ? relayOnly : null),
+      // The dial half reads the TRI-STATE, so the stub must answer whether the store is readable.
+      // `true` here means "readable", so `relayOnly: null` is a genuine OFF rather than an unknown —
+      // which is what the off-path test below needs in order to be testing what it claims.
+      hasDatabase: () => true,
       createSessionNode: async () => ({ ok: true }),
       connectToCounterparty: async (_a: string, _s: string, addrs: string[]) => {
         dialled.push(addrs);
@@ -341,6 +345,58 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
       "getStandingReceiverInfo must pass its endpoint through publishableEndpoint — without it, " +
         "relay-only publishes the operator's real addresses and the setting is a placebo",
     ).toContain("publishableEndpoint");
+  });
+
+  it("★★★ THE SENTINEL IS `!== null` — `!== undefined` made the whole fix DEAD CODE", () => {
+    /**
+     * ⚠️ THE BUG REVIEW FOUND IN MY OWN FIX, pinned at the exact character that was wrong.
+     *
+     * `#db` is declared `DaemonDatabase | null` and is only ever assigned on open or set to `null`
+     * on close — **it is never `undefined` at any point in its lifetime.** So `this.#db !== undefined`
+     * was a compile-time-constant `true`, TypeScript had nothing to object to, and the entire
+     * `"unknown"` branch was unreachable. In the exact window it was written for — shutting down,
+     * `#db` null, standing receiver still alive — it returned `off` and published the operator's real
+     * addresses, while the DoD recorded the window as closed.
+     *
+     * The pure-function test above could never have caught this: it passes the boolean in literally.
+     * **The defect was at the CALL SITE, in how that boolean is computed**, which is why this asserts
+     * on the call site rather than the function.
+     */
+    const src = readFileSync(SNM_PATH, "utf8");
+    const start = src.indexOf("getStandingReceiverInfo(agentName: string)");
+    const body = src.slice(start, src.indexOf("\n  }", start));
+    expect(
+      body,
+      "the readable argument must test against null. `!== undefined` is always true for this field, " +
+        "which silently disables the entire unknown branch and fails toward disclosure.",
+    ).toContain("this.#db !== null");
+    expect(
+      body,
+      "and it must NOT test undefined — that sentinel cannot occur, so it is a guard that never fires",
+    ).not.toContain("this.#db !== undefined");
+  });
+
+  it("★★★ EVERY return path leaves through the choke point — not just one that mentions it", () => {
+    /**
+     * ⚠️ THE GUARD'S OWN WEAKNESS, found by review. The earlier version asserted the string
+     * `publishableEndpoint` appears SOMEWHERE in the method — so inserting `return endpoint;` at the
+     * top would have left it green while the control was completely dead. It also went briefly false
+     * in fact: the `unknown` branch used to build its own filtered object inline, so a second filter
+     * existed inside the one method whose stated design is that there is exactly one.
+     *
+     * Now every `return` in the body must be either the null case or a call through the choke point.
+     */
+    const src = readFileSync(SNM_PATH, "utf8");
+    const start = src.indexOf("getStandingReceiverInfo(agentName: string)");
+    const body = src.slice(start, src.indexOf("\n  }", start));
+    const returns = body.split("\n").map((l) => l.trim()).filter((l) => l.startsWith("return "));
+    expect(returns.length, "precondition: the method must have return statements to police").toBeGreaterThan(0);
+    const offenders = returns.filter((r) => r !== "return null;" && !r.includes("publishableEndpoint"));
+    expect(
+      offenders,
+      "a return path leaves getStandingReceiverInfo without passing through publishableEndpoint — " +
+        "that path publishes whatever it was handed, which under relay-only is the operator's real address",
+    ).toEqual([]);
   });
 
   it("★★ NOBODY reads a standing receiver's raw addresses around the choke point", () => {

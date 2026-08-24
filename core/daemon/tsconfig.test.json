@@ -80,6 +80,7 @@
     "src/__tests__/dod-m15-sealwire-1-sender-leg.test.ts",
     "src/__tests__/dod-m15-sealwire-1-sent-proof-wired.test.ts",
     "src/__tests__/dod-m15-sealwire-1-held-authorship.test.ts",
+    "src/__tests__/dod-m15-sealwire-1-callsite-enforcer.test.ts",
     "src/__tests__/relay-client-fake.ts",
     // DOD-M15-SALTSPLIT-1's own two files. New and clean on creation, which is this list's stated
     // admission criterion — and I nearly shipped them OUTSIDE it in the same session I widened the
