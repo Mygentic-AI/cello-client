@@ -377,9 +377,45 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   // DECLARED membership, straight off the verified manifest — no probe. Lets the resolver reject a
   // primary that resolves but belongs to a different consortium (the compiled-in default URL after
   // a consortium move) without mistaking a momentarily-down member for a non-member.
+  /**
+   * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — THE FOURTH CONSUMER, missed by the line's own enumeration and
+   * found by its review. The line named three; this is where the residual risk actually lives.
+   *
+   * This is the consortium MEMBERSHIP set: it lets the resolver reject a directory endpoint that
+   * resolves but belongs to a different consortium. Read from a lapsed manifest, a node REMOVED
+   * since the lapse is still a member here — so it can still be accepted as the endpoint this daemon
+   * talks to, which is the seat that coordinates a ceremony and declares the participant count.
+   *
+   * **Same verdict as the other two permitting consumers, for the same reason.** Refusing means the
+   * resolver can accept no endpoint at all, which takes a running daemon offline for a manifest that
+   * was valid when it started — the identical bricking cost, and this one is reached inside the 10 s
+   * signaling wait, so it fails fast and silently.
+   *
+   * **Reported once per manifest version.** This runs per resolution attempt, not per challenge, so
+   * a version key is the right granularity — unlike the challenge verifier, where a per-node key was
+   * needed because `nodeId` is in the payload.
+   */
+  let lapsedMembershipReportedFor: number | null = null;
   const getManifestPeerIds = (): Set<string> | null => {
     const m = manifestProvider?.getCurrentManifest();
     if (!m) return null;
+    const validity = classifyManifestValidity(m, Date.now());
+    if (validity.state !== "valid" && validity.state !== "expiring_soon" && lapsedMembershipReportedFor !== m.version) {
+      lapsedMembershipReportedFor = m.version;
+      logger.warn("directory.membership.manifest.lapsed", {
+        manifestVersion: m.version,
+        state: validity.state,
+        members: m.nodes.length,
+        impact:
+          "the set deciding WHICH directory endpoints this daemon will accept came from a manifest " +
+          "outside its validity window. A node removed from the consortium since then is still a " +
+          "member by this reckoning, so it can still be accepted as the directory this daemon talks " +
+          "to — the seat that coordinates a ceremony and declares the participant count.",
+        guidance:
+          "Endpoint selection was NOT blocked — refusing here accepts no directory at all and takes " +
+          "a running daemon offline. cello_status reports the window and where the manifest came from.",
+      });
+    }
     const ids = m.nodes.map((n) => n.peerId).filter((p): p is string => typeof p === "string" && p.length > 0);
     return ids.length > 0 ? new Set(ids) : null;
   };
