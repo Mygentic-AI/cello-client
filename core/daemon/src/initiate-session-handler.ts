@@ -15,6 +15,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { selectAdvertisedAddress, type ITransportSelector, type SessionNegotiator } from "./transport-selector.js";
 import { TIER } from "./contacts-tier-migration.js";
+import { isRelayOnly, shouldDialCounterparty } from "./relay-only.js";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { IAutoNatService } from "@cello-protocol/transport";
 
@@ -207,7 +208,20 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // the session stays active and a later cello_send queues the content in the durable retry
     // queue until a route exists (the relay-park path is MSG-001-3b).
     const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
-    if (counterpartyAddrs.length > 0) {
+    // DOD-M15-RELAYONLY-1: the OTHER half of the control. Suppressing our own published addresses
+    // stops them dialing US; this stops us handing our IP to THEM. Both are needed, because the
+    // counterparty may not be relay-only themselves — they will still advertise addresses, and the
+    // gate below is otherwise satisfied by exactly that.
+    const relayOnly = isRelayOnly((key) => sessionNodeManager.getSetting(agentName, key));
+    if (relayOnly && counterpartyAddrs.length > 0) {
+      logger.info("session.initiate.direct_dial.suppressed", {
+        sessionId,
+        addrCount: counterpartyAddrs.length,
+        impact: "relay-only is on: routing over the relay and not revealing this node's address",
+        correlationId,
+      });
+    }
+    if (shouldDialCounterparty(counterpartyAddrs, relayOnly)) {
       const connected = await sessionNodeManager.connectToCounterparty(agentName, sessionId, counterpartyAddrs);
       if (!connected.ok) {
         logger.warn("session.initiate.connect.failed", {

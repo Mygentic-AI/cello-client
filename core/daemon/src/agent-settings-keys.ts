@@ -15,6 +15,7 @@
  */
 
 import { TIER } from "./contacts-tier-migration.js";
+import { RELAY_ONLY_KEY } from "./relay-only.js";
 
 /** The tiers whose bounds and away texts are settable (BLOCKED is fixed, never overridable). */
 export const SETTABLE_TIER_NAMES = Object.freeze(["unknown", "known", "whitelisted", "vip"] as const);
@@ -53,6 +54,9 @@ const BOUND_FIELDS: readonly BoundField[] = Object.freeze(["max_sessions", "max_
 /** Every valid setting key, precomputed. The handler validates a `set` against this exact set. */
 const VALID_KEYS: ReadonlySet<string> = new Set<string>([
   AWAY_DEFAULT_KEY,
+  // DOD-M15-RELAYONLY-1: relay-only routing. A BOOLEAN key, and the first one here — see
+  // `validateSettingValue`, where it needs its own branch or the away-text fallback swallows it.
+  RELAY_ONLY_KEY,
   ...SETTABLE_TIER_NAMES.flatMap((t) => [
     ...BOUND_FIELDS.map((f) => boundSettingKey(t, f)),
     awayTierSettingKey(t),
@@ -91,6 +95,20 @@ export function validateSettingValue(key: string, value: string): { ok: true } |
     // Number.MAX_SAFE_INTEGER guard — a value past it loses precision and is meaningless as a cap.
     if (Number(value) > Number.MAX_SAFE_INTEGER) {
       return { ok: false, reason: "a bound must be <= Number.MAX_SAFE_INTEGER" };
+    }
+    return { ok: true };
+  }
+  // DOD-M15-RELAYONLY-1: a BOOLEAN key, and it must be caught BEFORE the away-text fallback below.
+  //
+  // ⚠️ THE FALLBACK IS THE HAZARD, not an edge case. Everything that is not a bound key falls
+  // through to away-text validation, which accepts any non-empty string under 2048 characters. So
+  // without this branch `transport.relay_only = "yes"` — or `"flase"` — would STORE successfully and
+  // then read as not-"true" forever: the operator sets the privacy control, is told it was saved,
+  // and has no protection. `isRelayOnly` deliberately treats anything but "true" as OFF, which is
+  // only safe because a bad value cannot get past here to be misread later.
+  if (key === RELAY_ONLY_KEY) {
+    if (value !== "true" && value !== "false") {
+      return { ok: false, reason: `${RELAY_ONLY_KEY} must be exactly "true" or "false"` };
     }
     return { ok: true };
   }

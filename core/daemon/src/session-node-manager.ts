@@ -43,6 +43,7 @@ import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUN
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
+import { isRelayOnly, publishableEndpoint } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
@@ -3250,7 +3251,19 @@ export class SessionNodeManager {
     // as the session node — so the advertised endpoint matches the node the counterparty dials.
     const sr = this.#standingReceivers.get(agentName);
     if (!sr) return null;
-    return { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() };
+    // DOD-M15-RELAYONLY-1: THE CHOKE POINT. Every path that publishes this agent's session
+    // addresses draws from here — `initiator_session_addrs` on the way out, and
+    // `counterparty_session_addrs` when answering an offer — and this method has no other kind of
+    // consumer: its whole purpose is to be advertised, as the docstring above says.
+    //
+    // The suppression lives HERE rather than at those call sites deliberately. Call-site gating
+    // would be a hand-kept list, and a fourth publish path added later would leak the operator's IP
+    // while every test stayed green. At the choke point a new caller inherits the protection
+    // instead of having to be told about it.
+    return publishableEndpoint(
+      { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() },
+      isRelayOnly((key) => this.getSetting(agentName, key)),
+    );
   }
 
   /**
