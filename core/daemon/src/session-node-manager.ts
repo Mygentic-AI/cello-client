@@ -59,7 +59,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
-import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, PARK_ENVELOPE_REASONS, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
+import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, PARK_ENVELOPE_REASONS, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
@@ -6688,12 +6688,7 @@ export class SessionNodeManager {
          * This is the reason `cause` had to become a code first: the distinction is unbranchable
          * while the field holds an English paragraph.
          */
-        guidance:
-          attempt.cause === PARK_ENVELOPE_REASONS.ALG_UNREADABLE
-            ? "This message names a content-hash algorithm your build cannot produce, so it could not be sealed for hand-off. The relay is NOT involved and this will not clear on its own — the message is safely stored but every retry fails the same way. Upgrade to a build that knows the algorithm, or start a new session with this counterparty. Re-sending on this build changes nothing."
-            : durable
-              ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
-              : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.",
+        guidance: parkRefusalGuidance(attempt.cause, durable),
       };
     }
   }

@@ -34,7 +34,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
-import { encodeParkEnvelope, sealParkEnvelope, ParkEnvelopeError, PARK_ENVELOPE_REASONS } from "../park-envelope.js";
+import { encodeParkEnvelope, sealParkEnvelope, ParkEnvelopeError, PARK_ENVELOPE_REASONS, RELAY_PARK_REFUSALS, parkRefusalGuidance } from "../park-envelope.js";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { readFileSync } from "node:fs";
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
@@ -221,5 +221,67 @@ describe("DOD-M15-SEALWIRE-1 B2b-2 constraint 6: the park refusal is CODED, not 
         "sealParkEnvelope's refusal must reach #parkContent's catch — a try here turns a coded, actionable fault back into a generic refused deposit",
       ).toBe(false);
     }
+  });
+});
+
+describe("DOD-M15-RELAYABUSE-1 — a THROTTLING relay is not an OUTAGE, and the guidance must not confuse them", () => {
+  /**
+   * ⚠️ THE SENTENCE WAS WRITTEN WHEN A REFUSED PARK COULD ONLY MEAN THE LINK WAS DOWN. Rate limiting
+   * made a second, opposite cause reachable: the relay answered, promptly, and said no on purpose.
+   *
+   * *"will be re-sent automatically when the relay link is back"* then fails twice over. It sends the
+   * operator to inspect a link that is fine — a wrong diagnosis is worse than none, because it tells
+   * them where NOT to look — and it promises a trigger that will never fire, since the client retries
+   * a deferred park only on events (boot, agent start, drain hook, signaling reconnect) and no
+   * link-restored event is coming.
+   */
+  it("★★ rate_limited says the relay is HEALTHY, gives the real clearing time, and never blames the link", () => {
+    const guidance = parkRefusalGuidance(RELAY_PARK_REFUSALS.RATE_LIMITED, true);
+
+    expect(
+      guidance,
+      "blaming the link sends the operator to a dashboard that will show everything green, which is " +
+        "the most expensive possible answer",
+    ).not.toMatch(/relay link is back|relay is down|link is down/i);
+    expect(
+      guidance,
+      "and it must say the relay is fine, because that is where the first guess goes",
+    ).toMatch(/healthy|nothing is wrong/i);
+    expect(
+      guidance,
+      "it must say the limit clears by itself, and roughly when — that is the fact that decides " +
+        "whether they wait or start debugging",
+    ).toMatch(/clears/i);
+    expect(
+      guidance,
+      "and it must still say not to re-send: re-sending is precisely what the limit exists to slow",
+    ).toMatch(/do not re-send/i);
+  });
+
+  it("★★ a FULL RECIPIENT mailbox is distinguished from a full relay — they need opposite actions", () => {
+    /**
+     * These read alike and are not alike. "This counterparty's mailbox is full" is about the other
+     * party and another relay would refuse it identically; "the relay's store is full" is about
+     * infrastructure and its operator needs to know. Collapsing them into one message loses the only
+     * thing that decides what the reader does next.
+     */
+    const recipient = parkRefusalGuidance(RELAY_PARK_REFUSALS.RECIPIENT_FULL, true);
+    const store = parkRefusalGuidance(RELAY_PARK_REFUSALS.STORE_FULL, true);
+
+    expect(recipient, "the recipient case must point at the counterparty, not the infrastructure").toMatch(
+      /counterparty|their mailbox|come online/i,
+    );
+    expect(
+      recipient,
+      "and must say another relay would not help — otherwise the obvious next move is to try one",
+    ).toMatch(/another relay/i);
+    expect(store, "the store case must point at the relay operator").toMatch(/relay operator|store is full/i);
+    expect(recipient, "and the two must not be the same paragraph").not.toBe(store);
+  });
+
+  it("★ the ORIGINAL outage wording still exists for the case it was written for", () => {
+    /** The regression half: an actual link failure must still get the sentence that is true for it. */
+    const generic = parkRefusalGuidance("relay_unreachable", true);
+    expect(generic, "an unknown/link failure keeps the original guidance").toMatch(/when the relay link is back/i);
   });
 });

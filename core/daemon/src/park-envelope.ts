@@ -140,6 +140,25 @@ export const PARK_ENVELOPE_REASONS = {
   ALG_UNREADABLE: "park_envelope_alg_unreadable",
 } as const;
 
+/**
+ * The relay's own refusal reasons that the CLIENT must branch on, as codes rather than prose.
+ *
+ * ⚠️ `RATE_LIMITED` exists because the operator-facing sentence for a refused park was written for a
+ * relay OUTAGE — *"will be re-sent automatically when the relay link is back"* — and
+ * `DOD-M15-RELAYABUSE-1` made a second, opposite cause reachable: a perfectly healthy relay
+ * deliberately throttling this peer. The link is not down and there is no link-restored event
+ * coming, so that sentence promises a trigger that will never fire. **A wrong diagnosis is worse
+ * than none: it tells the operator where NOT to look.**
+ */
+export const RELAY_PARK_REFUSALS = {
+  /** The relay is throttling this depositor. Self-clears; the relay says when via `retry_after_ms`. */
+  RATE_LIMITED: "rate_limited",
+  /** The relay's parked-content store is at a bound. Self-clears as entries expire or are collected. */
+  STORE_FULL: "content_store_full",
+  /** This RECIPIENT's mailbox is at its own bound — another relay will not help. */
+  RECIPIENT_FULL: "content_store_recipient_full",
+} as const;
+
 export type ParkEnvelopeReason = (typeof PARK_ENVELOPE_REASONS)[keyof typeof PARK_ENVELOPE_REASONS];
 
 /**
@@ -357,4 +376,55 @@ export function authenticateParkedEntry(args: {
   }
 
   return { ok: true };
+}
+
+
+/**
+ * The operator-facing guidance for a refused park hand-off — **a pure function, deliberately.**
+ *
+ * ⚠️ It was an inline ternary inside `sendContent`, which meant the only way to assert any branch of
+ * it was to stand up a two-connection fixture and drive a real send. That is why the branch that was
+ * WRONG for a throttling relay survived: nothing cheap could reach it. A guidance string is a
+ * decision about what a person does next, and it deserves to be testable on its own.
+ *
+ * `durable` distinguishes "queued and will retry" from "not queued — it is lost", which is the one
+ * distinction that changes whether the reader must act right now.
+ */
+export function parkRefusalGuidance(cause: string | undefined, durable: boolean): string {
+  if (cause === PARK_ENVELOPE_REASONS.ALG_UNREADABLE) {
+    return (
+      "This message names a content-hash algorithm your build cannot produce, so it could not be " +
+      "sealed for hand-off. The relay is NOT involved and this will not clear on its own — the " +
+      "message is safely stored but every retry fails the same way. Upgrade to a build that knows " +
+      "the algorithm, or start a new session with this counterparty. Re-sending on this build " +
+      "changes nothing."
+    );
+  }
+  if (cause === RELAY_PARK_REFUSALS.RATE_LIMITED) {
+    return (
+      "The relay is healthy and deliberately rate-limiting this agent's hand-offs, so it refused " +
+      "this one. NOTHING IS WRONG with the link or the counterparty. The message is queued and " +
+      "re-sent automatically, and the limit clears on its own within about a minute. Do not " +
+      "re-send it — an identical re-send is not separately queued, and re-sending is what the " +
+      "limit exists to slow down."
+    );
+  }
+  if (cause === RELAY_PARK_REFUSALS.RECIPIENT_FULL) {
+    return (
+      "The relay is holding as much undelivered content for THIS counterparty as it will, so it " +
+      "refused the hand-off. That is about their mailbox, not your connection, and another relay " +
+      "would refuse it too. It clears when they come online and collect it, or when older entries " +
+      "expire. The message is queued and re-sent automatically."
+    );
+  }
+  if (cause === RELAY_PARK_REFUSALS.STORE_FULL) {
+    return (
+      "The relay's parked-content store is full, so it refused the hand-off. The link is fine and " +
+      "the message is queued and re-sent automatically. If this persists the relay operator needs " +
+      "to know — it means the store is under sustained pressure."
+    );
+  }
+  return durable
+    ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
+    : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.";
 }
