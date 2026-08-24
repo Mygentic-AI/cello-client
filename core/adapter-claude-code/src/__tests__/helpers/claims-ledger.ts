@@ -107,6 +107,89 @@ export function countClaimWords(text: string): number {
 }
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
+  // ── DOD-M15-TIERTEXT-1 — `cello-mcp.ts` tool descriptions (Andre ruled Option B, 2026-08-24) ──
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_contact_set_tier: tier 3 is 'auto-accepted when you're away'",
+    excerpts: ["3=whitelisted (much larger limits — note EVERY tier is auto-accepted; tiers govern how much, not whether)"],
+    enforcedBy: "daemon-local",
+    verdict: "corrected",
+    evidence:
+      "Said '3=whitelisted (auto-accepted when you're away)', attributing unattended acceptance to " +
+      "the tier. EVERY tier is auto-accepted: `daemon.ts` says so at its own extension point — " +
+      "'inbound sessions are auto-accepted by the standing receiver' — and `isAutoAccept`, the only " +
+      "tier check that would gate it, has no production caller. The promise was not unkept but " +
+      "REDUNDANT, which is worse: whitelisting did not fail to let someone through, it failed to be " +
+      "the reason they got through, and the reader was misled in the safe-feeling direction.",
+  },
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_contact_add: a known contact is 'NOT auto-accepted when you're away'",
+    excerpts: ["Tiers do not gate who reaches you; they gate how much."],
+    enforcedBy: "daemon-local",
+    verdict: "corrected",
+    evidence:
+      "The same false model stated from the other side, plus an instruction built on it: 'Promote " +
+      "them to whitelisted/vip to let them reach you unattended.' They already reach you unattended " +
+      "at every tier.",
+  },
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_contacts: known peers are 'exempt from the unknown-sender gate and anti-spam caps'",
+    excerpts: ["known peers: larger limits, and exempt from the stranger-pool cap. Per-sender caps still apply at every tier."],
+    enforcedBy: "daemon-local",
+    verdict: "corrected",
+    evidence:
+      "Half true, and the false half was the reassuring one. The stranger-pool exemption is exact — " +
+      "the global cap is gated on `tier === TIER.UNKNOWN` ('a KNOWN+ sender is past it by trust'). " +
+      "But NO tier is exempt from anti-spam caps: `DEFAULT_TIER_BOUNDS` is finite at every level " +
+      "(whitelisted 20 sessions / 500 MB, vip 50 / 2 GB), and `INV-TIER-BOUND` exists specifically " +
+      "to kill a `tier >= KNOWN ? Infinity` implementation. The description promised the very thing " +
+      "a test forbids. Found by auditing the whole file rather than the two descriptions the DoD " +
+      "line named.",
+  },
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_contact_set_tier: '0=blocked (refused, indistinguishable from a full inbox)'",
+    excerpts: ["0=blocked (refused, indistinguishable from a full inbox)"],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "CHECKED AND LEFT ALONE. Blocking is real — `DEFAULT_TIER_BOUNDS[TIER.BLOCKED]` is " +
+      "`maxSessionsPerSender: 0` — and it refuses through the SAME per-sender-cap path an over-cap " +
+      "stranger takes, deliberately and with no separate branch, so the refusal cannot tell someone " +
+      "they are blocked. The parenthetical is exact; tidying it in the same pass would have removed " +
+      "a true statement alongside the false ones.",
+  },
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_contact_set_tier: a higher tier 'never removes' bounds and 'never buys less screening'",
+    excerpts: [
+      "Every tier is still bounded — a higher tier only RAISES limits, it never removes them.",
+      "a higher tier never buys less screening",
+    ],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "Bounds: `DEFAULT_TIER_BOUNDS` is finite at every tier, so 'raises, never removes' holds. " +
+      "Screening: verified by ABSENCE — the inbound screening path does not consult tier at all, so " +
+      "no tier can weaken it. An absence is the right evidence here because the claim is that " +
+      "something does NOT happen.",
+  },
+  {
+    surface: "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)",
+    claim: "cello_config_set: 'You can only make it STRICTER from here.'",
+    excerpts: ["You can only make it STRICTER from here."],
+    enforcedBy: "daemon-local",
+    verdict: "true",
+    evidence:
+      "I NEARLY FILED THIS AS FALSE FROM A FRAGMENT. `config-store.ts` returns " +
+      "`{ ok: false, reason: \"needs_confirmation\", direction: \"loosen\" }`, which read alone says " +
+      "loosening is possible. The NEXT sentence of the description resolves it: a loosening 'is " +
+      "REFUSED, and the response names the exact command the human operator must run at their " +
+      "terminal.' 'From here' means the agent surface, and that is precisely what the code does — " +
+      "an agent cannot weaken its own guards, a human can, at a terminal.",
+  },
   {
     surface: "core/cli/src/registry.ts (operator-facing strings)",
     claim: "close-session: 'Both sides sign off where they can, and each gets a tamper-evident receipt.'",
