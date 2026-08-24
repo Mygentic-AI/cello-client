@@ -54,6 +54,12 @@ export function wireSessionOfferHandler(deps: {
    * there is no receiver or the offer named nobody.
    */
   admitOfferedDialer: (initiatorSessionPeerId: string, sessionIdHex: string) => "narrowed" | "no_receiver" | "no_peer_named";
+  /**
+   * DOD-M15-RELAYONLY-1: is relay-only on for this agent? Optional, defaulting to FALSE, so every
+   * existing caller and test keeps its exact behaviour — the guard below must only fire when the
+   * setting is what emptied the address list, never when a receiver simply has none yet.
+   */
+  isRelayOnly?: () => boolean;
   signaling: SignalingSeam;
   logger: Logger;
 }): () => void {
@@ -108,7 +114,13 @@ export function wireSessionOfferHandler(deps: {
         await sendOfferReject(sessionId, "standing_receiver_unavailable");
         return;
       }
-      // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list.
+      // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list — **but only when
+      // relay-only is what emptied it.**
+      //
+      // ⚠️ An empty `addrs` is NOT exclusively a relay-only condition, and the first version of this
+      // guard refused unconditionally — which broke the pre-existing accept path for a receiver that
+      // legitimately has no addresses yet, a case `session-ceremony-verify` covers on purpose. A
+      // privacy control that changes behaviour when it is switched OFF is its own defect.
       //
       // ⚠️ Under relay-only the endpoint is already filtered to circuit addresses, and with no relay
       // reservation that set is EMPTY. The directory folds an accept only
@@ -117,7 +129,7 @@ export function wireSessionOfferHandler(deps: {
       // `counterparty_unavailable`: a lie about our state, produced by our setting. Rejecting
       // explicitly keeps the failure attributable to the side that caused it, and is the same
       // answer-never-vanish contract the reject path above already implements.
-      if (sr.addrs.length === 0) {
+      if (sr.addrs.length === 0 && (deps.isRelayOnly?.() ?? false)) {
         deps.logger.warn("session.offer.abort", {
           agentName: deps.agentName,
           reason: "relay_only_no_reservation",

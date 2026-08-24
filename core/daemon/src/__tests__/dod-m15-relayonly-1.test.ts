@@ -399,6 +399,32 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
     ).toEqual([]);
   });
 
+  it("★★★ EVERY node is built through the agent-aware factory — a raw one hole-punches", () => {
+    /**
+     * ⚠️ THE SECOND CHOKE POINT, and it guards a leak the address filters cannot reach. dcutr
+     * UPGRADES a relayed connection into a direct one, and the inbound side starts the upgrade —
+     * which is exactly a standing receiver. So a node built without the agent's privacy posture
+     * routes over the relay precisely as asked and then hole-punches to a direct connection anyway.
+     * **Every test stays green, because the leak happens inside libp2p after the assertions.**
+     *
+     * Five sites build nodes. Passing the flag at each would be a hand-kept list, and the SIXTH
+     * would leak. So the only permitted direct use of the raw factory is inside the wrapper itself.
+     */
+    const src = readFileSync(SNM_PATH, "utf8");
+    const raw = src.split("\n")
+      .map((line, i) => ({ line: line.trim(), n: i + 1 }))
+      .filter((r) => r.line.includes("#factory.createNode("));
+    expect(raw.length, "precondition: the factory must still be called somewhere, or this guard is vacuous")
+      .toBeGreaterThan(0);
+    const offenders = raw.filter((r) => !r.line.includes("...config, relayOnly"));
+    expect(
+      offenders.map((r) => `session-node-manager.ts:${r.n}`),
+      "a node is built straight off the factory instead of through #createAgentNode, so it does not " +
+        "carry this agent's relay-only posture — that node will hole-punch to a direct connection " +
+        "and disclose the address the setting exists to hide",
+    ).toEqual([]);
+  });
+
   it("★★ NOBODY reads a standing receiver's raw addresses around the choke point", () => {
     /**
      * ⚠️ THE BYPASS GUARD, and the shape that survives a refactor. Once suppression is at the choke

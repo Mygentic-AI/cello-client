@@ -405,6 +405,18 @@ export interface SessionNodeConfig {
   sessionId: string;
   connectionGater?: SessionConnectionGater;
   /**
+   * DOD-M15-RELAYONLY-1: this agent has asked never to be directly reachable, so the factory must
+   * omit dcutr from the node's service set.
+   *
+   * ⚠️ NOT a duplicate of filtering the published addresses. Those two things stop DIFFERENT
+   * disclosures: the filter controls what the DIRECTORY is told, and dcutr talks to the peer
+   * directly. Its whole job is to upgrade a relayed connection into a direct one, and the inbound
+   * side starts the upgrade — which is exactly a standing receiver. Leaving it on means the agent
+   * routes over the relay precisely as asked and then hole-punches to a direct connection anyway,
+   * with every test still green because the leak happens inside libp2p after the assertions.
+   */
+  relayOnly?: boolean;
+  /**
    * CELLO-M7-TRANSPORT-001: role of the node, forwarded to createNode to tune the
    * libp2p service set (dcutr is included for 'session' dialers, omitted for the
    * 'standing_receiver'). AutoNAT is present for both.
@@ -2202,6 +2214,47 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M15-RELAYONLY-1: build a transport node for THIS AGENT, with its privacy posture applied.
+   *
+   * ⚠️ THE CHOKE POINT FOR NODE CREATION, and it exists for the same reason as the one around
+   * `getStandingReceiverInfo`. Five call sites construct nodes; passing `relayOnly` at each would be
+   * a hand-kept list, and the SIXTH — added next month by someone who has never read this line —
+   * would build a node that hole-punches its way to a direct connection for an operator who asked
+   * never to be directly reachable. Here, a new caller inherits the posture instead of being told.
+   *
+   * `unknown` counts as ON, matching the publish and dial halves: a node that declines to hole-punch
+   * is reachable over the relay, while a disclosed address cannot be recalled.
+   */
+  // ⚠️ NOT `async`. This wrapper sits in the standing-receiver startup path, and making it async
+  // added ONE extra microtask hop before the receiver was installed in `#standingReceivers` — which
+  // was enough for `createSessionNode` to run first and answer `standing_receiver_unavailable`. Two
+  // tests in `msg-021-session-seed` caught it. Returning the factory's promise directly keeps the
+  // await count identical to the call it replaced. **This is a real fragility in the install path,
+  // not a quirk of the tests:** anything that adds a tick here re-breaks it.
+  #createAgentNode(agentName: string, config: SessionNodeConfig): Promise<CelloNode> {
+    // ⚠️ THE POSTURE READ MUST NEVER COST US A NODE. This sits in the standing-receiver startup
+    // path, whose caller treats a throw as "no receiver" and leaves the agent deaf to all inbound —
+    // surfacing to the operator as `standing_receiver_unavailable`, which names the transport for a
+    // fault in a settings lookup. `relayOnlyState` already absorbs a throwing GETTER; this absorbs
+    // everything else, including a resolution failure for an agent row that is not there yet.
+    //
+    // The fallback is ON, not off: an agent whose posture we cannot read gets the private-but-
+    // reachable node, because a node that declines to hole-punch still works over the relay while a
+    // disclosed address cannot be recalled.
+    let relayOnly = true;
+    try {
+      relayOnly = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== null) !== "off";
+    } catch (err) {
+      this.#logger.warn("settings.relay_only.unreadable", {
+        agentName,
+        reason: err instanceof Error ? err.message : String(err),
+        impact: "could not read this agent's relay-only posture, so the node is built WITHOUT the hole-punch",
+      });
+    }
+    return this.#factory.createNode({ ...config, relayOnly });
+  }
+
+  /**
    * RELAYSIG-1: the durably-stored, signature-verified relay ordering-record receipts for an agent
    * (optionally a single session). Empty when no receipts have been recorded yet. Read-only.
    */
@@ -3652,7 +3705,7 @@ export class SessionNodeManager {
       });
       try {
         seed = randomBytes(32);
-        node = await this.#factory.createNode({ sessionId, connectionGater: gater, nodeType: "session", transportPrivateKey: seed });
+        node = await this.#createAgentNode(agentName, { sessionId, connectionGater: gater, nodeType: "session", transportPrivateKey: seed });
         await node.start();
       } catch (err: unknown) {
         const errorMessage = err instanceof Error ? err.message : String(err);
@@ -12050,7 +12103,7 @@ export class SessionNodeManager {
       //
       // Nothing reads the seed before the winner is installed, so per-candidate costs nothing.
       const candidateSeed = randomBytes(32);
-      const candidate = await this.#factory.createNode({
+      const candidate = await this.#createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
         nodeType: "standing_receiver",
@@ -12104,7 +12157,7 @@ export class SessionNodeManager {
     }
 
     const plainSeed = randomBytes(32);
-    const plain = await this.#factory.createNode({
+    const plain = await this.#createAgentNode(agentName, {
       sessionId,
       connectionGater: gater,
       nodeType: "standing_receiver",
@@ -12361,7 +12414,7 @@ export class SessionNodeManager {
     agentName: string,
   ): Promise<CelloNode> {
     for (const circuitAddr of candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES)) {
-      const candidate = await this.#factory.createNode({
+      const candidate = await this.#createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
         nodeType: "session",
@@ -12422,7 +12475,7 @@ export class SessionNodeManager {
     // THE FLOOR. No reservation, so the counterparty cannot dial us directly — but their messages
     // park at the relay and drain, which is how every message in the 2026-08-18 test arrived. A
     // session usable one way beats a session that never comes back.
-    const plain = await this.#factory.createNode({
+    const plain = await this.#createAgentNode(agentName, {
       sessionId,
       connectionGater: gater,
       nodeType: "session",

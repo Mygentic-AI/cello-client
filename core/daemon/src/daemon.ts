@@ -149,6 +149,7 @@ import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
 import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
 import { createDeliveryOpenRegistry } from "./delivery-open-registry.js";
 import { FrontierMismatchStore, renderFrontierMismatch } from "./frontier-mismatch.js";
+import { relayOnlyState } from "./relay-only.js";
 import { decodeCbor } from "@cello-protocol/protocol-types";
 
 
@@ -246,9 +247,15 @@ export class ProductionSessionNodeFactory implements ISessionNodeFactory {
       listenAddresses: [listenAddr, ...(config.circuitRelayListenAddrs ?? [])],
       ...(announce ? { announceAddresses: announce } : {}),
       connectionGater: config.connectionGater,
+      // DOD-M15-RELAYONLY-1: an agent that asked never to be directly reachable must not hole-punch
+      // its way to a direct connection. dcutr's job is to UPGRADE a relayed connection, and the
+      // INBOUND side starts that upgrade — which is precisely the standing receiver. So filtering
+      // what the directory publishes is not enough on its own: the address a peer cannot be TOLD, a
+      // hole-punch still REVEALS, and it happens inside libp2p after every assertion has passed.
+      ...(config.relayOnly === true ? { holePunch: { enabled: false } } : {}),
       // Forward the role. After DOD-NAT-REACHABILITY-1, dcutr is on every node
-      // type; nodeType's remaining transport effect is the HOP gate (client
-      // types never advertise circuit-relay HOP).
+      // type unless relay-only turns it off above; nodeType's remaining transport effect is the HOP
+      // gate (client types never advertise circuit-relay HOP).
       nodeType: config.nodeType,
       // DOD-M12B-SESSION-SEED-1: forward the caller's transport seed when it supplied one, so a
       // rebuilt session node returns at the peer id the counterparty already holds. Omitted (rather
@@ -1040,6 +1047,9 @@ async function startDaemonHoldingLock(
       agentName,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agentName),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agentName, peerId, sessionIdHex),
+      // DOD-M15-RELAYONLY-1: lets the handler tell "no addresses because relay-only filtered them"
+      // from "no addresses yet", which need opposite answers — a refusal, and the pre-existing path.
+      isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agentName, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,
     });
@@ -1115,6 +1125,8 @@ async function startDaemonHoldingLock(
       agentName: agent.name,
       getStandingReceiverEndpoint: () => sessionNodeManager.getStandingReceiverInfo(agent.name),
       admitOfferedDialer: (peerId, sessionIdHex) => sessionNodeManager.admitOfferedDialer(agent.name, peerId, sessionIdHex),
+      // DOD-M15-RELAYONLY-1 — see the note on the sibling call site above.
+      isRelayOnly: () => relayOnlyState((key) => sessionNodeManager.getSetting(agent.name, key), sessionNodeManager.hasDatabase()) !== "off",
       signaling: mgr,
       logger,
     });
