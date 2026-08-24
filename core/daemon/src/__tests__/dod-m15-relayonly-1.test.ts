@@ -66,6 +66,11 @@ import {
   dialableAddrs,
 } from "../relay-only.js";
 import { isValidSettingKey, validateSettingValue } from "../agent-settings-keys.js";
+import { registerInitiateSessionHandler } from "../initiate-session-handler.js";
+import type { IpcHandler } from "../ipc-server.js";
+import type { Logger } from "../types.js";
+import type { SessionNegotiator } from "../transport-selector.js";
+import type { IAutoNatService } from "@cello-protocol/transport";
 
 /** The operator's own address — the thing that must never leave this machine under relay-only. */
 const DIRECT = "/ip4/203.0.113.7/tcp/4001";
@@ -182,6 +187,79 @@ describe("DOD-M15-RELAYONLY-1 — the two halves of the control", () => {
     expect(dialableAddrs(theirs, false), "and the ordinary path is untouched").toEqual(theirs);
     expect(dialableAddrs([DIRECT], true), "a counterparty offering only a direct addr is not dialled at all").toEqual([]);
     expect(dialableAddrs([], false), "no addrs is still no dial, as before").toEqual([]);
+  });
+});
+
+describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", () => {
+  /**
+   * ⚠️ THIS BLOCK EXISTS BECAUSE REVIEW FOUND THE DIAL HALF FAILED THE REVERT TEST. Reverting the
+   * gate in `initiate-session-handler.ts` left every other test in this file GREEN — the pure
+   * functions were pinned and the *behaviour* was not, which is the hollow-test shape this milestone
+   * keeps finding. These drive `openSessionAs` and read what the daemon actually tried to dial.
+   */
+  function opener(relayOnly: string | null, counterpartyAddrs: string[]) {
+    const dialled: string[][] = [];
+    const assignment = {
+      session_id: new Uint8Array(32).fill(0xab),
+      counterparty_session_peer_id: "12D3KooWTheirs",
+      counterparty_session_addrs: counterpartyAddrs,
+      counterparty_pubkey: "cd".repeat(32),
+      transport_mode: "relay",
+    };
+    const sessionNodeManager = {
+      getSetting: (_a: string, key: string) => (key === RELAY_ONLY_KEY ? relayOnly : null),
+      createSessionNode: async () => ({ ok: true }),
+      connectToCounterparty: async (_a: string, _s: string, addrs: string[]) => {
+        dialled.push(addrs);
+        return { ok: true };
+      },
+      addContact: () => {},
+    };
+    const { openSessionAs } = registerInitiateSessionHandler({
+      handlers: new Map<string, IpcHandler>(),
+      logger: { debug() {}, info() {}, warn() {}, error() {} } as unknown as Logger,
+      sessionNodeManager: sessionNodeManager as never,
+      getConnState: () => undefined,
+      resolveCurrentAgent: (_c, explicit) => explicit ?? null,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+      resolvedSessionNegotiator: {
+        negotiate: async () => ({ ok: true as const, assignment }),
+      } as unknown as SessionNegotiator,
+      transportSelector: { dial: async () => ({ ok: true, mode: "relay" }) } as never,
+      autoNatService: { getDialability: () => ({ dialable: false }) } as unknown as IAutoNatService,
+      buildRelayConnectParams: async () => undefined,
+      getRelayCircuitAddress: () => "",
+    });
+    return { openSessionAs, dialled };
+  }
+
+  it("★★★ RELAY-ONLY ON: the daemon dials the CIRCUIT and never the operator-revealing address", async () => {
+    const { openSessionAs, dialled } = opener("true", [DIRECT, CIRCUIT]);
+    await openSessionAs("alice", { target_pubkey: "cd".repeat(32) });
+    expect(dialled.length, "it must still connect — relay-only is a routing control, not a disconnection").toBe(1);
+    expect(
+      dialled[0],
+      "ONLY the circuit may be dialled. Dialling their direct address is what hands them our IP, " +
+        "with the operator's own privacy setting switched on.",
+    ).toEqual([CIRCUIT]);
+  });
+
+  it("★★★ RELAY-ONLY OFF: the ordinary path is untouched — both addresses are dialled", async () => {
+    /** The regression half. A privacy control that changes the default path is a bug in itself. */
+    const { openSessionAs, dialled } = opener(null, [DIRECT, CIRCUIT]);
+    await openSessionAs("alice", { target_pubkey: "cd".repeat(32) });
+    expect(dialled[0], "unchanged when the setting is off").toEqual([DIRECT, CIRCUIT]);
+  });
+
+  it("★★ RELAY-ONLY with only a DIRECT address offered: no dial at all", async () => {
+    /**
+     * The counterparty is not relay-only, so they advertise a direct address and nothing else.
+     * Refusing to dial is correct — the session falls back to the relay-park path rather than
+     * revealing this node. **This is the case that must not silently become a direct dial.**
+     */
+    const { openSessionAs, dialled } = opener("true", [DIRECT]);
+    await openSessionAs("alice", { target_pubkey: "cd".repeat(32) });
+    expect(dialled, "nothing dialable without revealing ourselves, so nothing is dialled").toEqual([]);
   });
 });
 

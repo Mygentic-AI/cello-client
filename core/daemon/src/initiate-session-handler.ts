@@ -204,7 +204,12 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // directly-reachable one — localhost or a public addr — advertises a direct multiaddr), so
     // attempt the dial whenever the assignment carries counterparty session addrs, regardless
     // of the transport_mode LABEL (the local selector stub labels everything "relay" even when
-    // the addrs are directly dialable). A failure is NOT fatal: per the dead-channel contract,
+    // the addrs are directly dialable).
+    //
+    // ⚠️ DOD-M15-RELAYONLY-1 NARROWED THIS: the label is still not the authority, but the ADDRESS
+    // SET now is. Under relay-only only `/p2p-circuit` addrs are dialled — see `dialableAddrs`.
+    //
+    // A failure is NOT fatal: per the dead-channel contract,
     // the session stays active and a later cello_send queues the content in the durable retry
     // queue until a route exists (the relay-park path is MSG-001-3b).
     const counterpartyAddrs = assignment.counterparty_session_addrs ?? [];
