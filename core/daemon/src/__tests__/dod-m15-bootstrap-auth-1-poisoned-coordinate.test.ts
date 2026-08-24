@@ -25,9 +25,27 @@
  * connection died at step-6 identity auth with `key_not_in_manifest`. Reachability was never the
  * right test."*
  *
- * ⚠️ **AND IT HAD NO TEST.** Nothing in the suite named `not_in_consortium`. The single guard that
- * makes the poisoned-coordinate case survivable — and therefore makes this line's launch call
- * correct — was held up by nothing.
+ * ─── ⚠️ WHAT THIS FILE ADDS, CORRECTED AFTER REVIEW ───────────────────────────────────────────
+ *
+ * **I first wrote that this guard "HAD NO TEST". That was false, and the way I got it wrong is the
+ * point.** I grepped the EVENT NAME (`not_in_consortium`), found nothing, and concluded the guard
+ * was uncovered. `directory-bootstrap.test.ts:313` has had four tests on it since M12 — including
+ * one that is this file's test 1 minus the log assertion, and one that is this file's test 3. **An
+ * empty grep is a hypothesis, not proof of absence**, and I applied the deadness-by-grep shape to
+ * tests instead of to code.
+ *
+ * **What is genuinely new here:** test 2 (the all-poisoned → `null` case, which has no analogue),
+ * test 4 (the address residual, asserted as a bound), and one assertion each in tests 1 and 3 — that
+ * the swap is REPORTED, and that the healthy path reports nothing.
+ *
+ * ─── ⚠️ THE PRECONDITION, WHICH IS NOT UNIVERSAL ──────────────────────────────────────────────
+ *
+ * All of this holds on the **bundled-manifest posture**: `CELLO_DIRECTORY_URL` unset, or byte-equal
+ * to a bundled endpoint. On any other URL `buildManifestDeps` returns `{}` — no manifest provider,
+ * so `getManifestPeerIds` is absent, **the membership check is skipped AND step-6 identity auth is
+ * off**, and a poisoned coordinate is completely unmitigated. The daemon says so at warn
+ * (`daemon.manifest.bundled.skipped`). A DNS name pointing at the same machine is enough to land
+ * there, which is `DOD-M15-STEP6-REPLAY-1`'s byte-match bullet.
  */
 
 import { describe, it, expect } from "vitest";
@@ -48,12 +66,18 @@ const addr = (p: string) => `/dns4/node.example/tcp/443/wss/p2p/${p}`;
 
 function captureLogger(events: Array<{ level: string; event: string }>): Logger {
   const rec = (level: string) => (event: string) => { events.push({ level, event }); };
-  return { debug: rec("debug"), info: rec("info"), warn: rec("warn"), error: rec("error") } as unknown as Logger;
+  return { debug: rec("debug"), info: rec("info"), warn: rec("warn"), error: rec("error") };
 }
 
+/**
+ * ⚠️ Declared as real `ConsortiumEndpoint`s with no cast — review F4. `pubkey` is REQUIRED, and the
+ * first version cast past that with `as ConsortiumEndpoint`. This file is in the typecheck allowlist
+ * precisely so "the mutants are typecheck failures now" is true, and the roster is the one object
+ * the resolver actually reads — casting it was the single place that claim did not hold.
+ */
 const ROSTER: ConsortiumEndpoint[] = [
-  { peerId: HONEST_A, multiaddr: addr(HONEST_A), nodeId: "gcp-use1" } as ConsortiumEndpoint,
-  { peerId: HONEST_B, multiaddr: addr(HONEST_B), nodeId: "gcp-euw1" } as ConsortiumEndpoint,
+  { nodeId: "gcp-use1", pubkey: "a".repeat(64), peerId: HONEST_A, multiaddr: addr(HONEST_A) },
+  { nodeId: "gcp-euw1", pubkey: "b".repeat(64), peerId: HONEST_B, multiaddr: addr(HONEST_B) },
 ];
 
 /** Members as the SIGNED manifest declares them. The rogue is absent by construction. */
@@ -156,10 +180,17 @@ describe("DOD-M15-BOOTSTRAP-AUTH-1 — a poisoned /bootstrap coordinate", () => 
      * So an attacker who answers `/bootstrap` with a REAL node's peer id and their OWN multiaddr
      * gets past it, and the client dials the attacker's machine.
      *
-     * **What stops it there, and why this is a bound rather than a hole:** libp2p's Noise handshake
-     * authenticates the remote peer id, and the attacker does not hold that node's private key, so
-     * the connection cannot be established. The cost is therefore DENIAL — this daemon keeps being
-     * pointed at an address it can never connect to — and not impersonation.
+     * **What stops it there:** libp2p's Noise handshake authenticates the remote peer id, and the
+     * attacker does not hold that node's private key, so the connection cannot be established. The
+     * cost is DENIAL, not impersonation.
+     *
+     * ⚠️ **AND REVIEW MEASURED THE DENIAL WIDER THAN I FIRST WROTE IT.** I called it "denial of that
+     * node". It is denial of **this daemon's directory connection, with no failover path**: branch 2
+     * returns the primary every call, never sets `stuckToFallback`, and never probes the roster — and
+     * `maxReconnectAttempts` is `MAX_SAFE_INTEGER`, so the manager reconnect-loops forever rather
+     * than ever reporting `lost`. A restart re-picks a bundled endpoint whose plaintext `/bootstrap`
+     * the same on-path attacker answers again. **That is a STALL, which is the outcome this line
+     * pre-registered as "failover does NOT hold" — see `DOD-M15-BOOTSTRAP-ADDR-1`.**
      *
      * **And the resolver cannot learn better on its own.** Its own doc says so: *"stickiness here is
      * by ROSTER REACHABILITY, not by observed connect success — the resolver is not told whether a
