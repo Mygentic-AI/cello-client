@@ -24,6 +24,7 @@ const AUTONAT_PROTOCOL = "/libp2p/autonat/1.0.0";
 import { identify } from "@libp2p/identify";
 import { generateKeyPair, generateKeyPairFromSeed } from "@libp2p/crypto/keys";
 import { multiaddr } from "@multiformats/multiaddr";
+import type { Multiaddr } from "@multiformats/multiaddr";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { Libp2p, Stream, Connection, StreamHandler } from "@libp2p/interface";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -1052,6 +1053,20 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     addresses: {
       listen: opts.listenAddresses,
       ...(opts.announceAddresses?.length ? { announce: opts.announceAddresses } : {}),
+      // ⚠️ DOD-M15-RELAYONLY-1: THE OTHER HALF OF THE HOLE-PUNCH FIX, and without it the whole
+      // control is theatre. Turning dcutr off stops us UPGRADING to a direct connection; it does
+      // nothing about `identify`, which hands a peer our full listen-address set on the FIRST
+      // relayed connection — LAN addresses always, and the AutoNAT-confirmed public one once it is
+      // promoted. So the counterparty would simply be TOLD the address they could not reach by
+      // punching.
+      //
+      // `announceFilter` is libp2p's own seam for this: it decides what we advertise. Under
+      // relay-only we advertise circuit addresses and nothing else, which is exactly what
+      // `publishableEndpoint` does for the directory — the same rule applied on the peer-to-peer
+      // side, where the directory's filter has no reach.
+      ...(opts.holePunch?.enabled === false
+        ? { announceFilter: (addrs: Multiaddr[]): Multiaddr[] => addrs.filter((a) => a.toString().split("/").includes("p2p-circuit")) }
+        : {}),
     },
     ...(hasCircuitListen ? { transportManager: { faultTolerance: FaultTolerance.NO_FATAL } } : {}),
     transports: [
