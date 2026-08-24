@@ -28,7 +28,7 @@ import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
-import { contentHashFor, resolveContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
+import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -562,12 +562,32 @@ export function createContentPark(deps: ContentParkDeps) {
         }
         const signer = getKeyProvider(candidates[0]!.name);
         if (!signer) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${candidates[0]!.name}' is not loaded.` };
+        /**
+         * The algorithm `contentHash` was computed under must travel WITH it, and omitting it is not
+         * neutral — absent means `sha256`. A caller depositing a SALTED hash and saying nothing gets
+         * the entry recomputed unsalted at the far end, which surfaces as `content_hash_mismatch`:
+         * a TAMPER report on a message nobody touched. That is the failure this parameter exists to
+         * prevent, and it is exactly what the dedup path hit.
+         *
+         * Refused rather than defaulted when the name is unreadable, matching `resolveContentHashAlg`
+         * on the receive side: there is no correct hash to compare against, so guessing produces a
+         * confident wrong answer.
+         */
+        let contentHashAlg: string | undefined;
+        const rawAlg = params?.contentHashAlg;
+        if (rawAlg !== undefined && rawAlg !== null) {
+          if (typeof rawAlg !== "string" || !isKnownContentHashAlg(rawAlg)) {
+            return { ok: false, reason: "unknown_content_hash_alg", guidance: `This daemon cannot compute "${typeof rawAlg === "string" ? rawAlg : `(${typeof rawAlg})`}". Known algorithms: ${Object.values(CONTENT_HASH_ALGS).join(", ")}. Omit the field to mean ${CONTENT_HASH_ALGS.SHA256}.` };
+          }
+          contentHashAlg = rawAlg;
+        }
         payload = await sealParkEnvelope({
           signer,
           sessionIdHex: sessionId,
           recipientPubkey: Buffer.from(recipientPubkey, "hex"),
           contentHash: Buffer.from(contentHash, "hex"),
           content: Buffer.from(content, "hex"),
+          ...(contentHashAlg !== undefined ? { contentHashAlg } : {}),
         });
       } else {
         payload = Buffer.from(ciphertext!, "hex");
