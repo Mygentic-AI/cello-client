@@ -111,7 +111,7 @@ import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
 import { createSealCoordinator, type SealCompletion } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
-import { registerSessionContentHandlers } from "./session-content-handlers.js";
+import { registerSessionContentHandlers, sentAuthorship } from "./session-content-handlers.js";
 import { createDocumentLayer, agentPublicKeyFromId } from "./document-layer.js";
 import { isDocumentFrame } from "./document-frame-router.js";
 import { INBOUND_INJECTION_BLOCKED } from "@cello-protocol/gateway";
@@ -1439,7 +1439,7 @@ async function startDaemonHoldingLock(
             // never agree with.
             const placed = sessionNodeManager.placeOwnLeaf(agentName, sessionId, rejectHashHex, rejectBytes, sendResult.sequenceNumber, randomUUID());
             if (placed.placed) {
-              sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placed.leafIndex, "sent", rejectBytes, randomUUID());
+              sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placed.leafIndex, "sent", rejectBytes, randomUUID(), sentAuthorship(sendResult));
             }
             logger.info("session.away.inbox.oneshot.rejected", { agentName, sessionId, sequenceNumber: placed.placed ? placed.leafIndex : placed.heldAt, committed: placed.placed, queued: !sendResult.ok });
           } else {
@@ -1670,7 +1670,7 @@ async function startDaemonHoldingLock(
         // that is where its leaf goes.
         const placedQueued = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
         if (placedQueued.placed) {
-          sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedQueued.leafIndex, "sent", contentBytes, randomUUID());
+          sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedQueued.leafIndex, "sent", contentBytes, randomUUID(), sentAuthorship(sendResult));
         }
         logger.info("session.away.response.deferred", {
           agentName, sessionId, kind, isKnown,
@@ -1684,7 +1684,7 @@ async function startDaemonHoldingLock(
       // path most likely to have a gap open under it — exactly where a tail append does damage.
       const placedReply = sessionNodeManager.placeOwnLeaf(agentName, sessionId, contentHashHex, contentBytes, sendResult.sequenceNumber, randomUUID());
       if (placedReply.placed) {
-        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedReply.leafIndex, "sent", contentBytes, randomUUID());
+        sessionNodeManager.recordTranscriptMessage(agentName, sessionId, placedReply.leafIndex, "sent", contentBytes, randomUUID(), sentAuthorship(sendResult));
       }
       logger.info("session.away.response.sent", {
         agentName, sessionId, kind, isKnown,

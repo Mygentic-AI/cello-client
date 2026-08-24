@@ -94,6 +94,21 @@ const AUTO_REPLY_GUIDANCE =
   "is NOT evidence a person wrote it. Never tell the operator a human replied because a message " +
   "was unmarked.";
 
+
+/**
+ * DOD-M15-SEALWIRE-1 bullet 5, SENT half — the proof for a message THIS agent sent.
+ *
+ * Present only when the relay WITNESSED the leaf: an unwitnessed send never put a Structure-1 on the
+ * wire, so there is nothing signed to store, and the row must record `self_authored` with no proof
+ * rather than imply one. `sendContent` returns it per-send rather than stashing it by session,
+ * because a side map hands a caller the wrong send's signature the moment two are in flight.
+ */
+export function sentAuthorship(
+  r: Awaited<ReturnType<SessionNodeManager["sendContent"]>>,
+): { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined {
+  return r.ok ? r.authorship : undefined;
+}
+
 export interface SessionContentDeps {
   handlers: Map<string, IpcHandler>;
   logger: Logger;
@@ -557,7 +572,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // feeds it to a cursor or a `--since-seq` read is then wrong.
         const queuedLeaf = placed.placed ? placed.leafIndex : -1;
         if (placed.placed) {
-          sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId);
+          sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, queuedLeaf, "sent", sendBytes, correlationId, sentAuthorship(sendResult));
           advanceConnectionCursor(connectionId, sessionId, queuedLeaf);
         }
         logger.info(placed.placed ? "session.content.queued.committed" : "session.content.queued.held", {
@@ -640,7 +655,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // M9 merge fix: use sendBytes (the ALTERED bytes on a redact verdict), never the pre-redaction
     // contentBytes — the leaf hash above already binds sendBytes; the transcript must match what
     // actually went on the wire, not the pre-redaction draft (M9's own stated seam invariant).
-    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", sendBytes, correlationId);
+    sessionNodeManager.recordTranscriptMessage(record.agent_name, sessionId, leafIndex, "sent", sendBytes, correlationId, sentAuthorship(sendResult));
     // M8C-CURSOR-1: the sender authored this leaf — advance ITS OWN cursor so it doesn't get
     // blocked by session_not_current on its own just-sent message.
     advanceConnectionCursor(connectionId, sessionId, leafIndex);
