@@ -2796,14 +2796,40 @@ async function startDaemonHoldingLock(
   // Permissive by design (D12): an agent that exists goes online regardless of directory
   // registration state (online-without-registration is an established contract). Returns a
   // structured failure so callers can surface agent_start_failed with a real reason + guidance.
-  function startAgentInternal(name: string): { ok: true } | { ok: false; reason: string; guidance: string } {
+  /**
+   * `standing_receiver` is part of the SUCCESS shape, not an optional extra — `DOD-M15-START-AGENT-
+   * UNAWAITED-1`. A bare `{ ok: true }` claimed the agent was started and reachable when only the
+   * first half was known, and the union makes the two states impossible to conflate at a call site.
+   */
+  function startAgentInternal(name: string):
+    | { ok: true; standing_receiver: "ready" }
+    | { ok: true; standing_receiver: "starting"; standing_receiver_cause: string | undefined; guidance: string }
+    | { ok: false; reason: string; guidance: string } {
     const agent = agents.find((a) => a.name === name);
     if (!agent || agent.state === "load_failed") {
       return { ok: false, reason: "agent_not_found", guidance: `Agent '${name}' does not exist. Run 'cello login' to register agents, or check agent names with cello_agents.` };
     }
     if (onlineAgents.has(name)) {
-      // Idempotent — already online, no event
-      return { ok: true };
+      // Idempotent — already online, no event.
+      //
+      // It still reports REAL readiness rather than a bare ok. "Already online" says this daemon
+      // marked the agent online at some earlier moment; it says nothing about whether the receiver
+      // that ensure was firing ever came up. An operator who calls start twice — which is exactly
+      // what someone does when the first one seemed not to work — would otherwise get the most
+      // reassuring answer in the run on the attempt where something is actually wrong.
+      const readyNow = sessionNodeManager.getStandingReceiverInfo(name) !== null;
+      if (readyNow) return { ok: true, standing_receiver: "ready" };
+      const cause = sessionNodeManager.standingReceiverAbsenceReason(name);
+      return {
+        ok: true,
+        standing_receiver: "starting",
+        standing_receiver_cause: cause,
+        guidance:
+          `'${name}' was already online, and its standing receiver is not up (${cause}). Outbound ` +
+          `sends and cello_initiate_session ensure it on demand. An inbound session arriving before ` +
+          `it is ready is refused with 'standing_receiver_unavailable' — this daemon, not the ` +
+          `counterparty. If it stays this way, stop the agent and start it again.`,
+      };
     }
     onlineAgents.add(name);
     // Pressing start clears the deliberate-offline mark — that is what makes the switch reversible.
@@ -2829,7 +2855,19 @@ async function startDaemonHoldingLock(
     void sessionNodeManager.ensureStandingReceiverForAgent(name)
       .then(() => flushAwaitingContent(name))
       .catch((err: unknown) => {
-        logger.warn("session.standing_receiver.ensure.failed", { agentName: name, reason: extractErrorMessage(err) });
+        logger.warn("session.standing_receiver.ensure.failed", {
+          agentName: name,
+          reason: extractErrorMessage(err),
+          // `DOD-M15-START-AGENT-UNAWAITED-1`. The operator has ALREADY been told `ok: true` — this
+          // handler answered before this promise settled — so nothing corrects that answer if this
+          // is permanent. Say what it costs them here, because this line is the only account.
+          impact:
+            "cello_start_agent already answered ok for this agent, and its standing receiver did not " +
+            "come up. The agent is online to the directory and CANNOT accept an inbound session: a " +
+            "counterparty dialling it is refused standing_receiver_unavailable. Initiate and accept " +
+            "each re-ensure on demand, so this may still recover on the next attempt; if it does not, " +
+            "stop and restart the agent.",
+        });
       })
       // DOD-MSG-4 (auto-recover-on-reconnect): RECEIVER drains its parked mailbox from every relay it
       // has sessions on (symmetric to the sender re-park). Its own stage so a failure is labelled
@@ -2839,10 +2877,51 @@ async function startDaemonHoldingLock(
       .catch((err: unknown) => {
         logger.warn("content.recover.auto.failed", { agentName: name, stage: "agent_start", error: extractErrorMessage(err) });
       });
-    logger.info("agent.online", { agentName: name, agentPubkey: agent.pubkey ?? "" });
+    /**
+     * `DOD-M15-START-AGENT-UNAWAITED-1` — SAY WHETHER THE AGENT CAN ACTUALLY HEAR YET.
+     *
+     * The ensure above is fire-and-forget and that is deliberate: initiate and accept both ensure on
+     * demand, and awaiting it here would turn a transient network failure into a failed start. **The
+     * defect was never the timing — it was the CLAIM.** `{ ok: true }` with nothing else reads as
+     * "your agent is running and reachable", and a session landing in the window before the receiver
+     * exists is refused `standing_receiver_unavailable` — a precondition on OUR side, surfacing to
+     * the operator as though the counterparty or the directory were at fault.
+     *
+     * ⚠️ **This field is only worth having because it can genuinely say `ready`.** Computed one line
+     * after firing an async ensure, a naive readiness flag would be `starting` on every call — a
+     * field that can never take its other value, which is the same defect as a log line reporting a
+     * verdict its producer cannot have. It escapes that because `ensureStandingReceiverForAgent` is
+     * IDEMPOTENT: an agent that already holds a receiver (a repeat start, or one whose receiver
+     * survived) has one at this instant and reports `ready` truthfully.
+     *
+     * `cause` is read from the same four-way answer the refusal path uses, so the response and the
+     * eventual error agree instead of describing the same state in two vocabularies.
+     */
+    const receiverReady = sessionNodeManager.getStandingReceiverInfo(name) !== null;
+    const startingCause = receiverReady ? undefined : sessionNodeManager.standingReceiverAbsenceReason(name);
+    logger.info("agent.online", {
+      agentName: name,
+      agentPubkey: agent.pubkey ?? "",
+      standingReceiver: receiverReady ? "ready" : "starting",
+      ...(startingCause !== undefined ? { standingReceiverCause: startingCause } : {}),
+    });
     // MCP-002: Broadcast agent_state_changed to ALL connections
     notificationDispatcher.dispatchAgentStateChanged(name, "online", "started");
-    return { ok: true };
+    if (receiverReady) return { ok: true, standing_receiver: "ready" as const };
+    return {
+      ok: true,
+      standing_receiver: "starting" as const,
+      standing_receiver_cause: startingCause,
+      // Invariant: an agent-facing response carries an affordance. Naming the refusal text is the
+      // load-bearing half — an operator who hits it in the next second can otherwise only conclude
+      // the other side is broken.
+      guidance:
+        `'${name}' is online and its standing receiver is still being built. Outbound sends and ` +
+        `cello_initiate_session ensure it on demand, so ordinary use is fine. A session arriving in ` +
+        `the next moment can be refused with 'standing_receiver_unavailable' — that is this daemon ` +
+        `not being ready yet, NOT the counterparty being unreachable. It clears on its own; ` +
+        `cello_status reports the receiver once it is up.`,
+    };
   }
 
   // M8C-AUTOSTART-1 (F18): resolve which agent an agent-defaulting tool should act on for this
