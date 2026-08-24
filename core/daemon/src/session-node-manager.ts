@@ -10162,6 +10162,85 @@ export class SessionNodeManager {
   }
 
   /**
+   * DROP AN UNSPENT SALT — `DOD-M15-SALTSPLIT-1`. The second writer of `content_salt`, and the only
+   * one that clears it.
+   *
+   * Reached when the counterparty tells us it can never adopt a salt for this session. Keeping ours
+   * would mean every message we send from here is refused by them with
+   * `content_hash_salt_unavailable` — a conversation that dies while looking merely quiet, which is
+   * the failure this exists to prevent.
+   *
+   * ⚠️ THE ADOPTION CHECK IS REPEATED HERE ON PURPOSE, not because the caller is untrusted.
+   *
+   * The caller has already computed `adoption`, so this looks redundant — and it is, for today's one
+   * call site. It stays because the cost of a future caller getting it wrong is a transcript that no
+   * single rule can verify: leaves hashed under a salt that has just been erased, with nothing
+   * recording that they were. A guard whose failure mode is silent and permanent belongs next to the
+   * destructive act, not only at the place that currently decides to perform it. Same reasoning that
+   * made `placeOwnLeaf`'s authorship parameter required rather than optional.
+   *
+   * Returns true only if a salt was actually cleared.
+   */
+  #discardUnspentSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
+    const held = this.#getSessionSalt(agentName, sessionId);
+    if (held === null) return false;
+
+    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
+    if (adoption.closed) {
+      // SPENT. Something is already hashed under this salt, so it is not ours to drop.
+      this.#logger.error("session.salt.discard.refused", {
+        agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
+        impact: "the salt was NOT dropped, because content in this session is already hashed under it and erasing it would leave a transcript no single rule can verify. The session stays split: the counterparty holds no salt and refuses everything sent from here.",
+      });
+      return false;
+    }
+
+    if (!this.#db) {
+      this.#logger.error("session.salt.discard.failed", {
+        agentName, sessionId, correlationId, reason: "db_closed",
+        impact: "the salt is still stored, so after the next restart this side hashes salted while the counterparty refuses every message. Only reachable during shutdown; the agreement re-runs on the next connect, which discards it then.",
+      });
+      return false;
+    }
+
+    try {
+      const cleared = this.#db
+        .prepare("UPDATE sessions SET content_salt = NULL WHERE agent_id = ? AND session_id = ?")
+        .run(this.#requireAgentId(agentName), sessionId);
+      if (Number(cleared.changes) !== 1) {
+        // The row-count check that `#persistSessionSalt` learned the hard way: an UPDATE matching no
+        // row does not throw, and reporting success here would leave the durable salt in place while
+        // the cache said otherwise — salted after a restart, unsalted before one.
+        this.#logger.error("session.salt.discard.failed", {
+          agentName, sessionId, correlationId, changes: Number(cleared.changes), reason: "no_session_row",
+          impact: "the stored salt was NOT cleared, so this side hashes unsalted now and salted again after a restart — the transcript splits at the restart rather than here",
+        });
+        return false;
+      }
+    } catch (err: unknown) {
+      this.#logger.error("session.salt.discard.failed", {
+        agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        impact: "the stored salt was NOT cleared, so this side hashes unsalted now and salted again after a restart — the transcript splits at the restart rather than here",
+      });
+      return false;
+    }
+
+    /**
+     * CACHE AFTER ROW, and both or the session is worse off than before.
+     *
+     * `#saltForHashing` reads the cache on its first line and never consults the row, so clearing
+     * one without the other produces a session that hashes one way in this process and the other way
+     * in the next — the split transcript, arriving at a daemon restart instead of at a frame.
+     */
+    this.#sessionSalts.delete(this.#k(agentName, sessionId));
+    this.#logger.info("session.salt.discarded", {
+      agentName, sessionId, correlationId,
+      impact: "the counterparty can never adopt a salt for this session, so this side dropped its own before spending it. Both sides now hash unsalted — exactly as verifiable as every session shipped before content salting existed, and every message continues to be accepted. Nothing was hashed under the discarded salt.",
+    });
+    return true;
+  }
+
+  /**
    * Announce our state to the counterparty: a contribution if we hold no salt, a fingerprint if we
    * do. Called on every counterparty connect — first connection, reconnect and revival alike — and
    * on receiving a peer contribution.
@@ -10396,7 +10475,39 @@ export class SessionNodeManager {
             ? "This side could not read its own message frontier, so it refused the salt rather than risk hashing half the session one way and half the other. Starting a new session will NOT help — it will refuse the same way. Look for session.content.held.restore.failed or other storage errors around this line; the conversation still works and every message is intact, it is just unsalted."
             : "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
         });
+        /**
+         * DOD-M15-SALTSPLIT-1 — THE SESSION IS SPLIT, AND THE WARN ABOVE SAYS IT IS FINE.
+         *
+         * We refused adoption AND we hold a salt. That combination means the salt was agreed before
+         * our frontier closed and content is already hashed under it — spent, unrecoverable. The
+         * peer holds none and will refuse every message we send with `content_hash_salt_unavailable`.
+         *
+         * `session.salt.adoption.refused` fires just above with *"nothing is degraded relative to
+         * any shipped release, and no message is affected"*, which is true for the ordinary refusal
+         * and FALSE here, at the exact moment every message stops being accepted. So this is its own
+         * event at ERROR rather than a tightened sentence on that one: an operator filtering for the
+         * refusal is looking at a benign condition, and this is not that condition.
+         */
+        if (this.#getSessionSalt(agentName, sessionId) !== null) {
+          this.#logger.error("session.salt.split", {
+            agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
+            impact: "this session cannot continue. Content here is already hashed under a salt the counterparty can never hold, so they refuse every message sent from this side — the conversation looks quiet rather than broken, and the session can never be sealed because the two transcripts no longer agree on a leaf.",
+            guidance: "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed, so a fresh session agrees or declines cleanly on both sides. This one cannot be repaired — the salt cannot be dropped without leaving a transcript no single rule can verify, and it cannot be shared with a peer that has already closed adoption.",
+          });
+        }
       } else {
+        /**
+         * DOD-M15-SALTSPLIT-1 — CARRY OUT THE CLAIM ABOVE INSTEAD OF ONLY STATING IT.
+         *
+         * `shared.impact` says *"neither side will use a content salt for this session, and both now
+         * know it."* Nothing made that true: a salt already agreed on this side stayed on disk and in
+         * the cache, and `#saltForHashing` returns it before it ever looks at adoption. Our adoption
+         * is still open here, so nothing has been hashed under it and dropping it is free.
+         *
+         * Ordering matters — discard BEFORE the log, so the line cannot claim an outcome that the
+         * write then failed to produce.
+         */
+        this.#discardUnspentSalt(agentName, sessionId, correlationId);
         this.#logger.info("session.salt.adoption.closed", shared);
       }
       if (action.announce) {

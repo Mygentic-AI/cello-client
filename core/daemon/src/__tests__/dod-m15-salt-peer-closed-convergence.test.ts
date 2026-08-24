@@ -167,9 +167,24 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
       "the two sides are now permanently incompatible and the operator must be told — a WARN saying " +
       "'no message is affected' is false at the exact moment every message stops being accepted",
     ).toBeGreaterThan(0);
+    /**
+     * ⚠️ MY FIRST VERSION READ `split[0].impact` THROUGH A CAST AND GOT `''`.
+     *
+     * The fields live under `ctx`; `as { impact?: string }` asserted a shape the object never had,
+     * and `?? ""` then turned the miss into an empty string that failed on the PATTERN — sending the
+     * reader to look at the log line's wording for a defect that was in the test's own accessor.
+     * That is precisely the laundering the `.toMatch` enforcer in the spine lane exists to catch,
+     * committed here by the person who wrote it. Read through the typed `CapturedEvent` instead, so
+     * a wrong field name is a compile error rather than an empty string.
+     */
     expect(
-      String((split[0] as { impact?: string }).impact ?? ""),
+      String(split[0].ctx.impact ?? ""),
       "the impact must say what the operator will SEE: their counterparty refuses everything they send",
     ).toMatch(/refus/i);
+    expect(
+      split[0].level,
+      "ERROR, not WARN — the neighbouring `session.salt.adoption.refused` is a benign condition and " +
+      "an operator who has learned to skim it must not skim this",
+    ).toBe("error");
   }, 60_000);
 });
