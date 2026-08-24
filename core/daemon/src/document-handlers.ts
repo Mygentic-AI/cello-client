@@ -50,6 +50,21 @@ import {
   type DocumentProposalEnvelope,
 } from "@cello-protocol/protocol-types";
 import type { IpcHandler } from "./ipc-server.js";
+
+/**
+ * How long one holder's amendment send may be outstanding before the daemon SAYS SO —
+ * `DOD-M15-DOCACCEPT-UNBOUNDED-1`.
+ *
+ * **This is a reporting threshold, not a timeout.** Nothing is cancelled when it fires; the send is
+ * still awaited. It exists because the fan-out is sequential and unbounded, so a single unreachable
+ * holder stalls the whole operation — and until now the daemon logged nothing at all while that
+ * happened, leaving the failure loud in neither the log nor the agent response.
+ *
+ * Chosen well under the MCP client's own 60s request timeout, so the line lands **while the operator
+ * is still waiting** rather than after their tool call has already given up. A threshold that fires
+ * after the caller has gone is a line nobody reads.
+ */
+const HOLDER_SLOW_WARN_MS = 5_000;
 import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
@@ -767,6 +782,40 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
   }): Promise<Record<string, boolean>> => {
     const told: Record<string, boolean> = {};
     for (const holder of args.holders) {
+      /**
+       * ⚠️ SAY WHO WE ARE WAITING ON, WHILE WE ARE STILL WAITING — `DOD-M15-DOCACCEPT-UNBOUNDED-1`.
+       *
+       * This loop is SEQUENTIAL and `sendBytes` opens a session to the holder with **no timeout** in
+       * the whole chain (`sendBytes` → `acquireSession` → `openSession`). **One holder who cannot be
+       * reached blocks the entire operation** — `cello_doc_accept` is the caller that surfaces it, and
+       * the operator's client gives up after 60s having been told nothing at all. Measured live:
+       * every `j-multiplayer` timeout is `cello_doc_accept` at 60000ms while the failing test set
+       * reshuffles, which is what identified this loop.
+       *
+       * **The product's own journey names the invariant that breaks:** *"an absent holder blocks
+       * nobody."* An absent holder blocks everybody.
+       *
+       * ⚠️ THIS DOES NOT FIX THAT, DELIBERATELY. Bounding the wait is a behaviour change, and the
+       * right bound is a product judgement — too short falsely marks holders un-notified, which is a
+       * membership-change correctness problem; too long leaves the hang. The layer's only existing
+       * bound, `RECONCILE_INFLIGHT_BOUND_MS`, is 60s for a BACKGROUND sweep and is longer than the
+       * client's own timeout, so it cannot be borrowed. Tracked for that decision.
+       *
+       * What is fixed here is the **silence**: the daemon logged nothing while it blocked, so the
+       * failure was loud in neither the log nor the agent response. This names the holder being waited
+       * on **while the wait is still happening**, and changes nothing else — the timer is cleared on
+       * every exit path, including a throw.
+       */
+      const slowSend = setTimeout(() => {
+        logger.warn("document.amendment.holder_slow", {
+          documentId: args.documentId,
+          holderAgentId: holder,
+          verb: args.verb,
+          waitedMs: HOLDER_SLOW_WARN_MS,
+          impact: "this fan-out is sequential and unbounded, so every holder after this one is waiting too, and the caller (cello_doc_accept) has returned nothing. An operator sees an accept that simply hangs.",
+          guidance: "This holder cannot currently be reached. Nothing is lost — the amendment is recorded locally and they are re-notified on reconcile — but the calling operation will not answer until this send settles.",
+        });
+      }, HOLDER_SLOW_WARN_MS);
       try {
         const sent = await deps.transportFor(args.agentName).sendBytes({
           peerAgentId: holder,
@@ -800,6 +849,10 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           reason: "amendment_send_threw",
           detail: err instanceof Error ? err.message : String(err),
         });
+      } finally {
+        // EVERY exit path, including the throw above — a timer left armed would log a slow send for a
+        // holder that already answered, which is worse than the silence it replaces.
+        clearTimeout(slowSend);
       }
     }
     return told;
