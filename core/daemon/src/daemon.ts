@@ -2055,6 +2055,15 @@ async function startDaemonHoldingLock(
     return null;
   });
 
+  /**
+   * DOD-M15-RELAYABUSE-1: scheduled park-retry timers, tracked so shutdown can clear them.
+   *
+   * ⚠️ Every other daemon timer is cleared in `stop()`; an untracked one lets an in-process restart
+   * leave a stale timer that drains into a torn-down manager. Unref'd already, so it cannot hold the
+   * process open — this is about a clean teardown, not about exiting.
+   */
+  const parkRetryTimers = new Set<ReturnType<typeof setTimeout>>();
+
   sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
@@ -2139,10 +2148,51 @@ async function startDaemonHoldingLock(
      * self-inflicted flood, which is what the limiter exists to stop.
      */
     if (res.retryAfterMs !== undefined && res.retryAfterMs > 0) {
+      /**
+       * ⚠️ CLAMPED, because the number comes from ANOTHER PARTY'S SOFTWARE and an unclamped one is
+       * not merely wrong — it inverts the fix. Node's `setTimeout` holds an int32: a relay reporting
+       * `3_000_000_000` overflows it and the timer fires in about **one millisecond**, re-parking
+       * instantly into the limit that just refused, and printing a `TimeoutOverflowWarning` on
+       * stderr from a daemon whose convention forbids console output. A reported `1` does the same
+       * thing 250 ms later.
+       *
+       * The floor is a second and the ceiling five minutes: long enough that a shortcut is a
+       * shortcut, short enough that it stays one. A clamp is announced rather than silent — a relay
+       * asking us to wait 35 days is a fact an operator wants.
+       */
+      const MIN_RETRY_MS = 1_000;
+      const MAX_RETRY_MS = 5 * 60_000;
+      const requested = res.retryAfterMs;
+      const delay = Math.min(Math.max(requested, MIN_RETRY_MS), MAX_RETRY_MS);
+      if (delay !== requested) {
+        logger.warn("content.park.retry.clamped", {
+          sessionId,
+          requestedMs: requested,
+          usedMs: delay,
+          impact:
+            "the relay asked for a retry delay outside the range this daemon will schedule, so it " +
+            "was clamped — an unclamped value can overflow the timer and fire immediately, which " +
+            "would re-park straight into the limit that just refused",
+        });
+      }
+      logger.info("content.park.retry.scheduled", { sessionId, delayMs: delay, reason: res.reason });
+      /**
+       * Scoped to the AGENT, not global. `flushAwaitingContent` coalesces on its filter, so an
+       * unfiltered call and a per-agent one are different keys and can run concurrently over the
+       * same session — and the drain removes an entry only after a SUCCESSFUL park, so an overlap
+       * can deposit the same entry twice and burn two slots of the very budget that is limited.
+       */
       const timer = setTimeout(() => {
-        void flushAwaitingContent().catch(() => { /* best-effort: the event triggers still apply */ });
-      }, res.retryAfterMs + 250);
+        void flushAwaitingContent(agentName).catch((err: unknown) => {
+          logger.warn("content.park.retry.timer.failed", {
+            sessionId,
+            reason: err instanceof Error ? err.message : String(err),
+            impact: "the scheduled drain threw; the ordinary event triggers (boot, agent start, reconnect) still apply",
+          });
+        });
+      }, delay);
       timer.unref?.();
+      parkRetryTimers.add(timer);
     }
     return { ok: false, reason: res.reason ?? "relay_deposit_failed" };
   });
@@ -5180,6 +5230,10 @@ async function startDaemonHoldingLock(
   async function stop(reason: string): Promise<void> {
     clearInterval(reconcileSweepTimer);
     clearInterval(revivalBoundSweepTimer);
+    // DOD-M15-RELAYABUSE-1: scheduled park retries. Unref'd, so they never held the process open —
+    // cleared so an in-process restart cannot leave one draining into a torn-down manager.
+    for (const t of parkRetryTimers) clearTimeout(t);
+    parkRetryTimers.clear();
     // DOD-M12B-SHUTDOWN-1: clearing the timer only stops the NEXT tick. The pass already running
     // walks every agent, and each step dials a peer and opens a session — which is why a daemon
     // reported down, with its socket already removed, was still logging `document.reconcile.sweep`

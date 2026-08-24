@@ -286,40 +286,43 @@ describe("DOD-M15-RELAYABUSE-1 — a THROTTLING relay is not an OUTAGE, and the 
   });
 });
 
-describe("DOD-M15-RELAYABUSE-1 — the relay's 'when' reaches the client instead of being dropped", () => {
+describe("DOD-M15-RELAYABUSE-1 — the guidance cannot promise a queue that does not exist", () => {
   /**
-   * ⚠️ THE VALUE-WITH-NO-READER DEFECT, caught one layer before it shipped. The relay computes
-   * exactly when a throttle clears and puts `retry_after_ms` on the ack. If the client parsed the
-   * ack and dropped that field, the number would exist, be logged on the relay, be asserted in a
-   * relay test — and change nothing, which is this milestone's most-repeated defect.
+   * ⚠️ THE DEFECT REVIEW FOUND IN MY OWN FIX, and it is the lie this whole family of work exists to
+   * kill, reintroduced one layer up.
    *
-   * It matters concretely: a deferred park is retried only on EVENTS (boot, agent start, drain hook,
-   * signaling reconnect), and none of those is coming for a throttle — the relay is healthy and the
-   * link never dropped. So the one refusal that self-heals in about a minute was the one that waited
-   * longest.
+   * The first version of the three new branches returned a complete paragraph per cause and NEVER
+   * consulted `durable`. So all three ended *"The message is queued and re-sent automatically. Do
+   * not re-send it."* — including when the durable enqueue had been refused as a duplicate, or the
+   * retry hook was unwired. The daemon logs at ERROR that the content is not retained, and the
+   * operator was simultaneously told it was safe and instructed not to re-send it. **Nothing held
+   * the message.**
+   *
+   * Diagnosis and action are now composed, so the action half is produced in one place and cannot be
+   * reached without reading the flag.
    */
-  function parseAck(ack: Record<string, unknown>): { retryAfterMs?: number } {
-    const raw = ack["retry_after_ms"];
-    const retryAfterMs = typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : undefined;
-    return retryAfterMs !== undefined ? { retryAfterMs } : {};
+  for (const cause of [
+    RELAY_PARK_REFUSALS.RATE_LIMITED,
+    RELAY_PARK_REFUSALS.RECIPIENT_FULL,
+    RELAY_PARK_REFUSALS.STORE_FULL,
+  ]) {
+    it(`${cause}: durable=false says LOST, and never says queued`, () => {
+      const g = parkRefusalGuidance(cause, false);
+      expect(g, "a message that was not queued must be described as lost").toMatch(/lost|send it again/i);
+      expect(
+        g,
+        "and it must NOT tell the operator it is queued and to sit tight — that is the exact lie " +
+          "this family of work exists to remove",
+      ).not.toMatch(/queued and re-sent automatically/i);
+      expect(g, "nor tell them not to re-send the only copy that exists").not.toMatch(/do not re-send/i);
+    });
+
+    it(`${cause}: durable=true keeps the diagnosis AND says it is queued`, () => {
+      const g = parkRefusalGuidance(cause, true);
+      expect(g, "the queued case still says so").toMatch(/queued and re-sent automatically/i);
+      expect(g, "and still carries the cause-specific diagnosis rather than a generic sentence").not.toBe(
+        parkRefusalGuidance("something_else_entirely", true),
+      );
+    });
   }
-
-  it("a rate-limited ack carries the delay through, and it is a usable number", () => {
-    const parsed = parseAck({ type: "content_park_deposit_ack", ok: false, reason: "rate_limited", retry_after_ms: 42_000 });
-    expect(parsed.retryAfterMs, "the relay said when — the client must keep it").toBe(42_000);
-  });
-
-  it("a MISSING or nonsense delay is dropped rather than trusted", () => {
-    /**
-     * The relay is another party's software and may be older, newer, or simply wrong. A zero, a
-     * negative or a NaN must not become a setTimeout argument: zero would schedule an immediate
-     * re-park into the very limit that just refused, which is the self-inflicted flood the limiter
-     * exists to stop.
-     */
-    expect(parseAck({ ok: false, reason: "rate_limited" }).retryAfterMs, "absent = no shortcut, events still apply").toBeUndefined();
-    expect(parseAck({ retry_after_ms: 0 }).retryAfterMs, "zero would re-park instantly into the same limit").toBeUndefined();
-    expect(parseAck({ retry_after_ms: -5 }).retryAfterMs).toBeUndefined();
-    expect(parseAck({ retry_after_ms: Number.NaN }).retryAfterMs, "NaN is the lesson this milestone already learned once").toBeUndefined();
-    expect(parseAck({ retry_after_ms: "60000" }).retryAfterMs, "a string is not a delay").toBeUndefined();
-  });
 });

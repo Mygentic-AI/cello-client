@@ -400,30 +400,37 @@ export function parkRefusalGuidance(cause: string | undefined, durable: boolean)
       "changes nothing."
     );
   }
-  if (cause === RELAY_PARK_REFUSALS.RATE_LIMITED) {
-    return (
-      "The relay is healthy and deliberately rate-limiting this agent's hand-offs, so it refused " +
-      "this one. NOTHING IS WRONG with the link or the counterparty. The message is queued and " +
-      "re-sent automatically, and the limit clears on its own within about a minute. Do not " +
-      "re-send it — an identical re-send is not separately queued, and re-sending is what the " +
-      "limit exists to slow down."
-    );
+
+  /**
+   * ⚠️ DIAGNOSIS AND ACTION ARE COMPOSED, NOT WRITTEN TOGETHER — and this shape is the fix for a
+   * defect review found in the first version.
+   *
+   * That version returned a complete paragraph per cause and **never consulted `durable`**, so all
+   * three new branches ended "The message is queued and re-sent automatically. Do not re-send it."
+   * `durable` is OBSERVED, not assumed: it is false when the durable enqueue was refused as a
+   * duplicate, or when the retry hook is unwired. In that case the daemon logs at ERROR that the
+   * content is *not* separately retained while the operator was simultaneously told it was queued
+   * and instructed not to re-send. **Nothing held the message.** That is precisely the lie this
+   * family of work exists to kill, reintroduced one layer up.
+   *
+   * Splitting them makes the mistake unavailable: the action half is produced in exactly one place
+   * and cannot be reached without reading the flag.
+   */
+  const diagnosis =
+    cause === RELAY_PARK_REFUSALS.RATE_LIMITED
+      ? "The relay is healthy and deliberately rate-limiting this agent's hand-offs, so it refused this one. NOTHING IS WRONG with the link or the counterparty, and the limit clears on its own."
+      : cause === RELAY_PARK_REFUSALS.RECIPIENT_FULL
+        ? "The relay is holding as much undelivered content for THIS counterparty as it will, so it refused the hand-off. That is about their mailbox, not your connection, and another relay would refuse it too. It clears when they come online and collect it, or when older entries expire."
+        : cause === RELAY_PARK_REFUSALS.STORE_FULL
+          ? "The relay's parked-content store is full, so it refused the hand-off. The link is fine. If this persists the relay operator needs to know — it means the store is under sustained pressure."
+          : null;
+
+  if (diagnosis !== null) {
+    return durable
+      ? `${diagnosis} The message is queued and re-sent automatically. Do not re-send it: an identical re-send is not separately queued.`
+      : `${diagnosis} ⚠️ BUT THIS MESSAGE WAS NOT QUEUED — it is lost. Send it again.`;
   }
-  if (cause === RELAY_PARK_REFUSALS.RECIPIENT_FULL) {
-    return (
-      "The relay is holding as much undelivered content for THIS counterparty as it will, so it " +
-      "refused the hand-off. That is about their mailbox, not your connection, and another relay " +
-      "would refuse it too. It clears when they come online and collect it, or when older entries " +
-      "expire. The message is queued and re-sent automatically."
-    );
-  }
-  if (cause === RELAY_PARK_REFUSALS.STORE_FULL) {
-    return (
-      "The relay's parked-content store is full, so it refused the hand-off. The link is fine and " +
-      "the message is queued and re-sent automatically. If this persists the relay operator needs " +
-      "to know — it means the store is under sustained pressure."
-    );
-  }
+
   return durable
     ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
     : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.";
