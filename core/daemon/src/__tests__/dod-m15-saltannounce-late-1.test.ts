@@ -62,8 +62,12 @@ function makeNodeWithPeerAlreadyAttached(peerId: string) {
 const SID = "5c".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
 
-/** A node reporting the counterparty ALREADY attached — the standing receiver's state at promotion. */
-function nodeWithPeerAttached(peerId: string): CelloNode {
+const RELAY_PEER = "12D3KooWFixtureRelay";
+/** The address the swept connection reports — the address-learn half must pick this up. */
+const PEER_ADDR = "/ip4/9.9.9.9/tcp/1";
+
+/** A node reporting a peer ALREADY attached — the standing receiver's state at promotion. */
+function nodeWithPeerAttached(peerId: string, remoteAddr: string = PEER_ADDR): CelloNode {
   return {
     async start() {}, async stop() {},
     getPeerId: () => "fake-local",
@@ -71,7 +75,7 @@ function nodeWithPeerAttached(peerId: string): CelloNode {
     async dial() { return { peerId }; },
     async handle() {}, getProtocols: () => [],
     // THE POINT: the peer is on the wire before anyone registers a connect listener.
-    getConnections: () => [{ peerId, id: "c1", status: "open", direction: "inbound", openedAt: Date.now(), streamCount: 1 }],
+    getConnections: () => [{ peerId, id: "c1", status: "open", direction: "inbound", openedAt: Date.now(), streamCount: 1, remoteAddr: `${remoteAddr}/p2p/${peerId}` }],
     onPeerConnect() {}, onPeerDisconnect() {},
     getDialability: () => ({ dialable: false, publicAddr: null }),
     onDialabilityChange: () => () => {},
@@ -112,6 +116,68 @@ describe("DOD-M15-SALTANNOUNCE-LATE-1 — DRIVEN THROUGH PRODUCTION", () => {
         "sides. This assertion is the only one in the file that can tell.",
     ).toBeGreaterThan(0);
     expect(String(noticed[0]!.ctx.peerId), "and it must be the counterparty, not the relay").toBe(PEER);
+
+    /**
+     * ⚠️ ASSERTING THE SWEEP'S OWN ANNOUNCEMENT IS NOT ENOUGH — review proved this test bypassable.
+     *
+     * Keeping the sweep and the log line but deleting the single call `onCounterpartyAttached(peerId)`
+     * left **all five tests green while the sweep did nothing.** The assertion above proves production
+     * NOTICED the peer; it proves nothing about the salt announce or the address learn, which are the
+     * entire reason this line exists. My comment calling it *"the only one in the file that can tell"*
+     * was true relative to the other four and still overclaimed.
+     *
+     * These assert the EFFECTS, and they die under that one-line bypass.
+     */
+    expect(
+      fx.eventsNamed("session.salt.announced").length,
+      "the salt must actually be ANNOUNCED for the already-attached peer — noticing it and doing " +
+        "nothing leaves the agreement unstarted, which is the outage this line exists to close",
+    ).toBeGreaterThan(0);
+    /**
+     * A SUBSTRING, not equality: what is stored is the full multiaddr including the `/p2p/<peerId>`
+     * suffix. My first version asserted exact membership and failed on a value that was CORRECT —
+     * the address was learned, it just carries the peer id. Asserting the shape the producer actually
+     * writes, rather than the shape I assumed.
+     */
+    const learned = fx.snm.getCounterpartyAddrsForTest("alice", SID);
+    expect(
+      learned.some((a) => a.startsWith(PEER_ADDR)),
+      "the counterparty's address must be LEARNED from that connection — the responder has no other " +
+        `source for it, so without this every send after an interruption parks with no error. Got: ${JSON.stringify(learned)}`,
+    ).toBe(true);
+  }, 60_000);
+
+  it("★★★ A RELAY CONNECT IS NOT A COUNTERPARTY CONNECT — the guard my refactor dropped", async () => {
+    /**
+     * ⚠️ THE REGRESSION THIS UNIT SHIPPED AND REVIEW MEASURED, pinned so it cannot return.
+     *
+     * Extracting the inline listener into a shared function left its first line behind:
+     * `if (!isCounterparty(peerId)) return;`. Every relay connect then ran the counterparty attach
+     * path — liveness flipped to `alive` for a dead counterparty, and the counterparty's re-dial
+     * address was overwritten with the RELAY's. That defeats `session.transport.redial.unavailable`,
+     * which fires on an EMPTY address list: the list was not empty, it was wrong. The operator sees
+     * no error at all while every send parks.
+     *
+     * **2925 daemon tests stayed green with the guard deleted**, because the existing keepalive test
+     * pins only the DISCONNECT side (*"a RELAY link dropping leaves counterparty liveness alone"*).
+     * Nothing pinned the connect side. That is the coverage gap that let it through, and this closes
+     * it.
+     */
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-saltannounce-relay-",
+      node: nodeWithPeerAttached(RELAY_PEER, "/ip4/8.8.8.8/tcp/4001"),
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    expect(
+      fx.eventsNamed("session.liveness.peer_already_attached").length,
+      "a RELAY peer must never be swept as the counterparty — it is not one",
+    ).toBe(0);
+    expect(
+      fx.snm.getCounterpartyAddrsForTest("alice", SID),
+      "and the relay's address must never be recorded as the counterparty's: that list being WRONG " +
+        "rather than EMPTY is what silences session.transport.redial.unavailable",
+    ).not.toContain("/ip4/8.8.8.8/tcp/4001");
   }, 60_000);
 });
 
