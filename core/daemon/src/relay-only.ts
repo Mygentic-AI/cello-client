@@ -54,6 +54,33 @@ export function isRelayOnly(getSetting: (key: string) => string | null): boolean
   return getSetting(RELAY_ONLY_KEY) === "true";
 }
 
+/**
+ * The setting's state when the read itself may fail — `"on" | "off" | "unknown"`.
+ *
+ * ⚠️ **"THE DATABASE IS GONE" IS NOT A VALUE, AND TREATING IT AS ONE FAILS TOWARD DISCLOSURE.**
+ * `getSetting` returns `null` both for *unset* and for *no database*, and `isRelayOnly` reads both
+ * as OFF. Unset-means-off is right; **db-gone-means-off is not** — the standing receiver outlives
+ * the database during shutdown, so an offer arriving in that window would publish the operator's
+ * real addresses with relay-only switched on.
+ *
+ * A read that THROWS is also `"unknown"` rather than an escaping exception: this sits on a ceremony
+ * path with no catch, where a throw becomes an unhandled rejection and the offer vanishes with no
+ * local log — the initiator then sees `counterparty_did_not_accept` and blames its own subsystem.
+ *
+ * The caller decides what `"unknown"` costs. For publishing, it must cost a refusal, never a guess.
+ */
+export function relayOnlyState(
+  getSetting: (key: string) => string | null,
+  readable: boolean,
+): "on" | "off" | "unknown" {
+  if (!readable) return "unknown";
+  try {
+    return getSetting(RELAY_ONLY_KEY) === "true" ? "on" : "off";
+  } catch {
+    return "unknown";
+  }
+}
+
 /** A session-transport endpoint as published to a counterparty. */
 export interface PublishableEndpoint {
   peerId: string;

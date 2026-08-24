@@ -63,6 +63,7 @@ import {
   isRelayOnly,
   publishableEndpoint,
   relayOnlyReachable,
+  relayOnlyState,
   dialableAddrs,
 } from "../relay-only.js";
 import { isValidSettingKey, validateSettingValue } from "../agent-settings-keys.js";
@@ -120,6 +121,28 @@ describe("DOD-M15-RELAYONLY-1 — the setting", () => {
     expect(isRelayOnly(() => "false"), "explicit false = off").toBe(false);
     expect(isRelayOnly(() => "true"), "explicit true = ON").toBe(true);
     expect(isRelayOnly(() => "yes"), "a value that never passed validation is not ON").toBe(false);
+  });
+
+  it("★★ A GONE DATABASE IS 'unknown', NOT 'off' — the difference is a disclosure", () => {
+    /**
+     * ⚠️ THE SILENT FALLBACK REVIEW FOUND, and it failed in the dangerous direction. `getSetting`
+     * answers `null` for BOTH "unset" and "there is no database", and reading them the same way
+     * means a shutdown window — where the standing receiver outlives the DB — publishes the
+     * operator's real addresses with relay-only switched on.
+     *
+     * Unset-means-off is correct. Db-gone-means-off is a leak. They must be different answers.
+     */
+    expect(relayOnlyState(() => "true", true), "readable and on").toBe("on");
+    expect(relayOnlyState(() => null, true), "readable and unset = off, as before").toBe("off");
+    expect(
+      relayOnlyState(() => null, false),
+      "NOT readable = unknown. Reading this as 'off' is what publishes a real address during shutdown.",
+    ).toBe("unknown");
+    expect(
+      relayOnlyState(() => { throw new Error("retired agent"); }, true),
+      "and a THROW is unknown rather than an escaping exception — this sits on a ceremony path with " +
+        "no catch, where it would become an unhandled rejection and the offer would vanish silently",
+    ).toBe("unknown");
   });
 });
 
@@ -278,11 +301,19 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
      * fails — which is the point, because every behavioural test above would still pass. They
      * exercise the pure functions; only this one pins that the daemon actually calls them.
      */
+    /**
+     * ⚠️ Reads the method's ACTUAL BODY — from its signature to its closing brace — rather than a
+     * fixed number of characters. The first version sliced 1200 chars and went red the moment the
+     * method grew, which is a guard that fails for a reason unrelated to what it guards. A test that
+     * cries wolf on formatting gets weakened or deleted, and then it protects nothing.
+     */
     const src = readFileSync(SNM_PATH, "utf8");
-    const method = src.slice(src.indexOf("getStandingReceiverInfo(agentName: string)"));
-    expect(method.length, "precondition: the method must be found at all — a rename makes this guard vacuous").toBeGreaterThan(0);
+    const start = src.indexOf("getStandingReceiverInfo(agentName: string)");
+    expect(start, "precondition: the method must be found at all — a rename makes this guard vacuous").toBeGreaterThan(0);
+    const end = src.indexOf("\n  }", start);
+    expect(end, "precondition: the method's closing brace must be locatable").toBeGreaterThan(start);
     expect(
-      method.slice(0, 1200),
+      src.slice(start, end),
       "getStandingReceiverInfo must pass its endpoint through publishableEndpoint — without it, " +
         "relay-only publishes the operator's real addresses and the setting is a placebo",
     ).toContain("publishableEndpoint");

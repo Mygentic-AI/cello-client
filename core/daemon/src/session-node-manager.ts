@@ -43,7 +43,7 @@ import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUN
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
-import { isRelayOnly, publishableEndpoint } from "./relay-only.js";
+import { isRelayOnly, publishableEndpoint, relayOnlyState, isCircuitAddr } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
@@ -3260,10 +3260,25 @@ export class SessionNodeManager {
     // would be a hand-kept list, and a fourth publish path added later would leak the operator's IP
     // while every test stayed green. At the choke point a new caller inherits the protection
     // instead of having to be told about it.
-    return publishableEndpoint(
-      { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() },
-      isRelayOnly((key) => this.getSetting(agentName, key)),
-    );
+    const endpoint = { peerId: sr.node.getPeerId(), addrs: sr.node.listenAddresses() };
+    // ⚠️ TRI-STATE, not a boolean, and the third state is the one that matters. `getSetting` answers
+    // `null` both for "unset" and for "there is no database", and reading the second as OFF fails
+    // TOWARD DISCLOSURE: the standing receiver outlives the DB during shutdown, so an offer arriving
+    // in that window would publish the operator's real addresses with relay-only switched on.
+    // `relayOnlyState` also absorbs a THROW — `#requireAgentId` throws for a retired agent, and this
+    // method is called from the offer ceremony inside a floating async with no catch, where the
+    // throw becomes an unhandled rejection and the offer vanishes with no local log.
+    const state = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== undefined);
+    if (state === "unknown") {
+      this.#logger.warn("settings.relay_only.unreadable", {
+        agentName,
+        impact:
+          "cannot tell whether relay-only is on, so this agent's session addresses are NOT published " +
+          "— refusing is the only safe direction, because publishing a real address is irreversible",
+      });
+      return { peerId: endpoint.peerId, addrs: endpoint.addrs.filter(isCircuitAddr) };
+    }
+    return publishableEndpoint(endpoint, state === "on");
   }
 
   /**
