@@ -310,6 +310,37 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
         "the signature is genuinely valid — a failing report must not turn that into a forgery claim",
       ).toEqual({ valid: true });
     });
+
+    it("★ a FAILED report does not spend the budget — one flaky log write must not silence it forever", async () => {
+      /**
+       * The key used to be recorded BEFORE the callback ran, so a single transient sink failure
+       * burned that `(version, nodeId)` for the process lifetime and the signal went permanently
+       * silent. That is the same "absence reads as safety" argument accepted for the adversary,
+       * with a flaky logger as the actor instead of an attacker.
+       */
+      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+        expires: "2020-01-01T00:00:00Z",
+      }) as unknown as ConsortiumManifest;
+      const provider = new TestManifestProvider(manifest);
+      void provider.loadAndVerify([], 0);
+
+      let failNext = true;
+      const seen: Array<{ nodeId: string }> = [];
+      const verifier = new ManifestDirectoryChallengeVerifier(provider, (info) => {
+        if (failNext) { failNext = false; throw new Error("sink down"); }
+        seen.push(info);
+      });
+      const { tbsBytes, signatureHex } = await goodChallenge();
+
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+      expect(seen, "the first report threw, so nothing was recorded").toEqual([]);
+
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+      expect(
+        seen.length,
+        "and the NEXT authentication must still report — a report that never landed was never made",
+      ).toBe(1);
+    });
   });
 
   it("returns { valid: false, reason: 'signature_invalid' } for wrong signature", async () => {
