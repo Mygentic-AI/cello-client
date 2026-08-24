@@ -191,16 +191,25 @@ export class ManifestDirectoryChallengeVerifier implements IDirectoryChallengeVe
       if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
         const seen = `${manifest.version}\u001f${nodeId}`;
         if (!this.#reportedLapsed.has(seen)) {
-          this.#reportedLapsed.add(seen);
           /**
-           * OUTSIDE the crypto try/catch's reach — its handler returns `signature_invalid`, so a
-           * throwing logger would have reported that this directory FORGED ITS IDENTITY PROOF.
-           * A reporting failure must never fail an authentication, and must never be described as
-           * one.
+           * ─── The inner catch is what holds the property, not this block's POSITION ────────────
+           *
+           * This code is lexically INSIDE the outer `try`, whose handler returns `signature_invalid`
+           * — so without the catch below, a throwing logger would report that this directory FORGED
+           * ITS IDENTITY PROOF. A reporting failure must never fail an authentication, and must
+           * never be described as one. (Said precisely because an earlier version of this comment
+           * claimed the position did the work; it does not.)
+           *
+           * ⚠️ AND THE BUDGET IS SPENT ONLY IF THE REPORT ACTUALLY LANDED — pass 2. `add(seen)` used
+           * to run BEFORE the call, so one transient sink failure burned the key for the process
+           * lifetime and the signal went permanently silent for that (version, node). That is the
+           * same "absence reads as safety" argument accepted for the adversary, with a flaky logger
+           * as the actor instead.
            */
           try {
             this.#onExpiredManifest?.({ nodeId, version: manifest.version, expires: manifest.expires });
-          } catch { /* a report is not a verdict */ }
+            this.#reportedLapsed.add(seen);
+          } catch { /* a report is not a verdict — and a failed one does not count as reported */ }
         }
       }
       return { valid: true };

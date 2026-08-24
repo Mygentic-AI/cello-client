@@ -399,13 +399,29 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
   const getManifestPeerIds = (): Set<string> | null => {
     const m = manifestProvider?.getCurrentManifest();
     if (!m) return null;
+    const ids = m.nodes.map((n) => n.peerId).filter((p): p is string => typeof p === "string" && p.length > 0);
+    /**
+     * ⚠️ REPORT ONLY IF A MEMBERSHIP SET IS ACTUALLY PRODUCED — pass 2, and this is the over-claim
+     * class that the register-handler rewording had just fixed, reintroduced by me in the consumer
+     * that review asked for.
+     *
+     * The first version reported BEFORE this filter. `ids.length === 0` returns `null`, and the
+     * caller treats `null` as **skip the membership check entirely** — so the event announced that
+     * "the set deciding which endpoints this daemon will accept came from a lapsed manifest" when no
+     * set was produced and nothing was decided. Not an edge case: `peerId` is OPTIONAL, and
+     * manifests written before the field existed carry none — for those the claim is ALWAYS false,
+     * and the once-per-version budget is spent saying it.
+     *
+     * `members` is the FILTERED count for the same reason: the member set is what survives the
+     * filter, not how many nodes the manifest lists.
+     */
     const validity = classifyManifestValidity(m, Date.now());
-    if (validity.state !== "valid" && validity.state !== "expiring_soon" && lapsedMembershipReportedFor !== m.version) {
+    if (ids.length > 0 && validity.state !== "valid" && validity.state !== "expiring_soon" && lapsedMembershipReportedFor !== m.version) {
       lapsedMembershipReportedFor = m.version;
       logger.warn("directory.membership.manifest.lapsed", {
         manifestVersion: m.version,
         state: validity.state,
-        members: m.nodes.length,
+        members: ids.length,
         impact:
           "the set deciding WHICH directory endpoints this daemon will accept came from a manifest " +
           "outside its validity window. A node removed from the consortium since then is still a " +
@@ -416,7 +432,6 @@ export function createConsortiumRouting(deps: ConsortiumRoutingDeps): Consortium
           "a running daemon offline. cello_status reports the window and where the manifest came from.",
       });
     }
-    const ids = m.nodes.map((n) => n.peerId).filter((p): p is string => typeof p === "string" && p.length > 0);
     return ids.length > 0 ? new Set(ids) : null;
   };
 

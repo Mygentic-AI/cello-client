@@ -304,6 +304,75 @@ describe("createConsortiumRouting", () => {
     expect(await routing.getFailoverEndpoint()).toEqual(primary);
   });
 
+  /**
+   * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — the FOURTH consumer, added because pass 1 found the line's
+   * own enumeration missed it, and tested because pass 2 found it shipped with no coverage at all.
+   *
+   * `getManifestPeerIds` is the consortium MEMBERSHIP set: it decides which directory endpoints are
+   * ACCEPTED. Read from a lapsed manifest, a node removed since the lapse is still a member by that
+   * reckoning — so it can still take the seat that coordinates a ceremony.
+   */
+  it("★ a LAPSED manifest is reported once, and does NOT stop an endpoint being accepted", async () => {
+    const logger = makeLogger();
+    const primary = { url: "https://primary.example.com", peerId: "12D3KooWPrimary", multiaddr: "/ip4/1.2.3.4/tcp/4001" };
+    const lapsed = makeManifest({
+      expires: new Date(Date.now() - 3_600_000).toISOString(),
+      // A peerId is REQUIRED for the claim to be true — see the next test.
+      nodes: [{ ...node("n1"), peerId: "12D3KooWPrimary" }, { ...node("n2"), peerId: "12D3KooWOther" }],
+    } as Partial<ConsortiumManifest>);
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(lapsed),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      directoryEndpointResolver: async () => primary as never,
+      logger,
+    });
+
+    expect(
+      await routing.getFailoverEndpoint(),
+      "the PERMIT half — refusing here accepts no directory at all and takes a running daemon offline",
+    ).toEqual(primary);
+    await routing.getFailoverEndpoint();
+
+    const warns = logger.warn.mock.calls.filter((c: unknown[]) => c[0] === "directory.membership.manifest.lapsed");
+    expect(warns.length, "reported once per manifest version, not once per resolution").toBe(1);
+    expect((warns[0]![1] as Record<string, unknown>)["state"]).toBe("expired");
+  });
+
+  it("★ a manifest with NO peer ids reports NOTHING — the claim would be false", async () => {
+    /**
+     * Pass 2's finding, and it is the over-claim class the register-handler wording had just been
+     * fixed for, reintroduced in the consumer that same review asked for.
+     *
+     * With no peerIds the filter yields an empty set and the function returns `null` — which the
+     * caller reads as **skip the membership check entirely**. So the event would announce that "the
+     * set deciding which endpoints this daemon will accept came from a lapsed manifest" when no set
+     * was produced and nothing was decided. **Not an edge case:** `peerId` is optional and manifests
+     * written before the field existed carry none, so for those the claim is ALWAYS false — and the
+     * once-per-version budget is spent saying it.
+     */
+    const logger = makeLogger();
+    const primary = { url: "https://primary.example.com", peerId: "12D3KooWPrimary", multiaddr: "/ip4/1.2.3.4/tcp/4001" };
+    const routing = createConsortiumRouting({
+      manifestProvider: makeProvider(makeManifest({
+        expires: new Date(Date.now() - 3_600_000).toISOString(),
+      })),
+      manifestVersionStore: makeVersionStore(),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      directoryEndpointResolver: async () => primary as never,
+      logger,
+    });
+
+    await routing.getFailoverEndpoint();
+    expect(
+      logger.warn.mock.calls.filter((c: unknown[]) => c[0] === "directory.membership.manifest.lapsed").length,
+      "no membership set was produced, so there is nothing to warn about — reporting here would " +
+        "spend the budget on a claim that is always false for a pre-peerId manifest",
+    ).toBe(0);
+  });
+
   it("resolveConsortiumRoster returns null when no manifest is configured — a single-node ceremony, not an empty roster", async () => {
     const logger = makeLogger();
     const routing = createConsortiumRouting({

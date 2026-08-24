@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
+import { registerRegisterHandler } from "../register-handler.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -105,61 +106,74 @@ describe("cello_register single-flight guard", () => {
 });
 
 /**
- * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — registration PROCEEDS on a manifest outside its window.
+ * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — registration PROCEEDS on a manifest outside its window, and
+ * says so.
  *
- * ⚠️ WRITTEN BECAUSE REVIEW MEASURED THAT THE BRANCH HAD NEVER RUN — 2869 daemon tests green and
- * zero coverage, because every test above builds a daemon with no `manifestProvider` at all.
+ * ⚠️ THIS REPLACES TWO SOURCE-TEXT ASSERTIONS THAT WERE HOLLOW, and the bypass is worth recording
+ * because it is subtle: they read the handler's own source and asserted a `logger.warn` appeared
+ * between two markers and no `return { ok: false` did. **Change one argument — pass `null` instead
+ * of the manifest to `classifyManifestValidity` — and the event never fires in production while
+ * both tests still pass**, because the text between the markers is byte-identical. They survived
+ * deletion and not neutering, which is the failure mode that actually ships.
  *
- * ─── WHY THIS IS A SOURCE ASSERTION AND NOT AN IPC ONE, STATED RATHER THAN GLOSSED ──────────────
- *
- * I wrote the IPC version first and it could not reach the branch. Two things stop it, and both are
- * worth knowing because each one CONFIRMS a claim this line rests on:
- *
- *   1. **A daemon will not START on an expired manifest** — *"the daemon cannot start with an
- *      unverified manifest when manifestProvider is configured."* That is the fail-closed startup
- *      gate the whole decision leans on, demonstrated instead of assumed, and it is exactly why the
- *      state can only be reached by a manifest lapsing under a daemon already running.
- *   2. **The check sits after `waitForSignalingConnected(…, 10_000)`** — deliberately, because it is
- *      about the DKG roster and not about attempting a registration. So reaching it in-process needs
- *      a live directory, which is a spine-lane cost for a log line.
- *
- * **The PERMIT half is the decision, and it is what this pins.** A later "make the three consumers
- * consistent" refactor turning this into a refusal would strand every running daemon whose manifest
- * lapsed — and with no test, nothing would go red. So the assertion is: the lapsed branch reports
- * and does NOT refuse.
+ * I wrote them because I could not reach the branch at IPC altitude: a daemon will not START on an
+ * expired manifest, and the check sits after a 10 s signaling wait. Both true — and both irrelevant,
+ * because `registerRegisterHandler` injects EVERY dependency on that path. The seam was one level
+ * down from where I was testing.
  */
-describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: the lapsed branch reports and does NOT refuse", () => {
-  it("★ the branch contains a warn and NO refusal — the permit half, pinned", async () => {
-    const { readFileSync } = await import("node:fs");
-    const src = readFileSync(join(import.meta.dirname, "..", "register-handler.ts"), "utf8");
+describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: a lapsed manifest is reported, and does NOT block", () => {
+  it("★ emits registration.manifest.lapsed AND still proceeds past it", async () => {
+    const warns: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const handlers = new Map<string, (p: Record<string, unknown> | undefined, c: string) => Promise<unknown>>();
+    const logger: Logger = {
+      debug() {}, info() {}, error() {},
+      warn(event, ctx) { warns.push({ event, ctx: (ctx ?? {}) as Record<string, unknown> }); },
+    };
 
-    const start = src.indexOf("const lapsed = manifestValidity.state");
-    expect(start, "the lapsed decision must exist").toBeGreaterThan(-1);
-    const end = src.indexOf("const consortiumRoster", start);
-    expect(end, "…and the roster resolution must follow it").toBeGreaterThan(start);
-    const branch = src.slice(start, end);
+    const expired = {
+      version: 3,
+      not_before: "2020-01-01T00:00:00Z",
+      expires: "2020-06-01T00:00:00Z",
+      nodes: [{ nodeId: "n1", pubkey: "aa".repeat(32), region: "local", provider: "gcp", endpoint: "http://127.0.0.1:1", role: "validator" }],
+    };
+
+    let reachedRoster = false;
+    registerRegisterHandler({
+      handlers: handlers as never,
+      logger,
+      keyProviders: new Map([["alice", { getPublicKey: async () => new Uint8Array(32).fill(1) } as never]]),
+      getPersistence: () => ({}) as never,
+      getAgentSignaling: () => ({ signaling: {} as never, getNode: () => null }),
+      // TRUE: the 10 s wait is the thing that stopped an IPC-level test reaching the branch.
+      waitForSignalingConnected: async () => true,
+      dropAgentSignaling: async () => {},
+      startAgentInternal: () => ({ ok: true }),
+      directoryEndpointResolver: async () => ({ peerId: "12D3KooWX", multiaddr: "/ip4/127.0.0.1/tcp/1" }) as never,
+      loadedAgents: [{ name: "alice", pubkey: "11".repeat(32), keyProvider: {} as never }],
+      registrationGuidance: () => "guidance",
+      manifestProvider: {
+        loadAndVerify: async () => expired as never,
+        getCurrentManifest: () => { reachedRoster = true; return expired as never; },
+        updateManifest: () => {},
+      } as never,
+    });
+
+    const handler = handlers.get("cello_register")!;
+    expect(handler, "the handler must be registered").toBeDefined();
+    await handler({ agent: "alice", preAuthToken: "t1" }, "conn-1").catch(() => undefined);
+
+    const lapsed = warns.find((w) => w.event === "registration.manifest.lapsed");
+    expect(
+      lapsed,
+      "the operator must be told the roster came from a manifest outside its window — a later " +
+        "dkg_below_threshold names an exit point with no cause anywhere",
+    ).toBeDefined();
+    expect(lapsed!.ctx["state"]).toBe("expired");
 
     expect(
-      branch.includes('logger.warn("registration.manifest.lapsed"'),
-      "the operator must be told — a bare dkg_below_threshold later names an exit point with no cause",
+      reachedRoster,
+      "and it must have gone ON to resolve the roster — the PERMIT half. Refusing here would strand " +
+        "a running daemon, since a restart without a replacement manifest never comes back",
     ).toBe(true);
-    expect(
-      /return\s*\{\s*ok:\s*false/.test(branch),
-      "and it must NOT refuse. Refusing would strand a running daemon, because a restart without a " +
-        "replacement manifest never comes back — this is the decision, not an oversight",
-    ).toBe(false);
-  });
-
-  it("★ it fires on every out-of-window state, not just `expired`", async () => {
-    const { readFileSync } = await import("node:fs");
-    const src = readFileSync(join(import.meta.dirname, "..", "register-handler.ts"), "utf8");
-    const start = src.indexOf("const lapsed = manifestValidity.state");
-    const branch = src.slice(start, src.indexOf("if (lapsed)", start));
-
-    // `unreadable_window` is the one that matters most: the hardened startup gate stops it booting,
-    // but a manifest POLLED IN after startup can still put a running daemon into it.
-    for (const state of ["expired", "unreadable_window", "not_yet_valid"]) {
-      expect(branch.includes(`"${state}"`), `${state} must be reported, not silently dealt against`).toBe(true);
-    }
   });
 });

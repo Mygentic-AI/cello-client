@@ -193,17 +193,27 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
            * emitted immediately before that refusal, so it is the line that explains an otherwise
            * bare `dkg_below_threshold` — which names an exit point and not a cause.
            */
+          /**
+           * ⚠️ ONE CAUSE OF A MULTI-CAUSE EXIT — pass 2, and the previous wording inverted the
+           * redundancy invariant in prose. `dkg_below_threshold` comes from a single comparison
+           * (`roster.length !== participants`) whose own comment names TWO causes: a node we reported
+           * is now unreachable, OR a manifest version skew. **An unreachable node is the routine
+           * one** — under the sovereign-node design a node being down is the expected steady state,
+           * not the exception. Saying "THIS is the cause" and "replace the trust anchor rather than
+           * retrying" told the operator to replace a threshold-signed anchor in the case where the
+           * correct move is to retry.
+           */
           impact:
             "the consortium roster this registration works from came from a manifest whose validity " +
-            "window is not currently open. Two gates stand behind this: a node whose identity rotated " +
-            "since is dropped at the dial layer, and a node removed from the directory's current " +
-            "manifest makes the participant counts disagree, which REFUSES the registration with " +
-            "dkg_below_threshold. So if this registration fails with that reason, THIS is the cause.",
+            "window is not currently open. This is ONE possible cause of a subsequent " +
+            "dkg_below_threshold — a directory node being momentarily unreachable is the more common " +
+            "one, and is expected rather than exceptional.",
           guidance:
             "Registration was NOT blocked here — blocking it would strand a running daemon, since a " +
             "restart without a replacement manifest does not come back. If it then fails with " +
-            "dkg_below_threshold, replace the trust anchor rather than retrying. cello_status reports " +
-            "the window and where your manifest came from.",
+            "dkg_below_threshold: RETRY FIRST, because an unreachable node is the usual cause. " +
+            "Replace the trust anchor only if cello_status shows the manifest window is the " +
+            "discrepancy.",
         });
       }
       const consortiumRoster = currentManifest
