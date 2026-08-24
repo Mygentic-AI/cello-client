@@ -1009,6 +1009,25 @@ export class SessionNodeManager {
    */
   #saltLastOutcome = new Map<string, "timeout" | "closed" | "persist_failed" | "announce_failed">();
   #hashedWithoutSalt = new Map<string, number>();
+
+  /**
+   * `#hashedWithSalt` — how many content hashes this session has computed UNDER its salt and not yet
+   * landed anywhere a count can see (`DOD-M15-SALTSPLIT-1`, review HIGH-2).
+   *
+   * The mirror of `#hashedWithoutSalt`, and it exists for the same window: a hash is computed, then a
+   * relay round trip happens, and only afterwards does the message appear as a leaf, a hold or an
+   * awaiting-ack entry. In between, every count reads zero.
+   *
+   * It is read by `#discardUnspentSalt` alone. "Unspent" must mean *nothing has been hashed under
+   * it*, and without this the answer is *nothing has FINISHED being hashed under it* — which is the
+   * question nobody asked, answered destructively.
+   *
+   * Never decremented on success: a salted hash that reaches the wire is spent forever, and unlike
+   * the unsalted counter there is no `abandonUnsaltedHash` equivalent to undo. It is cleared only
+   * with the rest of the session's caches. **For a discard decision, erring toward "spent" is the
+   * safe direction** — a salt kept is recoverable, a salt erased is not.
+   */
+  #hashedWithSalt = new Map<string, number>();
   #unsaltedAnnounced = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
@@ -4511,6 +4530,9 @@ export class SessionNodeManager {
      */
     this.#settleSaltPending(agentName, sessionId, "closed");
     this.#hashedWithoutSalt.delete(key);
+    // DOD-M15-SALTSPLIT-1 HIGH-2: goes with its mirror. The session is being torn down, so there is
+    // no discard decision left for it to protect.
+    this.#hashedWithSalt.delete(key);
     this.#unsaltedAnnounced.delete(key);
     this.#saltLastOutcome.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
@@ -9632,6 +9654,26 @@ export class SessionNodeManager {
   ): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> {
     const { salt, reason } = await this.#saltForHashing(agentName, sessionId);
     if (salt !== null) {
+      /**
+       * ⚠️ THE SALTED HASH MARKS ITSELF SPENT — `DOD-M15-SALTSPLIT-1` review pass 1, HIGH-2.
+       *
+       * The unsalted branch below has counted itself since review pass 2 F1, for a reason stated
+       * there in full: between hashing and `#trackAwaitingAck` there is a relay round trip, and in
+       * that window leaves, held content and awaiting-ack ALL read zero. **The salted direction was
+       * left with no counterpart**, which was harmless while nothing acted on the answer — and
+       * `#discardUnspentSalt` is the first code that acts on it destructively.
+       *
+       * Without this, a peer's `adoption_closed` frame arriving inside that window finds adoption
+       * "open", discards the salt, and the message already on the wire carries
+       * `content_hash_alg: hmac-salt-v1` with a hash **nobody — including this daemon — can ever
+       * recompute**. The alg is copied verbatim into the parked envelope on TTF expiry, so it
+       * survives the round trip that would otherwise have hidden it.
+       *
+       * A COUNT, not a bit, for the same reason the unsalted side is a count: two connections can be
+       * mid-send at once, and one finishing must not clear the claim the other is still relying on.
+       */
+      const key = this.#k(agentName, sessionId);
+      this.#hashedWithSalt.set(key, (this.#hashedWithSalt.get(key) ?? 0) + 1);
       const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
       return { hash: contentHashFor(content, { alg, salt }), alg };
     }
@@ -10184,6 +10226,20 @@ export class SessionNodeManager {
   #discardUnspentSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
     const held = this.#getSessionSalt(agentName, sessionId);
     if (held === null) return false;
+
+    /**
+     * ⚠️ IN-FLIGHT FIRST — `DOD-M15-SALTSPLIT-1` review HIGH-2. `#saltAdoptionClosed` cannot see a
+     * hash that has been computed under the salt but has not yet become a leaf, a hold or an
+     * awaiting-ack entry, and that gap is a full relay round trip wide.
+     */
+    const inFlight = this.#hashedWithSalt.get(this.#k(agentName, sessionId)) ?? 0;
+    if (inFlight > 0) {
+      this.#logger.info("session.salt.discard.refused", {
+        agentName, sessionId, correlationId, reason: "salted_hash_in_flight", inFlight,
+        impact: "the salt was NOT dropped: a message has already been hashed under it and is mid-send, so erasing it now would put a hash on the wire that nothing — including this daemon — could ever recompute. The session stays salted and the counterparty, which cannot adopt, will refuse what is in flight.",
+      });
+      return false;
+    }
 
     const adoption = this.#saltAdoptionClosed(agentName, sessionId);
     if (adoption.closed) {

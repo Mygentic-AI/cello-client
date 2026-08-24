@@ -128,6 +128,47 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     ).toBeNull();
   }, 60_000);
 
+  it("★★ A SALTED HASH MID-FLIGHT COUNTS AS SPENT — review HIGH-2", async () => {
+    /**
+     * The window no count could see. `#saltAdoptionClosed` sums leaves, held content and
+     * awaiting-ack entries; a hash that has been COMPUTED under the salt appears in none of them
+     * until a relay round trip later. So a closed frame landing in that window found adoption "open"
+     * and discarded the salt — while the message already on its way carried
+     * `content_hash_alg: hmac-salt-v1` and a hash **nobody could ever recompute**, this daemon
+     * included. The alg is copied verbatim into the parked envelope on expiry, so the round trip
+     * does not hide it either.
+     *
+     * Driven the way the reviewer specified: start the hash, do NOT await it, deliver the frame.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-saltsplit-inflight-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, contributionFrame(), PEER);
+    await wait(200);
+    const held = storedSalt(fx);
+    expect(held, "precondition: this side holds a salt").not.toBeNull();
+    expect(fx.snm.getSessionTree("alice", SID).size(), "precondition: no leaf yet, so every count reads zero").toBe(0);
+
+    // In flight: computed under the salt, nowhere a count can see it.
+    const hashing = fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("mid-flight"));
+    await fx.snm.handleContentFrameForTest("alice", SID, closedFrame(), PEER);
+    await wait(300);
+
+    expect(
+      storedSalt(fx),
+      "a message is already hashed under this salt and is mid-send — erasing it now puts a hash on " +
+      "the wire that nothing, including this daemon, could ever recompute",
+    ).toEqual(held);
+    expect(
+      fx.snm.getSessionContentSalt("alice", SID),
+      "and the cache must hold it too, or the in-flight send finishes against a salt this process has forgotten",
+    ).not.toBeNull();
+
+    const out = await hashing;
+    expect(out.alg, "the hash really was computed under the salt — otherwise this test proves nothing")
+      .toBe("hmac-sha256-salt-v1");
+  }, 60_000);
+
   it("★★ A SPENT SALT IS NEVER DISCARDED, AND THE SPLIT IS LOUD", async () => {
     /**
      * The unrecoverable half, and the reason the fix above is guarded rather than unconditional.
@@ -159,6 +200,23 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     expect(
       storedSalt(fx),
       "a spent salt must NEVER be discarded — those leaves are hashed under it and dropping it splits the transcript",
+    ).toEqual(spent);
+
+    /**
+     * ⚠️ ADDED BY REVIEW — THIS TEST HAD A SURVIVING MUTANT AND THE OTHER ONE DID NOT.
+     *
+     * Move `#sessionSalts.delete(...)` to the top of `#discardUnspentSalt`, before the guards, and
+     * both tests stayed green: the spent case never reaches the `UPDATE`, so the ROW still matched,
+     * and the `session.salt.split` check re-read through `#getSessionSalt`, which missed the cache,
+     * re-read the row, and quietly repopulated it. Meanwhile the product was split exactly the way
+     * this file's own comments warn about — unsalted in this process, salted after a restart.
+     *
+     * The unspent test asserted the cache; this one asserted only the row. Same method, two
+     * assertions, one blind spot.
+     */
+    expect(
+      fx.snm.getSessionContentSalt("alice", SID),
+      "the cache must survive too — clearing it while the row keeps the salt splits the transcript at the next restart",
     ).toEqual(spent);
 
     const split = fx.eventsNamed("session.salt.split");
