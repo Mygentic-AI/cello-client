@@ -143,6 +143,21 @@ export type SubmitResult =
       // return structure2_cbor.
       structure1_cbor?: Uint8Array;
       structure2_cbor?: Uint8Array;
+      /**
+       * DOD-M15-SEALWIRE-1 bullet 5, SENT half — OUR signature over `structure1_cbor`.
+       *
+       * It is already computed on the submit path (`keyProvider.sign(structure1)`) and put on the
+       * wire as `sender_signature`; it simply was not handed back, so the transcript row for a
+       * message THIS agent sent stored no proof of authorship at all.
+       *
+       * Why that matters and is not symmetry for its own sake: a RECEIVED row carries the
+       * counterparty's pubkey and signature, so a third party can check it. A SENT row carried
+       * `attribution: "self_authored"` and nothing else — fine for its owner, who already knows, and
+       * **worth nothing to the auditor the bullet exists for.** Half a transcript was provable.
+       *
+       * Undefined on the relay-degraded path, where no submit happens and there is nothing to sign.
+       */
+      sender_signature?: Uint8Array;
     }
   | {
       ok: false;
@@ -288,6 +303,13 @@ export class AgentRelayClient {
   // The sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
   // SubmitResult can carry it (the ack itself only returns the relay's structure2_cbor).
   #pendingStructure1: Uint8Array | null = null;
+  /**
+   * DOD-M15-SEALWIRE-1 bullet 5 (sent half) — OUR signature over the in-flight `#pendingStructure1`,
+   * paired with its ack for the same reason that one is: the ack returns the relay's record, never
+   * ours. Cleared wherever `#pendingStructure1` is cleared; the two must never drift apart, because
+   * a signature paired with the WRONG signed bytes is worse than no signature at all.
+   */
+  #pendingSignature: Uint8Array | null = null;
   // The in-flight submit's leaf kind (0x00 msg / 0x02 ctrl), paired with its ack so
   // #captureReceipt can persist it alongside the Structure2/Structure1 carry bytes for the unilateral seal.
   #pendingLeafKind: number | null = null;
@@ -461,6 +483,7 @@ export class AgentRelayClient {
     this.#pendingAck = null;
     this.#pendingAckSessionHex = null;
     this.#pendingStructure1 = null;
+    this.#pendingSignature = null;
     this.#pendingLeafKind = null;
     if (resolve) resolve(r);
   }
@@ -594,6 +617,8 @@ export class AgentRelayClient {
       const s2 = frame["structure2_cbor"];
       const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
       const structure1Cbor = this.#pendingStructure1 ?? undefined;
+      // Captured with structure1Cbor and BEFORE #settlePending clears both — see #pendingSignature.
+      const senderSignature = this.#pendingSignature ?? undefined;
       // Verify the relay's signed ordering record and durably store the receipt BEFORE
       // settling (which clears #pendingStructure1, the source of the content hash + session id). A
       // signed-but-INVALID ACK rejects the submit so the send does not settle ok on an unverified sequence.
@@ -602,7 +627,7 @@ export class AgentRelayClient {
         rejectSubmit
           ? { ok: false, reason: "relay_ack_signature_invalid" }
           : seq >= 0
-            ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor }
+            ? { ok: true, sequence_number: seq, structure1_cbor: structure1Cbor, structure2_cbor: structure2Cbor, sender_signature: senderSignature }
             : { ok: false, reason: "relay_ack_malformed" },
       );
     } else if (type === "hash_submit_error") {
@@ -1157,6 +1182,7 @@ export class AgentRelayClient {
     // Remember this submit's sender-signed structure1_cbor so its ack can return the full
     // ordering record (the ack itself carries only the relay's structure2_cbor).
     this.#pendingStructure1 = structure1;
+    this.#pendingSignature = signature;
     this.#pendingLeafKind = leafKind;
     try {
       stream.send(lp.encode.single(frame));
