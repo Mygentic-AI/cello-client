@@ -1,4 +1,9 @@
-node_modules/
+# NO TRAILING SLASH, deliberately. `node_modules/` matches DIRECTORIES only, and under the iCloud
+# workaround below every package's `node_modules` is a SYMLINK to `node_modules.nosync` — so the
+# slashed pattern missed all of them and `git status` reported a dozen untracked entries on a clean
+# checkout. That is not cosmetic: `j-canary` asserts `git status --porcelain` is empty in both repos,
+# so the canary could never pass on a normal dev machine.
+node_modules
 dist/
 *.tsbuildinfo
 .env
