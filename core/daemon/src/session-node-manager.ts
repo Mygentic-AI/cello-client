@@ -4639,10 +4639,43 @@ export class SessionNodeManager {
     } else {
       const interruptedAt = new Date(now).toISOString();
       try {
-        this.#db.prepare(
+        const res = this.#db.prepare(
           // DOD-CAP-SELF-HEAL-1: OURS. Our own shutdown ended these, not the counterparty.
           "UPDATE sessions SET status = 'interrupted', updated_at = ?, interrupted_at = COALESCE(interrupted_at, ?), interrupted_by = 'local' WHERE status = 'active'",
         ).run(now, interruptedAt);
+        /**
+         * ⚠️ THE AUTHORITATIVE PERSISTENCE STEP WAS SILENT ON SUCCESS, AND THAT IS WHY ITS OWN TEST
+         * CANNOT BE DIAGNOSED.
+         *
+         * `AC-009 (binary): SIGTERM marks active sessions interrupted` failed twice in a row on CI
+         * and blocked a publish. The captured daemon log ends at `daemon.started` with nothing after
+         * it — because the ONLY thing this block could ever log was a thrown error. So the evidence
+         * is equally consistent with two very different failures:
+         *
+         *   - the shutdown never ran (signal handler, early exit, teardown ordering), or
+         *   - it ran and the UPDATE matched ZERO rows (visibility, or the rows genuinely were not
+         *     `active` at that moment).
+         *
+         * Nothing in the log separates them, so the test's own comment picked one — *"the daemon's
+         * connection can begin its shutdown UPDATE against a snapshot that predates this commit"* —
+         * added a `wal_checkpoint(TRUNCATE)` for it, and the test failed again. One diagnosis, one
+         * fix, one recurrence: the point at which the diagnosis is the thing to doubt.
+         *
+         * `changes` was on the result object the whole time and nobody read it. It discriminates the
+         * two outright, and this is the last line the daemon writes before it dies, so it is the last
+         * thing anyone investigating a bad shutdown will see.
+         *
+         * ⚠️ INFO AND NOT AN ERROR EVEN AT ZERO. Zero is the ordinary case for a daemon with no
+         * active sessions — most shutdowns. Making it a warning would fire on nearly every clean exit
+         * and train operators to filter the one signal that matters.
+         */
+        this.#logger.info("session.interrupt.db.write.complete", {
+          sessionId: "__all__",
+          rowsMarkedInterrupted: Number(res.changes),
+          impact: Number(res.changes) === 0
+            ? "no session rows were 'active' at shutdown, so none was marked interrupted. Ordinary for a daemon with no live sessions — but if a session WAS expected to be interrupted, the UPDATE ran and matched nothing, which is a visibility or state question and NOT a shutdown that failed to run."
+            : "these sessions are recorded as interrupted by OUR OWN shutdown, so they can be resumed or sealed rather than read as abandoned.",
+        });
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
           sessionId: "__all__",
