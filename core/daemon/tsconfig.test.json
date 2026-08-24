@@ -31,6 +31,10 @@
     // "the mutants are typecheck failures now" is not true.
     // Added on creation, per the trap in RESUME STATE: a test file outside this list is one where
     // "the mutants are typecheck failures now" is not true.
+    // DOD-M15-RELAYONLY-1. New and clean on creation, which is this list's admission criterion —
+    // and a privacy control is exactly the kind of unit where "the mutants are typecheck failures
+    // now" needs to be true rather than assumed.
+    "src/__tests__/dod-m15-relayonly-1.test.ts",
     "src/__tests__/dod-m15-salt-adoption-rule.test.ts",
     "src/__tests__/dod-m15-salt-capability-signal.test.ts",
     "src/__tests__/dod-m15-send-consults-the-salt.test.ts",
@@ -60,6 +64,12 @@
     // its job at the cost of hiding the very breakage the signature change was meant to make loud.
     // Added here because a required parameter that no compiler checks is a comment.
     "src/__tests__/msg-007-index-discipline.test.ts",
+    // DOD-M15-SALTSPLIT-1's own two files. New and clean on creation, which is this list's stated
+    // admission criterion — and I nearly shipped them OUTSIDE it in the same session I widened the
+    // list for someone else's breakage. That is the whole trap in one move: the allowlist protects
+    // what you remember to add, so the files most likely to be missing are your own newest ones.
+    "src/__tests__/dod-m15-salt-peer-closed-convergence.test.ts",
+    "src/__tests__/dod-m15-saltsplit-1-closed-is-not-empty.test.ts",
     // ⚠️ `m12-p14-seal-readiness.test.ts` is NOT here, and the omission is measured rather than
     // assumed. Its nine-argument `placeOwnLeaf` calls are fixed in the same commit, but adding the
     // file surfaces FIVE pre-existing errors that have nothing to do with this unit: four
