@@ -527,60 +527,115 @@ export function createContentPark(deps: ContentParkDeps) {
      * relay rather than envelope semantics.
      */
     handlers.set("content_park_deposit", async (params, _connectionId) => {
+      /**
+       * `Buffer.from(x, "hex")` TRUNCATES at the first invalid pair instead of throwing — the trap
+       * `park-envelope.ts` already documents. Unvalidated, a typo'd `content` is signed and sealed at
+       * its truncated length and surfaces at the far end as `content_hash_mismatch`: a TAMPER verdict
+       * on a local argument mistake. Review MEDIUM-4.
+       */
+      const hexOrNull = (v: unknown): string | null =>
+        typeof v === "string" && v.length % 2 === 0 && /^[0-9a-fA-F]*$/.test(v) ? v : null;
+
       const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
-      const recipientPubkey = params?.recipientPubkey as string | undefined;
-      const contentHash = params?.contentHash as string | undefined;
-      const sessionId = params?.sessionId as string | undefined;
-      const ciphertext = params?.ciphertext as string | undefined;
-      const content = params?.content as string | undefined;
+      const recipientPubkey = hexOrNull(params?.recipientPubkey);
+      const contentHash = hexOrNull(params?.contentHash);
+      const sessionId = hexOrNull(params?.sessionId);
       const senderAgentName = params?.senderAgentName as string | undefined;
+      const hasCiphertext = params?.ciphertext !== undefined;
+      const hasContent = params?.content !== undefined;
+
       if (!relay || !recipientPubkey || !contentHash || !sessionId) {
-        return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId — all hex." };
+        const bad = [
+          !relay ? "relayMultiaddr (needs /p2p/<peerId>)" : null,
+          recipientPubkey === null ? "recipientPubkey" : null,
+          contentHash === null ? "contentHash" : null,
+          sessionId === null ? "sessionId" : null,
+        ].filter(Boolean);
+        return { ok: false, reason: "missing_params", guidance: `Missing or not even-length hex: ${bad.join(", ")}. Hex is validated here because Buffer.from truncates silently, and a truncated value is signed and refused at the far end as a content hash mismatch.` };
       }
-      if (!ciphertext && content === undefined) {
+      if (!hasCiphertext && !hasContent) {
         return { ok: false, reason: "missing_params", guidance: "Provide either `content` (plaintext hex — sealed and SIGNED here, the production shape) or `ciphertext` (hex — deposited verbatim, no envelope)." };
       }
-      if (ciphertext && content !== undefined) {
+      if (hasCiphertext && hasContent) {
         return { ok: false, reason: "conflicting_params", guidance: "Provide `content` OR `ciphertext`, not both — they are two different deposit shapes and honouring one would silently discard the other." };
       }
+
+      /**
+       * ⚠️ PARSED BEFORE THE BRANCH, and refused on the raw branch rather than dropped — review
+       * HIGH-2, and it was the same defect this parameter exists to prevent, reintroduced one branch
+       * over. It used to be read INSIDE the `content` branch, so `ciphertext` + `contentHashAlg`
+       * discarded the algorithm in silence: the far end then resolves the absent field to `sha256`,
+       * recomputes unsalted, and reports `content_hash_mismatch` — a tamper verdict on an honest
+       * message, with nothing on the sender side logging anything at all.
+       *
+       * A raw deposit has nowhere to PUT the name (there is no envelope), so naming one is a
+       * contradiction, not a preference. Refuse it.
+       */
+      let contentHashAlg: string | undefined;
+      const rawAlg = params?.contentHashAlg;
+      if (rawAlg !== undefined && rawAlg !== null) {
+        if (typeof rawAlg !== "string" || !isKnownContentHashAlg(rawAlg)) {
+          return { ok: false, reason: "unknown_content_hash_alg", guidance: `This daemon cannot compute "${typeof rawAlg === "string" ? rawAlg : `(${typeof rawAlg})`}". Known algorithms: ${Object.values(CONTENT_HASH_ALGS).join(", ")}. Omit the field to mean ${CONTENT_HASH_ALGS.SHA256}.` };
+        }
+        if (hasCiphertext) {
+          return { ok: false, reason: "conflicting_params", guidance: "`contentHashAlg` cannot ride with `ciphertext`: a raw deposit carries no envelope, so there is nowhere to record the algorithm and the far end would recompute under sha256 and report a content hash mismatch on honest content. Use `content` to deposit under a named algorithm." };
+        }
+        contentHashAlg = rawAlg;
+      }
+
       const node = sessionNodeManager.getStandingReceiverNode();
       if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
 
       let payload: Uint8Array;
-      if (content !== undefined) {
-        // Which agent signs. Named explicitly when given; otherwise the only local agent, and if
-        // there is more than one we REFUSE rather than pick — silently signing as the wrong sender
-        // would produce an entry the recipient authenticates against a pubkey nobody expected, and
-        // the resulting failure would surface at recover time as a signature mismatch with no clue
-        // that the wrong key was chosen here.
-        const candidates = senderAgentName ? agents.filter((a) => a.name === senderAgentName) : agents;
+      if (hasContent) {
+        const content = hexOrNull(params?.content);
+        if (content === null) {
+          return { ok: false, reason: "missing_params", guidance: "`content` is not even-length hex. It is validated because Buffer.from truncates silently, and a truncated body is sealed at the wrong length and refused at the far end as a content hash mismatch." };
+        }
+        /**
+         * Which agent signs. Named explicitly when given; otherwise the only local agent that COULD
+         * sign, and if there is more than one we REFUSE rather than pick — silently signing as the
+         * wrong sender produces an entry the recipient authenticates against a pubkey nobody
+         * expected, surfacing at recover time as a signature mismatch with no clue the wrong key was
+         * chosen here.
+         *
+         * `load_failed` agents are excluded (review LOW-5): they hold no key provider, so listing
+         * one as a candidate makes a daemon with one healthy agent report `ambiguous_sender` and
+         * name a candidate that cannot sign.
+         */
+        const signable = agents.filter((a) => a.state !== "load_failed");
+        const candidates = senderAgentName ? signable.filter((a) => a.name === senderAgentName) : signable;
         if (candidates.length === 0) {
-          return { ok: false, reason: "agent_not_found", guidance: senderAgentName ? `No local agent named '${senderAgentName}' to sign this deposit.` : "This daemon has no local agent to sign the deposit." };
+          return { ok: false, reason: "agent_not_found", guidance: senderAgentName ? `No local agent named '${senderAgentName}' that can sign this deposit.` : "This daemon has no loadable local agent to sign the deposit." };
         }
         if (candidates.length > 1) {
-          return { ok: false, reason: "ambiguous_sender", guidance: `This daemon has ${candidates.length} local agents (${candidates.map((a) => a.name).join(", ")}); pass senderAgentName to say which one signs.` };
+          return { ok: false, reason: "ambiguous_sender", guidance: `This daemon has ${candidates.length} signable agents (${candidates.map((a) => a.name).join(", ")}); pass senderAgentName to say which one signs.` };
         }
-        const signer = getKeyProvider(candidates[0]!.name);
-        if (!signer) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${candidates[0]!.name}' is not loaded.` };
+        const signerAgent = candidates[0]!;
+
         /**
-         * The algorithm `contentHash` was computed under must travel WITH it, and omitting it is not
-         * neutral — absent means `sha256`. A caller depositing a SALTED hash and saying nothing gets
-         * the entry recomputed unsalted at the far end, which surfaces as `content_hash_mismatch`:
-         * a TAMPER report on a message nobody touched. That is the failure this parameter exists to
-         * prevent, and it is exactly what the dedup path hit.
+         * ⚠️ BIND THE SIGNATURE TO A SESSION THIS DAEMON ACTUALLY HOLDS — review HIGH-1.
          *
-         * Refused rather than defaulted when the name is unreadable, matching `resolveContentHashAlg`
-         * on the receive side: there is no correct hash to compare against, so guessing produces a
-         * confident wrong answer.
+         * Both production producers derive `(sessionId, recipientPubkey)` from a session record;
+         * this handler took them from the caller and signed whatever pair it was handed. A caller
+         * passing the wrong session id or the wrong recipient therefore got a perfectly-formed
+         * SIGNED entry, which the far end refuses as `bad_signature` / `signer_not_counterparty` —
+         * **an attack verdict for a local argument mistake** — and a refused entry is deliberately
+         * never confirm-deleted, so it re-pulls forever.
+         *
+         * `getSessionRecord` returns the row regardless of status, so a COMMITTED session still
+         * resolves and the post-seal straggler case keeps working.
          */
-        let contentHashAlg: string | undefined;
-        const rawAlg = params?.contentHashAlg;
-        if (rawAlg !== undefined && rawAlg !== null) {
-          if (typeof rawAlg !== "string" || !isKnownContentHashAlg(rawAlg)) {
-            return { ok: false, reason: "unknown_content_hash_alg", guidance: `This daemon cannot compute "${typeof rawAlg === "string" ? rawAlg : `(${typeof rawAlg})`}". Known algorithms: ${Object.values(CONTENT_HASH_ALGS).join(", ")}. Omit the field to mean ${CONTENT_HASH_ALGS.SHA256}.` };
-          }
-          contentHashAlg = rawAlg;
+        const record = sessionNodeManager.getSessionRecord(signerAgent.name, sessionId);
+        if (!record) {
+          return { ok: false, reason: "session_not_found", guidance: `Agent '${signerAgent.name}' holds no session ${sessionId.slice(0, 16)}…. Signing a park entry for a session this daemon does not hold produces bytes the recipient can only read as a forgery.` };
         }
+        if ((record.counterparty_pubkey ?? "").toLowerCase() !== recipientPubkey.toLowerCase()) {
+          return { ok: false, reason: "session_recipient_mismatch", guidance: `Session ${sessionId.slice(0, 16)}… has counterparty ${(record.counterparty_pubkey ?? "(none)").slice(0, 16)}…, not ${recipientPubkey.slice(0, 16)}…. Refused rather than signed: the entry would authenticate against a key the recipient never expects and be reported as a bad signature — an attack verdict for a wrong argument.` };
+        }
+
+        const signer = getKeyProvider(signerAgent.name);
+        if (!signer) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${signerAgent.name}' is not loaded.` };
         payload = await sealParkEnvelope({
           signer,
           sessionIdHex: sessionId,
@@ -590,7 +645,11 @@ export function createContentPark(deps: ContentParkDeps) {
           ...(contentHashAlg !== undefined ? { contentHashAlg } : {}),
         });
       } else {
-        payload = Buffer.from(ciphertext!, "hex");
+        const ciphertext = hexOrNull(params?.ciphertext);
+        if (ciphertext === null) {
+          return { ok: false, reason: "missing_params", guidance: "`ciphertext` is not even-length hex." };
+        }
+        payload = Buffer.from(ciphertext, "hex");
       }
 
       const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
