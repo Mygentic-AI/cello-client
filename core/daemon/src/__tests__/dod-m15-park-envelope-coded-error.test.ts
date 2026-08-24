@@ -149,6 +149,42 @@ describe("DOD-M15-SEALWIRE-1 B2b-2 constraint 6: the park refusal is CODED, not 
     ).toBe(PARK_ENVELOPE_REASONS.ALG_UNREADABLE);
   }, 60_000);
 
+  it("★★ the code crosses the IPC BOUNDARY too — an agent cannot branch on a paragraph", async () => {
+    /**
+     * ⚠️ ONE LAYER OUT FROM THE TEST ABOVE, and the layer that actually matters to a caller.
+     *
+     * `sendContent` carried `cause` correctly; the IPC boundary then dropped it and answered with
+     * `reason: "session_stream_unavailable"` — an EXIT-POINT label — leaving the real cause inside
+     * the English `guidance`. So an MCP agent wanting to tell "throttled, wait 45 seconds" from
+     * "this counterparty's mailbox is full, another relay will not help" from "this build cannot
+     * seal it" was back to substring-matching prose, which is precisely what `cause` exists to
+     * prevent. Three newly-distinguishable causes had just landed and none reached the agent.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-park-ipc-", node: new FakeNode({ newStreamFails: true }) as unknown as CelloNode });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER, { relay: true });
+    fx.snm.setContentParkHook(realSealHook);
+
+    const client = await fx.connectAs("alice");
+    const res = (await client.send("cello_send", {
+      session_id: SID,
+      content: "a message whose algorithm this build cannot reproduce",
+      content_hash_alg: "sha3-512-someday",
+    })) as { ok?: boolean; reason?: string; cause?: string; guidance?: string };
+
+    expect(res.ok, "precondition: the send must fail, or nothing below is being tested").toBe(false);
+    expect(
+      res.cause,
+      "the machine-readable cause must cross the boundary. Without it the agent has only `reason`, " +
+        "which names where the failure surfaced rather than what happened, and the real answer is " +
+        "buried in a paragraph it would have to parse.",
+    ).toBeDefined();
+    expect(
+      res.reason,
+      "and `reason` is still the exit point — the two are different fields on purpose, not " +
+        "duplicates",
+    ).not.toBe(res.cause);
+  }, 60_000);
+
   it("★ and the operator is NOT told the relay refused it, nor that it will re-send itself", async () => {
     /**
      * ⚠️ THE ASSERTION THIS UNIT EXISTS FOR, and it is about what the person reading the error does

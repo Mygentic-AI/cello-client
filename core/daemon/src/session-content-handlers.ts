@@ -591,6 +591,19 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         return {
           ok: false,
           reason: sendResult.reason,
+          /**
+           * DOD-M15-RELAYABUSE-1 review MEDIUM-7 — **THE CODE MUST CROSS THE BOUNDARY, NOT JUST THE
+           * PARAGRAPH.**
+           *
+           * `reason` here is `session_stream_unavailable` — an EXIT-POINT label. The actual cause
+           * (throttled / this counterparty's mailbox is full / the relay's store is full / this
+           * build cannot seal the algorithm) was computed, logged, and then left inside the English
+           * `guidance`. So an MCP caller wanting to tell "wait 45 seconds" from "another relay will
+           * not help" was back to substring-matching prose — which is exactly what `cause` was added
+           * to stop. Three newly-distinguishable causes had just landed and none of them reached the
+           * agent that would act on them.
+           */
+          ...(sendResult.cause !== undefined ? { cause: sendResult.cause } : {}),
           queued: true,
           // Carried on BOTH paths: without it a caller cannot tell "queued and in the record" from
           // "queued and not in the record yet".
@@ -602,6 +615,9 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       return {
         ok: false,
         reason: sendResult.reason,
+        // DOD-M15-RELAYABUSE-1 review MEDIUM-7: the machine-readable cause crosses here too — see
+        // the note on the queued return above. `reason` is the exit point; `cause` is what happened.
+        ...(sendResult.cause !== undefined ? { cause: sendResult.cause } : {}),
         // M12-P12 (review pass 2): sendContent knows whether the content is actually recoverable;
         // this boundary used to overwrite that with one sentence promising a retry for EVERY
         // failure — including a persist that threw, where the message is simply gone, and a session
