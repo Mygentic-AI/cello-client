@@ -1858,9 +1858,22 @@ export class SessionNodeManager {
         -- transcript is only ever read by its owner, and worthless the moment it is shown to anyone
         -- else — which is the whole point of a notarized record.
         --
-        -- sender_sig is the Structure-2 signature, and it is stored ONLY after the receiver has
-        -- already verified it against the pubkey inside the sender's own signed bytes
-        -- (#recordFrameOrdering). A stored signature here is a VERIFIED one, never a claimed one.
+        -- sender_sig holds one of TWO things, and which one is told by `direction`:
+        --   RECEIVED row -> the Structure-2 signature, stored ONLY after the receiver verified it
+        --                   against the pubkey inside the sender's own signed bytes
+        --                   (#recordFrameOrdering). Verified, never claimed.
+        --   SENT row     -> OUR OWN signature over the Structure-1 bytes we put on the wire, taken
+        --                   from the submit result. Produced, not verified — there was no
+        --                   counterparty in the act, so it must NEVER be labelled verified_signature.
+        --
+        -- ⚠️ `self_authored` COVERS TWO PROVENANCES, and `sender_sig IS NOT NULL` is the discriminator.
+        -- Named here because it is the same shape this column exists to prevent, one level up: a
+        -- provable sent row and an unprovable one share a label, so a reader keying on `attribution`
+        -- alone cannot tell them apart. An unprovable sent row is legitimate — an UNWITNESSED send
+        -- never put a Structure 1 on the wire, so there is nothing signed to store — but the reader
+        -- has to be told where the distinction lives, or it will be rediscovered as a bug.
+        --   self_authored + sender_sig NOT NULL -> we wrote it and can prove we did
+        --   self_authored + sender_sig NULL     -> we wrote it; the relay never witnessed it
         --
         -- attribution is NOT NULL ON PURPOSE, and it is the load-bearing column. There is a soft
         -- path — session.content.ordering.decode_failed falls back to hash-dedup — that ingests a
