@@ -31,10 +31,27 @@
  *      in shipped code, and it is unit-exact rather than incidental.
  *   2. **The honest negative** — an unwitnessed send stores no signature and fabricates none.
  *
- * **STILL NOT COVERED, and named so it is not mistaken for done:** a WITNESSED send driven end to
- * end, asserting the stored row carries the proof. That needs a relay that actually acks;
- * `m8c-away-1.test.ts` has one (`makeFakeRelayServerOneshot` plus its node subclass), and promoting
- * it into a shared helper is the way in. **Carried, not silently skipped.**
+ * ⚠️ **THAT PARAGRAPH WAS STALE AND IS DELETED — review F3.** It said a witnessed end-to-end send was
+ * *"STILL NOT COVERED"* and pointed at `m8c-away-1.test.ts` for a relay to promote. **This file
+ * already defines `makeAckingRelay` below and `★★ THE WITNESSED SEND, END TO END` already does it** —
+ * both were here before the commit that kept the paragraph. The DoD carried the same dead sentence.
+ *
+ * That is not cosmetic. **A header naming a gap that is closed, while not naming the gap that is
+ * open, steers the next auditor away from the only thing still missing** — which is how this bullet
+ * was closed wrongly twice.
+ *
+ * ─── WHAT IS ACTUALLY COVERED HERE, AND WHAT IS COVERED NEXT DOOR ─────────────────────────────
+ *
+ * This file covers the **CARRIER**: its held-path test calls `snm.placeOwnLeaf(...)` DIRECTLY with a
+ * hand-built proof, proving the held entry carries authorship through to the released row.
+ *
+ * It does **NOT** cover the **CALL SITES**. No production call site is in its call graph, so mutating
+ * both `placeOwnLeaf` calls in `session-content-handlers.ts` to `undefined` leaves the entire package
+ * green — 278 files, 2910 tests, zero red. `dod-m15-sealwire-1-held-authorship.test.ts` is the one
+ * that drives a real `cello_send` through those call sites and reddens on that mutation.
+ *
+ * **The two are not duplicates and must not be merged or deleted for looking alike.** One was deleted
+ * on exactly that reasoning and had to be restored.
  */
 
 import { describe, it, expect, afterEach } from "vitest";
@@ -295,7 +312,17 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
         "placeOwnLeaf's authorship argument is doing nothing, which is exactly what shipped and " +
         "exactly what the delivered-path mutation could not see.",
     ).not.toBeNull();
-    expect(rows[0]!.sender_sig!.length, "a 64-byte Ed25519 signature, intact across the hold").toBe(64);
+    /**
+     * ⚠️ THE VALUE, NOT THE LENGTH — review F2. This asserted `length === 64` and never compared the
+     * bytes, so a release path storing a WRONG but well-formed 64 bytes passed: a zero fill, a
+     * truncated key, or the signature belonging to a different message in the same session. "Some
+     * 64 bytes arrived" is not the property; "THIS proof arrived" is.
+     */
+    expect(
+      Buffer.from(rows[0]!.sender_sig!),
+      "the exact signature handed to the hold must be the one that reaches the row — a different " +
+        "well-formed 64 bytes is a proof of nothing and would have passed the length check",
+    ).toEqual(Buffer.from(proof.senderSig));
     expect(rows[0]!.sender_pubkey, "and the key it verifies against").toBe("11".repeat(32));
     expect(rows[0]!.attribution, "we wrote it, so self_authored — with a proof attached").toBe("self_authored");
   });
