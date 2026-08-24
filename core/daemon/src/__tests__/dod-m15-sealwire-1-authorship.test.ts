@@ -161,6 +161,71 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — the transcript records HOW a message i
     ).toEqual(["self_authored", "local_session_state"]);
   });
 
+  it("★ A SENT ROW CAN CARRY OUR OWN SIGNATURE — and is still `self_authored`, not `verified`", async () => {
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5, SENT half.
+     *
+     * ─── The asymmetry this closes ───────────────────────────────────────────────────────────────
+     *
+     * A RECEIVED row carries the counterparty's pubkey and signature, so a third party can check it.
+     * A SENT row carried `self_authored` and nothing else — **fine for its owner, who already knows
+     * what they wrote, and worth nothing to the auditor this bullet exists for.** Half the transcript
+     * was provable. The signature was never missing: the submit path already computes
+     * `keyProvider.sign(structure1)` and puts it on the wire; it simply was not handed back.
+     *
+     * ─── Why `self_authored` MUST survive the signature ─────────────────────────────────────────
+     *
+     * The obvious move is to reuse `verified_signature` now that a signature is present. **That
+     * would be false.** Nobody verified anything here — there was no counterparty in the act, and no
+     * key was checked against anything. We PRODUCED this signature. Collapsing "I wrote it" into "I
+     * checked someone else's" is the same defect the third enum value was added to prevent, one turn
+     * further on: two rows with different provenance wearing one label.
+     *
+     * So the attribution expression now decides on DIRECTION FIRST, and this test is what holds that
+     * ordering in place — swap it back and this reddens while everything else stays green.
+     */
+    const h = await startWithAgent("alice");
+    const mgr = h.getSessionNodeManager();
+    const ourPubkey = new Uint8Array(32).fill(0x7e);
+    const ourSig = new Uint8Array(64).fill(0x5a);
+
+    mgr.recordTranscriptMessage(
+      "alice", "s-sent-signed", 0, "sent", new TextEncoder().encode("I agree to the terms"), "t-sent",
+      { senderPubkey: ourPubkey, senderSig: ourSig },
+    );
+
+    const [row] = rowsFor("s-sent-signed");
+    expect(
+      row!.attribution,
+      "a message WE wrote is self_authored even when it carries a signature — we produced that " +
+        "signature, we did not verify anyone else's, and the two are different facts about the row",
+    ).toBe("self_authored");
+    expect(
+      row!.sender_pubkey,
+      "and the proof is stored, so the row is checkable by someone who is not its owner",
+    ).toBe("7e".repeat(32));
+    expect(
+      row!.sender_sig === null ? null : Buffer.from(row!.sender_sig).toString("hex"),
+      "the 64-byte signature over the Structure-1 bytes we put on the wire",
+    ).toBe("5a".repeat(64));
+  });
+
+  it("★ a sent row with NO signature is still self_authored, and still carries nothing", async () => {
+    /**
+     * The relay-degraded path: no submit happens, so there is nothing to sign and nothing to store.
+     * The row must not pretend otherwise — this is the pair to the test above, and without it a
+     * change that always stamped a placeholder signature would pass.
+     */
+    const h = await startWithAgent("alice");
+    const mgr = h.getSessionNodeManager();
+    mgr.recordTranscriptMessage("alice", "s-sent-bare", 0, "sent", new TextEncoder().encode("hi"), "t-bare");
+
+    const [row] = rowsFor("s-sent-bare");
+    expect(row!.attribution).toBe("self_authored");
+    expect(row!.sender_sig, "no submit, no signature — never a placeholder").toBeNull();
+    expect(row!.sender_pubkey).toBeNull();
+  });
+
   it("THE DISTINCTION: a proven row and an assumed row are told apart by the STORED record alone", async () => {
     /**
      * This is the assertion the bullet is actually about, and the reason the other two are not
