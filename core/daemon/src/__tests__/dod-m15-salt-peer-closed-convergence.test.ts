@@ -1,5 +1,6 @@
 /**
- * WHEN THE PEER CLOSES ADOPTION, "NEITHER SIDE WILL USE A SALT" HAS TO BE TRUE —
+ * WHEN THE PEER CLOSES ADOPTION, "NEITHER SIDE WILL USE A SALT" HAS TO BE TRUE — AND NOTHING
+ * IRREVERSIBLE MAY HANG ON THEIR SAY-SO —
  * `DOD-M15-SALTSPLIT-1`, found from a live `CLOSEROOT-1` lead.
  *
  * ─── The user-visible failure, which is the worst kind this milestone has ─────────────────────
@@ -29,22 +30,37 @@
  *
  * ─── The counterbalance, named before the code ───────────────────────────────────────────────
  *
- * Discarding a salt is destructive, and there is exactly one condition under which it is safe: this
- * side has hashed NOTHING under it yet. That is not a guess about timing — it is the same frontier
- * question `#saltAdoptionClosed` already answers, and the branch has already computed it. Where our
- * own adoption is still open, no leaf, no hold and no pending hash used the salt, so dropping it
- * costs a protection we had not yet spent and buys back a conversation.
+ * The obvious fix — erase our salt when the peer says it can never hold one — was built first, and
+ * it was WRONG in a way worth keeping written down, because it looked defensible.
  *
- * Where we HAVE spent it, the split is real and unrecoverable: those leaves are hashed under a salt
- * the peer will never hold. Nothing may be discarded, nothing may be repaired, and the only correct
- * behaviour is to say so at ERROR. The current WARN tells that operator *"nothing is broken and no
- * message was lost"* — while their counterparty refuses every message they send.
+ * **It is an authorization question, not a compatibility one.** Erasing performs an irreversible
+ * destruction of durable key material on a peer's bare assertion, with nothing to check the claim
+ * against. And the claim's own trigger is not a hostile or outdated peer: `frontier_unreadable` is a
+ * healthy current peer that could not read its own state for one second. That side would have
+ * permanently destroyed key material on this one.
+ *
+ * So the salt is **SUSPENDED, not destroyed**. A salt that is not used is inert; erasing is what
+ * converted a transient disagreement into a permanent one. What the peer needs — we stop hashing
+ * under it — happens immediately. What cannot be undone waits.
+ *
+ * **The mark is in memory and the erase is DEFERRED rather than cancelled**, because a durable mark
+ * needs a column and this milestone has lost data twice in the rebuild DDL. In-memory alone would
+ * split the transcript at the next restart (unsalted now, salted after a reboot), so the bytes are
+ * erased at the first unsalted hash — the moment erasing becomes both harmless (nothing was hashed
+ * under it) and required (keeping it would re-salt the session). Before that moment a corrected
+ * announcement restores the session fully salted, which erasure makes impossible even in principle:
+ * a salt is a one-way function of two halves and neither side can re-derive it alone.
+ *
+ * Where the salt is already SPENT, none of this applies: those leaves are hashed under a salt the
+ * peer will never hold. Nothing may be suspended, nothing may be erased, nothing may be repaired,
+ * and the only correct behaviour is to say so at ERROR — because switching to unsalted mid-session
+ * would leave a transcript verifiable by no single rule, which is worse than an honestly dead one.
  */
 
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { encodeCbor } from "@cello-protocol/protocol-types";
-import { SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
+import { SALT_CONTRIBUTION_BYTES, saltFingerprint } from "@cello-protocol/crypto";
 import * as lp from "it-length-prefixed";
 
 const SID = "7e".repeat(32);
@@ -90,7 +106,7 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     expect(storedSalt(fx), "a salt agreed at session open must be adopted").not.toBeNull();
   }, 60_000);
 
-  it("★★ THE UNSPENT SALT IS DISCARDED — this is the branch's own claim, made executable", async () => {
+  it("★★ THE UNSPENT SALT IS SUSPENDED, THEN ERASED AT THE FIRST UNSALTED HASH", async () => {
     /**
      * We agreed a salt and have hashed nothing under it. The peer then tells us it can never adopt
      * one. Keeping ours means every message we send from here is refused by them.
@@ -110,10 +126,36 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     await fx.snm.handleContentFrameForTest("alice", SID, closedFrame(), PEER);
     await wait(300);
 
+    /**
+     * ⚠️ THIS TEST USED TO ASSERT THE SALT WAS GONE HERE, AND THAT WAS THE WRONG CONTRACT.
+     *
+     * Erasing on a peer's bare assertion is an irreversible destruction of durable key material with
+     * nothing to check the claim against — and the claim's own trigger includes a healthy peer that
+     * could not read its own frontier for one second. The salt is SUSPENDED instead: not used, not
+     * destroyed. What the peer needs (we stop hashing under it) is delivered; what cannot be undone
+     * is not done yet.
+     */
     expect(
       storedSalt(fx),
-      "the peer can never adopt a salt, so holding ours means every message we send is refused by them " +
-      "with content_hash_salt_unavailable — the conversation dies while looking merely quiet",
+      "the bytes are KEPT — a peer that merely could not read its own state for a moment can restore " +
+      "this session with its next announcement, and an erased salt cannot be re-derived from one side",
+    ).not.toBeNull();
+
+    const suspended = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("after the refusal"));
+    expect(
+      suspended.alg,
+      "suspension must actually STOP the salt being used — otherwise every message we send is refused " +
+      "by a counterparty that can never hold it, and the conversation dies while looking merely quiet",
+    ).toBe("sha256");
+
+    /**
+     * And NOW it is erased, because this is the moment keeping it would do harm: the session has
+     * hashed unsalted, so a salt surviving on disk would re-salt it at the next restart and split the
+     * transcript down the middle by a reboot.
+     */
+    expect(
+      storedSalt(fx),
+      "once this session has actually hashed unsalted, keeping the salt would split the transcript at the next restart",
     ).toBeNull();
 
     /**
@@ -126,6 +168,48 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
       fx.snm.getSessionContentSalt("alice", SID),
       "the cache must be cleared too — a row-only clear splits the transcript at the next restart",
     ).toBeNull();
+  }, 60_000);
+
+  it("★★ A SUSPENDED SALT RESUMES when the peer turns out to hold the same one", async () => {
+    /**
+     * THE RECOVERY THE ERASE MADE IMPOSSIBLE, and the reason keeping the bytes is worth the extra
+     * state. The peer's terminal frame can be wrong about itself — `frontier_unreadable` is a healthy
+     * peer that could not read its own state for one second, not an old build. When it can read
+     * again it announces a fingerprint, and if it matches the salt we kept, the session is simply
+     * salted again with nothing lost.
+     *
+     * Erasure cannot reach this outcome even in principle: a salt is a one-way function of two
+     * halves and neither side can re-derive it alone.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-saltsplit-resume-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, contributionFrame(), PEER);
+    await wait(200);
+    const agreed = storedSalt(fx);
+    expect(agreed, "precondition: a salt was agreed").not.toBeNull();
+
+    await fx.snm.handleContentFrameForTest("alice", SID, closedFrame(), PEER);
+    await wait(200);
+    expect(fx.eventsNamed("session.salt.suspended").length, "precondition: it is suspended, not erased").toBe(1);
+
+    // The peer can read its own state again and announces the salt it holds — the same one.
+    await fx.snm.handleContentFrameForTest(
+      "alice", SID,
+      lp.encode.single(encodeCbor({
+        type: "session_salt_agreement", session_id: SID, fingerprint: saltFingerprint(agreed!),
+      }) as Uint8Array).subarray(),
+      PEER,
+    );
+    await wait(300);
+
+    expect(fx.eventsNamed("session.salt.resumed").length, "the session must come back salted").toBe(1);
+    const resumed = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("after recovery"));
+    expect(
+      resumed.alg,
+      "resumed means USING it again — a log line saying 'resumed' over a session still hashing sha256 is the comment-asserts-a-property defect",
+    ).toBe("hmac-sha256-salt-v1");
+    expect(storedSalt(fx), "and the bytes are the ones we kept").toEqual(agreed);
   }, 60_000);
 
   it("★★ A SALTED HASH MID-FLIGHT COUNTS AS SPENT — review HIGH-2", async () => {

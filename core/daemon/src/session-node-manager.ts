@@ -1028,6 +1028,43 @@ export class SessionNodeManager {
    * safe direction** — a salt kept is recoverable, a salt erased is not.
    */
   #hashedWithSalt = new Map<string, number>();
+
+  /**
+   * `#saltSuspended` — the peer has told us it can never hold a salt, so ours must not be USED. The
+   * bytes stay on disk (`DOD-M15-SALTSPLIT-1`, the other lane's authorization argument).
+   *
+   * ⚠️ THIS REPLACED AN IMMEDIATE, IRREVERSIBLE ERASE, AND THE REFRAMING IS THE WHOLE POINT.
+   *
+   * I defended the erase as a compatibility question — a legacy peer might send the misleading frame,
+   * we are pre-launch, do not carry weight for a state nobody is in. All true, and it does not reach
+   * the question. **It is an AUTHORIZATION question:** the receiver performed an irreversible
+   * destruction of durable key material on a peer's bare assertion with nothing to check it against.
+   * Re-derived against an empty database — *would I let one side erase the other's key material on an
+   * unauthenticated claim carrying no evidence?* No. My own empty-database rule argued FOR a guard,
+   * not against one.
+   *
+   * And my own trigger was the proof I walked past: `frontier_unreadable` is not a legacy peer, it is
+   * a **healthy current peer having one bad second**. Fixing the producer made our side stop emitting
+   * it wrongly and left the receiver built to obey it — *one side of that exchange correct by
+   * construction, the other still correct by luck.*
+   *
+   * A salt that cannot be used is inert. The destruction is what turned a transient disagreement into
+   * a permanent one, so **nothing irreversible hangs on the claim any more** and proving the claim
+   * stops being load-bearing.
+   *
+   * ⚠️ IN MEMORY ON PURPOSE, AND THE ERASE IS DEFERRED RATHER THAN CANCELLED. A durable mark needs a
+   * column, and this milestone has lost data twice in the rebuild DDL. In-memory alone would split
+   * the transcript at the next restart — unsalted now, salted after a reboot — so the salt IS erased,
+   * at the first unsalted hash, which is the moment erasing becomes both harmless (nothing was hashed
+   * under it) and REQUIRED (keeping it would re-salt after a restart). Before that moment a corrected
+   * announce carrying a matching fingerprint un-suspends and the session recovers fully salted, which
+   * erasure makes impossible even in principle: the far side cannot re-derive without both halves.
+   *
+   * A restart before either outcome loses the mark, we are salted again, the peer refuses one message,
+   * and the announce re-runs and re-suspends. **One refused message, then convergence** — against a
+   * dead session.
+   */
+  #saltSuspended = new Set<string>();
   #unsaltedAnnounced = new Set<string>();
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
@@ -4533,6 +4570,7 @@ export class SessionNodeManager {
     // DOD-M15-SALTSPLIT-1 HIGH-2: goes with its mirror. The session is being torn down, so there is
     // no discard decision left for it to protect.
     this.#hashedWithSalt.delete(key);
+    this.#saltSuspended.delete(key);
     this.#unsaltedAnnounced.delete(key);
     this.#saltLastOutcome.delete(key);
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
@@ -9705,6 +9743,23 @@ export class SessionNodeManager {
      * run, and the entries then outlive the session they describe. There is also nothing to protect:
      * a session that no longer exists cannot adopt a salt or split a transcript.
      */
+    /**
+     * ⚠️ THE DEFERRED ERASE — `DOD-M15-SALTSPLIT-1`. This is the moment a suspended salt becomes both
+     * harmless to erase and NECESSARY to erase, and it must run BEFORE the count below.
+     *
+     * Harmless: this session has hashed nothing under the salt, which is what let it be suspended.
+     * Necessary: we are about to hash unsalted, and a salt left on disk reads back fine after a
+     * restart — so the next process would hash salted and the transcript would be split down the
+     * middle by a reboot rather than by any frame.
+     *
+     * **Before the `#hashedWithoutSalt` increment on purpose.** `#discardUnspentSalt` refuses to erase
+     * once adoption is closed, and that counter is one of the things that closes it — increment first
+     * and the erase we just decided is correct gets refused by our own guard, leaving exactly the
+     * split this ordering exists to prevent.
+     */
+    if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN && this.#saltSuspended.has(this.#k(agentName, sessionId))) {
+      this.#discardUnspentSalt(agentName, sessionId);
+    }
     if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN) {
       /**
        * ⚠️ A COUNT, NOT A BIT — review pass 2, F1 (HIGH). It was a `Set`, and that made it ONE FLAG
@@ -9759,10 +9814,20 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
   ): Promise<{ salt: Uint8Array; reason?: undefined } | { salt: null; reason: UnsaltedReason }> {
-    const held = this.#getSessionSalt(agentName, sessionId);
-    if (held !== null) return { salt: held };
-
     const key = this.#k(agentName, sessionId);
+    const held = this.#getSessionSalt(agentName, sessionId);
+    if (held !== null) {
+      /**
+       * SUSPENDED BEATS HELD — `DOD-M15-SALTSPLIT-1`. The peer has said it can never hold a salt, so
+       * hashing under ours produces a message it must refuse. We hold one and deliberately do not
+       * use it; `PEER_CLOSED_ADOPTION` already carries exactly the right guidance for that, so no new
+       * reason is needed and none is invented.
+       */
+      if (this.#saltSuspended.has(key)) {
+        return { salt: null, reason: UNSALTED_REASONS.PEER_CLOSED_ADOPTION };
+      }
+      return { salt: held };
+    }
     if (this.#saltAdoptionClosed(agentName, sessionId).closed) {
       return { salt: null, reason: UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY };
     }
@@ -10228,6 +10293,64 @@ export class SessionNodeManager {
    *
    * Returns true only if a salt was actually cleared.
    */
+  /**
+   * SUSPEND, don't destroy — `DOD-M15-SALTSPLIT-1`, the authorization argument. Returns true if a
+   * salt is now suspended (or already was).
+   *
+   * This is the frame handler's entry point. It runs the same two refusals as the erase below —
+   * a spent salt and one mid-flight are not ours to set aside either, because the messages already
+   * hashed under them would become unverifiable the moment we stop using it — and where they do not
+   * fire it records the suspension instead of doing anything irreversible.
+   */
+  #suspendSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
+    const key = this.#k(agentName, sessionId);
+    if (this.#getSessionSalt(agentName, sessionId) === null) return false;
+    if (this.#saltSuspended.has(key)) return true;
+
+    const inFlight = this.#hashedWithSalt.get(key) ?? 0;
+    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
+    if (inFlight > 0 || adoption.closed) {
+      /**
+       * SPENT, or mid-send. Suspending is not destructive, but it IS a split: content already hashed
+       * under this salt stays hashed under it while everything after would be hashed the other way,
+       * in one session, with nothing recording where the change happened. That is the one thing
+       * Decision #8 forbids outright, so the salt keeps being used and the session stays honestly
+       * broken rather than becoming dishonestly half-verifiable.
+       */
+      this.#logger.info("session.salt.suspend.refused", {
+        agentName, sessionId, correlationId,
+        reason: inFlight > 0 ? "salted_hash_in_flight" : adoption.label,
+        ...(inFlight > 0 ? { inFlight } : { frontier: adoption.why }),
+        impact: "the salt stays IN USE, because content in this session is already hashed under it and switching now would split the transcript — half verifiable by one rule, half by another. The counterparty cannot hold this salt, so it will keep refusing messages sent from here. See session.salt.split.",
+      });
+      return false;
+    }
+
+    this.#saltSuspended.add(key);
+    this.#logger.info("session.salt.suspended", {
+      agentName, sessionId, correlationId,
+      impact: "the counterparty can never adopt a salt for this session, so this side has STOPPED USING its own — messages are hashed the way every build before content salting hashed them, and every message continues to be accepted. Nothing was hashed under it, so nothing is split.",
+      guidance: "No action. The salt bytes are kept, not erased: if the counterparty was merely unable to read its own state for a moment, its next announcement carrying a matching fingerprint restores this session to salted automatically. The bytes are erased only when this session actually hashes a message unsalted, which is the point after which keeping them would re-salt the session at the next restart.",
+    });
+    return true;
+  }
+
+  /** Un-suspend: the peer answered with a fingerprint matching the salt we kept. */
+  #resumeSalt(agentName: string, sessionId: string, correlationId?: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (!this.#saltSuspended.delete(key)) return;
+    /**
+     * THE RECOVERY THE ERASE MADE IMPOSSIBLE. Keeping the bytes is what allows this line to exist:
+     * the peer's earlier terminal frame was wrong (a frontier it could not read for a moment), it can
+     * read again, and the fingerprints match — so the session resumes salted with nothing lost. An
+     * erased salt cannot be re-derived from one side.
+     */
+    this.#logger.info("session.salt.resumed", {
+      agentName, sessionId, correlationId,
+      impact: "the counterparty now confirms the same salt this side kept, so this session is salted again. It was suspended earlier because the counterparty reported it could never hold one; that has resolved. No message was hashed while suspended, so the transcript is uniform.",
+    });
+  }
+
   #discardUnspentSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
     const held = this.#getSessionSalt(agentName, sessionId);
     if (held === null) return false;
@@ -10455,6 +10578,9 @@ export class SessionNodeManager {
       frame,
     });
     if (action.action === "confirmed") {
+      // DOD-M15-SALTSPLIT-1: the peer confirms the salt we KEPT while suspended — resume before logging
+      // agreement, so a resumed session is never reported as agreed while still suspended.
+      this.#resumeSalt(agentName, sessionId, correlationId);
       this.#logger.info("session.salt.agreed", {
         agentName, sessionId, correlationId, via: "fingerprint_match",
       });
@@ -10538,8 +10664,13 @@ export class SessionNodeManager {
        * cleared, which settles the question below without a second read; `false` is ambiguous (we
        * held none, or we refused to drop one), so that case still asks.
        */
-      const discarded = this.#discardUnspentSalt(agentName, sessionId, correlationId);
-      const stillHoldsSalt = !discarded && this.#getSessionSalt(agentName, sessionId) !== null;
+      const suspended = this.#suspendSalt(agentName, sessionId, correlationId);
+      /**
+       * "Still holds a salt it is USING" — suspension is what settles it, not possession. A suspended
+       * session keeps the bytes on disk deliberately, and reporting that as an unrecoverable split
+       * would fire the ERROR below on the one case that recovers by itself.
+       */
+      const stillHoldsSalt = !suspended && this.#getSessionSalt(agentName, sessionId) !== null;
 
       const shared = {
         agentName, sessionId, correlationId, detail: action.detail,
