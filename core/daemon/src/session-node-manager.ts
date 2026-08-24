@@ -2277,7 +2277,21 @@ export class SessionNodeManager {
            *
            * No plumbing needed: `direction` already carries the answer at write time.
            */
-          authorship ? "verified_signature" : direction === "sent" ? "self_authored" : "local_session_state",
+          /**
+           * DIRECTION FIRST — DOD-M15-SEALWIRE-1 bullet 5, sent half.
+           *
+           * This used to read `authorship ? "verified_signature" : …`, which was right while only
+           * RECEIVED rows could carry a signature. Now a SENT row carries one too — our own, over
+           * the Structure-1 bytes we put on the wire — and labelling that `verified_signature` would
+           * be false in the way this column exists to prevent: **we did not verify it, we produced
+           * it.** Nobody checked a counterparty's key; there was no counterparty in the act.
+           *
+           * So the three values keep meaning three different things:
+           *   `self_authored`      — this agent wrote it. Now PROVABLE when a signature is stored.
+           *   `verified_signature` — someone else wrote it and we checked their key against it.
+           *   `local_session_state`— someone else wrote it and nobody checked anything.
+           */
+          direction === "sent" ? "self_authored" : authorship ? "verified_signature" : "local_session_state",
         );
       this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
       return true;
