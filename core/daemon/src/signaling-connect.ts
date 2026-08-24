@@ -85,6 +85,16 @@ async function safeStop(node: CelloNode): Promise<void> {
  */
 const IDENTITY_PROOF_MAX_SKEW_MS = 5 * 60_000;
 
+/**
+ * DOD-M15-DIRAUTH-1 — directory peers already told about a skipped identity check.
+ *
+ * Mirrors `consortium-bootstrap`'s `lapsedMembershipReportedFor` idiom: the fact is about a PEER,
+ * not about a connection, so reporting it per connection says the same true thing 48 times an hour
+ * forever. Keyed on the peer this daemon DIALLED — never on the peer's own claim about itself,
+ * which on this path is precisely the thing that was not verified.
+ */
+const authSkipReportedFor = new Set<string>();
+
 export interface DirectoryEndpoint {
   peerId: string;
   /** A dialable multiaddr (e.g. /dns4/host/tcp/443/wss/p2p/<peerId>). Optional if already connected. */
@@ -320,14 +330,35 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
          * knowing to look for it. The control is `CELLO_REQUIRE_DIRECTORY_AUTH`, which refuses at
          * startup; this is what tells an operator who has not set it what they are running.
          */
-        deps.logger.warn("directory.auth.skipped", {
-          directoryNodeId,
-          agentPubkey: identity.pubkeyHex,
-          impact:
-            "no directory identity verifier is configured, so this connection did NOT check which " +
-            "directory it reached — the peer's claim of its own identity was accepted as given. " +
-            "Set CELLO_REQUIRE_DIRECTORY_AUTH=1 to refuse at startup instead of connecting unverified.",
-        });
+        /**
+         * ⚠️ ONCE PER DIRECTORY, NOT ONCE PER CONNECT — review F3, and the number is the argument.
+         * The signaling stream turns over roughly every 70 seconds and reconnects forever, so a
+         * per-connect WARN is ~48 an hour PER AGENT, indefinitely, and the daemon's stdout logger
+         * has no level filtering. Three agents is ~3,400 identical lines a day. **A signal that
+         * fires on the normal case is not a signal** — this repo's own rule — and it would bury the
+         * public-directory case this exists to raise.
+         *
+         * ⚠️ AND THE FIELD IS NAMED FOR WHAT IT IS — review F4. On this path `directoryNodeId` is
+         * `ackFrame["nodeId"]`: a string the REMOTE sent about itself, with nothing checked. Printing
+         * it under that name inside a line whose whole subject is *"we did not check which directory
+         * this is"* presents the peer's own answer as the answer. `dialedPeerId` sits beside it as
+         * the thing this daemon actually chose.
+         */
+        const claimedNodeId = typeof ackFrame["nodeId"] === "string" ? (ackFrame["nodeId"] as string) : null;
+        if (!authSkipReportedFor.has(endpoint.peerId)) {
+          authSkipReportedFor.add(endpoint.peerId);
+          deps.logger.warn("directory.auth.skipped", {
+            dialedPeerId: endpoint.peerId,
+            claimedNodeId,
+            agentPubkey: identity.pubkeyHex,
+            impact:
+              "no directory identity verifier is configured, so this connection did NOT check which " +
+              "directory it reached — the peer's claim of its own identity was accepted as given. " +
+              "Set CELLO_CONSORTIUM_ROOT_KEYS (with CELLO_CONSORTIUM_THRESHOLD) to enable " +
+              "verification, or CELLO_REQUIRE_DIRECTORY_AUTH=1 to refuse at startup instead of " +
+              "connecting unverified. Reported ONCE per directory peer, not per reconnect.",
+          });
+        }
       }
       if (verifier) {
         const nodeId = ackFrame["nodeId"] as string | undefined;

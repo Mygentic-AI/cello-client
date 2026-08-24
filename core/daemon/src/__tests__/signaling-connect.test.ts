@@ -167,6 +167,11 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
 
     const skipped = warns.find((w) => w.event === "directory.auth.skipped");
     expect(
+      String(skipped?.ctx["claimedNodeId"] ?? "") === String(skipped?.ctx["dialedPeerId"] ?? "") ? "same" : "distinct",
+      "the peer's CLAIM about itself and the peer we DIALLED must be separate fields — this line's " +
+        "whole subject is that the claim was not checked",
+    ).toBe("distinct");
+    expect(
       skipped,
       "connecting with no verifier must WARN by name. Without it, an operator running unverified " +
         "looks identical in the log to one running enforced, and the disarm is invisible.",
@@ -175,6 +180,34 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
       String(skipped!.ctx["impact"]),
       "and it must say what was not checked, plus the setting that refuses instead of connecting",
     ).toContain("CELLO_REQUIRE_DIRECTORY_AUTH");
+
+    /**
+     * ⚠️ ONCE, NOT PER CONNECT — review F3. The signaling stream turns over about every 70 seconds
+     * and reconnects forever, so a per-connect WARN is ~48 an hour per agent, indefinitely, on a
+     * logger with no level filtering. A signal that fires on the normal case is not a signal, and it
+     * would bury the public-directory case this exists to raise.
+     */
+    const { node: node2 } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(7) }),
+      encodeFrame({ type: "signaling_auth_ok" }),
+    ]);
+    const reconnect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: {
+        ...silentLogger,
+        warn: (event: string, ctx?: Record<string, unknown>) => { warns.push({ event, ctx: ctx ?? {} }); },
+      } as Logger,
+      createDirectoryNode: async () => node2 as never,
+      getManifestVersion: () => 0,
+    });
+    await reconnect();
+
+    expect(
+      warns.filter((w) => w.event === "directory.auth.skipped").length,
+      "reconnecting to the SAME directory must not repeat it — 48 times an hour forever is noise, " +
+        "not a warning, and it buries the case that matters",
+    ).toBe(1);
   });
 
   // Cross-node item 3: the visiting flag rides the auth response ONLY when deps.visiting is set.
