@@ -22,18 +22,28 @@
  *
  * A direct connection leaks the IP in BOTH directions:
  *
- *   1. **We must not dial them** — `shouldDialCounterparty`. Dialing hands our address to the peer.
- *   2. **We must not publish our own session addrs** — `publishableEndpoint`. With nothing to dial,
- *      the operator is protected **even against a counterparty who ignores the flag entirely**.
+ *   1. **We dial only their CIRCUIT** — `dialableAddrs`. Dialling their direct address hands them
+ *      ours; dialling the circuit terminates at the relay and reveals nothing.
+ *   2. **We publish only our own CIRCUIT** — `publishableEndpoint`. The only route they hold points
+ *      at the relay, which protects the operator **even against a counterparty who ignores the flag**.
  *
  * The second is load-bearing: *a control that depends on the other side honouring it is not a
  * control.* The first alone would leave us reachable by anyone who kept our address.
+ *
+ * ⚠️ **AND NEITHER HALF IS SUFFICIENT WHILE libp2p CAN SPEAK FOR US.** These functions filter what
+ * the DIRECTORY is told. `identify` hands a peer our listen addresses on the first relayed
+ * connection, and `dcutr` actively hole-punches a relayed connection into a direct one — the inbound
+ * side starts that upgrade, and a relay-only responder IS the inbound side. Both bypass everything
+ * here, peer-to-peer. `createNode`'s `holePunch: { enabled: false }` closes the second; the announce
+ * filter closes the first. **Without those, this file filters the paperwork and leaves the wire
+ * open** — see `DOD-M15-RELAYONLY-1`.
  *
  * `publishableEndpoint` is applied INSIDE `getStandingReceiverInfo` — the single method both publish
  * paths draw from — rather than at its call sites. Suppressing at call sites would be a hand-kept
  * list, and a fourth publish path added later would leak while every test stayed green. At the choke
  * point a new caller inherits the protection instead of having to be told about it.
  */
+
 
 /** The per-agent settings key. Lower-snake, dotted namespace, per `agent-settings-keys.ts`. */
 export const RELAY_ONLY_KEY = "transport.relay_only";
@@ -99,7 +109,33 @@ export interface PublishableEndpoint {
  * So relay-only is not "no addresses". It is "circuit addresses only".
  */
 export function isCircuitAddr(addr: string): boolean {
-  return addr.includes("/p2p-circuit");
+  // ⚠️ PARSED, never substring-matched. `addr.includes("/p2p-circuit")` was defeatable by the
+  // COUNTERPARTY, who controls these strings — the directory copies them verbatim and the FROST
+  // signature attests that the quorum agreed on the assignment, NOT that its contents are circuits.
+  //
+  //     /dns4/p2p-circuit.attacker.example/tcp/443/p2p/12D3KooWTheirs
+  //
+  // contains the literal text, resolves through the DNS transport, and would have been dialled
+  // directly — handing over the operator's IP with relay-only switched ON, while the suppression log
+  // reported `suppressed: 0`. A control a peer can defeat by naming a host is precisely what this
+  // line rules out.
+  //
+  // EXACT SEGMENT match on the multiaddr's own `/`-delimited components. `p2p-circuit` is a
+  // standalone protocol with no value, so it appears as a whole segment; a hostname that merely
+  // CONTAINS the text appears as `p2p-circuit.attacker.example`, which is a different segment and is
+  // correctly rejected.
+  //
+  // Deliberately NOT `multiaddr().protoNames()`, which would be the stricter parse: that lives in
+  // `@multiformats/multiaddr`, a dependency `core/daemon` does not have. Reaching for it here would
+  // add a package to the daemon to make one boolean stricter, and this client is installed on
+  // operators' machines where install weight is a user-facing cost. The exact-segment test defeats
+  // the demonstrated bypass with no new dependency.
+  //
+  // ⚠️ RESIDUAL, stated rather than left implied: this proves the address CLAIMS a circuit hop, not
+  // that the circuit runs through a relay we chose. A peer could name a relay we hold no reservation
+  // with. Binding the embedded relay peer id to our own reservations is the stronger check and is
+  // NOT done here.
+  return addr.split("/").includes("p2p-circuit");
 }
 
 /**

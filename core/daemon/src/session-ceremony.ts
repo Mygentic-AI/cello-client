@@ -108,6 +108,27 @@ export function wireSessionOfferHandler(deps: {
         await sendOfferReject(sessionId, "standing_receiver_unavailable");
         return;
       }
+      // DOD-M15-RELAYONLY-1: ANSWER, never publish an empty address list.
+      //
+      // ⚠️ Under relay-only the endpoint is already filtered to circuit addresses, and with no relay
+      // reservation that set is EMPTY. The directory folds an accept only
+      // `if (counterparty_session_addrs.length > 0)` — **with no `else`** — so an empty accept is
+      // dropped in silence, the offer waiter never resolves, and the INITIATOR's operator is told
+      // `counterparty_unavailable`: a lie about our state, produced by our setting. Rejecting
+      // explicitly keeps the failure attributable to the side that caused it, and is the same
+      // answer-never-vanish contract the reject path above already implements.
+      if (sr.addrs.length === 0) {
+        deps.logger.warn("session.offer.abort", {
+          agentName: deps.agentName,
+          reason: "relay_only_no_reservation",
+          impact:
+            "relay-only is on and this agent holds no relay reservation, so it has no circuit " +
+            "address to advertise and will not reveal its own — the offer is refused rather than " +
+            "answered with an empty endpoint the directory would silently drop",
+        });
+        await sendOfferReject(sessionId, "relay_only_no_reservation");
+        return;
+      }
       /**
        * DOD-M15-ASSIGN-1 — open the door to the named dialer, and ONLY then publish our address.
        *

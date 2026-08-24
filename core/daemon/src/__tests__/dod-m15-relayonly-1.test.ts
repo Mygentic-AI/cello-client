@@ -64,6 +64,7 @@ import {
   publishableEndpoint,
   relayOnlyReachable,
   relayOnlyState,
+  isCircuitAddr,
   dialableAddrs,
 } from "../relay-only.js";
 import { isValidSettingKey, validateSettingValue } from "../agent-settings-keys.js";
@@ -193,6 +194,29 @@ describe("DOD-M15-RELAYONLY-1 — the two halves of the control", () => {
   it("★ a null endpoint stays null under both — no receiver is not an empty receiver", () => {
     expect(publishableEndpoint(null, true)).toBeNull();
     expect(publishableEndpoint(null, false)).toBeNull();
+  });
+
+  it("★★★ A HOSTILE COUNTERPARTY CANNOT DEFEAT THE FILTER BY NAMING A HOST", () => {
+    /**
+     * ⚠️ THE BYPASS REVIEW FOUND, and it turned the control off from the OTHER side of the wire.
+     * The first version tested `addr.includes("/p2p-circuit")` — and the COUNTERPARTY controls these
+     * strings. The directory copies them verbatim, and the FROST signature attests that the quorum
+     * agreed on the assignment, **not that its contents are circuits**.
+     *
+     * So a peer offering `/dns4/p2p-circuit.attacker.example/...` got dialled DIRECTLY, handing over
+     * the operator's IP with relay-only switched ON — and the suppression log reported
+     * `suppressed: 0`, so nothing looked wrong. **A control a peer can defeat by naming a host is
+     * exactly what this line rules out.**
+     */
+    const attack = "/dns4/p2p-circuit.attacker.example/tcp/443/p2p/12D3KooWTheirs";
+    expect(isCircuitAddr(attack), "a HOSTNAME containing the text is not a circuit hop").toBe(false);
+    expect(
+      dialableAddrs([attack], true),
+      "and it must not be dialled — this is the operator's IP, handed to whoever picked the hostname",
+    ).toEqual([]);
+    expect(isCircuitAddr(CIRCUIT), "while a real circuit address still passes").toBe(true);
+    expect(isCircuitAddr(DIRECT), "and a plain direct address still does not").toBe(false);
+    expect(isCircuitAddr("not-a-multiaddr"), "unparseable is not a circuit — the safe answer for both callers").toBe(false);
   });
 
   it("★★ RELAY-ONLY DIALS THE CIRCUIT AND DROPS THE DIRECT — 'only over the relay', not 'never'", () => {

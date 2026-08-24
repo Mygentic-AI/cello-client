@@ -726,6 +726,26 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
           guidance: "The standing receiver is not ready, so no initiator session endpoint can be advertised. Retry once the daemon has finished starting.",
         };
       }
+      // DOD-M15-RELAYONLY-1: REFUSE LOUDLY rather than publish an empty address list.
+      //
+      // ⚠️ Under relay-only, `getStandingReceiverInfo` has already filtered to circuit addresses. If
+      // the relay granted no reservation — the `plain` fallback receiver, built whenever the relay
+      // rejects or times out — that set is EMPTY, and publishing an empty list is a MALFORMED frame:
+      // the directory rejects it and the operator is told **"Ensure the counterparty is registered
+      // and online"**, naming someone else's state for a fault that is a setting plus a missing
+      // reservation on THIS machine. Saying so here is the difference between a diagnosable refusal
+      // and a wild goose chase.
+      if (sr.addrs.length === 0) {
+        return {
+          ok: false,
+          reason: "relay_only_no_reservation",
+          guidance:
+            "Relay-only routing is on for this agent, but it holds no relay reservation yet, so it " +
+            "has no circuit address to advertise and cannot be reached without revealing this node's " +
+            "own address. Retry once the standing receiver has a relay reservation, or turn " +
+            "transport.relay_only off with cello_settings_set if you accept direct connections.",
+        };
+      }
       const { signaling } = getAgentSignaling(ctx.agentName, kp, agentRec.pubkey);
       if (!(await waitForSignalingConnected(signaling, SIGNALING_CONNECT_WAIT_MS))) {
         return {

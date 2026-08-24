@@ -15,7 +15,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import { selectAdvertisedAddress, type ITransportSelector, type SessionNegotiator } from "./transport-selector.js";
 import { TIER } from "./contacts-tier-migration.js";
-import { isRelayOnly, dialableAddrs } from "./relay-only.js";
+import { relayOnlyState, dialableAddrs } from "./relay-only.js";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { IAutoNatService } from "@cello-protocol/transport";
 
@@ -217,7 +217,13 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // stops them dialing US; this stops us handing our IP to THEM. Both are needed, because the
     // counterparty may not be relay-only themselves — they will still advertise addresses, and the
     // gate below is otherwise satisfied by exactly that.
-    const relayOnly = isRelayOnly((key) => sessionNodeManager.getSetting(agentName, key));
+    // ⚠️ TRI-STATE HERE TOO. The publish half was fixed to treat "cannot read the setting" as
+    // distinct from "off"; leaving the DIAL half on the plain boolean kept the old failure direction
+    // on this side — a closed or not-yet-opened database read as `false` and the operator's IP went
+    // out on the dial. `unknown` is treated as ON for the same reason it is when publishing: a
+    // narrowed route is recoverable and a disclosed address is not.
+    const relayOnly =
+      relayOnlyState((key) => sessionNodeManager.getSetting(agentName, key), sessionNodeManager.hasDatabase()) !== "off";
     const dialable = dialableAddrs(counterpartyAddrs, relayOnly);
     if (relayOnly && counterpartyAddrs.length > dialable.length) {
       logger.info("session.initiate.direct_dial.suppressed", {

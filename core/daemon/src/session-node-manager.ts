@@ -2189,6 +2189,19 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M15-RELAYONLY-1: is the settings store readable RIGHT NOW?
+   *
+   * ⚠️ Exists because `getSetting` cannot answer it. That method returns `null` for BOTH "the key is
+   * unset" and "there is no database", and a security setting must tell those apart: unset-means-off
+   * is correct, db-gone-means-off publishes the operator's real address during the shutdown window.
+   * `getDb()` cannot stand in either — it THROWS when there is no database, which on a catch-less
+   * ceremony path is worse than the wrong answer.
+   */
+  hasDatabase(): boolean {
+    return this.#db !== null;
+  }
+
+  /**
    * RELAYSIG-1: the durably-stored, signature-verified relay ordering-record receipts for an agent
    * (optionally a single session). Empty when no receipts have been recorded yet. Read-only.
    */
@@ -3268,17 +3281,26 @@ export class SessionNodeManager {
     // `relayOnlyState` also absorbs a THROW — `#requireAgentId` throws for a retired agent, and this
     // method is called from the offer ceremony inside a floating async with no catch, where the
     // throw becomes an unhandled rejection and the offer vanishes with no local log.
-    const state = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== undefined);
+    // ⚠️ `!== null`, NOT `!== undefined`. The field is declared `DaemonDatabase | null` and is only
+    // ever assigned on open or set to `null` on close — **it is never `undefined` at any point in
+    // its lifetime**, so the first version of this line was a compile-time-constant `true` that
+    // TypeScript had no reason to complain about, and the whole `"unknown"` branch was unreachable
+    // dead code. The fix for the disclosure window silently did nothing, which is worse than not
+    // having written it: the DoD said the window was closed and it was wide open.
+    const state = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== null);
     if (state === "unknown") {
       this.#logger.warn("settings.relay_only.unreadable", {
         agentName,
         impact:
-          "cannot tell whether relay-only is on, so this agent's session addresses are NOT published " +
-          "— refusing is the only safe direction, because publishing a real address is irreversible",
+          "cannot tell whether relay-only is on, so ONLY this agent's relay-circuit addresses are " +
+          "published — never a direct one. Publishing a real address is irreversible and a narrowed " +
+          "route is not, so this errs toward reachability loss rather than disclosure",
       });
-      return { peerId: endpoint.peerId, addrs: endpoint.addrs.filter(isCircuitAddr) };
     }
-    return publishableEndpoint(endpoint, state === "on");
+    // ONE filter, not two. The `unknown` branch used to build its own filtered object inline, which
+    // put a second implementation inside the very method whose design rationale is that there is
+    // exactly one — and the bypass guard could not see it.
+    return publishableEndpoint(endpoint, state !== "off");
   }
 
   /**
