@@ -42,6 +42,88 @@ const SALT = deriveSessionSalt(
 );
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
+/**
+ * DOD-M15-HASHCORRELATE-1 — the exposure this whole mechanism exists to remove.
+ *
+ * ─── What was true, in the relay's chair ───────────────────────────────────────────────────────
+ *
+ * `wireContentHash(content) = SHA-256(0x00 ‖ content)` — nothing session-specific entered it. So the
+ * same message text produced **the same 32 bytes in every conversation, between every pair of
+ * agents, forever.** A relay could not merely spot repeats inside one session: it could correlate a
+ * message across different sessions and different agent pairs, and — because most traffic is short
+ * and predictable — precompute a table of common messages once and read them everywhere. "yes",
+ * "approved", a name.
+ *
+ * ─── Why the tests above do not cover it ──────────────────────────────────────────────────────
+ *
+ * They prove the salted form differs from the unsalted one, and that it is HMAC rather than
+ * `SHA-256(salt ‖ content)`. Both true, neither is this: **the correlation property is about two
+ * DIFFERENT SESSIONS.** A build could hash under a single global salt, satisfy every assertion in
+ * this file, and leave the exposure exactly as it was — one table to precompute instead of none.
+ *
+ * The old function is kept in the test as the CONTROL, so this reads as the defect and its removal
+ * rather than as an assertion about an implementation detail.
+ */
+describe("DOD-M15-HASHCORRELATE-1 — the same message in two sessions is not the same bytes", () => {
+  const twoSalts = (): [Uint8Array, Uint8Array] => [
+    deriveSessionSalt(
+      new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x11),
+      new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x22),
+    ),
+    deriveSessionSalt(
+      new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x33),
+      new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x44),
+    ),
+  ];
+
+  it("★ THE EXPOSURE: the old algorithm gives an identical fingerprint in every session", () => {
+    // The control, and the reason this line exists. Two different conversations, one message, one
+    // set of bytes — which is precisely what makes a precomputed table work.
+    const inSessionA = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.SHA256, salt: null });
+    const inSessionB = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.SHA256, salt: null });
+    expect(
+      hex(inSessionA),
+      "this is not a regression to fix — it is the defect, pinned so the fix below has something to be",
+    ).toBe(hex(inSessionB));
+  });
+
+  it("★ THE FIX: the same message under two session salts produces two different hashes", () => {
+    const [saltA, saltB] = twoSalts();
+    const inSessionA = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
+    const inSessionB = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltB });
+    expect(
+      hex(inSessionA),
+      "a relay holding both conversations must not be able to tell these are the same message — " +
+        "this is the assertion the correlation exposure is actually about",
+    ).not.toBe(hex(inSessionB));
+  });
+
+  it("★ and it is the SALT doing it, not the message — the same salt still matches itself", () => {
+    /**
+     * Without this, the test above passes against a hash that is simply random per call — which
+     * would break dedup, ordering and the tamper check while looking like privacy.
+     */
+    const [saltA] = twoSalts();
+    const once = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
+    const twice = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
+    expect(
+      hex(once),
+      "inside ONE session the same message must still hash identically, or dedup and the tamper " +
+        "cross-check both break — the property is unlinkability ACROSS sessions, not randomness",
+    ).toBe(hex(twice));
+  });
+
+  it("★ a DIFFERENT message in the same session also differs — the salt has not flattened anything", () => {
+    const [saltA] = twoSalts();
+    const approved = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.HMAC_SALT_V1, salt: saltA });
+    const other = contentHashFor(new TextEncoder().encode("denied"), {
+      alg: CONTENT_HASH_ALGS.HMAC_SALT_V1,
+      salt: saltA,
+    });
+    expect(hex(approved), "the hash must still distinguish messages").not.toBe(hex(other));
+  });
+});
+
 describe("the two algorithms produce different bytes for the same message", () => {
   it("★ salted and unsalted differ — which is the whole reason the name has to travel", () => {
     const plain = contentHashFor(CONTENT, { alg: CONTENT_HASH_ALGS.SHA256, salt: null });
