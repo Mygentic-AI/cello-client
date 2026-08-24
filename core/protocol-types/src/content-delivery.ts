@@ -34,6 +34,35 @@ export const IT_LENGTH_PREFIX_DEFAULT_MAX = 4 * 1024 * 1024;
 export const CONTENT_PARK_PROTOCOL_ID = "/cello/content-park/1.0.0";
 
 /**
+ * The relay's park-deposit refusal codes — **ONE definition, consumed by both sides of the wire.**
+ *
+ * ⚠️ These were declared INDEPENDENTLY in each repo: the relay threw the strings and the client
+ * matched them, and they agreed only because I checked by hand once. Verification-once is not a
+ * guard. If the relay renames `rate_limited`, nothing goes red — the client's branch simply stops
+ * matching and falls through to the generic "the relay link is down" wording, which is the exact
+ * defect that family of work exists to remove, reintroduced by a rename nobody thought was a
+ * protocol change.
+ *
+ * They live here for the same reason `CONTENT_PARK_PROTOCOL_ID` and `buildContentParkAuthMsg` do:
+ * this package is the one both repos already consume, so a change on either side is a change to a
+ * shared symbol rather than to a private copy that happens to agree.
+ *
+ * ⚠️ THESE ARE WIRE VALUES. The string is the contract, not the key — renaming a key is free,
+ * changing a value is a protocol change and breaks every deployed peer on the other side.
+ */
+export const RELAY_PARK_REFUSALS = {
+  /** The relay is throttling this depositor. Self-clears; the relay says when via `retry_after_ms`. */
+  RATE_LIMITED: "rate_limited",
+  /** The relay's parked-content store is at a global bound. Another relay may still accept. */
+  STORE_FULL: "content_store_full",
+  /** This RECIPIENT's mailbox is at its own bound — another relay would refuse it too. */
+  RECIPIENT_FULL: "content_store_recipient_full",
+} as const;
+
+/** A value of {@link RELAY_PARK_REFUSALS}. */
+export type RelayParkRefusal = (typeof RELAY_PARK_REFUSALS)[keyof typeof RELAY_PARK_REFUSALS];
+
+/**
  * Domain separator for the content-park pull/confirm auth signature (I1). The caller
  * signs SHA-256(utf8(CONTENT_PARK_AUTH_DOMAIN) || nonce(32) || recipient_pubkey(32))
  * with its Ed25519 identity key to prove ownership before the relay serves/deletes.

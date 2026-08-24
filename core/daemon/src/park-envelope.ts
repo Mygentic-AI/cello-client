@@ -141,23 +141,16 @@ export const PARK_ENVELOPE_REASONS = {
 } as const;
 
 /**
- * The relay's own refusal reasons that the CLIENT must branch on, as codes rather than prose.
+ * The relay's park-refusal codes.
  *
- * ⚠️ `RATE_LIMITED` exists because the operator-facing sentence for a refused park was written for a
- * relay OUTAGE — *"will be re-sent automatically when the relay link is back"* — and
- * `DOD-M15-RELAYABUSE-1` made a second, opposite cause reachable: a perfectly healthy relay
- * deliberately throttling this peer. The link is not down and there is no link-restored event
- * coming, so that sentence promises a trigger that will never fire. **A wrong diagnosis is worse
- * than none: it tells the operator where NOT to look.**
+ * ⚠️ RE-EXPORTED FROM `@cello-protocol/protocol-types`, NOT declared here. They used to be a private
+ * copy that happened to agree with the relay's strings — verified by hand once, which is not a
+ * guard. A rename on the relay side would have left this copy silently unmatched, falling through to
+ * the generic "the relay link is down" wording: the exact defect this family of work removed,
+ * reintroduced by a change nobody would think of as a protocol change.
  */
-export const RELAY_PARK_REFUSALS = {
-  /** The relay is throttling this depositor. Self-clears; the relay says when via `retry_after_ms`. */
-  RATE_LIMITED: "rate_limited",
-  /** The relay's parked-content store is at a bound. Self-clears as entries expire or are collected. */
-  STORE_FULL: "content_store_full",
-  /** This RECIPIENT's mailbox is at its own bound — another relay will not help. */
-  RECIPIENT_FULL: "content_store_recipient_full",
-} as const;
+import { RELAY_PARK_REFUSALS } from "@cello-protocol/protocol-types";
+export { RELAY_PARK_REFUSALS };
 
 export type ParkEnvelopeReason = (typeof PARK_ENVELOPE_REASONS)[keyof typeof PARK_ENVELOPE_REASONS];
 

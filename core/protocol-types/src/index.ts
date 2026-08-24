@@ -201,8 +201,10 @@ export type {
   ContentParkNotify,
   ContentParkPullRequest,
   ContentParkPullResponse,
+  RelayParkRefusal,
 } from "./content-delivery.js";
 export {
+  RELAY_PARK_REFUSALS,
   IT_LENGTH_PREFIX_DEFAULT_MAX,
   CONTENT_PARK_PROTOCOL_ID,
   CONTENT_PARK_AUTH_DOMAIN,
