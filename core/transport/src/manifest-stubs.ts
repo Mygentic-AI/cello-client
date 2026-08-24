@@ -108,17 +108,54 @@ export class TestDirectoryChallengeVerifier implements IDirectoryChallengeVerifi
  *   4. Call ed25519.verify(sigBytes, tbsBytes, pubkeyBytes).
  *   5. Return the result; catch all errors and return false.
  */
+/**
+ * ⚠️ NOT A STUB, despite the filename. Wired in production twice by `manifest-deps.ts`. Anyone
+ * reading `manifest-stubs.ts` and assuming test-only is wrong about this one class.
+ */
 export class ManifestDirectoryChallengeVerifier implements IDirectoryChallengeVerifier {
   readonly #manifestProvider: IManifestProvider;
+  /**
+   * DOD-M15-EXPIRY-CONSUMER-POLICY-1. Called at most ONCE per manifest version when a directory is
+   * authenticated against a manifest whose validity window has closed. Optional so no caller is
+   * forced to change; absent means the old silent behaviour.
+   */
+  readonly #onExpiredManifest?: (info: { nodeId: string; version: number; expires: string }) => void;
+  /** Last version already reported. `verifyChallenge` runs per challenge, so this cannot flood. */
+  #warnedVersion: number | null = null;
 
-  constructor(manifestProvider: IManifestProvider) {
+  constructor(
+    manifestProvider: IManifestProvider,
+    onExpiredManifest?: (info: { nodeId: string; version: number; expires: string }) => void,
+  ) {
     this.#manifestProvider = manifestProvider;
+    this.#onExpiredManifest = onExpiredManifest;
   }
 
   verifyChallenge(nodeId: string, tbsBytes: Uint8Array, signatureHex: string): ChallengeVerifyResult {
     try {
       const manifest = this.#manifestProvider.getCurrentManifest();
       if (!manifest) return { valid: false, reason: "key_not_in_manifest" };
+
+      /**
+       * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — this consumer PERMITS on a lapsed manifest, deliberately,
+       * and now says so instead of being silent about it.
+       *
+       * **Why not refuse.** This is what authenticates a directory node on the signaling path. Refuse
+       * here and a long-running daemon whose manifest lapsed cannot authenticate ANY directory — it
+       * goes effectively offline, every agent with it, for a manifest that was valid when the process
+       * started. Availability is a first-class protocol concern, and that trade is not worth the
+       * residual risk, which requires a node to have been REMOVED or ROTATED since the lapse.
+       *
+       * **Reported once per manifest VERSION, not per challenge.** Challenges are continuous; an
+       * event per challenge is a flood, and a flood is how a real signal gets ignored.
+       */
+      const expiresMs = Date.parse(manifest.expires);
+      if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+        if (this.#warnedVersion !== manifest.version) {
+          this.#warnedVersion = manifest.version;
+          this.#onExpiredManifest?.({ nodeId, version: manifest.version, expires: manifest.expires });
+        }
+      }
 
       const node = manifest.nodes.find((n) => n.nodeId === nodeId);
       if (!node) return { valid: false, reason: "key_not_in_manifest" };

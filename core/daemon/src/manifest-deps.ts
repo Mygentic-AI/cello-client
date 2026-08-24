@@ -100,7 +100,22 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
       return {};
     }
     const manifestProvider = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
-    const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+    const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider, (info) => {
+    // DOD-M15-EXPIRY-CONSUMER-POLICY-1: a directory was authenticated against a manifest whose
+    // window has closed. NOT refused — see the verifier for why — but no longer silent. Fires at
+    // most once per manifest version.
+    logger.warn("directory.auth.manifest.lapsed", {
+      ...info,
+      impact:
+        "a directory node was authenticated against a manifest whose validity window has closed, so " +
+        "its key is trusted on the strength of a check that has expired. If that node has been " +
+        "rotated or removed since, this daemon would not know.",
+      guidance:
+        "Signaling was NOT blocked — refusing here would leave a long-running daemon unable to " +
+        "authenticate any directory, taking every agent offline. Install a current manifest and " +
+        "restart when convenient; cello_status reports the expiry.",
+    });
+  });
     logger.info("daemon.manifest.bundled", {
       version: BUNDLED_CONSORTIUM_MANIFEST.version,
       nodeCount: BUNDLED_CONSORTIUM_MANIFEST.nodes.length,
@@ -125,7 +140,22 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
   }
 
   const manifestProvider = new FileManifestProvider({ path: manifestPath });
-  const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider);
+  const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider, (info) => {
+    // DOD-M15-EXPIRY-CONSUMER-POLICY-1: a directory was authenticated against a manifest whose
+    // window has closed. NOT refused — see the verifier for why — but no longer silent. Fires at
+    // most once per manifest version.
+    logger.warn("directory.auth.manifest.lapsed", {
+      ...info,
+      impact:
+        "a directory node was authenticated against a manifest whose validity window has closed, so " +
+        "its key is trusted on the strength of a check that has expired. If that node has been " +
+        "rotated or removed since, this daemon would not know.",
+      guidance:
+        "Signaling was NOT blocked — refusing here would leave a long-running daemon unable to " +
+        "authenticate any directory, taking every agent offline. Install a current manifest and " +
+        "restart when convenient; cello_status reports the expiry.",
+    });
+  });
   // DOD-AUTH-2: background manifest poll. The directory is re-polled on a randomized 6–12h interval
   // (thundering-herd avoidance) and a newer signed manifest is adopted. The interval is env-injectable
   // so the live binary test can poll sub-second instead of waiting hours; production leaves these
