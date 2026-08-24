@@ -84,7 +84,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       guidance: "Almost always their CELLO build is newer than this one.",
     });
 
-    const [notice] = mgr.takeContentRefusals("alice", "s1");
+    const [notice] = mgr.takeContentRefusals("alice", "s1", "op");
     expect(notice, "the refusal must reach the operator at all — this is the whole defect").toBeDefined();
     expect(notice!.reason).toBe("content_hash_alg_unknown");
     expect(
@@ -111,14 +111,14 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
     }
 
-    const first = mgr.takeContentRefusals("alice", "s2");
+    const first = mgr.takeContentRefusals("alice", "s2", "op");
     expect(first.length, "told once").toBe(1);
     expect(
       first[0]!.count,
       "and the count carries the scale — deduplication must not make 90 look like 1",
     ).toBe(90);
 
-    const second = mgr.takeContentRefusals("alice", "s2");
+    const second = mgr.takeContentRefusals("alice", "s2", "op");
     expect(
       second,
       "a refusal already shown must NOT re-announce on the next read, or the surface becomes the " +
@@ -136,7 +136,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      */
     mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
     expect(
-      mgr.takeContentRefusals("alice", "s2"),
+      mgr.takeContentRefusals("alice", "s2", "op"),
       "a refusal arriving AFTER the operator was already told must stay silent — this is the case " +
         "the two-reads-in-a-row assertion cannot see, and the only case a skewed peer actually produces",
     ).toEqual([]);
@@ -181,19 +181,19 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { impact: "x" });
 
     note();
-    expect(mgr.takeContentRefusals("alice", "s-scale")[0]!.count, "first refusal is the signal").toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
 
     for (let i = 0; i < 8; i++) note(); // 9 total — under the next order of magnitude
-    expect(mgr.takeContentRefusals("alice", "s-scale"), "nine is not news").toEqual([]);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "nine is not news").toEqual([]);
 
     note(); // 10
-    const [again] = mgr.takeContentRefusals("alice", "s-scale");
+    const [again] = mgr.takeContentRefusals("alice", "s-scale", "op");
     expect(again, "ten times is a different fact about the problem than once").toBeDefined();
     expect(again!.count).toBe(10);
     expect(again!.repeat, "and it says it is a repeat, so a reader can present it as an escalation").toBe(true);
 
     for (let i = 0; i < 89; i++) note(); // 99
-    expect(mgr.takeContentRefusals("alice", "s-scale"), "still inside the same magnitude").toEqual([]);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "still inside the same magnitude").toEqual([]);
   });
 
   it("THE DECLINED PROTECTION: a session says whether its content hashes are salted", async () => {
@@ -243,10 +243,10 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     // a first one was already reported would be the dedup causing the very silence it mitigates.
     const mgr = (await start()).getSessionNodeManager();
     mgr.noteContentRefusal("alice", "s3", "content_hash_alg_unknown", { impact: "a" });
-    expect(mgr.takeContentRefusals("alice", "s3").length).toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s3", "op").length).toBe(1);
 
     mgr.noteContentRefusal("alice", "s3", "content_hash_mismatch", { impact: "b" });
-    const next = mgr.takeContentRefusals("alice", "s3");
+    const next = mgr.takeContentRefusals("alice", "s3", "op");
     expect(next.length, "a new KIND of refusal is a new signal").toBe(1);
     expect(next[0]!.reason).toBe("content_hash_mismatch");
   });
@@ -254,8 +254,8 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
   it("refusals are per SESSION — one conversation's problem is not another's", async () => {
     const mgr = (await start()).getSessionNodeManager();
     mgr.noteContentRefusal("alice", "s-a", "content_hash_mismatch", { impact: "a" });
-    expect(mgr.takeContentRefusals("alice", "s-b"), "a quiet session reports nothing").toEqual([]);
-    expect(mgr.takeContentRefusals("alice", "s-a").length).toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s-b", "op"), "a quiet session reports nothing").toEqual([]);
+    expect(mgr.takeContentRefusals("alice", "s-a", "op").length).toBe(1);
   });
 
   it("A REAL refusal produces a notice — the producer leg, not a hand-seeded store", async () => {
@@ -301,6 +301,41 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     ).toBe(false);
   });
 
+  it("THE VERSION SKEW produces a notice — the reason this whole line exists", async () => {
+    /**
+     * ⚠️ Every other test drives or seeds `content_hash_mismatch`. That left the reason this DoD
+     * line was WRITTEN about — `content_hash_alg_unknown` — with no producer coverage at all:
+     * deleting its `noteContentRefusal` call left all thirteen tests green while the version skew
+     * went silent again. A one-line bypass through the entire file.
+     *
+     * It matters more than the mismatch it was tested through. A mismatch is rare and arguably
+     * one-off; an unknown algorithm is a VERSION SKEW, so it refuses EVERY message from that
+     * counterparty, permanently — the conversation goes quiet and stays quiet.
+     */
+    const h = await start();
+    const mgr = h.getSessionNodeManager();
+    const sid = "s-skew";
+    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-skew");
+
+    const content = new TextEncoder().encode("a message from a newer build");
+    // The hash is CORRECT — nothing is tampered with. The refusal is purely "I cannot verify this
+    // the way you say you hashed it", which is what makes the skew case distinct.
+    const res = await mgr.ingestReceivedContent(
+      "alice", sid, content, msgLeafHash(content), "corr-skew", undefined, "blake3-nonexistent",
+    );
+    expect(res.ok, "an algorithm this build cannot resolve must be refused, not ingested").toBe(false);
+    expect(res.reason).toBe("content_hash_alg_unknown");
+
+    const [notice] = mgr.takeContentRefusals("alice", sid);
+    expect(
+      notice,
+      "and the operator must be TOLD — this is the permanent, every-message case, and it was the " +
+        "one path through this file with no producer test",
+    ).toBeDefined();
+    expect(notice!.reason).toBe("content_hash_alg_unknown");
+    expect(notice!.guidance, "the guidance must point at the BUILD, not the network").toMatch(/build|version/i);
+  });
+
   it("THE CONTENT NEVER TRAVELS — not in any field of the notice", async () => {
     /**
      * The refused message failed verification. Showing it to the operator is precisely the injection
@@ -317,7 +352,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       guidance: "Ask the counterparty to resend.",
     });
 
-    const serialized = JSON.stringify(mgr.takeContentRefusals("alice", "s4"));
+    const serialized = JSON.stringify(mgr.takeContentRefusals("alice", "s4", "op"));
     expect(
       serialized.includes(SECRET),
       "the refused content must not appear anywhere in what the operator is shown",

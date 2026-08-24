@@ -6763,7 +6763,16 @@ export class SessionNodeManager {
   takeContentRefusals(
     agentName: string,
     sessionId: string,
-    consumerId = "default",
+    /**
+     * REQUIRED, deliberately — no default.
+     *
+     * It had one (`"default"`), and a default is the defect this method was rewritten to remove,
+     * lying in wait: any future call site that omits the argument silently shares ONE bucket across
+     * every window, the first reader consumes the notice for all the others, and nothing fails to
+     * compile and no test goes red. The parameter existing is not the protection; being unable to
+     * forget it is.
+     */
+    consumerId: string,
   ): Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
     const perSession = this.#contentRefusals.get(this.#k(agentName, sessionId));
     if (!perSession) return [];
