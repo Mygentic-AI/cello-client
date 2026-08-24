@@ -130,6 +130,53 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
     expect(result.manifestVersion).toBe(0);
   });
 
+  it("★★ DOD-M15-DIRAUTH-1: a SKIPPED identity check warns by name — it must not look healthy", async () => {
+    /**
+     * ⚠️ THE DISARMED PATH, and the reason this test exists at all. With no verifier configured,
+     * step 6 does not run: this daemon takes the directory's word for which directory it is. The
+     * only trace used to be `verified: false` — one field inside the **info** line that a
+     * SUCCESSFUL connect also emits — so the disarmed state and the enforced state were
+     * distinguishable only by reading one boolean nobody alerts on.
+     *
+     * This does NOT make it a control; the entry's own conclusion is that a log is not a control,
+     * and a WARN is still a log. It makes the absence NAMED, at its own level, so it can be seen
+     * without knowing to look for it.
+     *
+     * **Revert test, RUN:** delete the `if (!verifier)` block in `signaling-connect.ts` and this
+     * goes red while every other test in this file stays green — which is exactly the blind spot
+     * that let the check disarm quietly.
+     */
+    const warns: Array<{ event: string; ctx: Record<string, unknown> }> = [];
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(7) }),
+      encodeFrame({ type: "signaling_auth_ok" }),
+    ]);
+
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: {
+        ...silentLogger,
+        warn: (event: string, ctx?: Record<string, unknown>) => { warns.push({ event, ctx: ctx ?? {} }); },
+      } as Logger,
+      createDirectoryNode: async () => node as never,
+      getManifestVersion: () => 0,
+    });
+
+    await connect();
+
+    const skipped = warns.find((w) => w.event === "directory.auth.skipped");
+    expect(
+      skipped,
+      "connecting with no verifier must WARN by name. Without it, an operator running unverified " +
+        "looks identical in the log to one running enforced, and the disarm is invisible.",
+    ).toBeDefined();
+    expect(
+      String(skipped!.ctx["impact"]),
+      "and it must say what was not checked, plus the setting that refuses instead of connecting",
+    ).toContain("CELLO_REQUIRE_DIRECTORY_AUTH");
+  });
+
   // Cross-node item 3: the visiting flag rides the auth response ONLY when deps.visiting is set.
   it("sets visiting:true in signaling_auth_response iff deps.visiting is set", async () => {
     async function firstSentFrame(stream: { send: { mock: { calls: unknown[][] } } }): Promise<Record<string, unknown>> {

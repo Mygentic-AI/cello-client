@@ -303,6 +303,32 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
       // Runs only when a challengeVerifier is configured. M6 ran without one.
       let directoryNodeId = typeof ackFrame["nodeId"] === "string" ? (ackFrame["nodeId"] as string) : endpoint.peerId;
       const verifier = deps.challengeVerifier;
+      if (!verifier) {
+        /**
+         * DOD-M15-DIRAUTH-1 — **A DISARMED CHECK MUST NOT LOOK LIKE A HEALTHY ONE.**
+         *
+         * With no verifier configured, step 6 does not run at all: this daemon takes the
+         * directory's word for which directory it is. Until now the only trace of that was
+         * `verified: false` — a boolean field inside the **info** line at the bottom of a successful
+         * connect. Every other connect logged the same event at the same level, so the disarmed
+         * state and the enforced state were distinguishable only by reading one field of one line,
+         * which nothing alerts on and no operator reads.
+         *
+         * ⚠️ THIS IS NOT THE FIX AND MUST NOT BE MISTAKEN FOR ONE — this entry's own conclusion is
+         * that **a log is not a control**, and a WARN is still a log. What it buys is that the
+         * absence has a name and a level of its own, so "authentication is off" can be seen without
+         * knowing to look for it. The control is `CELLO_REQUIRE_DIRECTORY_AUTH`, which refuses at
+         * startup; this is what tells an operator who has not set it what they are running.
+         */
+        deps.logger.warn("directory.auth.skipped", {
+          directoryNodeId,
+          agentPubkey: identity.pubkeyHex,
+          impact:
+            "no directory identity verifier is configured, so this connection did NOT check which " +
+            "directory it reached — the peer's claim of its own identity was accepted as given. " +
+            "Set CELLO_REQUIRE_DIRECTORY_AUTH=1 to refuse at startup instead of connecting unverified.",
+        });
+      }
       if (verifier) {
         const nodeId = ackFrame["nodeId"] as string | undefined;
         const signature = ackFrame["signature"] as string | undefined;
