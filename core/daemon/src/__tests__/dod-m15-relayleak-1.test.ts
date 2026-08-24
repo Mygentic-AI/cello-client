@@ -54,15 +54,30 @@ const SID = "1d".repeat(32);
 const RELAY_PEER = "12D3KooWRelayForSealLeak000000000000000000000";
 const RELAY_ADDRS = ["/ip4/127.0.0.1/tcp/4001"];
 
-/** A relay client that records what was asked of it and nothing else. */
-function makeFakeRelayClient(): AgentRelayClient & {
+/**
+ * A relay client that records what was asked of it and nothing else.
+ *
+ * ⚠️ **TYPED WITH `Pick`, NOT `as unknown as` — review LOW-1, and the reason is this file's own
+ * history.** The first version cast through `as unknown`, which erases every structural check, and
+ * that is precisely how a fake with NO `submitLeaf` reached runtime and had to be caught by a
+ * hand-written precondition instead of by the compiler. `Pick` pins each signature the production
+ * path actually calls, so a renamed parameter or a changed return shape is a typecheck failure here.
+ * The runtime `submitCount()` precondition stays — it guards against a NEW method the fake lacks,
+ * which no cast-free type can see either.
+ */
+type FakeRelayClient = Pick<
+  AgentRelayClient,
+  "registerSession" | "unregisterSession" | "hasSessions" | "hasSession" | "close" | "submitLeaf"
+> & {
   closed: number;
   sessions: Set<string>;
   /** Every id ever registered — survives release, so a test can prove registration HAPPENED. */
   registered: string[];
   /** Completed submits — a 0 here means the tests are exercising the throw path, not the real one. */
   submitCount: () => number;
-} {
+};
+
+function makeFakeRelayClient(): FakeRelayClient {
   const sessions = new Set<string>();
   const registered: string[] = [];
   let submits = 0;
@@ -89,9 +104,7 @@ function makeFakeRelayClient(): AgentRelayClient & {
     /** How many submits actually COMPLETED — proves the throw path is not what is being tested. */
     submitCount() { return submits; },
   };
-  return fake as unknown as AgentRelayClient & {
-    closed: number; sessions: Set<string>; registered: string[]; submitCount: () => number;
-  };
+  return fake;
 }
 
 /**
@@ -121,7 +134,16 @@ async function setUpDetachedSeal(fx: TwoConnectionFixture): Promise<{
   // The detached path dials FROM the agent's standing receiver.
   await fx.snm.ensureStandingReceiverForAgent("alice");
 
-  fx.snm.setDetachedRelayClientBuilder(() => { calls += 1; return client; });
+  /**
+   * The ONE cast, and it is narrow on purpose. The fake implements only the members this path calls,
+   * so it is not a whole `AgentRelayClient` — but every member it DOES implement is pinned by the
+   * `Pick` above, which is the half that catches a renamed parameter or a changed return shape. A
+   * cast of the object itself (what this file used to do) would have erased both.
+   */
+  fx.snm.setDetachedRelayClientBuilder(() => {
+    calls += 1;
+    return client as unknown as AgentRelayClient;
+  });
   return { client, builderCalled: () => calls };
 }
 
@@ -235,5 +257,54 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
       "the detached seal transport must not leave a session registered. While one remains, " +
         "hasSessions() is true forever and the client can never be closed by any path.",
     ).toBe(false);
+
+    /**
+     * ⚠️ Review: unregistering is only half the fix, and without this the other half is untested.
+     * An implementation that unregisters and never closes passes every assertion above while still
+     * holding the authenticated stream and the relay's reservation for the life of the daemon —
+     * which is the harm this DoD line names, not a tidier map.
+     */
+    expect(
+      client.closed,
+      "releasing must also CLOSE the client once nothing holds it. Unregistering alone leaves the " +
+        "stream and the relay-side reservation open, which is the cost this line exists to stop.",
+    ).toBeGreaterThan(0);
+  }, 60_000);
+  it("★★★ a PASSENGER call does not re-register and does not close a client it does not own", async () => {
+    /**
+     * ⚠️ THE TEST FOR THE FIX THAT HAD NONE. Review measured it: revert the claim guard — make
+     * `registerSession` unconditional and `releaseOnDone` always true — and every other test in this
+     * file still passes, because they all start from a FRESH client where `hasSession` is false and
+     * the passenger branch never runs. The bypass implementation is literally the pre-fix code.
+     *
+     * **Why re-registering is the harm, not just untidiness:** `registerSession` replaces the
+     * entry's `onLeafDeliver` with `onLeafDeliver ?? (() => {})` and does NOT carry the existing
+     * handler forward. This path passes none. So a detached seal over a live registration swaps that
+     * session's inbound leaf delivery for a no-op — the counterparty's leaves arrive and are dropped,
+     * and the operator sees a session that has simply gone quiet.
+     *
+     * **Revert test:** drop the `claimedRegistration` guard and this goes red twice over — the id is
+     * registered a second time, and the passenger closes a client it never claimed.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-relayleak-passenger-" });
+    const { client, builderCalled } = await setUpDetachedSeal(fx);
+
+    // The session is ALREADY registered when the seal arrives — the orphaned-registration state.
+    client.registerSession(SID, undefined as never);
+    expect(client.registered, "precondition: one registration exists before the seal").toHaveLength(1);
+
+    await submitSeal(fx, "corr-passenger");
+
+    expect(builderCalled(), "PRECONDITION — the detached branch must have been entered").toBeGreaterThan(0);
+    expect(
+      client.registered,
+      "a passenger must NOT re-register: registerSession replaces onLeafDeliver with a no-op and " +
+        "this path has no handler, so re-registering blinds a live session's inbound delivery",
+    ).toHaveLength(1);
+    expect(
+      client.closed,
+      "a passenger must not close a client it did not claim — the registration may belong to a live " +
+        "session, and closing it takes that session's stream with it",
+    ).toBe(0);
   }, 60_000);
 });
