@@ -60,7 +60,18 @@ export function makeTestManifest(
   const manifest: ConsortiumManifestInput = {
     version: opts?.version ?? 1,
     not_before: opts?.notBefore ?? "2026-01-01T00:00:00Z",
-    expires: opts?.expires ?? "2027-01-01T00:00:00Z",
+    /**
+     * ⚠️ A FIXTURE THAT EXPIRES IS A TEST SUITE WITH A FUSE. This defaulted to `2027-01-01`, four
+     * months out when it was found (2026-08-24) — after which every default-fixture manifest becomes
+     * EXPIRED and every test that needs an in-window one goes red **on a date, with no code change**.
+     * It would also have silently switched on the lapsed-manifest branches added by
+     * `DOD-M15-EXPIRY-CONSUMER-POLICY-1` for every existing verifier test at the same moment.
+     *
+     * Far-future and FIXED, not `Date.now() + 1y`: a rolling default makes the fixture's window
+     * depend on the clock, and the tests that care about window boundaries pass their own dates
+     * anyway — which is the reason this default only ever needs to mean "in window".
+     */
+    expires: opts?.expires ?? "2099-01-01T00:00:00Z",
     nodes: nodes as readonly Record<string, unknown>[],
     signatures: [],
   };
