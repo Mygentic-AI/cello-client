@@ -699,7 +699,7 @@ export class SessionNodeManager {
    * instead of at the endpoint.
    */
   #resolveSealTransport(agentName: string, sessionId: string):
-    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array; detached?: true }
+    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array; releaseOnDone?: true }
     | { error: string } {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (entry) {
@@ -744,9 +744,25 @@ export class SessionNodeManager {
     // relay_session_gone` branch — which exists to tell "the relay never had it" apart from "the
     // relay swept or sealed it" — can never fire, so the operator is handed a first-message-race
     // label for a swept session.
-    client.registerSession(sessionId, node);
     /**
-     * DOD-M15-RELAYLEAK-1 — **`detached: true` IS THE RELEASE SIGNAL, and its absence was the leak.**
+     * DOD-M15-RELAYLEAK-1 (review MEDIUM-5) — **ONLY THE CALL THAT CLAIMED THE REGISTRATION MAY
+     * RELEASE IT.**
+     *
+     * Two calls can be in this method for the same session at once — the method's own comment says
+     * two near-simultaneous seal triggers are expected by design. If both released, the second to
+     * finish would unregister the only session and CLOSE the client while the first is still parked
+     * on `await …submitLeaf(...)`, settling that submit with `relay_client_closed`. The operator is
+     * then told to check `cello_status` and their relay for a client **this daemon closed on
+     * itself** — an exit-point label pointing at innocent infrastructure.
+     *
+     * So the release signal is not "this branch ran", it is "this call ADDED the registration". A
+     * call that finds it already present is a passenger: it uses the client and leaves the closing
+     * to whoever claimed it.
+     */
+    const claimedRegistration = !client.hasSession(sessionId);
+    if (claimedRegistration) client.registerSession(sessionId, node);
+    /**
+     * DOD-M15-RELAYLEAK-1 — **`releaseOnDone` IS THE RELEASE SIGNAL, and its absence was the leak.**
      *
      * This branch (no `#activeNodes` entry) CACHES a relay client and registers a session on it, and
      * nothing ever unregistered. `#detachSessionRelay` closes a client only when
@@ -755,7 +771,14 @@ export class SessionNodeManager {
      * lifetime. The LIVE branch above registers nothing here, so only this one needs releasing, and
      * marking it is what lets the caller tell them apart without guessing.
      */
-    return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")), detached: true as const };
+    return {
+      node,
+      relayClient: client,
+      relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")),
+      // Not `true` unconditionally: a passenger call must not release a registration it did not
+      // claim — see the note above `claimedRegistration`.
+      ...(claimedRegistration ? { releaseOnDone: true as const } : {}),
+    };
   }
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
   // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
@@ -6779,7 +6802,7 @@ export class SessionNodeManager {
      * must not close a freshly-built replacement for the same key.
      */
     const releaseDetached = (): void => {
-      if (transport.detached !== true) return;
+      if (transport.releaseOnDone !== true) return;
       try {
         entry.relayClient.unregisterSession(sessionId);
         if (!entry.relayClient.hasSessions()) {

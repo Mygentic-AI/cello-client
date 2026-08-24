@@ -477,6 +477,19 @@ export class AgentRelayClient {
     return this.#sessions.size > 0;
   }
 
+  /**
+   * Is THIS session already registered on this client?
+   *
+   * DOD-M15-RELAYLEAK-1 (review MEDIUM-5). The detached seal transport releases its registration
+   * when the submit finishes, and "did I register it, or did I find it already there?" is the
+   * difference between releasing my own and **pulling a live one out from under a concurrent
+   * caller** — which closes the client that caller is mid-`submitLeaf` on. `hasSessions()` cannot
+   * answer it: it is a count, and by then the id is in the set either way.
+   */
+  hasSession(sessionIdHex: string): boolean {
+    return this.#sessions.has(sessionIdHex);
+  }
+
   /** Settle the one outstanding submit (if any) exactly once. */
   #settlePending(r: SubmitResult): void {
     const resolve: AckResolver | null = this.#pendingAck;

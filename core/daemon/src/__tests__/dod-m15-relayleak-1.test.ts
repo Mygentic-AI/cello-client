@@ -70,6 +70,9 @@ function makeFakeRelayClient(): AgentRelayClient & {
     registerSession(sessionId: string) { sessions.add(sessionId); registered.push(sessionId); },
     unregisterSession(sessionId: string) { sessions.delete(sessionId); },
     hasSessions() { return sessions.size > 0; },
+    // Required by the release-claim check. Omitting it made `#resolveSealTransport` throw a
+    // TypeError that the old `.catch(() => undefined)` swallowed whole — see `submitSeal` below.
+    hasSession(sessionId: string) { return sessions.has(sessionId); },
     close() { (fake as { closed: number }).closed += 1; },
     getLastReaderError() { return undefined; },
   };
@@ -107,6 +110,29 @@ async function setUpDetachedSeal(fx: TwoConnectionFixture): Promise<{
   return { client, builderCalled: () => calls };
 }
 
+/**
+ * Call `submitSealLeaf` and assert it did not THROW.
+ *
+ * ⚠️ It is expected to RETURN `{ok:false, …}` here — there is no live relay to accept the leaf, and
+ * that is fine; the leak is on the way out either way. What must not happen is an exception, and a
+ * bare `.catch(() => undefined)` cannot tell the two apart. It hid a real one: the fake client was
+ * missing `hasSession`, so the resolver threw a TypeError, nothing was ever registered, and the only
+ * thing that noticed was the precondition assertion.
+ */
+async function submitSeal(fx: TwoConnectionFixture, correlationId: string): Promise<void> {
+  let thrown: unknown;
+  try {
+    await fx.snm.submitSealLeaf("alice", SID, correlationId);
+  } catch (err: unknown) {
+    thrown = err;
+  }
+  expect(
+    thrown,
+    "submitSealLeaf must not THROW here — a failed submit is a returned {ok:false}. An exception " +
+      "means the detached path broke before doing its work, and every assertion after it is vacuous.",
+  ).toBeUndefined();
+}
+
 describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the daemon", () => {
   let fx: TwoConnectionFixture | null = null;
   afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
@@ -131,7 +157,7 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
     // Stays "in use" so the release leaves it cached — see the note above.
     (client as unknown as { hasSessions: () => boolean }).hasSessions = () => true;
 
-    await fx.snm.submitSealLeaf("alice", SID, "corr-cache").catch(() => undefined);
+    await submitSeal(fx, "corr-cache");
 
     expect(
       builderCalled(),
@@ -170,7 +196,7 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-relayleak-release-" });
     const { client, builderCalled } = await setUpDetachedSeal(fx);
 
-    await fx.snm.submitSealLeaf("alice", SID, "corr-leak").catch(() => undefined);
+    await submitSeal(fx, "corr-leak");
 
     expect(
       builderCalled(),
