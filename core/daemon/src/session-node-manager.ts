@@ -6640,7 +6640,11 @@ export class SessionNodeManager {
    * In memory, deliberately: a restart re-signalling a still-broken peer is correct behaviour, not
    * duplication, and durability here would buy nothing the next refusal does not.
    */
-  #contentRefusals = new Map<string, Map<string, { reason: string; impact?: string; guidance?: string; firstAt: number; count: number; surfaced: boolean }>>();
+  /**
+   * (agentName, sessionId) → reason → the notice. `firstAt` was dropped: it was written and read by
+   * nothing, and a field nobody consumes is a claim the code does not keep.
+   */
+  #contentRefusals = new Map<string, Map<string, { reason: string; impact?: string; guidance?: string; count: number; surfacedTo: Map<string, number> }>>();
 
   /** Record an inbound refusal for the operator. First of its kind per session is the signal. */
   noteContentRefusal(
@@ -6664,30 +6668,59 @@ export class SessionNodeManager {
       reason,
       impact: detail?.impact,
       guidance: detail?.guidance,
-      firstAt: Date.now(),
       count: 1,
-      surfaced: false,
+      // Per CONSUMER, not one global flag. See `takeContentRefusals`.
+      surfacedTo: new Map<string, number>(),
     });
   }
 
   /**
-   * Drain the refusals this operator has not been shown yet, and mark them shown.
+   * Drain the refusals a GIVEN CONSUMER has not been shown yet, and remember what it was shown.
    *
-   * Draining rather than peeking: a refusal the operator has seen once must not re-announce on
-   * every subsequent read, or the surface becomes the flood the dedup above exists to prevent.
-   * `count` still grows underneath, so a later reader can ask how many without being told again.
+   * ─── Why this is keyed by connection, and not by a single flag ─────────────────────────────────
+   *
+   * It used to set one `surfaced: boolean` on the notice. Two MCP windows attending the same agent
+   * is the ordinary case, and under that flag whoever read FIRST consumed the notice — the second
+   * window was told nothing, permanently. **That is the same defect `takeReceivedContent` had**, and
+   * the comment above the delivery loop in `session-content-handlers.ts` spells out why it was
+   * removed: *"reading is non-destructive by construction. Nothing one consumer does mutates state
+   * another consumer reads."* The whole `taken_by_sibling` apparatus exists because this was paid
+   * for once already; re-introducing it on a different surface makes it no less true.
+   *
+   * ─── Why the count now has a reader ────────────────────────────────────────────────────────────
+   *
+   * The old docstring claimed *"count still grows underneath, so a later reader can ask how many
+   * without being told again."* **There was no later reader.** After the first surfacing the count
+   * incremented under a flag the drain skipped unconditionally, so 3 refusals became 903 and nothing
+   * anywhere could say so — while the comment asserted the opposite.
+   *
+   * So a reason RE-ANNOUNCES to a consumer when its count has grown by an order of magnitude since
+   * that consumer last saw it (1 → 10 → 100 → …), marked `repeat: true`. That keeps the first
+   * refusal the signal and the ninetieth silent, which is the dedup's point, while still making a
+   * skew that has swallowed hundreds of messages visible — at a handful of announcements per
+   * session, not one per message.
    */
   takeContentRefusals(
     agentName: string,
     sessionId: string,
-  ): Array<{ reason: string; impact?: string; guidance?: string; count: number }> {
+    consumerId = "default",
+  ): Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
     const perSession = this.#contentRefusals.get(this.#k(agentName, sessionId));
     if (!perSession) return [];
-    const out: Array<{ reason: string; impact?: string; guidance?: string; count: number }> = [];
+    const out: Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> = [];
     for (const notice of perSession.values()) {
-      if (notice.surfaced) continue;
-      notice.surfaced = true;
-      out.push({ reason: notice.reason, impact: notice.impact, guidance: notice.guidance, count: notice.count });
+      const shownAt = notice.surfacedTo.get(consumerId);
+      const firstTime = shownAt === undefined;
+      // `shownAt` is at least 1 whenever it is set, so this cannot loop on zero.
+      if (!firstTime && notice.count < shownAt * 10) continue;
+      notice.surfacedTo.set(consumerId, notice.count);
+      out.push({
+        reason: notice.reason,
+        impact: notice.impact,
+        guidance: notice.guidance,
+        count: notice.count,
+        ...(firstTime ? {} : { repeat: true }),
+      });
     }
     return out;
   }
@@ -6856,6 +6889,26 @@ export class SessionNodeManager {
         // waiting for a reconnect is exactly the wrong advice. Leaving it out of this list would
         // have sent an operator to look for a read failure that is not there and never will be.
         guidance: "Look for session.salt.adoption.refused first: if it is there, this side declined the salt because the session had already hashed messages, that is permanent for this session, and reconnecting will NOT fix it — close the session and start a new one. Otherwise look for session.salt.read.failed or session.salt.persist.failed. If either is present the agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If none of the three is present, the agreement never completed with this counterparty: close the session and start a new one. In every case the transcript up to here is intact.",
+      });
+      // DOD-M15-REFUSED-INBOUND-SILENT-1 — and this branch needed it MORE than the two that had it.
+      //
+      // It was refused, logged with a full impact and guidance, not ingested, not shown — and the
+      // operator was told nothing. Twenty lines below the branches that were wired, in the same
+      // function, with the same shape.
+      //
+      // One of its four causes is permanent, and the guidance above says so in its own words: an
+      // adoption refusal means this side declined the salt for the life of the session and
+      // reconnecting will NOT fix it. So the failure this line exists to close — the conversation
+      // goes quiet, the explanation sits in a log nobody opens — was still live on the one branch
+      // that never repairs itself.
+      //
+      // The guidance is passed by reference to the log's own text rather than duplicated: a second
+      // copy is a second thing to keep true, and the log's version is the one that gets maintained.
+      this.noteContentRefusal(agentName, sessionId, "content_hash_salt_unavailable", {
+        impact:
+          "this message could not be verified — the sender says it is salted and this side holds no salt for the session — so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
+        guidance:
+          "If this side refused the salt because the session had already hashed messages, that is PERMANENT for this session and reconnecting will not fix it — close the session and start a new one. Otherwise the salt agreement re-runs on the next reconnect and this repairs itself. Check session.salt.adoption.refused in the log to tell which. The transcript up to here is intact either way.",
       });
       return { ok: false, reason: "content_hash_salt_unavailable" };
     }
