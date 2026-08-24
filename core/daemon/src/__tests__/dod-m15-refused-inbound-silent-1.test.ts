@@ -240,17 +240,42 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
   }
 
   /**
-   * The session must EXIST and have nothing new, which is the real shape: the operator read what
-   * arrived before the skew started, and everything after it is being refused.
+   * DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by the STABLE `agent_id`, never `agent_name`. The
+   * agent has a real `agents` row by now — it is imported from the flat-file key at daemon start.
+   */
+  function insertSessionRow(agent: string, session: string): void {
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const agentRow = db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get(agent) as { agent_id: string } | undefined;
+    if (!agentRow) throw new Error(`test fixture bug: agent '${agent}' has no 'agents' row yet`);
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+    ).run(session, agentRow.agent_id, "bb".repeat(32), now, now);
+  }
+
+  /**
+   * ⚠️ READ THIS BEFORE CHANGING THE CALL BELOW — the first version of this helper did not reach the
+   * exit it exists to test, and every assertion in it still passed.
+   *
+   * `handleReceive` branches on `since_seq` FIRST: `typeof rawSince === "number" && isFinite` takes
+   * the catch-up BATCH exit and returns immediately. **`since_seq: 0` is a finite number**, so
+   * passing it — which I did, meaning "nothing after seq 0" — skipped the blocking loop entirely and
+   * tested a different exit than the one named in every test title. Deleting the quiet-exit spread
+   * left the whole file green.
+   *
+   * So: NO `since_seq`, and NO seeded transcript row either — a received row above the delivery
+   * bookmark is taken by the live-delivery exit, which is a third exit that also is not this one.
+   * A real `sessions` row IS required or the call exits early at `session_not_live`.
    */
   async function quietReceive(session: string): Promise<Record<string, unknown>> {
     const client = await connect(join(tempDir, "daemon.sock"));
     await client.send("cello_use_agent", { name: "alice" });
-    handle!.getSessionNodeManager().recordTranscriptMessage(
-      "alice", session, 0, "received", new TextEncoder().encode("the last message that got through"), "seed",
-    );
+    insertSessionRow("alice", session);
     return (await client.send("cello_receive", {
-      session_id: session, since_seq: 0, timeout_ms: 150,
+      session_id: session, timeout_ms: 150,
     })) as Record<string, unknown>;
   }
 
@@ -283,8 +308,9 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
       impact: "not ingested", guidance: "their build is newer",
     });
 
-    const guidance = String((await quietReceive("s-ipc-2"))["guidance"] ?? "");
-    expect(guidance, "it must say waiting will not help").toMatch(/will not help|won'?t help/i);
+    const res2 = await quietReceive("s-ipc-2");
+    const guidance = String(res2["guidance"] ?? "");
+    expect(guidance, `it must say waiting will not help — got ${JSON.stringify(res2)}`).toMatch(/will not help|won'?t help/i);
     expect(
       guidance,
       "and must NOT still be advising the wait — the two cannot both be on screen",
