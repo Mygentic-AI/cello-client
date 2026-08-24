@@ -163,19 +163,47 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
        * dealt against one. That is what this event is.
        */
       const manifestValidity = classifyManifestValidity(currentManifest ?? null, Date.now());
-      if (manifestValidity.state === "expired") {
+      /**
+       * ⚠️ NOT ONLY `expired` — review F7. `unreadable_window` (a window field that does not parse)
+       * and `not_yet_valid` (a wrong clock, or a manifest rotated in early) both reached the DKG
+       * with no event at all. `unreadable_window` matters more than it looks: since the startup gate
+       * was hardened it cannot start a daemon, but a manifest POLLED IN after startup can still put
+       * a running daemon into it.
+       */
+      const lapsed = manifestValidity.state === "expired"
+        || manifestValidity.state === "unreadable_window"
+        || manifestValidity.state === "not_yet_valid";
+      if (lapsed) {
         logger.warn("registration.manifest.lapsed", {
           agent: name,
-          expires: manifestValidity.expires,
+          state: manifestValidity.state,
+          window: manifestValidity.state === "expired" ? manifestValidity.expires : manifestValidity.notBefore,
           validators: currentManifest ? validatorNodes(currentManifest.nodes).length : 0,
+          /**
+           * ⚠️ THIS USED TO SAY "a share MAY BE DEALT to a node that is no longer authorized", and
+           * that over-claimed in the very case it named. Review traced the path: a validator removed
+           * since the lapse is either unreachable — dropped at the dial layer by the peerId
+           * cross-check against the signed manifest — or reachable but absent from the DIRECTORY's
+           * current manifest, in which case the roster/participants counts disagree and registration
+           * REFUSES with `dkg_below_threshold`. **Dealing a share to a de-authorized node is not
+           * reachable through this path.** The event was about to be emitted alongside a FAILED
+           * registration while telling the operator a share may have gone somewhere.
+           *
+           * What it says now is what is actually true, and it is still worth saying: this event is
+           * emitted immediately before that refusal, so it is the line that explains an otherwise
+           * bare `dkg_below_threshold` — which names an exit point and not a cause.
+           */
           impact:
-            "the consortium roster this registration deals FROST shares against came from a manifest " +
-            "whose validity window has closed. If a validator has been removed since it lapsed, a " +
-            "share may be dealt to a node that is no longer authorized to hold one.",
+            "the consortium roster this registration works from came from a manifest whose validity " +
+            "window is not currently open. Two gates stand behind this: a node whose identity rotated " +
+            "since is dropped at the dial layer, and a node removed from the directory's current " +
+            "manifest makes the participant counts disagree, which REFUSES the registration with " +
+            "dkg_below_threshold. So if this registration fails with that reason, THIS is the cause.",
           guidance:
-            "Registration was NOT blocked — blocking it would strand a running daemon, since startup " +
-            "fails closed on an expired manifest and a restart without a replacement never comes back. " +
-            "Install a current manifest and restart when you can. Check cello_status for the expiry.",
+            "Registration was NOT blocked here — blocking it would strand a running daemon, since a " +
+            "restart without a replacement manifest does not come back. If it then fails with " +
+            "dkg_below_threshold, replace the trust anchor rather than retrying. cello_status reports " +
+            "the window and where your manifest came from.",
         });
       }
       const consortiumRoster = currentManifest
