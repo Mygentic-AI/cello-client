@@ -4998,7 +4998,7 @@ export class SessionNodeManager {
      */
     for (const [key, client] of this.#relayClients) {
       try {
-        void key; void client; // MUTATION
+        client.close();
       } catch (err: unknown) {
         this.#logger.warn("session.relay_client.close_failed", {
           relayClientKey: key,
