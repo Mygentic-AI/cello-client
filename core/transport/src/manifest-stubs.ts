@@ -115,13 +115,17 @@ export class TestDirectoryChallengeVerifier implements IDirectoryChallengeVerifi
 export class ManifestDirectoryChallengeVerifier implements IDirectoryChallengeVerifier {
   readonly #manifestProvider: IManifestProvider;
   /**
-   * DOD-M15-EXPIRY-CONSUMER-POLICY-1. Called at most ONCE per manifest version when a directory is
-   * authenticated against a manifest whose validity window has closed. Optional so no caller is
-   * forced to change; absent means the old silent behaviour.
+   * DOD-M15-EXPIRY-CONSUMER-POLICY-1. Called once per (manifest version, nodeId) when a directory
+   * has been SUCCESSFULLY authenticated against a manifest whose validity window has closed — so
+   * `nodeId` is a verified identity, never the peer's unchecked claim.
+   *
+   * Optional only because seven existing test constructions do not pass it; every production wiring
+   * does. **Absent means silence**, which is the old defect — so a new caller that omits it is
+   * choosing that, and should not.
    */
   readonly #onExpiredManifest?: (info: { nodeId: string; version: number; expires: string }) => void;
-  /** Last version already reported. `verifyChallenge` runs per challenge, so this cannot flood. */
-  #warnedVersion: number | null = null;
+  /** `${version}\u001f${nodeId}` already reported — per challenge would flood; per node does not. */
+  readonly #reportedLapsed = new Set<string>();
 
   constructor(
     manifestProvider: IManifestProvider,
@@ -135,27 +139,6 @@ export class ManifestDirectoryChallengeVerifier implements IDirectoryChallengeVe
     try {
       const manifest = this.#manifestProvider.getCurrentManifest();
       if (!manifest) return { valid: false, reason: "key_not_in_manifest" };
-
-      /**
-       * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — this consumer PERMITS on a lapsed manifest, deliberately,
-       * and now says so instead of being silent about it.
-       *
-       * **Why not refuse.** This is what authenticates a directory node on the signaling path. Refuse
-       * here and a long-running daemon whose manifest lapsed cannot authenticate ANY directory — it
-       * goes effectively offline, every agent with it, for a manifest that was valid when the process
-       * started. Availability is a first-class protocol concern, and that trade is not worth the
-       * residual risk, which requires a node to have been REMOVED or ROTATED since the lapse.
-       *
-       * **Reported once per manifest VERSION, not per challenge.** Challenges are continuous; an
-       * event per challenge is a flood, and a flood is how a real signal gets ignored.
-       */
-      const expiresMs = Date.parse(manifest.expires);
-      if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
-        if (this.#warnedVersion !== manifest.version) {
-          this.#warnedVersion = manifest.version;
-          this.#onExpiredManifest?.({ nodeId, version: manifest.version, expires: manifest.expires });
-        }
-      }
 
       const node = manifest.nodes.find((n) => n.nodeId === nodeId);
       if (!node) return { valid: false, reason: "key_not_in_manifest" };
@@ -174,7 +157,53 @@ export class ManifestDirectoryChallengeVerifier implements IDirectoryChallengeVe
 
       // RFC 8032: ed25519.verify(signature, message, publicKey)
       const ok = ed25519.verify(sigBytes, tbsBytes, pubkeyBytes);
-      return ok ? { valid: true } : { valid: false, reason: "signature_invalid" };
+      if (!ok) return { valid: false, reason: "signature_invalid" };
+
+      /**
+       * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — this consumer PERMITS on a lapsed manifest, deliberately,
+       * and now says so instead of being silent about it.
+       *
+       * **Why not refuse.** This authenticates a directory node on the signaling path. Refuse here
+       * and a long-running daemon whose manifest lapsed cannot authenticate ANY directory — it goes
+       * effectively offline, every agent with it, for a manifest that was valid when the process
+       * started. The residual risk needs a node REMOVED or ROTATED since the lapse.
+       *
+       * ─── WHY THIS SITS AFTER THE VERIFY, AND NOT WHERE I FIRST PUT IT ────────────────────────
+       *
+       * The first version ran BEFORE the node lookup and the signature check, and all three
+       * consequences were wrong:
+       *   1. **The message was false in the failure case.** It says a directory *was authenticated*;
+       *      from up there the very next line can return `key_not_in_manifest`.
+       *   2. **`nodeId` was unauthenticated remote input** — the peer's own claim, verified after.
+       *   3. **The once-per-version budget was BURNABLE BY THE ADVERSARY.** A rogue directory — the
+       *      exact threat this check exists for — sends any `nodeId`, spends the budget, and every
+       *      genuine authentication against the lapsed anchor is silent for that manifest version.
+       *      A security signal an attacker can switch off is worse than none, because its absence
+       *      reads as safety.
+       * On the success path all three vanish: the text is true, `nodeId` is a verified identity, and
+       * only a real directory can spend the budget.
+       *
+       * Keyed on (version, nodeId): a per-manifest condition, reported once per node rather than per
+       * challenge. Challenges are continuous; N nodes give N events per manifest lifetime, not a
+       * flood.
+       */
+      const expiresMs = Date.parse(manifest.expires);
+      if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+        const seen = `${manifest.version}\u001f${nodeId}`;
+        if (!this.#reportedLapsed.has(seen)) {
+          this.#reportedLapsed.add(seen);
+          /**
+           * OUTSIDE the crypto try/catch's reach — its handler returns `signature_invalid`, so a
+           * throwing logger would have reported that this directory FORGED ITS IDENTITY PROOF.
+           * A reporting failure must never fail an authentication, and must never be described as
+           * one.
+           */
+          try {
+            this.#onExpiredManifest?.({ nodeId, version: manifest.version, expires: manifest.expires });
+          } catch { /* a report is not a verdict */ }
+        }
+      }
+      return { valid: true };
     } catch {
       return { valid: false, reason: "signature_invalid" };
     }

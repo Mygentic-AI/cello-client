@@ -208,6 +208,110 @@ describe("AC-003: IDirectoryChallengeVerifier — Ed25519 challenge verification
     expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
   });
 
+  /**
+   * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — the lapsed-manifest report.
+   *
+   * ⚠️ WRITTEN BECAUSE REVIEW MEASURED THAT THE BRANCH HAD NEVER RUN. The unit shipped with
+   * `core/daemon` 2869 green, transport 154 green and the `trustless-cello` root 1742 green — and
+   * **not one of those executed a line of it**, because every verifier fixture uses a manifest that
+   * is still in window. Three green suites and zero coverage.
+   *
+   * It is also not "a log line". `#reportedLapsed` is stateful dedup — a set, an insertion ordered
+   * ahead of a call, and a suppression rule — which regresses silently to *never fires* or *fires on
+   * every challenge*, and neither is visible in any gate.
+   */
+  describe("DOD-M15-EXPIRY-CONSUMER-POLICY-1: authenticating against a LAPSED manifest is reported", () => {
+    function lapsedVerifier() {
+      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+        expires: "2020-01-01T00:00:00Z",
+      }) as unknown as ConsortiumManifest;
+      const provider = new TestManifestProvider(manifest);
+      void provider.loadAndVerify([], 0);
+      const seen: Array<{ nodeId: string; version: number; expires: string }> = [];
+      const verifier = new ManifestDirectoryChallengeVerifier(provider, (info) => seen.push(info));
+      return { verifier, provider, seen };
+    }
+
+    async function goodChallenge(): Promise<{ tbsBytes: Uint8Array; signatureHex: string }> {
+      const keyProvider = new TestDirectoryKeyProvider({ nodeId, privateKeyHex });
+      const tbsBytes = buildStep5Tbs({
+        nodeId, agentPubkeyHex: "a".repeat(64), nonceHex: "b".repeat(64),
+        isoTimestamp: "2026-06-12T10:00:00.000Z",
+      });
+      return { tbsBytes, signatureHex: Buffer.from(await keyProvider.sign(tbsBytes)).toString("hex") };
+    }
+
+    it("★ reports ONCE for a node, not once per challenge", async () => {
+      const { verifier, seen } = lapsedVerifier();
+      const { tbsBytes, signatureHex } = await goodChallenge();
+
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+
+      expect(seen.length, "challenges are continuous — an event per challenge is a flood").toBe(1);
+      expect(seen[0]!.nodeId).toBe(nodeId);
+      expect(seen[0]!.expires).toBe("2020-01-01T00:00:00Z");
+    });
+
+    it("★ an IN-WINDOW manifest reports NOTHING — a signal that fires on the normal case is not a signal", async () => {
+      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)]) as unknown as ConsortiumManifest;
+      const provider = new TestManifestProvider(manifest);
+      void provider.loadAndVerify([], 0);
+      const seen: unknown[] = [];
+      const verifier = new ManifestDirectoryChallengeVerifier(provider, (i) => seen.push(i));
+      const { tbsBytes, signatureHex } = await goodChallenge();
+
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, signatureHex)).toEqual({ valid: true });
+      expect(seen, "without this the whole change can regress to a flood undetected").toEqual([]);
+    });
+
+    it("★ THE ADVERSARY CANNOT SILENCE IT: a FAILED authentication reports nothing", async () => {
+      /**
+       * The finding this ordering exists for. The first version reported BEFORE the node lookup and
+       * the signature check, so a rogue directory — the exact threat this check is for — could send
+       * any `nodeId`, spend the once-per-node budget, and leave every genuine authentication against
+       * the lapsed anchor silent. **A security signal an attacker can switch off is worse than none,
+       * because its absence reads as safety.**
+       */
+      const { verifier, seen } = lapsedVerifier();
+      const { tbsBytes } = await goodChallenge();
+
+      expect(verifier.verifyChallenge(nodeId, tbsBytes, "00".repeat(64)))
+        .toEqual({ valid: false, reason: "signature_invalid" });
+      expect(verifier.verifyChallenge("a-node-the-peer-made-up", tbsBytes, "00".repeat(64)))
+        .toEqual({ valid: false, reason: "key_not_in_manifest" });
+
+      expect(
+        seen,
+        "a rejected challenge must spend no budget — otherwise the report is burnable by the party " +
+          "it exists to expose, and it would also claim a directory 'was authenticated' when it was not",
+      ).toEqual([]);
+    });
+
+    it("★ a THROWING reporter must not become 'this directory forged its signature'", async () => {
+      /**
+       * The callback originally sat inside the crypto try/catch, whose handler returns
+       * `signature_invalid` — which surfaces to the operator as `directory_challenge_failed`. So a
+       * logger write failure would have accused a healthy directory node of forging its identity
+       * proof, once, unreproducibly. A reporting failure must never fail an authentication.
+       */
+      const manifest = makeTestManifest([makeTestNode(nodeId, publicKeyHex)], {
+        expires: "2020-01-01T00:00:00Z",
+      }) as unknown as ConsortiumManifest;
+      const provider = new TestManifestProvider(manifest);
+      void provider.loadAndVerify([], 0);
+      const verifier = new ManifestDirectoryChallengeVerifier(provider, () => {
+        throw new Error("the log sink is down");
+      });
+      const { tbsBytes, signatureHex } = await goodChallenge();
+
+      expect(
+        verifier.verifyChallenge(nodeId, tbsBytes, signatureHex),
+        "the signature is genuinely valid — a failing report must not turn that into a forgery claim",
+      ).toEqual({ valid: true });
+    });
+  });
+
   it("returns { valid: false, reason: 'signature_invalid' } for wrong signature", async () => {
     const { verifier } = makeVerifier();
     const tbsBytes = buildStep5Tbs({

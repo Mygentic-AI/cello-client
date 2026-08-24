@@ -167,7 +167,7 @@ export function classifyManifestValidity(
 export type ManifestOrigin = "bundled" | "file";
 
 /** What to actually DO about a manifest that needs replacing, given where it came from. */
-function remedyFor(origin: ManifestOrigin): string {
+export function remedyFor(origin: ManifestOrigin): string {
   return origin === "bundled"
     ? "This daemon uses the COMPILED-IN consortium manifest, so there is no file to replace: " +
       "upgrade the @cello-protocol/connect package to get a newer one. Do NOT repoint " +

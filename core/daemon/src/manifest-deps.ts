@@ -28,6 +28,7 @@ import {
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
 import type { Logger } from "./types.js";
+import { remedyFor, type ManifestOrigin } from "./manifest-validity.js";
 
 /** Normalize a directory URL for comparison (trim, drop trailing slashes, lowercase). */
 function normalizeUrl(u: string): string {
@@ -59,6 +60,37 @@ export interface ManifestDeps {
  * The single manifestProvider instance is shared between startDaemon's loadAndVerify call and the
  * ManifestDirectoryChallengeVerifier, so step-6 reads the same cached, verified manifest.
  */
+/**
+ * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — ONE callback, built per origin.
+ *
+ * It was duplicated verbatim across the bundled and file branches, and the one place the two copies
+ * had to DIFFER was the one place they were identical: the remedy. "Install a current manifest and
+ * restart" is advice that cannot be followed on the bundled path — the manifest is compiled in, that
+ * branch wires no poll, so it can never self-heal — and the workaround an operator reaches for
+ * instead (repointing CELLO_DIRECTORY_URL) starts the daemon with directory identity authentication
+ * SILENTLY OFF. Guidance that routes a stuck operator into disabling a security control is a defect
+ * in the guidance, which `remedyFor` already exists to prevent.
+ */
+function lapsedManifestReporter(
+  logger: Logger,
+  origin: ManifestOrigin,
+): (info: { nodeId: string; version: number; expires: string }) => void {
+  return (info) => {
+    logger.warn("directory.auth.manifest.lapsed", {
+      ...info,
+      origin,
+      impact:
+        "a directory node was SUCCESSFULLY authenticated against a manifest whose validity window " +
+        "has closed, so its key was trusted on the strength of a check that has expired. If that " +
+        "node has been rotated or removed since, this daemon would not know.",
+      guidance:
+        "Signaling was NOT blocked — refusing here would leave a long-running daemon unable to " +
+        "authenticate any directory, taking every agent offline. " + remedyFor(origin) +
+        " cello_status reports the expiry.",
+    });
+  };
+}
+
 export function buildManifestDeps(logger: Logger): ManifestDeps {
   const manifestPath = process.env.CELLO_CONSORTIUM_MANIFEST;
   if (!manifestPath) {
@@ -100,22 +132,8 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
       return {};
     }
     const manifestProvider = new EmbeddedManifestProvider(BUNDLED_CONSORTIUM_MANIFEST);
-    const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider, (info) => {
-    // DOD-M15-EXPIRY-CONSUMER-POLICY-1: a directory was authenticated against a manifest whose
-    // window has closed. NOT refused — see the verifier for why — but no longer silent. Fires at
-    // most once per manifest version.
-    logger.warn("directory.auth.manifest.lapsed", {
-      ...info,
-      impact:
-        "a directory node was authenticated against a manifest whose validity window has closed, so " +
-        "its key is trusted on the strength of a check that has expired. If that node has been " +
-        "rotated or removed since, this daemon would not know.",
-      guidance:
-        "Signaling was NOT blocked — refusing here would leave a long-running daemon unable to " +
-        "authenticate any directory, taking every agent offline. Install a current manifest and " +
-        "restart when convenient; cello_status reports the expiry.",
-    });
-  });
+    const challengeVerifier = new ManifestDirectoryChallengeVerifier(
+      manifestProvider, lapsedManifestReporter(logger, "bundled"));
     logger.info("daemon.manifest.bundled", {
       version: BUNDLED_CONSORTIUM_MANIFEST.version,
       nodeCount: BUNDLED_CONSORTIUM_MANIFEST.nodes.length,
@@ -140,22 +158,8 @@ export function buildManifestDeps(logger: Logger): ManifestDeps {
   }
 
   const manifestProvider = new FileManifestProvider({ path: manifestPath });
-  const challengeVerifier = new ManifestDirectoryChallengeVerifier(manifestProvider, (info) => {
-    // DOD-M15-EXPIRY-CONSUMER-POLICY-1: a directory was authenticated against a manifest whose
-    // window has closed. NOT refused — see the verifier for why — but no longer silent. Fires at
-    // most once per manifest version.
-    logger.warn("directory.auth.manifest.lapsed", {
-      ...info,
-      impact:
-        "a directory node was authenticated against a manifest whose validity window has closed, so " +
-        "its key is trusted on the strength of a check that has expired. If that node has been " +
-        "rotated or removed since, this daemon would not know.",
-      guidance:
-        "Signaling was NOT blocked — refusing here would leave a long-running daemon unable to " +
-        "authenticate any directory, taking every agent offline. Install a current manifest and " +
-        "restart when convenient; cello_status reports the expiry.",
-    });
-  });
+  const challengeVerifier = new ManifestDirectoryChallengeVerifier(
+    manifestProvider, lapsedManifestReporter(logger, "file"));
   // DOD-AUTH-2: background manifest poll. The directory is re-polled on a randomized 6–12h interval
   // (thundering-herd avoidance) and a newer signed manifest is adopted. The interval is env-injectable
   // so the live binary test can poll sub-second instead of waiting hours; production leaves these
