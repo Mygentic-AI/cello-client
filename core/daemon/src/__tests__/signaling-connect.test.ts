@@ -147,10 +147,10 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
      * that let the check disarm quietly.
      */
     const warns: Array<{ event: string; ctx: Record<string, unknown> }> = [];
-    const { node } = makeFakeNode([
+    const freshNode = (): unknown => makeFakeNode([
       encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(7) }),
       encodeFrame({ type: "signaling_auth_ok" }),
-    ]);
+    ]).node;
 
     const connect = createSignalingConnect({
       getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
@@ -159,18 +159,13 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
         ...silentLogger,
         warn: (event: string, ctx?: Record<string, unknown>) => { warns.push({ event, ctx: ctx ?? {} }); },
       } as Logger,
-      createDirectoryNode: async () => node as never,
+      createDirectoryNode: async () => freshNode() as never,
       getManifestVersion: () => 0,
     });
 
     await connect();
 
     const skipped = warns.find((w) => w.event === "directory.auth.skipped");
-    expect(
-      String(skipped?.ctx["claimedNodeId"] ?? "") === String(skipped?.ctx["dialedPeerId"] ?? "") ? "same" : "distinct",
-      "the peer's CLAIM about itself and the peer we DIALLED must be separate fields — this line's " +
-        "whole subject is that the claim was not checked",
-    ).toBe("distinct");
     expect(
       skipped,
       "connecting with no verifier must WARN by name. Without it, an operator running unverified " +
@@ -180,28 +175,20 @@ describe("createSignalingConnect — handshake (M6 path, step-6 off)", () => {
       String(skipped!.ctx["impact"]),
       "and it must say what was not checked, plus the setting that refuses instead of connecting",
     ).toContain("CELLO_REQUIRE_DIRECTORY_AUTH");
+    expect(
+      skipped!.ctx["dialedPeerId"],
+      "the peer we DIALLED is the honest field — this line's whole subject is that the peer's own " +
+        "claim about itself was not checked",
+    ).toBe(PEER);
 
     /**
-     * ⚠️ ONCE, NOT PER CONNECT — review F3. The signaling stream turns over about every 70 seconds
-     * and reconnects forever, so a per-connect WARN is ~48 an hour per agent, indefinitely, on a
-     * logger with no level filtering. A signal that fires on the normal case is not a signal, and it
-     * would bury the public-directory case this exists to raise.
+     * ⚠️ ONCE, NOT PER CONNECT — review F3, and the RECONNECT is driven through the SAME factory
+     * because that is what production does: `SignalingManager` calls this same `connect` again on
+     * every reconnect, with `maxReconnectAttempts` effectively infinite. The stream turns over about
+     * every 70 seconds, so a per-connect WARN is ~48 an hour per agent, indefinitely, on a logger
+     * with no level filtering. A signal that fires on the normal case is not a signal.
      */
-    const { node: node2 } = makeFakeNode([
-      encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(7) }),
-      encodeFrame({ type: "signaling_auth_ok" }),
-    ]);
-    const reconnect = createSignalingConnect({
-      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
-      getAuthIdentity: validIdentity,
-      logger: {
-        ...silentLogger,
-        warn: (event: string, ctx?: Record<string, unknown>) => { warns.push({ event, ctx: ctx ?? {} }); },
-      } as Logger,
-      createDirectoryNode: async () => node2 as never,
-      getManifestVersion: () => 0,
-    });
-    await reconnect();
+    await connect();
 
     expect(
       warns.filter((w) => w.event === "directory.auth.skipped").length,

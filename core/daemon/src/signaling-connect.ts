@@ -85,15 +85,6 @@ async function safeStop(node: CelloNode): Promise<void> {
  */
 const IDENTITY_PROOF_MAX_SKEW_MS = 5 * 60_000;
 
-/**
- * DOD-M15-DIRAUTH-1 — directory peers already told about a skipped identity check.
- *
- * Mirrors `consortium-bootstrap`'s `lapsedMembershipReportedFor` idiom: the fact is about a PEER,
- * not about a connection, so reporting it per connection says the same true thing 48 times an hour
- * forever. Keyed on the peer this daemon DIALLED — never on the peer's own claim about itself,
- * which on this path is precisely the thing that was not verified.
- */
-const authSkipReportedFor = new Set<string>();
 
 export interface DirectoryEndpoint {
   peerId: string;
@@ -185,6 +176,20 @@ function parseRelayEndpoints(raw: unknown): Array<{ peerId: string; addrs: strin
  * transport SignalingManager catches the throw and schedules a reconnect.
  */
 export function createSignalingConnect(deps: SignalingConnectDeps): () => Promise<ConnectResult> {
+  /**
+   * DOD-M15-DIRAUTH-1 — directory peers already told about a skipped identity check.
+   *
+   * Mirrors `consortium-bootstrap`'s `lapsedMembershipReportedFor` idiom: the fact is about a PEER,
+   * not about a connection, so reporting it per connection says the same true thing ~48 times an
+   * hour forever. Keyed on the peer this daemon DIALLED — never on the peer's own claim about
+   * itself, which on this path is precisely the thing that was not verified.
+   *
+   * ⚠️ SCOPED TO THE FACTORY, not the module. A module-level set is shared by every daemon wiring in
+   * the process and never resets, which makes the suppression outlive the thing it describes and
+   * makes test order load-bearing — my first version did exactly that and a later test silently lost
+   * its warning to an earlier one.
+   */
+  const authSkipReportedFor = new Set<string>();
   return async function connect(): Promise<ConnectResult> {
     const endpoint = await deps.getDirectoryEndpoint();
     if (!endpoint) {
