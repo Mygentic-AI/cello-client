@@ -64,7 +64,26 @@ import type { IpcHandler } from "./ipc-server.js";
  * is still waiting** rather than after their tool call has already given up. A threshold that fires
  * after the caller has gone is a line nobody reads.
  */
-const HOLDER_SLOW_WARN_MS = 5_000;
+const HOLDER_OPENING_INFO_MS = 5_000;
+
+/**
+ * When a holder's send stops being "slow" and starts being "not answering" —
+ * `DOD-M15-DOCACCEPT-UNBOUNDED-1`.
+ *
+ * ⚠️ THE FIRST VERSION HAD ONE THRESHOLD AT 5s AND IT FIRED ON THE HEALTHY CASE. Review measured real
+ * cold-session-open latency from a 150 MB daemon log — 74 opens where a fresh session had to be
+ * dialled: **p50 12.9s, p90 25.1s, min 3.6s, and only 9 of 74 under 5s.** So a single `warn` at 5s
+ * saying *"this holder cannot currently be reached"* was **false on ~88% of the cold opens that
+ * trigger it** — the holder WAS reached, twelve seconds later. That is precisely the outcome I said I
+ * was guarding against: a signal that fires on the normal case is one operators learn to ignore, which
+ * is worse than the silence it replaced. It was also error substitution — naming *unreachability* and
+ * sending the reader to the transport when the true state is "a session is being opened".
+ *
+ * Two thresholds now. **5s is INFO and says what is actually happening**; **30s is WARN and says the
+ * holder has not answered** — above the observed p90, still under the client's own 60s request
+ * timeout so the line lands while the operator is still waiting.
+ */
+const HOLDER_UNANSWERED_WARN_MS = 30_000;
 import type { Logger } from "./types.js";
 import type { DocumentLayer } from "./document-layer.js";
 import type { DocumentPublish } from "./document-publish.js";
@@ -806,16 +825,46 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
        * on **while the wait is still happening**, and changes nothing else — the timer is cleared on
        * every exit path, including a throw.
        */
-      const slowSend = setTimeout(() => {
-        logger.warn("document.amendment.holder_slow", {
+      /**
+       * ⚠️ THE RECONCILE PROMISE IS NOT TRUE FOR EVERY VERB — review F2, the worst of the findings
+       * because it reassured the operator about permanent loss.
+       *
+       * The first version said flatly *"they are re-notified on reconcile"*. `sweepTargets` skips a
+       * document when `derived.state.ended !== null`, and when the owner is no longer among `seats`.
+       * So for **`kill`**, for the **`close`** that ends the document, and for **`refuse_join`** (where
+       * the refuser has just given up their own seat), the document is never swept again — the entry is
+       * appended locally, the send fails, and that holder keeps reading the document as ACTIVE forever.
+       * Telling them "nothing is lost" there is worse than saying nothing.
+       */
+      const reconcileWillRetry = !["kill", "close", "refuse_join"].includes(String(args.verb));
+      const started = Date.now();
+      let announced: "opening" | "unanswered" | null = null;
+      const openingTimer = setTimeout(() => {
+        announced = "opening";
+        logger.info("document.amendment.holder_opening", {
           documentId: args.documentId,
           holderAgentId: holder,
           verb: args.verb,
-          waitedMs: HOLDER_SLOW_WARN_MS,
-          impact: "this fan-out is sequential and unbounded, so every holder after this one is waiting too, and the caller (cello_doc_accept) has returned nothing. An operator sees an accept that simply hangs.",
-          guidance: "This holder cannot currently be reached. Nothing is lost — the amendment is recorded locally and they are re-notified on reconcile — but the calling operation will not answer until this send settles.",
+          thresholdMs: HOLDER_OPENING_INFO_MS,
+          detail: "still working on this holder — most often a session is being opened, which measures p50 ~13s and p90 ~25s on a cold peer. NOT yet evidence of a problem.",
         });
-      }, HOLDER_SLOW_WARN_MS);
+      }, HOLDER_OPENING_INFO_MS);
+      const unansweredTimer = setTimeout(() => {
+        announced = "unanswered";
+        logger.warn("document.amendment.holder_unanswered", {
+          documentId: args.documentId,
+          holderAgentId: holder,
+          verb: args.verb,
+          thresholdMs: HOLDER_UNANSWERED_WARN_MS,
+          // NO TOOL NAME — review F3. This hardcoded `cello_doc_accept`, and `fanOutAmendment` has
+          // five call sites: an operator whose `cello_doc_invite` hung was told their
+          // `cello_doc_accept` returned nothing, contradicted by `verb` in the same payload.
+          impact: "this fan-out is sequential and unbounded, so every holder after this one is waiting too and the calling operation has returned nothing. The operator sees it simply hang.",
+          guidance: reconcileWillRetry
+            ? "This holder has not answered well past a normal session open. The amendment is recorded locally and the reconcile sweep will carry it to them later, so it is not lost — but the calling operation will not answer until this send settles."
+            : `This holder has not answered well past a normal session open, and this verb ("${String(args.verb)}") ENDS the document or gives up this seat — so the reconcile sweep will NOT carry it. If this send never settles, that holder keeps reading the document as active, permanently.`,
+        });
+      }, HOLDER_UNANSWERED_WARN_MS);
       try {
         const sent = await deps.transportFor(args.agentName).sendBytes({
           peerAgentId: holder,
@@ -852,7 +901,25 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       } finally {
         // EVERY exit path, including the throw above — a timer left armed would log a slow send for a
         // holder that already answered, which is worse than the silence it replaces.
-        clearTimeout(slowSend);
+        clearTimeout(openingTimer);
+        clearTimeout(unansweredTimer);
+        /**
+         * ⚠️ PAIR THE ANNOUNCEMENT WITH ITS OUTCOME — review F5. The old line logged
+         * `waitedMs: <the constant>`, which is not a measurement, and nothing was written when the send
+         * settled. So the log could not distinguish *outstanding 6s then fine* from *outstanding 55s
+         * then the client gave up* — the one thing an operator reading it wants to know. Emitted only
+         * if we announced, so a healthy send stays silent.
+         */
+        if (announced !== null) {
+          logger.info("document.amendment.holder_settled", {
+            documentId: args.documentId,
+            holderAgentId: holder,
+            verb: args.verb,
+            waitedMs: Date.now() - started,
+            announcedAs: announced,
+            notified: told[holder] === true,
+          });
+        }
       }
     }
     return told;
