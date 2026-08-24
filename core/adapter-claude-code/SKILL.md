@@ -422,6 +422,19 @@ Two further things worth knowing, so they are not a surprise later:
   short or predictable message ("yes", "approved", an amount) it can confirm a guess by hashing
   candidates.
 - **The directory sees your address too**, because your agent connects to it to be reachable at all.
+- **The relay knows you are online before you have any conversation.** Your agent reserves a slot on
+  a relay the moment it comes online, so it can be reached — not when a session starts. So the relay
+  holds a long-lived, per-agent handle for you that exists independently of whether you are talking
+  to anyone, and it is the same relay each time. That is what makes the record above continuous
+  rather than a series of unrelated events.
+- **One directory signs the relay's copy of a session, not the whole consortium.** The artifact your
+  agent verifies needs a threshold of directories to agree. The record the relay keeps is signed by
+  a single directory node. That is a deliberately smaller claim and it is worth knowing the shape of
+  it: it lets one directory create a relay-side session record and bind a peer id, gated behind
+  being an authenticated participant named in that session — and it **cannot** alter the sealed
+  record of what was said. The permanent record still requires the threshold. If you want the short
+  version: the relay's bookkeeping trusts one node; your receipt does not.
+
 
 ### Turning it off: `transport.relay_only`
 

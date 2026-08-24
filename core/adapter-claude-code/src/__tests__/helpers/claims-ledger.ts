@@ -952,6 +952,44 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
       "relay-only's hole-punch and advertisement halves need an agent RESTART, because they are " +
       "fixed when the network node is built, while the address filtering takes effect immediately.",
   },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "a single directory's signature cannot alter the sealed record",
+    excerpts: [
+      "being an authenticated participant named in that session \u2014 and it **cannot** alter the sealed",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "Added by DOD-M15-DISCLOSE-1 bullet 3, and the asymmetry it describes was read out of the relay " +
+      "rather than assumed. The relay verifies a SESSION ASSIGNMENT against the any-directory set " +
+      "(`relay-node.ts`: `this.#directoryPubkeys.find((pk) => verify(pk, tbs, ...))`), so ONE sovereign " +
+      "directory's signature is sufficient for the relay-side record and the peer-id binding \u2014 which " +
+      "is exactly what the sentence concedes. The SEALED record is a different artifact with a " +
+      "different requirement: it is a FROST threshold signature over the session's root, T-of-N with " +
+      "T = majority(N), so no single directory key can produce one. `structural` because the " +
+      "distinction is the cryptography, not a check that runs: a single Ed25519 key cannot generate a " +
+      "threshold signature, so there is no branch to skip.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "a single directory's signature cannot alter the sealed record",
+    excerpts: [
+      "being an authenticated participant named in that session \u2014 and it **cannot** alter the sealed",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "Added by DOD-M15-DISCLOSE-1 bullet 3, and the asymmetry it describes was read out of the relay " +
+      "rather than assumed. The relay verifies a SESSION ASSIGNMENT against the any-directory set " +
+      "(`relay-node.ts`: `this.#directoryPubkeys.find((pk) => verify(pk, tbs, ...))`), so ONE sovereign " +
+      "directory's signature is sufficient for the relay-side record and the peer-id binding \u2014 which " +
+      "is exactly what the sentence concedes. The SEALED record is a different artifact with a " +
+      "different requirement: it is a FROST threshold signature over the session's root, T-of-N with " +
+      "T = majority(N), so no single directory key can produce one. `structural` because the " +
+      "distinction is the cryptography, not a check that runs: a single Ed25519 key cannot generate a " +
+      "threshold signature, so there is no branch to skip.",
+  },
 ];
 
 /**
