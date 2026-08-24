@@ -43,7 +43,7 @@ import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUN
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
-import { isRelayOnly, publishableEndpoint, relayOnlyState, isCircuitAddr } from "./relay-only.js";
+import { publishableEndpoint, relayOnlyState, isCircuitAddr } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
