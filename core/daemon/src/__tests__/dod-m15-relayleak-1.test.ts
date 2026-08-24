@@ -60,9 +60,12 @@ function makeFakeRelayClient(): AgentRelayClient & {
   sessions: Set<string>;
   /** Every id ever registered — survives release, so a test can prove registration HAPPENED. */
   registered: string[];
+  /** Completed submits — a 0 here means the tests are exercising the throw path, not the real one. */
+  submitCount: () => number;
 } {
   const sessions = new Set<string>();
   const registered: string[] = [];
+  let submits = 0;
   const fake = {
     closed: 0,
     sessions,
@@ -73,10 +76,22 @@ function makeFakeRelayClient(): AgentRelayClient & {
     // Required by the release-claim check. Omitting it made `#resolveSealTransport` throw a
     // TypeError that the old `.catch(() => undefined)` swallowed whole — see `submitSeal` below.
     hasSession(sessionId: string) { return sessions.has(sessionId); },
+    /**
+     * ⚠️ **THE TESTS USED TO PASS WITHOUT THIS, AND THAT WAS THE PROBLEM.** With no `submitLeaf` on
+     * the fake, the submit threw a TypeError and the release was only ever exercised on the THROW
+     * path — the `finally` runs there too, so the leak assertions still held and nothing said the
+     * normal path had never been tried. Returning a successful submit makes these tests cover the
+     * case that actually happens: a submit that COMPLETES, and a client that must be released after.
+     */
+    submitLeaf() { submits += 1; return Promise.resolve({ ok: true as const, sequence_number: 1 }); },
     close() { (fake as { closed: number }).closed += 1; },
     getLastReaderError() { return undefined; },
+    /** How many submits actually COMPLETED — proves the throw path is not what is being tested. */
+    submitCount() { return submits; },
   };
-  return fake as unknown as AgentRelayClient & { closed: number; sessions: Set<string>; registered: string[] };
+  return fake as unknown as AgentRelayClient & {
+    closed: number; sessions: Set<string>; registered: string[]; submitCount: () => number;
+  };
 }
 
 /**
@@ -202,6 +217,12 @@ describe("DOD-M15-RELAYLEAK-1 — a cached relay client does not outlive the dae
       builderCalled(),
       "PRECONDITION — the detached branch must have been entered; a 0 here means the assertions " +
         "below are about a path that never ran",
+    ).toBeGreaterThan(0);
+    expect(
+      client.submitCount(),
+      "PRECONDITION — the submit must have COMPLETED. Before the fake implemented submitLeaf this " +
+        "threw, and the release was exercised only on the exception path while the normal one was " +
+        "never tried at all.",
     ).toBeGreaterThan(0);
     expect(
       client.registered,
