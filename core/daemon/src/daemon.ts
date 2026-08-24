@@ -4866,9 +4866,27 @@ async function startDaemonHoldingLock(
             correlationId,
             "doc",
             /**
-             * No proof, and that is the truth rather than an omission: the document transport does
-             * not go through `sendContent`, so no Structure-1 was signed for this frame and there is
-             * nothing witnessed to record. Stated here because the signature now requires an answer.
+             * No proof — and the reason I first wrote here was FALSE, which review traced rather
+             * than read.
+             *
+             * ⚠️ IT SAID *"the document transport does not go through `sendContent`, so no Structure-1
+             * was signed."* Both halves are wrong. `document-delivery-transport.ts` calls
+             * `deps.sendContent(...)`, wired straight to `sessionNodeManager.sendContent` a few lines
+             * above this; and `session-relay-client.ts` signs the Structure-1 with no `leafKind` gate
+             * at all, so a `0x04` doc leaf is signed exactly like a message. **A proof exists and is
+             * discarded here.**
+             *
+             * That matters more than a wrong comment usually would, because this unit's whole thesis
+             * is *"`undefined` is a claim the author made rather than one the signature made for
+             * them"* — and the first claim made under the new signature was untrue.
+             *
+             * THE TRUE REASON, which is a better one: **no consumer.** A doc leaf released from a
+             * hold writes no transcript row — `#releaseHeld` skips `recordTranscriptMessage` for
+             * `kind === "doc"` — so there is nothing for the proof to reach. Discarding it is
+             * no-consumer-no-ship, deliberately.
+             *
+             * **If doc rows ever reach the transcript, `appendLeaf` needs an authorship parameter**
+             * and this `undefined` becomes a defect rather than a decision.
              */
             undefined,
           );

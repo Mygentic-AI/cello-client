@@ -65,7 +65,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import * as lp from "it-length-prefixed";
 import { Encoder, decode } from "cbor-x";
-import type { CelloNode, Stream } from "@cello-protocol/transport";
+import type { CelloNode } from "@cello-protocol/transport";
+import type { Stream } from "@libp2p/interface";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });

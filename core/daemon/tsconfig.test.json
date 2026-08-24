@@ -64,6 +64,23 @@
     // its job at the cost of hiding the very breakage the signature change was meant to make loud.
     // Added here because a required parameter that no compiler checks is a comment.
     "src/__tests__/msg-007-index-discipline.test.ts",
+    /**
+     * ⚠️ SEALWIRE-1's OWN FOUR FILES — missing until review found them, in the very commit that
+     * widened this list for two OTHER units and wrote the trap down verbatim: *"the files most likely
+     * to be missing are your own newest ones."* I wrote that sentence and then left bullet 5's
+     * headline evidence outside the compiler.
+     *
+     * It was not free. `-sent-proof-wired` imported `Stream` from `@cello-protocol/transport`, which
+     * does not export it — `error TS2305`. It is used three times as `as unknown as Stream`, so the
+     * acking relay's stream shape was completely unconstrained in the file this bullet rests on. The
+     * type came from `@libp2p/interface` all along; nothing caught it because nothing looked.
+     */
+    "src/__tests__/dod-m15-sealwire-1-authorship.test.ts",
+    "src/__tests__/dod-m15-sealwire-1-root-check.test.ts",
+    "src/__tests__/dod-m15-sealwire-1-sender-leg.test.ts",
+    "src/__tests__/dod-m15-sealwire-1-sent-proof-wired.test.ts",
+    "src/__tests__/dod-m15-sealwire-1-held-authorship.test.ts",
+    "src/__tests__/relay-client-fake.ts",
     // DOD-M15-SALTSPLIT-1's own two files. New and clean on creation, which is this list's stated
     // admission criterion — and I nearly shipped them OUTSIDE it in the same session I widened the
     // list for someone else's breakage. That is the whole trap in one move: the allowlist protects
