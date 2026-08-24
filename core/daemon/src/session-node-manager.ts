@@ -59,7 +59,11 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
-import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, PARK_ENVELOPE_REASONS, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
+// `PARK_ENVELOPE_REASONS` is deliberately NOT imported here. The reason codes are compared inside
+// `park-envelope.ts` itself (`parkRefusalGuidance`) and asserted in its own test; this file only ever
+// receives the already-classified `ParkAuthFailure`, so importing the code table here would invite a
+// second, drifting copy of the classification logic.
+import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.

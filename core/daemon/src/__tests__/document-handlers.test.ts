@@ -2198,4 +2198,51 @@ describe("starting content is screened at BOTH ends of the invite", () => {
     });
     expect(res.ok).toBe(true);
   });
+
+  it("★★ DOD-M15-DOCACCEPT-UNBOUNDED-1: a holder that stops answering is NAMED while the caller still waits", async () => {
+    /**
+     * ⚠️ I FILED THIS AS UNREACHABLE AND I WAS WRONG — review disproved it by running the path.
+     *
+     * I claimed the plain bilateral accept *"fans out to nobody"*, citing my own measurement
+     * `sends attempted: []`, and filed an AC saying this needed `JOIN-1`'s three-party setup. **Both
+     * halves were false.** `cello_doc_accept` on a bilateral proposal fans out a `consent` amendment —
+     * which is the exact verb the live 60s `cello_doc_accept` timeouts carried — and the evidence was
+     * already in this file: the test above comments *"B's consent entry reaches A"* and asserts the
+     * amendment chain grows, and `fanOutAmendment` is its only sender.
+     *
+     * My measurement was wrong because the fan-out had not happened *yet* at the moment I sampled, not
+     * because it never happens. A negative reading from an un-awaited path is not evidence of absence.
+     *
+     * What this pins: the send stalls, and the daemon SAYS SO while the caller is still blocked.
+     * Without it the operator sees an operation that simply hangs and the log says nothing at all.
+     */
+    const fA = await newFixture();
+    const fB = await newFixture();
+    const proposed = await fA.call("cello_doc_propose", { peer_pubkey: fB.owner });
+    const documentId = proposed.documentId as string;
+    const proposalSend = fA.sent.find((s) => s.peerAgentId === fB.owner)!;
+    fB.layer.onDocumentFrame(AGENT, "session-1", proposalSend.bytes, fA.owner);
+    await until(() => fB.layer.handshake.pending(fB.owner).length === 1);
+
+    const release = fB.holderStopsAnswering();
+    const accept = fB.call("cello_doc_accept", { document_id: documentId });
+
+    // 5s: INFO, and it must NOT claim unreachability — a cold session open is p50 ~13s, so at this
+    // point "still opening" is the truthful statement and "cannot be reached" would be false.
+    await vi.waitFor(
+      () => expect(fB.events).toContain("document.amendment.holder_opening"),
+      { timeout: 9_000, interval: 100 },
+    );
+    expect(
+      fB.events.includes("document.amendment.holder_unanswered"),
+      "the WARN must not fire at the INFO threshold — a healthy cold open lives in this window, and a " +
+        "warn here is the noise-on-every-first-contact failure this design exists to avoid",
+    ).toBe(false);
+
+    release();
+    expect((await accept).ok, "and the accept completes once the holder answers").toBe(true);
+
+    // The pair: an announcement with no outcome cannot distinguish "slow then fine" from "never came".
+    await until(() => fB.events.includes("document.amendment.holder_settled"));
+  }, 20_000);
 });
