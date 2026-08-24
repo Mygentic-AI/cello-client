@@ -10187,8 +10187,16 @@ export class SessionNodeManager {
 
     const adoption = this.#saltAdoptionClosed(agentName, sessionId);
     if (adoption.closed) {
-      // SPENT. Something is already hashed under this salt, so it is not ours to drop.
-      this.#logger.error("session.salt.discard.refused", {
+      /**
+       * SPENT. Something is already hashed under this salt, so it is not ours to drop.
+       *
+       * INFO, not ERROR, and the level is a judgement rather than a downgrade: this is the guard
+       * doing its job correctly, and the FAILURE it accompanies — the session is split and unusable
+       * — is reported by `session.salt.split` at ERROR from the caller that has the operator-facing
+       * detail. Two ERRORs for one condition trains people to read neither. This line stays so the
+       * refusal itself is correlatable when someone asks why the salt is still on disk.
+       */
+      this.#logger.info("session.salt.discard.refused", {
         agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
         impact: "the salt was NOT dropped, because content in this session is already hashed under it and erasing it would leave a transcript no single rule can verify. The session stays split: the counterparty holds no salt and refuses everything sent from here.",
       });
@@ -10450,6 +10458,22 @@ export class SessionNodeManager {
        * is nothing for its operator to do. Logging that at WARN would fire on the innocent side of
        * every such session and train them to ignore the name.
        */
+      /**
+       * DOD-M15-SALTSPLIT-1 — ONE PLACE DECIDES WHETHER THE SALT GOES, and it is not here.
+       *
+       * ⚠️ THIS CALL WAS INSIDE THE `else` BELOW, AND THE REVERT TEST CAUGHT IT.
+       *
+       * Guarding it by `adoption.closed` here meant `#discardUnspentSalt`'s own adoption check could
+       * never be reached, so deleting that check left all three tests GREEN — the survivor. A guard
+       * nothing can redden is not a guard; it is a comment that happens to execute, which is the
+       * shape this milestone keeps finding.
+       *
+       * Called unconditionally now. The method owns the spent/unspent decision, both outcomes run
+       * through it, and deleting its check reddens the spent test immediately. That also removes the
+       * duplicated condition: two places deciding the same thing is one place being wrong later.
+       */
+      this.#discardUnspentSalt(agentName, sessionId, correlationId);
+
       const shared = {
         agentName, sessionId, correlationId, detail: action.detail,
         impact: "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
@@ -10507,7 +10531,6 @@ export class SessionNodeManager {
          * Ordering matters — discard BEFORE the log, so the line cannot claim an outcome that the
          * write then failed to produce.
          */
-        this.#discardUnspentSalt(agentName, sessionId, correlationId);
         this.#logger.info("session.salt.adoption.closed", shared);
       }
       if (action.announce) {
