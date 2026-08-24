@@ -5,64 +5,75 @@
  *
  * `cello_contact_set_tier` shipped as *"3=whitelisted (auto-accepted when you're away)"*, and
  * `cello_contact_add` as *"…NOT auto-accepted when you're away. Promote them to whitelisted/vip …
- * to let them reach you unattended."* Both attributed unattended acceptance to the tier.
+ * to let them reach you unattended."* Both attributed unattended acceptance to the tier, and both
+ * misled the reader in the SAFE-FEELING direction: whitelisting is not the reason a peer got through.
  *
- * **EVERY tier is auto-accepted.** So the promise was not unkept — it was REDUNDANT, which is the
- * worse shape: whitelisting did not fail to let someone through, it failed to be the *reason* they
- * got through. An operator reading it concludes strangers are held back while they are away. They
- * are not, and **the reader is misled in the safe-feeling direction.**
+ * ─── ⚠️ AND THE FIRST REPLACEMENT WAS FALSE IN THE OTHER DIRECTION, WHICH IS WORSE ─────────────
  *
- * ─── ⚠️ WHY THIS FILE EXISTS AT ALL, WHICH IS THE PART WORTH READING ───────────────────────────
+ * It read *"note EVERY tier is auto-accepted; tiers govern how much, not whether"*. **Acceptance IS
+ * gated on tier.** `checkUnknownSenderAcceptanceBound` reads `getTier`, resolves that tier's
+ * `max_sessions`, and refuses at the cap — and `DEFAULT_TIER_BOUNDS[BLOCKED]` is `0`, so a blocked
+ * contact is refused on the FIRST knock (`inbound-sessions.ts`: *"BLOCKED 0 → refused here"*).
  *
- * The DoD line's enforcer is explicit that a hand audit is not evidence:
+ * So the sentence contradicted the `0=blocked` clause two clauses earlier, and told an operator —
+ * and any agent reading the tool surface — **that their block does nothing.** The original defect
+ * over-promised a protection; that one denied a protection that exists, and it pointed at the kill
+ * switch. Corrected to "tiers 1-4 are auto-accepted WITHIN THEIR CAPS; above tier 0, tiers govern
+ * how much, not whether."
  *
- *   > *"Enforcer — NOT 'I read the file'. … every claim-vocabulary match in `cello-mcp.ts`
- *   > adjudicated into `helpers/claims-ledger.ts` with its verdict and evidence … so the work is a
- *   > **shrinking count**, not a paragraph saying it was done."*
+ * ─── What this file does and does NOT enforce ─────────────────────────────────────────────────
  *
- * **`claims-ledger.ts` had NO IMPORTER.** 900 lines of adjudications, exported and read by nothing —
- * so the count was never computed, never compared, never asserted. Adding rows to it would have been
- * an assertion that the work happened, wearing the costume of evidence, which is the exact thing the
- * enforcer was written to forbid.
- *
- * That is the same defect this milestone keeps producing — **a value with no reader** — sitting in
- * the mechanism meant to enforce against it.
- *
- * **Scope, deliberately narrow.** This consumes the ledger for ONE surface: `cello-mcp.ts`. Sweeping
- * the other eight is `DOD-M15-LEDGER-1`, which Andre PARKED until after Tier 4. Building its
- * machinery here would be doing a parked line's work under another line's name.
+ * The line's enforcer wants every claim-vocabulary match adjudicated into `claims-ledger.ts` so the
+ * count shrinks. **That cannot be done from here yet**, and the reason is a dependency nobody wrote
+ * down: `shippedSurfaces()` enumerates `.md` files plus one hard-coded string, so it cannot produce
+ * `cello-mcp.ts` as a surface at all — adding rows for it made the scanner's own orphan guard fail
+ * and turned main red. Teaching the scanner to read this surface is `DOD-M15-TOOLDESC-SCAN-1`.
+ * **This file therefore pins the regression, not the ledger arithmetic.**
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { ADJUDICATED, countClaimWords } from "./helpers/claims-ledger.js";
 
-const SURFACE = "core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)";
 const SURFACE_PATH = join(import.meta.dirname, "..", "bin", "cello-mcp.ts");
 
-/** Only the description strings — the first string argument of each `server.tool(...)` call. */
+/**
+ * Every tool description on the surface.
+ *
+ * ⚠️ `\s*` after `server.tool(` is load-bearing: the first version required the name on the SAME
+ * line, which silently skipped `cello_backup` and `cello_restore` — two of fifty-eight, both
+ * declared multi-line, both carrying claim vocabulary nobody had read. An extractor that
+ * under-counts makes every guard built on it narrower than it appears, so the count is asserted
+ * below rather than trusted.
+ */
 function toolDescriptions(src: string): Array<{ tool: string; desc: string }> {
-  return [...src.matchAll(/server\.tool\("([a-z_]+)",\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => ({
+  return [...src.matchAll(/server\.tool\(\s*"([a-z_0-9]+)",\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => ({
     tool: m[1]!,
     desc: m[2]!,
   }));
 }
 
-describe("DOD-M15-TIERTEXT-1 — the tier descriptions, and the ledger that accounts for them", () => {
+describe("DOD-M15-TIERTEXT-1 — the tier descriptions", () => {
   const src = readFileSync(SURFACE_PATH, "utf8");
-  const rows = ADJUDICATED.filter((r) => r.surface === SURFACE);
+
+  it("★ the extractor sees EVERY tool — a guard is only as wide as what it reads", () => {
+    const declared = src.split("server.tool(").length - 1;
+    expect(
+      toolDescriptions(src).length,
+      `${declared} server.tool( declarations but the extractor found fewer — a description it cannot ` +
+        `see is one the regression guard below cannot protect`,
+    ).toBe(declared);
+  });
 
   it("★ THE FALSE CLAIM IS GONE — no description attributes unattended acceptance to a tier", () => {
     /**
-     * The regression guard, and it is worth more than the ledger arithmetic below: this is the exact
-     * sentence an operator read and believed, which is how the line was found.
+     * The regression guard, and the sentence an operator actually read and believed, which is how
+     * this line was found.
      */
     for (const { tool, desc } of toolDescriptions(src)) {
       expect(
         /auto-accepted when you'?re away/i.test(desc),
-        `${tool} still claims a tier decides who reaches you while you are away. Every tier is ` +
-          `auto-accepted; tiers govern how much, not whether.`,
+        `${tool} still claims a tier decides who reaches you while you are away`,
       ).toBe(false);
       expect(
         /promote them to whitelisted\/vip .* reach you unattended/i.test(desc),
@@ -71,96 +82,64 @@ describe("DOD-M15-TIERTEXT-1 — the tier descriptions, and the ledger that acco
     }
   });
 
-  it("★ every ledger excerpt for this surface still appears VERBATIM in it", () => {
+  it("★ AND THE CORRECTION IS NOT FALSE THE OTHER WAY — nothing says every tier is accepted", () => {
     /**
-     * A row whose excerpt has drifted accounts for nothing. Without this, the ledger silently stops
-     * matching the file it claims to adjudicate — and the count below would keep reporting success
-     * against text that no longer exists.
+     * The guard against my own first fix. Acceptance IS tier-gated at tier 0, so an unqualified
+     * "EVERY tier is auto-accepted" denies the kill switch. Any future rewording that drops the
+     * qualifier reddens here.
      */
-    expect(rows.length, "the surface must have adjudicated rows at all").toBeGreaterThan(0);
-    for (const row of rows) {
-      for (const excerpt of row.excerpts) {
-        expect(
-          src.includes(excerpt),
-          `ledger row "${row.claim}" quotes text that is no longer in the surface:\n  ${excerpt}`,
-        ).toBe(true);
-      }
+    for (const { tool, desc } of toolDescriptions(src)) {
+      expect(
+        /every tier is auto-accepted/i.test(desc),
+        `${tool} claims every tier is auto-accepted. Tier 0 is refused on the first knock — ` +
+          `checkUnknownSenderAcceptanceBound reads getTier and BLOCKED's cap is 0. This sentence ` +
+          `tells an operator their block does nothing.`,
+      ).toBe(false);
     }
-  });
-
-  it("★ THE SHRINKING COUNT: every claim-vocabulary hit in a tier/contact description is adjudicated", () => {
-    /**
-     * The enforcer's actual demand. The ledger's own `countClaimWords` is used — the same regex the
-     * scanner applies — so an unadjudicated claim shows up as a number, not as a feeling.
-     *
-     * Scoped to the contact/tier tools this DoD line owns. The remaining tools on this surface are
-     * `LEDGER-1`'s sweep and it is parked; counting them here would report a failure for work
-     * deliberately not being done yet.
-     */
-    const OWNED = ["cello_contacts", "cello_contact_add", "cello_contact_set_tier", "cello_config_set"];
-    const accounted = rows.reduce((n, r) => n + r.excerpts.reduce((m, e) => m + countClaimWords(e), 0), 0);
-    const present = toolDescriptions(src)
-      .filter((t) => OWNED.includes(t.tool))
-      .reduce((n, t) => n + countClaimWords(t.desc), 0);
-
+    const setTier = toolDescriptions(src).find((t) => t.tool === "cello_contact_set_tier")!;
     expect(
-      accounted,
-      `${present} claim-vocabulary hits across ${OWNED.length} owned descriptions, but the ledger ` +
-        `accounts for ${accounted}. An unaccounted hit is an unaudited claim — adjudicate it into ` +
-        `claims-ledger.ts with a verdict and evidence, or delete the claim.`,
-    ).toBeGreaterThanOrEqual(present);
+      setTier.desc,
+      "and tier 0 must still be described as refusing — the one tier that does gate WHO",
+    ).toMatch(/0=blocked \(refused/);
   });
 
-  it("★ THE REPLACEMENT CLAIM IS TRUE TOO: nothing gates ACCEPTANCE on tier", () => {
+  it("★ `isAutoAccept` still has no production caller — the OTHER tier gate stays unwired", () => {
     /**
-     * The corrected text now asserts *"EVERY tier is auto-accepted; tiers govern how much, not
-     * whether"*. A fix that replaces a false claim with an unverified one has moved the problem, so
-     * this pins the new sentence rather than only the absence of the old one.
+     * ⚠️ NAMED FOR WHAT IT CHECKS, after review caught the previous name asserting something false.
+     * It was called "nothing gates ACCEPTANCE on tier" — and something does. This test looks at the
+     * one tier function that is NOT wired; it never proved the broader claim, and a green test
+     * sitting beside a false description implied a proof it had not given.
      *
-     * The claim is an ABSENCE, so the evidence is one: `isAutoAccept` — the only tier check that
-     * could gate acceptance — has NO PRODUCTION CALLER. `session-node-manager.ts` defines it and its
-     * own docstring says the consumer is the offline mailbox and it is *"defined here as the seam"*.
+     * It is still worth having: if `isAutoAccept` is ever wired up, tier gains a SECOND acceptance
+     * gate and every description on this surface needs re-reading.
      *
-     * **This is the guard that matters if someone later wires it up.** The day acceptance starts
-     * depending on tier, this test goes red — and the description saying tiers do not gate who
-     * reaches you becomes false at the same moment. Better a red test than a quietly-true-again
-     * promise nobody re-reads.
-     *
-     * The other two corrected claims already have behaviour tests and are not duplicated here:
-     * the stranger-pool exemption at `m8c-abuse-1.test.ts` ("a KNOWN+ contact is not part of the
-     * stranger pool"), and finite per-tier caps via `INV-TIER-BOUND`.
+     * Walks all packages, not just the top level of one — the method is public on
+     * `SessionNodeManager`, so a caller in `core/cli` or `core/client` would leave a daemon-only
+     * scan green while the surface became wrong.
      */
-    const { readdirSync } = require("node:fs") as typeof import("node:fs");
-    const daemonSrc = join(import.meta.dirname, "..", "..", "..", "daemon", "src");
+    const root = join(import.meta.dirname, "..", "..", "..");
     const callers: string[] = [];
-    for (const f of readdirSync(daemonSrc).filter((n) => n.endsWith(".ts"))) {
-      const text = readFileSync(join(daemonSrc, f), "utf8");
-      // A CALL, not the definition and not a mention in prose.
-      for (const m of text.matchAll(/\bisAutoAccept\s*\(/g)) {
-        const line = text.slice(0, m.index).split("\n").length;
-        const isDefinition = /isAutoAccept\s*\(agentName: string/.test(text.slice(m.index, m.index + 60));
-        if (!isDefinition) callers.push(`${f}:${line}`);
+    const walk = (dir: string): void => {
+      for (const e of readdirSync(dir, { withFileTypes: true })) {
+        if (e.name === "node_modules" || e.name === "dist" || e.name === "__tests__") continue;
+        const full = join(dir, e.name);
+        if (e.isDirectory()) { walk(full); continue; }
+        if (!e.name.endsWith(".ts")) continue;
+        const text = readFileSync(full, "utf8");
+        for (const m of text.matchAll(/\bisAutoAccept\s*\(/g)) {
+          const isDefinition = /isAutoAccept\s*\(\s*agentName/.test(text.slice(m.index, m.index + 60));
+          if (!isDefinition) callers.push(`${e.name}:${text.slice(0, m.index).split("\n").length}`);
+        }
       }
+    };
+    for (const pkg of readdirSync(root, { withFileTypes: true })) {
+      if (!pkg.isDirectory()) continue;
+      try { walk(join(root, pkg.name, "src")); } catch { /* package has no src */ }
     }
     expect(
       callers,
-      "acceptance is now gated on tier somewhere — so 'EVERY tier is auto-accepted; tiers govern " +
-        "how much, not whether' has become FALSE and the description must change with the code",
+      "isAutoAccept now has a caller — tier has a second acceptance gate and every tier description " +
+        "on this surface must be re-read against it",
     ).toEqual([]);
-  });
-
-  it("★ a `true` verdict may not rest on nobody enforcing it", () => {
-    /**
-     * Carried from `DOD-M15-CLAIM-SCANNER-1` and load-bearing: a claim held up by the operator's own
-     * rewritable client and one held up by the absence of a wire field are different facts. A row
-     * marked `true` with `nobody-yet` is only honest when the claim asserts an ABSENCE.
-     */
-    for (const row of rows.filter((r) => r.verdict === "true")) {
-      expect(
-        row.enforcedBy,
-        `"${row.claim}" is marked true but nothing enforces it`,
-      ).not.toBe("nobody-yet");
-      expect(row.evidence.length, `"${row.claim}" has no evidence`).toBeGreaterThan(80);
-    }
   });
 });
