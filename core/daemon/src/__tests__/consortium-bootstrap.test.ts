@@ -131,6 +131,50 @@ describe("verifyStartupManifest — the gate reports, it does not decide", () =>
     expect(store.persisted).toEqual([]);
   });
 
+  it("★ an UNDATEABLE manifest is REFUSED — a garbage window is not an in-window one", async () => {
+    /**
+     * DOD-M15-EXPIRY-CONSUMER-POLICY-1. This gate compared `new Date(manifest.expires)` with `<=`,
+     * and `new Date("nonsense")` is Invalid Date: **every comparison against NaN is false.** So a
+     * manifest whose `expires` does not parse passed BOTH window checks, set `manifestVerified`, and
+     * started the daemon on an artefact nobody can date.
+     *
+     * `manifest-validity.ts` describes this exact code — *"the startup check's own shape waves a
+     * garbage timestamp through as though it were in-window"* — and fixed it for the runtime
+     * classifier while leaving the startup gate as it found it.
+     *
+     * **It also falsified the premise the rest of that DoD line rests on.** The argument for
+     * permitting elsewhere is that a lapsed manifest only exists inside a long-running daemon, so
+     * refusing would strand a live operator. Not here: this daemon starts FRESH into the
+     * lapsed-equivalent state and stays there permanently, while the guidance tells the operator not
+     * to restart because it will not come back. It comes back, cleanly, forever, on the same broken
+     * file.
+     *
+     * Not attacker-mintable — the field sits inside the threshold-signed body — so this is the
+     * hand-edited-file and broken-generator case, which is precisely what `unreadable_window` exists
+     * to name.
+     */
+    const logger = makeLogger();
+    const store = makeVersionStore();
+    const result = await verifyStartupManifest({
+      manifestProvider: makeProvider(makeManifest({ expires: "not-a-date" })),
+      manifestRootKeys: ROOT_KEYS,
+      manifestThreshold: THRESHOLD,
+      manifestVersionStore: store,
+      logger,
+    });
+
+    expect(
+      result.manifestVerified,
+      "an undateable manifest must not start the daemon — before this, it did",
+    ).toBe(false);
+    expect(
+      logged(logger, "error", "directory.auth.manifest.unreadable.window"),
+      "and it must be named as MALFORMED, not as expired — 'expired' tells an operator to rotate a " +
+        "stale manifest, which is the wrong fix for a field that is garbage",
+    ).toBe(true);
+    expect(store.persisted).toEqual([]);
+  });
+
   it("an expired manifest is REFUSED", async () => {
     const logger = makeLogger();
     const store = makeVersionStore();

@@ -27,6 +27,7 @@ import { randomUUID } from "node:crypto";
 import { startHttpManifestPoll } from "./http-manifest-poll.js";
 import type { ProbeBudget } from "./directory-bootstrap.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
+import { classifyManifestValidity } from "./manifest-validity.js";
 import {
   resolveDirectoryUrl,
   manifestNodesToEndpoints, FAST_PROBE,
@@ -115,18 +116,54 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
   try {
     const manifest = await manifestProvider.loadAndVerify(manifestRootKeys, manifestThreshold);
 
+    /**
+     * DOD-M15-EXPIRY-CONSUMER-POLICY-1 — THIS GATE HAD THE NaN HOLE ITS OWN CLASSIFIER WAS WRITTEN
+     * TO CLOSE, and the whole line's premise rested on it.
+     *
+     * It was `new Date(manifest.expires)` compared with `<=`. `new Date("nonsense")` is Invalid
+     * Date, and **every comparison against NaN is false** — so a manifest with an unparseable
+     * `expires` passed BOTH checks, set `manifestVerified = true`, and started the daemon on an
+     * artefact nobody can date. `manifest-validity.ts` says exactly this about exactly this code —
+     * *"the startup check's own shape waves a garbage timestamp through as though it were
+     * in-window"* — and fixed it for the RUNTIME classifier while leaving the startup gate as it
+     * found it. `signal-submission.ts` and `preauth-capability.ts` both get it right; this was the
+     * odd one out.
+     *
+     * **It also falsified the argument the rest of this line rests on.** Everything else here reasons
+     * that a lapsed manifest exists only inside a LONG-RUNNING daemon, so refusing would strand a
+     * live operator. For the unparseable case that was untrue: such a daemon starts FRESH into the
+     * lapsed-equivalent state and stays there permanently — while both new events tell the operator
+     * *"do not restart, it will not come back."* It comes back cleanly, forever, on the same broken
+     * file. Wrong advice, in the one case where refusing costs nothing.
+     *
+     * Now one policy object for the startup gate and the runtime surface, which is what this DoD
+     * line is about. Refuses anything that is not affirmatively in-window.
+     */
+    const validity = classifyManifestValidity(manifest, Date.now());
+    if (validity.state === "unreadable_window" || (validity.state === "expired" && !Number.isFinite(Date.parse(manifest.expires)))) {
+      logger.error("directory.auth.manifest.unreadable.window", {
+        manifestVersion: manifest.version,
+        notBefore: manifest.not_before,
+        expires: manifest.expires,
+        detail: "a validity-window field does not parse — the artefact is malformed, not merely stale. " +
+          "A hand-edited file or a broken generator is the usual cause. Refusing rather than treating " +
+          "an undateable manifest as in-window.",
+      });
+      return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
+    }
+
     const now = new Date();
     const notBefore = new Date(manifest.not_before);
     const expiresAt = new Date(manifest.expires);
 
-    if (now < notBefore) {
+    if (validity.state === "not_yet_valid" || now < notBefore) {
       logger.error("directory.auth.manifest.not.yet.valid", {
         manifestVersion: manifest.version,
         notBefore: manifest.not_before,
       });
       return { manifestVerified, verifiedManifestVersion, consortiumEndpoints, verifiedManifest, unresolvedNodes, unresolvedSweptAt };
     }
-    if (expiresAt <= now) {
+    if (validity.state === "expired" || expiresAt <= now) {
       logger.error("directory.auth.manifest.expired", {
         manifestVersion: manifest.version,
         expiresAt: manifest.expires,
