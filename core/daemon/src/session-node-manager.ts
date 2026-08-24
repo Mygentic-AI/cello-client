@@ -10454,6 +10454,25 @@ export class SessionNodeManager {
      * hash that has been computed under the salt but has not yet become a leaf, a hold or an
      * awaiting-ack entry, and that gap is a full relay round trip wide.
      */
+    /**
+     * ⚠️ MEASURED UNREACHABLE FROM TODAY'S CALLERS, AND KEPT ANYWAY — pass 2 test-teeth, survivor 2.
+     *
+     * Deleting this block leaves the whole salt suite GREEN. That is the definition this unit has
+     * used all along for *"not a guard, a comment that happens to execute"*, so it is labelled rather
+     * than quietly left to look load-bearing. `#suspendSalt` refuses on `inFlight > 0` before a
+     * session can ever be marked, and both callers of this method require the mark — so the deferred
+     * erase cannot observe a non-zero count.
+     *
+     * It stays for one reason: **it sits at an irreversible write.** The earlier instance of this
+     * question in this same unit was resolved by making the guard the actual decision-maker, and that
+     * option does not exist here — `#suspendSalt` genuinely must refuse early, so the duplication is
+     * structural rather than a mistake about where responsibility lives. For a destructive act, the
+     * safe direction is to keep a check that cannot fire over removing one that turns out it could.
+     *
+     * What must NOT happen is claiming it as coverage. It is not tested and it is not testable from
+     * outside; if a third caller ever reaches this method without the suspension mark, this becomes
+     * reachable and needs a test in the same commit.
+     */
     const inFlight = this.#hashedWithSalt.get(this.#k(agentName, sessionId)) ?? 0;
     if (inFlight > 0) {
       this.#logger.info("session.salt.discard.refused", {
