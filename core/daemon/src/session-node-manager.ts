@@ -1858,7 +1858,7 @@ export class SessionNodeManager {
         -- transcript is only ever read by its owner, and worthless the moment it is shown to anyone
         -- else — which is the whole point of a notarized record.
         --
-        -- sender_sig holds one of TWO things, and which one is told by `direction`:
+        -- sender_sig holds one of TWO things, and which one is told by direction:
         --   RECEIVED row -> the Structure-2 signature, stored ONLY after the receiver verified it
         --                   against the pubkey inside the sender's own signed bytes
         --                   (#recordFrameOrdering). Verified, never claimed.
@@ -1866,9 +1866,9 @@ export class SessionNodeManager {
         --                   from the submit result. Produced, not verified — there was no
         --                   counterparty in the act, so it must NEVER be labelled verified_signature.
         --
-        -- ⚠️ `self_authored` COVERS TWO PROVENANCES, and `sender_sig IS NOT NULL` is the discriminator.
+        -- ⚠️ self_authored COVERS TWO PROVENANCES, and sender_sig IS NOT NULL is the discriminator.
         -- Named here because it is the same shape this column exists to prevent, one level up: a
-        -- provable sent row and an unprovable one share a label, so a reader keying on `attribution`
+        -- provable sent row and an unprovable one share a label, so a reader keying on attribution
         -- alone cannot tell them apart. An unprovable sent row is legitimate — an UNWITNESSED send
         -- never put a Structure 1 on the wire, so there is nothing signed to store — but the reader
         -- has to be told where the distinction lives, or it will be rediscovered as a bug.
