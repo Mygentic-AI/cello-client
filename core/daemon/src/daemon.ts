@@ -2204,7 +2204,13 @@ async function startDaemonHoldingLock(
        */
       scheduleParkRetry(res.retryAfterMs, agentName, "send");
     }
-    return { ok: false, reason: res.reason ?? "relay_deposit_failed" };
+    return {
+      ok: false,
+      reason: res.reason ?? "relay_deposit_failed",
+      // DOD-M15-RELAYABUSE-1 review MEDIUM-6: the guidance quotes the relay's OWN window instead of
+      // guessing "about a minute", which is a hardcoded assumption about a configurable value.
+      ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+    };
   });
 
   // CELLO-M7-MSG-001 (AC-004/AC-005, D-d): startup flush of locally-persisted un-acked

@@ -326,3 +326,38 @@ describe("DOD-M15-RELAYABUSE-1 — the guidance cannot promise a queue that does
     });
   }
 });
+
+
+describe("DOD-M15-RELAYABUSE-1 — the guidance quotes the RELAY's window, or says nothing", () => {
+  /**
+   * ⚠️ "in about a minute" was a HARDCODED GUESS about the other side's configuration. The relay's
+   * window is configurable; run it at ten minutes and that sentence becomes a wrong promise — and a
+   * wrong number is worse than no number, because the reader plans around it.
+   *
+   * The real value was two frames away and died at `ParkAttempt`, which is the value-with-no-reader
+   * defect one layer further out from where it had just been fixed twice.
+   */
+  it("quotes the relay's own delay when it gave one", () => {
+    const g = parkRefusalGuidance(RELAY_PARK_REFUSALS.RATE_LIMITED, true, 45_000);
+    expect(g, "45s is quoted in seconds, not rounded into a guess").toMatch(/about 45 seconds/i);
+    expect(g, "and the old hardcoded guess is gone").not.toMatch(/about a minute/i);
+  });
+
+  it("renders a long window in minutes rather than 600 seconds", () => {
+    const g = parkRefusalGuidance(RELAY_PARK_REFUSALS.RATE_LIMITED, true, 10 * 60_000);
+    expect(g, "a ten-minute window must read as minutes — this is the case the guess got wrong").toMatch(/about 10 minutes/i);
+  });
+
+  it("says NOTHING about timing when the relay did not say", () => {
+    /** Silence beats invention: an older relay sends no delay, and a made-up one is a wrong promise. */
+    const g = parkRefusalGuidance(RELAY_PARK_REFUSALS.RATE_LIMITED, true, undefined);
+    expect(g, "no delay, no claim about when").not.toMatch(/in about/i);
+    expect(g, "but the diagnosis still stands").toMatch(/rate-limiting/i);
+  });
+
+  it("ignores a nonsense delay rather than rendering it", () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(parkRefusalGuidance(RELAY_PARK_REFUSALS.RATE_LIMITED, true, bad), `${String(bad)} must not be rendered`).not.toMatch(/in about/i);
+    }
+  });
+});

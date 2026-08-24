@@ -574,7 +574,14 @@ const RECEIVED_BUFFER_CAP = 32;
  * standing receiver.
  */
 // M12-P18: how many refused session ids to retain per agent (drain-sweep matching, not security).
-type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string };
+/**
+ * ⚠️ `retryAfterMs` — `DOD-M15-RELAYABUSE-1` review MEDIUM-6. The guidance told operators the
+ * throttle clears *"in about a minute"*, which is a hardcoded guess about the RELAY's configurable
+ * window: a relay run at ten minutes makes that sentence a wrong promise. The real number was in
+ * hand two frames away and died here, which is the value-with-no-reader defect one layer further
+ * out from where it was just fixed twice.
+ */
+type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string; retryAfterMs?: number };
 
 /**
  * DOD-M12B-REVIVAL-BOUND-1 — how long an interrupted session stays revivable before it is closed.
@@ -1321,7 +1328,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
     | null = null;
 
   constructor(opts: {
@@ -1445,7 +1452,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -1580,7 +1587,11 @@ export class SessionNodeManager {
           reason: result.reason,
           cause: result.cause,
         });
-        return { outcome: "refused", cause: result.cause ?? result.reason };
+        return {
+          outcome: "refused",
+          cause: result.cause ?? result.reason,
+          ...(result.retryAfterMs !== undefined ? { retryAfterMs: result.retryAfterMs } : {}),
+        };
       }
       return { outcome: "parked" };
     } catch (err: unknown) {
@@ -6688,7 +6699,7 @@ export class SessionNodeManager {
          * This is the reason `cause` had to become a code first: the distinction is unbranchable
          * while the field holds an English paragraph.
          */
-        guidance: parkRefusalGuidance(attempt.cause, durable),
+        guidance: parkRefusalGuidance(attempt.cause, durable, attempt.retryAfterMs),
       };
     }
   }

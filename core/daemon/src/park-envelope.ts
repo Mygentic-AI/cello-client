@@ -390,7 +390,7 @@ export function authenticateParkedEntry(args: {
  * `durable` distinguishes "queued and will retry" from "not queued — it is lost", which is the one
  * distinction that changes whether the reader must act right now.
  */
-export function parkRefusalGuidance(cause: string | undefined, durable: boolean): string {
+export function parkRefusalGuidance(cause: string | undefined, durable: boolean, retryAfterMs?: number): string {
   if (cause === PARK_ENVELOPE_REASONS.ALG_UNREADABLE) {
     return (
       "This message names a content-hash algorithm your build cannot produce, so it could not be " +
@@ -418,7 +418,7 @@ export function parkRefusalGuidance(cause: string | undefined, durable: boolean)
    */
   const diagnosis =
     cause === RELAY_PARK_REFUSALS.RATE_LIMITED
-      ? "The relay is healthy and deliberately rate-limiting this agent's hand-offs, so it refused this one. NOTHING IS WRONG with the link or the counterparty, and the limit clears on its own."
+      ? `The relay is healthy and deliberately rate-limiting this agent's hand-offs, so it refused this one. NOTHING IS WRONG with the link or the counterparty, and the limit clears on its own${describeRetryWindow(retryAfterMs)}.`
       : cause === RELAY_PARK_REFUSALS.RECIPIENT_FULL
         ? "The relay is holding as much undelivered content for THIS counterparty as it will, so it refused the hand-off. That is about their mailbox, not your connection, and another relay would refuse it too. It clears when they come online and collect it, or when older entries expire."
         : cause === RELAY_PARK_REFUSALS.STORE_FULL
@@ -434,4 +434,20 @@ export function parkRefusalGuidance(cause: string | undefined, durable: boolean)
   return durable
     ? "Direct delivery failed and the relay refused the hand-off, so the message is queued and will be re-sent automatically when the relay link is back. Do not re-send it: an identical re-send is not separately queued."
     : "Direct delivery failed and the message could NOT be queued for retry — it is lost. Send it again.";
+}
+
+
+/**
+ * Render the relay's own retry delay, or say nothing at all.
+ *
+ * ⚠️ SAYS NOTHING WHEN THE RELAY DID NOT SAY — review MEDIUM-6. The first version of the guidance
+ * asserted the limit clears *"in about a minute"*, which is a hardcoded guess about the relay's
+ * CONFIGURABLE window: a relay run at ten minutes makes that a wrong promise, and a wrong number is
+ * worse than no number because the reader plans around it. When the relay tells us, we quote it;
+ * when it does not, the sentence simply ends.
+ */
+function describeRetryWindow(retryAfterMs: number | undefined): string {
+  if (retryAfterMs === undefined || !Number.isFinite(retryAfterMs) || retryAfterMs <= 0) return "";
+  const seconds = Math.ceil(retryAfterMs / 1000);
+  return seconds < 90 ? ` in about ${String(seconds)} seconds` : ` in about ${String(Math.ceil(seconds / 60))} minutes`;
 }
