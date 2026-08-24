@@ -170,6 +170,59 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     ).toBeNull();
   }, 60_000);
 
+  it("★★ A LEAF AFTER SUSPENSION MUST NOT LET US HASH UNSALTED WHILE THE SALT SURVIVES — pass 2, F2", async () => {
+    /**
+     * ⚠️ THE REGRESSION MY OWN REDESIGN INTRODUCED, and the reviewer reproduced it through the real
+     * inbound path rather than arguing it.
+     *
+     * The deferred erase was ordered before the `#hashedWithoutSalt` increment because that counter
+     * closes adoption. **It is one of FOUR contributors.** Leaves, held rows and awaiting-ack close
+     * adoption too — and the most ordinary event in the protocol closes it: *the peer sends its next
+     * message.* So: suspend, the peer's message lands as a leaf, we send, the erase is REFUSED with
+     * `already_hashing`, and we hashed `sha256` anyway with the salt still on disk. One
+     * teardown-and-revive later — **no process restart needed** — the next hash is `hmac` again.
+     * That is the split transcript, produced by the fix for the split transcript.
+     *
+     * The immediate-erase design this replaced could not produce it: a refused discard there simply
+     * kept the session salted. **Suspension is what made "unsalted now, salted later" reachable.**
+     *
+     * So going unsalted and erasing the salt are ONE decision. If the salt cannot be erased, we keep
+     * hashing under it — one rule for the whole session — and say so at ERROR. The counterparty may
+     * refuse those messages; a dead session beats a transcript no single rule can verify.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-saltsplit-leafafter-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, contributionFrame(), PEER);
+    await wait(200);
+    const agreed = storedSalt(fx);
+    expect(agreed, "precondition: a salt was agreed").not.toBeNull();
+
+    await fx.snm.handleContentFrameForTest("alice", SID, closedFrame(), PEER);
+    await wait(200);
+    expect(fx.eventsNamed("session.salt.suspended").length, "precondition: suspended, bytes kept").toBe(1);
+
+    // The peer keeps talking. This closes adoption — and nothing was hashed under OUR salt.
+    fx.seedReceived("alice", SID, "the peer's next message");
+    expect(fx.snm.getSessionTree("alice", SID).size(), "precondition: the frontier moved").toBeGreaterThan(0);
+
+    const out = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("our reply"));
+
+    expect(
+      out.alg,
+      "the salt could not be erased, so we must NOT go unsalted — one rule for the whole session. " +
+      "Hashing sha256 here leaves the bytes on disk and the very next revival hashes hmac again.",
+    ).toBe("hmac-sha256-salt-v1");
+    expect(
+      storedSalt(fx),
+      "and the salt is still held, which is exactly why we may not hash unsalted",
+    ).toEqual(agreed);
+    expect(
+      fx.eventsNamed("session.salt.split").length,
+      "a session that will now have every message refused must say so at ERROR, not sit at INFO",
+    ).toBeGreaterThan(0);
+  }, 60_000);
+
   it("★★ A SUSPENDED SALT RESUMES when the peer turns out to hold the same one", async () => {
     /**
      * THE RECOVERY THE ERASE MADE IMPOSSIBLE, and the reason keeping the bytes is worth the extra
@@ -251,6 +304,29 @@ describe("DOD-M15-SALTSPLIT-1: a peer that closes adoption must leave both sides
     const out = await hashing;
     expect(out.alg, "the hash really was computed under the salt — otherwise this test proves nothing")
       .toBe("hmac-sha256-salt-v1");
+
+    /**
+     * ⚠️ THIS TEST SURVIVED ITS OWN MUTANT UNTIL PASS 2 — deleting `inFlight > 0 ||` from
+     * `#suspendSalt` left all five tests GREEN.
+     *
+     * The three assertions above (row present, cache present, `alg === hmac`) all hold whether or not
+     * the suspension was refused, because the erase is deferred: nothing about them distinguishes
+     * "the guard refused" from "the guard never ran and the erase simply had not happened yet". The
+     * test named the in-flight guard and measured the deferral.
+     *
+     * So: name the refusal itself, and prove the salt is still being USED afterwards.
+     */
+    expect(
+      fx.eventsNamed("session.salt.suspend.refused").filter(
+        (e) => e.ctx.reason === "salted_hash_in_flight",
+      ).length,
+      "the in-flight case must be REFUSED by name — without this the test passes with the guard deleted",
+    ).toBe(1);
+    const next = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("the one after"));
+    expect(
+      next.alg,
+      "and the session must still be hashing under the salt — a refusal that leaves us unsalted anyway is the refusal not working",
+    ).toBe("hmac-sha256-salt-v1");
   }, 60_000);
 
   it("★★ A SPENT SALT IS NEVER DISCARDED, AND THE SPLIT IS LOUD", async () => {

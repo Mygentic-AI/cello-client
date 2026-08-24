@@ -9771,7 +9771,42 @@ export class SessionNodeManager {
      * split this ordering exists to prevent.
      */
     if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN && this.#saltSuspended.has(this.#k(agentName, sessionId))) {
-      this.#discardUnspentSalt(agentName, sessionId);
+      /**
+       * ⚠️ GOING UNSALTED AND ERASING THE SALT ARE ONE DECISION — pass 2, F2 (HIGH), and this is my
+       * regression, not a pre-existing one.
+       *
+       * The note above claimed the ordering was sufficient because `#hashedWithoutSalt` is what
+       * closes adoption. **It is one of FOUR contributors.** Leaves, held rows and awaiting-ack close
+       * it too — and the most ordinary event in the protocol closes it: *the peer sends us its next
+       * message.* Reproduced through the real inbound path: suspend, peer's message lands as leaf 0,
+       * we hash `sha256`, and the erase is REFUSED with `already_hashing` while the bytes stay on
+       * disk. One teardown-and-revive later — no process restart required — we hash `hmac` again.
+       * That is the split transcript, produced by the fix for the split transcript.
+       *
+       * Worth naming precisely: **the immediate-erase design this replaced could NOT produce it.**
+       * There, a refused discard simply kept the session salted — one rule throughout, and loud.
+       * Suspension is what made "unsalted now, salted later" reachable. Same shape as pass 1: the fix
+       * worse than the defect on one path.
+       *
+       * So the two are atomic. If the salt cannot be erased, we do **not** go unsalted — we keep
+       * hashing under the held salt, which is one rule for the whole session, and say so at ERROR.
+       * The counterparty may refuse those messages, and that is the honest failure: a dead session
+       * beats a transcript no single rule can verify. The durable column remains the real answer.
+       */
+      if (!this.#discardUnspentSalt(agentName, sessionId)) {
+        const stillHeld = this.#getSessionSalt(agentName, sessionId);
+        if (stillHeld !== null) {
+          const key = this.#k(agentName, sessionId);
+          this.#logger.error("session.salt.split", {
+            agentName, sessionId, reason: "suspended_but_unerasable",
+            impact: "this session stays SALTED even though the counterparty says it can never hold a salt, because the salt could not be erased and hashing unsalted now would leave half this transcript under each rule — verifiable by nobody. Expect the counterparty to refuse messages sent from here.",
+            guidance: "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed. This one cannot be repaired — look for session.salt.discard.refused immediately above for why the salt could not be released.",
+          });
+          this.#hashedWithSalt.set(key, (this.#hashedWithSalt.get(key) ?? 0) + 1);
+          const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
+          return { hash: contentHashFor(content, { alg, salt: stillHeld }), alg };
+        }
+      }
     }
     if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN) {
       /**
@@ -10047,6 +10082,24 @@ export class SessionNodeManager {
    * Read-only and cache-backed, so exposing it adds no way to CHANGE the salt from outside — the
    * only writer remains `#persistSessionSalt`, behind the one-salt-per-session predicate.
    */
+  /**
+   * IS THIS SESSION ACTUALLY PROTECTED BY ITS SALT RIGHT NOW — pass 2, F3.
+   *
+   * Distinct from `getSessionContentSalt`, which is POSSESSION and is what the verifier needs: a
+   * message parked before suspension was hashed under this salt and must still be checkable against
+   * it, so that accessor must keep answering with the bytes.
+   *
+   * This one answers the OPERATOR's question, and it is a different question. A suspended session
+   * holds a salt it will not use, so every hash it produces is `sha256` — reporting `contentSalted:
+   * true` there is not a gap, it is an affirmatively false security claim on the surface whose own
+   * comment reads *"a security property must not be inferable from a gap."* Same predicate
+   * `#saltForHashing` uses, so the flag cannot drift from the behaviour it describes.
+   */
+  isContentSaltActive(agentName: string, sessionId: string): boolean {
+    if (this.#saltSuspended.has(this.#k(agentName, sessionId))) return false;
+    return this.#getSessionSalt(agentName, sessionId) !== null;
+  }
+
   getSessionContentSalt(agentName: string, sessionId: string): Uint8Array | null {
     return this.#getSessionSalt(agentName, sessionId);
   }
@@ -10351,7 +10404,35 @@ export class SessionNodeManager {
   /** Un-suspend: the peer answered with a fingerprint matching the salt we kept. */
   #resumeSalt(agentName: string, sessionId: string, correlationId?: string): void {
     const key = this.#k(agentName, sessionId);
-    if (!this.#saltSuspended.delete(key)) return;
+    if (!this.#saltSuspended.has(key)) return;
+
+    /**
+     * ⚠️ REFUSE THE RESUME IF THIS SESSION HAS ALREADY HASHED UNSALTED — pass 2, F1 (HIGH).
+     *
+     * `#resumeSalt` deleted the mark unconditionally, and the reviewer produced the counter-example
+     * in ONE process with no restart: suspend, the peer keeps talking so a leaf lands, we send `m1`
+     * under `sha256`, the peer's frontier recovers and announces `fingerprint(S)`, we resume, and
+     * `m2` goes out under `hmac`. Two rules, one session — and `session.salt.resumed` asserted
+     * *"No message was hashed while suspended, so the transcript is uniform"* while it was happening.
+     * **The code never checked the thing its own log line claimed**, which is this milestone's
+     * signature defect committed inside the fix for it.
+     *
+     * `#unsaltedAnnounced` is exactly that fact and is already maintained, so the check costs a
+     * lookup. Once it is set the salt can never be used again, so it is erased here rather than left
+     * to be found by a later restart.
+     */
+    if (this.#unsaltedAnnounced.has(key)) {
+      this.#logger.warn("session.salt.resume.refused", {
+        agentName, sessionId, correlationId,
+        impact: "the counterparty now confirms a salt this side is holding, but this session has ALREADY hashed at least one message unsalted. Resuming would put half the transcript under each rule, which no single rule can verify — so the session stays unsalted for its whole life and the salt is released.",
+        guidance: "Nothing to do here, and nothing is lost: the transcript stays uniform and every message is intact. If you want the salt protection with this counterparty, start a new session — the agreement runs at open, before anything is hashed.",
+      });
+      this.#saltSuspended.delete(key);
+      this.#discardUnspentSalt(agentName, sessionId, correlationId);
+      return;
+    }
+
+    this.#saltSuspended.delete(key);
     /**
      * THE RECOVERY THE ERASE MADE IMPOSSIBLE. Keeping the bytes is what allows this line to exist:
      * the peer's earlier terminal frame was wrong (a frontier it could not read for a moment), it can
@@ -10438,6 +10519,15 @@ export class SessionNodeManager {
      * in the next — the split transcript, arriving at a daemon restart instead of at a frame.
      */
     this.#sessionSalts.delete(this.#k(agentName, sessionId));
+    /**
+     * ⚠️ THE MARK GOES WITH THE BYTES — pass 2, F5. Leaving the key in `#saltSuspended` after a
+     * successful erase means a LATER agreed salt is silently never used: `#persistSessionSalt`'s
+     * predicate explicitly allows a write when the column is NULL, and `abandonUnsaltedHash` can
+     * re-open adoption — so the session would log `session.salt.agreed`, surface as protected, and
+     * hash `sha256` for the rest of its life. A stale suppression is indistinguishable from a
+     * feature that does not work.
+     */
+    this.#saltSuspended.delete(this.#k(agentName, sessionId));
     this.#logger.info("session.salt.discarded", {
       agentName, sessionId, correlationId,
       impact: "the counterparty can never adopt a salt for this session, so this side dropped its own before spending it. Both sides now hash unsalted — exactly as verifiable as every session shipped before content salting existed, and every message continues to be accepted. Nothing was hashed under the discarded salt.",
@@ -10719,20 +10809,46 @@ export class SessionNodeManager {
             ? "This side could not read its own message frontier, so it refused the salt rather than risk hashing half the session one way and half the other. Starting a new session will NOT help — it will refuse the same way. Look for session.content.held.restore.failed or other storage errors around this line; the conversation still works and every message is intact, it is just unsalted."
             : "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
         });
+      } else {
         /**
-         * DOD-M15-SALTSPLIT-1 — THE SESSION IS SPLIT, AND THE WARN ABOVE SAYS IT IS FINE.
+         * DOD-M15-SALTSPLIT-1 — CARRY OUT THE CLAIM ABOVE INSTEAD OF ONLY STATING IT.
          *
-         * We refused adoption AND we hold a salt. That combination means the salt was agreed before
-         * our frontier closed and content is already hashed under it — spent, unrecoverable. The
-         * peer holds none and will refuse every message we send with `content_hash_salt_unavailable`.
+         * `shared.impact` says *"neither side will use a content salt for this session, and both now
+         * know it."* Nothing made that true: a salt already agreed on this side stayed on disk and in
+         * the cache, and `#saltForHashing` returns it before it ever looks at adoption. Our adoption
+         * is still open here, so nothing has been hashed under it and dropping it is free.
          *
-         * `session.salt.adoption.refused` fires just above with *"nothing is degraded relative to
-         * any shipped release, and no message is affected"*, which is true for the ordinary refusal
-         * and FALSE here, at the exact moment every message stops being accepted. So this is its own
-         * event at ERROR rather than a tightened sentence on that one: an operator filtering for the
-         * refusal is looking at a benign condition, and this is not that condition.
+         * Ordering matters — discard BEFORE the log, so the line cannot claim an outcome that the
+         * write then failed to produce.
          */
-        if (stillHoldsSalt) {
+        this.#logger.info("session.salt.adoption.closed", shared);
+      }
+
+      /**
+       * ⚠️ OUTSIDE THE ADOPTION BRANCH — pass 2, F4. This used to live inside `if (adoption.closed)`,
+       * so the one case that needed it most never got it: suspension refused for
+       * `salted_hash_in_flight` while adoption is still OPEN leaves us holding a salt the peer can
+       * never accept, and it took the `else` path. Measured on that exact scenario:
+       * `suspend.refused = 1`, `adoption.closed = 1`, **`split = 0`** — while two other log lines
+       * told the operator to *"see session.salt.split on the next line"*, a line that was never
+       * written. Guidance pointing at an event that does not fire is worse than no guidance: it
+       * spends the reader's trust and their time.
+       *
+       * The condition was always `stillHoldsSalt`; only its placement disagreed.
+       *
+       * ─── What this event means, moved here with the code it describes ─────────────────────────
+       *
+       * We hold a salt AND the peer has told us it can never hold one. Either our frontier closed
+       * with the salt already spent, or a salted hash is mid-flight — both mean the salt cannot be
+       * released, so the peer will refuse every message we send with `content_hash_salt_unavailable`.
+       *
+       * `session.salt.adoption.refused` may fire alongside, saying *"nothing is degraded relative to
+       * any shipped release, and no message is affected"* — true for the ordinary refusal and FALSE
+       * here, at the exact moment every message stops being accepted. Hence its own event at ERROR
+       * rather than a tightened sentence on that one: an operator filtering for the refusal is
+       * looking at a benign condition, and this is not it.
+       */
+      if (stillHoldsSalt) {
           /**
            * ⚠️ TWO REASONS REACH `adoption.closed`, AND ONLY ONE IS ABOUT CONTENT — review MEDIUM-4.
            *
@@ -10756,20 +10872,6 @@ export class SessionNodeManager {
               : "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed, so a fresh session agrees or declines cleanly on both sides. This one cannot be repaired — the salt cannot be dropped without leaving a transcript no single rule can verify, and it cannot be shared with a peer that has already closed adoption.",
           });
         }
-      } else {
-        /**
-         * DOD-M15-SALTSPLIT-1 — CARRY OUT THE CLAIM ABOVE INSTEAD OF ONLY STATING IT.
-         *
-         * `shared.impact` says *"neither side will use a content salt for this session, and both now
-         * know it."* Nothing made that true: a salt already agreed on this side stayed on disk and in
-         * the cache, and `#saltForHashing` returns it before it ever looks at adoption. Our adoption
-         * is still open here, so nothing has been hashed under it and dropping it is free.
-         *
-         * Ordering matters — discard BEFORE the log, so the line cannot claim an outcome that the
-         * write then failed to produce.
-         */
-        this.#logger.info("session.salt.adoption.closed", shared);
-      }
       if (action.announce) {
         void this.#sendSaltFrame(agentName, sessionId, correlationId, action.announce);
       }

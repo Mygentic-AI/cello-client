@@ -447,7 +447,10 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
        * session shipped before the feature existed. This is the difference between *knowing* and
        * *working*, and it costs one boolean per row rather than an event per message.
        */
-      contentSalted: sessionNodeManager.getSessionContentSalt(row.agent_name, row.session_id) !== null,
+      // `isContentSaltActive`, NOT `getSessionContentSalt` — pass 2, F3. Possession is not
+      // protection: a SUSPENDED session still holds its salt and deliberately does not use it, so
+      // the possession read reported `true` for a session hashing sha256 on every message.
+      contentSalted: sessionNodeManager.isContentSaltActive(row.agent_name, row.session_id),
     }));
     return { ok: true, filter, limit, totalMatched: matched.length, sessions };
   }
