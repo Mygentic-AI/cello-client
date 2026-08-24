@@ -699,7 +699,7 @@ export class SessionNodeManager {
    * instead of at the endpoint.
    */
   #resolveSealTransport(agentName: string, sessionId: string):
-    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array }
+    | { node: CelloNode; relayClient: AgentRelayClient; relaySessionIdBytes: Uint8Array; detached?: true }
     | { error: string } {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (entry) {
@@ -745,7 +745,17 @@ export class SessionNodeManager {
     // relay swept or sealed it" — can never fire, so the operator is handed a first-message-race
     // label for a swept session.
     client.registerSession(sessionId, node);
-    return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")) };
+    /**
+     * DOD-M15-RELAYLEAK-1 — **`detached: true` IS THE RELEASE SIGNAL, and its absence was the leak.**
+     *
+     * This branch (no `#activeNodes` entry) CACHES a relay client and registers a session on it, and
+     * nothing ever unregistered. `#detachSessionRelay` closes a client only when
+     * `!client.hasSessions()`, so a registration that is never removed keeps that predicate false
+     * **forever** — the client, its authenticated stream and its reader survive for the process
+     * lifetime. The LIVE branch above registers nothing here, so only this one needs releasing, and
+     * marking it is what lets the caller tell them apart without guessing.
+     */
+    return { node, relayClient: client, relaySessionIdBytes: new Uint8Array(Buffer.from(sessionId, "hex")), detached: true as const };
   }
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
   // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
@@ -4901,6 +4911,35 @@ export class SessionNodeManager {
     for (const timer of this.#lingeringStreams) clearTimeout(timer);
     this.#lingeringStreams.clear();
 
+    /**
+     * DOD-M15-RELAYLEAK-1 — **CLOSE THE RELAY CLIENTS. Shutdown never did.**
+     *
+     * This method stops every session NODE and left `#relayClients` untouched — verified by reading:
+     * the whole of `gracefulShutdown` referenced `relayClient` zero times. Each cached client holds
+     * an authenticated libp2p stream to a relay and a reader loop, so a `cello logout` left them
+     * open until the process itself exited.
+     *
+     * That is a real cost rather than untidiness: the relay counts a reservation per client and its
+     * slots are finite, so a daemon that restarts repeatedly consumes them faster than they are
+     * released, which is the "agents cannot get a reservation" failure the relay's own limits note
+     * describes from the other side.
+     *
+     * Best-effort and individually caught: teardown must not be the thing that throws. One client
+     * that refuses to close must not prevent the next from being released.
+     */
+    for (const [key, client] of this.#relayClients) {
+      try {
+        client.close();
+      } catch (err: unknown) {
+        this.#logger.warn("session.relay_client.close_failed", {
+          relayClientKey: key,
+          reason: err instanceof Error ? err.message : String(err),
+          impact: "one cached relay client did not close cleanly on shutdown; the rest are still released",
+        });
+      }
+    }
+    this.#relayClients.clear();
+
     // Cancel every armed awaiting-ACK timer so an un-acked send (e.g. a rejected /
     // tampered frame that never produced a `persisted` ACK) does not leave a 20s
     // timer pinning the content + this manager in memory past teardown (review M1).
@@ -6731,113 +6770,153 @@ export class SessionNodeManager {
     const transport = this.#resolveSealTransport(agentName, sessionId);
     if ("error" in transport) return { ok: false, reason: transport.error };
     const entry = transport;
-
-    // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
-    // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
-    // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
-    // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
-    // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
-    // DOD-M12B-INTERRUPTED-ESCALATE-1 — THE MARK MUST SURVIVE A RESTART, or one automatic retry
-    // permanently forfeits the receipt.
-    //
-    // `#responderSealSubmitted` is in memory. A session whose close was in flight when the daemon
-    // stopped already has our SEAL ctrl leaf in the relay log — and on the next boot the mark is
-    // empty, so the restart-seal resolver's automatic close would submit a SECOND one. The
-    // directory requires exactly one ctrl leaf (`ctrlLeaves.length !== 1 → unilateral_seal_leaf_invalid`)
-    // and the carry is durable, so every future attempt would carry both and be refused forever.
-    //
-    // The durable evidence already exists and was simply not consulted: our own ctrl leaf is in
-    // `session_seal_leaves`. Recover the escalation values from it instead of submitting again.
-    if (!this.#responderSealSubmitted.has(sealKey)) {
-      const durable = this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
-      if (durable === "unknown") {
-        // REFUSE, do not submit. A second ctrl leaf makes the session unsealable forever, and the
-        // question "is one already there?" just failed to answer. Refusing costs this close; a
-        // second leaf costs the receipt permanently.
-        return { ok: false, reason: "seal_leaf_recovery_unavailable" };
-      }
-      if (durable !== "none") {
-        this.#logger.info("session.seal.leaf.already_submitted.recovered", {
-          sessionId, agentName, sequenceNumber: durable.sequenceNumber,
-          impact: "our SEAL ctrl leaf is already in the relay log from a previous run; submitting a second would make this session unsealable forever",
-        });
-        this.#responderSealSubmitted.set(sealKey, durable);
-      }
-    }
-    if (this.#responderSealSubmitted.has(sealKey)) {
-      // M8B FINDING-1: carry the FIRST submit's reported root/sequence so a retry close can
-      // still escalate to a unilateral seal. A null value means that submit is still in
-      // flight — return the bare reason and let the caller fall back to the pending path.
-      const prior = this.#responderSealSubmitted.get(sealKey);
-      return prior
-        ? {
-            ok: false,
-            reason: "responder_seal_already_submitted",
-            reportedRootHex: prior.reportedRootHex,
-            sequenceNumber: prior.sequenceNumber,
+    /**
+     * DOD-M15-RELAYLEAK-1 — release a DETACHED seal transport when this submission is done.
+     *
+     * Only the detached branch registers a session here, so this can never remove a live one. The
+     * client is closed only when it has no sessions left and the cache still holds THIS client —
+     * the same two guards `#detachSessionRelay` uses, and for the same reason: a racing teardown
+     * must not close a freshly-built replacement for the same key.
+     */
+    const releaseDetached = (): void => {
+      if (transport.detached !== true) return;
+      try {
+        entry.relayClient.unregisterSession(sessionId);
+        if (!entry.relayClient.hasSessions()) {
+          for (const [key, cached] of this.#relayClients) {
+            if (cached === entry.relayClient) {
+              cached.close();
+              this.#relayClients.delete(key);
+              break;
+            }
           }
-        : { ok: false, reason: "responder_seal_already_submitted" };
-    }
-    this.#responderSealSubmitted.set(sealKey, null);
-
-    // A throw anywhere before the mark is finalized would strand the null in-flight marker
-    // and lock every future close out of escalation (a FINDING-1-shaped deadlock via a
-    // different trigger) — clear the mark on any unexpected exception.
-    try {
-      const finalRootHex = this.getSessionTreeRootHex(agentName, sessionId);
-      const sealPayload = encodeSealPayload({
-        session_id: entry.relaySessionIdBytes,
-        final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
-        close_timestamp: Date.now(),
-        attestation: "PENDING",
-      });
-      // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
-      const contentHash = new Uint8Array(
-        createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
-      );
-      /**
-       * ⚠️ `sealPayload` IS PASSED, AND ITS ABSENCE WAS THE WHOLE DEFECT — `DOD-M15-SEALWIRE-1`
-       * bullets 3+4, review pass 1, F1.
-       *
-       * These exact bytes were computed two lines above, hashed, and then dropped: `submitLeaf` had
-       * no parameter for them. So the directory received a SHA-256 pre-image nobody transmitted, and
-       * the client's SIGNED `final_root` — the one value in the seal the relay cannot produce — was
-       * unrecoverable. Four legs of this line shipped and were reviewed green while the head of the
-       * chain did not exist.
-       *
-       * The payload and the hash MUST come from the same derivation. If they ever diverge the
-       * directory reports `seal_payload_unbound`, whose guidance says *"someone between them and here
-       * altered or fabricated the payload — the relay is the only party on that path"* — a correct
-       * relay accused by name, in an error written to sound like an attack, for a mismatch made here.
-       */
-      const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
-      if (!result.ok) {
-        // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
-        this.#responderSealSubmitted.delete(sealKey);
-        this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
-        return { ok: false, reason: result.reason };
+        }
+      } catch (err: unknown) {
+        this.#logger.warn("session.seal.transport.release_failed", {
+          agentName,
+          sessionId,
+          reason: err instanceof Error ? err.message : String(err),
+          impact: "a detached seal relay client could not be released; it is held until process exit",
+        });
       }
-      // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
-      // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
-      // rebuilds from the relay's content-hash chain (the relay records the identical
-      // content_hash for this ctrl leaf). Computed without mutating the durable tree /
-      // message_count, so the bilateral + interrupted seal paths are unaffected.
-      const contentHashHex = Buffer.from(contentHash).toString("hex");
-      const reportedRootHex = this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex);
-      // M8B FINDING-1: durably associate the submit's escalation values with the idempotency
-      // mark, so any LATER close call can retrieve them via the already-submitted result.
-      this.#responderSealSubmitted.set(sealKey, { reportedRootHex, sequenceNumber: result.sequence_number });
-      this.#logger.info("session.seal.leaf.submitted", {
-        sessionId,
-        sequenceNumber: result.sequence_number,
-        correlationId,
-      });
-      // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
-      // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
-      return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
-    } catch (err: unknown) {
-      this.#responderSealSubmitted.delete(sealKey);
-      throw err;
+    };
+    /**
+     * ⚠️ try/finally, NOT a call at each return. There are three exits today and adding a release
+     * to each would be a hand-kept list — the shape this milestone has been bitten by repeatedly,
+     * where the FOURTH exit added later quietly leaks. Here the release cannot be bypassed by a new
+     * return, and it runs on the throw path too, which is where a leak matters most.
+     */
+    try {
+
+      // M7-UPGRADE-002 idempotency: this party submits its responder SEAL leaf AT MOST ONCE per
+      // session. BOTH cello_close_session and the auto-acknowledge path call here; the first to reach
+      // this point wins, the second short-circuits. The check+set is SYNCHRONOUS (before any await) so
+      // two near-simultaneous triggers (e.g. B's own close racing A's delivered SEAL ctrl leaf) cannot
+      // both submit. Cleared below on a relay submit failure so a genuine retry can proceed.
+      // DOD-M12B-INTERRUPTED-ESCALATE-1 — THE MARK MUST SURVIVE A RESTART, or one automatic retry
+      // permanently forfeits the receipt.
+      //
+      // `#responderSealSubmitted` is in memory. A session whose close was in flight when the daemon
+      // stopped already has our SEAL ctrl leaf in the relay log — and on the next boot the mark is
+      // empty, so the restart-seal resolver's automatic close would submit a SECOND one. The
+      // directory requires exactly one ctrl leaf (`ctrlLeaves.length !== 1 → unilateral_seal_leaf_invalid`)
+      // and the carry is durable, so every future attempt would carry both and be refused forever.
+      //
+      // The durable evidence already exists and was simply not consulted: our own ctrl leaf is in
+      // `session_seal_leaves`. Recover the escalation values from it instead of submitting again.
+      if (!this.#responderSealSubmitted.has(sealKey)) {
+        const durable = this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
+        if (durable === "unknown") {
+          // REFUSE, do not submit. A second ctrl leaf makes the session unsealable forever, and the
+          // question "is one already there?" just failed to answer. Refusing costs this close; a
+          // second leaf costs the receipt permanently.
+          return { ok: false, reason: "seal_leaf_recovery_unavailable" };
+        }
+        if (durable !== "none") {
+          this.#logger.info("session.seal.leaf.already_submitted.recovered", {
+            sessionId, agentName, sequenceNumber: durable.sequenceNumber,
+            impact: "our SEAL ctrl leaf is already in the relay log from a previous run; submitting a second would make this session unsealable forever",
+          });
+          this.#responderSealSubmitted.set(sealKey, durable);
+        }
+      }
+      if (this.#responderSealSubmitted.has(sealKey)) {
+        // M8B FINDING-1: carry the FIRST submit's reported root/sequence so a retry close can
+        // still escalate to a unilateral seal. A null value means that submit is still in
+        // flight — return the bare reason and let the caller fall back to the pending path.
+        const prior = this.#responderSealSubmitted.get(sealKey);
+        return prior
+          ? {
+              ok: false,
+              reason: "responder_seal_already_submitted",
+              reportedRootHex: prior.reportedRootHex,
+              sequenceNumber: prior.sequenceNumber,
+            }
+          : { ok: false, reason: "responder_seal_already_submitted" };
+      }
+      this.#responderSealSubmitted.set(sealKey, null);
+
+      // A throw anywhere before the mark is finalized would strand the null in-flight marker
+      // and lock every future close out of escalation (a FINDING-1-shaped deadlock via a
+      // different trigger) — clear the mark on any unexpected exception.
+      try {
+        const finalRootHex = this.getSessionTreeRootHex(agentName, sessionId);
+        const sealPayload = encodeSealPayload({
+          session_id: entry.relaySessionIdBytes,
+          final_root: new Uint8Array(Buffer.from(finalRootHex, "hex")),
+          close_timestamp: Date.now(),
+          attestation: "PENDING",
+        });
+        // content_hash = SHA-256(0x02 || seal_payload) — the ctrl leaf kind byte is 0x02.
+        const contentHash = new Uint8Array(
+          createHash("sha256").update(new Uint8Array([LEAF_KIND_CTRL])).update(sealPayload).digest(),
+        );
+        /**
+         * ⚠️ `sealPayload` IS PASSED, AND ITS ABSENCE WAS THE WHOLE DEFECT — `DOD-M15-SEALWIRE-1`
+         * bullets 3+4, review pass 1, F1.
+         *
+         * These exact bytes were computed two lines above, hashed, and then dropped: `submitLeaf` had
+         * no parameter for them. So the directory received a SHA-256 pre-image nobody transmitted, and
+         * the client's SIGNED `final_root` — the one value in the seal the relay cannot produce — was
+         * unrecoverable. Four legs of this line shipped and were reviewed green while the head of the
+         * chain did not exist.
+         *
+         * The payload and the hash MUST come from the same derivation. If they ever diverge the
+         * directory reports `seal_payload_unbound`, whose guidance says *"someone between them and here
+         * altered or fabricated the payload — the relay is the only party on that path"* — a correct
+         * relay accused by name, in an error written to sound like an attack, for a mismatch made here.
+         */
+        const result = await entry.relayClient.submitLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_CTRL, sealPayload);
+        if (!result.ok) {
+          // Clear the idempotency mark so a genuine retry (agent close / reconnect) can proceed (DB-001).
+          this.#responderSealSubmitted.delete(sealKey);
+          this.#logger.warn("session.seal.leaf.submit.failed", { sessionId, reason: result.reason, correlationId });
+          return { ok: false, reason: result.reason };
+        }
+        // SESSION-002: the reported_root for a unilateral seal is the content-hash root the
+        // local tree WOULD have with this SEAL ctrl leaf appended — the same root the directory
+        // rebuilds from the relay's content-hash chain (the relay records the identical
+        // content_hash for this ctrl leaf). Computed without mutating the durable tree /
+        // message_count, so the bilateral + interrupted seal paths are unaffected.
+        const contentHashHex = Buffer.from(contentHash).toString("hex");
+        const reportedRootHex = this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex);
+        // M8B FINDING-1: durably associate the submit's escalation values with the idempotency
+        // mark, so any LATER close call can retrieve them via the already-submitted result.
+        this.#responderSealSubmitted.set(sealKey, { reportedRootHex, sequenceNumber: result.sequence_number });
+        this.#logger.info("session.seal.leaf.submitted", {
+          sessionId,
+          sequenceNumber: result.sequence_number,
+          correlationId,
+        });
+        // M7-UPGRADE-002: #responderSealSubmitted was set synchronously at the top of this method —
+        // the guard now blocks any second submit (auto-ack OR a redelivered counterparty SEAL ctrl leaf).
+        return { ok: true, sequenceNumber: result.sequence_number, reportedRootHex };
+      } catch (err: unknown) {
+        this.#responderSealSubmitted.delete(sealKey);
+        throw err;
+      }
+    } finally {
+      releaseDetached();
     }
   }
 
