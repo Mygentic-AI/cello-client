@@ -81,6 +81,7 @@
     "src/__tests__/dod-m15-sealwire-1-sent-proof-wired.test.ts",
     "src/__tests__/dod-m15-sealwire-1-held-authorship.test.ts",
     "src/__tests__/dod-m15-sealwire-1-callsite-enforcer.test.ts",
+    "src/__tests__/dod-m15-saltannounce-late-1.test.ts",
     "src/__tests__/relay-client-fake.ts",
     // DOD-M15-SALTSPLIT-1's own two files. New and clean on creation, which is this list's stated
     // admission criterion — and I nearly shipped them OUTSIDE it in the same session I widened the
@@ -96,6 +97,12 @@
     // '"sealed" | "error" | "interrupted"'`, a test passing a status the function cannot take.
     // That last one is a genuine finding and it belongs to `DOD-M12B-TESTS-NOT-TYPECHECKED-1`, not
     // here. Fixing someone else's file to widen my own guard is how a unit stops being reviewable.
+    //
+    // ⚠️ AND SAY THE COST OUT LOUD — review MEDIUM-3. The sentence above read as though the file is
+    // now fine. It is not: those four calls are **UNVERIFIED BY ANY COMPILER**. No config reads this
+    // file, so they are correct by inspection only, and the file is arguably in a worse state than
+    // before — four calls that LOOK checked, in a file nothing checks. The five errors are mechanical
+    // (two callback annotations, one string literal) for whoever closes that line.
     "src/__tests__/helpers/encrypted-db.ts",
     "src/__tests__/helpers/hold-singleton-lock.ts",
     "src/__tests__/helpers/park-relay.ts",

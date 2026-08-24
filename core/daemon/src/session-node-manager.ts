@@ -4030,8 +4030,12 @@ export class SessionNodeManager {
       const entry = this.#activeNodes.get(key);
       return entry?.relayPeerId !== peerId;
     };
-    node.onPeerConnect((peerId: string) => {
-      if (!isCounterparty(peerId)) return;
+    /**
+     * Named rather than inline so the already-attached sweep below can invoke **this exact function**
+     * instead of a second copy of it. A copy is what would drift: the two would have to be kept in
+     * step by whoever edits either, and the failure would be silent.
+     */
+    const onCounterpartyAttached = (peerId: string): void => {
       /**
        * DOD-M12B-RESPONDER-ADDR-1 (review MEDIUM-4) — LEARN THE ADDRESS HERE, where it cannot race.
        *
@@ -4079,7 +4083,59 @@ export class SessionNodeManager {
        * single lost frame does not strand the agreement.
        */
       void this.#sendSaltFrame(agentName, sessionId, correlationId);
-    });
+    };
+    node.onPeerConnect(onCounterpartyAttached);
+
+    /**
+     * ⚠️ THE CONNECT THAT ALREADY HAPPENED — `DOD-M15-SALTANNOUNCE-LATE-1`.
+     *
+     * `onPeerConnect` above is `addEventListener("peer:connect", …)` (`core/transport/src/node.ts`),
+     * and **an event listener cannot fire for a connection that predates it.** On the
+     * `reuseStandingReceiver` path this session does not build a node — it TAKES the standing
+     * receiver's, which has been listening all along. So the ordinary sequence is:
+     *
+     *   1. `#tryCreateStandingReceiver` starts the node listening. It never calls this method, so
+     *      there is no handler yet.
+     *   2. The counterparty connects. `peer:connect` fires into nothing.
+     *   3. The session promotes that same node and registers the handler — one step too late.
+     *
+     * The handler then never runs, and everything hanging off it is silently skipped: **the salt is
+     * never announced** (`no_agreement_started`, the sender salts, the receiver holds none, and every
+     * message between them is refused) **and the counterparty's address is never learned or
+     * refreshed.** Measured live: `j-documents` 7 of 12 red, every failure a document update that
+     * never arrived, with no error shown to either operator.
+     *
+     * ⚠️ THE COMMENT ON THE HANDLER ABOVE NAMES THE OPPOSITE HAZARD, AND IT IS ALSO RIGHT: *"a send
+     * placed at `createSessionNode` would be an announcement to a peer that is not attached yet."*
+     * Both are real, which is why this is a SWEEP AFTER REGISTERING rather than a move. Too-early
+     * stays impossible — the sweep runs at the same point the handler is armed — and too-late stops
+     * being invisible, because an already-open connection is now looked at instead of waited for.
+     *
+     * Idempotent by construction: it invokes the SAME handler the event would have, so a peer that
+     * connects normally is unaffected, and a peer seen twice re-announces — which the announce path
+     * already tolerates (*"we re-announce on every reconnect"*).
+     */
+    try {
+      // `getConnections()` returns CONNECTIONS, and one peer can hold several — dedupe, or a peer
+      // with two open connections would run the attach path twice for no reason.
+      const attachedPeers = new Set(node.getConnections().map((c) => c.peerId));
+      for (const peerId of attachedPeers) {
+        if (!isCounterparty(peerId)) continue;
+        this.#logger.info("session.liveness.peer_already_attached", {
+          agentName, sessionId, peerId, correlationId,
+          impact: "this counterparty connected BEFORE the session's liveness handler was registered — on the standing-receiver promotion path that is the ordinary case, not a rare one. Running the attach path for it now: without this the salt is never announced (every message from the peer is then refused) and the counterparty's address is never learned.",
+        });
+        onCounterpartyAttached(peerId);
+      }
+    } catch (err: unknown) {
+      // Never let the sweep cost the caller its session: the handler is already armed, so a failure
+      // here degrades to exactly the behaviour that shipped before this fix.
+      this.#logger.warn("session.liveness.attached_sweep.failed", {
+        agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        impact: "could not check for an already-attached counterparty. If one is attached, this session may never announce its salt and will refuse that peer's messages — the pre-fix behaviour.",
+      });
+    }
+
     node.onPeerDisconnect((peerId: string) => {
       if (!isCounterparty(peerId)) {
         // Not silence: a relay link dropping is a real event, it is simply not a
