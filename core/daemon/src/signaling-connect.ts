@@ -74,6 +74,17 @@ async function safeStop(node: CelloNode): Promise<void> {
 }
 
 /** A directory node the daemon can dial, resolved from bootstrap config or a manifest. */
+/**
+ * DOD-M15-STEP6-REPLAY-1 — how far out of date a directory identity proof may be.
+ *
+ * ±5 minutes: wide enough for ordinary clock skew between an operator's machine and a directory
+ * node without requiring either to be time-synced, narrow enough that a captured proof stops being
+ * useful in minutes rather than never. An UNPARSEABLE timestamp is treated as out of window — the
+ * NaN-comparison lesson from the manifest gate, where `new Date("nonsense") <= x` is false and a
+ * garbage value sailed through a check that looked like it covered it.
+ */
+const IDENTITY_PROOF_MAX_SKEW_MS = 5 * 60_000;
+
 export interface DirectoryEndpoint {
   peerId: string;
   /** A dialable multiaddr (e.g. /dns4/host/tcp/443/wss/p2p/<peerId>). Optional if already connected. */
@@ -311,8 +322,56 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
           deps.logger.error("directory.auth.challenge.failed", { directoryNodeId: nodeId, reason: result.reason });
           throw new Error(`directory_challenge_failed: ${result.reason}`);
         }
+        /**
+         * DOD-M15-STEP6-REPLAY-1 — A VALID SIGNATURE IS NOT A FRESH ONE.
+         *
+         * The TBS covers `nodeId ‖ agent pubkey ‖ nonce ‖ timestamp`, and until this check the
+         * client verified the signature over that tuple and looked at **neither** the timestamp nor
+         * the nonce. So **any party that once obtained a valid tuple for this agent could replay it
+         * indefinitely.**
+         *
+         * ─── WHY THE NONCE CANNOT CARRY THE FRESHNESS, WHICH IS THE PART THAT SURPRISED ME ──────
+         *
+         * The obvious answer is "check the nonce is the one we just sent". **We did not send it.**
+         * The nonce here is `challengeFrame["nonce"]` — the DIRECTORY's own, from step 1-2. The
+         * client contributes no fresh value to this exchange at all, so it holds nothing of its own
+         * to bind against. A replaying party simply replays the captured nonce in step 2 and the
+         * captured ack in step 5, and both halves agree.
+         *
+         * **That leaves the timestamp as the only freshness anchor**, and it is a real one: it is
+         * inside the signed bytes, so a replayer cannot move it without invalidating the signature
+         * they are replaying.
+         *
+         * ─── AFTER the signature, deliberately ─────────────────────────────────────────────────
+         *
+         * A stale proof and a forged one are different facts and must not collapse into one
+         * message. Checking freshness only once the signature verifies means `identity_proof_stale`
+         * always describes a GENUINE proof that is too old — never a forgery — which is what makes
+         * it diagnostic rather than another exit-point label.
+         *
+         * **The window, and what it does NOT fix.** ±5 minutes tolerates ordinary client/directory
+         * clock skew without a time-sync dependency. It BOUNDS replay to that window; it does not
+         * eliminate it, because with no client-chosen nonce there is nothing to make a proof
+         * single-use. Closing the remainder needs either a client contribution in the challenge or a
+         * seen-nonce cache — both wire or state changes, and neither is this line.
+         */
+        const proofMs = Date.parse(timestamp);
+        const skewMs = Number.isFinite(proofMs) ? Math.abs(Date.now() - proofMs) : Number.NaN;
+        if (!Number.isFinite(skewMs) || skewMs > IDENTITY_PROOF_MAX_SKEW_MS) {
+          deps.logger.error("directory.auth.challenge.failed", {
+            directoryNodeId: nodeId,
+            reason: "identity_proof_stale",
+            timestamp,
+            skewMs: Number.isFinite(skewMs) ? Math.round(skewMs) : null,
+            maxSkewMs: IDENTITY_PROOF_MAX_SKEW_MS,
+            detail:
+              "the directory's identity proof carries a valid signature over a timestamp outside the " +
+              "freshness window — either a replayed proof, or a clock that is badly out on one side.",
+          });
+          throw new Error("directory_challenge_failed: identity_proof_stale");
+        }
         directoryNodeId = nodeId;
-        deps.logger.info("directory.auth.challenge.verified", { directoryNodeId });
+        deps.logger.info("directory.auth.challenge.verified", { directoryNodeId, skewMs: Math.round(skewMs) });
       }
 
       // DOD-NAT-REACHABILITY-1 (Phase 2): the directory's relay pool rides

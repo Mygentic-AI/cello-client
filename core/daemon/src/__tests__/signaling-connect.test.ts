@@ -311,3 +311,110 @@ describe("createSignalingConnect — relay endpoints from signaling_auth_ok", ()
     expect(call, "nor a loopback one — this node needs no socket at all").not.toMatch(/127\.0\.0\.1/);
   });
 });
+
+/**
+ * DOD-M15-STEP6-REPLAY-1 — a directory identity proof cannot be replayed indefinitely.
+ *
+ * ─── The defect ────────────────────────────────────────────────────────────────────────────────
+ *
+ * Step 6's signed bytes cover `nodeId ‖ agent pubkey ‖ nonce ‖ timestamp`, and the client checked
+ * the SIGNATURE over that tuple while looking at neither the timestamp nor the nonce. **Any party
+ * that once obtained a valid tuple for this agent could replay it forever.**
+ *
+ * ─── Why the nonce cannot carry the freshness ──────────────────────────────────────────────────
+ *
+ * The obvious fix is "check the nonce is the one we sent". **We did not send it** — it is the
+ * DIRECTORY's, from step 1-2. The client contributes no fresh value to this exchange, so it holds
+ * nothing of its own to bind against, and a replayer replays both halves together. The timestamp is
+ * the only anchor, and it is a real one: it is inside the signed bytes, so it cannot be moved
+ * without invalidating the very signature being replayed.
+ *
+ * These tests use a verifier that always says the signature is valid, precisely so the freshness
+ * check is the only variable.
+ */
+describe("DOD-M15-STEP6-REPLAY-1 — a valid signature is not a fresh one", () => {
+  const NODE_ID = "gcp-use1";
+  const alwaysValid = { verifyChallenge: () => ({ valid: true as const }) };
+
+  function ackWith(timestamp: string) {
+    return encodeFrame({
+      type: "signaling_auth_ok",
+      nodeId: NODE_ID,
+      signature: "ab".repeat(64),
+      timestamp,
+    });
+  }
+
+  function connectWith(timestamp: string) {
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(9) }),
+      ackWith(timestamp),
+    ]);
+    return {
+      node,
+      connect: createSignalingConnect({
+        getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+        getAuthIdentity: validIdentity,
+        logger: silentLogger,
+        createDirectoryNode: async () => node as never,
+        challengeVerifier: alwaysValid as never,
+      }),
+    };
+  }
+
+  it("★ a FRESH proof is accepted — the gate must not break the ordinary case", async () => {
+    const { connect } = connectWith(new Date().toISOString());
+    const result = await connect();
+    expect(result.directoryNodeId, "a current proof authenticates the node as before").toBe(NODE_ID);
+  });
+
+  it("★ THE REPLAY: a proof from an hour ago is REFUSED, even with a valid signature", async () => {
+    /**
+     * The captured-tuple attack, minimal form. The signature verifies — the verifier says so
+     * unconditionally — and the connection must still be refused, because the only thing separating
+     * a replay from a live proof is how old it is.
+     */
+    const { connect, node } = connectWith(new Date(Date.now() - 3_600_000).toISOString());
+    await expect(connect()).rejects.toThrow("identity_proof_stale");
+    expect(node.stop, "and the node is torn down, not left half-open").toHaveBeenCalled();
+  });
+
+  it("★ a proof from the FUTURE is refused too — skew is absolute, not one-sided", async () => {
+    /**
+     * Guarding `Date.now() - proofMs` rather than `Math.abs(...)`: a signed future timestamp would
+     * otherwise be permanently valid, which is a strictly better replay token than a stale one.
+     */
+    const { connect } = connectWith(new Date(Date.now() + 3_600_000).toISOString());
+    await expect(connect()).rejects.toThrow("identity_proof_stale");
+  });
+
+  it("★ an UNPARSEABLE timestamp is refused, not waved through", async () => {
+    /**
+     * The NaN lesson from the manifest startup gate, applied before it could be repeated here:
+     * every comparison against NaN is false, so a naive `skew > MAX` check treats garbage as fresh.
+     */
+    const { connect } = connectWith("not-a-timestamp");
+    await expect(connect()).rejects.toThrow("identity_proof_stale");
+  });
+
+  it("★ STALE IS NOT FORGED — the two never collapse into one message", async () => {
+    /**
+     * The freshness check runs AFTER the signature check for this reason. A stale proof is a genuine
+     * proof that is too old; a forged one is an attack. Reporting both as `signature_invalid` would
+     * send an operator hunting a forgery when their clock is wrong — and reporting a forgery as
+     * stale would do the reverse.
+     */
+    const { node } = makeFakeNode([
+      encodeFrame({ type: "signaling_auth_challenge", nonce: new Uint8Array(32).fill(9) }),
+      ackWith(new Date().toISOString()),
+    ]);
+    const connect = createSignalingConnect({
+      getDirectoryEndpoint: () => ({ peerId: PEER, multiaddr: MULTIADDR }),
+      getAuthIdentity: validIdentity,
+      logger: silentLogger,
+      createDirectoryNode: async () => node as never,
+      challengeVerifier: { verifyChallenge: () => ({ valid: false, reason: "signature_invalid" }) } as never,
+    });
+    await expect(connect()).rejects.toThrow("signature_invalid");
+  });
+});
