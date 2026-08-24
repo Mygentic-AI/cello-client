@@ -38,8 +38,80 @@
  */
 
 import { describe, it, expect, afterEach } from "vitest";
+import * as lp from "it-length-prefixed";
+import { Encoder, decode } from "cbor-x";
+import type { CelloNode, Stream } from "@cello-protocol/transport";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { sentAuthorship } from "../session-content-handlers.js";
+
+const CBOR_ENC = new Encoder({ tagUint8Array: false });
+/** The peer id `two-connection-fixture` configures when `relay: true`. */
+const FIXTURE_RELAY_PEER = "12D3KooWFixtureRelay";
+
+/**
+ * A relay that ACTUALLY ACKS — the piece the fixture is missing.
+ *
+ * `two-connection-fixture` points its relay at a dead loopback address, so nothing is ever
+ * witnessed through it. That is fine for the park tests it was built for and fatal for this one:
+ * with no ack there is no signature, and an assertion that a row carries proof fails for a reason
+ * that has nothing to do with the code. Same shape as `m8c-away-1`'s oneshot server.
+ */
+function makeAckingRelay() {
+  let seq = 0;
+  function openStream() {
+    const inbound: Uint8Array[] = [];
+    let notify: (() => void) | null = null;
+    let ended = false;
+    const push = (frame: Record<string, unknown>): void => {
+      const enc = lp.encode.single(CBOR_ENC.encode(frame) as Uint8Array);
+      inbound.push(enc instanceof Uint8Array ? enc : (enc as { subarray(): Uint8Array }).subarray());
+      notify?.();
+    };
+    const stream = {
+      send: (b: { subarray?: () => Uint8Array } | Uint8Array) => {
+        const bytes = b instanceof Uint8Array ? b : (b.subarray ? b.subarray() : (b as unknown as Uint8Array));
+        void (async () => {
+          for await (const chunk of lp.decode([bytes] as unknown as AsyncIterable<Uint8Array>)) {
+            const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
+            const frame = decode(u8) as Record<string, unknown>;
+            if (frame["type"] === "relay_auth_response") push({ type: "relay_auth_ok" });
+            else if (frame["type"] === "hash_submit") push({ type: "hash_submit_ack", sequence_number: ++seq });
+          }
+        })();
+      },
+      close: async () => { ended = true; notify?.(); },
+      async *[Symbol.asyncIterator]() {
+        while (!ended) {
+          while (inbound.length) yield inbound.shift()!;
+          if (ended) return;
+          await new Promise<void>((r) => { notify = r; });
+          notify = null;
+        }
+      },
+    };
+    push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    return stream;
+  }
+  return { openStream };
+}
+
+/** A node whose relay-peer streams reach the acking relay; everything else is inert. */
+function makeRelayAwareNode(relay: ReturnType<typeof makeAckingRelay>): CelloNode {
+  return {
+    async start() {}, async stop() {},
+    getPeerId: () => "fake-sender",
+    listenAddresses: () => ["/ip4/127.0.0.1/tcp/0"],
+    async dial() { return { peerId: FIXTURE_RELAY_PEER }; },
+    async handle() {}, getProtocols: () => [], getConnections: () => [],
+    onPeerConnect() {}, onPeerDisconnect() {},
+    getDialability: () => ({ dialable: false, publicAddr: null }),
+    onDialabilityChange: () => () => {},
+    async newStream(peerId: unknown): Promise<Stream> {
+      if (String(peerId) === FIXTURE_RELAY_PEER) return relay.openStream() as unknown as Stream;
+      return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
+    },
+  } as unknown as CelloNode;
+}
 
 const SID = "cc".repeat(32);
 
@@ -103,6 +175,44 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
       sentAuthorship({ ok: false, reason: "no_node", error: "x", durable: false } as never),
       "a result with no proof yields none — never a placeholder",
     ).toBeUndefined();
+  });
+
+  it("★★ THE WITNESSED SEND, END TO END: a real relay ack puts a real signature on the row", async () => {
+    /**
+     * The assertion the whole bullet is for, and the one that was missing when both lanes called it
+     * done. It drives `cello_send` over IPC → the real handler → `sendContent` → a relay that
+     * genuinely ACKS → the signature captured on the submit → `SubmitResult` → `sentAuthorship()` →
+     * the transcript write, then reads the stored bytes back out of SQLite.
+     *
+     * **Delete `authorship` from `sendContent`'s return, or from any of the call sites, and this is
+     * the test that goes red.** Nothing else in the unit does.
+     */
+    const relay = makeAckingRelay();
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-sentproof-witnessed-",
+      node: makeRelayAwareNode(relay),
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", undefined, { relay: true });
+
+    const client = await fx.connectAs("alice");
+    const res = (await client.send("cello_send", {
+      session_id: SID, content: "a message whose authorship is provable",
+    })) as { ok?: boolean; reason?: string };
+
+    const rows = sentRows("alice", SID);
+    expect(rows.length, `no sent row was written — got ${JSON.stringify(res)}`).toBeGreaterThan(0);
+    const row = rows[0]!;
+
+    expect(row.attribution, "we wrote it, so self_authored whatever proof it carries").toBe("self_authored");
+    expect(
+      row.sender_sig,
+      "the relay witnessed and signed this send, so the row must carry the proof. A null here means " +
+        "the path from the submit result to the transcript write is not connected — which is " +
+        "exactly what shipped, typechecked, and passed every other test in this unit.",
+    ).not.toBeNull();
+    expect(row.sender_sig!.length, "a 64-byte Ed25519 signature").toBe(64);
+    expect(row.sender_pubkey, "and the key it verifies against, taken from inside the signed bytes")
+      .toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("★ an UNWITNESSED send stores no proof, and does not fabricate one", async () => {
