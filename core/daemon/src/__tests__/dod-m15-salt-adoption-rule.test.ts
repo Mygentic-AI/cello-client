@@ -120,7 +120,12 @@ describe("Decision #8: the salt is adopted before the first leaf, or not at all"
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     // A send assigned slot 3 with an empty tail: ahead of the frontier, so it is HELD, not appended.
-    const placed = fx.snm.placeOwnLeaf("alice", SID, "ab".repeat(32), new TextEncoder().encode("held, and already hashed"), 3, "corr-held");
+    // `"msg", undefined` matches the three production call sites in `session-content-handlers.ts`
+    // (`…, randomUUID(), "msg", sentAuthorship(sendResult)`). Both arguments are REQUIRED by
+    // design — `DOD-M15-SEALWIRE-1` removed their defaults so a caller must state the leaf kind and
+    // the authorship rather than inherit them silently. Nothing is witnessed here, so there is no
+    // authorship to carry: this send is HELD, never submitted, which is the point of the case.
+    const placed = fx.snm.placeOwnLeaf("alice", SID, "ab".repeat(32), new TextEncoder().encode("held, and already hashed"), 3, "corr-held", "msg", undefined);
     expect(placed, "precondition: the send must actually be HELD, not appended").toMatchObject({ placed: false });
     expect(fx.snm.getSessionTree("alice", SID).size(), "precondition: and the TREE must still look empty — that is the trap").toBe(0);
 
