@@ -1187,7 +1187,7 @@ export class AgentRelayClient {
     try {
       stream.send(lp.encode.single(frame));
     } catch (err: unknown) {
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingLeafKind = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingSignature = null; this.#pendingLeafKind = null; }
       this.#logger.warn("session.relay.submit.send.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
       return { ok: false, reason: "relay_submit_send_failed" };
     }
@@ -1202,7 +1202,7 @@ export class AgentRelayClient {
       return result;
     } finally {
       clearTimeout(timer);
-      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingLeafKind = null; }
+      if (this.#pendingAck === resolveAck) { this.#pendingAck = null; this.#pendingAckSessionHex = null; this.#pendingStructure1 = null; this.#pendingSignature = null; this.#pendingLeafKind = null; }
     }
   }
 

@@ -6014,18 +6014,55 @@ export class SessionNodeManager {
            * agent resolved by name). Taking it from the signed bytes makes that class impossible.
            */
           if (witnessed.structure1_cbor && witnessed.sender_signature) {
+            /**
+             * ⚠️ THE DROP IS SOFT, BUT IT MUST NOT BE SILENT — review pass 1, F2.
+             *
+             * My comment here claimed the resulting row is "distinguishable from one that carries a
+             * signature". True, and it misses the comparison that matters: **it is byte-identical to
+             * an UNWITNESSED send** — `self_authored`, both proof columns NULL. So the record cannot
+             * tell "the relay never witnessed this" from "we witnessed it, held the proof, and
+             * dropped it decoding our own bytes."
+             *
+             * And the asymmetry with the received half is the argument. `#recordFrameOrdering` is
+             * soft because the COUNTERPARTY supplied those bytes — an absence we cannot resolve.
+             * Here **we produced them**, in `session-relay-client.ts`, moments earlier. A failure
+             * means our own encoder and decoder disagree: an internal invariant break that would
+             * strip authorship from every sent row for the life of the process. Soft is still right
+             * — throwing would lose a delivered message over a missing attestation — but soft and
+             * unannounced is the silent-fallback pattern this milestone exists to find.
+             */
+            const dropAuthorship = (reason: string, error?: unknown): void => {
+              this.#logger.warn("session.sent.authorship.unavailable", {
+                sessionId,
+                agentName,
+                reason,
+                ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
+                impact:
+                  "this sent message is recorded with attribution 'self_authored' and NO signature, so the row " +
+                  "asserts its author rather than proving one. It is indistinguishable in the database from a " +
+                  "send the relay never witnessed — this log line is the only thing that tells them apart.",
+                guidance:
+                  "We produced these bytes ourselves, so a decode or shape failure here means this daemon's own " +
+                  "encoder and decoder disagree. Treat it as an internal invariant break, not a peer problem.",
+                correlationId,
+              });
+            };
             try {
               // Structure 1 = [1, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]
               // — the same decode `#recordFrameOrdering` does for the received half, index 2.
               const s1 = decode(witnessed.structure1_cbor) as unknown[];
               const pk = s1[2];
-              if (pk instanceof Uint8Array && pk.length === 32) {
+              // The SIGNATURE is length-checked too (review F2): the guard checked the pubkey's 32
+              // bytes and only truthiness on the signature, so a zero-length one would have stored an
+              // uncheckable BLOB. Not reachable today — `sign()` returns 64 — and the asymmetry is
+              // the kind that stops being unreachable quietly.
+              if (pk instanceof Uint8Array && pk.length === 32 && witnessed.sender_signature.length === 64) {
                 sentAuthorship = { senderPubkey: pk, senderSig: witnessed.sender_signature };
+              } else {
+                dropAuthorship(pk instanceof Uint8Array ? "pubkey_or_signature_shape" : "pubkey_not_bytes");
               }
-            } catch {
-              // A decode failure here costs the row its PROOF, never the message. The row then
-              // records `self_authored` with no signature — true, and distinguishable from one that
-              // carries it. Throwing would lose a delivered message over a missing attestation.
+            } catch (err: unknown) {
+              dropAuthorship("structure1_decode_failed", err);
             }
           }
           // 1-BASED → 0-BASED. The relay numbers the first leaf of a session 1

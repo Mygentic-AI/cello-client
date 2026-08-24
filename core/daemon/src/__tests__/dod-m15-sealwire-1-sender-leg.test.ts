@@ -48,7 +48,7 @@
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
 import { decode } from "cbor-x";
-import { generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair, verify } from "@cello-protocol/crypto";
 import { encodeSealPayload, decodeSealPayload } from "@cello-protocol/protocol-types";
 import { AgentRelayClient, LEAF_KIND_MSG, LEAF_KIND_CTRL, LEAF_KIND_DOC } from "../session-relay-client.js";
 import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
@@ -202,6 +202,61 @@ describe("DOD-M15-SEALWIRE-1 sender leg: the SEAL payload reaches the wire, and 
       Buffer.from(decoded!.session_id).equals(Buffer.from(sid)),
       "a payload naming another session is refused by the relay before it ever reaches the directory",
     ).toBe(true);
+  });
+
+  it("★★ THE SENT ROW'S STORED PAIR ACTUALLY VERIFIES — bullet 5's sent half, and nothing else checks it", async () => {
+    /**
+     * ⚠️ THE ONE ASSERTION THAT CAN CATCH A WRONG PUBKEY INDEX, AND IT DID NOT EXIST.
+     *
+     * Bullet 5's sent half stores our own signature on the transcript row so a third party can prove
+     * we wrote it. `sendContent` builds that pair by decoding the sender pubkey out of
+     * `structure1_cbor` at **index 2** and pairing it with `sender_signature`.
+     *
+     * Review pass 1 found that BOTH halves of that work shipped — mine and the call sites — with
+     * **zero execution of the path**. The existing authorship tests call `recordTranscriptMessage`
+     * directly with hand-built bytes (`fill(0x7e)`, `fill(0x5a)`), so `decode()` never runs and no
+     * `verify()` is ever called against a stored pair anywhere in the repo. **A wrong index, a wrong
+     * key, or a mismatched pair would all produce a row that LOOKS checkable and fails** — silently,
+     * because nothing in production reads those columns back yet either.
+     *
+     * This closes it with real crypto and no fabricated values: submit through a real
+     * `AgentRelayClient`, take the bytes and signature it actually produced, decode the pubkey the
+     * way `sendContent` does, and **verify the signature against it**. If index 2 is not the sender
+     * pubkey, `verify` returns false and this goes red. That single assertion covers the index, the
+     * pairing, and whether the signing key matches the stored key — the three ways this can be
+     * quietly wrong.
+     */
+    const { client, relay, sid } = await connectedClient();
+    const contentHash = new Uint8Array(32).fill(0x11);
+
+    const submit = client.submitMessageHash(relay.node, sid, contentHash, LEAF_KIND_MSG);
+    await authenticate(relay);
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    const res = await submit;
+    expect(res.ok, "the submit must succeed or there is no pair to check").toBe(true);
+    if (!res.ok) return;
+
+    expect(res.structure1_cbor, "the signed bytes must come back").toBeTruthy();
+    expect(res.sender_signature, "the signature must come back — it was never handed back before bullet 5").toBeTruthy();
+    expect(res.sender_signature!.length, "an Ed25519 signature is 64 bytes; a short one would store an uncheckable BLOB").toBe(64);
+
+    // EXACTLY what sendContent does — index 2 of Structure 1.
+    const s1 = decode(res.structure1_cbor!) as unknown[];
+    const pk = s1[2];
+    expect(pk instanceof Uint8Array, "index 2 of Structure 1 must be the sender pubkey").toBe(true);
+    expect((pk as Uint8Array).length, "an Ed25519 public key is 32 bytes").toBe(32);
+
+    /**
+     * ⚠️ THE ASSERTION ITSELF. This is what a third party does with the row, and it is the only
+     * thing that distinguishes a real proof from 96 bytes that merely look like one.
+     */
+    expect(
+      verify(pk as Uint8Array, res.structure1_cbor!, res.sender_signature!),
+      "the stored pubkey does NOT verify the stored signature over the signed bytes — a sent transcript row " +
+        "built from these would look checkable to an auditor and fail. Suspect the Structure 1 index or the " +
+        "pubkey source before anything else.",
+    ).toBe(true);
+    client.close();
   });
 
   it("★★ AN UNBOUND OR NON-PAYLOAD CTRL LEAF IS REFUSED LOCALLY — pass 2, HIGH-1 and MEDIUM-1", async () => {
