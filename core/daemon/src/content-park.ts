@@ -27,7 +27,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
-import { decodeParkEnvelope } from "./park-envelope.js";
+import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 
 export interface ContentParkDeps {
@@ -501,23 +501,84 @@ export function createContentPark(deps: ContentParkDeps) {
 
   /** Phase 2: register the IPC handlers, once the handler map exists. */
   function registerHandlers(handlers: Map<string, IpcHandler>): void {
+    /**
+     * ⚠️ THIS HANDLER HAS NO PRODUCTION CALLER, AND THAT IS WHY IT DRIFTED.
+     *
+     * Production parks through `#parkContent` (`daemon.ts`), which seals a SIGNED envelope via
+     * `sealParkEnvelope`. This IPC handler is reached only from the spine tests, and it deposited
+     * whatever bytes it was handed — so the tests were parking a shape production stopped producing
+     * when SEC-1 landed. `authenticateParkedEntry` then refused every one of them with
+     * `unsigned_envelope`, which `park-envelope.ts` calls "the ATTACKER shape". Three j-content tests
+     * were asserting downstream security properties — tamper detection, dedup, the post-seal
+     * straggler guard — that the code never reached, because the entry was thrown out one step
+     * earlier for a reason none of them mentioned.
+     *
+     * So `content` (plaintext hex) now parks the PRODUCTION way: same `sealParkEnvelope`, the sole
+     * signer, no second copy of the encoder anywhere near a test.
+     *
+     * **`contentHash` stays a separate parameter on purpose — it is NOT derived from `content`.**
+     * The signature covers `(sessionId, recipient, contentHash)` and deliberately does not bind the
+     * content, so a sender CAN sign an entry whose claimed hash does not match what is inside. That
+     * is a real malicious-sender case, it is what the recover path's hash cross-check exists to
+     * catch, and a caller that wants to exercise it must be able to state the two independently.
+     * Deriving the hash here would make that case unreachable and quietly hollow the tamper test.
+     *
+     * `ciphertext` (the raw path) is kept for the one caller that wants byte fidelity through the
+     * relay rather than envelope semantics.
+     */
     handlers.set("content_park_deposit", async (params, _connectionId) => {
       const relay = parseRelayPeer(params?.relayMultiaddr as string | undefined);
       const recipientPubkey = params?.recipientPubkey as string | undefined;
       const contentHash = params?.contentHash as string | undefined;
       const sessionId = params?.sessionId as string | undefined;
       const ciphertext = params?.ciphertext as string | undefined;
-      if (!relay || !recipientPubkey || !contentHash || !sessionId || !ciphertext) {
-        return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId, ciphertext — all hex." };
+      const content = params?.content as string | undefined;
+      const senderAgentName = params?.senderAgentName as string | undefined;
+      if (!relay || !recipientPubkey || !contentHash || !sessionId) {
+        return { ok: false, reason: "missing_params", guidance: "Provide relayMultiaddr (with /p2p/<peerId>), recipientPubkey, contentHash, sessionId — all hex." };
+      }
+      if (!ciphertext && content === undefined) {
+        return { ok: false, reason: "missing_params", guidance: "Provide either `content` (plaintext hex — sealed and SIGNED here, the production shape) or `ciphertext` (hex — deposited verbatim, no envelope)." };
+      }
+      if (ciphertext && content !== undefined) {
+        return { ok: false, reason: "conflicting_params", guidance: "Provide `content` OR `ciphertext`, not both — they are two different deposit shapes and honouring one would silently discard the other." };
       }
       const node = sessionNodeManager.getStandingReceiverNode();
       if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+
+      let payload: Uint8Array;
+      if (content !== undefined) {
+        // Which agent signs. Named explicitly when given; otherwise the only local agent, and if
+        // there is more than one we REFUSE rather than pick — silently signing as the wrong sender
+        // would produce an entry the recipient authenticates against a pubkey nobody expected, and
+        // the resulting failure would surface at recover time as a signature mismatch with no clue
+        // that the wrong key was chosen here.
+        const candidates = senderAgentName ? agents.filter((a) => a.name === senderAgentName) : agents;
+        if (candidates.length === 0) {
+          return { ok: false, reason: "agent_not_found", guidance: senderAgentName ? `No local agent named '${senderAgentName}' to sign this deposit.` : "This daemon has no local agent to sign the deposit." };
+        }
+        if (candidates.length > 1) {
+          return { ok: false, reason: "ambiguous_sender", guidance: `This daemon has ${candidates.length} local agents (${candidates.map((a) => a.name).join(", ")}); pass senderAgentName to say which one signs.` };
+        }
+        const signer = getKeyProvider(candidates[0]!.name);
+        if (!signer) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${candidates[0]!.name}' is not loaded.` };
+        payload = await sealParkEnvelope({
+          signer,
+          sessionIdHex: sessionId,
+          recipientPubkey: Buffer.from(recipientPubkey, "hex"),
+          contentHash: Buffer.from(contentHash, "hex"),
+          content: Buffer.from(content, "hex"),
+        });
+      } else {
+        payload = Buffer.from(ciphertext!, "hex");
+      }
+
       const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
       return await client.deposit(node, {
         recipientPubkey: Buffer.from(recipientPubkey, "hex"),
         contentHash: Buffer.from(contentHash, "hex"),
         sessionId: Buffer.from(sessionId, "hex"),
-        ciphertext: Buffer.from(ciphertext, "hex"),
+        ciphertext: payload,
       });
     });
 
