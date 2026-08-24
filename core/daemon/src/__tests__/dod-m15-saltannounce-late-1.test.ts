@@ -37,7 +37,9 @@
  * behaviour that shipped before.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { CelloNode } from "@cello-protocol/transport";
 
 /**
  * A node whose peer is ALREADY attached before anyone registers a connect listener — the standing
@@ -57,7 +59,63 @@ function makeNodeWithPeerAlreadyAttached(peerId: string) {
   };
 }
 
-describe("DOD-M15-SALTANNOUNCE-LATE-1: a connection that predates the listener must not be invisible", () => {
+const SID = "5c".repeat(32);
+const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
+
+/** A node reporting the counterparty ALREADY attached — the standing receiver's state at promotion. */
+function nodeWithPeerAttached(peerId: string): CelloNode {
+  return {
+    async start() {}, async stop() {},
+    getPeerId: () => "fake-local",
+    listenAddresses: () => ["/ip4/127.0.0.1/tcp/0"],
+    async dial() { return { peerId }; },
+    async handle() {}, getProtocols: () => [],
+    // THE POINT: the peer is on the wire before anyone registers a connect listener.
+    getConnections: () => [{ peerId, id: "c1", status: "open", direction: "inbound", openedAt: Date.now(), streamCount: 1 }],
+    onPeerConnect() {}, onPeerDisconnect() {},
+    getDialability: () => ({ dialable: false, publicAddr: null }),
+    onDialabilityChange: () => () => {},
+    async newStream() { return { send() {}, async close() {}, abort() {}, status: "open" } as never; },
+  } as unknown as CelloNode;
+}
+
+describe("DOD-M15-SALTANNOUNCE-LATE-1 — DRIVEN THROUGH PRODUCTION", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  it("★★★ the real wiring path notices a counterparty that was already attached", async () => {
+    /**
+     * ⚠️ THIS FILE'S FIRST FOUR TESTS WERE HOLLOW, AND THE REVERT TEST CAUGHT IT.
+     *
+     * They built a fake node and then ran **their own copy** of the sweep — a `for` loop over
+     * `getConnections()` written inside the test. So they proved the PATTERN works and said nothing
+     * about whether production does it. **Deleting the production sweep entirely left all four
+     * green.** That is precisely the hollow-test shape this milestone has been hunting, committed
+     * inside the fix for a defect that same discipline found.
+     *
+     * This one drives the real thing: a session is created through the fixture with a node that
+     * reports the counterparty already attached, and the assertion is on the event PRODUCTION emits.
+     * Delete the sweep in `#wireSessionLiveness` and this goes red.
+     */
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-saltannounce-late-",
+      node: nodeWithPeerAttached(PEER),
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const noticed = fx.eventsNamed("session.liveness.peer_already_attached");
+    expect(
+      noticed.length,
+      "the counterparty was attached BEFORE the liveness handler was registered, which is the " +
+        "ordinary case on the standing-receiver promotion path. If production does not sweep for it, " +
+        "the salt is never announced and every message from that peer is refused — silently, on both " +
+        "sides. This assertion is the only one in the file that can tell.",
+    ).toBeGreaterThan(0);
+    expect(String(noticed[0]!.ctx.peerId), "and it must be the counterparty, not the relay").toBe(PEER);
+  }, 60_000);
+});
+
+describe("DOD-M15-SALTANNOUNCE-LATE-1: the mechanism, pinned separately", () => {
   it("★★ THE DEFECT — an event listener alone NEVER sees the peer that connected first", () => {
     /**
      * The mechanism, pinned on its own so the fix below is measured against something real rather
