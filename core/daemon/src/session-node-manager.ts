@@ -1054,7 +1054,16 @@ export class SessionNodeManager {
   // of being appended out of order. Once the missing in-between sequence(s) land (recovered from the
   // relay mailbox), #releaseHeld drains the held entries in canonical order. content is plaintext in
   // memory only — evicted on teardown, same as #receivedContent.
-  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind }>>();
+  /**
+   * DOD-M15-SEALWIRE-1 bullet 5 — `authorship` rides the held entry.
+   *
+   * A SENT message that lands ahead of our tree tail is held here and its transcript row is written
+   * later, on release. The hold happens AFTER the submit, so it was signed exactly like an unheld
+   * one — without carrying the proof through, a message that happened to queue behind a gap became
+   * permanently less provable than the identical message that did not, for a reason with nothing to
+   * do with authorship.
+   */
+  #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind; authorship?: SentAuthorship }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
   // sub-increment (catch-up-before-live: on reconnect, hold live arrivals until the tree reaches this
@@ -5951,7 +5960,17 @@ export class SessionNodeManager {
     // proof, which is exactly what happened, rather than implying one.
     | { ok: true; delivered: true; sequenceNumber?: number; authorship?: SentAuthorship }
     | { ok: true; delivered: false; parked: true; sequenceNumber?: number; authorship?: SentAuthorship }
-    | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string; sequenceNumber?: number }
+    /**
+     * ⚠️ `authorship` RIDES THE FAILURE PATH TOO — review pass 2, and it is the same reasoning that
+     * already put `sequenceNumber` here.
+     *
+     * A DURABLY QUEUED message was witnessed and SIGNED before delivery was attempted; only the
+     * direct hand-off failed. Omitting the proof here meant every relay-degraded-but-alive send —
+     * the common case — wrote a transcript row indistinguishable from one the relay never saw, while
+     * the signature for it sat in scope and was discarded. The position survives a failed delivery
+     * for exactly this reason; so does the proof.
+     */
+    | { ok: false; reason: string; error: string; durable: boolean; cause?: string; guidance?: string; sequenceNumber?: number; authorship?: SentAuthorship }
   > {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
     if (!entry) {
@@ -6379,6 +6398,8 @@ export class SessionNodeManager {
         // Carried on the failure path too: a DURABLY QUEUED message still owns the position the
         // relay witnessed for it before delivery was attempted, and its leaf must go there.
         ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }),
+        // …and so does its PROOF, for the same reason. It was signed before the hand-off failed.
+        ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }),
         // M12-P13: the machine-readable half of the distinction below. M12-P12 shipped it in the
         // guidance SENTENCE only, so the callers that have to ACT on it — commit the leaf for a
         // queued message, never for a lost one — would have had to substring-match English. None
@@ -8340,6 +8361,12 @@ export class SessionNodeManager {
     assignedSeq: number | undefined,
     correlationId?: string,
     kind: WritableSessionTreeLeafKind = "msg",
+    /**
+     * DOD-M15-SEALWIRE-1 bullet 5 — the proof for THIS send, so a held row keeps it.
+     * Optional: an unwitnessed send has nothing signed, and a caller that has no proof passes none
+     * rather than a placeholder.
+     */
+    authorship?: SentAuthorship,
   ): { placed: true; leafIndex: number; diverged?: true } | { placed: false; heldAt: number } {
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.
@@ -8413,7 +8440,7 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     let held = this.#heldContent.get(key);
     if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent", kind });
+    held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent", kind, ...(authorship ? { authorship } : {}) });
     this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent", kind);
     this.#logger.info("session.content.held", {
       sessionId, canonicalSeq: assignedSeq, nextExpected, gap: assignedSeq - nextExpected,
@@ -8666,7 +8693,8 @@ export class SessionNodeManager {
         // OBSERVED, not assumed — the received path already does this. The leaf commits either way,
         // so a dropped transcript write means the operator's OWN message is missing from their own
         // transcript with the chain saying it is there, and nothing anywhere said so.
-        if (!this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId)) {
+        // bullet 5: the proof was captured at submit time and rides the held entry — see #heldContent.
+        if (!this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
           this.#logger.error("session.content.released.transcript.failed", {
             agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
             impact: "this side's own message is committed to the chain but missing from its transcript",

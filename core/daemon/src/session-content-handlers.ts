@@ -106,7 +106,15 @@ const AUTO_REPLY_GUIDANCE =
 export function sentAuthorship(
   r: Awaited<ReturnType<SessionNodeManager["sendContent"]>>,
 ): { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined {
-  return r.ok ? r.authorship : undefined;
+  /**
+   * ⚠️ NOT `r.ok ? …` — that made two of the five call sites DEAD BY CONSTRUCTION.
+   *
+   * Both live inside `if (!sendResult.ok)`, so an `ok`-gated read is unconditionally `undefined`
+   * there: the durably-queued send — witnessed, signed, only the direct hand-off failed — wrote a
+   * row with no proof while the proof sat in the result. The union now carries `authorship` on the
+   * failure member too, so read it off whichever shape arrived.
+   */
+  return r.authorship;
 }
 
 export interface SessionContentDeps {
@@ -566,6 +574,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         // else's index — which parts the two roots and makes the next seal terminal.
         const placed = sessionNodeManager.placeOwnLeaf(
           record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+          "msg", sentAuthorship(sendResult),
         );
         // `sequence_number` is a LEAF INDEX or nothing. Reporting the relay's number when no leaf
         // exists hands the caller a value that matches no leaf on this side, and anything that
@@ -615,6 +624,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // a message we receive out of order.
     const placement = sessionNodeManager.placeOwnLeaf(
       record.agent_name, sessionId, contentHashHex, sendBytes, sendResult.sequenceNumber, correlationId,
+      "msg", sentAuthorship(sendResult),
     );
     if (!placement.placed) {
       // NOT IN THE RECORD YET, and the caller is told so rather than handed a plain success.
