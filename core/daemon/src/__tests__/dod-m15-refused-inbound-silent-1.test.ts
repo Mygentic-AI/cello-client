@@ -490,7 +490,12 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     db.prepare("UPDATE sessions SET content_salt = ? WHERE session_id = ?")
       .run(new Uint8Array(32).fill(7), "s-list-salted");
 
-    const res = (await client.send("cello_list_sessions", {})) as { sessions?: Array<Record<string, unknown>> };
+    // `filter: "all"` deliberately: the default is `open`, and a session with no messages classifies
+    // as a dead handshake and is filtered out — so the default would have hidden both rows and the
+    // assertion below would have failed for a reason that has nothing to do with the salt field.
+    const res = (await client.send("cello_list_sessions", { filter: "all" })) as {
+      sessions?: Array<Record<string, unknown>>;
+    };
     const byId = new Map((res.sessions ?? []).map((s) => [s["sessionId"] as string, s]));
 
     expect(
