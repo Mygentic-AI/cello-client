@@ -1488,14 +1488,45 @@ describe("SessionNodeManager — integration tests", () => {
     db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").run();
     db.close();
 
-    // Step (c): send SIGTERM and wait for clean exit
+    /**
+     * Step (c): send SIGTERM and wait for exit.
+     *
+     * ─── `code === null` IS NOT SUCCESS, and treating it as such hid the only fact that matters ──
+     *
+     * Node passes `(code, signal)`. When a child dies from the DEFAULT action of a signal, `code` is
+     * `null` and `signal` names it — so the old `code === 0 || code === null` accepted *"the handler
+     * never ran and the kernel killed it"* as a clean shutdown, and dropped `signal` on the floor.
+     *
+     * That collapse is what left this test's CI failures unexplained. The daemon already answers the
+     * question through its exit status, deliberately: `onStopped` exits **1** on a dirty stop and the
+     * SIGTERM handler exits **1** on a throw, precisely so that a shutdown which never marked its
+     * sessions interrupted cannot report success. So the two surviving worlds are:
+     *
+     *   - **exit 0** — the shutdown RAN and reported success, and the UPDATE still matched no rows.
+     *     A state/visibility question, and the more serious of the two.
+     *   - **exit null + SIGTERM** — the handler never ran at all; nothing was ever marked.
+     *
+     * Both used to arrive here as the same silent `resolve()`, and the failure then surfaced one step
+     * later as a bare `expected 'active' to be 'interrupted'` — an assertion that cannot distinguish
+     * them. Now `null` rejects and names the signal, and both values are carried into the status
+     * assertion below so a CI-only failure says which world it was.
+     */
     child.kill("SIGTERM");
+    let exitCode: number | null = null;
+    let exitSignal: NodeJS.Signals | null = null;
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error("Daemon did not exit after SIGTERM")), 5_000);
-      child.on("exit", (code) => {
+      child.on("exit", (code, signal) => {
         clearTimeout(timeout);
-        if (code === 0 || code === null) resolve();
-        else reject(new Error(`Daemon exited with code ${code}`));
+        exitCode = code;
+        exitSignal = signal;
+        if (code === 0) resolve();
+        else if (code === null) {
+          reject(new Error(
+            `Daemon was KILLED by ${signal ?? "an unknown signal"} rather than exiting — the SIGTERM ` +
+            `handler never ran, so no session was ever marked interrupted. This is NOT a clean exit.`,
+          ));
+        } else reject(new Error(`Daemon exited with code ${code} (dirty stop — handle.stop() failed)`));
       });
     });
 
@@ -1513,7 +1544,25 @@ describe("SessionNodeManager — integration tests", () => {
       `the daemon logged a failed interrupt-write during shutdown:\n${daemonLog.slice(-2000)}`,
     ).toBe(false);
     for (const row of rows) {
-      expect(row.status, `daemon log:\n${daemonLog.slice(-2000)}`).toBe("interrupted");
+      /**
+       * The exit status travels WITH the assertion, because on a CI-only failure this message is the
+       * entire investigation. `expected 'active' to be 'interrupted'` cost two agents a publish
+       * window precisely because it named neither the shutdown's own verdict nor how the process
+       * died — and the daemon reports both, deliberately.
+       *
+       * Reaching here at all now means the child exited 0, i.e. `onStopped({ok:true})` — the shutdown
+       * RAN and called itself successful. So a failure on this line is the serious world: a
+       * successful-looking shutdown whose interrupt UPDATE matched nothing. Pair it with
+       * `rowsMarkedInterrupted` in the log, which says whether the UPDATE ran and how many rows it
+       * touched.
+       */
+      expect(
+        row.status,
+        `session ${row.session_id} was still '${row.status}' after a shutdown that reported SUCCESS ` +
+          `(exit code ${String(exitCode)}, signal ${String(exitSignal)}). Look for rowsMarkedInterrupted ` +
+          `in the log below — if it is 0, the UPDATE ran and matched nothing; if it is absent, the ` +
+          `shutdown never reached it.\ndaemon log:\n${daemonLog.slice(-2000)}`,
+      ).toBe("interrupted");
     }
   }, 30_000);
 
