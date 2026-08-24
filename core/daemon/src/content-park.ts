@@ -280,7 +280,10 @@ export function createContentPark(deps: ContentParkDeps) {
                   // Lifted from the direct path's equivalent, because the operator needs the same
                   // answer wherever the message arrived. Deliberately does NOT promise delivery:
                   // without the salt this entry cannot be verified on any future drain either.
-                  ? "The salt agreement never completed on this side for this session — look for session.salt.read.failed or session.salt.persist.failed. Their build is NOT the problem; do not ask them to upgrade. This message will keep being re-pulled and re-refused until the session is closed, so close it and start a new one."
+                  // DOD-M15-SALTSPLIT-1 review MEDIUM-3: "never completed" is now one of TWO ways to
+                  // hold no salt. The discard undoes an agreement that DID complete, so an operator
+                  // reading the old sentence would look for a failure that never happened.
+                  ? "This side holds no salt for the session, for one of two reasons. If session.salt.discarded is in the log, the agreement completed and this side then dropped its salt on purpose because the counterparty said it could never hold one. Otherwise the agreement never completed — look for session.salt.read.failed or session.salt.persist.failed. Either way their build is NOT the problem; do not ask them to upgrade. This message will keep being re-pulled and re-refused until the session is closed, so close it and start a new one."
                   : "Their CELLO build is newer than this one: ask which version they run, and upgrade. The message stays on the relay and is delivered once this daemon can read that algorithm.",
                 correlationId,
               },

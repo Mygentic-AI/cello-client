@@ -7154,7 +7154,12 @@ export class SessionNodeManager {
         // one that does not repair: this side declined the salt permanently for this session, so
         // waiting for a reconnect is exactly the wrong advice. Leaving it out of this list would
         // have sent an operator to look for a read failure that is not there and never will be.
-        guidance: "Look for session.salt.adoption.refused first: if it is there, this side declined the salt because the session had already hashed messages, that is permanent for this session, and reconnecting will NOT fix it — close the session and start a new one. Otherwise look for session.salt.read.failed or session.salt.persist.failed. If either is present the agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If none of the three is present, the agreement never completed with this counterparty: close the session and start a new one. In every case the transcript up to here is intact.",
+        // DOD-M15-SALTSPLIT-1 review MEDIUM-3: `session.salt.discarded` is the FIFTH cause, and it
+        // was added by the discard without appearing in this tree. Without it an operator whose salt
+        // was deliberately dropped is sent to look for three events that will not be there and then
+        // told a fifth thing that is false — the agreement DID complete here, and was then undone on
+        // purpose.
+        guidance: "Look for session.salt.discarded first: if it is there, this side dropped its salt because the counterparty said it could never hold one, the agreement did complete and was deliberately undone, and a new session is the repair. Otherwise look for session.salt.adoption.refused: if it is there, this side declined the salt because the session had already hashed messages, that is permanent for this session, and reconnecting will NOT fix it — close the session and start a new one. Otherwise look for session.salt.read.failed or session.salt.persist.failed. If either is present the agreement re-runs on the next reconnect and this repairs itself — wait for that before doing anything. If none of the four is present, the agreement never completed with this counterparty: close the session and start a new one. In every case the transcript up to here is intact.",
       });
       // DOD-M15-REFUSED-INBOUND-SILENT-1 — and this branch needed it MORE than the two that had it.
       //
@@ -7174,7 +7179,7 @@ export class SessionNodeManager {
         impact:
           "this message could not be verified — the sender says it is salted and this side holds no salt for the session — so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
         guidance:
-          "If this side refused the salt because the session had already hashed messages, that is PERMANENT for this session and reconnecting will not fix it — close the session and start a new one. Otherwise the salt agreement re-runs on the next reconnect and this repairs itself. Check session.salt.adoption.refused in the log to tell which. The transcript up to here is intact either way.",
+          "If session.salt.discarded is present, this side dropped its salt on purpose because the counterparty said it could never hold one — a new session is the repair. If this side refused the salt because the session had already hashed messages, that is PERMANENT for this session and reconnecting will not fix it — close the session and start a new one. Otherwise the salt agreement re-runs on the next reconnect and this repairs itself. Check session.salt.discarded and session.salt.adoption.refused in the log to tell which. The transcript up to here is intact either way.",
       });
       return { ok: false, reason: "content_hash_salt_unavailable" };
     }
@@ -10528,11 +10533,26 @@ export class SessionNodeManager {
        * through it, and deleting its check reddens the spent test immediately. That also removes the
        * duplicated condition: two places deciding the same thing is one place being wrong later.
        */
-      this.#discardUnspentSalt(agentName, sessionId, correlationId);
+      /**
+       * The return is CONSUMED, not decorative — review LOW-5. `true` means a salt was actually
+       * cleared, which settles the question below without a second read; `false` is ambiguous (we
+       * held none, or we refused to drop one), so that case still asks.
+       */
+      const discarded = this.#discardUnspentSalt(agentName, sessionId, correlationId);
+      const stillHoldsSalt = !discarded && this.#getSessionSalt(agentName, sessionId) !== null;
 
       const shared = {
         agentName, sessionId, correlationId, detail: action.detail,
-        impact: "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
+        /**
+         * ⚠️ *"no message is affected"* IS FALSE WHEN WE ARE STILL HOLDING A SALT — review MEDIUM-4,
+         * second instance. The sentence was written for a session where neither side ever adopted
+         * one, and it stayed attached to a branch that now also covers the case where this side
+         * kept a spent salt and every message it sends is about to be refused. Two log lines from
+         * one event contradicting each other is worse than either alone.
+         */
+        impact: stillHoldsSalt
+          ? "the counterparty will not use a content salt, and this side is still holding one it cannot drop — see session.salt.split on the next line for what that costs and what to do about it."
+          : "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
       };
       if (adoption.closed) {
         /**
@@ -10568,11 +10588,28 @@ export class SessionNodeManager {
          * event at ERROR rather than a tightened sentence on that one: an operator filtering for the
          * refusal is looking at a benign condition, and this is not that condition.
          */
-        if (this.#getSessionSalt(agentName, sessionId) !== null) {
+        if (stillHoldsSalt) {
+          /**
+           * ⚠️ TWO REASONS REACH `adoption.closed`, AND ONLY ONE IS ABOUT CONTENT — review MEDIUM-4.
+           *
+           * This fired for both with a single impact asserting *"content here is already hashed
+           * under a salt"*. For `frontier_unreadable` that is a claim about content made from a
+           * database read that FAILED — we do not know what was hashed; that is the whole condition.
+           *
+           * The WARN twenty lines above was explicitly corrected for this exact collapse — its
+           * comment reads *"TWO REFUSALS, TWO DIFFERENT THINGS TO DO — and this used to report both
+           * as `already_hashing`"* — and I reintroduced it one severity level up, with the guidance
+           * that WARN was fixed to stop giving. Branching on the label the way it already does.
+           */
+          const unreadable = adoption.label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE;
           this.#logger.error("session.salt.split", {
             agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
-            impact: "this session cannot continue. Content here is already hashed under a salt the counterparty can never hold, so they refuse every message sent from this side — the conversation looks quiet rather than broken, and the session can never be sealed because the two transcripts no longer agree on a leaf.",
-            guidance: "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed, so a fresh session agrees or declines cleanly on both sides. This one cannot be repaired — the salt cannot be dropped without leaving a transcript no single rule can verify, and it cannot be shared with a peer that has already closed adoption.",
+            impact: unreadable
+              ? "this side holds a salt, the counterparty can never hold one, and this side could NOT read its own message frontier — so whether anything has been hashed under that salt is unknown. The salt is kept rather than dropped, because dropping one that HAS been spent leaves a transcript no single rule can verify. Until the read succeeds, expect the counterparty to refuse messages sent from here."
+              : "this session cannot continue. Content here is already hashed under a salt the counterparty can never hold, so they refuse every message sent from this side — the conversation looks quiet rather than broken, and the session can never be sealed because the two transcripts no longer agree on a leaf.",
+            guidance: unreadable
+              ? "Do NOT start a new session yet — it would refuse in exactly the same way, because the fault is this side's storage rather than this conversation. Look for session.content.held.restore.failed or other storage errors around this line. Once the frontier reads again, this resolves to either an ordinary salted session or the split case, and the log will say which."
+              : "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed, so a fresh session agrees or declines cleanly on both sides. This one cannot be repaired — the salt cannot be dropped without leaving a transcript no single rule can verify, and it cannot be shared with a peer that has already closed adoption.",
           });
         }
       } else {
