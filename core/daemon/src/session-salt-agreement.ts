@@ -390,8 +390,32 @@ export function onPeerSaltFrame(state: {
   /**
    * WE have closed adoption. Say so instead of deriving, whatever the peer sent — otherwise we
    * refuse silently, they adopt, and every message they send afterwards is unverifiable here.
+   *
+   * ⚠️ `&& !state.ownSalt` — `DOD-M15-SALTSPLIT-1` review pass 1, HIGH-1. WITHOUT IT THIS BRANCH
+   * ANNOUNCES THAT WE HOLD NO SALT WHILE WE ARE HOLDING ONE.
+   *
+   * "Adoption closed" means *"I cannot adopt a NEW salt"*. It was being tested before `ownSalt`, so
+   * a side that had agreed salt S and then leafed a message answered a matching `fingerprint(S)`
+   * with `adoption_closed: already_hashing` — a frame the receiver reads as *"the peer has none"*.
+   * Once `SALTSPLIT-1` taught the receiver to discard on that frame, the receiver erased **its own
+   * copy of the same salt**, and a working session became one where every message is refused. The
+   * fix made things worse than the defect on that path, which is why the correction is here at the
+   * producer and not as a new check at each receiver.
+   *
+   * The rule underneath it: **a side that already HOLDS a salt has nothing to adopt, so the adoption
+   * question does not apply to it at all.** It falls through to the `state.ownSalt` block below,
+   * which answers a contribution with a repair and a fingerprint with match-or-mismatch — the
+   * correct answers for a salt-holder, and the ones it could never reach before.
+   *
+   * Deliberately NOT moved above the malformed-frame guard: the `ownSalt` block reads
+   * `hasContribution`/`hasFingerprint` and relies on exactly one of them being set.
+   *
+   * A legacy peer on an older build can still send the misleading frame, and a fixed side would
+   * still discard on it. Accepted rather than defended against with a wire field: we are pre-launch
+   * with no external installs, and the standing rule here is to re-derive against an empty database
+   * rather than carry compatibility for a state nobody is in.
    */
-  if (state.ownAdoption?.closed) {
+  if (state.ownAdoption?.closed && !state.ownSalt) {
     return {
       action: "adoption_closed",
       // The LABEL and the WHY, in that order: the label is the word an operator scans for, the why
