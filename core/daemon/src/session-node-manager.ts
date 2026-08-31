@@ -807,6 +807,52 @@ export class SessionNodeManager {
       ...(claimedRegistration ? { releaseOnDone: true as const } : {}),
     };
   }
+
+  /**
+   * DOD-M15-RELAYAUTH-1: authenticate a fresh standing receiver to its reservation relay over the
+   * CELLO relay protocol — proof of K_local key possession, not a session. Reuses the SAME
+   * `#relayClients` cache `#connectSessionRelay`/`#resolveSealTransport` read from, keyed
+   * identically (`${agentName}::${relayPeerId}`), so a session created moments later on this same
+   * relay finds an already-authenticated client instead of dialing and authenticating twice.
+   *
+   * The manager holds no K_local (M12-P15's own rationale for `#detachedRelayClientBuilder`) —
+   * without a builder wired (a narrow startup race, or a test harness that never wires one), this
+   * is a no-op and the relay's own grace-window revoke is the backstop, not a defect in this path.
+   */
+  async #authenticateStandingReceiver(
+    agentName: string,
+    node: CelloNode,
+    relayPeerId: string,
+    heldCircuitAddr: string,
+    correlationId: string,
+  ): Promise<void> {
+    const clientKey = `${agentName}::${relayPeerId}`;
+    let client = this.#relayClients.get(clientKey);
+    if (!client) {
+      if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+      if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+      /**
+       * ⚠️ SPLIT, NOT AN ANCHORED STRIP. The held address is
+       * `/ip4/…/tcp/…/p2p/<relay>/p2p-circuit/p2p/<self>` — the `/p2p-circuit` marker is in the
+       * MIDDLE, not at the end, so a `/\/p2p-circuit$/` replace matches nothing and silently
+       * hands the relay client a circuit address as its DIAL address. Measured, not assumed:
+       * that first version failed this file's own test because the client could not dial.
+       */
+      const baseRelayAddr = heldCircuitAddr.split("/p2p-circuit")[0] ?? heldCircuitAddr;
+      client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
+        receiptStore: this.#relayReceiptStore ?? undefined,
+        sealLeafStore: this.#sealLeafStore ?? undefined,
+      });
+      if (!client) {
+        this.#logger.debug("session.standing_receiver.relay_auth.no_builder", { agentName, relayPeerId, correlationId });
+        return;
+      }
+      this.#relayClients.set(clientKey, client);
+    }
+    const connected = await client.connect(node);
+    this.#logger.info("session.standing_receiver.relay_auth.result", { agentName, relayPeerId, connected, correlationId });
+  }
+
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
   // (the loopback case) needs each agent to have its OWN inbound receiver node — otherwise the
   // initiator (consuming its agent's standing receiver) and the responder (consuming its agent's)
@@ -12537,6 +12583,24 @@ export class SessionNodeManager {
       sessionPeerId: node.getPeerId(),
       correlationId,
     });
+
+    // DOD-M15-RELAYAUTH-1: authenticate to the reservation relay NOW, not when a session first
+    // needs one. The relay times out a reservation nobody has proven key possession for
+    // (relay-connection-gater.ts, trustless-cello) — proving it here, instead of waiting for a
+    // real session to exist, is what keeps this reservation alive past that grace window.
+    // Best-effort and unawaited: a failure here costs nothing beyond the relay's own grace-window
+    // revoke, which the reservation watchdog already treats as an ordinary lost reservation.
+    if (reservedRelayPeerId !== undefined && heldCircuitAddr !== undefined) {
+      void this.#authenticateStandingReceiver(agentName, node, reservedRelayPeerId, heldCircuitAddr, correlationId)
+        .catch((err: unknown) => {
+          this.#logger.warn("session.standing_receiver.relay_auth.failed", {
+            agentName,
+            relayPeerId: reservedRelayPeerId,
+            error: extractErrorMessage(err),
+            correlationId,
+          });
+        });
+    }
 
     // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come
     // up? circuitAddrs === 0 with reservations requested means every relay
