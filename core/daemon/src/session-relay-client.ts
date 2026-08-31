@@ -907,9 +907,29 @@ export class AgentRelayClient {
       return false;
     }
     if (ackFrame["type"] !== "relay_auth_ok") {
+      /**
+       * DOD-M15-RELAYABUSE-1 review F2 — **THE RELAY SAYS WHY, AND WE USED TO THROW IT AWAY.**
+       *
+       * `relay_auth_failed` carries a `reason` — `rate_limited`, `signature_invalid`, `nonce_expired`,
+       * `nonce_reused`, `nonce_unknown` — and, when throttled, a `retry_after_ms`. This branch
+       * collapsed all of them into the single word `auth_rejected`, so a throttled agent looked
+       * exactly like a bad signature, which looked exactly like a dead relay. That is precisely the
+       * distinction the order that added those refusals set out to create, undone at the last hop.
+       *
+       * The difference matters to whoever is looking: `rate_limited` clears by itself and says when;
+       * `signature_invalid` never clears and means a key or clock problem; a nonce failure means the
+       * handshake raced and an immediate retry is the right move. One label for all three sends
+       * someone to look for a broken relay in all three cases.
+       */
+      const relayReason = typeof ackFrame["reason"] === "string" ? (ackFrame["reason"] as string) : undefined;
+      const retryAfterMs = typeof ackFrame["retry_after_ms"] === "number" ? (ackFrame["retry_after_ms"] as number) : undefined;
       this.#logger.warn("session.relay.auth.failed", {
         relayPeerId: this.#relayPeerId,
-        reason: ackFrame["type"] === "relay_auth_failed" ? "auth_rejected" : "unexpected_frame",
+        reason: ackFrame["type"] === "relay_auth_failed" ? (relayReason ?? "auth_rejected") : "unexpected_frame",
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        impact: relayReason === "rate_limited"
+          ? "this relay is throttling us; it clears on its own after the stated window, and until it does this agent cannot reserve or witness here"
+          : "this agent could not authenticate to this relay, so it cannot witness leaves or hold a reservation here",
       });
       return false;
     }
