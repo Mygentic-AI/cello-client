@@ -4122,10 +4122,87 @@ export class SessionNodeManager {
       // Proactively connect so the relay has this agent's stream to deliver leaves to
       // (the RECEIVER must be connected before the counterparty submits). Best-effort.
       await client.connect(node);
+
+      // DOD-M15-RELAYAUTH-1 review HIGH-2 — see below. Best-effort and non-blocking: a session must
+      // never fail to come up because a SECOND relay could not be told about it.
+      void this.#presentAssignmentToReservationRelay(agentName, node, relay, sessionIdHexForRelay, correlationId);
     } catch (err: unknown) {
       this.#logger.warn("session.relay.connect.error", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
+        correlationId,
+      });
+    }
+  }
+
+  /**
+   * DOD-M15-RELAYAUTH-1 review HIGH-2 — **THE RELAY THAT GATES THE DIAL IS NOT ALWAYS THE RELAY
+   * THAT HOLDS THE ASSIGNMENT, AND THE GATE DENIES WHEN THEY DIFFER.**
+   *
+   * Two relays are in play for one session, chosen by unrelated rules:
+   *   - the WITNESS relay, `assignment.relay_endpoint`, picked by the directory. Both parties
+   *     present `client_record_assignment` to it and to nowhere else.
+   *   - the RESERVATION relay, whichever one this node's circuit address is held on — the first
+   *     candidate that granted when it was a standing receiver.
+   *
+   * The counterparty dials our CIRCUIT address, so it is the RESERVATION relay whose gater is asked
+   * `denyOutboundRelayedConnection(them, us)`. With no assignment recorded there it finds no binding
+   * and refuses a completely legitimate dial. Two relays run in production and the client's own
+   * logs show the fall-through to the second candidate is frequent, so this is the ordinary case,
+   * not a corner: the session still opens, but every message falls to the store-and-forward park
+   * path, and the only trace is a denial on a relay nobody is tailing.
+   *
+   * So the node that will be DIALLED presents the same assignment to the relay that will be asked
+   * to allow it. Safe by construction: the assignment is self-authenticating (a per-node directory
+   * signature the relay verifies against its consortium set), so presenting it more widely grants
+   * nothing that forging it would not already require. No directory change, no new frame.
+   */
+  async #presentAssignmentToReservationRelay(
+    agentName: string,
+    node: CelloNode,
+    relay: RelayConnectParams,
+    sessionIdHex: string,
+    correlationId: string,
+  ): Promise<void> {
+    if (!relay.assignment) return; // direct/legacy/persisted-reconnect: nothing to present anywhere
+    const heldCircuitAddr = node.listenAddresses().find((a) => a.includes("/p2p-circuit"));
+    if (!heldCircuitAddr) return; // no reservation held → nobody will gate a dial to us
+    const reservationRelayPeerId = /\/p2p\/([^/]+)\/p2p-circuit/.exec(heldCircuitAddr)?.[1];
+    if (!reservationRelayPeerId || reservationRelayPeerId === relay.relayPeerId) return; // same relay — already recorded
+    try {
+      const clientKey = `${agentName}::${reservationRelayPeerId}`;
+      let client = this.#relayClients.get(clientKey);
+      if (!client) {
+        if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
+        if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+        // Split on the marker, not an anchored strip: the held address is
+        // `…/p2p/<relay>/p2p-circuit/p2p/<self>`, so the marker is in the MIDDLE.
+        const baseRelayAddr = heldCircuitAddr.split("/p2p-circuit")[0] ?? heldCircuitAddr;
+        client = this.#detachedRelayClientBuilder?.(agentName, reservationRelayPeerId, [baseRelayAddr], {
+          receiptStore: this.#relayReceiptStore ?? undefined,
+          sealLeafStore: this.#sealLeafStore ?? undefined,
+        });
+        if (!client) return;
+        this.#relayClients.set(clientKey, client);
+      }
+      // registerSession presents the assignment eagerly (see its own comment). No leaf handler: this
+      // relay is not witnessing the session, it only needs the binding that authorizes the dial.
+      client.registerSession(sessionIdHex, node, undefined, relay.assignment);
+      this.#logger.info("session.relay.assignment.presented_to_reservation_relay", {
+        agentName,
+        sessionId: sessionIdHex.slice(0, 16),
+        witnessRelayPeerId: relay.relayPeerId,
+        reservationRelayPeerId,
+        impact: "the relay that will be asked to allow inbound circuit dials to this node now holds the assignment authorizing them",
+        correlationId,
+      });
+    } catch (err: unknown) {
+      this.#logger.warn("session.relay.assignment.reservation_relay_failed", {
+        agentName,
+        sessionId: sessionIdHex.slice(0, 16),
+        reservationRelayPeerId,
+        error: extractErrorMessage(err),
+        impact: "inbound relayed dials to this node may be refused by its reservation relay; the session still works over the direct path and the park backstop",
         correlationId,
       });
     }

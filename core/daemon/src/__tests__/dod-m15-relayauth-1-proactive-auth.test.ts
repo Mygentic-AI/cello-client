@@ -79,36 +79,54 @@ async function startAuthRecordingRelay(): Promise<{
   authenticatedPeerIds: string[];
   /** Whether each auth declared itself a reservation proof — it must not claim the delivery stream. */
   purposes: Array<string | undefined>;
+  /**
+   * Session ids this relay was handed a `client_record_assignment` for. HIGH-2's subject: the relay
+   * that gates inbound circuit dials must hold the assignment authorizing them, and it is not
+   * always the relay the directory named.
+   */
+  recordedSessionIds: string[];
 }> {
   const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
   await node.start();
   const authenticatedPubkeys: string[] = [];
   const authenticatedPeerIds: string[] = [];
   const purposes: Array<string | undefined> = [];
+  const recordedSessionIds: string[] = [];
 
   await node.handle(RELAY_PROTOCOL_ID, (stream: Stream, remotePeerId?: string) => {
     void (async () => {
       try {
         const nonce = new Uint8Array(32).fill(7);
         stream.send(lp.encode.single(CBOR_ENC.encode({ type: "relay_auth_challenge", nonce }) as Uint8Array));
+        let authed = false;
         for await (const chunk of lp.decode(stream)) {
           const bytes = chunk instanceof Uint8Array ? chunk : (chunk as unknown as { slice(): Uint8Array }).slice();
           const frame = decode(bytes) as Record<string, unknown>;
-          if (frame["type"] !== "relay_auth_response") continue;
-          const pubkey = frame["pubkey"] as Uint8Array;
-          const signature = frame["signature"] as Uint8Array;
-          // Verify exactly as the relay does — a client that sends a malformed or unsigned
-          // response must not be recorded as authenticated.
-          const { verify } = await import("@cello-protocol/crypto");
-          const authMsg = new Uint8Array(Buffer.concat([Buffer.from(AUTH_DOMAIN, "utf8"), nonce, pubkey]));
-          const msgHash = new Uint8Array(createHash("sha256").update(authMsg).digest());
-          if (verify(pubkey, msgHash, signature)) {
+          if (!authed) {
+            if (frame["type"] !== "relay_auth_response") continue;
+            const pubkey = frame["pubkey"] as Uint8Array;
+            const signature = frame["signature"] as Uint8Array;
+            // Verify exactly as the relay does — a client that sends a malformed or unsigned
+            // response must not be recorded as authenticated.
+            const { verify } = await import("@cello-protocol/crypto");
+            const authMsg = new Uint8Array(Buffer.concat([Buffer.from(AUTH_DOMAIN, "utf8"), nonce, pubkey]));
+            const msgHash = new Uint8Array(createHash("sha256").update(authMsg).digest());
+            if (!verify(pubkey, msgHash, signature)) break;
             authenticatedPubkeys.push(Buffer.from(pubkey).toString("hex"));
             if (remotePeerId) authenticatedPeerIds.push(remotePeerId);
-            purposes.push(typeof frame["purpose"] === "string" ? (frame["purpose"] as string) : undefined);
+            const purpose = typeof frame["purpose"] === "string" ? (frame["purpose"] as string) : undefined;
+            purposes.push(purpose);
             stream.send(lp.encode.single(CBOR_ENC.encode({ type: "relay_auth_ok" }) as Uint8Array));
+            authed = true;
+            // A reservation proof says nothing further — mirrors the real relay, which closes here.
+            if (purpose === "reservation") break;
+            continue;
           }
-          break;
+          if (frame["type"] === "client_record_assignment") {
+            const sid = frame["session_id"];
+            if (sid instanceof Uint8Array) recordedSessionIds.push(Buffer.from(sid).toString("hex"));
+            stream.send(lp.encode.single(CBOR_ENC.encode({ type: "assignment_ok" }) as Uint8Array));
+          }
         }
       } catch { /* the stream went away — the assertion is on what was recorded, not on teardown */ }
     })();
@@ -116,7 +134,7 @@ async function startAuthRecordingRelay(): Promise<{
 
   const addr = node.listenAddresses().find((a) => a.includes("/p2p/"));
   if (!addr) throw new Error("relay node has no addressed multiaddr");
-  return { node, peerId: node.getPeerId(), addr, authenticatedPubkeys, authenticatedPeerIds, purposes };
+  return { node, peerId: node.getPeerId(), addr, authenticatedPubkeys, authenticatedPeerIds, purposes, recordedSessionIds };
 }
 
 describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reservation relay proactively", () => {
@@ -300,6 +318,107 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();
+    }
+  }, 45_000);
+
+  it("★★★ the assignment also reaches the RESERVATION relay when it differs from the witness relay", async () => {
+    /**
+     * Review HIGH-2. Two relays serve one session, chosen by unrelated rules:
+     *   - the WITNESS relay is `assignment.relay_endpoint`, picked by the directory, and it is the
+     *     only relay either party presented the assignment to;
+     *   - the RESERVATION relay is whichever one this node's circuit address is held on.
+     *
+     * The counterparty dials our CIRCUIT address, so it is the RESERVATION relay whose gater decides
+     * whether to allow it — and with no assignment recorded there it refused a legitimate dial. Two
+     * relays run in production and falling through to the second candidate is frequent, so this is
+     * the ordinary case: the session opened, but every message dropped to the slow park path with
+     * the only trace on a relay nobody tails.
+     */
+    const witnessRelay = await startAuthRecordingRelay();
+    const reservationRelay = await startAuthRecordingRelay();
+    const { logger } = makeLogger();
+    const dbPath = join(tempDir, `sessions-${randomUUID()}.db`);
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath,
+    });
+    await manager.initialize();
+
+    const agentKp = generateKeypair();
+    const agentPubkey = await agentKp.getPublicKey();
+    manager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs, stores) =>
+      new AgentRelayClient({
+        relayPeerId, relayAddrs, keyProvider: agentKp, senderPubkey: agentPubkey, logger,
+        receiptStore: stores.receiptStore, sealLeafStore: stores.sealLeafStore,
+      }),
+    );
+
+    try {
+      // The standing receiver reserves on the RESERVATION relay (it is the only endpoint seeded).
+      const db = manager.getDb();
+      const ids = await seedAgents(db, ["alice"]);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, relay_peer_id, relay_addrs)
+         VALUES (?, ?, ?, 'sealed', ?, ?, 0, ?, ?)`,
+      ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, reservationRelay.peerId, JSON.stringify([reservationRelay.addr]));
+
+      await manager.ensureStandingReceiverForAgent("alice");
+      const reserved = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      expect(reserved, "precondition: the receiver holds a reservation on the RESERVATION relay").toBe(true);
+
+      // The session's assignment names the WITNESS relay — a different one, as the directory picks.
+      const counterpartyNode = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+      await counterpartyNode.start();
+      const sessionIdHex = randomUUID().replaceAll("-", "");
+      const counterpartyPub = await generateKeypair().getPublicKey();
+      const created = await manager.createSessionNode(
+        sessionIdHex, "alice", Buffer.from(counterpartyPub).toString("hex"),
+        counterpartyNode.getPeerId(), randomUUID(), true,
+        {
+          relayPeerId: witnessRelay.peerId,
+          relayAddrs: [witnessRelay.addr],
+          keyProvider: agentKp,
+          senderPubkey: agentPubkey,
+          sessionIdBytes: new Uint8Array(Buffer.from(sessionIdHex, "hex")),
+          assignment: {
+            participantA: agentPubkey,
+            participantB: counterpartyPub,
+            sessionTimestamp: Date.now(),
+            initiatorSessionPeerId: manager.getStandingReceiverInfo("alice")?.peerId ?? "",
+            counterpartySessionPeerId: counterpartyNode.getPeerId(),
+            // A real directory signature is not needed: these test relays record what they are
+            // HANDED. Whether the relay would VERIFY it is the relay's own concern and is covered
+            // relay-side. What is under test here is WHICH relays the client presents it to.
+            assignmentSignature: new Uint8Array(64).fill(9),
+          },
+        },
+      );
+      expect(created.ok, "precondition: the session must be created").toBe(true);
+
+      // The witness relay obviously gets it — that was never the bug.
+      const witnessGot = await waitUntil(() => witnessRelay.recordedSessionIds.includes(sessionIdHex), 15_000);
+      expect(witnessGot, "precondition: the witness relay receives the assignment as it always did").toBe(true);
+
+      // THE ASSERTION: the relay that will gate inbound circuit dials to this node also holds it.
+      const reservationGot = await waitUntil(() => reservationRelay.recordedSessionIds.includes(sessionIdHex), 15_000);
+      expect(
+        reservationGot,
+        "the RESERVATION relay must also hold the assignment. Without it, its dial-through gate finds " +
+          "no binding and refuses the counterparty's legitimate dial — the session still opens, but " +
+          "every message silently falls to the slow store-and-forward path.",
+      ).toBe(true);
+
+      await counterpartyNode.stop();
+    } finally {
+      await manager.gracefulShutdown();
+      await witnessRelay.node.stop();
+      await reservationRelay.node.stop();
     }
   }, 45_000);
 });
