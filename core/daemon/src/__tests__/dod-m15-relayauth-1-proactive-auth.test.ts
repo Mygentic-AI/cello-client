@@ -69,12 +69,24 @@ async function startAuthRecordingRelay(): Promise<{
   peerId: string;
   addr: string;
   authenticatedPubkeys: string[];
+  /**
+   * ⚠️ **PEER IDS, NOT JUST PUBKEYS — and the distinction IS the review finding.** Every standing
+   * receiver an agent builds signs with the SAME K_local, so a pubkey-only record cannot tell the
+   * first receiver from its replacement. The relay's reservation gate keys on the TRANSPORT peer
+   * id, so that is what has to be observed: HIGH-1 was precisely that the replacement receiver's
+   * peer id never appeared here, while the pubkey did (from the first one).
+   */
+  authenticatedPeerIds: string[];
+  /** Whether each auth declared itself a reservation proof — it must not claim the delivery stream. */
+  purposes: Array<string | undefined>;
 }> {
   const node = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
   await node.start();
   const authenticatedPubkeys: string[] = [];
+  const authenticatedPeerIds: string[] = [];
+  const purposes: Array<string | undefined> = [];
 
-  await node.handle(RELAY_PROTOCOL_ID, (stream: Stream) => {
+  await node.handle(RELAY_PROTOCOL_ID, (stream: Stream, remotePeerId?: string) => {
     void (async () => {
       try {
         const nonce = new Uint8Array(32).fill(7);
@@ -92,6 +104,8 @@ async function startAuthRecordingRelay(): Promise<{
           const msgHash = new Uint8Array(createHash("sha256").update(authMsg).digest());
           if (verify(pubkey, msgHash, signature)) {
             authenticatedPubkeys.push(Buffer.from(pubkey).toString("hex"));
+            if (remotePeerId) authenticatedPeerIds.push(remotePeerId);
+            purposes.push(typeof frame["purpose"] === "string" ? (frame["purpose"] as string) : undefined);
             stream.send(lp.encode.single(CBOR_ENC.encode({ type: "relay_auth_ok" }) as Uint8Array));
           }
           break;
@@ -102,7 +116,7 @@ async function startAuthRecordingRelay(): Promise<{
 
   const addr = node.listenAddresses().find((a) => a.includes("/p2p/"));
   if (!addr) throw new Error("relay node has no addressed multiaddr");
-  return { node, peerId: node.getPeerId(), addr, authenticatedPubkeys };
+  return { node, peerId: node.getPeerId(), addr, authenticatedPubkeys, authenticatedPeerIds, purposes };
 }
 
 describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reservation relay proactively", () => {
@@ -175,10 +189,117 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
           "relay's grace-window revoke reclaims the reservation and the agent goes unreachable",
       ).toBe(true);
 
-      expect(events.some((e) => e.event === "session.standing_receiver.relay_auth.result")).toBe(true);
+      /**
+       * ⚠️ AWAITED, not asserted directly. The relay records the auth the moment it VERIFIES it;
+       * the client writes this line only after the ack has round-tripped back. So the server-side
+       * observation above can legitimately land first, and asserting this synchronously failed
+       * under full-suite load while passing when the file ran alone — a race in the test, not in
+       * the product (the assertion that matters, the relay seeing the proof, had already passed).
+       */
+      const logged = await waitUntil(
+        () => events.some((e) => e.event === "session.standing_receiver.relay_auth.result"),
+        5_000,
+      );
+      expect(logged, "the client must report the outcome of its own reservation proof").toBe(true);
+
+      // It must declare itself a reservation proof — otherwise the relay would rebind this agent's
+      // delivery target to whichever receiver authenticated last, stealing a live session's leaves.
+      expect(relay.purposes).toContain("reservation");
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();
     }
   }, 30_000);
+
+  it("★★★ the REPLACEMENT receiver authenticates too — the case a shared relay client silently skipped", async () => {
+    /**
+     * ⚠️ **THIS IS THE CASE THAT WAS BROKEN, AND THE FIRST TEST COULD NOT SEE IT.**
+     *
+     * The first test covers the very first receiver, when no relay client exists yet — the one
+     * situation the defect did NOT affect. Once a session starts, the standing receiver is promoted
+     * into it and a REPLACEMENT is built behind it. Both share one `AgentRelayClient` (cached per
+     * agent+relay), and the original fix called `connect()`, which returns immediately when the
+     * client already holds a stream — the promoted node's. So the replacement sent nothing, the
+     * relay never saw its transport identity, and its reservation was revoked ~15s later: the agent
+     * churned reserve→revoke→rebuild for the life of the conversation and was unreachable to anyone
+     * trying to start a second session with it.
+     *
+     * Asserting on PEER IDS is what makes this test able to fail: both receivers sign with the same
+     * K_local, so a pubkey assertion stays green on the first receiver's auth alone.
+     */
+    const relay = await startAuthRecordingRelay();
+    const { logger } = makeLogger();
+    const dbPath = join(tempDir, `sessions-${randomUUID()}.db`);
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath,
+    });
+    await manager.initialize();
+
+    const agentKp = generateKeypair();
+    const agentPubkey = await agentKp.getPublicKey();
+    manager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs, stores) =>
+      new AgentRelayClient({
+        relayPeerId,
+        relayAddrs,
+        keyProvider: agentKp,
+        senderPubkey: agentPubkey,
+        logger,
+        receiptStore: stores.receiptStore,
+        sealLeafStore: stores.sealLeafStore,
+      }),
+    );
+
+    try {
+      const db = manager.getDb();
+      const ids = await seedAgents(db, ["alice"]);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, relay_peer_id, relay_addrs)
+         VALUES (?, ?, ?, 'sealed', ?, ?, 0, ?, ?)`,
+      ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, relay.peerId, JSON.stringify([relay.addr]));
+
+      await manager.ensureStandingReceiverForAgent("alice");
+      await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 10_000);
+      const firstPeerId = manager.getStandingReceiverInfo("alice")?.peerId;
+      expect(firstPeerId, "precondition: a first receiver exists").toBeTruthy();
+      await waitUntil(() => relay.authenticatedPeerIds.includes(firstPeerId!), 10_000);
+
+      // Consume the standing receiver into a session, exactly as a real session start does. That
+      // promotion is what triggers the REPLACEMENT receiver being built behind it.
+      const counterpartyNode = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+      await counterpartyNode.start();
+      const created = await manager.createSessionNode(
+        randomUUID().replaceAll("-", ""), "alice", "dd".repeat(32),
+        counterpartyNode.getPeerId(), randomUUID(), true,
+      );
+      expect(created.ok, "precondition: the session must consume the standing receiver").toBe(true);
+
+      // A DIFFERENT receiver must now exist, and it must have proven itself independently.
+      const rebuilt = await waitUntil(() => {
+        const id = manager.getStandingReceiverInfo("alice")?.peerId;
+        return id !== undefined && id !== firstPeerId;
+      }, 15_000);
+      expect(rebuilt, "precondition: a replacement receiver must be built after the promotion").toBe(true);
+      const secondPeerId = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      const secondProven = await waitUntil(() => relay.authenticatedPeerIds.includes(secondPeerId), 15_000);
+      expect(
+        secondProven,
+        "the REPLACEMENT receiver must prove possession from its OWN transport identity. If this " +
+          "fails, the relay revokes its reservation and the agent is unreachable to anyone starting " +
+          "a new session while the existing one is open.",
+      ).toBe(true);
+
+      await counterpartyNode.stop();
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 45_000);
 });

@@ -849,8 +849,27 @@ export class SessionNodeManager {
       }
       this.#relayClients.set(clientKey, client);
     }
-    const connected = await client.connect(node);
-    this.#logger.info("session.standing_receiver.relay_auth.result", { agentName, relayPeerId, connected, correlationId });
+    /**
+     * ⚠️ `proveReservation`, NOT `connect`. Review HIGH-1: `connect()` short-circuits on the
+     * client's cached stream, which belongs to whichever node connected FIRST — so every
+     * REPLACEMENT standing receiver (the one built behind each new session) sent nothing, the relay
+     * never saw its transport identity, and its reservation was revoked ~15s later. The agent then
+     * churned reserve→revoke→rebuild for the life of the conversation, holding no usable circuit
+     * address, so while you were talking to one person nobody else could reach you.
+     *
+     * `proveReservation` always opens its own stream from THIS node, and marks it so the relay
+     * proves possession without rebinding the agent's delivery target away from the live session.
+     */
+    const proven = await client.proveReservation(node);
+    this.#logger.info("session.standing_receiver.relay_auth.result", {
+      agentName,
+      relayPeerId,
+      // The node that actually proved itself — without this, HIGH-1 was invisible in the logs: the
+      // line said `connected: true` for a receiver that had sent nothing.
+      nodePeerId: node.getPeerId(),
+      proven,
+      correlationId,
+    });
   }
 
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
