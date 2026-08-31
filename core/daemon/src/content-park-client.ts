@@ -187,7 +187,10 @@ export class ContentParkClient {
        */
       if (countFrame && countFrame["type"] === "content_park_pull_refused") {
         const reason = typeof countFrame["reason"] === "string" ? (countFrame["reason"] as string) : "refused";
-        this.#logger.warn("content.park.pull.refused", {
+        // Review L2: named `..._by_relay`, not `content.park.pull.refused` — that name is already
+        // emitted by the relay itself, and an operator grepping one aggregated log for it would get
+        // two events from opposite sides of a trust boundary under a single name.
+        this.#logger.warn("content.park.pull.refused_by_relay", {
           relayPeerId: this.#relayPeerId,
           reason,
           impact:
@@ -253,7 +256,34 @@ export class ContentParkClient {
       );
       const ack = await this.#read(iter);
       const ok = !!ack && ack["type"] === "content_park_confirm_ack" && ack["ok"] === true;
-      if (!ok) this.#logger.warn("content.park.confirm.failed", { relayPeerId: this.#relayPeerId, reason: "no_confirm_ack" });
+      if (!ok) {
+        /**
+         * Review M3 — the same error substitution HIGH-3 fixed on the pull path, left standing one
+         * function above in this same file.
+         *
+         * A refused confirm is not a missing ack. The relay answers with a perfectly well-formed
+         * `content_park_confirm_ack { ok: false, reason }`, and reporting `no_confirm_ack` is a
+         * complaint about the wire shape of the RIGHT answer — it sends the operator to look at the
+         * transport when the relay has already said exactly what is wrong.
+         *
+         * What it costs: confirm is delete-on-pickup. If it is refused, the entry is never deleted,
+         * so the recipient is re-notified about a message it has already read, every time it
+         * reconnects, forever — while the log blames the connection.
+         */
+        const reason = typeof ack?.["reason"] === "string"
+          ? (ack["reason"] as string)
+          : ack
+            ? "unexpected_frame"
+            : "no_confirm_ack";
+        this.#logger.warn("content.park.confirm.failed", {
+          relayPeerId: this.#relayPeerId,
+          reason,
+          impact:
+            "pickup was not confirmed, so the relay keeps the entry and will keep announcing it as " +
+            "unread on every reconnect. If the reason is not_a_participant this relay has no record " +
+            "of a session naming this agent; a new session on it re-vouches the key.",
+        });
+      }
       return ok;
     } finally {
       await stream.close().catch(() => {});

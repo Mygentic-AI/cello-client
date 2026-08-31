@@ -858,7 +858,24 @@ export class SessionNodeManager {
         sealLeafStore: this.#sealLeafStore ?? undefined,
       });
       if (!client) {
-        this.#logger.debug("session.standing_receiver.relay_auth.no_builder", { agentName, relayPeerId, correlationId });
+        /**
+         * Review M5: this was a `debug` line, and it is not a debug-level event.
+         *
+         * If no builder is wired we return without proving key possession, the relay revokes this
+         * receiver's reservation about fifteen seconds later, and the agent stops being reachable
+         * from behind NAT — while reporting itself perfectly healthy. Calling that "a narrow startup
+         * race" in a comment concedes it happens in production, and a system that is unreachable
+         * must not be quieter about it than a system that is merely slow.
+         */
+        this.#logger.warn("session.standing_receiver.relay_auth.no_builder", {
+          agentName,
+          relayPeerId,
+          correlationId,
+          impact:
+            "this receiver cannot prove key possession, so the relay will revoke its reservation and " +
+            "the agent becomes unreachable from behind NAT — nobody can start a session with it — " +
+            "even though it still reports itself online.",
+        });
         return;
       }
       this.#relayClients.set(clientKey, client);
