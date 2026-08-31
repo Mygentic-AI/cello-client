@@ -421,4 +421,115 @@ describe("DOD-M15-RELAYAUTH-1: the standing receiver authenticates to its reserv
       await reservationRelay.node.stop();
     }
   }, 45_000);
+
+  it("★★★ the dial is AUTHORIZED BEFORE IT IS MADE — the gate was refusing the legitimate dial", async () => {
+    /**
+     * Review H1, and the reason the HIGH-2 test above does not cover it: **that test is
+     * ordering-blind.** It polls `waitUntil` for up to 15 seconds, so it passes whether the
+     * assignment reaches the relay before the dial or a comfortable second afterwards — and
+     * "afterwards" is the production failure.
+     *
+     * Both parties receive the assignment from the directory independently. We connect to the
+     * witness relay and dial the counterparty's circuit address (~2 RTT); they connect to their own
+     * witness relay and then, unawaited, tell their RESERVATION relay about the session (~3–4 RTT).
+     * Nothing sequenced the two, ours is shorter, and so we usually arrived at a gate that had never
+     * heard of the session and were refused. `cello_initiate_session` still answered
+     * `{ok:true, transportMode:"relay"}`, so the operator saw a healthy session in which every
+     * message silently took the slow store-and-forward path for the life of the conversation.
+     *
+     * So this asserts the ORDERING, with NO polling: the instant `connectToCounterparty` resolves,
+     * the relay that gates the dial must ALREADY hold the assignment. A `waitUntil` here would
+     * re-admit the exact bug. The dial itself fails — the fake relay speaks no circuit-v2 hop — and
+     * that is deliberate: what is under test is what happened BEFORE the dial, and a test that
+     * needed the dial to succeed would need a real relay and would stop testing ordering.
+     */
+    const witnessRelay = await startAuthRecordingRelay();
+    const dialGateRelay = await startAuthRecordingRelay();
+    const { logger } = makeLogger();
+    const dbPath = join(tempDir, `sessions-${randomUUID()}.db`);
+    const manager = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: new ProductionSessionNodeFactory(),
+      logger,
+      dbPath,
+    });
+    await manager.initialize();
+
+    const agentKp = generateKeypair();
+    const agentPubkey = await agentKp.getPublicKey();
+    manager.setDetachedRelayClientBuilder((agentName, relayPeerId, relayAddrs, stores) =>
+      new AgentRelayClient({
+        relayPeerId, relayAddrs, keyProvider: agentKp, senderPubkey: agentPubkey, logger,
+        receiptStore: stores.receiptStore, sealLeafStore: stores.sealLeafStore,
+      }),
+    );
+
+    let counterpartyNode: CelloNode | undefined;
+    try {
+      const db = manager.getDb();
+      const ids = await seedAgents(db, ["alice"]);
+      const now = Date.now();
+      db.prepare(
+        `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, relay_peer_id, relay_addrs)
+         VALUES (?, ?, ?, 'sealed', ?, ?, 0, ?, ?)`,
+      ).run(randomUUID().replaceAll("-", ""), ids.get("alice")!, "cc".repeat(32), now, now, witnessRelay.peerId, JSON.stringify([witnessRelay.addr]));
+      await manager.ensureStandingReceiverForAgent("alice");
+      const reserved = await waitUntil(() => manager.getStandingReceiverInfo("alice") !== null, 10_000);
+      expect(reserved, "precondition: the agent has a standing receiver to promote").toBe(true);
+
+      counterpartyNode = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+      await counterpartyNode.start();
+      const sessionIdHex = randomUUID().replaceAll("-", "");
+      const counterpartyPub = await generateKeypair().getPublicKey();
+      const created = await manager.createSessionNode(
+        sessionIdHex, "alice", Buffer.from(counterpartyPub).toString("hex"),
+        counterpartyNode.getPeerId(), randomUUID(), true,
+        {
+          relayPeerId: witnessRelay.peerId,
+          relayAddrs: [witnessRelay.addr],
+          keyProvider: agentKp,
+          senderPubkey: agentPubkey,
+          sessionIdBytes: new Uint8Array(Buffer.from(sessionIdHex, "hex")),
+          assignment: {
+            participantA: agentPubkey,
+            participantB: counterpartyPub,
+            sessionTimestamp: Date.now(),
+            initiatorSessionPeerId: "",
+            counterpartySessionPeerId: counterpartyNode.getPeerId(),
+            assignmentSignature: new Uint8Array(64).fill(9),
+          },
+        },
+      );
+      expect(created.ok, "precondition: the session must be created").toBe(true);
+
+      // Wait for the witness wiring to finish, so the session is holding its assignment before the
+      // dial. This wait is a PRECONDITION, not the assertion — the assertion below never polls.
+      const witnessGot = await waitUntil(() => witnessRelay.recordedSessionIds.includes(sessionIdHex), 15_000);
+      expect(witnessGot, "precondition: the session is wired to its witness relay").toBe(true);
+
+      expect(
+        dialGateRelay.recordedSessionIds.includes(sessionIdHex),
+        "precondition: the relay that gates the dial has NOT heard of this session yet",
+      ).toBe(false);
+
+      // The counterparty is reachable only through a relay we have told nothing about — the
+      // ordinary case whenever they are behind NAT on a relay the directory did not pick.
+      const circuitAddr = `${dialGateRelay.addr}/p2p-circuit/p2p/${counterpartyNode.getPeerId()}`;
+      await manager.connectToCounterparty("alice", sessionIdHex, [circuitAddr]);
+
+      // THE ASSERTION. No waitUntil: it must already be true the moment the call returns.
+      expect(
+        dialGateRelay.recordedSessionIds.includes(sessionIdHex),
+        "the relay that gates this circuit dial must hold the assignment BEFORE the dial is made. " +
+          "Presenting it without waiting is not enough — that is the bug: the dial reaches the gate " +
+          "first, is refused, and the session degrades to the park path while still reporting itself " +
+          "as a healthy relay transport.",
+      ).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      if (counterpartyNode) await counterpartyNode.stop();
+      await witnessRelay.node.stop();
+      await dialGateRelay.node.stop();
+    }
+  }, 45_000);
 });

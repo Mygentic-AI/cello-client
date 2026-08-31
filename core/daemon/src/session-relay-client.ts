@@ -400,6 +400,30 @@ export class AgentRelayClient {
   }
 
   /**
+   * DOD-M15-RELAYAUTH-1 review H1 — **present the assignment and WAIT for the relay to say it
+   * recorded it.**
+   *
+   * `registerSession` above presents eagerly and forgets: the record is queued onto the submit chain
+   * and nobody can observe when it lands. That is correct for the witness relay, where the only
+   * requirement is "before the first submit". It is NOT sufficient for the relay that GATES A DIAL,
+   * because there the record is a precondition of an action we are about to take on another thread
+   * of the protocol — and losing that race denies a legitimate dial (review H1).
+   *
+   * Chained on `#submitChain` exactly like `#doSubmit`, so it cannot interleave with a submit on the
+   * same stream. Idempotent by construction: `#doRecord` returns `true` immediately once the session
+   * is recorded, so calling this straight after `registerSession` waits for the record that call
+   * already queued rather than sending a second one.
+   *
+   * Returns whether the relay recorded it. NEVER throws — a caller must be free to proceed on false
+   * (a dial that might be denied still beats no dial at all).
+   */
+  async recordAssignmentAndWait(node: CelloNode, sessionIdHex: string): Promise<boolean> {
+    const run = this.#submitChain.then(() => this.#doRecord(node, sessionIdHex));
+    this.#submitChain = run.then(() => undefined, () => undefined);
+    return run.catch(() => false);
+  }
+
+  /**
    * Present the directory-signed assignment to the relay. Idempotent
    * (no-op once `recorded`, or when the session has no assignment — direct/persisted/legacy sessions).
    * The relay reconstructs the TBS and verifies the per-node directory signature against any consortium
