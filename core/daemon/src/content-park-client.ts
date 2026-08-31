@@ -47,6 +47,20 @@ function asBytes(v: unknown): Uint8Array | null {
   return null;
 }
 
+/**
+ * DOD-M15-RELAYAUTH-1 review HIGH-3: the relay REFUSED to release parked content, as distinct from
+ * having none. Thrown rather than returned so it cannot be mistaken for an empty result — the whole
+ * defect was a refusal flattening into `[]`, which reads to an operator as "nothing was waiting".
+ */
+export class ContentParkRefusedError extends Error {
+  readonly reason: string;
+  constructor(reason: string) {
+    super(`the relay refused to release parked content: ${reason}`);
+    this.name = "ContentParkRefusedError";
+    this.reason = reason;
+  }
+}
+
 /** A single parked entry returned by pull(). */
 export interface ParkedEntry {
   contentHashHex: string;
@@ -157,6 +171,35 @@ export class ContentParkClient {
 
       // Count header, then N responses.
       const countFrame = await this.#read(iter);
+      /**
+       * DOD-M15-RELAYAUTH-1 review HIGH-3 — **A REFUSAL MUST NOT READ AS AN EMPTY MAILBOX.**
+       *
+       * The relay refuses a pull from a key it has never seen named by a directory-signed
+       * assignment, and it names the cause: `content_park_pull_refused { reason }`. Without this
+       * branch that frame simply is not `content_park_pull_count`, so the operator was told
+       * `no_pull_count` — a wire-shape complaint about the RIGHT answer — and the caller got `[]`,
+       * which the recover flow reports as `pulled: 0`: *nothing was waiting for you*. The relay was
+       * honest and the client threw the reason away one layer up.
+       *
+       * This is reachable on the ordinary path, not just under attack: the relay's vouched set is
+       * in-process, so every relay restart empties it, and a client does not re-present its
+       * assignment on reconnect.
+       */
+      if (countFrame && countFrame["type"] === "content_park_pull_refused") {
+        const reason = typeof countFrame["reason"] === "string" ? (countFrame["reason"] as string) : "refused";
+        // Review L2: named `..._by_relay`, not `content.park.pull.refused` — that name is already
+        // emitted by the relay itself, and an operator grepping one aggregated log for it would get
+        // two events from opposite sides of a trust boundary under a single name.
+        this.#logger.warn("content.park.pull.refused_by_relay", {
+          relayPeerId: this.#relayPeerId,
+          reason,
+          impact:
+            "this relay refused to release parked content for this key — it is NOT an empty mailbox. " +
+            "Content may still be waiting. If the reason is not_a_participant the relay has no record " +
+            "of a session naming this agent (it restarts empty), and a new session on this relay re-vouches it.",
+        });
+        throw new ContentParkRefusedError(reason);
+      }
       if (!countFrame || countFrame["type"] !== "content_park_pull_count") {
         this.#logger.warn("content.park.pull.failed", { relayPeerId: this.#relayPeerId, reason: "no_pull_count" });
         return [];
@@ -213,7 +256,34 @@ export class ContentParkClient {
       );
       const ack = await this.#read(iter);
       const ok = !!ack && ack["type"] === "content_park_confirm_ack" && ack["ok"] === true;
-      if (!ok) this.#logger.warn("content.park.confirm.failed", { relayPeerId: this.#relayPeerId, reason: "no_confirm_ack" });
+      if (!ok) {
+        /**
+         * Review M3 — the same error substitution HIGH-3 fixed on the pull path, left standing one
+         * function above in this same file.
+         *
+         * A refused confirm is not a missing ack. The relay answers with a perfectly well-formed
+         * `content_park_confirm_ack { ok: false, reason }`, and reporting `no_confirm_ack` is a
+         * complaint about the wire shape of the RIGHT answer — it sends the operator to look at the
+         * transport when the relay has already said exactly what is wrong.
+         *
+         * What it costs: confirm is delete-on-pickup. If it is refused, the entry is never deleted,
+         * so the recipient is re-notified about a message it has already read, every time it
+         * reconnects, forever — while the log blames the connection.
+         */
+        const reason = typeof ack?.["reason"] === "string"
+          ? (ack["reason"] as string)
+          : ack
+            ? "unexpected_frame"
+            : "no_confirm_ack";
+        this.#logger.warn("content.park.confirm.failed", {
+          relayPeerId: this.#relayPeerId,
+          reason,
+          impact:
+            "pickup was not confirmed, so the relay keeps the entry and will keep announcing it as " +
+            "unread on every reconnect. If the reason is not_a_participant this relay has no record " +
+            "of a session naming this agent; a new session on it re-vouches the key.",
+        });
+      }
       return ok;
     } finally {
       await stream.close().catch(() => {});

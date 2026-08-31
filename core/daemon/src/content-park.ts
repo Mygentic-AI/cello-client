@@ -25,7 +25,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
-import { ContentParkClient } from "./content-park-client.js";
+import { ContentParkClient, ContentParkRefusedError } from "./content-park-client.js";
 import { extractErrorMessage } from "./session-relay-client.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
@@ -94,7 +94,23 @@ export function createContentPark(deps: ContentParkDeps) {
     if (!node) return { ok: false, reason: sessionNodeManager.standingReceiverAbsenceReason(recipientAgent.name) };
     const recipientPubkey = recipientAgent.pubkey ?? "";
     const client = newParkClient({ relayPeerId, relayAddrs, logger });
-    const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    let entries;
+    try {
+      entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+    } catch (err: unknown) {
+      /**
+       * DOD-M15-RELAYAUTH-1 review HIGH-3 — a REFUSAL is not an empty mailbox, and the distinction
+       * is the whole point of this branch. Falling through with `[]` would report
+       * `{ok:true, pulled:0, recovered:0}` — "nothing was waiting for you" — for a relay that
+       * explicitly said it would not release this agent's content. Same defect shape as the
+       * refused-entry comment directly below, one layer further out.
+       */
+      if (err instanceof ContentParkRefusedError) {
+        logger.warn("content.recover.refused", { agentName: recipientAgent.name, relayPeerId, reason: err.reason });
+        return { ok: false, reason: `relay_refused_pull:${err.reason}` };
+      }
+      throw err;
+    }
     let recovered = 0;
     // SEC-1 / review M2: a REFUSED entry must not vanish behind `ok:true`. Report it — an operator
     // seeing {ok:true, pulled:3, recovered:0} would otherwise have three messages evaporate with the
@@ -675,7 +691,25 @@ export function createContentPark(deps: ContentParkDeps) {
       const node = sessionNodeManager.getStandingReceiverNode();
       if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
       const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
-      const entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+      let entries;
+      try {
+        entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
+      } catch (err: unknown) {
+        // DOD-M15-RELAYAUTH-1 review HIGH-3: a refusal must not be reported as an empty list.
+        if (err instanceof ContentParkRefusedError) {
+          return {
+            ok: false,
+            reason: `relay_refused_pull:${err.reason}`,
+            guidance:
+              "This relay refused to release parked content for this agent — it is NOT an empty mailbox, " +
+              "and content may still be waiting. A relay only recognises agents named by a session " +
+              "assignment it has recorded, and it forgets them when it restarts. Establish a session " +
+              "with this relay (cello_initiate_session) and retry, or pull from the relay that " +
+              "brokered the session the content belongs to.",
+          };
+        }
+        throw err;
+      }
       return {
         ok: true,
         entries: entries.map((e) => ({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, ciphertext: Buffer.from(e.ciphertext).toString("hex") })),

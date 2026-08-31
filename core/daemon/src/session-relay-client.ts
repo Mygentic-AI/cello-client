@@ -176,6 +176,12 @@ export type SubmitResult =
        * Optional, because an older relay sends none.
        */
       detail?: string;
+      /**
+       * DOD-M15-RELAYABUSE-1: milliseconds until the relay's rate-limit window clears, present only
+       * with `reason: "rate_limited"`. The relay computes it; nobody guesses it. `#doSubmit` waits
+       * this out and resubmits rather than surfacing a throttle — see the retry loop there.
+       */
+      retry_after_ms?: number;
     };
 type AckResolver = (r: SubmitResult) => void;
 
@@ -391,6 +397,30 @@ export class AgentRelayClient {
         .then(() => this.#doRecord(node, sessionIdHex))
         .then(() => undefined, () => undefined);
     }
+  }
+
+  /**
+   * DOD-M15-RELAYAUTH-1 review H1 — **present the assignment and WAIT for the relay to say it
+   * recorded it.**
+   *
+   * `registerSession` above presents eagerly and forgets: the record is queued onto the submit chain
+   * and nobody can observe when it lands. That is correct for the witness relay, where the only
+   * requirement is "before the first submit". It is NOT sufficient for the relay that GATES A DIAL,
+   * because there the record is a precondition of an action we are about to take on another thread
+   * of the protocol — and losing that race denies a legitimate dial (review H1).
+   *
+   * Chained on `#submitChain` exactly like `#doSubmit`, so it cannot interleave with a submit on the
+   * same stream. Idempotent by construction: `#doRecord` returns `true` immediately once the session
+   * is recorded, so calling this straight after `registerSession` waits for the record that call
+   * already queued rather than sending a second one.
+   *
+   * Returns whether the relay recorded it. NEVER throws — a caller must be free to proceed on false
+   * (a dial that might be denied still beats no dial at all).
+   */
+  async recordAssignmentAndWait(node: CelloNode, sessionIdHex: string): Promise<boolean> {
+    const run = this.#submitChain.then(() => this.#doRecord(node, sessionIdHex));
+    this.#submitChain = run.then(() => undefined, () => undefined);
+    return run.catch(() => false);
   }
 
   /**
@@ -648,7 +678,16 @@ export class AgentRelayClient {
       // Carry the relay's `detail` through — see `SubmitResult`. Reading the class and discarding
       // what happened is how a refusal arrives as a bare code with no cause attached to it.
       const detail = typeof frame["detail"] === "string" ? frame["detail"] : undefined;
-      this.#settlePending({ ok: false, reason, ...(detail ? { detail } : {}) });
+      // DOD-M15-RELAYABUSE-1: the relay knows when its window clears and says so. Carried, not
+      // dropped — `#doSubmit` waits it out and resubmits, so a throttle never reaches the operator.
+      const rawRetry = frame["retry_after_ms"];
+      const retry_after_ms = typeof rawRetry === "number" && Number.isFinite(rawRetry) && rawRetry > 0 ? rawRetry : undefined;
+      this.#settlePending({
+        ok: false,
+        reason,
+        ...(detail ? { detail } : {}),
+        ...(retry_after_ms !== undefined ? { retry_after_ms } : {}),
+      });
     } else if (type === "assignment_ok") {
       // The relay verified + recorded our client-presented assignment.
       const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("ok");
@@ -716,6 +755,54 @@ export class AgentRelayClient {
     return this.#ensureConnected(node);
   }
 
+  /**
+   * DOD-M15-RELAYAUTH-1 review HIGH-1 — prove key possession FROM THIS NODE, on its own stream.
+   *
+   * ⚠️ **`connect()` CANNOT be used for this, and using it was the defect.** `#ensureConnected`
+   * returns `true` the moment `#stream` is non-null, and `#stream` belongs to whichever node
+   * connected FIRST. An agent legitimately runs several nodes against one relay — the node promoted
+   * into a live session, plus the replacement standing receiver built behind it — and they share
+   * one `AgentRelayClient` because the cache is keyed `${agent}::${relay}`. So calling `connect()`
+   * from the replacement receiver short-circuited on the session node's stream, sent nothing, and
+   * the relay never saw that receiver's transport identity: it revoked the reservation ~15s later,
+   * the watchdog rebuilt, and the agent churned on a ~45s loop holding no usable circuit address
+   * for as long as the conversation lasted. Any future "reuse the existing connection" optimisation
+   * here reintroduces exactly that.
+   *
+   * So this always opens its own short-lived stream from `node`, and marks it
+   * `purpose: "reservation"` so the relay proves possession WITHOUT rebinding the agent's delivery
+   * stream (which would steal the live session's inbound leaves — see the relay-side dispatch).
+   */
+  async proveReservation(node: CelloNode): Promise<boolean> {
+    if (this.#closed) return false;
+    for (const addr of this.#relayAddrs) {
+      try { await node.dial(addr); break; } catch { /* try the next address */ }
+    }
+    let stream: Stream;
+    try {
+      stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
+    } catch (err: unknown) {
+      this.#logger.warn("session.relay.reservation_proof.failed", {
+        relayPeerId: this.#relayPeerId, reason: "stream", error: extractErrorMessage(err),
+      });
+      return false;
+    }
+    try {
+      const iter = (lp.decode(stream as unknown as AsyncIterable<Uint8Array>) as AsyncIterable<unknown>)[
+        Symbol.asyncIterator
+      ]() as AsyncIterator<Uint8Array>;
+      const ok = await this.#authenticate(stream, iter, "reservation");
+      this.#logger.info("session.relay.reservation_proof.result", {
+        relayPeerId: this.#relayPeerId,
+        nodePeerId: node.getPeerId(),
+        ok,
+      });
+      return ok;
+    } finally {
+      await stream.close().catch(() => {});
+    }
+  }
+
   /** Ensure an authenticated stream exists, (re)dialing from `node` if needed. */
   async #ensureConnected(node: CelloNode): Promise<boolean> {
     if (this.#closed) return false;
@@ -770,7 +857,7 @@ export class AgentRelayClient {
     return true;
   }
 
-  async #authenticate(stream: Stream, iter: AsyncIterator<Uint8Array>): Promise<boolean> {
+  async #authenticate(stream: Stream, iter: AsyncIterator<Uint8Array>, purpose?: "reservation"): Promise<boolean> {
     const challengeRes = await nextWithTimeout(iter, RELAY_AUTH_TIMEOUT_MS);
     if (challengeRes.done || challengeRes.value === undefined) {
       this.#logger.warn("session.relay.auth.failed", { relayPeerId: this.#relayPeerId, reason: "no_challenge" });
@@ -794,7 +881,15 @@ export class AgentRelayClient {
     }
     const authSig = await this.#keyProvider.sign(buildRelayAuthPayload(nonce, this.#senderPubkey));
     try {
-      stream.send(lp.encode.single(encodeCbor({ type: "relay_auth_response", pubkey: this.#senderPubkey, signature: authSig }) as Uint8Array));
+      stream.send(lp.encode.single(encodeCbor({
+        type: "relay_auth_response",
+        pubkey: this.#senderPubkey,
+        signature: authSig,
+        // DOD-M15-RELAYAUTH-1: absent for the ordinary session auth (which also registers this
+        // stream as the agent's delivery target). `"reservation"` proves possession from THIS
+        // node's transport identity and nothing more — see proveReservation().
+        ...(purpose ? { purpose } : {}),
+      }) as Uint8Array));
     } catch (err: unknown) {
       this.#logger.warn("session.relay.auth.failed", { relayPeerId: this.#relayPeerId, reason: "response_send", error: extractErrorMessage(err) });
       return false;
@@ -1055,6 +1150,21 @@ export class AgentRelayClient {
    * and returned as-is — retrying those would be pointless traffic masking a real state.
    */
   static readonly #SESSION_NOT_FOUND_ATTEMPTS = 3;
+  /**
+   * DOD-M15-RELAYABUSE-1 review F1: how many times a throttled submit waits out the relay's stated
+   * window before the refusal is surfaced. Three, because the window is a fixed sliding minute —
+   * two waits clear any ordinary burst, and a third failure means something other than this
+   * sender's own volume is going on, which the operator should hear about.
+   */
+  static readonly #RATE_LIMITED_ATTEMPTS = 3;
+  /** Used only when the relay names no window (an older relay, or a malformed value). */
+  static readonly #RATE_LIMITED_FALLBACK_MS = 5_000;
+  /**
+   * Ceiling on a single wait, so a relay reporting an implausible window cannot park a send
+   * indefinitely — a hostile or misconfigured relay must not be able to stall a sender by
+   * answering `retry_after_ms: 3600000`. Past this the send fails and says so.
+   */
+  static readonly #RATE_LIMITED_MAX_WAIT_MS = 65_000;
 
   async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null): Promise<SubmitResult> {
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
@@ -1098,6 +1208,58 @@ export class AgentRelayClient {
         reason: result.reason,
       });
       result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
+    }
+
+    /**
+     * DOD-M15-RELAYABUSE-1 review F1 — **A THROTTLE IS BACK-PRESSURE, NOT AN ERROR.** (Andre,
+     * 2026-08-31: retry on the relay's own timing; surface only if the retry also fails.)
+     *
+     * Without this the relay's `rate_limited` fell into the caller's catch-all: one log line, and
+     * `cello_send` returned `{ok:true, delivered:true}` for a message the relay had refused to
+     * witness — on the parked path telling the operator it was *"sealed, witnessed and on its way"*.
+     * The leaf went out unwitnessed with no sequence number, and the seal later covered a transcript
+     * missing it.
+     *
+     * This is the ONE refusal that is safely retryable and self-clearing, and the relay tells us
+     * exactly when. So we wait it out here, where the wait is invisible, rather than handing the
+     * agent an error for a condition that resolves in under a minute. Bounded: if the window is
+     * absent or implausible we fall back to a fixed wait, and after
+     * `#RATE_LIMITED_ATTEMPTS` the refusal is returned and the caller surfaces it — Option 2 as
+     * the fallback, not the first move.
+     */
+    for (
+      let attempt = 1;
+      attempt < AgentRelayClient.#RATE_LIMITED_ATTEMPTS
+        && !result.ok
+        && result.reason === "rate_limited"
+        && !this.#closed;
+      attempt++
+    ) {
+      const waitMs = Math.min(
+        result.retry_after_ms !== undefined ? result.retry_after_ms : AgentRelayClient.#RATE_LIMITED_FALLBACK_MS,
+        AgentRelayClient.#RATE_LIMITED_MAX_WAIT_MS,
+      );
+      this.#logger.info("session.relay.submit.throttled", {
+        relayPeerId: this.#relayPeerId,
+        sessionShort: sessionIdHex.slice(0, 16),
+        attempt,
+        waitMs,
+        retryAfterMsFromRelay: result.retry_after_ms,
+        impact: "the relay is throttling this sender; waiting out its stated window and resubmitting — the message is NOT lost and the operator is not told, because this clears on its own",
+      });
+      await new Promise((r) => setTimeout(r, waitMs));
+      if (this.#closed) break;
+      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
+    }
+    if (!result.ok && result.reason === "rate_limited") {
+      // Option 2, the fallback: it did not clear within our budget, so the caller must hear it
+      // rather than be told the message was witnessed.
+      this.#logger.warn("session.relay.submit.throttle_persisted", {
+        relayPeerId: this.#relayPeerId,
+        sessionShort: sessionIdHex.slice(0, 16),
+        attempts: AgentRelayClient.#RATE_LIMITED_ATTEMPTS,
+        impact: "this message was NOT witnessed by the relay — it has no sequence number and will not appear in the notarized record",
+      });
     }
 
     // The relay lost a session we had successfully recorded — sealed, idle-swept, or restarted.
