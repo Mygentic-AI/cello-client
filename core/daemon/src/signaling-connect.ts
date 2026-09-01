@@ -156,6 +156,13 @@ export interface SignalingConnectDeps {
    * key this directory does not know as a registered agent. Either way there is no slot.
    */
   onOnlineToken?: (token: Uint8Array) => void;
+  /**
+   * DOD-M15-RELAYSLOTS-1 review M1: fired instead of `onOnlineToken` when the directory issued
+   * none, carrying WHICH absence it was. `undefined` means the directory stated no reason, i.e. it
+   * predates the token — which is itself the third distinct answer and must not be folded into the
+   * other two.
+   */
+  onOnlineTokenAbsent?: (reason: "not_registered_here" | "issue_failed" | undefined) => void;
 }
 
 /**
@@ -479,12 +486,30 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
           deps.logger.info("directory.online_token.received", { directoryNodeId, bytes: token.length });
           deps.onOnlineToken(token);
         } else {
+          /**
+           * Review M1: the directory names WHICH absence, so this is no longer one label for three
+           * different problems. `not_registered_here` in particular is a payload fact, and reporting
+           * it as a generic "no token" sent the operator to check a directory connection that is
+           * working perfectly.
+           */
+          const raw = ackFrame["online_token_absent_reason"];
+          const absentReason = raw === "not_registered_here" || raw === "issue_failed" ? raw : undefined;
+          deps.onOnlineTokenAbsent?.(absentReason);
           deps.logger.warn("directory.online_token.absent", {
             directoryNodeId,
             agentPubkey: identity.pubkeyHex,
-            impact: "this directory issued no online token, so no relay will let this agent hold a " +
-              "circuit reservation and it will be reachable only over a direct connection. Either " +
-              "the directory predates the token, or it does not hold an agent profile for this key.",
+            reason: absentReason ?? "unstated",
+            impact: absentReason === "not_registered_here"
+              ? "this directory holds no agent profile for this key, so it issued no online token " +
+                "and no relay will grant this agent a reservation. The directory connection is FINE " +
+                "— either this agent registered against a different sovereign node and its profile " +
+                "has not replicated here yet, or it is not registered at all."
+              : absentReason === "issue_failed"
+                ? "this directory could not issue an online token — its own lookup or signing failed. " +
+                  "That is a fault on the directory, not on this agent or on any relay."
+                : "this directory issued no online token, so no relay will let this agent hold a " +
+                  "circuit reservation and it will be reachable only over a direct connection. It " +
+                  "stated no reason, which means it predates the token.",
           });
         }
       }

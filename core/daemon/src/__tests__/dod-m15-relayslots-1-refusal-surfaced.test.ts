@@ -10,7 +10,17 @@
  * relay, or even at a `logger.warn` on the client — from where the person is sitting, their agent
  * came up, reported itself online, and is reachable by nobody.
  *
- * So these tests assert on **what the client can show someone**, not on what was logged anywhere.
+ * ⚠️ **THESE ARE UNIT TESTS OF THE CLASSIFIER, AND THEY ARE NOT THE EVIDENCE FOR CLAUSE 7.** They
+ * were, and review measured that they could not be: every assertion below still passed with the
+ * whole operator surface deleted — the capture in the relay client, the map in the manager, and
+ * both `standing_receiver_refusal` blocks in the daemon. A pure function asserted in isolation says
+ * nothing about what reaches a person.
+ *
+ * The clause-7 and clause-9 evidence lives in `dod-m15-relayslots-1-online-token-carried.test.ts`,
+ * which drives a relay that really refuses and reads `getStandingReceiverRefusal` — the same value
+ * `cello_status` puts in front of an operator. What remains here is worth keeping on its own terms:
+ * it pins the wording and the failover classification per reason, which that test exercises for
+ * only two of them.
  *
  * ─── And the second consumer is the daemon ────────────────────────────────────────────────────
  *
@@ -33,6 +43,7 @@ describe("DOD-M15-RELAYSLOTS-1: every relay refusal carries a cause AND an affor
     "online_token_pubkey_mismatch",
     "online_token_no_directory_key",
     "slot_cap_exceeded",
+    "session_tuple_cap_exceeded",
     "rate_limited",
   ];
 
@@ -66,6 +77,7 @@ describe("DOD-M15-RELAYSLOTS-1: every relay refusal carries a cause AND an affor
       "online_token_pubkey_mismatch",
       "online_token_no_directory_key",
       "slot_cap_exceeded",
+      "session_tuple_cap_exceeded",
       "rate_limited",
     ];
     const advice = new Set(distinctNextSteps.map((r) => classifyRelayAuthRefusal(r).advice));

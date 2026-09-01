@@ -982,6 +982,12 @@ async function startDaemonHoldingLock(
       onOnlineToken: (token) => {
         sessionNodeManager.setDirectoryOnlineToken(agentName, token);
       },
+      // Review M1: and when there is none, WHY — so the operator surface can say "this directory
+      // does not know this agent" instead of "check your directory connection" about a connection
+      // that just succeeded.
+      onOnlineTokenAbsent: (reason) => {
+        sessionNodeManager.setDirectoryOnlineTokenAbsent(agentName, reason);
+      },
     });
     const mgr = new SignalingManager({
       connect,

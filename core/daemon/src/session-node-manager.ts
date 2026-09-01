@@ -267,6 +267,16 @@ const REDIAL_COOLDOWN_MS = 15_000;
  */
 export const SR_RESERVATION_MAX_RETRIES = 5;
 
+/**
+ * DOD-M15-RELAYSLOTS-1 — how long an agent skips a relay that refused it for a relay-side fault.
+ *
+ * Ten minutes: long enough that the agent is not re-asking a relay that cannot serve it every time
+ * its receiver rebuilds, short enough that when someone fixes that relay the agent finds it again
+ * without needing its own restart. The fault is on somebody else's machine and nobody tells us when
+ * it is fixed, so this has to expire on its own.
+ */
+export const RELAY_QUARANTINE_MS = 10 * 60 * 1000;
+
 export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_TTL_MS"]) || 2 * 60 * 60 * 1000;
 
 /**
@@ -913,7 +923,25 @@ export class SessionNodeManager {
      */
     if (!proven) {
       const refusal = client.getLastAuthRefusal();
-      if (refusal) this.#srRelayRefusal.set(agentName, { ...refusal, relayPeerId });
+      /**
+       * Review L2: the `else` is not symmetry for its own sake. `proveReservation` also fails for
+       * transport reasons, which leave `getLastAuthRefusal()` null — and without this branch the
+       * PREVIOUS refusal stayed in the map, so `cello_status` went on showing a cause and an
+       * affordance for something that was no longer what was wrong.
+       */
+      if (refusal) this.#srRelayRefusal.set(agentName, { ...this.#withDirectoryCause(agentName, refusal), relayPeerId });
+      else this.#srRelayRefusal.delete(agentName);
+      /**
+       * DOD-M15-RELAYSLOTS-1 clause 9 — **ACT on the classification, do not merely record it.**
+       * A relay-side fault means a different relay will work now, so quarantine this one and
+       * rebuild the receiver against the rest of the pool. Everything else stays put: a token
+       * problem reproduces on every relay, and walking the fleet would turn one client fault into
+       * what looks like a fleet-wide outage.
+       */
+      if (refusal?.tryAnotherRelay && !this.#shuttingDown) {
+        this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
+        void this.#rebuildStandingReceiver(agentName);
+      }
     } else {
       this.#srRelayRefusal.delete(agentName);
     }
@@ -947,6 +975,37 @@ export class SessionNodeManager {
    */
   getStandingReceiverRefusal(agentName: string): (RelayAuthRefusal & { relayPeerId: string }) | null {
     return this.#srRelayRefusal.get(agentName) ?? null;
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 review M1 — **replace the relay's guess with the directory's fact.**
+   *
+   * The relay can only say "no token was presented"; the DIRECTORY knows why there was none, and
+   * the two most useful answers point somewhere the relay's own advice does not. Left alone,
+   * `online_token_required` tells the operator to check that their agent is reaching a directory —
+   * which, in the `not_registered_here` case, it plainly is.
+   */
+  #withDirectoryCause(agentName: string, refusal: RelayAuthRefusal): RelayAuthRefusal {
+    if (refusal.reason !== "online_token_required") return refusal;
+    const absent = this.#directoryOnlineTokenAbsent.get(agentName);
+    if (absent === "not_registered_here") {
+      return {
+        ...refusal,
+        advice: "The directory this agent is connected to holds no profile for its key, so it " +
+          "issued no token and no relay will grant a reservation. The directory connection itself " +
+          "is fine — either this agent registered against a different sovereign node and its " +
+          "profile has not replicated here yet, or it is not registered at all.",
+      };
+    }
+    if (absent === "issue_failed") {
+      return {
+        ...refusal,
+        advice: "The directory could not issue this agent a token — its own lookup or signing " +
+          "failed. That is a fault on the directory, not on this agent or on any relay; it usually " +
+          "clears on the next connection.",
+      };
+    }
+    return refusal;
   }
 
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
@@ -12374,6 +12433,22 @@ export class SessionNodeManager {
    */
   setDirectoryOnlineToken(agentName: string, token: Uint8Array): void {
     this.#directoryOnlineTokens.set(agentName, token);
+    this.#directoryOnlineTokenAbsent.delete(agentName);
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 review M1: the directory issued no token, and this is which absence it was.
+   *
+   * Kept so the relay's eventual `online_token_required` refusal can be reported with the cause the
+   * DIRECTORY knew and the relay never learns — most importantly `not_registered_here`, where the
+   * generic advice ("check that you are reaching a directory") points at a connection that is
+   * working and away from the actual problem.
+   */
+  readonly #directoryOnlineTokenAbsent = new Map<string, "not_registered_here" | "issue_failed" | "unstated">();
+
+  setDirectoryOnlineTokenAbsent(agentName: string, reason: "not_registered_here" | "issue_failed" | undefined): void {
+    this.#directoryOnlineTokens.delete(agentName);
+    this.#directoryOnlineTokenAbsent.set(agentName, reason ?? "unstated");
   }
 
   /**
@@ -12484,6 +12559,55 @@ export class SessionNodeManager {
    * of past sessions (getAgentRelayEndpoints — covers a directory that predates
    * the auth_ok extension).
    */
+  /**
+   * DOD-M15-RELAYSLOTS-1: relays this agent should skip, and until when — see the failover note in
+   * `#reservationCircuitAddrs`. Keyed agent → relay peer id → expiry.
+   *
+   * Time-boxed rather than permanent because the fault is somebody else's to fix and we will not
+   * hear when they have: an operator sets the missing directory key and restarts, and this agent
+   * should find that relay again without needing its own restart.
+   */
+  readonly #relayQuarantine = new Map<string, Map<string, number>>();
+
+  /**
+   * Is this agent currently skipping this relay? The observable half of the failover decision — a
+   * test that asserts only on the classifier's boolean proves nothing about what the daemon does.
+   */
+  isRelayQuarantined(agentName: string, relayPeerId: string): boolean {
+    return this.#relayQuarantineFor(agentName).has(relayPeerId);
+  }
+
+  /** Live quarantine entries for an agent, expired ones swept on read. */
+  #relayQuarantineFor(agentName: string): Set<string> {
+    const byRelay = this.#relayQuarantine.get(agentName);
+    if (!byRelay) return new Set();
+    const now = Date.now();
+    for (const [relayPeerId, expiresAt] of byRelay) {
+      if (now >= expiresAt) byRelay.delete(relayPeerId);
+    }
+    if (byRelay.size === 0) this.#relayQuarantine.delete(agentName);
+    return new Set(byRelay.keys());
+  }
+
+  /**
+   * Skip this relay for this agent for a while. Called only for refusals the classifier marks
+   * `tryAnotherRelay` — a fault of the relay's, not one that would follow us to the next one.
+   */
+  #quarantineRelay(agentName: string, relayPeerId: string, reason: string): void {
+    let byRelay = this.#relayQuarantine.get(agentName);
+    if (!byRelay) { byRelay = new Map(); this.#relayQuarantine.set(agentName, byRelay); }
+    byRelay.set(relayPeerId, Date.now() + RELAY_QUARANTINE_MS);
+    this.#logger.warn("session.standing_receiver.relay_quarantined", {
+      agentName,
+      relayPeerId,
+      reason,
+      forMs: RELAY_QUARANTINE_MS,
+      impact: "this relay refused this agent for a fault of its own, so the agent will ask a " +
+        "different relay for its reservation until the quarantine lapses. Its inbound reachability " +
+        "is restored by moving, not by waiting for someone to fix that relay.",
+    });
+  }
+
   #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
     let persisted: Array<{ relayPeerId: string; relayAddrs: string[] }>;
     try {
@@ -12503,9 +12627,33 @@ export class SessionNodeManager {
     for (const ep of [...(this.#directoryRelayEndpoints.get(agentName) ?? []), ...persisted]) {
       if (!merged.has(ep.relayPeerId)) merged.set(ep.relayPeerId, ep);
     }
+    /**
+     * DOD-M15-RELAYSLOTS-1 — **THE FAILOVER.** Skip relays that refused this agent for a fault of
+     * their own (today: a relay holding no directory public key, which can verify nobody and is
+     * refusing everyone). We run several relays precisely so one being broken is survivable.
+     *
+     * ⚠️ NEVER TO THE POINT OF HAVING NO RELAY AT ALL. If the quarantine would empty the candidate
+     * list it is ignored wholesale: a relay that refuses is strictly better than no relay, because
+     * the refusal at least has a cause the operator can read, while an agent with no candidates is
+     * simply unreachable with nothing to show for it. This is the same "refusing too eagerly is the
+     * failure mode" rule, applied to the client's own choice of where to ask.
+     */
+    const quarantined = this.#relayQuarantineFor(agentName);
+    const eligible = [...merged.values()].filter((ep) => !quarantined.has(ep.relayPeerId));
+    const usable = eligible.length > 0 ? eligible : [...merged.values()];
+    if (eligible.length === 0 && quarantined.size > 0 && merged.size > 0) {
+      this.#logger.warn("session.standing_receiver.relay_quarantine.ignored", {
+        agentName,
+        quarantined: [...quarantined],
+        impact: "every known relay has refused this agent for a relay-side fault, so the quarantine " +
+          "is being ignored and they are all being tried again. A relay that refuses with a cause " +
+          "is better than no relay at all — but if this persists, every relay this agent knows " +
+          "about is misconfigured, and that is the thing to look at.",
+      });
+    }
     const addrs: string[] = [];
     const relayPeerIds: string[] = [];
-    for (const ep of merged.values()) {
+    for (const ep of usable) {
       const base = ep.relayAddrs[0];
       if (!base) continue;
       const candidate = base.includes("/p2p/")

@@ -60,8 +60,13 @@ async function waitUntil(fn: () => boolean, timeoutMs: number, everyMs = 50): Pr
 /**
  * An in-process relay that speaks the auth handshake and records the `online_token` on each
  * response — as hex, so an assertion can name the exact bytes rather than "something arrived".
+ *
+ * `refuseWith`, when given, makes it answer `relay_auth_failed` instead of `relay_auth_ok`. That is
+ * what lets a test drive a REAL refusal all the way to the operator surface rather than calling the
+ * classifier directly — review found the first version of the clause-7 test doing exactly that, and
+ * every assertion in it still passed with the whole surface deleted.
  */
-async function startTokenRecordingRelay(): Promise<{
+async function startTokenRecordingRelay(refuseWith?: Record<string, unknown>): Promise<{
   node: CelloNode;
   peerId: string;
   addr: string;
@@ -90,7 +95,9 @@ async function startTokenRecordingRelay(): Promise<{
           if (!verify(pubkey, msgHash, signature)) break;
           const tok = frame["online_token"];
           tokensSeen.push(tok instanceof Uint8Array ? Buffer.from(tok).toString("hex") : null);
-          stream.send(lp.encode.single(CBOR_ENC.encode({ type: "relay_auth_ok" }) as Uint8Array));
+          stream.send(lp.encode.single(CBOR_ENC.encode(
+            refuseWith ?? { type: "relay_auth_ok" },
+          ) as Uint8Array));
           break;
         }
       } catch { /* the assertion is on what was recorded, not on teardown */ }
@@ -210,6 +217,109 @@ describe("DOD-M15-RELAYSLOTS-1: the daemon carries the directory's online token 
         "these tokens expire in an hour. A client that snapshots one at construction works until " +
           "that hour is up and then loses its slot for reasons nothing on this side reports.",
       ).toBe(Buffer.from(second).toString("hex"));
+    } finally {
+      await stop();
+      await relay.node.stop();
+    }
+  }, 40_000);
+
+  it("★★★ clause 7: a REAL refusal reaches the operator surface with its cause and its numbers", async () => {
+    /**
+     * ⚠️ THIS IS THE TEST REVIEW ASKED FOR, and the version it replaced was hollow.
+     *
+     * That one imported `classifyRelayAuthRefusal` and called it directly. Every assertion in it
+     * passed with the entire operator surface deleted — the capture in the relay client, the map in
+     * the manager, and both `standing_receiver_refusal` blocks in the daemon. It asserted a pure
+     * function while the clause is explicitly about what the CLIENT can show someone.
+     *
+     * So this drives a real relay that answers `relay_auth_failed`, and reads
+     * `getStandingReceiverRefusal` — the same value `cello_status` puts in front of a person.
+     */
+    const relay = await startTokenRecordingRelay({
+      type: "relay_auth_failed",
+      reason: "slot_cap_exceeded",
+      slots_held: 32,
+      slot_cap: 32,
+    });
+    const token = new Uint8Array(104).fill(0x7e);
+
+    const { manager, agentName, stop } = await managerReservingOn(relay);
+    try {
+      manager.setDirectoryOnlineToken(agentName, token);
+      await manager.ensureStandingReceiverForAgent(agentName);
+      await waitUntil(() => manager.getStandingReceiverRefusal(agentName) !== null, 15_000);
+
+      const refusal = manager.getStandingReceiverRefusal(agentName);
+      expect(refusal, "the relay refused and the client kept only a log line").not.toBeNull();
+      expect(refusal!.reason).toBe("slot_cap_exceeded");
+      expect(refusal!.slotsHeld).toBe(32);
+      expect(refusal!.slotCap).toBe(32);
+      expect(
+        refusal!.advice,
+        "a bare code reads as the product being broken. Nobody knows what sessions they have open, " +
+          "so the numbers are what turn this into something they can act on.",
+      ).toContain("32");
+      expect(refusal!.relayPeerId, "and WHICH relay said it").toBe(relay.peerId);
+    } finally {
+      await stop();
+      await relay.node.stop();
+    }
+  }, 40_000);
+
+  it("★★★ clause 9: a relay-side fault quarantines that relay; a client-side one does not", async () => {
+    /**
+     * The mirror of the test above, and the other half review found hollow: `tryAnotherRelay` was
+     * computed, stored, logged and unit-tested, and NOTHING branched on it. A boolean nobody reads
+     * is not a failover.
+     *
+     * Asserted on the candidate list the receiver would actually be rebuilt against, because that
+     * is where the decision lands.
+     */
+    const broken = await startTokenRecordingRelay({
+      type: "relay_auth_failed",
+      reason: "online_token_no_directory_key",
+    });
+    const token = new Uint8Array(104).fill(0x5a);
+
+    const { manager, agentName, stop } = await managerReservingOn(broken);
+    try {
+      manager.setDirectoryOnlineToken(agentName, token);
+      await manager.ensureStandingReceiverForAgent(agentName);
+
+      const quarantined = await waitUntil(
+        () => manager.isRelayQuarantined(agentName, broken.peerId),
+        15_000,
+      );
+      expect(
+        quarantined,
+        "this relay can verify nobody and is refusing everyone. Staying on it leaves the agent " +
+          "unreachable for a fault that is somebody else's to fix, when another relay works now.",
+      ).toBe(true);
+    } finally {
+      await stop();
+      await broken.node.stop();
+    }
+  }, 40_000);
+
+  it("★★★ clause 9, the other direction: a client-side refusal does NOT quarantine the relay", async () => {
+    const relay = await startTokenRecordingRelay({
+      type: "relay_auth_failed",
+      reason: "online_token_expired",
+    });
+    const token = new Uint8Array(104).fill(0x3c);
+
+    const { manager, agentName, stop } = await managerReservingOn(relay);
+    try {
+      manager.setDirectoryOnlineToken(agentName, token);
+      await manager.ensureStandingReceiverForAgent(agentName);
+      await waitUntil(() => manager.getStandingReceiverRefusal(agentName) !== null, 15_000);
+
+      expect(
+        manager.isRelayQuarantined(agentName, relay.peerId),
+        "an expired token reproduces identically on every relay in the fleet. Walking the fleet " +
+          "spends real time turning a client fault into what looks like a fleet-wide outage.",
+      ).toBe(false);
+      expect(manager.getStandingReceiverRefusal(agentName)?.reason).toBe("online_token_expired");
     } finally {
       await stop();
       await relay.node.stop();

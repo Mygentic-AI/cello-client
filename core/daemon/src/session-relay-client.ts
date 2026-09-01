@@ -166,6 +166,15 @@ export function classifyRelayAuthRefusal(
         : "This agent already holds the most reservations one agent may hold on this relay. That is " +
           "almost always sessions that were never closed — close some and this clears.";
       break;
+    case "session_tuple_cap_exceeded":
+      advice = extra.slotsHeld !== undefined && extra.slotCap !== undefined
+        ? `You already have ${String(extra.slotsHeld)} conversations open with this counterparty, ` +
+          `which is the maximum of ${String(extra.slotCap)} this relay allows between one pair of ` +
+          "agents. Close some and try again — this is almost always conversations that were never " +
+          "closed rather than ones anybody is still using."
+        : "You already have the maximum number of concurrent conversations open with this " +
+          "counterparty. Close some and try again.";
+      break;
     case "rate_limited":
       advice = extra.retryAfterMs !== undefined
         ? `This relay is throttling this agent; it clears on its own in about ${String(Math.ceil(extra.retryAfterMs / 1000))}s.`
@@ -827,7 +836,23 @@ export class AgentRelayClient {
     } else if (type === "assignment_invalid") {
       // The relay rejected the assignment (e.g. directory_signature_invalid — not signed by any
       // consortium directory). Fail LOUD: the session has no relay witness until this is resolved.
-      this.#logger.warn("session.relay.assignment.invalid", { relayPeerId: this.#relayPeerId, reason: typeof frame["reason"] === "string" ? frame["reason"] : "unknown" });
+      const reason = typeof frame["reason"] === "string" ? (frame["reason"] as string) : "unknown";
+      this.#logger.warn("session.relay.assignment.invalid", { relayPeerId: this.#relayPeerId, reason });
+      /**
+       * DOD-M15-RELAYSLOTS-1 review M2 — **the tuple cap has to reach the operator too.**
+       *
+       * Clause 7 says EVERY refusal reaches them with a cause and an affordance, and this one was
+       * arriving as `assignment_invalid` in a log. It is also the refusal most likely to hit a real
+       * person, for the reason the order itself gives: nobody knows what sessions they have open, so
+       * whoever hits it believes they have none. Routed through the same classifier and onto the
+       * same surface as every other relay refusal.
+       */
+      const concurrent = typeof frame["concurrent_sessions"] === "number" ? (frame["concurrent_sessions"] as number) : undefined;
+      const cap = typeof frame["session_cap"] === "number" ? (frame["session_cap"] as number) : undefined;
+      this.#lastAuthRefusal = classifyRelayAuthRefusal(reason, {
+        ...(concurrent !== undefined ? { slotsHeld: concurrent } : {}),
+        ...(cap !== undefined ? { slotCap: cap } : {}),
+      });
       const r = this.#pendingRecord; this.#pendingRecord = null; if (r) r("rejected");
     } else if (type === "leaf_deliver") {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
@@ -874,6 +899,35 @@ export class AgentRelayClient {
           authored_by_us: authoredByUs,
         });
       }
+    } else if (type === "relay_slot_reclaimed") {
+      /**
+       * DOD-M15-RELAYSLOTS-1 clause 8 — **the reaped party is told, and this is where it lands.**
+       *
+       * The relay reclaimed this agent's circuit reservation to free capacity. Without a branch
+       * here the frame fell off the end of this chain and was discarded in silence, which is the
+       * trap the order records in its own words: a refusal that only reaches the relay's log does
+       * not exist. From the agent's side the reservation simply stops working.
+       *
+       * Recorded as a refusal so it reaches `cello_status` through the same surface as every other
+       * relay refusal, with the same shape: a cause, and what to do about it.
+       */
+      const idleMs = typeof frame["idle_ms"] === "number" ? (frame["idle_ms"] as number) : undefined;
+      const detail = typeof frame["detail"] === "string" ? (frame["detail"] as string) : undefined;
+      this.#lastAuthRefusal = {
+        reason: "slot_reclaimed",
+        advice: detail ?? "This relay reclaimed your circuit reservation to free capacity because it " +
+          "had carried no traffic for a long time. Your agent stays online and rebuilds its receiver " +
+          "automatically; a new session will take a fresh reservation.",
+        // Not the relay's fault and not ours — it was under pressure and we were the quietest. The
+        // client rebuilds against the same pool, so there is nothing to fail over from.
+        tryAnotherRelay: false,
+      };
+      this.#logger.warn("session.relay.slot_reclaimed", {
+        relayPeerId: this.#relayPeerId,
+        ...(idleMs !== undefined ? { idleHours: Math.round(idleMs / 3_600_000) } : {}),
+        impact: "this relay reclaimed our circuit reservation to free capacity. Until a receiver is " +
+          "rebuilt, this agent is reachable only over a direct connection.",
+      });
     }
     // session_interrupted / content_park_notify are out of scope here — session interruption
     // is handled by the session node manager's dedicated relay-stream watcher.
