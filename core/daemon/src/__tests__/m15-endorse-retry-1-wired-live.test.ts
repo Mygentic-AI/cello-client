@@ -125,11 +125,11 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     return { key_id: "intake-0", pubkey: Buffer.from(await kp.getPublicKey()).toString("hex") };
   }
 
-  async function boot(connect: () => Promise<ConnectResult>, logger: Logger): Promise<DaemonHandle> {
+  async function boot(connect: () => Promise<ConnectResult>, logger: Logger, expiresInMs = 400 * DAY): Promise<DaemonHandle> {
     const manifest = {
       version: 1,
       not_before: new Date(Date.now() - DAY).toISOString(),
-      expires: new Date(Date.now() + 400 * DAY).toISOString(),
+      expires: new Date(Date.now() + expiresInMs).toISOString(),
       nodes: [{ nodeId: "n1", pubkey: "b".repeat(64), region: "r", provider: "p", endpoint: "http://127.0.0.1:1" }],
       signatures: [{ officerIndex: 0, signature: "c".repeat(128) }],
       intake_key: await intakeKey(),
@@ -235,6 +235,39 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     const after = (await c.send("wallet_list_issued", {})) as Record<string, unknown>;
     expect(after["in_flight"]).toEqual([]);
   }, 60_000);
+
+  it("a submission is NOT held when its intake key expires inside the retry window", async () => {
+    /**
+     * The sealed bytes are opened by the portal's intake key from THIS manifest. Holding them
+     * across that key's expiry produces a submission the portal cannot open and cannot attribute —
+     * poison, with no reply possible — while the operator has been told it is held and needs
+     * nothing from them. The plain failure is the better answer, because they can act on it.
+     *
+     * `composeSealedSubmission` refuses an ALREADY-expired manifest, so this is specifically the
+     * gap between "still valid" and "valid for longer than we would hold it": thirty minutes,
+     * against a one-hour window.
+     */
+    const dirNode = makeControllableDirectory();
+    const { logger } = makeLogger();
+    await makeAgentDir("alice");
+    await boot(dirNode.connect, logger, 30 * 60_000);
+    const c = await attach("alice");
+
+    const issued = (await c.send("cello_attestations_issue", {
+      subject_pubkey: "ef".repeat(32),
+      body: "vouching just before the key rotates",
+    })) as Record<string, unknown>;
+
+    // The compose SUCCEEDED — the manifest is still valid — so this is the retry declining to hold,
+    // not the expiry gate refusing to seal.
+    expect(issued["ok"]).toBe(false);
+    expect(issued["reason"]).toBe("signaling_reconnecting");
+    expect(String(issued["guidance"])).toMatch(/NOT\s+holding it/);
+    expect(String(issued["guidance"])).toMatch(/cannot open or even attribute/);
+
+    const list = (await c.send("wallet_list_issued", {})) as Record<string, unknown>;
+    expect(list["in_flight"], "a blob was held past the key that can open it").toEqual([]);
+  }, 30_000);
 
   it("CLAUSE 3 — a node that REFUSES on the merits is answered as a failure, and never retried", async () => {
     // The node is UP and answers `submission_write_error`. That is a decision about the submission,

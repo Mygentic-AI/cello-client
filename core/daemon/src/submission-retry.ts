@@ -206,11 +206,23 @@ const LOCAL_PRECONDITION_RETRY_MS = 60_000;
 const BASE_BACKOFF_MS = 30_000;
 /**
  * One hour. Chosen against the intake key, not against patience: the queued blob is sealed to the
- * intake key the manifest published at compose time, and a manifest window is measured in weeks —
- * so an hour cannot outlive the key that can open it. Sealing to a retired key produces a blob the
- * portal cannot open and cannot even attribute, which arrives as poison with no reply possible.
+ * intake key the manifest published at compose time, and a manifest window is measured in weeks.
+ *
+ * THIS COMMENT USED TO ASSERT THAT AN HOUR "CANNOT OUTLIVE THE KEY", AND THAT WAS AN UNCHECKED
+ * CLAIM (review M4). It holds only when the manifest has more than an hour left at compose time.
+ * `composeSealedSubmission` refuses an already-expired manifest, but nothing stopped a submission
+ * composed one minute before expiry from being held and re-sent for the next fifty-nine — and the
+ * portal's rotated-key retention does not cover it either, because that rule keeps a retired key
+ * "until no undrained row references it" (M10B-D11) and a HELD submission has no row at any node.
+ * The result is exactly the state the expiry gate exists to prevent: a blob the portal cannot open
+ * and cannot attribute, arriving as poison with no reply possible — while the operator has been
+ * told it is held and needs nothing from them.
+ *
+ * So the CALLER checks rather than this comment asserting. See the enqueue site in `daemon.ts`,
+ * which has the manifest in hand and refuses to hold a submission whose intake key would expire
+ * inside this window.
  */
-const DEFAULT_RETRY_WINDOW_MS = 60 * 60_000;
+export const DEFAULT_RETRY_WINDOW_MS = 60 * 60_000;
 const DEFAULT_QUEUE_CAP = 32;
 
 /** What the operator does about a submission still in flight. Named verb, real parameterless call. */

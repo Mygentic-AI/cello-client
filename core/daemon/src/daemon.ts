@@ -80,7 +80,7 @@ import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import { composeSealedSubmission, sendSealedSubmission, fetchSubmissionResults } from "./signal-submission.js";
-import { SubmissionRetryQueue, isRetryableSendFailure, type PendingSubmission } from "./submission-retry.js";
+import { SubmissionRetryQueue, isRetryableSendFailure, DEFAULT_RETRY_WINDOW_MS, type PendingSubmission } from "./submission-retry.js";
 import type { SubmissionOp, SignalSubjectKind } from "@cello-protocol/protocol-types";
 
 /**
@@ -3561,6 +3561,39 @@ async function startDaemonHoldingLock(
         // a string match. `submission_refused_by_node` means a node decoded it, evaluated it and
         // said no, and it falls straight through to the plain failure below; everything else means
         // no node ever reached a decision, so the daemon keeps it and re-sends on the reconnect.
+        /**
+         * DO NOT HOLD A BLOB PAST ITS OWN INTAKE KEY (review M4).
+         *
+         * The sealed bytes are opened by the portal's intake key from THIS manifest. Holding them
+         * across that key's expiry produces a submission the portal cannot open and cannot even
+         * attribute — poison, with no reply possible — while the operator has been told it is held
+         * and needs nothing from them. The plain failure is the better answer: they re-run it once
+         * a current manifest is loaded, and they know to.
+         *
+         * The manifest is in hand here and nowhere inside the queue, which is why the check lives
+         * at the call site rather than in the module that owns the window.
+         */
+        const manifestExpiresAt = verifiedManifest ? Date.parse(verifiedManifest.expires) : NaN;
+        const keyOutlivesWindow =
+          Number.isFinite(manifestExpiresAt) && manifestExpiresAt - Date.now() > DEFAULT_RETRY_WINDOW_MS;
+        if (!keyOutlivesWindow) {
+          logger.warn("signal.submission.retry.not_held", {
+            agentName: sel.name,
+            submissionId: composed.submissionId,
+            reason: "intake_key_expires_within_retry_window",
+            manifestExpires: verifiedManifest?.expires ?? null,
+            impact: "the operator is told it failed rather than being told it is held",
+          });
+          return {
+            queued: false,
+            reason: sent.reason,
+            guidance:
+              `${context} it did not reach a directory node (${sent.reason}), and the daemon is NOT ` +
+              "holding it to retry: the portal intake key it is sealed to expires too soon, and a " +
+              "submission sent after that expires is one the portal cannot open or even attribute. " +
+              "Load a current consortium manifest (cello_status shows its validity), then send it again.",
+          };
+        }
         if (isRetryableSendFailure(sent.reason)) {
           const held = submissionRetries.enqueue(
             {
