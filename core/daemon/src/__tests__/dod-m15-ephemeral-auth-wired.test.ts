@@ -134,19 +134,15 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     return { A, B, alicePub, bobPub, aliceKp, bobKp };
   }
 
-  it("★★ BOTH sides agree a key through the real signed exchange, with nothing seeded", async () => {
+  it("★★ BOTH sides agree a key through the real signed exchange, and a message crosses under it", async () => {
     /**
-     * The clause that makes the feature real: two managers, real identities, a real connection, and
-     * no seeded key anywhere. Each side signs its throwaway public with its agent identity, the other
-     * verifies it against the counterparty identity the session was opened with, and both derive.
+     * THE CLAUSE THAT MAKES THE FEATURE REAL. Two managers, real Ed25519 identities on both sides, a
+     * real connection, and NOTHING seeded: each signs its throwaway public with its agent identity,
+     * each verifies the other's against the counterparty identity the session was opened with, both
+     * derive, and a message goes across encrypted under the result.
      *
-     * ⚠️ SCOPE, STATED SO THIS IS NOT READ AS MORE THAN IT IS. This asserts the AGREEMENT, not the
-     * delivery of a message under it. Delivery in this two-manager harness does not work for a reason
-     * that has nothing to do with encryption — measured with a control that seeded both keys and
-     * skipped the exchange entirely: the send reports `delivered: true` and the receiver's handler
-     * never runs. Encrypted delivery end to end is covered by the seam tests and the daemon suite;
-     * what is NOT yet covered anywhere is delivery under a real UNSEEDED exchange, and that is
-     * recorded rather than implied.
+     * Every other content test in this repo seeds the agreed key, because its counterparty is a fake
+     * node that cannot handshake. This is the one that does not.
      */
     const { A, B } = await liveSession();
     await wait(600);
@@ -155,15 +151,33 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       A.events.find((e) => e.event === "session.key.agreed"),
       "A never agreed a key — the exchange did not complete in its direction",
     ).toBeDefined();
+    expect(B.events.find((e) => e.event === "session.key.agreed"), "B never agreed a key").toBeDefined();
     expect(
-      B.events.find((e) => e.event === "session.key.agreed"),
-      "B never agreed a key",
-    ).toBeDefined();
-    expect(
-      A.events.find((e) => e.event === "session.key.refused"),
+      A.events.find((e) => e.event === "session.key.refused") ?? B.events.find((e) => e.event === "session.key.refused"),
       "a side refused the other's key even though both are genuine",
     ).toBeUndefined();
-    expect(B.events.find((e) => e.event === "session.key.refused")).toBeUndefined();
+
+    const text = "the price is 40,000 and we close on Friday";
+    const content = new TextEncoder().encode(text);
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-send") as { ok: boolean; delivered?: boolean };
+    expect(sent.ok, "the send failed even though both sides agreed a key").toBe(true);
+    expect(
+      sent.delivered,
+      "the send PARKED instead of going direct — `ok` alone covers parked, so asserting it would pass for a message that never crossed the connection",
+    ).toBe(true);
+
+    const received = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
+    expect(received, "the message never arrived at B").not.toBeNull();
+    // The buffer holds the PLAINTEXT as hex — decrypted on the way in, exactly as every reader
+    // downstream expects it. Comparing the hex proves the bytes, not just a length.
+    expect(
+      Buffer.from((received as { contentHex: string }).contentHex, "hex").toString("utf8"),
+      "B decrypted to something other than what A sent",
+    ).toBe(text);
+    expect(
+      (received as { contentHex: string }).contentHex,
+      "and it is the plaintext that was buffered, not the sealed form",
+    ).toBe(Buffer.from(content).toString("hex"));
   }, 60_000);
 
   it("★★ the BYTES on the wire are ciphertext — the plaintext never travels", async () => {
