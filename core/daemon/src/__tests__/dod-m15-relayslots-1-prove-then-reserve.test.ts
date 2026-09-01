@@ -49,7 +49,20 @@ class ScriptedRelay {
   readonly proven = new Set<string>();
   /** Refusal to answer the NEXT proof with, per relay peer id. Absent means the proof succeeds. */
   readonly refusals = new Map<string, RelayAuthRefusal>();
-  readonly proofAttempts: Array<{ relayPeerId: string; peerId: string }> = [];
+  /**
+   * Every `proveReservation`, tagged with whether the proving node already held a circuit address.
+   *
+   * ⚠️ TWO DIFFERENT PROOFS REACH THIS, and conflating them made two assertions here wrong before
+   * the distinction existed. `#proveToRelay` proves a node that has just been REFUSED, so it holds
+   * no circuit address — that is the gate proof, and the subject of this file. Once a receiver
+   * holds a reservation, `#authenticateStandingReceiver` proves again over the delivery path, which
+   * is pre-existing behaviour and correct. Only the first kind is counted below.
+   */
+  readonly proofAttempts: Array<{ relayPeerId: string; peerId: string; hadCircuit: boolean; nodeType: string | undefined }> = [];
+  /** The proofs made to GET a reservation, in order. */
+  gateProofs(): Array<{ relayPeerId: string; peerId: string; nodeType: string | undefined }> {
+    return this.proofAttempts.filter((a) => !a.hadCircuit);
+  }
   grants(peerId: string): boolean { return this.proven.has(peerId); }
 }
 
@@ -61,6 +74,14 @@ class GatedNode extends FakeNode {
     seed: Uint8Array | undefined,
     private readonly relay: ScriptedRelay,
     private readonly circuit: string | undefined,
+    /**
+     * ⚠️ CARRIED SO A PROOF CAN BE ATTRIBUTED. A revived session reuses the receiver's transport
+     * seed — that is what a handoff IS — so peer id cannot tell the two apart, and an assertion
+     * that merely counts proofs is satisfied by the RECEIVER rebuilding. That is not a hypothetical:
+     * deleting the revival's prove step left the count assertion green, because clearing the
+     * relay's memory also strips the receiver's circuit address and its watchdog rebuilds.
+     */
+    readonly nodeType: string | undefined,
   ) {
     super();
     this.#id = seed ? `12D3KooW${createHash("sha256").update(seed).digest("hex").slice(0, 40)}` : "random";
@@ -83,7 +104,7 @@ class GatedFactory implements ISessionNodeFactory {
   constructor(private readonly relay: ScriptedRelay) {}
   async createNode(config: SessionNodeConfig): Promise<CelloNode> {
     const circuit = config.circuitRelayListenAddrs?.[0];
-    const node = new GatedNode(config.transportPrivateKey, this.relay, circuit);
+    const node = new GatedNode(config.transportPrivateKey, this.relay, circuit, config.nodeType);
     this.asks.push({ circuits: config.circuitRelayListenAddrs ?? [], nodeType: config.nodeType, peerId: node.getPeerId() });
     this.built.push(node);
     return node as unknown as CelloNode;
@@ -95,7 +116,12 @@ function relayClientStub(relay: ScriptedRelay, relayPeerId: string): AgentRelayC
   let lastRefusal: RelayAuthRefusal | null = null;
   return {
     async proveReservation(node: CelloNode): Promise<boolean> {
-      relay.proofAttempts.push({ relayPeerId, peerId: node.getPeerId() });
+      relay.proofAttempts.push({
+        relayPeerId,
+        peerId: node.getPeerId(),
+        hadCircuit: node.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+        nodeType: (node as unknown as GatedNode).nodeType,
+      });
       const refusal = relay.refusals.get(relayPeerId);
       if (refusal) { lastRefusal = refusal; return false; }
       relay.proven.add(node.getPeerId());
@@ -162,8 +188,8 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
         "so a retry on a fresh identity would be refused exactly like the first ask — the seed is " +
         "reused for precisely this reason.",
     ).toBe(asks[1]?.peerId);
-    expect(relay.proofAttempts).toHaveLength(1);
-    expect(relay.proofAttempts[0]?.peerId).toBe(asks[0]?.peerId);
+    expect(relay.gateProofs()).toHaveLength(1);
+    expect(relay.gateProofs()[0]?.peerId).toBe(asks[0]?.peerId);
   }, 30_000);
 
   it("★★★ a refusal about THIS AGENT reaches cello_status, and stops the fleet walk", async () => {
@@ -195,7 +221,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     expect(surfaced?.relayPeerId).toBe(RELAY_A);
 
     expect(
-      relay.proofAttempts.map((p) => p.relayPeerId),
+      relay.gateProofs().map((p) => p.relayPeerId),
       "and it must STOP. This refusal is about the agent, not the relay, so walking the pool costs " +
         "a node build and two dials per relay to reach the same answer — and makes one client-side " +
         "fault read as a fleet-wide outage.",
@@ -216,7 +242,7 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     await mgr.ensureStandingReceiverForAgent("alice");
 
     expect(
-      relay.proofAttempts.map((p) => p.relayPeerId),
+      relay.gateProofs().map((p) => p.relayPeerId),
       "a relay-side fault is the one case where the next relay genuinely helps — and A is asked " +
         "ONCE, because the retry exists only to use a proof that landed, and this one did not",
     ).toEqual([RELAY_A, RELAY_B]);
@@ -253,23 +279,33 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
      * the receiver proved.
      */
     relay.proven.clear();
-    const proofsBefore = relay.proofAttempts.length;
+    const asksBefore = factory.asks.length;
 
     const revived = await mgr.reviveSessionNode("alice", sid);
     expect(revived.ok, JSON.stringify(revived)).toBe(true);
 
+    /**
+     * ⚠️ FILTERED TO THE SESSION NODE, and the filter is the assertion. Counting proofs alone is
+     * green with the revival's prove step DELETED — clearing the relay's memory also strips the
+     * receiver's circuit address, its watchdog rebuilds, and the receiver's own gate proof makes
+     * the count go up. Measured: that mutant passed before this filter existed.
+     */
     expect(
-      relay.proofAttempts.length,
+      relay.gateProofs().filter((p) => p.nodeType === "session"),
       "without a prove step the revival is refused by every candidate and lands on the plain floor: " +
         "the session is alive and active and the counterparty cannot dial it, so every message in " +
         "both directions is forced through the relay park route.",
-    ).toBeGreaterThan(proofsBefore);
+    ).toHaveLength(1);
 
-    const revivedAsks = factory.asks.filter((a) => a.nodeType === "session" && a.circuits.length > 0);
-    const granted = factory.built.filter(
-      (n) => n.listenAddresses().some((a) => a.includes("/p2p-circuit")),
-    );
+    const revivedAsks = factory.asks
+      .slice(asksBefore)
+      .filter((a) => a.nodeType === "session" && a.circuits.length > 0);
     expect(revivedAsks.length, "one refused ask, one granted, on one relay").toBe(2);
-    expect(granted.length, "the revived session ends up holding a real circuit address").toBeGreaterThan(0);
+    expect(
+      factory.built.filter(
+        (n) => n.nodeType === "session" && n.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      ).length,
+      "the REVIVED SESSION ends up holding a real circuit address — not merely some node somewhere",
+    ).toBeGreaterThan(0);
   }, 30_000);
 });
