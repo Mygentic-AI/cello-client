@@ -51,11 +51,21 @@ export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string
 };
 
 /**
- * Render a stored reason for an agent.
+ * Render a reason for an agent.
  *
- * An UNRECOGNISED reason is described as unrecognised rather than guessed at. The value comes off a
- * database row that an older or newer build may have written, and asserting the wrong cause is how a
- * reader ends up acting on something that was never the problem.
+ * An UNRECOGNISED reason is described as unrecognised rather than guessed at, because asserting the
+ * wrong cause is how a reader acts on something that was never the problem.
+ *
+ * ⚠️ THE FALLBACK IS SCAFFOLDING AND IS UNREACHABLE IN PRODUCTION TODAY — say so rather than imply
+ * otherwise. There is no `content_encryption_reason` COLUMN: the value is stamped as a module
+ * constant in `#saltStatusOf` and read back by the same build in the same process, so it can only
+ * ever be one this file defines. An earlier version of this comment said the value "comes off a
+ * database row that an older or newer build may have written", which is the kind of confident
+ * provenance that is worth exactly nothing when it is not true.
+ *
+ * It is kept because `007-CRYPTO` adds reasons that depend on what a PEER did, and those are the
+ * ones a mixed-version pair can disagree about. Its test is labelled as covering a branch production
+ * does not enter.
  */
 export function contentEncryptionGuidanceFor(reason: string): string {
   const known = CONTENT_ENCRYPTION_GUIDANCE[reason as ContentEncryptionReason];

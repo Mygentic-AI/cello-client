@@ -88,17 +88,25 @@
  * the salt no longer rides on this secret, re-keying no longer disturbs the transcript's
  * verifiability.
  *
- * ⚠️ THE DESTRUCTION HAS NO CALLER YET, and this file used to read as though it did — *"that is the
- * forward secrecy, and `destroySessionEphemeral` is what makes it real."* Forward secrecy is a
- * property of the old secret being GONE, so a destroy function nothing calls does not provide it.
- * Nothing in the daemon mints an ephemeral, derives a content key, or destroys one: this module is
- * a library with tests and no consumer, deliberately, because binding the ephemeral to the agent's
- * identity comes first (`DOD-M15-EPHEMERAL-AUTH-1`) and there is no point wiring an unauthenticated
- * agreement into the send path.
+ * ⚠️ WHAT IS WIRED AND WHAT IS NOT, precisely — because this file has now been wrong in BOTH
+ * directions. It first claimed *"that is the forward secrecy, and `destroySessionEphemeral` is what
+ * makes it real"* while nothing called it; the correction then said *"nothing in the daemon mints an
+ * ephemeral, derives a content key, or destroys one"*, and `006-CRYPTO` made two thirds of that
+ * false the same day. State the boundary, not a slogan:
  *
- * Said plainly because `session-salt.ts` states its own reachability boundary and this file stated
- * none, so the two halves of the same exchange read as though both were live. The salt half IS live;
- * this half is not yet.
+ *   `generateSessionEphemeral` and `destroySessionEphemeral` HAVE a caller —
+ *   `session-node-manager.ts` mints one per session at activation and destroys it at every site
+ *   that drops the session's entry.
+ *   `deriveSessionSecrets` has NONE. Nothing exchanges the public halves, so no shared secret is
+ *   ever agreed and no message body is encrypted with one.
+ *
+ * The exchange, the signature over the ephemeral, and the encryption itself are
+ * `DOD-M15-EPHEMERAL-AUTH-1` / `007-CRYPTO` — one wire format that ships together. The lifecycle
+ * landed first on purpose: it is local, it changes no wire, and it is what makes the state visible
+ * on the session rather than leaving a reader to assume.
+ *
+ * Said this plainly because `session-salt.ts` states its own reachability boundary and this file
+ * stated none, so the two halves of the same exchange read as though both were live.
  *
  * ─── The key and the salt must never be EQUAL, and what actually keeps them apart ──────────────
  *

@@ -1323,10 +1323,12 @@ export class SessionNodeManager {
    * not a property of minting a fresh key — it is a property of the old one being GONE — so anything
    * that made this durable would void it permanently and silently.
    *
-   * Minted ONCE per session, at the moment the session becomes active, and destroyed by
-   * `#evictSessionCaches` when it tears down. A revived session therefore mints a FRESH one and
-   * re-keys, which is Decisions Carried #5 and is correct: the old secret did not survive, so there
-   * is nothing to be consistent with.
+   * Minted ONCE per session, at the moment the session becomes active, and destroyed at every site
+   * that drops the `#activeNodes` entry — see `#destroySessionEphemeralFor`, which explains why it
+   * is keyed to the entry rather than to the cache eviction. A revived session therefore mints a
+   * FRESH one and re-keys, which is Decisions Carried #5; that is only true because the interrupt
+   * path destroys, and an earlier version of this comment asserted it while the interrupt path
+   * silently kept the old key for hours.
    *
    * ⚠️ NOTHING SENDS THE PUBLIC HALF YET. The exchange, the signature over it, and encrypting
    * content with the agreed secret are `007-CRYPTO`, and they are one wire format that ships
@@ -5222,25 +5224,11 @@ export class SessionNodeManager {
     this.#saltRepairedAgainst.delete(key);
     this.#saltRepairedAgainstFingerprint.delete(key);
     this.#saltPeerClosedLabel.delete(key);
-    /**
-     * DESTROY THE THROWAWAY SECRET — 006-CRYPTO, and this is what forward secrecy actually is.
-     *
-     * Zeroed, then dropped. Dropping the map entry alone would leave the bytes for the garbage
-     * collector to move around at its leisure; `destroySessionEphemeral` overwrites the buffer we
-     * hold, which is the one copy we control.
-     *
-     * ⚠️ THIS RUNS AFTER THE SEAL, and that is a property of WHERE it is called, not of this line.
-     * Both teardown paths reach here at the end: the sealing path retires the node once the
-     * ceremony is finished, and the destroy path is a session that is already over. Moving this
-     * call earlier — into a close handler, or before the seal — would zero the key while the
-     * ceremony still needs the session, so the ordering is load-bearing.
-     */
-    const ephemeral = this.#sessionEphemerals.get(key);
-    if (ephemeral) {
-      destroySessionEphemeral(ephemeral);
-      this.#sessionEphemerals.delete(key);
-      this.#logger.debug("session.ephemeral.destroyed", { agentName, sessionId });
-    }
+    // The throwaway secret is destroyed where the `#activeNodes` entry is DROPPED, not here — see
+    // `#destroySessionEphemeralFor`. This call is the belt to that braces: both teardown paths that
+    // evict have already dropped the entry, so it is a no-op for them, and it is what catches any
+    // future path that evicts without going through one of those.
+    this.#destroySessionEphemeralFor(agentName, sessionId);
     /**
      * B2b-2's three, and the pending one is SETTLED rather than dropped.
      *
@@ -5554,6 +5542,13 @@ export class SessionNodeManager {
     // seed survives the shutdown in memory for as long as the process lingers.
     for (const identity of this.#sessionSeeds.values()) identity.seed.fill(0);
     this.#sessionSeeds.clear();
+    // 006-CRYPTO: the per-session throwaway secrets belong in the same sentence, for the same
+    // reason and with the same measured cause — shutdown marks rows `interrupted` by direct SQL, so
+    // no per-session teardown fires for them, and this process is known to linger (a `cello logout`
+    // was still alive 30+ seconds later). Without this, every live session's key survives the
+    // shutdown in memory for as long as it lingers.
+    for (const ephemeral of this.#sessionEphemerals.values()) destroySessionEphemeral(ephemeral);
+    this.#sessionEphemerals.clear();
 
     // Stop ALL per-agent standing receivers (DOD-LOOP-1). In PARALLEL and BOUNDED: this was a
     // sequential await per agent with no deadline, so five agents meant five chances for one stuck
@@ -6254,6 +6249,21 @@ export class SessionNodeManager {
         // Fall through — still remove from active map
       }
       this.#activeNodes.delete(this.#k(agentName, sessionId));
+      /**
+       * THE SECRET GOES WITH THE ENTRY — 006-CRYPTO, review pass 2 finding 2.
+       *
+       * This is the path an interrupted session actually takes, and it is the ORDINARY way a
+       * session ends badly: a relay blip, a closed stream, a sleeping laptop. Because it does not
+       * evict (see below) the secret used to survive here, and when the session later sealed
+       * `destroySessionNode` returned at its `if (!entry) return` without evicting either — so the
+       * receipt landed, the session was over, and the key stayed resident until the process exited.
+       *
+       * The reasons below for KEEPING the other caches do not transfer to key material: buffered
+       * plaintext must stay drainable and TTF timers must stay armed, whereas a secret nothing
+       * reads must not stay alive. A revived session mints a fresh one and re-keys, which is
+       * Decisions Carried #5 and is only true because of this line.
+       */
+      this.#destroySessionEphemeralFor(agentName, sessionId, entry.correlationId);
       this.#logger.info("session.node.destroyed", {
         sessionId,
         agentName,
@@ -10510,20 +10520,52 @@ export class SessionNodeManager {
    * and still cannot agree — reads as a network fault rather than as a bug here. `#saltContributionFor`
    * mints once for exactly the same reason.
    *
-   * A REVIVED session is not an exception. `#evictSessionCaches` destroyed the previous secret at
-   * teardown and it was never persisted, so there is nothing left to be consistent with: a revival
-   * mints fresh and re-keys (Decisions Carried #5).
+   * A REVIVED session is not an exception, and this guard is why it took a fix to make that true.
+   * Revival requires status `interrupted`, and the producer of `interrupted` drops the entry without
+   * evicting — so while the secret outlived that path, this guard found it still present and
+   * silently kept a key that had been resident for hours, on the one path where re-keying was
+   * explicitly decided. The interrupt path now destroys it, so the map really is empty by the time
+   * a revival reaches here and it mints fresh (Decisions Carried #5).
    */
-  #mintSessionEphemeral(agentName: string, sessionId: string): void {
+  #mintSessionEphemeral(agentName: string, sessionId: string, correlationId?: string): void {
     const key = this.#k(agentName, sessionId);
     if (this.#sessionEphemerals.has(key)) return;
     this.#sessionEphemerals.set(key, generateSessionEphemeral());
     this.#logger.debug("session.ephemeral.minted", {
-      agentName, sessionId,
+      agentName, sessionId, correlationId,
       // The PUBLIC half only, and only a prefix of it. The secret must never reach a log line, and
       // an operator correlating two daemons needs an identifier rather than the value.
       publicKeyPrefix: Buffer.from(this.#sessionEphemerals.get(key)!.publicKey.subarray(0, 8)).toString("hex"),
     });
+  }
+
+  /**
+   * DESTROY THIS SESSION'S THROWAWAY SECRET — 006-CRYPTO, and this is what forward secrecy IS.
+   *
+   * ⚠️ CALLED FROM EVERY SITE THAT DROPS THE `#activeNodes` ENTRY, not from `#evictSessionCaches`,
+   * and review pass 2 finding 2 is why. The first version rode the evict, which sounded right and
+   * was wrong on the path an interrupted session actually takes:
+   *
+   *   `markInterruptedWithDetails` drops the entry and DELIBERATELY does not evict — the received
+   *   plaintext has to stay drainable and the TTF park timers have to stay armed. So the secret
+   *   survived. Then, when that session later sealed, `destroySessionNode` returned at its
+   *   `if (!entry) return` — the entry was already gone — and never reached the evict either. The
+   *   receipt landed, the session was over, and the secret stayed resident until the process exited.
+   *
+   * A relay blip is the ORDINARY way a session ends badly, so that was the common path, not a corner.
+   * The evict's reasons for keeping the other caches are real and do not transfer: buffered plaintext
+   * must stay readable, and a secret nothing reads must not stay alive.
+   *
+   * Zero THEN drop. Dropping alone leaves the bytes wherever the collector last moved them;
+   * `destroySessionEphemeral` overwrites the one copy this process controls.
+   */
+  #destroySessionEphemeralFor(agentName: string, sessionId: string, correlationId?: string): void {
+    const key = this.#k(agentName, sessionId);
+    const ephemeral = this.#sessionEphemerals.get(key);
+    if (!ephemeral) return;
+    destroySessionEphemeral(ephemeral);
+    this.#sessionEphemerals.delete(key);
+    this.#logger.debug("session.ephemeral.destroyed", { agentName, sessionId, correlationId });
   }
 
   /**
@@ -13931,9 +13973,10 @@ export class SessionNodeManager {
     // different `impact` text — one event name standing for two meanings, fired twice for a single
     // condition. `#reconnectRevivedSessionRelay` takes it as a parameter now.
     const persistedRelay = this.getPersistedRelayEndpoint(agentName, sessionId);
-    // 006-CRYPTO: a REVIVED session mints a FRESH keypair and re-keys — Decisions Carried #5. The
-    // previous secret was destroyed at teardown and was never persisted, so there is nothing to be
-    // consistent with; the salt, which IS persisted, is re-read from the row instead.
+    // 006-CRYPTO: a REVIVED session mints a FRESH keypair and re-keys — Decisions Carried #5. That
+    // holds because the interrupt path destroys the old secret when it drops the entry; until it
+    // did, this call found the stale key still in the map and quietly kept it. The salt, which IS
+    // persisted, is re-read from the row instead — opposite lifetimes, deliberately.
     this.#mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(key, {
       node,
@@ -14008,6 +14051,9 @@ export class SessionNodeManager {
       const revivedEntry = this.#activeNodes.get(key);
       if (revivedEntry?.node === node) this.#detachSessionRelay(revivedEntry);
       this.#activeNodes.delete(key);
+      // 006-CRYPTO: the revival FAILED, so the key it just minted belongs to a session that never
+      // came back. Dropping the entry without this would strand it for the daemon's lifetime.
+      this.#destroySessionEphemeralFor(agentName, sessionId);
       try {
         await node.stop();
       } catch { /* best-effort: the status write already failed and is logged with its cause */ }

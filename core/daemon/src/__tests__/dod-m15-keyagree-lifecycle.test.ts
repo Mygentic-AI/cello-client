@@ -77,6 +77,27 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     ).toBe(1);
   }, 60_000);
 
+  it("★★ the HAND-OFF path mints too — an inbound session is as new as an outbound one", async () => {
+    /**
+     * Activation path 2 of 3, and it had no test (review pass 2, finding 6): every other test here
+     * goes through `createSession`, so deleting the mint from `acceptSession` left the whole suite
+     * green. A session promoted out of the standing receiver would then be active with no key and
+     * nothing saying so — the exact "missed path" this clause is written against.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-handoff-" });
+    await fx.snm.ensureStandingReceiverForAgent("alice");
+
+    const accepted = await fx.snm.acceptSession(
+      "e1".repeat(32), "alice", "cc".repeat(32), "initiator-peer", "corr-handoff",
+    );
+    expect(accepted, "PRECONDITION: the hand-off actually happened").toBeTruthy();
+
+    expect(
+      fx.snm.sessionEphemeralPublicForTest("alice", "e1".repeat(32)),
+      "a session accepted from the standing receiver has no key — the hand-off path does not mint",
+    ).not.toBeNull();
+  }, 60_000);
+
   it("★ the log NEVER carries the secret — only a prefix of the PUBLIC half", async () => {
     /**
      * A secret in a log line is a secret on disk, in a support bundle, and in whatever ships a log
@@ -106,9 +127,20 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     const row = db.prepare("SELECT * FROM sessions WHERE session_id = ?").get(SID) as Record<string, unknown>;
     expect(row, "PRECONDITION: the session row exists, or this test proves nothing").toBeTruthy();
 
-    // Every column, not a named one: a future migration that adds `session_ephemeral_secret` must
-    // fail here rather than pass because this test only knew about the columns of its own era.
+    /**
+     * A TRIPWIRE, AND ITS LIMITS ARE STATED SO IT IS NOT READ AS COMPLETE. It scans every column of
+     * the `sessions` row, so a migration adding `session_ephemeral_secret` fails it rather than
+     * slipping past a test that only knew the columns of its own era. It does NOT cover a persist to
+     * a different table, or a hex-`TEXT` column named none of these words.
+     *
+     * `content_salt` is exempt BY NAME, with a reason: it is 32 bytes and it is SUPPOSED to be on
+     * disk — opposite lifetime, deliberately (the salt must survive the session, this secret must
+     * not). Without the exemption this test goes red about the throwaway key the moment anything
+     * agrees a salt in this fixture, for a reason that has nothing to do with it.
+     */
+    const PERSISTED_ON_PURPOSE = new Set(["content_salt"]);
     for (const [column, value] of Object.entries(row)) {
+      if (PERSISTED_ON_PURPOSE.has(column)) continue;
       expect(
         /ephemeral|secret|private/i.test(column),
         `column '${column}' looks like it holds key material; the throwaway secret must never be persisted`,
@@ -140,29 +172,81 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     ).toBe(1);
   }, 60_000);
 
-  it("★★ destruction happens AFTER the node is torn down, never before the session is over", async () => {
+  it("★★ the key SURVIVES while a seal is in flight — it is not destroyed early", async () => {
     /**
-     * The ordering is load-bearing and it is a property of WHERE the call sits: it rides
-     * `#evictSessionCaches`, which both teardown paths reach at the END — the sealing path retires
-     * the node once the ceremony is finished. Zeroing the key earlier, from a close handler, would
-     * destroy it while the seal still needs the session.
+     * ⚠️ REPLACES AN ORDERING TEST THAT PROVED NOTHING (review pass 2, finding 4). It asserted
+     * `session.ephemeral.destroyed` came before `session.node.destroyed` — two log lines two
+     * statements apart in the same function, with nothing between them. The order was guaranteed by
+     * adjacency and said nothing about the seal, so moving the destroy to the TOP of the close
+     * handler, before the ceremony even started, passed it.
      *
-     * Asserted as an ORDER between two events rather than as "it eventually happened", because the
-     * second is what a premature destroy would still satisfy.
+     * What the clause actually requires is that the key is still there while the seal needs the
+     * session. So that is what this asserts: with a ceremony genuinely in flight, the key is
+     * present — and only once the session is torn down is it gone.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-order-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
-    await fx.snm.destroySessionNode("alice", SID, "sealed");
 
-    const names = fx.events.map((e) => e.event);
-    const destroyedKey = names.indexOf("session.ephemeral.destroyed");
-    const destroyedNode = names.indexOf("session.node.destroyed");
-    expect(destroyedKey, "PRECONDITION: the key was destroyed at all").toBeGreaterThan(-1);
-    expect(destroyedNode, "PRECONDITION: the node was torn down at all").toBeGreaterThan(-1);
+    fx.markSealInFlightForTest("alice", SID);
     expect(
-      destroyedKey,
-      "the key was zeroed before the node finished tearing down — a seal in flight would lose it",
-    ).toBeLessThan(destroyedNode);
+      fx.snm.sessionEphemeralPublicForTest("alice", SID),
+      "a seal is in flight and the key is already gone — destroying it before the ceremony finishes is the failure this clause names",
+    ).not.toBeNull();
+
+    await fx.snm.destroySessionNode("alice", SID, "sealed");
+    expect(
+      fx.snm.sessionEphemeralPublicForTest("alice", SID),
+      "and once the session is over it must be gone",
+    ).toBeNull();
+    expect(fx.eventsNamed("session.ephemeral.destroyed").length).toBe(1);
+  }, 60_000);
+
+  it("★★ an INTERRUPTED session destroys its key — the path that used to keep it for hours", async () => {
+    /**
+     * Review pass 2, finding 2, and it was the common path rather than a corner. A relay blip or a
+     * sleeping laptop is the ordinary way a session ends badly: `markInterruptedWithDetails` drops
+     * the node and deliberately does NOT evict the caches, because buffered plaintext has to stay
+     * drainable and the park timers have to stay armed. The destroy rode the eviction, so it never
+     * ran — and when that session later sealed, `destroySessionNode` returned at its
+     * `if (!entry) return` and never evicted either. The receipt landed, the session was over, and
+     * the secret was still resident until the process exited.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-interrupt-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    expect(fx.snm.sessionEphemeralPublicForTest("alice", SID)).not.toBeNull();
+
+    await fx.snm.markInterruptedWithDetails("alice", SID, 0, "stream_close");
+
+    expect(
+      fx.snm.sessionEphemeralPublicForTest("alice", SID),
+      "the session was interrupted and its key outlived it — on a long-lived daemon, until the process exits",
+    ).toBeNull();
+  }, 60_000);
+
+  it("★★ a REVIVED session RE-KEYS — it does not resume on the old secret", async () => {
+    /**
+     * Decisions Carried #5, and it was asserted in three comments while being false. Revival
+     * requires status `interrupted`, and that path kept the key — so `#mintSessionEphemeral` found
+     * one already present and the idempotence guard silently preserved it. A session interrupted at
+     * 09:15 and revived at 17:00 resumed on a key that had been resident for eight hours across a
+     * laptop sleep, with nothing anywhere recording that it had not re-keyed.
+     *
+     * Asserts the public half CHANGED. "A key exists afterwards" is satisfied by the stale one.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-rekey-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    const before = fx.snm.sessionEphemeralPublicForTest("alice", SID);
+    expect(before, "PRECONDITION: a key to re-key away from").not.toBeNull();
+
+    await fx.snm.markInterruptedWithDetails("alice", SID, 0, "stream_close");
+    await fx.snm.reviveSessionNode("alice", SID);
+
+    const after = fx.snm.sessionEphemeralPublicForTest("alice", SID);
+    expect(after, "the revived session has no key at all").not.toBeNull();
+    expect(
+      Buffer.from(after!).toString("hex"),
+      "the revived session resumed on the OLD secret instead of re-keying",
+    ).not.toBe(Buffer.from(before!).toString("hex"));
   }, 60_000);
 });
 
@@ -176,8 +260,15 @@ describe("006-CRYPTO: the session SAYS it is not encrypted rather than leaving i
      * agreement shipped with tests, a public header claiming forward secrecy, and no caller, and
      * nothing anywhere said so. Silence is what made that survivable.
      *
-     * Asserted on the AGENT-facing payload, not the daemon record — a field that stops at the record
-     * is the no-reader defect this codebase has already committed once, inside the fix for it.
+     * ⚠️ THIS ASSERTS THE DAEMON RECORD, AND THAT IS ONLY HALF THE PROPERTY. An earlier version of
+     * this docblock claimed it asserted the agent-facing payload; it did not, and deleting the whole
+     * whitelist entry in `session-read-handlers.ts` left this file green — the no-reader defect,
+     * committed for a fourth time inside the fix for it.
+     *
+     * The agent-facing half is asserted through the socket in
+     * `dod-m15-refused-inbound-silent-1.test.ts`, next to the salt test it should have been copied
+     * from. This one keeps the record-level check, which is still worth having: it is what fails if
+     * `#saltStatusOf` stops stamping the field at all.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-status-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
@@ -206,9 +297,12 @@ describe("006-CRYPTO: the session SAYS it is not encrypted rather than leaving i
     ).toMatch(/still encrypted in transit/i);
   });
 
-  it("★ an UNRECOGNISED reason is described as unrecognised, never guessed at", async () => {
-    // The value comes off a row an older or newer build may have written. Asserting the wrong cause
-    // is how a reader acts on something that was never the problem.
+  it("★ an UNRECOGNISED reason is described as unrecognised — a branch production cannot reach yet", async () => {
+    // Labelled as scaffolding on purpose: there is no `content_encryption_reason` column, so the
+    // value is stamped and read back by the same build and can only be one this file defines. The
+    // branch is kept because 007 adds reasons that depend on what a PEER did, which is where a
+    // mixed-version pair can genuinely disagree. Asserting the wrong cause is how a reader acts on
+    // something that was never the problem.
     const { contentEncryptionGuidanceFor } = await import("../content-encryption-status.js");
     const text = contentEncryptionGuidanceFor("some_reason_from_a_later_build");
     expect(text).toMatch(/does not recognise/i);
