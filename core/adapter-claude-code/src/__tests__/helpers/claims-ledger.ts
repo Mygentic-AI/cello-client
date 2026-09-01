@@ -107,6 +107,150 @@ export function countClaimWords(text: string): number {
 }
 
 export const ADJUDICATED: AdjudicatedClaim[] = [
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "Backup, restore and message-level proof are all live, and the verifier needs no daemon access",
+    excerpts: [
+      "estore, and message-level proof are all live",
+      "cello_verify_inclusion_proof({ proof, message, certified_root })",
+      "— check such a proof; needs no daemon access",
+    ],
+    verdict: "corrected",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`inclusion-proof-handlers.ts` registers both handlers and `daemon.ts` wires them at the " +
+      "composition root — the same place every other session handler is registered. The claim this " +
+      "REPLACES was the false one: three shipped surfaces said `cello_get_inclusion_proof` returns " +
+      "`not_implemented`, which stopped being true when DOD-M15-INCLUSION-1 deleted that stub loop. " +
+      "`dod-m15-inclusion-1.test.ts` issues a proof and verifies it end to end. 'Needs no daemon " +
+      "access' is the strong half and it is measured: the DoD 9 test DELETES the daemon's database " +
+      "before verifying, so it is a fact about the run rather than a claim about the signature.",
+  },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "The proof binds the message's exact bytes to the notarized root — and does NOT establish that the root is genuine",
+    excerpts: [
+      "**What an inclusion proof does and does not establish.**",
+      "root the directory notarized: change one character and verification fails.",
+    ],
+    verdict: "true",
+    enforcedBy: "directory",
+    evidence:
+      "MEASURED, not asserted. `verifyInclusionProof` recomputes the leaf from the supplied bytes " +
+      "with the daemon's own `contentHashFor` and compares — so a one-character edit yields a " +
+      "different leaf and is refused (`message_does_not_match_leaf`), which the DoD 6 test drives by " +
+      "changing an amount from 41,500 to 41,600. The root the audit path lands on is the FROST-signed " +
+      "`sealed_root`: `session_certified_leaves` is written only after the Merkle root over it " +
+      "reproduces that value, and the handler re-derives it again on every read. The SECOND half of " +
+      "the sentence is the bound, and it is the honest one — this establishes nothing about whether " +
+      "the ROOT is genuine. The certificate's own signature does that, and it is checked elsewhere " +
+      "(`seal-coordinator.ts`, `verifyBilateralSealCertificate`).",
+  },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "Take the root from the certificate, never from the proof — a proof checked against its own root proves nothing",
+    excerpts: [
+      "So hand a third party BOTH: the proof and the",
+      "receipt. Pass `certified_root` from the receipt, never the root inside the proof; a proof checked",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "STRUCTURAL — `verifyInclusionProof` takes `certifiedRootHex` as a REQUIRED third parameter and " +
+      "compares the proof's own root against it. There is no default and no fallback, so a proof " +
+      "cannot be checked against itself; the IPC handler refuses `missing_certified_root` rather than " +
+      "reaching into the proof for one. A mutation that made the root default from the proof was run " +
+      "and was caught. This is M15's rule that a signature is proof only against something the signer " +
+      "does not control, applied to a Merkle root.",
+  },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
+    claim: "It refuses by name rather than proving something weaker",
+    excerpts: [
+      "It refuses rather than proving something weaker. `not_sealed_yet` (nothing is notarized yet),",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "Each named reason is a distinct return in `inclusion-proof-handlers.ts` and each has a test: " +
+      "`not_sealed_yet` (no certificate exists), `certified_leaves_unavailable` (the party that was " +
+      "ABSENT at seal time never receives the signed leaves, and its counterparty's copy can still " +
+      "issue the proof), `local_tree_diverged`, `session_unsalted`, `message_not_in_session`. " +
+      "'Nothing is notarized yet' is exact: `getSealCertificate` returning null is what that branch " +
+      "tests, and the mutation that swapped the reason string was caught.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "Backup, restore and message-level proof are all live, and the verifier needs no daemon access",
+    excerpts: [
+      "estore, and message-level proof are all live",
+      "cello_verify_inclusion_proof({ proof, message, certified_root })",
+      "— check such a proof; needs no daemon access",
+    ],
+    verdict: "corrected",
+    enforcedBy: "daemon-local",
+    evidence:
+      "`inclusion-proof-handlers.ts` registers both handlers and `daemon.ts` wires them at the " +
+      "composition root — the same place every other session handler is registered. The claim this " +
+      "REPLACES was the false one: three shipped surfaces said `cello_get_inclusion_proof` returns " +
+      "`not_implemented`, which stopped being true when DOD-M15-INCLUSION-1 deleted that stub loop. " +
+      "`dod-m15-inclusion-1.test.ts` issues a proof and verifies it end to end. 'Needs no daemon " +
+      "access' is the strong half and it is measured: the DoD 9 test DELETES the daemon's database " +
+      "before verifying, so it is a fact about the run rather than a claim about the signature.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "The proof binds the message's exact bytes to the notarized root — and does NOT establish that the root is genuine",
+    excerpts: [
+      "**What an inclusion proof does and does not establish.**",
+      "root the directory notarized: change one character and verification fails.",
+    ],
+    verdict: "true",
+    enforcedBy: "directory",
+    evidence:
+      "MEASURED, not asserted. `verifyInclusionProof` recomputes the leaf from the supplied bytes " +
+      "with the daemon's own `contentHashFor` and compares — so a one-character edit yields a " +
+      "different leaf and is refused (`message_does_not_match_leaf`), which the DoD 6 test drives by " +
+      "changing an amount from 41,500 to 41,600. The root the audit path lands on is the FROST-signed " +
+      "`sealed_root`: `session_certified_leaves` is written only after the Merkle root over it " +
+      "reproduces that value, and the handler re-derives it again on every read. The SECOND half of " +
+      "the sentence is the bound, and it is the honest one — this establishes nothing about whether " +
+      "the ROOT is genuine. The certificate's own signature does that, and it is checked elsewhere " +
+      "(`seal-coordinator.ts`, `verifyBilateralSealCertificate`).",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "Take the root from the certificate, never from the proof — a proof checked against its own root proves nothing",
+    excerpts: [
+      "So hand a third party BOTH: the proof and the",
+      "receipt. Pass `certified_root` from the receipt, never the root inside the proof; a proof checked",
+    ],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "STRUCTURAL — `verifyInclusionProof` takes `certifiedRootHex` as a REQUIRED third parameter and " +
+      "compares the proof's own root against it. There is no default and no fallback, so a proof " +
+      "cannot be checked against itself; the IPC handler refuses `missing_certified_root` rather than " +
+      "reaching into the proof for one. A mutation that made the root default from the proof was run " +
+      "and was caught. This is M15's rule that a signature is proof only against something the signer " +
+      "does not control, applied to a Merkle root.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "It refuses by name rather than proving something weaker",
+    excerpts: [
+      "It refuses rather than proving something weaker. `not_sealed_yet` (nothing is notarized yet),",
+    ],
+    verdict: "true",
+    enforcedBy: "daemon-local",
+    evidence:
+      "Each named reason is a distinct return in `inclusion-proof-handlers.ts` and each has a test: " +
+      "`not_sealed_yet` (no certificate exists), `certified_leaves_unavailable` (the party that was " +
+      "ABSENT at seal time never receives the signed leaves, and its counterparty's copy can still " +
+      "issue the proof), `local_tree_diverged`, `session_unsalted`, `message_not_in_session`. " +
+      "'Nothing is notarized yet' is exact: `getSealCertificate` returning null is what that branch " +
+      "tests, and the mutation that swapped the reason string was caught.",
+  },
   /**
    * ⚠️ DOD-M15-TIERTEXT-1's SIX ROWS WERE REMOVED, and the reason is a real dependency nobody wrote
    * down. They named `core/adapter-claude-code/src/bin/cello-mcp.ts (tool descriptions)`, and
