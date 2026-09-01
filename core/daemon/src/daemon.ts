@@ -128,6 +128,7 @@ import { registerCloseSessionHandler } from "./close-session-handler.js";
 import { createInboundSessions } from "./inbound-sessions.js";
 import { createOutboundSessions } from "./outbound-sessions.js";
 import { registerSessionReadHandlers } from "./session-read-handlers.js";
+import { registerInclusionProofHandlers } from "./inclusion-proof-handlers.js";
 import { pullSealCertificate } from "./seal-certificate-pull.js";
 import { createBackup, inspectBackup } from "./backup-restore.js";
 import { resolveCurrentAgentFor } from "./agent-selection.js";
@@ -4359,13 +4360,19 @@ async function startDaemonHoldingLock(
     };
   });
 
-  // ─── MCP-001: stubs for tools registered in cello-mcp.ts but not yet implemented ───
-  // These return not_implemented (same as session tools) so LLMs get consistent guidance.
-  for (const tool of ["cello_get_inclusion_proof"]) {
-    handlers.set(tool, async (_params, _connectionId) => {
-      return { ok: false, reason: "not_implemented", guidance: `'${tool}' is not yet implemented in the daemon. This feature will be available in a future milestone.` };
-    });
-  }
+  // DOD-M15-INCLUSION-1: prove one message sits under the certified root, and check such a proof.
+  //
+  // This replaces the last entry of the MCP-001 `not_implemented` stub loop, which by the end held
+  // exactly one tool — `cello_get_inclusion_proof` — so the loop goes with it rather than being left
+  // as an empty scaffold that reads like other tools are still pending.
+  registerInclusionProofHandlers({
+    handlers,
+    logger,
+    sessionNodeManager,
+    getConnState: (connectionId) => perConnectionState.get(connectionId),
+    resolveCurrentAgent,
+    NO_CURRENT_AGENT_RESPONSE,
+  });
 
   // DOD-M9B-SURFACE-1: the security layer's control surface. Registered here, defined in its own
   // module — it needs the cello dir, a logger, and the connection's client type, and nothing else

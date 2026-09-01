@@ -118,14 +118,25 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
 ];
 
 /**
- * Tools that exist ONLY on the MCP surface. Their daemon handlers return `not_implemented`, so
- * there is deliberately no CLI command to build a second broken path to. Listed so the audit test
- * can tell "known MCP-only" from "stale name".
+ * Tools that exist ONLY on the MCP surface. Listed so the audit test can tell "known MCP-only" from
+ * "stale name".
+ *
+ * ⚠️ THIS COMMENT USED TO READ *"Their daemon handlers return `not_implemented`, so there is
+ * deliberately no CLI command to build a second broken path to."* That was true of all three when it
+ * was written and is now true of NONE of them — `cello_backup` and `cello_restore` were implemented
+ * by `DOD-M15-BACKUP-1`, and `cello_get_inclusion_proof` by `DOD-M15-INCLUSION-1`, which also added
+ * `cello_verify_inclusion_proof`. Rewritten rather than deleted, per the claim-truth lens: the
+ * sentence is the evidence that "MCP-only" was once a synonym for "unimplemented", and a reader who
+ * still believes that would take a working tool for a stub.
+ *
+ * What the list means NOW: these are implemented capabilities with no CLI twin. Membership is a
+ * statement about SURFACE, not about readiness.
  */
 export const MCP_ONLY_TOOLS: readonly string[] = [
   "cello_backup",
   "cello_restore",
   "cello_get_inclusion_proof",
+  "cello_verify_inclusion_proof",
 ];
 
 /**

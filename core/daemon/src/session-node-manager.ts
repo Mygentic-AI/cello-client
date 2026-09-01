@@ -85,6 +85,8 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
+import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
+import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { addColumnIfMissing } from "./column-birth.js";
 import {
   GATEWAY_UNAVAILABLE,
@@ -2284,6 +2286,31 @@ export class SessionNodeManager {
         leaf_hash_hex TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
+        PRIMARY KEY (agent_id, session_id, leaf_index)
+      )
+    `);
+
+    // DOD-M15-INCLUSION-1: the leaf set the DIRECTORY certified — a different tree from the one
+    // above, and the distinction is the whole reason this table exists.
+    //
+    // `session_tree_leaves` holds this agent's CONTENT leaves. The certified root covers every leaf
+    // the relay ordered, CONTROL leaves included, and nothing appends a ctrl leaf to the local tree
+    // (`submitSealLeaf` computes its root without mutating it). So an audit path built from
+    // `session_tree_leaves` lands on a root no certificate names — it proves this machine agrees
+    // with itself, which is worth nothing to the third party a proof is FOR.
+    //
+    // Rows land only after the Merkle root over them reproduces the FROST-signed `sealed_root`
+    // (`certifiedLeafSetFrom`), so what is stored here is the consortium's leaf set and not the
+    // directory's word for it. Written once at seal time; read only by the inclusion-proof surface,
+    // ORDER BY leaf_index.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS session_certified_leaves (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        leaf_index INTEGER NOT NULL,
+        content_hash_hex TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        -- DOD-LOOP-1: composite key so each agent's end of a loopback session keeps its own set.
         PRIMARY KEY (agent_id, session_id, leaf_index)
       )
     `);
@@ -6235,6 +6262,99 @@ export class SessionNodeManager {
       return null;
     }
     return { sealed_root: row.sealed_root_hex, legibility };
+  }
+
+  /**
+   * DOD-M15-INCLUSION-1: keep the leaf set the certificate is signed over, so one message can later
+   * be proved to sit under it.
+   *
+   * REFUSES unless the hashes reproduce `sealedRootHex` — `certifiedLeafSetFrom` does that check and
+   * this method never bypasses it. That is what separates "the leaves the directory sent" from "the
+   * leaves the consortium signed", and only the second is worth storing: a proof built on the first
+   * would inherit whatever the directory chose to say.
+   *
+   * Idempotent (INSERT OR REPLACE keyed on leaf_index) so a re-delivered seal frame, or a unilateral
+   * seal later upgraded to bilateral, rewrites the same rows instead of failing or doubling them.
+   *
+   * @returns whether the set was accepted and stored.
+   */
+  recordCertifiedLeafSet(
+    agentName: string,
+    sessionId: string,
+    signedLeaves: readonly SealFrontierLeaf[],
+    sealedRootHex: string,
+    correlationId?: string,
+  ): boolean {
+    if (!this.#db) return false;
+    const resolved = certifiedLeafSetFrom(signedLeaves, sealedRootHex);
+    if (!resolved.ok) {
+      // LOUD, and it names which of the two it is. `sealed_leaves_root_disagrees` in particular is
+      // the directory shipping a leaf set that is not the one it signed — the receipt still stands
+      // (its own signature is checked elsewhere), but nothing in this session can be proved at
+      // message granularity until a set that reproduces the root arrives.
+      this.#logger.error("seal.certified_leaves.refused", {
+        agentName,
+        sessionId,
+        reason: resolved.reason,
+        detail: resolved.detail,
+        correlationId,
+        impact:
+          "the leaf set shipped with this seal is not the one the certificate is signed over, so no " +
+          "inclusion proof can be issued for this session; the sealed receipt itself is unaffected",
+        guidance:
+          "cello_get_inclusion_proof will refuse this session by name (certified_leaves_unavailable). " +
+          "Nothing local repairs it — the set has to arrive with a seal frame that reproduces the " +
+          "signed root.",
+      });
+      return false;
+    }
+    const now = Date.now();
+    try {
+      const stmt = this.#db.prepare(
+        `INSERT OR REPLACE INTO session_certified_leaves
+           (agent_id, session_id, leaf_index, content_hash_hex, recorded_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      );
+      const agentId = this.#requireAgentId(agentName);
+      for (let i = 0; i < resolved.leafHashes.length; i++) {
+        stmt.run(agentId, sessionId, i, resolved.leafHashes[i], now);
+      }
+    } catch (err: unknown) {
+      this.#logger.error("seal.certified_leaves.persist.failed", {
+        agentName,
+        sessionId,
+        reason: extractErrorMessage(err),
+        correlationId,
+        impact:
+          "this session's certified leaf set was verified but not written, so cello_get_inclusion_proof " +
+          "will refuse it by name until a later seal frame re-delivers the set",
+      });
+      return false;
+    }
+    this.#logger.info("seal.certified_leaves.recorded", {
+      agentName,
+      sessionId,
+      leafCount: resolved.leafHashes.length,
+      sealedRoot: sealedRootHex,
+      correlationId,
+    });
+    return true;
+  }
+
+  /**
+   * The certified leaf set, in order, or null when none was stored for this session.
+   *
+   * Null is a REFUSAL upstream, never a fallback to the local tree: the two cover different leaves
+   * and substituting one for the other is how a proof comes to land on a root nobody signed.
+   */
+  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null {
+    if (!this.#db) return null;
+    const rows = this.#db
+      .prepare(
+        "SELECT content_hash_hex FROM session_certified_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index ASC",
+      )
+      .all(this.#requireAgentId(agentName), sessionId) as Array<{ content_hash_hex: string }>;
+    return rows.length > 0 ? rows.map((r) => r.content_hash_hex) : null;
   }
 
   /**
