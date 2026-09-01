@@ -170,6 +170,8 @@ function deriveDialability(addrs: string[], configuredHosts: ReadonlySet<string>
 
 class CelloNodeImpl implements CelloNode {
   readonly #libp2p: Libp2p;
+  /** DOD-M15-RELAYSLOTS-1 — see `reserveRelaySlot`. */
+  readonly #circuitTransport: CircuitTransportHandle | null;
   #connectionMonitorPolicy: ResolvedConnectionMonitorConfig = { abortConnectionOnPingFailure: true };
   readonly keyProvider: KeyProvider;
   // Dialability observable, updated on each AutoNAT probe cycle (surfaced by
@@ -222,7 +224,12 @@ class CelloNodeImpl implements CelloNode {
     expectsDirectListener: boolean,
     hasCircuitListen: boolean,
     dropAutonatResponder: boolean = false,
+    // DOD-M15-RELAYSLOTS-1: the circuit transport instance, so a reservation can be taken on
+    // demand AFTER authenticating rather than automatically at construction. Null on a node built
+    // without circuit transport.
+    circuitTransport: CircuitTransportHandle | null = null,
   ) {
+    this.#circuitTransport = circuitTransport;
     this.#libp2p = libp2p;
     this.keyProvider = keyProvider;
     this.#configuredHosts = configuredHosts;
@@ -628,6 +635,31 @@ class CelloNodeImpl implements CelloNode {
     if (!reservations.has(peerId)) return false;
     reservations.delete(peerId);
     return true;
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 — take a circuit reservation on demand. See the interface declaration for
+   * why the ordering matters; this method exists so the client can authenticate FIRST.
+   */
+  async reserveRelaySlot(relayPeerIdStr: string): Promise<boolean> {
+    const handle = this.#circuitTransport;
+    if (!handle) return false;
+    let peerId: ReturnType<typeof peerIdFromString>;
+    try {
+      peerId = peerIdFromString(relayPeerIdStr);
+    } catch {
+      return false;
+    }
+    if (handle.reservationStore.hasReservation(peerId)) return true;
+    try {
+      await handle.reservationStore.addRelay(peerId, "configured");
+    } catch {
+      // The relay refused, or the connection was not usable. The CALLER decides what that means —
+      // for a standing receiver it is "no slot here, try another relay" — so this reports rather
+      // than throws, and never pretends a reservation exists.
+      return handle.reservationStore.hasReservation(peerId);
+    }
+    return handle.reservationStore.hasReservation(peerId);
   }
 
   async hangUp(peerIdStr: string): Promise<void> {
@@ -1045,7 +1077,22 @@ export function resolveConnectionMonitorConfig(opts: {
   };
 }
 
+/**
+ * DOD-M15-RELAYSLOTS-1 — the slice of libp2p's circuit transport we drive directly.
+ *
+ * Deliberately narrow: only what `reserveRelaySlot` needs. A wider handle would invite reaching
+ * into libp2p's internals, and this is already the least-public thing in this file.
+ */
+interface CircuitTransportHandle {
+  reservationStore: {
+    addRelay(peerId: ReturnType<typeof peerIdFromString>, type: "configured" | "discovered"): Promise<unknown>;
+    hasReservation(peerId: ReturnType<typeof peerIdFromString>): boolean;
+  };
+}
+
 export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
+  // Captured by the wrapped transport factory below; null on a node whose transports never built.
+  let circuitTransportRef: CircuitTransportHandle | null = null;
   // HOP relay: service nodes keep it (deployed-relay compatibility); client node
   // types must opt in explicitly via relayServer.
   const includeRelayServer = opts.relayServer?.enabled ?? opts.nodeType === undefined;
@@ -1099,8 +1146,24 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     transports: [
       tcp(),
       webSockets(),
-      // Circuit relay transport enables dialing via relay addresses
-      circuitRelayTransport(),
+      /**
+       * DOD-M15-RELAYSLOTS-1 — the circuit transport is WRAPPED so we keep a handle to the
+       * instance, which is what makes `reserveRelaySlot` possible.
+       *
+       * A reservation is normally taken automatically at node construction, from the `/p2p-circuit`
+       * entry in `listenAddresses`. That ordering is the whole reason the relay could not gate on
+       * anything: the slot is requested before the client has said who it is, so the relay decides
+       * knowing only a peer id. Holding the transport lets the caller dial, prove itself, and THEN
+       * ask for the slot — at which point the relay can refuse a stranger outright.
+       *
+       * Wrapping our own factory rather than reaching into `libp2p.components` keeps this to the
+       * public surface: we construct it, so we may keep it.
+       */
+      (components: Parameters<ReturnType<typeof circuitRelayTransport>>[0]) => {
+        const transport = circuitRelayTransport()(components);
+        circuitTransportRef = transport as unknown as CircuitTransportHandle;
+        return transport;
+      },
     ],
     connectionEncrypters: [
       // Noise ONLY — no plaintext. SI-001.
@@ -1162,7 +1225,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // Return node in STOPPED state — caller must call start()
   const expectsDirectListener =
     hasCircuitListen && opts.listenAddresses.some((a) => !a.includes("/p2p-circuit"));
-  const node = new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder);
+  const node = new CelloNodeImpl(libp2p, opts.keyProvider, configuredHosts, expectsDirectListener, hasCircuitListen, !includeAutonatResponder, circuitTransportRef);
   node.setConnectionMonitorPolicy(connectionMonitorPolicy);
   node.setConnectionLimits(connectionLimits);
   if (opts.idleConnectionReaper) {
