@@ -591,6 +591,37 @@ describe("WHICH reason the peer gave survives to the operator — 006-CRYPTO fin
     expect(String(said[0]!.ctx!["guidance"])).not.toMatch(/already hashed messages/i);
   }, 60_000);
 
+  it("★ a SUSPENDED session does not report itself as salted — 006-CRYPTO finding 3", async () => {
+    /**
+     * `content_hashes_salted` was read off the stored column alone. A suspended salt keeps its bytes
+     * on disk deliberately — a salt kept is recoverable, a salt erased is not — while
+     * `#saltForHashing` returns null and every message goes out `sha256`. So the flag said `true` at
+     * the exact moment the session stopped salting.
+     *
+     * And it is worse than a wrong boolean: the field is emitted to the agent ONLY when `false`, so
+     * the agent saw no field at all, which reads as "not unsalted". The field exists to tell
+     * "unsalted because this build predates the feature" from "unsalted because adoption was
+     * refused" — and the refused case was the one it could not report.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-suspended-status-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+
+    const before = fx.snm.getSessionsForAgent("alice").find((s) => s.session_id === SID);
+    expect(
+      before?.["content_hashes_salted"],
+      "PRECONDITION: it really is salted before the peer closes, or the assertion below proves nothing",
+    ).toBe(true);
+
+    await fx.snm.handleSaltFrameForTest("alice", SID, { adoptionClosed: "already_hashing" });
+
+    const after = fx.snm.getSessionsForAgent("alice").find((s) => s.session_id === SID);
+    expect(
+      after?.["content_hashes_salted"],
+      "the session is suspended and hashing sha256 — reporting it as salted hides the one case this field was added for",
+    ).toBe(false);
+  }, 60_000);
+
   it("★ an UNKNOWN label asserts nothing about the counterparty", async () => {
     /**
      * The default must be the non-asserting reason, not the most common one. This string is chosen

@@ -5802,11 +5802,27 @@ export class SessionNodeManager {
    * BLOB to a listing surface that has no use for it; the boolean is the whole question a reader of
    * this list is asking, and shipping key material to answer a yes/no is not a trade worth making.
    */
-  #saltStatusOf(row: SessionRecord): SessionRecord {
+  /**
+   * ⚠️ THE STORED COLUMN IS NOT THE ANSWER ON ITS OWN — 006-CRYPTO finding 3.
+   *
+   * A SUSPENDED salt keeps its bytes on disk deliberately (`DOD-M15-SALTSPLIT-1`: a salt kept is
+   * recoverable, a salt erased is not), while `#saltForHashing` returns null for it and every
+   * message goes out `sha256`. Reading the column alone therefore reported `true` at the exact
+   * moment the session had STOPPED salting — and because the field is emitted only when `false`,
+   * the agent saw nothing at all, which reads as "not unsalted".
+   *
+   * That is precisely the case this field was added for. Its own note above says it exists to tell
+   * *"unsalted because this build predates the feature"* from *"unsalted because adoption was
+   * refused"*, and the refused case was the one it could not report.
+   */
+  #saltStatusOf(row: SessionRecord, agentName: string | null): SessionRecord {
     const { content_salt, ...rest } = row as SessionRecord & { content_salt?: Uint8Array | null };
+    const stored = content_salt != null && content_salt.length > 0;
+    const suspended =
+      agentName !== null && this.#saltSuspended.has(this.#k(agentName, String(row.session_id)));
     return {
       ...rest,
-      content_hashes_salted: content_salt != null && content_salt.length > 0,
+      content_hashes_salted: stored && !suspended,
     } as SessionRecord;
   }
 
@@ -5818,7 +5834,7 @@ export class SessionNodeManager {
     const rows = this.#db
       .prepare("SELECT * FROM sessions WHERE agent_id = ? ORDER BY updated_at DESC")
       .all(this.#requireAgentId(agentName)) as unknown as SessionRecord[];
-    return rows.map((r) => ({ ...this.#saltStatusOf(r), agent_name: agentName }));
+    return rows.map((r) => ({ ...this.#saltStatusOf(r, agentName), agent_name: agentName }));
   }
 
   /**
@@ -5838,7 +5854,12 @@ export class SessionNodeManager {
          ORDER BY s.updated_at DESC`,
       )
       .all()
-      .map((r) => this.#saltStatusOf(r as SessionRecord)) as unknown as SessionRecord[];
+      // The joined display name is what `#saltSuspended` is keyed on. NULL only where the agent row
+      // is missing — an orphaned session, which has no live in-memory state to be suspended in.
+      .map((r) => {
+        const row = r as SessionRecord & { agent_name?: string | null };
+        return this.#saltStatusOf(row, row.agent_name ?? null);
+      }) as unknown as SessionRecord[];
   }
 
   /**
