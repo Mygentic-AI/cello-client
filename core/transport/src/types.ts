@@ -358,6 +358,43 @@ export interface CelloNode {
   hangUp(peerId: string): Promise<void>;
 
   /**
+   * DOD-M15-RELAYSLOTS-1 — release the circuit RESERVATION this relay is holding for `peerId`.
+   * Returns true if one was held and is now gone.
+   *
+   * ⚠️ **`hangUp` DOES NOT DO THIS, AND THAT IS THE WHOLE REASON THIS EXISTS.** Verified against
+   * `@libp2p/circuit-relay-v2@4.2.3`: the server's `removeReservation` is called from exactly one
+   * place — the catch when writing the confirmation frame fails — and there is no connection-close
+   * or disconnect listener anywhere in its server. A reservation therefore survives its holder's
+   * disconnect for the full `reservationTtl`, which defaults to TWO HOURS.
+   *
+   * The consequence, measured rather than assumed: a relay could evict a peer, watch its own ledger
+   * drop, report itself well under capacity, and still be holding that reservation against libp2p's
+   * 4096 limit for two hours. Every reclaim path the relay has — the grace-window revoke, the
+   * reaper, the unproven-budget eviction — was freeing bookkeeping and not capacity.
+   *
+   * No-op on a node with no relay service, and on a peer holding no reservation.
+   */
+  releaseRelayReservation(peerId: string): boolean;
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 — ask `relayPeerId` for a circuit reservation NOW, rather than having taken
+   * one automatically at node construction. Resolves true if a reservation is held afterwards.
+   *
+   * ⚠️ **THE ORDERING IS THE POINT, and it is the whole fix for this order.** A reservation is
+   * normally requested from the `/p2p-circuit` entry in `listenAddresses`, which happens before the
+   * client has told the relay anything about itself — so the relay must decide knowing only a peer
+   * id, which is free to generate. That is why a machine with no registered agent could hold slots
+   * at all, and why every attempt to bound it afterwards was a heuristic rather than a gate.
+   *
+   * Build the node WITHOUT a `/p2p-circuit` listen address, dial the relay, prove yourself over
+   * `/cello/relay/1.0.0`, then call this. The relay can now refuse a stranger at the door.
+   *
+   * Requires an existing non-relayed connection to the relay — libp2p will not reserve over a
+   * circuit. Returns false, rather than throwing, on a node with no circuit transport.
+   */
+  reserveRelaySlot(relayPeerId: string): Promise<boolean>;
+
+  /**
    * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed
    * (direct) connection to peerId. Used by the transport selector's dcutr path to
    * observe whether a relay-fallback connection has been hole-punch upgraded to
