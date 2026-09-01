@@ -45,6 +45,38 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     ).toBe(SID);
   }, 60_000);
 
+  it("★★ RE-ENTERING the activation path does NOT mint a second keypair", async () => {
+    /**
+     * ⚠️ THIS TEST EXISTS BECAUSE A MUTATION PROVED THE LAST ONE DID NOT COVER IT. Deleting the
+     * idempotence guard left every test green: "opening a session mints exactly one" only ever calls
+     * the mint path ONCE, so it cannot tell an idempotent mint from one that overwrites.
+     *
+     * A reconnect can re-enter an activation path. Minting a second keypair there would leave the
+     * two sides deriving against a moving value, and the symptom — a session that reconnects and
+     * still cannot agree — reads as a network fault rather than as a bug here.
+     *
+     * Asserts the VALUE is unchanged, not just that the count stayed at one: an implementation that
+     * replaced the keypair and logged nothing would satisfy a count.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-once-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const first = fx.snm.sessionEphemeralPublicForTest("alice", SID);
+    expect(first, "PRECONDITION: a keypair exists to be preserved").not.toBeNull();
+
+    fx.snm.mintSessionEphemeralForTest("alice", SID);
+
+    const second = fx.snm.sessionEphemeralPublicForTest("alice", SID);
+    expect(
+      Buffer.from(second!).toString("hex"),
+      "a second keypair replaced the first mid-session; the peer is now holding a public half we no longer have the secret for",
+    ).toBe(Buffer.from(first!).toString("hex"));
+    expect(
+      fx.eventsNamed("session.ephemeral.minted").length,
+      "and it must not even claim to have minted twice",
+    ).toBe(1);
+  }, 60_000);
+
   it("★ the log NEVER carries the secret — only a prefix of the PUBLIC half", async () => {
     /**
      * A secret in a log line is a secret on disk, in a support bundle, and in whatever ships a log

@@ -10592,6 +10592,28 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seams: re-enter the mint path, and read back the PUBLIC half — 006-CRYPTO.
+   *
+   * `#mintSessionEphemeral` is idempotent because a reconnect can re-enter an activation path, and a
+   * second keypair mid-session would leave the two sides deriving against a moving value. Proving
+   * that needs the path called TWICE, and the alternative — driving a real reconnect — drags in node
+   * rebuild and relay reconnection, none of which the property is about. Same justification as
+   * `forgetSaltContributionForTest` above.
+   *
+   * It calls the REAL private method, so a test cannot pass against a decision production does not
+   * make. The reader returns the public half ONLY: a seam that could hand out the secret is a way
+   * for the secret to leave this object, which is the one thing the whole unit is about.
+   */
+  mintSessionEphemeralForTest(agentName: string, sessionId: string): void {
+    this.#mintSessionEphemeral(agentName, sessionId);
+  }
+
+  sessionEphemeralPublicForTest(agentName: string, sessionId: string): Uint8Array | null {
+    const e = this.#sessionEphemeralFor(agentName, sessionId);
+    return e ? Uint8Array.from(e.publicKey) : null;
+  }
+
+  /**
    * Test seam: deliver an inbound salt frame, exactly as the content-stream decoder does.
    *
    * 006-CRYPTO finding 2. WHICH of the four reasons the peer gave decides what the operator is told,
