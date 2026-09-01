@@ -18,6 +18,7 @@ import { classifySession, type SessionCategory } from "./session-category.js";
 import { validateSessionName } from "./session-name.js";
 import { renderFrontierMismatch, type FrontierMismatchStore } from "./frontier-mismatch.js";
 import { describeSealFailed, type SealFailure } from "./seal-failure-store.js";
+import { contentEncryptionGuidanceFor } from "./content-encryption-status.js";
 
 export interface SessionReadDeps {
   /** DOD-FRONTIER-STRAND-1 AC3: retained mismatches, surfaced on the session LIST (the AC's surface). */
@@ -408,6 +409,17 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       // WHITELIST — adding the field to the session record alone left it invisible here, which is
       // the no-reader defect this whole line is about, reproduced inside the fix for it.
       ...(row.content_hashes_salted === false ? { contentHashesSalted: false as const } : {}),
+      // 006-CRYPTO: same whitelist, same trap — a field on the record alone never reaches the agent.
+      // Carries the GUIDANCE, not the reason code: the code is for a log, and an agent reading this
+      // has to be able to tell an operator what it means without looking anything up.
+      ...(row.content_encrypted === false
+        ? {
+            contentEncrypted: false as const,
+            ...(row.content_encryption_reason
+              ? { contentEncryptionGuidance: contentEncryptionGuidanceFor(row.content_encryption_reason) }
+              : {}),
+          }
+        : {}),
       // Review HIGH-2: present only while a ceremony is actually in flight, so it stays a signal.
       ...(isSealing(row.agent_name, row.session_id) ? { sealing: true } : {}),
       messageCount,

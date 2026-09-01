@@ -31,6 +31,7 @@ import {
   SALT_FREEZE_GUIDANCE,
   type SaltAgreementFrame,
 } from "./session-salt-agreement.js";
+import { CONTENT_ENCRYPTION_REASONS } from "./content-encryption-status.js";
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -57,7 +58,10 @@ import { SessionConnectionGater } from "./session-connection-gater.js";
 import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
-import { verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES } from "@cello-protocol/crypto";
+import {
+  verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES,
+  generateSessionEphemeral, destroySessionEphemeral, type SessionEphemeral,
+} from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 // `PARK_ENVELOPE_REASONS` is deliberately NOT imported here. The reason codes are compared inside
@@ -1311,6 +1315,26 @@ export class SessionNodeManager {
    * to a non-asserting reason — the peer chooses these bytes.
    */
   #saltPeerClosedLabel = new Map<string, string>();
+  /**
+   * THIS SESSION'S THROWAWAY KEYPAIR — `DOD-M15-KEYAGREE-1`, the lifecycle half (006-CRYPTO).
+   *
+   * **A `Map`, never a field on the session row, and that is the whole point.** The secret is held
+   * in memory and nowhere else: not in SQLite, not in a backup, not in an export. Forward secrecy is
+   * not a property of minting a fresh key — it is a property of the old one being GONE — so anything
+   * that made this durable would void it permanently and silently.
+   *
+   * Minted ONCE per session, at the moment the session becomes active, and destroyed by
+   * `#evictSessionCaches` when it tears down. A revived session therefore mints a FRESH one and
+   * re-keys, which is Decisions Carried #5 and is correct: the old secret did not survive, so there
+   * is nothing to be consistent with.
+   *
+   * ⚠️ NOTHING SENDS THE PUBLIC HALF YET. The exchange, the signature over it, and encrypting
+   * content with the agreed secret are `007-CRYPTO`, and they are one wire format that ships
+   * together. Until that lands, this keypair is minted, held and destroyed correctly and no message
+   * is encrypted with it — which `#contentEncryptionStatus` states on the session itself rather than
+   * leaving a reader to assume.
+   */
+  #sessionEphemerals = new Map<string, SessionEphemeral>();
   /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
@@ -4138,6 +4162,9 @@ export class SessionNodeManager {
     });
 
     // Add to active map (keyed by (agentName, sessionId) — DOD-LOOP-1)
+    // 006-CRYPTO: the session's throwaway keypair is minted here, with the node, so "a session is
+    // active" and "a session has a key" are the same moment. All THREE activation paths mint.
+    this.#mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
@@ -4941,6 +4968,9 @@ export class SessionNodeManager {
     // Remove this agent's standing receiver from the slot and add to active map. The handed-off
     // node keeps its AutoNAT service (it continues to surface dialability).
     this.#standingReceivers.delete(agentName);
+    // 006-CRYPTO: the hand-off path. A session promoted out of the standing receiver is as new as
+    // one opened outbound, so it mints here too.
+    this.#mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
@@ -5192,6 +5222,25 @@ export class SessionNodeManager {
     this.#saltRepairedAgainst.delete(key);
     this.#saltRepairedAgainstFingerprint.delete(key);
     this.#saltPeerClosedLabel.delete(key);
+    /**
+     * DESTROY THE THROWAWAY SECRET — 006-CRYPTO, and this is what forward secrecy actually is.
+     *
+     * Zeroed, then dropped. Dropping the map entry alone would leave the bytes for the garbage
+     * collector to move around at its leisure; `destroySessionEphemeral` overwrites the buffer we
+     * hold, which is the one copy we control.
+     *
+     * ⚠️ THIS RUNS AFTER THE SEAL, and that is a property of WHERE it is called, not of this line.
+     * Both teardown paths reach here at the end: the sealing path retires the node once the
+     * ceremony is finished, and the destroy path is a session that is already over. Moving this
+     * call earlier — into a close handler, or before the seal — would zero the key while the
+     * ceremony still needs the session, so the ordering is load-bearing.
+     */
+    const ephemeral = this.#sessionEphemerals.get(key);
+    if (ephemeral) {
+      destroySessionEphemeral(ephemeral);
+      this.#sessionEphemerals.delete(key);
+      this.#logger.debug("session.ephemeral.destroyed", { agentName, sessionId });
+    }
     /**
      * B2b-2's three, and the pending one is SETTLED rather than dropped.
      *
@@ -5933,6 +5982,8 @@ export class SessionNodeManager {
     return {
       ...rest,
       content_hashes_salted: stored && !suspended,
+      content_encrypted: false,
+      content_encryption_reason: CONTENT_ENCRYPTION_REASONS.NO_KEY_EXCHANGE,
     } as SessionRecord;
   }
 
@@ -10450,6 +10501,41 @@ export class SessionNodeManager {
    * obvious place to put one. A session that shipped it there could not be repaired: the relay
    * would already hold the salt and every hash it protects.
    */
+  /**
+   * MINT THIS SESSION'S THROWAWAY KEYPAIR — once, at the moment the session becomes active.
+   *
+   * Idempotent on purpose. Three paths make a session active (open, hand-off from the standing
+   * receiver, revive) and a reconnect can re-enter them; minting a second keypair mid-session would
+   * leave the two sides deriving against a moving value, and the symptom — a session that reconnects
+   * and still cannot agree — reads as a network fault rather than as a bug here. `#saltContributionFor`
+   * mints once for exactly the same reason.
+   *
+   * A REVIVED session is not an exception. `#evictSessionCaches` destroyed the previous secret at
+   * teardown and it was never persisted, so there is nothing left to be consistent with: a revival
+   * mints fresh and re-keys (Decisions Carried #5).
+   */
+  #mintSessionEphemeral(agentName: string, sessionId: string): void {
+    const key = this.#k(agentName, sessionId);
+    if (this.#sessionEphemerals.has(key)) return;
+    this.#sessionEphemerals.set(key, generateSessionEphemeral());
+    this.#logger.debug("session.ephemeral.minted", {
+      agentName, sessionId,
+      // The PUBLIC half only, and only a prefix of it. The secret must never reach a log line, and
+      // an operator correlating two daemons needs an identifier rather than the value.
+      publicKeyPrefix: Buffer.from(this.#sessionEphemerals.get(key)!.publicKey.subarray(0, 8)).toString("hex"),
+    });
+  }
+
+  /**
+   * Our throwaway keypair for a session, WITHOUT minting one — the read-only counterpart.
+   *
+   * `null` means the session is not active here. It never means "mint one now": minting outside
+   * `#mintSessionEphemeral` is how a second keypair appears mid-session.
+   */
+  #sessionEphemeralFor(agentName: string, sessionId: string): SessionEphemeral | null {
+    return this.#sessionEphemerals.get(this.#k(agentName, sessionId)) ?? null;
+  }
+
   #saltContributionFor(agentName: string, sessionId: string): Uint8Array {
     const key = this.#k(agentName, sessionId);
     let contribution = this.#saltContributions.get(key);
@@ -13823,6 +13909,10 @@ export class SessionNodeManager {
     // different `impact` text — one event name standing for two meanings, fired twice for a single
     // condition. `#reconnectRevivedSessionRelay` takes it as a parameter now.
     const persistedRelay = this.getPersistedRelayEndpoint(agentName, sessionId);
+    // 006-CRYPTO: a REVIVED session mints a FRESH keypair and re-keys — Decisions Carried #5. The
+    // previous secret was destroyed at teardown and was never persisted, so there is nothing to be
+    // consistent with; the salt, which IS persisted, is re-read from the row instead.
+    this.#mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(key, {
       node,
       agentName,

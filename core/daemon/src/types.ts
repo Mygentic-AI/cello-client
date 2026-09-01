@@ -547,6 +547,15 @@ export interface SessionRecord {
    * their setup. Absent on records that did not come from a listing surface.
    */
   content_hashes_salted?: boolean;
+  /**
+   * 006-CRYPTO — whether CELLO's OWN encryption is protecting this session's message bodies, and
+   * why not when it is not. `false` in every build until `007-CRYPTO` ships the key exchange.
+   *
+   * Separate from `content_hashes_salted`: the salt stops a relay CONFIRMING a guess at a stored
+   * hash, this stops it READING the message. Absent on records that did not come from a listing.
+   */
+  content_encrypted?: boolean;
+  content_encryption_reason?: string;
   session_id: string;
   /**
    * The STABLE key this row is scoped by. Every `sessions` query joins on this, never on
@@ -624,6 +633,17 @@ export interface SessionListEntry {
    * because adoption was refused*, and only the second says anything about their setup.
    */
   contentHashesSalted?: false;
+  /**
+   * 006-CRYPTO — present ONLY when CELLO is not encrypting this session's message bodies itself.
+   *
+   * Its absence will be the healthy case once `007-CRYPTO` lands; today it is present on every
+   * session, and that is the truth about this build rather than a fault in the session. It is here
+   * so no reader has to infer the state from silence — the failure this whole line exists to end
+   * was a key agreement that had tests, a header claiming forward secrecy, and no caller.
+   */
+  contentEncrypted?: false;
+  /** What that means for the operator. Never a bare code — a bare code is not an affordance. */
+  contentEncryptionGuidance?: string;
   sessionId: string;
   agentName: string;
   counterpartyPubkey: string;
