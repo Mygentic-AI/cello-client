@@ -10656,6 +10656,23 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seam: INSTALL a keypair the caller already holds — the only way to prove ZEROING.
+   *
+   * Presence is easy to assert and is not the property. `destroySessionEphemeral` overwrites the
+   * buffer before the entry is dropped, and a mutant that drops without overwriting leaves the
+   * secret wherever the collector last moved it while passing every presence check — which is
+   * exactly what happened: the shutdown zeroing shipped with a surviving mutant, and the transport
+   * seeds four lines above it have the same untested gap today.
+   *
+   * The direction matters. Nothing here HANDS OUT a secret — the test supplies an object it already
+   * owns and then inspects its own reference. A reader that returned the live keypair would be a
+   * path for the secret to leave this object, which is the one thing this unit exists to prevent.
+   */
+  setSessionEphemeralForTest(agentName: string, sessionId: string, ephemeral: SessionEphemeral): void {
+    this.#sessionEphemerals.set(this.#k(agentName, sessionId), ephemeral);
+  }
+
+  /**
    * Test seam: deliver an inbound salt frame, exactly as the content-stream decoder does.
    *
    * 006-CRYPTO finding 2. WHICH of the four reasons the peer gave decides what the operator is told,

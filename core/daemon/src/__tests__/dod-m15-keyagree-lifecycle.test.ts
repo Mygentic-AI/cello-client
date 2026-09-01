@@ -25,6 +25,7 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { generateSessionEphemeral } from "@cello-protocol/crypto";
 
 const SID = "7c".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
@@ -164,12 +165,49 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
     expect(fx.eventsNamed("session.ephemeral.minted").length).toBe(1);
 
+    // A keypair THIS TEST owns, so the buffer can be inspected after the daemon is done with it.
+    // Asserting the event alone would pass for an implementation that logs and never overwrites.
+    const mine = generateSessionEphemeral();
+    fx.snm.setSessionEphemeralForTest("alice", SID, mine);
+    expect(mine.secretKey.some((b) => b !== 0), "PRECONDITION: a real secret to destroy").toBe(true);
+
     await fx.snm.destroySessionNode("alice", SID, "sealed");
 
     expect(
       fx.eventsNamed("session.ephemeral.destroyed").length,
       "the session ended and its key outlived it",
     ).toBe(1);
+    expect(
+      mine.secretKey.every((b) => b === 0),
+      "the entry was dropped without ZEROING it — the bytes are still wherever the collector left them",
+    ).toBe(true);
+  }, 60_000);
+
+  it("★★ SHUTDOWN zeroes every live session's secret, not just the map", async () => {
+    /**
+     * The transport seeds are zeroed four lines above this in `gracefulShutdown`, for a reason that
+     * applies identically: shutdown marks rows `interrupted` by direct SQL, so no per-session
+     * teardown fires, and this process is known to linger — a `cello logout` was measured still
+     * alive 30+ seconds later.
+     *
+     * ⚠️ THIS TEST EXISTS BECAUSE THE MUTANT SURVIVED. Deleting the `destroySessionEphemeral` call
+     * and keeping `.clear()` passed everything: the map was empty either way, so every presence
+     * assertion held while the secrets stayed in memory. Only a reference the test owns can tell
+     * the two apart.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-shutdown-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+
+    const mine = generateSessionEphemeral();
+    fx.snm.setSessionEphemeralForTest("alice", SID, mine);
+    expect(mine.secretKey.some((b) => b !== 0), "PRECONDITION: a real secret to destroy").toBe(true);
+
+    await fx.snm.gracefulShutdown();
+
+    expect(
+      mine.secretKey.every((b) => b === 0),
+      "the daemon shut down and left a live session's secret in memory for as long as the process lingers",
+    ).toBe(true);
   }, 60_000);
 
   it("★★ the key SURVIVES while a seal is in flight — it is not destroyed early", async () => {
