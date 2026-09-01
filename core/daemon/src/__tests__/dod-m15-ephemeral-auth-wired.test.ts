@@ -36,6 +36,7 @@ import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { LEAF_KIND_DOC } from "../session-relay-client.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { encodeCbor } from "@cello-protocol/protocol-types";
@@ -316,6 +317,34 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
       f["type"] === "content_frame" &&
       Buffer.from(f["content_bytes"] as Uint8Array).toString("hex").includes(Buffer.from(content).toString("hex")));
     expect(leaked, "the plaintext reached the wire").toBeUndefined();
+  }, 60_000);
+
+  it("★★ a DOCUMENT update crosses the same encrypted path — DoD 5, tested not assumed", async () => {
+    /**
+     * Documents ride the SAME `content_frame` as messages, so the encryption covers them for free.
+     * "For free" is exactly the reasoning that produces an untested claim, and the clause says
+     * tested rather than assumed — the document hook is handed the body AFTER decryption, and if it
+     * ever received the sealed form instead, collaboration would break with no message-path symptom
+     * to notice it by.
+     */
+    const { A, B } = await liveSession();
+    await wait(600);
+
+    const routed: Uint8Array[] = [];
+    B.manager.setOnDocumentFrame((_agent, _sid, content) => { routed.push(content); return { consumed: true }; });
+
+    // A document update is a content send with the DOC leaf kind.
+    const update = new TextEncoder().encode("yjs-update-bytes-stand-in");
+    const sent = await A.manager.sendContent("alice", SID, update, msgLeafHash(update), "corr-doc", LEAF_KIND_DOC) as { ok: boolean; delivered?: boolean };
+    expect(sent.delivered, "the document update did not go direct").toBe(true);
+
+    await pollFor(() => (routed.length > 0 ? routed : null));
+    expect(routed.length, "the document layer never saw the update").toBeGreaterThan(0);
+    expect(
+      Buffer.from(routed[0]!).toString("hex"),
+      "the document layer was handed the SEALED bytes — collaboration would break with nothing on " +
+        "the message path to notice it by",
+    ).toBe(Buffer.from(update).toString("hex"));
   }, 60_000);
 
   it("★★ an UNSIGNED ephemeral STOPS the session — it does not carry on unencrypted", async () => {
