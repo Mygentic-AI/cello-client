@@ -13993,6 +13993,9 @@ export class SessionNodeManager {
        * its own relay-discovery made. The agent would hold a slot nobody could dial through.
        */
       let candidateNode: CelloNode | undefined;
+      // Set when the relay refused the AGENT rather than being unwilling itself: every other relay
+      // in the pool answers identically, so the walk ends here rather than reproducing it N times.
+      let candidateRefusedAgent = false;
       for (let attempt = 0; attempt < 2; attempt++) {
       const candidate = await this.#createAgentNode(agentName, {
         sessionId,
@@ -14060,6 +14063,26 @@ export class SessionNodeManager {
               "unwell, so every other relay would refuse it identically. Stopped here; " +
               "cello_status carries the cause and what to do about it.",
           });
+          candidateRefusedAgent = true;
+          break;
+        }
+        /**
+         * ⚠️ RETRY ONLY WHAT A PROOF CAN FIX. The second attempt exists because the relay now
+         * remembers this transport identity; if the proof did not land, it remembers nothing and
+         * the retry is a node build and a dial spent to be refused identically. Only `proven`
+         * earns the retry — everything else moves to the next relay.
+         */
+        if (verdict !== "proven") {
+          this.#srLastRejectionReason.set(agentName, "relay_proof_refused");
+          this.#logger.warn("session.standing_receiver.relay.rejected", {
+            agentName,
+            circuitAddr,
+            reason: "relay_proof_refused",
+            attempts: attempt + 1,
+            correlationId,
+            impact: "this relay would not take the agent's proof, so it will refuse the retry the " +
+              "same way. Moving to the next relay rather than asking this one twice.",
+          });
           break;
         }
         continue;
@@ -14099,6 +14122,7 @@ export class SessionNodeManager {
       break;
       }
       if (candidateNode) return { node: candidateNode, seed: candidateSeed };
+      if (candidateRefusedAgent) break;
     }
 
     const plainSeed = randomBytes(32);
@@ -14446,6 +14470,18 @@ export class SessionNodeManager {
             impact: "the relay refused this agent rather than being unwilling or unwell, so every " +
               "other relay refuses it the same way. The session comes up reachable only via the " +
               "relay park route; cello_status carries the cause.",
+          });
+          break;
+        }
+        // Only a landed proof earns the retry — see the same rule in `#startReceiverNode`.
+        if (verdict !== "proven") {
+          this.#logger.warn("session.revive.reservation.declined", {
+            agentName,
+            sessionId,
+            circuitAddr,
+            reason: "relay_proof_refused",
+            impact: "this relay would not take the agent's proof, so asking it again would be " +
+              "refused the same way. Trying the next relay.",
           });
           break;
         }

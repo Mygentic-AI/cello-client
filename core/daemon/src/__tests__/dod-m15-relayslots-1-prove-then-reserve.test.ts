@@ -217,8 +217,14 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
 
     expect(
       relay.proofAttempts.map((p) => p.relayPeerId),
-      "a relay-side fault is the one case where the next relay genuinely helps",
+      "a relay-side fault is the one case where the next relay genuinely helps — and A is asked " +
+        "ONCE, because the retry exists only to use a proof that landed, and this one did not",
     ).toEqual([RELAY_A, RELAY_B]);
+    expect(
+      factory.asks.filter((a) => a.circuits[0] === CIRCUIT_A).length,
+      "one node build for A, not two: retrying a relay that refused the proof spends a build and a " +
+        "dial to be refused identically",
+    ).toBe(1);
     expect(
       mgr.isRelayQuarantined("alice", RELAY_A),
       "and it must not be asked first again on the next rebuild — otherwise a misconfigured relay " +
