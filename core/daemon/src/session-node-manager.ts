@@ -13855,6 +13855,17 @@ export class SessionNodeManager {
     circuitAddr: string,
     node: CelloNode,
     correlationId: string,
+    /**
+     * Whether this proof is the STANDING RECEIVER's, and may therefore write the surface
+     * `cello_status` reads as "your standing receiver was refused".
+     *
+     * A revival proves itself too, and its refusal is real — but it is not evidence about the
+     * receiver. A receiver that proved thirty seconds ago and holds a slot, plus a revival refused
+     * with `slot_cap_exceeded`, would otherwise have `cello_status` report a front door as refused
+     * while it is open. The refusal is still logged and still steers the candidate loop; what it
+     * does not do is claim to be about something it did not measure.
+     */
+    surfaceAsReceiverRefusal: boolean,
   ): Promise<"proven" | "refused_try_another_relay" | "refused_this_agent" | "unavailable"> {
     const relayPeerId = relayPeerIdOf(circuitAddr);
     const baseRelayAddr = circuitAddr.split("/p2p-circuit")[0];
@@ -13893,7 +13904,7 @@ export class SessionNodeManager {
       }
       const proven = await client.proveReservation(node);
       if (proven) {
-        this.#srRelayRefusal.delete(agentName);
+        if (surfaceAsReceiverRefusal) this.#srRelayRefusal.delete(agentName);
         this.#logger.info("session.standing_receiver.prove.result", {
           agentName, relayPeerId, peerId: node.getPeerId(), proven: true, correlationId,
         });
@@ -13907,10 +13918,12 @@ export class SessionNodeManager {
        * `cello_status` explaining a cause that is no longer what is wrong.
        */
       const refusal = client.getLastAuthRefusal();
-      if (refusal) {
-        this.#srRelayRefusal.set(agentName, { ...this.#withDirectoryCause(agentName, refusal), relayPeerId });
-      } else {
-        this.#srRelayRefusal.delete(agentName);
+      if (surfaceAsReceiverRefusal) {
+        if (refusal) {
+          this.#srRelayRefusal.set(agentName, { ...this.#withDirectoryCause(agentName, refusal), relayPeerId });
+        } else {
+          this.#srRelayRefusal.delete(agentName);
+        }
       }
       this.#logger.warn("session.standing_receiver.prove.result", {
         agentName,
@@ -14021,7 +14034,7 @@ export class SessionNodeManager {
        * relay; the relay remembers it across the reconnect below.
        */
       if (attempt === 0 && outcome === "started") {
-        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, correlationId);
+        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, correlationId, true);
         // AWAITED, not fire-and-forget: the retry rebuilds on this same transport identity, and two
         // live nodes sharing one peer id is the defect DOD-M12B-SESSION-SEED-1 exists to prevent.
         try { await candidate.stop(); } catch { /* it may never have finished starting */ }
@@ -14420,7 +14433,7 @@ export class SessionNodeManager {
        * teardown below, which is the only thing that reliably kills a still-starting node.
        */
       if (attempt === 0 && started) {
-        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, sessionId);
+        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, sessionId, false);
         try { await candidate.stop(); } catch { /* best-effort */ }
         if (verdict === "refused_this_agent") {
           // The refusal is about this AGENT, so the remaining candidates would answer identically.
