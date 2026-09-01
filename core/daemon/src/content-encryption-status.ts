@@ -31,6 +31,15 @@
  * added without something for the reader to do about it.
  */
 
+/**
+ * The `content_encryption` marker on a `content_frame`, naming the scheme its body is under.
+ *
+ * On the WIRE rather than inferred, so a receiver never has to guess a layout from a length — and
+ * ABSENT is refused rather than read as plaintext. There is no unencrypted sender to accommodate, so
+ * a missing marker is not "an old peer", it is a frame something rewrote.
+ */
+export const SESSION_CONTENT_ENCRYPTION_V1 = "session-aes-256-gcm-v1";
+
 export const CONTENT_ENCRYPTION_REASONS = {
   /**
    * The exchange has not finished yet. Transient, and the ordinary state for the instant between a

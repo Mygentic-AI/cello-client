@@ -220,8 +220,23 @@ export async function startTwoConnectionFixture(
     },
     async createSession(sessionId, agent, counterpartyPubkey = "bobpubkeyhex", peerId = "bob-peer-id", sessionOpts) {
       const snm = handle.getSessionNodeManager();
+      /**
+       * 007-CRYPTO: put the session into the state a COMPLETED key exchange leaves it in.
+       *
+       * A live send requires an agreed content key — there is no plaintext path to fall back to. In
+       * production the exchange completes on connect, before any send; a fixture whose counterparty
+       * is a `FakeNode` never completes it, so without this every content test built on this
+       * fixture would silently be exercising the refusal path instead of the thing it was written
+       * for. The state produced is exactly the production one; only how it got there is
+       * short-circuited, which is why `setSaltContributionForTest` exists in the same shape.
+       *
+       * Tests of the EXCHANGE itself drive the real signed frames and must not rely on this.
+       */
+      const agreeKey = () =>
+        snm.setSessionContentKeyForTest(agent, sessionId, new Uint8Array(32).fill(0x7e));
       if (!sessionOpts?.relay) {
         await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
+        agreeKey();
         return;
       }
       // A REAL keypair, not a stub: the park path signs the entry, and `sealParkEnvelope` is the
@@ -236,6 +251,7 @@ export async function startTwoConnectionFixture(
         senderPubkey: await kp.getPublicKey(),
         sessionIdBytes: Buffer.from(sessionId, "hex"),
       });
+      agreeKey();
     },
     seedSent(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();

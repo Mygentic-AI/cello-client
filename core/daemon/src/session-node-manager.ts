@@ -34,6 +34,7 @@ import {
 import {
   CONTENT_ENCRYPTION_REASONS,
   CONTENT_ENCRYPTION_GUIDANCE,
+  SESSION_CONTENT_ENCRYPTION_V1,
   type ContentEncryptionReason,
 } from "./content-encryption-status.js";
 import {
@@ -65,7 +66,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES,
   generateSessionEphemeral, destroySessionEphemeral, deriveSessionSecrets, type SessionEphemeral,
-  signSessionEphemeral, verifySessionEphemeral,
+  signSessionEphemeral, verifySessionEphemeral, sealSessionContent, openSessionContent,
 } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
@@ -7230,6 +7231,24 @@ export class SessionNodeManager {
     // connection). See the note on #handleContentStream's finally.
     let sendStream: Stream | undefined;
     try {
+      /**
+       * 🚨 NO KEY, NO DIRECT SEND — `DOD-M15-EPHEMERAL-AUTH-1`, and there is no plaintext fallback.
+       *
+       * Throwing here rather than sending in the open, because the catch below PARKS the content —
+       * and the mailbox copy is sealed to the counterparty's long-term identity key, so the message
+       * still travels encrypted and still arrives. The failure mode is a delay, never an exposure.
+       *
+       * A fallback to plaintext would be a thing an attacker steers a session into: strip the key
+       * frame and a system that "carries on, degraded" gives up the body while the operator reads a
+       * warning they have learned to scroll past. That is why this is a throw and not a warning.
+       */
+      const encState = this.#contentEncryptionState(agentName, sessionId);
+      if (encState.key === null) {
+        throw new Error(
+          `content_not_encryptable: ${encState.reason} — ${CONTENT_ENCRYPTION_GUIDANCE[encState.reason]}`,
+        );
+      }
+      const sessionKey = encState.key;
       const stream = await this.#openContentStream(agentName, sessionId, entry, correlationId);
       sendStream = stream;
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
@@ -7240,12 +7259,32 @@ export class SessionNodeManager {
       // resolves it (content.delivery.acked) and TTF expiry hands it to the park
       // backstop. The correlationId rides in the frame so the receiver's
       // session.content.received shares ONE flow id with the sender.
+      /**
+       * ⚠️ THE TRACKER KEEPS THE PLAINTEXT, AND THAT IS DELIBERATE — 007-CRYPTO.
+       *
+       * When live delivery times out, THIS is the copy the park backstop seals into the relay
+       * mailbox, under `sealToRecipient` to the counterparty's long-term identity key. Encrypting
+       * `content` in place would put a body locked under a session key — one about to be destroyed —
+       * inside the mailbox envelope, and the recipient would open the outer seal onto bytes nothing
+       * can read. It passes every live-delivery test and fails only for messages that park.
+       *
+       * So the session key encrypts the copy that goes ON THE WIRE, below, and nothing else.
+       */
       this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2, contentHashAlg);
+      /**
+       * THE WIRE COPY. `content_hash` above was computed over the PLAINTEXT and stays that way: the
+       * transcript, the seal and the salted hash all depend on it meaning what it means today, and
+       * the receiver decrypts before it verifies.
+       */
+      const wireBody = sealSessionContent(sessionKey, content);
       const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,
         content_hash: contentHash,
-        content_bytes: content,
+        content_bytes: wireBody,
+        // WHICH scheme the body is under. Present because the receiver must not have to guess from
+        // a length, and absent is not a valid state — a frame without it is refused, not read raw.
+        content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
         correlation_id: correlationId,
         // DOD-MSG-4 (self-ordering): the relay's signed ordering record, so the receiver verifies +
         // orders from the frame ALONE (no dependence on the separate leaf_deliver witness timing).
@@ -10939,6 +10978,24 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seam: put a session into the state a COMPLETED exchange leaves it in — 007-CRYPTO.
+   *
+   * A live send now requires an agreed key, because there is no plaintext path to fall back to. In
+   * production the exchange completes on connect, before any send. A fixture with no real peer never
+   * completes it, so without this every content test in the repo would be exercising the refusal
+   * path instead of the thing it was written for.
+   *
+   * ⚠️ IT SHORT-CIRCUITS HOW THE KEY GOT THERE, NEVER WHAT THE KEY IS FOR. The state it produces —
+   * a session holding an agreed content key — is exactly the production state, which is what makes
+   * it legitimate; `setSaltContributionForTest` exists for the same reason. Tests of the EXCHANGE
+   * itself drive the real signed frames and must not use this.
+   */
+  setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void {
+    this.#sessionContentKeys.set(this.#k(agentName, sessionId), Uint8Array.from(key));
+    this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
    * Test seam: deliver an inbound salt frame, exactly as the content-stream decoder does.
    *
    * 006-CRYPTO finding 2. WHICH of the four reasons the peer gave decides what the operator is told,
@@ -12745,6 +12802,63 @@ export class SessionNodeManager {
         });
         return;
       }
+      /**
+       * 🚨 DECRYPT BEFORE ANYTHING ELSE READS THE BODY — `DOD-M15-EPHEMERAL-AUTH-1`.
+       *
+       * `content_hash` is over the PLAINTEXT, so the hash check, the transcript, the seal and the
+       * salted hash all keep meaning exactly what they mean today — but only if the body is put back
+       * before any of them run.
+       *
+       * ⚠️ ABSENT IS NOT A PASS. A frame with no `content_encryption` is refused rather than read as
+       * plaintext. There is no unencrypted sender to be compatible with, and treating a missing
+       * marker as "this one is in the clear" is precisely the downgrade an attacker asks for: strip
+       * one field and the receiver reads the body raw. Missing and unknown take the same path as a
+       * failed decrypt, for the reason that runs through this whole unit — a check lenient about an
+       * absent proof is a check that gets skipped.
+       */
+      const declaredEncryption = frame["content_encryption"];
+      const encState = this.#contentEncryptionState(agentName, sessionId);
+      let plaintextBody: Uint8Array;
+      if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
+        this.#logger.error("session.content.refused", {
+          agentName, sessionId, correlationId,
+          reason: "content_encryption_absent_or_unknown",
+          declared: typeof declaredEncryption === "string" ? declaredEncryption : "(absent)",
+          impact: "the frame did not say it was encrypted under this session's key, so it was refused unread. Nothing was shown and nothing was stored.",
+          guidance:
+            "STOPPED ON PURPOSE. A message arrived that was not encrypted under this session's key. " +
+            "This build never sends one, so either something between you rewrote the frame, or your " +
+            "counterparty is running something that is not CELLO. Confirm with them OUT OF BAND " +
+            "before opening another session.",
+        });
+        return;
+      }
+      if (encState.key === null) {
+        this.#logger.error("session.content.refused", {
+          agentName, sessionId, correlationId,
+          reason: "no_session_key",
+          detail: encState.reason,
+          impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
+          guidance: CONTENT_ENCRYPTION_GUIDANCE[encState.reason],
+        });
+        return;
+      }
+      const opened = openSessionContent(encState.key, contentBytes);
+      if (opened === null) {
+        // GCM's tag is the only thing separating "not for us" from "modified in flight", and this
+        // side must not branch on which — that would be branching on attacker-controlled input.
+        this.#logger.error("session.content.refused", {
+          agentName, sessionId, correlationId,
+          reason: "decrypt_failed",
+          impact: "the message did not decrypt under this session's agreed key — it was modified in flight, or it was encrypted under a different key. Refused unread.",
+          guidance:
+            "STOPPED ON PURPOSE. Nothing was shown and nothing was stored. A message that fails this " +
+            "check has either been altered on its way to you or was not encrypted for this session. " +
+            "Confirm with your counterparty OUT OF BAND, then start a new session.",
+        });
+        return;
+      }
+      plaintextBody = opened;
       // DOD-MSG-4 (self-ordering content frame): if the frame carries the relay's signed ordering
       // record, verify the sender signature and record the canonical sequence FROM THE FRAME, BEFORE
       // ingest — so the strict-in-order gate has the position without waiting on the separate
@@ -12811,7 +12925,9 @@ export class SessionNodeManager {
        */
       const declaredAlg = frame["content_hash_alg"];
       const ingest = await this.ingestReceivedContent(
-        agentName, sessionId, contentBytes, contentHash, correlationId, framedSeq ?? undefined,
+        // THE DECRYPTED body — everything downstream (the hash cross-check, the leaf, the transcript,
+        // the delivery buffer) works on plaintext, exactly as it did before this layer existed.
+        agentName, sessionId, plaintextBody, contentHash, correlationId, framedSeq ?? undefined,
         declaredAlg === undefined ? undefined : (declaredAlg as string | null),
         verifiedAuthorship,
       );
