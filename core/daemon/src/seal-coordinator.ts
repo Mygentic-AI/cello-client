@@ -86,21 +86,32 @@ function keepCertifiedLeafSet(
 ): void {
   const leaves = parseFrontierLeaves(frame["frontier_leaves"]);
   if (!leaves) {
-    // ABSENT IS NOT FINE — it is just not fatal. The absent party's notification genuinely ships no
-    // leaves (FINDING-5 puts them on the present party's confirm frame only), so this party will
-    // never be able to prove one of its own messages against this receipt. Say it once, here, rather
-    // than leaving the operator to discover it at the moment they need the proof.
+    /**
+     * ABSENT IS NOT FINE — it is just not fatal. And WHICH absence this is decides what the operator
+     * should do, so it is recorded rather than flattened (fallback-finder findings 1 and 3).
+     *
+     * ⚠️ THIS GUIDANCE USED TO END *"The other party, whose confirm frame carries the leaves, can
+     * still issue proofs."* That is true on the `unilateral_notification` path and FALSE on
+     * `unilateral`: there, WE are the present party and the other party is the ABSENT one, who holds
+     * strictly less. So the one string sent each side to ask the other for something neither has —
+     * a remedy that reads actionable and is not, which spends the reader's trust as well as their
+     * time.
+     */
+    const state = path === "unilateral_notification" ? "not_carried_absent_party" : "not_carried_present_party";
+    deps.sessionNodeManager.noteCertifiedLeafSetUnavailable(agentName, sidHex, state, `no frontier_leaves on the ${path} seal frame`);
     deps.logger.warn("seal.certified_leaves.not_carried", {
       sessionId: sidHex,
       agentName,
       path,
+      state,
       impact:
         "this seal frame carried no signed leaves, so this side holds no certified leaf set for the " +
         "session and cannot issue an inclusion proof for any message in it; the sealed receipt itself " +
         "is complete and unaffected",
       guidance:
-        "cello_get_inclusion_proof will refuse this session by name (certified_leaves_unavailable). " +
-        "The other party, whose confirm frame carries the leaves, can still issue proofs.",
+        state === "not_carried_absent_party"
+          ? "cello_get_inclusion_proof refuses this session by name (certified_leaves_unavailable). This side was the ABSENT party, so the counterparty — whose confirm frame carries the leaves — can still issue proofs."
+          : "cello_get_inclusion_proof refuses this session by name (certified_leaves_not_carried). This side was PRESENT and the directory sent no leaves, so NEITHER side can prove an individual message here; do not send the operator to the counterparty for one.",
     });
     return;
   }

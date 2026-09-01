@@ -107,16 +107,13 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
     // ─── The certified leaf set: the tree the signature actually covers ─────────────────────────
     const certifiedLeaves = sessionNodeManager.getCertifiedLeafSet(agentName, sessionId);
     if (!certifiedLeaves) {
-      return {
-        ok: false,
-        reason: "certified_leaves_unavailable",
-        sealed_root: cert.sealed_root,
-        guidance:
-          "This side holds the receipt for this session but not the leaf set the receipt is signed " +
-          "over, so no message-level proof can be built here. This is the normal state for the party " +
-          "that was ABSENT at seal time — the signed leaves ship on the present party's confirm frame " +
-          "only. Ask your counterparty to issue the proof; their copy can. Nothing local repairs it.",
-      };
+      return missingLeafSetRefusal(
+        logger,
+        sessionNodeManager.getCertifiedLeafSetState(agentName, sessionId),
+        agentName,
+        sessionId,
+        cert.sealed_root,
+      );
     }
 
     /**
@@ -175,9 +172,37 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
       }
     }
 
-    // ─── The salt, without which a proof is about a number rather than a sentence ───────────────
-    const salt = sessionNodeManager.getSessionContentSalt(agentName, sessionId);
-    if (!salt) {
+    /**
+     * ─── The salt, without which a proof is about a number rather than a sentence ───────────────
+     *
+     * `getSessionContentSaltState`, NOT `getSessionContentSalt` — fallback-finder finding 2. The
+     * plain accessor answers `null` for a session that never agreed a salt AND for one whose salt
+     * row is corrupt or unreadable, and those need opposite sentences: the first is a fact about the
+     * conversation, the second is damage to this operator's own database, and telling them the
+     * second is the first sends them to their counterparty over a local disk problem.
+     */
+    const saltState = sessionNodeManager.getSessionContentSaltState(agentName, sessionId);
+    if (saltState.salt === null && saltState.reason === "unreadable") {
+      logger.error("inclusion.salt.unreadable", {
+        agentName,
+        sessionId,
+        impact:
+          "this session HOLDS a salt that could not be read, so its messages cannot be re-hashed and " +
+          "no inclusion proof can be issued — the conversation and its receipt are unaffected",
+      });
+      return {
+        ok: false,
+        reason: "session_salt_unreadable",
+        sealed_root: cert.sealed_root,
+        guidance:
+          "This session DOES have a salt and this machine could not read it, so the message cannot be " +
+          "re-hashed and no proof can be issued. THIS IS A PROBLEM WITH THIS MACHINE'S DATABASE, not " +
+          "with the session, the counterparty or their build — do not ask them to upgrade and do not " +
+          "start a new session to fix it. Look for session.salt.read.failed in the daemon log; it " +
+          "names the row. The receipt itself is unaffected and still proves the conversation sealed.",
+      };
+    }
+    if (saltState.salt === null) {
       return {
         ok: false,
         reason: "session_unsalted",
@@ -190,6 +215,7 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
           "session opened while both agents are connected agrees one at open.",
       };
     }
+    const salt = saltState.salt;
 
     const messageBytes = new TextEncoder().encode(message);
     const leafHash = Buffer.from(
@@ -395,6 +421,9 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
       leaf_count: result.leaf_count,
       certified_root: result.certified_root,
       content_hash_alg: result.content_hash_alg,
+      // Carried through so a caller cannot read `session_id` above as something that was checked.
+      // The anchor is the ROOT; nothing here binds a session id (fallback-finder finding 6).
+      session_id_verified: result.session_id_verified,
       // WHAT THIS DOES AND DOES NOT ESTABLISH. The proof binds a message to a root; it says nothing
       // about whether that root is the one a directory signed. Claiming more here would be the
       // "partially true is false" failure the claims ledger exists to catch.
@@ -402,9 +431,116 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
         "This exact message is at position " + result.leaf_index + " of the " + result.leaf_count +
         " leaves under root " + result.certified_root + ". It has not been altered by a single byte. " +
         "This does NOT by itself establish that the root is genuine — verify the certificate's own " +
-        "signature (cello_sealed_receipt) to establish that, then this proof binds the message to it.",
+        "signature (cello_sealed_receipt) to establish that, then this proof binds the message to it. " +
+        "The session_id above is copied from the proof and was NOT checked: nothing here binds a " +
+        "session id, so treat it as a label rather than as a finding.",
     };
   });
+}
+
+/**
+ * WHY there is no certified leaf set — one reason string per cause, never one for all four.
+ *
+ * ⚠️ THIS USED TO BE A SINGLE `certified_leaves_unavailable` WHOSE GUIDANCE ASSERTED THE MOST BENIGN
+ * OF FOUR CAUSES — fallback-finder finding 1, and it is the defect this milestone is named for.
+ *
+ * `getCertifiedLeafSet` answers null when: no seal frame carried the leaves, the DIRECTORY shipped a
+ * set that does not reproduce the root its own FROST signature covers, a leaf was malformed, or the
+ * write failed. The text said *"the normal state for the party that was ABSENT at seal time … ask
+ * your counterparty."* So an operator who was present throughout, whose directory had just
+ * contradicted its own signature — the strongest misbehaviour signal this client can produce — was
+ * told they had been absent, and sent to a counterparty who has nothing to give them. The detection
+ * was correct and its only consumer was a log line.
+ *
+ * `session_certified_leaves_state` is written at every one of those four points, so the cause
+ * survives to here. A state this build does not recognise is named as such rather than folded into
+ * the nearest familiar one.
+ */
+function missingLeafSetRefusal(
+  logger: Logger,
+  recorded: { state: string; detail: string | null } | null,
+  agentName: string,
+  sessionId: string,
+  sealedRoot: string,
+): Record<string, unknown> {
+  const base = { ok: false as const, sealed_root: sealedRoot, ...(recorded?.detail ? { detail: recorded.detail } : {}) };
+
+  switch (recorded?.state) {
+    case "sealed_leaves_root_disagrees":
+      // THE LOUD ONE. Not a degradation — a party that signed one thing and shipped another.
+      logger.error("inclusion.certified_leaves.directory_disagreed", {
+        agentName, sessionId, detail: recorded.detail,
+        impact:
+          "the leaf set delivered with this seal does not reproduce the root the consortium signed, " +
+          "so it was refused and no message in this session can be proved from this side",
+      });
+      return {
+        ...base,
+        reason: "certified_leaves_root_disagrees",
+        guidance:
+          "THIS IS NOT THE ORDINARY 'no leaves' CASE. The leaf set delivered with this seal does not " +
+          "hash to the root the directory consortium signed — the same party gave two answers that " +
+          "cannot both be true, so it was refused rather than stored. Your receipt is unaffected and " +
+          "still proves this conversation was sealed; what is unavailable is proof about an " +
+          "individual message. Keep the receipt, note the session id, and raise this with the " +
+          "operator — a directory contradicting its own signature is worth investigating, not " +
+          "retrying.",
+      };
+    case "sealed_leaves_malformed":
+      return {
+        ...base,
+        reason: "certified_leaves_malformed",
+        guidance:
+          "The signed leaves delivered with this seal could not be read, so none were stored and no " +
+          "message in this session can be proved from this side. The receipt is unaffected. This is " +
+          "a version or transport problem rather than a dispute — nothing local repairs it, and " +
+          "re-closing the session will not re-deliver them.",
+      };
+    case "persist_failed":
+      return {
+        ...base,
+        reason: "certified_leaves_persist_failed",
+        guidance:
+          "The leaf set for this session arrived and verified, and this machine failed to write it. " +
+          "THE FAULT IS LOCAL — do not ask your counterparty for anything. Look for " +
+          "seal.certified_leaves.persist.failed in the daemon log; it names the write. Your " +
+          "counterparty's copy can still issue a proof for the same messages in the meantime.",
+      };
+    case "not_carried_present_party":
+      // The false-remedy case: on this path the counterparty is the ABSENT one, who has less.
+      return {
+        ...base,
+        reason: "certified_leaves_not_carried",
+        guidance:
+          "This seal completed with your counterparty absent, and the directory sent no signed leaves " +
+          "with it — so NEITHER side can prove an individual message in this session. Do not ask them " +
+          "for a proof; they were not there and hold even less than you do. Your receipt is complete " +
+          "and still proves the conversation was sealed. Nothing local repairs this.",
+      };
+    case "not_carried_absent_party":
+      return {
+        ...base,
+        reason: "certified_leaves_unavailable",
+        guidance:
+          "You were the ABSENT party when this session sealed, and the signed leaves only ever reach " +
+          "the party that was present — so this side can never prove an individual message here, and " +
+          "re-closing will not change that. Ask your counterparty to issue the proof; their copy can. " +
+          "Your receipt is unaffected and still proves the conversation was sealed.",
+      };
+    default:
+      // Includes `recorded === null`: no seal has been processed on this side at all, which is a
+      // different sentence again — and an unrecognised state, which is named rather than guessed.
+      return {
+        ...base,
+        reason: "certified_leaves_unavailable",
+        ...(recorded ? { recorded_state: recorded.state } : {}),
+        guidance:
+          "This side holds the receipt for this session but not the leaf set it is signed over, and " +
+          "no cause was recorded for that — most often because the seal was processed by a build " +
+          "older than this one. No message-level proof can be built here. Ask your counterparty to " +
+          "issue the proof; their copy may still be able to. The receipt itself is unaffected.",
+      };
+  }
 }
 
 /**

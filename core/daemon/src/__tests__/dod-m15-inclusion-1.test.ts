@@ -359,6 +359,56 @@ describe("DOD-M15-INCLUSION-1: prove one message sits under the sealed root", ()
     expect(String(res["guidance"])).toContain("UNSALTED");
   });
 
+  /**
+   * A CORRUPT SALT IS NOT AN UNSALTED SESSION — fallback-finder finding 2.
+   *
+   * `getSessionContentSalt` answers null for both, and the two need opposite sentences. A session
+   * whose salt row is the wrong width DID hash its leaves under a salt; telling its operator the
+   * session is unsalted and to start a new one with their counterparty sends them to the other party
+   * over damage to their own disk. `wrong_width` is `#getSessionSalt`'s own case, used verbatim
+   * rather than a representative — the clause names it.
+   */
+  it("a session whose salt row is CORRUPT is refused as unreadable, not reported as unsalted", async () => {
+    const f = await makeFixture(dbPath());
+    f.mgr.getDb()
+      .prepare("UPDATE sessions SET content_salt = ? WHERE session_id = ?")
+      .run(Buffer.from(new Uint8Array(7)), SESSION_ID); // wrong width — a salt is SESSION_SALT_BYTES
+
+    // A fresh manager, because the salt this process already read is cached in memory.
+    const reopened = new SessionNodeManager({
+      securityGateway: new PassthroughGatewayClient(),
+      factory: NO_FACTORY,
+      logger: makeLogger().logger,
+      dbPath: dbPath(),
+    });
+    await reopened.initialize();
+    const handlers = new Map<string, IpcHandler>();
+    const { logger, events } = makeLogger();
+    registerInclusionProofHandlers({
+      handlers, logger, sessionNodeManager: reopened,
+      getConnState: () => ({ currentAgent: AGENT }) as never,
+      resolveCurrentAgent: () => AGENT,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+    });
+
+    const res = (await handlers.get("cello_get_inclusion_proof")!(
+      { session_id: SESSION_ID, message: f.messages[0] },
+      "conn-1",
+    )) as Record<string, unknown>;
+
+    expect(res["reason"]).toBe("session_salt_unreadable");
+    expect(res["reason"]).not.toBe("session_unsalted");
+    // The remedy must point at THIS machine, and must not send the operator to the counterparty.
+    expect(String(res["guidance"])).toContain("THIS MACHINE'S DATABASE");
+    expect(String(res["guidance"])).toContain("session.salt.read.failed");
+    // The remedy must not be "start a new session" — but the text legitimately contains that phrase
+    // in order to FORBID it, so the assertion is on the instruction, not on the substring. A bare
+    // `.not.toContain("start a new session")` fails the corrected text and passes the broken one.
+    expect(String(res["guidance"])).toMatch(/do not[^.]{0,60}start a new session/i);
+    expect(String(res["guidance"])).not.toMatch(/^(?!.*do not).*start a new session/is);
+    expect(events.some((e) => e.level === "error" && e.event === "inclusion.salt.unreadable")).toBe(true);
+  });
+
   it("DoD 8c: the verifier refuses an unsalted PROOF rather than checking it", async () => {
     const f = await makeFixture(dbPath());
     const proof = (await f.getProof())["proof"] as InclusionProof;
@@ -469,16 +519,121 @@ describe("DOD-M15-INCLUSION-1: prove one message sits under the sealed root", ()
     expect(verifyInclusionProof(second["proof"], new TextEncoder().encode(repeated), f.sealedRoot).ok).toBe(true);
   });
 
-  it("the party with no certified leaf set is told so by name, not given a weaker proof", async () => {
+  /**
+   * WHY THERE IS NO LEAF SET — four causes, four sentences. Fallback-finder finding 1.
+   *
+   * These used to be ONE reason whose guidance asserted the most benign of them: *"the normal state
+   * for the party that was ABSENT at seal time … ask your counterparty."* So an operator who was
+   * present throughout, whose directory had just shipped a leaf set contradicting its own FROST
+   * signature, was told they had been absent and sent to a counterparty with nothing to give.
+   *
+   * The exemplars are the recorded state values verbatim, not representatives — the branch is a
+   * switch on those strings, and picking a plausible-looking substitute would take the `default`.
+   */
+  it("the ABSENT party is told so by name, and pointed at the side that CAN prove it", async () => {
     const f = await makeFixture(dbPath(), { seal: false });
-    // A receipt with no leaf set — the ABSENT party's state: the notification carries no leaves.
     f.mgr.recordSealCertificate(AGENT, SESSION_ID, f.sealedRoot, JSON.stringify({ participants: [] }));
+    f.mgr.noteCertifiedLeafSetUnavailable(AGENT, SESSION_ID, "not_carried_absent_party", "no frontier_leaves on the unilateral_notification seal frame");
 
     const res = await f.getProof();
-    expect(res["ok"]).toBe(false);
     expect(res["reason"]).toBe("certified_leaves_unavailable");
     expect(res["sealed_root"]).toBe(f.sealedRoot);
-    expect(String(res["guidance"])).toContain("counterparty");
+    expect(String(res["guidance"])).toContain("Ask your counterparty");
+  });
+
+  it("the PRESENT party is NOT sent to a counterparty who holds even less", async () => {
+    const f = await makeFixture(dbPath(), { seal: false });
+    f.mgr.recordSealCertificate(AGENT, SESSION_ID, f.sealedRoot, JSON.stringify({ participants: [] }));
+    f.mgr.noteCertifiedLeafSetUnavailable(AGENT, SESSION_ID, "not_carried_present_party", "no frontier_leaves on the unilateral seal frame");
+
+    const res = await f.getProof();
+    expect(res["reason"]).toBe("certified_leaves_not_carried");
+    expect(res["reason"]).not.toBe("certified_leaves_unavailable");
+    // The remedy that was wrong: on this path the counterparty was the absent one.
+    expect(String(res["guidance"])).toContain("Do not ask them");
+    expect(String(res["guidance"])).toContain("NEITHER side");
+  });
+
+  it("a directory that contradicts its own signature is named as that, not as an absent party", async () => {
+    const f = await makeFixture(dbPath(), { seal: false });
+    f.mgr.recordSealCertificate(AGENT, SESSION_ID, f.sealedRoot, JSON.stringify({ participants: [] }));
+
+    // The real path: a set that does not reproduce the signed root is refused AND the cause recorded.
+    const tampered = [...f.certifiedLeaves];
+    tampered[1] = "ee".repeat(32);
+    expect(f.mgr.recordCertifiedLeafSet(AGENT, SESSION_ID, signedLeavesFor(tampered), f.sealedRoot)).toBe(false);
+    expect(f.mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)?.state).toBe("sealed_leaves_root_disagrees");
+
+    const handlers = new Map<string, IpcHandler>();
+    const { logger, events } = makeLogger();
+    registerInclusionProofHandlers({
+      handlers, logger, sessionNodeManager: f.mgr,
+      getConnState: () => ({ currentAgent: AGENT }) as never,
+      resolveCurrentAgent: () => AGENT,
+      NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
+    });
+    const res = (await handlers.get("cello_get_inclusion_proof")!(
+      { session_id: SESSION_ID, message: f.messages[0] },
+      "conn-1",
+    )) as Record<string, unknown>;
+
+    expect(res["reason"]).toBe("certified_leaves_root_disagrees");
+    expect(String(res["guidance"])).toContain("NOT THE ORDINARY");
+    expect(String(res["guidance"])).not.toContain("ABSENT at seal time");
+    // Loud as well as named — this is the strongest misbehaviour signal this client can produce.
+    expect(events.some((e) => e.level === "error" && e.event === "inclusion.certified_leaves.directory_disagreed")).toBe(true);
+  });
+
+  it("a re-delivered SHORTER leaf set replaces the old one instead of leaving stale rows", async () => {
+    const f = await makeFixture(dbPath());
+    expect(f.mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toEqual(f.certifiedLeaves);
+
+    // A two-leaf set with its own root — the shape that used to leave leaf 2 behind and make the
+    // stored set hash to nothing anybody signed.
+    const shorter = f.certifiedLeaves.slice(0, 2);
+    const shorterRoot = rootOver(shorter);
+    expect(f.mgr.recordCertifiedLeafSet(AGENT, SESSION_ID, signedLeavesFor(shorter), shorterRoot)).toBe(true);
+    expect(f.mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toEqual(shorter);
+    expect(f.mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toHaveLength(2);
+  });
+
+  it("a garbled certified_root is named as garbled, not as 'a different root'", async () => {
+    const f = await makeFixture(dbPath());
+    const proof = (await f.getProof())["proof"] as InclusionProof;
+
+    const truncated = f.sealedRoot.slice(0, 40); // the copy/paste failure, not a different session
+    const verdict = verifyInclusionProof(proof, new TextEncoder().encode(f.messages[0]), truncated);
+    expect(verdict.ok).toBe(false);
+    expect(verdict.ok === false && verdict.reason).toBe(INCLUSION_VERIFY_REASONS.CERTIFIED_ROOT_MALFORMED);
+    expect(verdict.ok === false && verdict.guidance).toContain("NOTHING about the proof has been established");
+  });
+
+  it("a verified proof does NOT claim its session id was checked", async () => {
+    const f = await makeFixture(dbPath());
+    const proof = (await f.getProof())["proof"] as InclusionProof;
+    const relabelled = { ...proof, session_id: "not-the-session-this-was-issued-for" };
+
+    // It still verifies — the anchor is the ROOT, and the root is unchanged. That is correct, and it
+    // is exactly why the session id must not be presented as a finding.
+    const verdict = verifyInclusionProof(relabelled, new TextEncoder().encode(f.messages[0]), f.sealedRoot);
+    expect(verdict.ok).toBe(true);
+    expect(verdict.ok === true && verdict.session_id_verified).toBe(false);
+
+    const viaTool = (await f.handlers.get("cello_verify_inclusion_proof")!(
+      { proof: relabelled, message: f.messages[0], certified_root: f.sealedRoot },
+      "conn-1",
+    )) as Record<string, unknown>;
+    expect(viaTool["session_id_verified"]).toBe(false);
+    expect(String(viaTool["means"])).toContain("was NOT checked");
+  });
+
+  it("an EMPTY leaf set is refused by the function that claims it, not by its caller", async () => {
+    const f = await makeFixture(dbPath(), { seal: false });
+    // sha256("") is the RFC 6962 empty-tree root. Nothing may 'verify' against zero leaves.
+    const emptyRoot = rootOver([]);
+    expect(f.mgr.recordCertifiedLeafSet(AGENT, SESSION_ID, [], emptyRoot)).toBe(false);
+    expect(f.mgr.getCertifiedLeafSet(AGENT, SESSION_ID)).toBeNull();
+    expect(f.mgr.getCertifiedLeafSetState(AGENT, SESSION_ID)?.state).toBe("sealed_leaves_malformed");
   });
 
   it("verification requires the certified root — it is never defaulted from the proof", async () => {

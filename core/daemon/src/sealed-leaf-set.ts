@@ -27,9 +27,26 @@
  * directory that reorders, adds, drops or alters a single leaf produces a different root and the set
  * is refused — so what lands on disk is, by construction, the leaf set the consortium signed.
  *
- * The hashes come out of `structure1_cbor`, which is each leaf's **participant-signed** to-be-signed
- * bytes. `reDeriveFrontiers` (seal-frontier-verify.ts) has already verified those signatures on this
- * same array before we are called, so the content hashes are the senders' own, not the directory's.
+ * ⚠️ THE PARAGRAPH THAT USED TO SIT HERE OVERSTATED IT, and it is rewritten rather than deleted
+ * because it is what a future reader would have reasoned from. It said: *"the hashes come out of
+ * `structure1_cbor`, each leaf's participant-signed to-be-signed bytes; `reDeriveFrontiers` has
+ * already verified those signatures on this same array before we are called, so the content hashes
+ * are the senders' own, not the directory's."*
+ *
+ * **That holds on the BILATERAL path only.** There, `seal-coordinator.ts` returns outright when
+ * `reDeriveFrontiers` fails, so nothing unverified reaches this module. On the UNILATERAL path
+ * `checkUnilateralFrontier` deliberately never rejects — a forged or cross-session leaf yields
+ * `leaves_invalid`, the frontier is corrected DOWN to zero, and the seal proceeds rather than
+ * dead-ending — and those same leaves are then handed here.
+ *
+ * **What is true on EVERY path is the root comparison below, and it is the load-bearing one.** A
+ * leaf set only lands if it reproduces the FROST-signed `sealed_root`, so forged leaves cannot enter
+ * the store unless they hash to a root the consortium already signed. The per-leaf signature check is
+ * a second, path-dependent line of defence, not the guarantee — and stating it as the guarantee is
+ * exactly the shape `DOD-M15-CLAIM-COMMENTS-1` exists to catch.
+ *
+ * The hashes still come out of `structure1_cbor`, each leaf's to-be-signed bytes — that part was
+ * always accurate, and it is why the hashes are the ones a sender's signature would cover.
  *
  * Crypto refs: RFC 6962 §2.1 (Merkle hash trees).
  */
@@ -52,6 +69,12 @@ import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
  * passing the moment a dropped leaf happened to be the last one.
  */
 export function sealedLeafHashesFromSignedLeaves(leaves: readonly SealFrontierLeaf[]): string[] | null {
+  // AN EMPTY SET IS NOT A LEAF SET — the guard belongs here, not in the caller that happens to have
+  // one. `[]` yields a root of sha256("") (RFC 6962 §2.1's empty tree), so a certificate whose root
+  // were ever that value would "verify" against zero leaves, be stored as zero rows, and log
+  // `leafCount: 0` as a success. Unreachable today only because `parseFrontierLeaves` filters empty
+  // arrays upstream — which is a property of the caller, not of this function.
+  if (leaves.length === 0) return null;
   const hashes: string[] = [];
   for (const leaf of leaves) {
     let arr: unknown;

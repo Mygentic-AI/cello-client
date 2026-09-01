@@ -76,6 +76,15 @@ export const INCLUSION_VERIFY_REASONS = {
   PROOF_MALFORMED: "proof_malformed",
   /** The proof names a root that is not the one in the certificate the caller holds. */
   ROOT_NOT_FROM_CERTIFICATE: "root_not_from_certificate",
+  /**
+   * The root SUPPLIED by the caller is not a 32-byte hex value — so there is nothing to compare.
+   *
+   * Separate from the reason above because that one's guidance says *"the proof lands on a DIFFERENT
+   * root than the certificate you supplied"*, and for a truncated paste or a stray quote that is
+   * false: no root was supplied at all. Naming the exit point instead of the cause is the defect
+   * Invariant 3 is about, and it costs an operator the one thing they can actually fix.
+   */
+  CERTIFIED_ROOT_MALFORMED: "certified_root_malformed",
   /** The proof names a hash algorithm this build cannot reproduce. */
   UNKNOWN_HASH_ALG: "unknown_content_hash_alg",
   /**
@@ -109,6 +118,11 @@ export const INCLUSION_VERIFY_GUIDANCE: Record<InclusionVerifyReason, string> = 
     "The proof lands on a DIFFERENT root than the certificate you supplied. It may be a proof for " +
     "another session, or for an earlier seal of this one. Check the session id on both, and take the " +
     "root from the certificate (cello_sealed_receipt reports it as sealed_root) — never from the proof.",
+  [INCLUSION_VERIFY_REASONS.CERTIFIED_ROOT_MALFORMED]:
+    "The certified_root you supplied is not a 64-character hex value, so there was nothing to check " +
+    "the proof against and NOTHING about the proof has been established either way. Copy sealed_root " +
+    "from cello_sealed_receipt exactly — a truncated paste, an added quote or a stray newline is the " +
+    "usual cause.",
   [INCLUSION_VERIFY_REASONS.UNKNOWN_HASH_ALG]:
     "The proof names a content-hash algorithm this build does not implement, so there is no value to " +
     "compare against. This is a version difference, NOT evidence of tampering. Upgrade the client and " +
@@ -139,6 +153,8 @@ export type InclusionVerifyResult =
       leaf_count: number;
       certified_root: string;
       content_hash_alg: ContentHashAlg;
+      /** Always false: no part of this check binds a session id. See the note at the return site. */
+      session_id_verified: false;
     }
   | { ok: false; reason: InclusionVerifyReason; detail: string; guidance: string };
 
@@ -234,7 +250,7 @@ export function verifyInclusionProof(
 
   if (typeof certifiedRootHex !== "string" || !HEX32.test(certifiedRootHex.toLowerCase())) {
     return fail(
-      INCLUSION_VERIFY_REASONS.ROOT_NOT_FROM_CERTIFICATE,
+      INCLUSION_VERIFY_REASONS.CERTIFIED_ROOT_MALFORMED,
       `the certified root supplied is not a 32-byte hex value (got ${typeof certifiedRootHex === "string" ? `${certifiedRootHex.length} chars` : typeof certifiedRootHex})`,
     );
   }
@@ -298,7 +314,16 @@ export function verifyInclusionProof(
 
   return {
     ok: true,
+    /**
+     * ⚠️ UNVERIFIED, AND THE FIELD SAYS SO ONE LEVEL UP — the caller must not present this as checked.
+     *
+     * Nothing here binds a session id: the anchor is the ROOT, and the root is what the certificate
+     * signs. This value is copied out of the proof, so a relabelled proof reports a session it was
+     * never checked against. It is returned because a reader holding several proofs needs to tell
+     * them apart, not because it has been established.
+     */
     session_id: proof.session_id,
+    session_id_verified: false,
     leaf_index: proof.leaf_index,
     leaf_count: proof.leaf_count,
     certified_root: anchor,
