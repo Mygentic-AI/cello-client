@@ -29,11 +29,22 @@
  *      omitting the hook defeats the entire reason for the work."* A parameter nothing exercises is
  *      a comment; the test below proves a different extra secret yields a different key.
  *
- * ─── One agreement, two outputs ────────────────────────────────────────────────────────────────
+ * ─── ONE agreement, ONE output — the salt is NOT derived here ─────────────────────────────────
  *
- * The message-sealing key and the per-session content-hash salt come from the SAME agreement under
- * different HKDF labels. They must never be equal — the salt is disclosed to anyone who can see a
- * content hash, and if it equalled the key that would hand over the key.
+ * This header used to say *"the message-sealing key and the per-session content-hash salt come from
+ * the SAME agreement under different HKDF labels"*, which the test *"★ this agreement produces ONE
+ * output"* sixty lines below refutes directly. Kept as a correction rather than deleted, because the
+ * coupling it describes is the defect the unit removed and the reason the split exists.
+ *
+ * The salt moved to `session-salt.ts` (Decisions Carried #8). Deriving both from one secret tied
+ * *"must be forgotten"* — the key, destroyed at close — to *"must be kept"* — the salt, which the
+ * transcript needs for its whole life. They are now agreed in the same EXCHANGE from different
+ * inputs: this one from the X25519 ephemeral-ephemeral secret, the salt from the two sides' random
+ * contributions.
+ *
+ * They must still never be equal, and that is now structural rather than a matter of labelling: the
+ * salt is disclosed to anyone who can see a content hash, and it is a function of different material
+ * entirely, so no label choice here can collide with it.
  */
 
 import { describe, it, expect } from "vitest";

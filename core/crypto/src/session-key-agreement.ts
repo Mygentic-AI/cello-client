@@ -83,12 +83,34 @@
  *
  * ─── The remaining output, and its lifetime ───────────────────────────────────────────────────
  *
- **The envelope key NEVER touches disk** and is destroyed at session close. That is the forward
- * secrecy, and `destroySessionEphemeral` is what makes it real. A revived session RE-KEYS (Decisions
- * Carried #5) — and because the salt no longer rides on this secret, re-keying no longer disturbs
- * the transcript's verifiability. They must never be EQUAL: the salt travels wherever a content hash
- * does and the relay sees it, so a salt that equalled the key would hand the key to everyone who can
- * see a hash. Domain separation by label is what keeps them independent.
+ **The envelope key NEVER touches disk**, and `destroySessionEphemeral` is how a caller discards the
+ * secret behind it at session close. A revived session RE-KEYS (Decisions Carried #5) — and because
+ * the salt no longer rides on this secret, re-keying no longer disturbs the transcript's
+ * verifiability.
+ *
+ * ⚠️ THE DESTRUCTION HAS NO CALLER YET, and this file used to read as though it did — *"that is the
+ * forward secrecy, and `destroySessionEphemeral` is what makes it real."* Forward secrecy is a
+ * property of the old secret being GONE, so a destroy function nothing calls does not provide it.
+ * Nothing in the daemon mints an ephemeral, derives a content key, or destroys one: this module is
+ * a library with tests and no consumer, deliberately, because binding the ephemeral to the agent's
+ * identity comes first (`DOD-M15-EPHEMERAL-AUTH-1`) and there is no point wiring an unauthenticated
+ * agreement into the send path.
+ *
+ * Said plainly because `session-salt.ts` states its own reachability boundary and this file stated
+ * none, so the two halves of the same exchange read as though both were live. The salt half IS live;
+ * this half is not yet.
+ *
+ * ─── The key and the salt must never be EQUAL, and what actually keeps them apart ──────────────
+ *
+ * The salt travels wherever a content hash does and the relay sees it, so a salt that equalled the
+ * key would hand the key to everyone who can see a hash.
+ *
+ * An earlier version said *"domain separation by label is what keeps them independent."* That was
+ * true when the salt was a second HKDF output of this function and is not true now. The salt is
+ * computed in `session-salt.ts` from a DIFFERENT input — the two sides' random contributions, not
+ * this ECDH secret — under its own label, with no HKDF salt. Different inputs, different module,
+ * different function. Label separation is not the mechanism; it is not even reachable, because
+ * there is only one label here.
  */
 
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -101,9 +123,14 @@ export const SESSION_KEY_BYTES = 32;
 
 const ENC = new TextEncoder();
 /**
- * Distinct labels are the ONLY thing separating the two outputs — same IKM, same salt, same binding.
- * Versioned so a future derivation change is a new label rather than a silent reinterpretation of
- * the same bytes.
+ * THE ONE label. Versioned so a future derivation change is a new label rather than a silent
+ * reinterpretation of the same bytes.
+ *
+ * An earlier version read *"distinct labels are the ONLY thing separating the two outputs — same
+ * IKM, same salt, same binding."* There are no longer two outputs to separate: the content-hash
+ * salt moved to `session-salt.ts` and is derived from different inputs entirely (Decisions Carried
+ * #8). The label still earns its place — it is bound into `info`, so it is what a future second
+ * output WOULD be separated by — but it is not currently holding two values apart.
  */
 const INFO_CONTENT_KEY = ENC.encode("cello/session/v1/content-key");
 
@@ -209,10 +236,11 @@ export function deriveSessionSecrets(opts: {
     throw new Error(
       `KEYAGREE: peer ephemeral public key must be ${X25519_KEY_BYTES} bytes, got ${opts.peerEphemeralPublic.length}. ` +
       "Refusing rather than padding — a short key silently zero-extended is an agreement with " +
-      "something that is not the peer. This check ALSO does double duty as the canonicalisation " +
-      "guard for the HKDF `info` (review F9): the label is recoverable as info[0 : len-64-|transcript|] " +
-      "only because both public keys are exactly 32 bytes. A variable-length public would let a " +
-      "crafted key make a content-key info equal a content-salt info.",
+      "something that is not the peer. This check ALSO keeps the HKDF `info` unambiguous (review " +
+      "F9): with a fixed-length label, two exactly-32-byte public keys and a trailing transcript, " +
+      "no two different (keys, transcript) inputs can encode to the same info bytes. A " +
+      "variable-length public would break that, and two peers whose info collided would derive the " +
+      "same key from different material.",
     );
   }
   if (opts.ownEphemeralSecret.length !== X25519_KEY_BYTES) {
