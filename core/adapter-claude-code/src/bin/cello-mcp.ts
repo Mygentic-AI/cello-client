@@ -862,7 +862,7 @@ server.tool(
     "a message altered by even one byte, and rejects a proof whose root is not the certificate's.",
   {
     proof: z
-      .union([z.string(), z.record(z.unknown())])
+      .union([z.string(), z.record(z.string(), z.unknown())])
       .describe("The proof object from cello_get_inclusion_proof (or its JSON text, pasted verbatim)"),
     message: z.string().describe("The exact message text the proof claims to be about"),
     certified_root: z
