@@ -271,7 +271,13 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
    */
   const hkdfRef = (ikm: Uint8Array, salt: Uint8Array, info: Uint8Array, len: number) => hkdf(sha256, ikm, salt, info, len);
 
-  function expected(ownSk: Uint8Array, peerPk: Uint8Array, sessionId: Uint8Array, extra?: Uint8Array) {
+  function expected(
+    ownSk: Uint8Array,
+    peerPk: Uint8Array,
+    sessionId: Uint8Array,
+    extra?: Uint8Array,
+    transcript?: Uint8Array,
+  ) {
     const shared = x25519.getSharedSecret(ownSk, peerPk);
     const ownPk = x25519.getPublicKey(ownSk);
     const e = extra ?? new Uint8Array(0);
@@ -283,10 +289,14 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     const cmp = Buffer.compare(Buffer.from(ownPk), Buffer.from(peerPk));
     const [first, second] = cmp < 0 ? [ownPk, peerPk] : [peerPk, ownPk];
     const enc = new TextEncoder();
+    // The transcript is TRAILING, after both public keys — the position the module's header claims
+    // and, until this parameter existed, the one thing here that pinned nothing.
+    const t = transcript ?? new Uint8Array(0);
     const withBind = (label: string) => {
       const l = enc.encode(label);
-      const out = new Uint8Array(l.length + 64);
+      const out = new Uint8Array(l.length + 64 + t.length);
       out.set(l, 0); out.set(first, l.length); out.set(second, l.length + 32);
+      out.set(t, l.length + 64);
       return out;
     };
     return { contentKey: hkdfRef(ikm, sessionId, withBind("cello/session/v1/content-key"), 32) };
@@ -315,6 +325,92 @@ describe("DOD-M15-KEYAGREE-1: the derivation itself is pinned, byte for byte", (
     const got = deriveSessionSecrets({ ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, extraSharedSecret: extra });
     expect(Buffer.from(got.contentKey).toString("hex")).toBe(
       Buffer.from(expected(SK_A, pkB, SID, extra).contentKey).toString("hex"),
+    );
+  });
+
+  it("★ the PQ TRANSCRIPT's POSITION is pinned — trailing in the info, not in the IKM", () => {
+    /**
+     * REVIEW MEASURED THIS: the transcript's position was pinned by nothing at all, and its position
+     * is the entire reason the parameter was added before there is a hybrid to use it.
+     *
+     * `extraSharedSecret`'s position IS pinned (the case below passes a 48-byte extra and the
+     * reference concatenates it into the IKM). The transcript's was not: the two byte-pinning tests
+     * never passed one, the reference had no slot for it, and the F8 test only asserts that a
+     * transcript CHANGES the key. Two mutants were measured byte-identical to the shipped code on
+     * every pinned vector and green on every assertion in this file:
+     *
+     *   - the transcript LEADING in `info`, before the label;
+     *   - the transcript folded into the IKM instead of the info.
+     *
+     * So the module header's claim — *"TRAILING, so the label remains recoverable as
+     * info[0 : len-64-|transcript|]"* — rested on a comment, and the promise the hook exists for
+     * ("an addition, not a rewrite") rested on it too. A hybrid built later against a different
+     * position is the wire change this parameter was added to avoid.
+     */
+    const pkB = x25519.getPublicKey(SK_B);
+    const transcript = new Uint8Array(72).fill(0x55);
+    const got = deriveSessionSecrets({
+      ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, pqTranscript: transcript,
+    });
+    expect(
+      Buffer.from(got.contentKey).toString("hex"),
+      "the transcript is not bound where the header says it is",
+    ).toBe(Buffer.from(expected(SK_A, pkB, SID, undefined, transcript).contentKey).toString("hex"));
+  });
+
+  it("★ and the two measured mutants are explicitly NOT what this produces", () => {
+    // Pinned by name, exactly as the salt module pins the XOR combiner, so neither can come back
+    // quietly. Both were green across every other assertion in this file.
+    const pkB = x25519.getPublicKey(SK_B);
+    const transcript = new Uint8Array(72).fill(0x55);
+    const got = deriveSessionSecrets({
+      ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID, pqTranscript: transcript,
+    });
+
+    const shared = x25519.getSharedSecret(SK_A, pkB);
+    const ownPk = x25519.getPublicKey(SK_A);
+    const [first, second] = Buffer.compare(Buffer.from(ownPk), Buffer.from(pkB)) < 0
+      ? [ownPk, pkB] : [pkB, ownPk];
+    const label = new TextEncoder().encode("cello/session/v1/content-key");
+
+    // MUTANT 1 — transcript LEADING in the info.
+    const leadingInfo = new Uint8Array(transcript.length + label.length + 64);
+    leadingInfo.set(transcript, 0);
+    leadingInfo.set(label, transcript.length);
+    leadingInfo.set(first, transcript.length + label.length);
+    leadingInfo.set(second, transcript.length + label.length + 32);
+    expect(
+      Buffer.from(got.contentKey),
+      "the transcript is LEADING, so the label is no longer recoverable from the front of the info",
+    ).not.toEqual(Buffer.from(hkdf(sha256, shared, SID, leadingInfo, 32)));
+
+    // MUTANT 2 — transcript folded into the IKM instead of the info.
+    const ikmWithTranscript = new Uint8Array(shared.length + transcript.length);
+    ikmWithTranscript.set(shared, 0);
+    ikmWithTranscript.set(transcript, shared.length);
+    const infoNoTranscript = new Uint8Array(label.length + 64);
+    infoNoTranscript.set(label, 0);
+    infoNoTranscript.set(first, label.length);
+    infoNoTranscript.set(second, label.length + 32);
+    expect(
+      Buffer.from(got.contentKey),
+      "the transcript went into the IKM, which makes it a second shared SECRET rather than bound " +
+        "public context — the exact distinction X-Wing's combiner draws",
+    ).not.toEqual(Buffer.from(hkdf(sha256, ikmWithTranscript, SID, infoNoTranscript, 32)));
+  });
+
+  it("★ the extra secret and the transcript are pinned TOGETHER — one goes in the IKM, one in the info", () => {
+    // Each is pinned alone above; this fixes them relative to each other, so a swap of the two
+    // parameters cannot pass by satisfying both single-value cases.
+    const pkB = x25519.getPublicKey(SK_B);
+    const extra = new Uint8Array(48).fill(0x44);
+    const transcript = new Uint8Array(72).fill(0x55);
+    const got = deriveSessionSecrets({
+      ownEphemeralSecret: SK_A, peerEphemeralPublic: pkB, sessionId: SID,
+      extraSharedSecret: extra, pqTranscript: transcript,
+    });
+    expect(Buffer.from(got.contentKey).toString("hex")).toBe(
+      Buffer.from(expected(SK_A, pkB, SID, extra, transcript).contentKey).toString("hex"),
     );
   });
 
