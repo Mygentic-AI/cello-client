@@ -145,6 +145,17 @@ export interface SignalingConnectDeps {
    * as session_assignment frames. Absent field (old directory) → never called.
    */
   onRelayEndpoints?: (endpoints: Array<{ peerId: string; addrs: string[] }>) => void;
+  /**
+   * DOD-M15-RELAYSLOTS-1: receives the directory's online token — the credential the relays above
+   * now require before they will let this agent hold a circuit reservation slot. Rides the same
+   * frame and the same cadence as `relay_endpoints`: every connect and every reconnect, which is
+   * what keeps a short-lived token current.
+   *
+   * Absent field → never called. That is the honest signal in two different situations, and the
+   * daemon cannot tell them apart from here: an older directory that does not issue tokens, or a
+   * key this directory does not know as a registered agent. Either way there is no slot.
+   */
+  onOnlineToken?: (token: Uint8Array) => void;
 }
 
 /**
@@ -448,6 +459,33 @@ export function createSignalingConnect(deps: SignalingConnectDeps): () => Promis
             relayPeerIds: endpoints.map((e) => e.peerId),
           });
           deps.onRelayEndpoints(endpoints);
+        }
+      }
+
+      /**
+       * DOD-M15-RELAYSLOTS-1: the online token rides the same frame as the relay pool above, for
+       * the same reason — a standing receiver needs both before any session exists: WHERE to ask
+       * for a reservation slot, and the credential that lets it keep one.
+       *
+       * A field of the wrong type is dropped rather than failing the handshake, exactly as a
+       * malformed relay endpoint is. The consequence is bounded and visible (this agent gets no
+       * slot on any relay, and the relay names the reason when it refuses), whereas failing the
+       * handshake would also cost session offers, which arrive on this same stream.
+       */
+      if (deps.onOnlineToken) {
+        const raw = ackFrame["online_token"];
+        const token = raw instanceof Uint8Array ? raw : Buffer.isBuffer(raw) ? new Uint8Array(raw) : undefined;
+        if (token && token.length > 0) {
+          deps.logger.info("directory.online_token.received", { directoryNodeId, bytes: token.length });
+          deps.onOnlineToken(token);
+        } else {
+          deps.logger.warn("directory.online_token.absent", {
+            directoryNodeId,
+            agentPubkey: identity.pubkeyHex,
+            impact: "this directory issued no online token, so no relay will let this agent hold a " +
+              "circuit reservation and it will be reachable only over a direct connection. Either " +
+              "the directory predates the token, or it does not hold an agent profile for this key.",
+          });
         }
       }
 

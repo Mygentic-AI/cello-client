@@ -91,6 +91,12 @@
     // what you remember to add, so the files most likely to be missing are your own newest ones.
     "src/__tests__/dod-m15-salt-peer-closed-convergence.test.ts",
     "src/__tests__/dod-m15-saltsplit-1-closed-is-not-empty.test.ts",
+    // DOD-M15-RELAYSLOTS-1's own file. New and clean on creation, which is this list's admission
+    // criterion — and the trap written twice above caught me on the way in: I ran the root typecheck
+    // against a file calling a method that did not exist yet and it reported exit 0, then a
+    // deliberate `const x: number = "not a number"` in the same file ALSO reported exit 0. Without
+    // that positive control I would have read a green gate as evidence the API was already there.
+    "src/__tests__/dod-m15-relayslots-1-online-token-carried.test.ts",
     // ⚠️ `m12-p14-seal-readiness.test.ts` is NOT here, and the omission is measured rather than
     // assumed. Its nine-argument `placeOwnLeaf` calls are fixed in the same commit, but adding the
     // file surfaces FIVE pre-existing errors that have nothing to do with this unit: four

@@ -206,6 +206,20 @@ export interface AgentRelayClientOpts {
    * directory's OFFLINE tree rebuild. Optional — when absent, no leaf log is kept.
    */
   sealLeafStore?: SessionSealLeafStore;
+  /**
+   * DOD-M15-RELAYSLOTS-1: the current directory-issued online token for this agent, or `undefined`
+   * when the directory has not issued one (not connected yet, or this key is not a registered
+   * agent). A relay refuses an auth without it, and refuses to let the peer hold a reservation slot.
+   *
+   * ⚠️ A FUNCTION, NOT A VALUE, and that is the whole point. The token is short-lived and reissued
+   * on every signaling reconnect — which happens far more often than a relay auth. A client
+   * constructed with a snapshot would work for the first hour of an agent's life and then present
+   * an expired token forever, losing its slot for a reason nothing on this side reports.
+   *
+   * Optional so a caller with no directory connection at all (tests of unrelated paths) still
+   * compiles; production always supplies it.
+   */
+  onlineToken?: () => Uint8Array | undefined;
 }
 
 /**
@@ -293,6 +307,8 @@ export class AgentRelayClient {
   readonly #logger: Logger;
   readonly #receiptStore: RelayReceiptStore | undefined;
   readonly #sealLeafStore: SessionSealLeafStore | undefined;
+  /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
+  readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
 
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
@@ -360,6 +376,7 @@ export class AgentRelayClient {
     this.#logger = opts.logger;
     this.#receiptStore = opts.receiptStore;
     this.#sealLeafStore = opts.sealLeafStore;
+    this.#onlineToken = opts.onlineToken;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge. */
@@ -880,6 +897,24 @@ export class AgentRelayClient {
       return false;
     }
     const authSig = await this.#keyProvider.sign(buildRelayAuthPayload(nonce, this.#senderPubkey));
+    /**
+     * DOD-M15-RELAYSLOTS-1: read the token NOW, not at construction — it is reissued on every
+     * signaling reconnect and the one this client was built with is usually already gone.
+     *
+     * When there is none we send the auth anyway. Declining to try would replace a named refusal
+     * from the relay (`online_token_required`, which says what is wrong and what to do) with
+     * silence on both sides — and silence is what an operator reads as "the product is broken".
+     */
+    const onlineToken = this.#onlineToken?.();
+    if (!onlineToken) {
+      this.#logger.warn("session.relay.auth.no_online_token", {
+        relayPeerId: this.#relayPeerId,
+        impact: "authenticating without the directory's online token. The relay will refuse this and " +
+          "will not let this node keep a circuit reservation, so the agent is reachable by nobody " +
+          "over this relay. The usual cause is that no directory connection has been established " +
+          "yet; the next signaling connect issues a token and the receiver re-authenticates.",
+      });
+    }
     try {
       stream.send(lp.encode.single(encodeCbor({
         type: "relay_auth_response",
@@ -889,6 +924,9 @@ export class AgentRelayClient {
         // stream as the agent's delivery target). `"reservation"` proves possession from THIS
         // node's transport identity and nothing more — see proveReservation().
         ...(purpose ? { purpose } : {}),
+        // DOD-M15-RELAYSLOTS-1: opaque bytes from the directory, forwarded verbatim. The client
+        // never parses them — a format it does not read is a format it cannot get wrong.
+        ...(onlineToken ? { online_token: onlineToken } : {}),
       }) as Uint8Array));
     } catch (err: unknown) {
       this.#logger.warn("session.relay.auth.failed", { relayPeerId: this.#relayPeerId, reason: "response_send", error: extractErrorMessage(err) });

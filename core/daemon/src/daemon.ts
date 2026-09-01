@@ -976,6 +976,12 @@ async function startDaemonHoldingLock(
           endpoints.map((e) => ({ relayPeerId: e.peerId, relayAddrs: e.addrs })),
         );
       },
+      // DOD-M15-RELAYSLOTS-1: and the credential those relays require. Same frame, same cadence as
+      // the endpoints above — every connect and every reconnect, which is what keeps a token that
+      // expires within the hour current for a receiver that lives much longer than that.
+      onOnlineToken: (token) => {
+        sessionNodeManager.setDirectoryOnlineToken(agentName, token);
+      },
     });
     const mgr = new SignalingManager({
       connect,
@@ -1956,6 +1962,9 @@ async function startDaemonHoldingLock(
       // seal depends on — silently, while reporting success.
       receiptStore: stores.receiptStore,
       sealLeafStore: stores.sealLeafStore,
+      // DOD-M15-RELAYSLOTS-1: the manager owns the current token and hands the accessor down, so
+      // this client reads a fresh one at every auth instead of a snapshot taken here at build time.
+      onlineToken: stores.onlineToken,
     });
   });
 

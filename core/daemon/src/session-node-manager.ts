@@ -691,8 +691,15 @@ export class SessionNodeManager {
    * manager deliberately does not hold. Only consulted on the detached seal path — an ACTIVE session
    * always uses its own registered client.
    */
-  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined) | null = null;
-  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined): void {
+  /**
+   * DOD-M15-RELAYSLOTS-1: `onlineToken` is REQUIRED on the dependency bag, not optional. Every
+   * relay client needs the directory's token or the relay refuses it a reservation slot, and the
+   * failure is invisible from the client side — the agent comes up, reports itself online, and is
+   * reachable by nobody. Making it required means a call site that forgets to pass it is a type
+   * error rather than an agent that quietly stops being dialable.
+   */
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined): void {
     this.#detachedRelayClientBuilder = fn;
   }
 
@@ -744,6 +751,8 @@ export class SessionNodeManager {
       client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+        onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });
       if (!client) return { error: "relay_client_unavailable" };
       // Review MEDIUM-4: cache it, so a retry loop does not leak one authenticated relay stream per
@@ -856,6 +865,8 @@ export class SessionNodeManager {
       client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+        onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });
       if (!client) {
         /**
@@ -4114,6 +4125,8 @@ export class SessionNodeManager {
           logger: this.#logger,
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         this.#relayClients.set(clientKey, client);
       }
@@ -4234,6 +4247,8 @@ export class SessionNodeManager {
         client = this.#detachedRelayClientBuilder?.(agentName, reservationRelayPeerId, [baseRelayAddr], {
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         if (!client) return;
         this.#relayClients.set(clientKey, client);
@@ -6519,6 +6534,8 @@ export class SessionNodeManager {
           client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
             receiptStore: this.#relayReceiptStore ?? undefined,
             sealLeafStore: this.#sealLeafStore ?? undefined,
+            // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+            onlineToken: () => this.getDirectoryOnlineToken(agentName),
           });
           if (!client) {
             this.#logger.warn("session.transport.dial_authorization.no_builder", {
@@ -12306,6 +12323,35 @@ export class SessionNodeManager {
   readonly #directoryRelayEndpoints = new Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>();
 
   /**
+   * DOD-M15-RELAYSLOTS-1: the directory-issued online token per agent — the credential the relays
+   * above now require before they will let this agent hold a circuit reservation slot.
+   *
+   * Arrives with `signaling_auth_ok`, on the same frame as the relay endpoints and on the same
+   * cadence: every connect AND every reconnect. Held here rather than passed to a relay client at
+   * construction because it expires within the hour and the client outlives it — the client reads
+   * it through `getDirectoryOnlineToken` at each authentication.
+   */
+  readonly #directoryOnlineTokens = new Map<string, Uint8Array>();
+
+  /**
+   * DOD-M15-RELAYSLOTS-1: accept the directory's online token for an agent. Called on every
+   * signaling connect and reconnect, which is what keeps it fresh.
+   */
+  setDirectoryOnlineToken(agentName: string, token: Uint8Array): void {
+    this.#directoryOnlineTokens.set(agentName, token);
+  }
+
+  /**
+   * The current token, or `undefined` when the directory has not issued one — either no directory
+   * connection yet, or this key has no agent profile there. Undefined is a real answer, not a
+   * missing one: the relay refuses without a token, which is the intended outcome for a key the
+   * directory does not recognise.
+   */
+  getDirectoryOnlineToken(agentName: string): Uint8Array | undefined {
+    return this.#directoryOnlineTokens.get(agentName);
+  }
+
+  /**
    * DOD-NAT-REACHABILITY-1 (Phase 2): accept the directory's relay-pool endpoints
    * for an agent (arrives with signaling_auth_ok, i.e. on every connect AND every
    * reconnect). If the agent's standing receiver is up but holds NO reservation —
@@ -13142,6 +13188,8 @@ export class SessionNodeManager {
         client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         if (!client) {
           this.#logger.warn("session.revive.relay.builder_absent", {
