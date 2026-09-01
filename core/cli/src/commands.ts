@@ -849,7 +849,7 @@ export async function attestations(
        */
       const flight = issued.in_flight ?? [];
       const flightBlock = flight.length === 0 ? "" :
-        "\n\n  Not yet at any directory node:\n" +
+        "\n\n  Not yet at any directory node (held in memory — a daemon restart loses these):\n" +
         flight.map((f) => {
           const state = f.delivery === "gave_up" ? `gave up (${f.gave_up_because ?? "unknown"})` : "retrying";
           return `  ${state.padEnd(30)}  ${f.submission_id.slice(0, 12)}…  ${f.op}  last: ${f.last_reason}\n      ${f.guidance}`;

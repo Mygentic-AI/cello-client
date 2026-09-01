@@ -3586,7 +3586,8 @@ async function startDaemonHoldingLock(
                 `${context.replace(/:$/, "")} — not yet. It did not reach a directory node ` +
                 `(${sent.reason}), so the daemon is holding it and will send it as soon as the ` +
                 "directory signaling stream is back, on whichever node that is. You do NOT need to " +
-                "run this again. Run cello_attestations_issued to see where it got to.",
+                "run this again. Run cello_attestations_issued to see where it got to. It is held IN " +
+                "MEMORY, so if the daemon restarts before it lands you will have to write it again.",
             };
           }
           // The queue is full, so nothing is holding it and saying otherwise would be a lie the

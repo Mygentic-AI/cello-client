@@ -78,6 +78,9 @@ function makeClock() {
       now = target;
       for (let i = 0; i < 20; i++) await Promise.resolve();
     },
+    /** How many timers are still armed. Lets a test assert that stop() left NOTHING behind, rather
+     *  than only that nothing was sent. */
+    pendingCount: () => pending.size,
   };
 }
 
@@ -325,7 +328,70 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     await h.clock.advance(1_000);
     const before = h.sends.length;
     h.queue.stop();
+    // ASSERT THE TIMER, not merely the absence of a send. Reverting only `#timer?.cancel()` left
+    // this green before, because `#pump`'s own `#stopped` check suppressed the send — so the test
+    // named "nothing is armed" was really asserting "nothing is sent". A dead timer left behind is
+    // its own defect: it shows up in a shutdown trace and keeps the process alive.
+    expect(h.clock.pendingCount(), "stop() left a timer armed").toBe(0);
     await h.clock.advance(60 * 60_000);
     expect(h.sends).toHaveLength(before);
+  });
+
+  it("stop() NAMES every submission it drops — a restart must not lose them silently", async () => {
+    /**
+     * The operator was told "you do NOT need to run this again". A restart takes the queue with it,
+     * and before this there was no durable trace anywhere naming what was lost — not in `issued`
+     * (nothing reached a node), not in `in_flight` (the process is gone), and not in the log.
+     */
+    const h = harness({ outcomes: [fail("directory_unreachable")] });
+    h.queue.enqueue(item({ submissionId: "11".repeat(32) }), "signaling_lost");
+    h.queue.enqueue(item({ submissionId: "22".repeat(32), subject: "ee".repeat(32) }), "signaling_lost");
+    h.queue.stop();
+
+    const dropped = h.events.filter((e) => e.event === "signal.submission.retry.dropped_on_shutdown");
+    expect(dropped).toHaveLength(2);
+    // NAME THE VALUE: the id alone cannot be turned back into a submission, because the body is
+    // deliberately not stored. The subject is what tells the operator WHO they were vouching for.
+    expect(dropped.map((e) => e.ctx["subject"]).sort()).toEqual(["bb".repeat(32), "ee".repeat(32)]);
+    expect(dropped[0].ctx["impact"]).toMatch(/issued again/);
+  });
+
+  it("a submission a node ACCEPTS during shutdown still records its handle", async () => {
+    /**
+     * `stop()` does not await the send in flight. When the node accepts it afterwards the
+     * endorsement is REAL and the portal will mint it — so a daemon that recorded nothing would
+     * leave the operator holding no handle, and a submission with no handle can never be withdrawn.
+     */
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const clock = makeClock();
+    const { logger, events } = makeLogger();
+    const accepted: Array<{ item: PendingSubmission; stored: boolean }> = [];
+    const queue = new SubmissionRetryQueue({
+      logger,
+      send: async (pending) => {
+        await gate;
+        return { ok: true, submissionId: pending.submissionId, stored: true };
+      },
+      onAccepted: (pending, stored) => { accepted.push({ item: pending, stored }); },
+      now: clock.now,
+      schedule: (fn, ms) => clock.schedule(fn, ms),
+    });
+    queue.enqueue(item(), "signaling_lost");
+    queue.onSignalingConnected("Alice");
+    await clock.advance(1_000);
+
+    // The daemon is stopping while the node is still deciding.
+    queue.stop();
+    release();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    expect(accepted, "an endorsement a node accepted left no local handle").toHaveLength(1);
+    const acceptedEvents = events.filter((e) => e.event === "signal.submission.retry.accepted");
+    expect(acceptedEvents).toHaveLength(1);
+    // The log line alone must be enough to reconstruct the handle, because the database may already
+    // be closed by the time this runs.
+    expect(acceptedEvents[0].ctx["subject"]).toBe("bb".repeat(32));
+    expect(acceptedEvents[0].ctx["duringShutdown"]).toBe(true);
   });
 });

@@ -186,7 +186,9 @@ const DEFAULT_QUEUE_CAP = 32;
 const RETRYING_GUIDANCE =
   "The daemon is retrying this submission on its own — it is sealed and held, and it goes out as " +
   "soon as the directory signaling stream is back. You do not need to send it again. Run " +
-  "cello_attestations_issued to see where it got to.";
+  "cello_attestations_issued to see where it got to. It is held IN MEMORY: if the daemon restarts " +
+  "before it lands, it is gone and you will have to write it again — re-sending is safe either way, " +
+  "the submission id is derived from the content.";
 
 function gaveUpGuidance(reason: SubmissionGiveUpReason, last: SubmissionSendFailure): string {
   const shared =
@@ -355,11 +357,34 @@ export class SubmissionRetryQueue {
     return views;
   }
 
-  /** Stop, and start nothing further. Everything pending is dropped — see the in-memory note. */
+  /**
+   * Stop, and start nothing further.
+   *
+   * EVERY DROPPED SUBMISSION IS NAMED (review H2). The queue is in memory by design, but the
+   * operator was told in as many words "you do NOT need to run this again" — and before this, a
+   * restart left no durable trace anywhere naming what had been lost. A comment in the composition
+   * root asserting "in memory by design" is not a record; these lines are.
+   *
+   * The SUBJECT is logged and the body is not: the subject is a pubkey or a signal hash, and the
+   * body is the operator's own words about a third party, which this whole path exists to keep out
+   * of the clear on disk.
+   */
   stop(): void {
     this.#stopped = true;
     this.#timer?.cancel();
     this.#timer = null;
+    for (const entry of this.#queue.values()) {
+      this.#deps.logger.warn("signal.submission.retry.dropped_on_shutdown", {
+        agentName: entry.item.agentName,
+        submissionId: entry.item.submissionId,
+        op: entry.item.op,
+        subject: entry.item.subject,
+        attempts: entry.attempts,
+        sends: entry.totalSends,
+        impact: "it reached no directory node and the daemon is stopping — it must be issued again",
+      });
+    }
+    this.#queue.clear();
   }
 
   #arm(delayMs: number): void {
@@ -413,16 +438,33 @@ export class SubmissionRetryQueue {
       this.#running = false;
     }
 
-    if (this.#stopped) return;
-
+    /**
+     * AN ACCEPTANCE IS RECORDED EVEN IF WE ARE SHUTTING DOWN, and the `#stopped` check sits BELOW
+     * this branch for that reason (review H1).
+     *
+     * `stop()` does not await the send in flight. Checking `#stopped` first meant a node that
+     * accepted the submission during shutdown produced no `onAccepted`, no log line, and no row in
+     * `issued_submissions` — while the portal went on to mint it. The endorsement is real and the
+     * operator holds no handle to it, so it can never be withdrawn: `recordIssuedSubmission`'s own
+     * comment is "KEEP THE HANDLE, or a withdrawal has nothing to name."
+     *
+     * The log line goes out FIRST and carries the subject, so even if the database is already
+     * closed the handle survives in `daemon.log`. A bare `return` here was the worst of the three
+     * available options.
+     */
     if (result.ok) {
       this.#queue.delete(key);
       this.#deps.logger.info("signal.submission.retry.accepted", {
         agentName: entry.item.agentName,
         submissionId: entry.item.submissionId,
         op: entry.item.op,
+        // The SUBJECT, so this line alone is enough to reconstruct the handle if the write below
+        // cannot run. It is a pubkey or a signal hash — never the operator's words.
+        subject: entry.item.subject,
+        intakeKeyId: entry.item.intakeKeyId,
         sends: entry.totalSends,
         stored: result.stored,
+        ...(this.#stopped ? { duringShutdown: true } : {}),
       });
       try {
         this.#deps.onAccepted(entry.item, result.stored);
@@ -432,12 +474,16 @@ export class SubmissionRetryQueue {
         this.#deps.logger.error("signal.submission.retry.record_failed", {
           agentName: entry.item.agentName,
           submissionId: entry.item.submissionId,
+          subject: entry.item.subject,
           error: err instanceof Error ? err.message : String(err),
         });
       }
-      this.#armIfWork();
+      if (!this.#stopped) this.#armIfWork();
       return;
     }
+
+    // Below here everything is bookkeeping for a FUTURE attempt, and a stopped queue makes none.
+    if (this.#stopped) return;
 
     // A refusal ON THE MERITS arriving mid-retry is terminal here too. The node decoded it and said
     // no; nothing about a later reconnect changes that.
