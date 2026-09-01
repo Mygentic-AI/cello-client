@@ -140,8 +140,35 @@ const UNSALTED_REASONS = {
   NO_AGREEMENT_STARTED: "no_agreement_started",
   /** We announced and they did not answer inside the bound. */
   AGREEMENT_TIMED_OUT: "agreement_timed_out",
-  /** They answered, terminally: they have already hashed content and can never adopt. */
+  /**
+   * They answered, terminally: they have already hashed content and can never adopt.
+   *
+   * ⚠️ THIS IS ONE OF FOUR THINGS THE PEER CAN SAY, AND IT USED TO BE ALL OF THEM — 006-CRYPTO
+   * finding 2. The wire frame carries WHICH reason, and `SaltAgreementFrame.adoptionClosed` is a
+   * label rather than a boolean precisely so a caller cannot say `closed` without saying why. That
+   * distinction reached the log and was then dropped one call before the operator, who was told
+   * "they had already hashed messages" no matter which of the four it was.
+   */
   PEER_CLOSED_ADOPTION: "peer_closed_adoption",
+  /**
+   * They answered terminally because their side could NOT READ its own frontier — local storage
+   * trouble on their machine, not a conversation that started early.
+   *
+   * Kept apart from `PEER_CLOSED_ADOPTION` because the remedies are opposites: a new session fixes
+   * the already-hashing case and does nothing at all for this one.
+   */
+  PEER_FRONTIER_UNREADABLE: "peer_frontier_unreadable",
+  /** They answered terminally because the two sides could not converge — 006-CRYPTO finding 1. */
+  PEER_EXCHANGE_STALLED: "peer_exchange_stalled",
+  /**
+   * They closed adoption naming a reason THIS build does not recognise.
+   *
+   * Deliberately non-asserting. The peer chooses this string, so the safe rendering states what we
+   * know — they declined, and the label is in the log line above — and asserts nothing about why.
+   * Guessing here is how an operator ends up asking a counterparty to change something that was
+   * never the problem.
+   */
+  PEER_CLOSED_UNSPECIFIED: "peer_closed_unspecified",
   /** The session was torn down while the first send was still waiting. */
   SESSION_TORN_DOWN: "session_torn_down",
   /** This side already hashed, leafed, held or has in flight — adoption closed here. */
@@ -177,6 +204,12 @@ const UNSALTED_GUIDANCE: Record<UnsaltedReason, string> = {
     "Your counterparty was connected but did not answer the salt agreement in time. Almost always they are on a build that predates it, in which case this is expected and permanent for this session — start a new session once they upgrade. If you know they are on the same version, look for session.salt.persist.failed on this side and session.salt.announce.failed on either.",
   [UNSALTED_REASONS.PEER_CLOSED_ADOPTION]:
     "Your counterparty declined the salt because their side of this session had already hashed messages — their conversation started before yours could agree one. Both builds are fine and both sides know. Start a new session if you want the protection.",
+  [UNSALTED_REASONS.PEER_FRONTIER_UNREADABLE]:
+    "Your counterparty declined the salt because their machine could not read its own record of this conversation — their local storage is not answering. Nothing is wrong with your machine or with either build, and they did not do anything wrong. STARTING A NEW SESSION WILL NOT HELP: the next one will decline the same way until their storage is working. Ask them, out of band, to look for session.salt.adoption.refused on their side; it names the read that failed.",
+  [UNSALTED_REASONS.PEER_EXCHANGE_STALLED]:
+    "Your counterparty holds a salt for this session and this side never managed to store one, so the two of you could not converge and both agreed to stop rather than trade messages about it forever. Nobody is at fault and no message was lost. Look for session.salt.persist.failed on this side — if it is there, a write to local storage failed and that is the whole cause. Start a new session; it will agree a salt normally.",
+  [UNSALTED_REASONS.PEER_CLOSED_UNSPECIFIED]:
+    "Your counterparty declined the salt for a reason this build does not recognise — most likely they are on a newer build that names a case this one predates. Both sides agree there is no salt, so nothing is broken and no message was lost. The exact reason they gave is in the session.salt.adoption.closed line just above. Start a new session once you both know why.",
   [UNSALTED_REASONS.SESSION_TORN_DOWN]:
     "This session was closed or reset while the message was still being prepared. This line is about the salt only; look for the close or freeze event just before it for what actually happened to the session.",
   [UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY]:
@@ -1160,6 +1193,18 @@ export class SessionNodeManager {
    * answered; only an identical re-offer is the loop.
    */
   #saltRepairedAgainstFingerprint = new Map<string, string>();
+  /**
+   * THE LABEL THE PEER GAVE when it closed adoption — 006-CRYPTO finding 2.
+   *
+   * The wire carries WHY, `session-salt-agreement.ts` makes it a union so a caller cannot close
+   * without saying why, and the agreement's `detail` puts it in the log. It was going no further:
+   * `#settleSaltPending(..., "closed")` recorded only that it was closed, so every one of the four
+   * reasons arrived at the operator as "they had already hashed messages".
+   *
+   * Stored raw and rendered through `#peerClosedReason`, which maps anything outside the known set
+   * to a non-asserting reason — the peer chooses these bytes.
+   */
+  #saltPeerClosedLabel = new Map<string, string>();
   /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
@@ -5036,6 +5081,7 @@ export class SessionNodeManager {
     this.#sessionSalts.delete(key);
     this.#saltRepairedAgainst.delete(key);
     this.#saltRepairedAgainstFingerprint.delete(key);
+    this.#saltPeerClosedLabel.delete(key);
     /**
      * B2b-2's three, and the pending one is SETTLED rather than dropped.
      *
@@ -10327,6 +10373,28 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seam: deliver an inbound salt frame, exactly as the content-stream decoder does.
+   *
+   * 006-CRYPTO finding 2. WHICH of the four reasons the peer gave decides what the operator is told,
+   * and reaching that decision from a test otherwise needs a second live daemon that has closed
+   * adoption for a specific reason — which is not something a counterparty can be asked to do on
+   * demand. The four labels are the whole point of the finding, so they need to be reachable.
+   *
+   * It calls the REAL private handler rather than reproducing its routing, so a test cannot pass
+   * against a decision production does not make. It takes the DECODED frame, so it deliberately
+   * does NOT stand in for the decoder above it — the length and vocabulary checks there have their
+   * own tests driving `handleContentFrameForTest`.
+   */
+  async handleSaltFrameForTest(
+    agentName: string,
+    sessionId: string,
+    frame: SaltAgreementFrame,
+    correlationId = "test",
+  ): Promise<void> {
+    await this.#handleSaltFrame(agentName, sessionId, frame, correlationId);
+  }
+
+  /**
    * Test seam: drop this session's own half while leaving the stored salt in place — the state every
    * teardown produces, because `#evictSessionCaches` clears the map and the row survives.
    *
@@ -10547,11 +10615,16 @@ export class SessionNodeManager {
       /**
        * SUSPENDED BEATS HELD — `DOD-M15-SALTSPLIT-1`. The peer has said it can never hold a salt, so
        * hashing under ours produces a message it must refuse. We hold one and deliberately do not
-       * use it; `PEER_CLOSED_ADOPTION` already carries exactly the right guidance for that, so no new
-       * reason is needed and none is invented.
+       * use it.
+       *
+       * ⚠️ An earlier note here said `PEER_CLOSED_ADOPTION` "already carries exactly the right
+       * guidance, so no new reason is needed and none is invented." That was right about not
+       * inventing a reason and wrong about which one applies: the peer can suspend us for any of
+       * four reasons, and the one hardcoded here asserted the most flattering of them. It now asks
+       * the same mapping every other closed path asks (006-CRYPTO finding 2).
        */
       if (this.#saltSuspended.has(key)) {
-        return { salt: null, reason: UNSALTED_REASONS.PEER_CLOSED_ADOPTION };
+        return { salt: null, reason: this.#peerClosedReason(key) };
       }
       return { salt: held };
     }
@@ -10564,7 +10637,7 @@ export class SessionNodeManager {
       // An agreement that already ENDED is not an agreement that never started. Only the second is
       // "your counterparty was not connected", and only an absent entry means it.
       const last = this.#saltLastOutcome.get(key);
-      if (last !== undefined) return { salt: null, reason: this.#reasonForOutcome(last) };
+      if (last !== undefined) return { salt: null, reason: this.#reasonForOutcome(key, last) };
       return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
     }
 
@@ -10672,11 +10745,38 @@ export class SessionNodeManager {
    * ONE mapping from a settled outcome to the operator-facing reason, so the send that WAITED and the
    * send that arrived afterwards cannot disagree about what happened.
    */
-  #reasonForOutcome(outcome: "timeout" | "closed" | "persist_failed" | "announce_failed"): UnsaltedReason {
+  #reasonForOutcome(
+    key: string,
+    outcome: "timeout" | "closed" | "persist_failed" | "announce_failed",
+  ): UnsaltedReason {
     if (outcome === "announce_failed") return UNSALTED_REASONS.ANNOUNCE_FAILED;
     if (outcome === "persist_failed") return UNSALTED_REASONS.OUR_PERSIST_FAILED;
-    if (outcome === "closed") return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
+    if (outcome === "closed") return this.#peerClosedReason(key);
     return UNSALTED_REASONS.AGREEMENT_TIMED_OUT;
+  }
+
+  /**
+   * WHICH of the four terminal answers the peer actually gave — 006-CRYPTO finding 2.
+   *
+   * The default is the NON-ASSERTING reason, not the most common one. An unknown label means a build
+   * we do not understand, and rendering that as "they had already hashed messages" states something
+   * about a counterparty that may be untrue — which is what sends an operator to raise a
+   * non-problem with them. The label is peer-supplied, so nothing outside the known set is repeated
+   * back as our own diagnosis.
+   *
+   * A missing entry maps to the already-hashing case: `PEER_CLOSED_FIRST` and an absent label both
+   * mean the peer is answering a closure of OURS, and `#saltForHashing` answers that with
+   * `ADOPTION_CLOSED_LOCALLY` one branch earlier — this is only the fallback if it did not.
+   */
+  #peerClosedReason(key: string): UnsaltedReason {
+    const label = this.#saltPeerClosedLabel.get(key);
+    if (label === undefined || label === SALT_ADOPTION_LABELS.PEER_CLOSED_FIRST) {
+      return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
+    }
+    if (label === SALT_ADOPTION_LABELS.ALREADY_HASHING) return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
+    if (label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE) return UNSALTED_REASONS.PEER_FRONTIER_UNREADABLE;
+    if (label === SALT_ADOPTION_LABELS.EXCHANGE_STALLED) return UNSALTED_REASONS.PEER_EXCHANGE_STALLED;
+    return UNSALTED_REASONS.PEER_CLOSED_UNSPECIFIED;
   }
 
   /** Resolve a pending agreement. Idempotent: the first outcome wins and the timer is cleared. */
@@ -11365,6 +11465,12 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
     const peerFingerprintHex = frame.fingerprint ? Buffer.from(frame.fingerprint).toString("hex") : null;
+    // WHY the peer closed, kept for the operator-facing reason — 006-CRYPTO finding 2. Recorded here
+    // rather than in the `adoption_closed` handler because that action fires for OUR closure too,
+    // and only the frame says what the PEER said.
+    if (typeof frame.adoptionClosed === "string") {
+      this.#saltPeerClosedLabel.set(key, frame.adoptionClosed);
+    }
     const adoption = this.#saltAdoptionClosed(agentName, sessionId);
     const action = onPeerSaltFrame({
       ...this.#saltState(agentName, sessionId),

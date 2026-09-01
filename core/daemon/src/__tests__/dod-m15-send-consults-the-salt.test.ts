@@ -498,3 +498,77 @@ describe("DOD-M15-SEALWIRE-1 B2b-2: the send path consults the salt", () => {
     ).toBe(1);
   }, 60_000);
 });
+
+describe("WHICH reason the peer gave survives to the operator — 006-CRYPTO finding 2", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  /**
+   * `adoptionClosed` is a LABEL rather than a boolean, and `session-salt-agreement.ts` says why in
+   * as many words: *"Making it a union means a caller cannot say `closed` without saying WHY…
+   * Reporting a disk that will not answer as 'you already sent messages' points the operator at a
+   * session they cannot fix instead of a database they can, and tells the counterparty something
+   * untrue about them."*
+   *
+   * The label reached the log and was then dropped one call before the person who needed it:
+   * `#settleSaltPending(…, "closed")` recorded only that it closed, and `#reasonForOutcome` mapped
+   * every closure to `peer_closed_adoption`. All four reasons arrived as "they had already hashed
+   * messages" — with a remedy, "start a new session", that is right for one of them and useless for
+   * the others.
+   */
+  async function closedBy(label: string, prefix: string) {
+    fx = await startTwoConnectionFixture({ dirPrefix: prefix });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    // An agreement must be IN FLIGHT for a terminal answer to be recorded against it — a settle with
+    // nothing pending is a no-op, which would silently make every assertion below vacuous.
+    fx.snm.markSaltAgreementPendingForTest("alice", SID);
+    await fx.snm.handleSaltFrameForTest("alice", SID, { adoptionClosed: label });
+    await fx.snm.contentHashForSession("alice", SID, BODY);
+    const said = fx.eventsNamed("session.content.unsalted");
+    expect(said.length, "PRECONDITION: the fallback was announced exactly once").toBe(1);
+    return { reason: String(said[0]!.ctx!["reason"]), guidance: String(said[0]!.ctx!["guidance"]) };
+  }
+
+  it("★ a peer whose STORAGE failed is not reported as a peer who already sent messages", async () => {
+    const { reason, guidance } = await closedBy("frontier_unreadable", "cello-closed-frontier-");
+    expect(reason).toBe("peer_frontier_unreadable");
+    expect(
+      guidance,
+      "the operator must not be told the counterparty's conversation started early — it did not, their disk would not answer",
+    ).not.toMatch(/already hashed messages|started before yours/i);
+    expect(
+      guidance,
+      "and the remedy must not be one that cannot work: the next session declines identically until their storage is fixed",
+    ).toMatch(/will not help/i);
+  }, 60_000);
+
+  it("★ a peer that already hashed still reads exactly as it did — the common case is unchanged", async () => {
+    const { reason, guidance } = await closedBy("already_hashing", "cello-closed-hashing-");
+    expect(reason).toBe("peer_closed_adoption");
+    expect(guidance).toMatch(/already hashed messages/i);
+    expect(guidance).toMatch(/new session/i);
+  }, 60_000);
+
+  it("★ a stalled exchange names the LOCAL write that caused it, not the counterparty's build", async () => {
+    const { reason, guidance } = await closedBy("exchange_stalled", "cello-closed-stalled-");
+    expect(reason).toBe("peer_exchange_stalled");
+    expect(
+      guidance,
+      "the cause is a failed write on THIS machine — sending the operator to their counterparty's build is the substitution this closed set exists to end",
+    ).not.toMatch(/upgrade/i);
+    expect(guidance).toMatch(/session\.salt\.persist\.failed/i);
+  }, 60_000);
+
+  it("★ an UNKNOWN label asserts nothing about the counterparty", async () => {
+    /**
+     * The default must be the non-asserting reason, not the most common one. This string is chosen
+     * by the peer, so a build that does not recognise it knows only that they declined — and
+     * rendering that as "they had already hashed messages" states something about a counterparty
+     * that may simply be false, which is what sends an operator to raise a non-problem with them.
+     */
+    const { reason, guidance } = await closedBy("some_reason_from_a_newer_build", "cello-closed-unknown-");
+    expect(reason).toBe("peer_closed_unspecified");
+    expect(guidance).not.toMatch(/already hashed messages|storage|disk/i);
+    expect(guidance, "it must point at where the actual label can be read").toMatch(/session\.salt\.adoption\.closed/i);
+  }, 60_000);
+});
