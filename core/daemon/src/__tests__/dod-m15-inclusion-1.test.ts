@@ -409,6 +409,45 @@ describe("DOD-M15-INCLUSION-1: prove one message sits under the sealed root", ()
     expect(events.some((e) => e.level === "error" && e.event === "inclusion.salt.unreadable")).toBe(true);
   });
 
+  /**
+   * A MESSAGE ON THE OTHER SIDE OF A SALT SPLIT IS NOT AN ABSENT MESSAGE — review F5.
+   *
+   * The handler picks the algorithm from salt POSSESSION, and `#suspendSalt` deliberately keeps the
+   * salt bytes while the session hashes `sha256` — so a session can hold salted leaves next to
+   * unsalted ones. For a leaf on the other side of that split the old answer was
+   * `message_not_in_session`, whose guidance ended *"this message is genuinely not in this sealed
+   * conversation"*: an affirmatively false statement about the product's central claim, produced by
+   * this daemon's own algorithm guess and wearing an exit-point label.
+   */
+  it("a message hashed UNSALTED in a salted session is named, not declared absent", async () => {
+    const f = await makeFixture(dbPath());
+    const stray = "Sent after the salt was suspended.";
+    const strayHash = Buffer.from(
+      contentHashFor(new TextEncoder().encode(stray), { alg: CONTENT_HASH_ALGS.SHA256, salt: null }),
+    ).toString("hex");
+
+    // The certified set gains the unsalted leaf; the certificate is re-signed over the new root, so
+    // nothing else about the session is inconsistent — only the hash rule for that one leaf.
+    const mixed = [...f.certifiedLeaves, strayHash];
+    const mixedRoot = rootOver(mixed);
+    f.mgr.recordSealCertificate(AGENT, SESSION_ID, mixedRoot, JSON.stringify({ participants: [] }));
+    expect(f.mgr.recordCertifiedLeafSet(AGENT, SESSION_ID, signedLeavesFor(mixed), mixedRoot)).toBe(true);
+
+    const res = await f.getProof({ message: stray });
+    expect(res["ok"]).toBe(false);
+    expect(res["reason"]).toBe("message_hashed_under_other_alg");
+    expect(res["reason"]).not.toBe("message_not_in_session");
+    expect(res["leaf_index"]).toBe(mixed.length - 1);
+    // The sentence that was false must be gone, and the true one present.
+    expect(String(res["guidance"])).toContain("THIS MESSAGE IS IN THE SEALED RECORD");
+    expect(String(res["guidance"])).not.toContain("genuinely not in this sealed conversation");
+
+    // A message that really is absent still says so — otherwise the new branch would just be a
+    // blanket softening of the refusal.
+    const absent = await f.getProof({ message: "Nobody ever sent this." });
+    expect(absent["reason"]).toBe("message_not_in_session");
+  });
+
   it("DoD 8c: the verifier refuses an unsalted PROOF rather than checking it", async () => {
     const f = await makeFixture(dbPath());
     const proof = (await f.getProof())["proof"] as InclusionProof;

@@ -158,7 +158,8 @@ Only Agent A calls `cello_close_session`. Agent B detects the seal via their rec
 
 ```
 cello_sealed_receipt({ cello_session_id: "<hex>" })
-cello_get_inclusion_proof({ cello_session_id: "<hex>", content_hash: "<hash>" })
+cello_get_inclusion_proof({ cello_session_id: "<hex>", message: "<the exact message text>" })
+cello_verify_inclusion_proof({ proof, message: "<the exact message text>", certified_root: "<sealed_root>" })
 ```
 
 ---
@@ -260,7 +261,9 @@ cello_sessions()
 ```
 cello_close_session({ cello_session_id })              — initiator only; triggers FROST seal
 cello_sealed_receipt({ cello_session_id })         — tamper-evident seal after close
-cello_get_inclusion_proof({ cello_session_id, content_hash })  — Merkle proof for a message
+cello_get_inclusion_proof({ cello_session_id, message })   — prove ONE message is in the sealed record
+cello_verify_inclusion_proof({ proof, message, certified_root })
+                                                   — check that proof; needs no daemon access
 ```
 
 **Key management**
