@@ -28,7 +28,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createNode } from "@cello-protocol/transport";
 import {
-  generateKeypair, msgLeafHash, signSessionEphemeral, sealSessionContent, openSessionContent,
+  generateKeypair, msgLeafHash, signSessionEphemeral, sealSessionContent,
   type KeyProvider,
 } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
