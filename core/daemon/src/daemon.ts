@@ -976,6 +976,18 @@ async function startDaemonHoldingLock(
           endpoints.map((e) => ({ relayPeerId: e.peerId, relayAddrs: e.addrs })),
         );
       },
+      // DOD-M15-RELAYSLOTS-1: and the credential those relays require. Same frame, same cadence as
+      // the endpoints above — every connect and every reconnect, which is what keeps a token that
+      // expires within the hour current for a receiver that lives much longer than that.
+      onOnlineToken: (token) => {
+        sessionNodeManager.setDirectoryOnlineToken(agentName, token);
+      },
+      // Review M1: and when there is none, WHY — so the operator surface can say "this directory
+      // does not know this agent" instead of "check your directory connection" about a connection
+      // that just succeeded.
+      onOnlineTokenAbsent: (reason) => {
+        sessionNodeManager.setDirectoryOnlineTokenAbsent(agentName, reason);
+      },
     });
     const mgr = new SignalingManager({
       connect,
@@ -1956,6 +1968,9 @@ async function startDaemonHoldingLock(
       // seal depends on — silently, while reporting success.
       receiptStore: stores.receiptStore,
       sealLeafStore: stores.sealLeafStore,
+      // DOD-M15-RELAYSLOTS-1: the manager owns the current token and hands the accessor down, so
+      // this client reads a fresh one at every auth instead of a snapshot taken here at build time.
+      onlineToken: stores.onlineToken,
     });
   });
 
@@ -2514,6 +2529,19 @@ async function startDaemonHoldingLock(
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
           standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
           standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
+          /**
+           * DOD-M15-RELAYSLOTS-1: WHY it is not reachable, and what to do about it.
+           *
+           * `standing_receiver_reachability` says `retrying` or `unreachable` and stops there, which
+           * for the person reading it is indistinguishable from the product being broken. The relay
+           * now refuses for reasons someone can act on — no token from a directory yet, too many
+           * sessions still open, this relay is misconfigured — each with a different next step, and
+           * every one of them is wasted if it only reaches a log file. Absent when the last attempt
+           * succeeded.
+           */
+          ...(sessionNodeManager.getStandingReceiverRefusal(a.name)
+            ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
+            : {}),
           // DOD-COATTEND-VISIBLE-1 AC2: how many sessions are driving this agent, including this
           // one. Live, not a high-water mark — it drops when a session disconnects. `selected` says
           // whether YOU hold it; this says whether anyone else does too.
@@ -2761,6 +2789,11 @@ async function startDaemonHoldingLock(
         state: agentStateFor(a),
         standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
         standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
+        // DOD-M15-RELAYSLOTS-1: the same cause-and-advice on the daemon-wide surface — see the note
+        // on the MCP one above. Two surfaces, one reason to exist.
+        ...(sessionNodeManager.getStandingReceiverRefusal(a.name)
+          ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
+          : {}),
       })),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),

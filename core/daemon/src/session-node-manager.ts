@@ -68,7 +68,7 @@ import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnve
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal } from "./session-relay-client.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
@@ -300,6 +300,16 @@ const REDIAL_COOLDOWN_MS = 15_000;
  * span about 2.5 hours.
  */
 export const SR_RESERVATION_MAX_RETRIES = 5;
+
+/**
+ * DOD-M15-RELAYSLOTS-1 — how long an agent skips a relay that refused it for a relay-side fault.
+ *
+ * Ten minutes: long enough that the agent is not re-asking a relay that cannot serve it every time
+ * its receiver rebuilds, short enough that when someone fixes that relay the agent finds it again
+ * without needing its own restart. The fault is on somebody else's machine and nobody tells us when
+ * it is fixed, so this has to expire on its own.
+ */
+export const RELAY_QUARANTINE_MS = 10 * 60 * 1000;
 
 export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_TTL_MS"]) || 2 * 60 * 60 * 1000;
 
@@ -725,8 +735,15 @@ export class SessionNodeManager {
    * manager deliberately does not hold. Only consulted on the detached seal path — an ACTIVE session
    * always uses its own registered client.
    */
-  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined) | null = null;
-  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore }) => AgentRelayClient | undefined): void {
+  /**
+   * DOD-M15-RELAYSLOTS-1: `onlineToken` is REQUIRED on the dependency bag, not optional. Every
+   * relay client needs the directory's token or the relay refuses it a reservation slot, and the
+   * failure is invisible from the client side — the agent comes up, reports itself online, and is
+   * reachable by nobody. Making it required means a call site that forgets to pass it is a type
+   * error rather than an agent that quietly stops being dialable.
+   */
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined): void {
     this.#detachedRelayClientBuilder = fn;
   }
 
@@ -778,6 +795,8 @@ export class SessionNodeManager {
       client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+        onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });
       if (!client) return { error: "relay_client_unavailable" };
       // Review MEDIUM-4: cache it, so a retry loop does not leak one authenticated relay stream per
@@ -890,6 +909,8 @@ export class SessionNodeManager {
       client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+        onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });
       if (!client) {
         /**
@@ -926,6 +947,38 @@ export class SessionNodeManager {
      * proves possession without rebinding the agent's delivery target away from the live session.
      */
     const proven = await client.proveReservation(node);
+    /**
+     * DOD-M15-RELAYSLOTS-1: keep the relay's refusal where the OPERATOR can reach it.
+     *
+     * The log line below is a good log line and it is not an answer to "why is my agent
+     * unreachable?" — nobody opens the file. The relay now refuses for reasons a person can act on
+     * (no token yet, too many sessions still open, this relay is misconfigured), each with its own
+     * next step, and every one of them is useless if it stops at a log.
+     */
+    if (!proven) {
+      const refusal = client.getLastAuthRefusal();
+      /**
+       * Review L2: the `else` is not symmetry for its own sake. `proveReservation` also fails for
+       * transport reasons, which leave `getLastAuthRefusal()` null — and without this branch the
+       * PREVIOUS refusal stayed in the map, so `cello_status` went on showing a cause and an
+       * affordance for something that was no longer what was wrong.
+       */
+      if (refusal) this.#srRelayRefusal.set(agentName, { ...this.#withDirectoryCause(agentName, refusal), relayPeerId });
+      else this.#srRelayRefusal.delete(agentName);
+      /**
+       * DOD-M15-RELAYSLOTS-1 clause 9 — **ACT on the classification, do not merely record it.**
+       * A relay-side fault means a different relay will work now, so quarantine this one and
+       * rebuild the receiver against the rest of the pool. Everything else stays put: a token
+       * problem reproduces on every relay, and walking the fleet would turn one client fault into
+       * what looks like a fleet-wide outage.
+       */
+      if (refusal?.tryAnotherRelay && !this.#shuttingDown) {
+        this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
+        void this.#rebuildStandingReceiver(agentName);
+      }
+    } else {
+      this.#srRelayRefusal.delete(agentName);
+    }
     this.#logger.info("session.standing_receiver.relay_auth.result", {
       agentName,
       relayPeerId,
@@ -933,8 +986,60 @@ export class SessionNodeManager {
       // line said `connected: true` for a receiver that had sent nothing.
       nodePeerId: node.getPeerId(),
       proven,
+      ...(proven ? {} : {
+        refusalReason: client.getLastAuthRefusal()?.reason ?? "no_relay_verdict",
+        tryAnotherRelay: client.getLastAuthRefusal()?.tryAnotherRelay ?? false,
+      }),
       correlationId,
     });
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1: the last relay refusal per agent, with the advice that goes with it.
+   * Written where the refusal is actually known; read by whatever tells the operator.
+   */
+  readonly #srRelayRefusal = new Map<string, RelayAuthRefusal & { relayPeerId: string }>();
+
+  /**
+   * Why this agent's standing receiver could not hold a reservation, in words the person running it
+   * can act on — or null when the last attempt succeeded or none has been made.
+   *
+   * This is the surface DoD clause 7 is about: the assertion that matters is what the CLIENT can
+   * show someone, not what the relay wrote in its own log.
+   */
+  getStandingReceiverRefusal(agentName: string): (RelayAuthRefusal & { relayPeerId: string }) | null {
+    return this.#srRelayRefusal.get(agentName) ?? null;
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 review M1 — **replace the relay's guess with the directory's fact.**
+   *
+   * The relay can only say "no token was presented"; the DIRECTORY knows why there was none, and
+   * the two most useful answers point somewhere the relay's own advice does not. Left alone,
+   * `online_token_required` tells the operator to check that their agent is reaching a directory —
+   * which, in the `not_registered_here` case, it plainly is.
+   */
+  #withDirectoryCause(agentName: string, refusal: RelayAuthRefusal): RelayAuthRefusal {
+    if (refusal.reason !== "online_token_required") return refusal;
+    const absent = this.#directoryOnlineTokenAbsent.get(agentName);
+    if (absent === "not_registered_here") {
+      return {
+        ...refusal,
+        advice: "The directory this agent is connected to holds no profile for its key, so it " +
+          "issued no token and no relay will grant a reservation. The directory connection itself " +
+          "is fine — either this agent registered against a different sovereign node and its " +
+          "profile has not replicated here yet, or it is not registered at all.",
+      };
+    }
+    if (absent === "issue_failed") {
+      return {
+        ...refusal,
+        advice: "The directory could not issue this agent a token — its own lookup or signing " +
+          "failed. That is a fault on the directory, not on this agent or on any relay; it usually " +
+          "clears on the next connection.",
+      };
+    }
+    return refusal;
   }
 
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents
@@ -4172,6 +4277,8 @@ export class SessionNodeManager {
           logger: this.#logger,
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         this.#relayClients.set(clientKey, client);
       }
@@ -4292,6 +4399,8 @@ export class SessionNodeManager {
         client = this.#detachedRelayClientBuilder?.(agentName, reservationRelayPeerId, [baseRelayAddr], {
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         if (!client) return;
         this.#relayClients.set(clientKey, client);
@@ -6600,6 +6709,8 @@ export class SessionNodeManager {
           client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
             receiptStore: this.#relayReceiptStore ?? undefined,
             sealLeafStore: this.#sealLeafStore ?? undefined,
+            // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+            onlineToken: () => this.getDirectoryOnlineToken(agentName),
           });
           if (!client) {
             this.#logger.warn("session.transport.dial_authorization.no_builder", {
@@ -12465,6 +12576,51 @@ export class SessionNodeManager {
   readonly #directoryRelayEndpoints = new Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>();
 
   /**
+   * DOD-M15-RELAYSLOTS-1: the directory-issued online token per agent — the credential the relays
+   * above now require before they will let this agent hold a circuit reservation slot.
+   *
+   * Arrives with `signaling_auth_ok`, on the same frame as the relay endpoints and on the same
+   * cadence: every connect AND every reconnect. Held here rather than passed to a relay client at
+   * construction because it expires within the hour and the client outlives it — the client reads
+   * it through `getDirectoryOnlineToken` at each authentication.
+   */
+  readonly #directoryOnlineTokens = new Map<string, Uint8Array>();
+
+  /**
+   * DOD-M15-RELAYSLOTS-1: accept the directory's online token for an agent. Called on every
+   * signaling connect and reconnect, which is what keeps it fresh.
+   */
+  setDirectoryOnlineToken(agentName: string, token: Uint8Array): void {
+    this.#directoryOnlineTokens.set(agentName, token);
+    this.#directoryOnlineTokenAbsent.delete(agentName);
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1 review M1: the directory issued no token, and this is which absence it was.
+   *
+   * Kept so the relay's eventual `online_token_required` refusal can be reported with the cause the
+   * DIRECTORY knew and the relay never learns — most importantly `not_registered_here`, where the
+   * generic advice ("check that you are reaching a directory") points at a connection that is
+   * working and away from the actual problem.
+   */
+  readonly #directoryOnlineTokenAbsent = new Map<string, "not_registered_here" | "issue_failed" | "unstated">();
+
+  setDirectoryOnlineTokenAbsent(agentName: string, reason: "not_registered_here" | "issue_failed" | undefined): void {
+    this.#directoryOnlineTokens.delete(agentName);
+    this.#directoryOnlineTokenAbsent.set(agentName, reason ?? "unstated");
+  }
+
+  /**
+   * The current token, or `undefined` when the directory has not issued one — either no directory
+   * connection yet, or this key has no agent profile there. Undefined is a real answer, not a
+   * missing one: the relay refuses without a token, which is the intended outcome for a key the
+   * directory does not recognise.
+   */
+  getDirectoryOnlineToken(agentName: string): Uint8Array | undefined {
+    return this.#directoryOnlineTokens.get(agentName);
+  }
+
+  /**
    * DOD-NAT-REACHABILITY-1 (Phase 2): accept the directory's relay-pool endpoints
    * for an agent (arrives with signaling_auth_ok, i.e. on every connect AND every
    * reconnect). If the agent's standing receiver is up but holds NO reservation —
@@ -12562,6 +12718,55 @@ export class SessionNodeManager {
    * of past sessions (getAgentRelayEndpoints — covers a directory that predates
    * the auth_ok extension).
    */
+  /**
+   * DOD-M15-RELAYSLOTS-1: relays this agent should skip, and until when — see the failover note in
+   * `#reservationCircuitAddrs`. Keyed agent → relay peer id → expiry.
+   *
+   * Time-boxed rather than permanent because the fault is somebody else's to fix and we will not
+   * hear when they have: an operator sets the missing directory key and restarts, and this agent
+   * should find that relay again without needing its own restart.
+   */
+  readonly #relayQuarantine = new Map<string, Map<string, number>>();
+
+  /**
+   * Is this agent currently skipping this relay? The observable half of the failover decision — a
+   * test that asserts only on the classifier's boolean proves nothing about what the daemon does.
+   */
+  isRelayQuarantined(agentName: string, relayPeerId: string): boolean {
+    return this.#relayQuarantineFor(agentName).has(relayPeerId);
+  }
+
+  /** Live quarantine entries for an agent, expired ones swept on read. */
+  #relayQuarantineFor(agentName: string): Set<string> {
+    const byRelay = this.#relayQuarantine.get(agentName);
+    if (!byRelay) return new Set();
+    const now = Date.now();
+    for (const [relayPeerId, expiresAt] of byRelay) {
+      if (now >= expiresAt) byRelay.delete(relayPeerId);
+    }
+    if (byRelay.size === 0) this.#relayQuarantine.delete(agentName);
+    return new Set(byRelay.keys());
+  }
+
+  /**
+   * Skip this relay for this agent for a while. Called only for refusals the classifier marks
+   * `tryAnotherRelay` — a fault of the relay's, not one that would follow us to the next one.
+   */
+  #quarantineRelay(agentName: string, relayPeerId: string, reason: string): void {
+    let byRelay = this.#relayQuarantine.get(agentName);
+    if (!byRelay) { byRelay = new Map(); this.#relayQuarantine.set(agentName, byRelay); }
+    byRelay.set(relayPeerId, Date.now() + RELAY_QUARANTINE_MS);
+    this.#logger.warn("session.standing_receiver.relay_quarantined", {
+      agentName,
+      relayPeerId,
+      reason,
+      forMs: RELAY_QUARANTINE_MS,
+      impact: "this relay refused this agent for a fault of its own, so the agent will ask a " +
+        "different relay for its reservation until the quarantine lapses. Its inbound reachability " +
+        "is restored by moving, not by waiting for someone to fix that relay.",
+    });
+  }
+
   #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
     let persisted: Array<{ relayPeerId: string; relayAddrs: string[] }>;
     try {
@@ -12581,9 +12786,33 @@ export class SessionNodeManager {
     for (const ep of [...(this.#directoryRelayEndpoints.get(agentName) ?? []), ...persisted]) {
       if (!merged.has(ep.relayPeerId)) merged.set(ep.relayPeerId, ep);
     }
+    /**
+     * DOD-M15-RELAYSLOTS-1 — **THE FAILOVER.** Skip relays that refused this agent for a fault of
+     * their own (today: a relay holding no directory public key, which can verify nobody and is
+     * refusing everyone). We run several relays precisely so one being broken is survivable.
+     *
+     * ⚠️ NEVER TO THE POINT OF HAVING NO RELAY AT ALL. If the quarantine would empty the candidate
+     * list it is ignored wholesale: a relay that refuses is strictly better than no relay, because
+     * the refusal at least has a cause the operator can read, while an agent with no candidates is
+     * simply unreachable with nothing to show for it. This is the same "refusing too eagerly is the
+     * failure mode" rule, applied to the client's own choice of where to ask.
+     */
+    const quarantined = this.#relayQuarantineFor(agentName);
+    const eligible = [...merged.values()].filter((ep) => !quarantined.has(ep.relayPeerId));
+    const usable = eligible.length > 0 ? eligible : [...merged.values()];
+    if (eligible.length === 0 && quarantined.size > 0 && merged.size > 0) {
+      this.#logger.warn("session.standing_receiver.relay_quarantine.ignored", {
+        agentName,
+        quarantined: [...quarantined],
+        impact: "every known relay has refused this agent for a relay-side fault, so the quarantine " +
+          "is being ignored and they are all being tried again. A relay that refuses with a cause " +
+          "is better than no relay at all — but if this persists, every relay this agent knows " +
+          "about is misconfigured, and that is the thing to look at.",
+      });
+    }
     const addrs: string[] = [];
     const relayPeerIds: string[] = [];
-    for (const ep of merged.values()) {
+    for (const ep of usable) {
       const base = ep.relayAddrs[0];
       if (!base) continue;
       const candidate = base.includes("/p2p/")
@@ -13301,6 +13530,8 @@ export class SessionNodeManager {
         client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
           receiptStore: this.#relayReceiptStore ?? undefined,
           sealLeafStore: this.#sealLeafStore ?? undefined,
+          // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
+          onlineToken: () => this.getDirectoryOnlineToken(agentName),
         });
         if (!client) {
           this.#logger.warn("session.revive.relay.builder_absent", {
