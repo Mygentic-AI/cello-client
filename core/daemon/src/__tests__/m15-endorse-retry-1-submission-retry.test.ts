@@ -247,6 +247,38 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     expect(listed[0].delivery.guidance).toMatch(/cello_attestations_issue/);
   });
 
+  it("CLAUSE 4 — in a MIXED run, only the failures that reached a node are counted", async () => {
+    /**
+     * THE COUNTER ITSELF, pinned separately from the give-up branch, because a mutation that made
+     * a local precondition increment `attempts` SURVIVED the two tests above: the exhaustion branch
+     * is guarded on `!localPrecondition`, so the wrong count was invisible there. It is visible
+     * HERE — `delivery.attempts` is a number the operator reads, and it is the backoff's input.
+     *
+     * The sequence alternates deliberately. Three of these six sends are transport failures that
+     * say nothing about the submission; three reached a node and did not answer. With a budget of 3
+     * the run must end on the THIRD timeout, having counted exactly three.
+     */
+    const outcomes: SendSubmissionResult[] = [
+      fail("signaling_reconnecting"),
+      fail("submission_write_timeout"),
+      fail("directory_unreachable"),
+      fail("submission_write_timeout"),
+      fail("signaling_lost"),
+      fail("submission_write_timeout"),
+    ];
+    const h = harness({ outcomes, maxAttempts: 3, retryWindowMs: 24 * 60 * 60_000 });
+    h.queue.enqueue(item(), "signaling_reconnecting");
+    h.queue.onSignalingConnected("Alice");
+    await h.clock.advance(60 * 60_000);
+
+    expect(h.sends).toHaveLength(6);
+    const listed = h.queue.list("agent-alice");
+    expect(listed[0].delivery.state).toBe("gave_up");
+    expect(listed[0].delivery.gaveUpBecause).toBe("attempts_exhausted");
+    // THE VALUE, not its shadow: six sends, three of which were verdicts about nothing.
+    expect(listed[0].delivery.attempts).toBe(3);
+  });
+
   it("CLAUSE 4 — a bounded queue refuses to grow without limit, and says so", () => {
     const h = harness({ outcomes: [fail("directory_unreachable")], queueCap: 2 });
     expect(h.queue.enqueue(item({ submissionId: "11".repeat(32) }), "signaling_lost")).toBe(true);
