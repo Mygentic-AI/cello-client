@@ -43,10 +43,6 @@ import type { Logger } from "./types.js";
 /**
  * Send failures worth retrying — the ones that are NOT a verdict on the submission.
  *
- * Enumerated as a set rather than as "everything except the refusal" on purpose: a member added to
- * `SubmissionSendFailure` later then defaults to NOT retried, which is the safe direction. A new
- * failure that should be retried is a decision someone makes here, in writing.
- *
  *   directory_unreachable / signaling_reconnecting / signaling_lost
  *       Nothing reached anybody. This is the case the unit exists for.
  *   submission_unsupported_by_node
@@ -58,17 +54,34 @@ import type { Logger } from "./types.js";
  *       different from refused: re-sending is safe by the content-derived id, so the honest move is
  *       to try again rather than to report a failure the operator cannot resolve either.
  *
- * `submission_refused_by_node` is deliberately absent. The node decoded it, evaluated it and said
- * no; a retry cannot change that answer, and a machine asking again is badgering a node that has
- * already decided.
+ *   submission_refused_by_node
+ *       The node decoded it, evaluated it and said no. A retry cannot change that answer, and a
+ *       machine asking again is badgering a node that has already decided.
+ *   submission_agent_unloaded
+ *       Retry-path only, and terminal: nobody on this daemon can sign as the submitting agent any
+ *       more, so no amount of waiting produces a sender.
+ *
+ * A `Record`, NOT a hand-written list, and that is the whole point (review §4). A list is a loop
+ * over what the author typed; adding a seventh member to `SubmissionSendFailure` left the old test
+ * green while the new member defaulted into "not retried" in silence. A total record fails to
+ * COMPILE until someone decides — and it lives here rather than in a test, because
+ * `core/daemon/tsconfig.json` excludes `src/__tests__`, so a compile-time pin there is never
+ * evaluated and asserts nothing (`signal-submission.ts` calls that "a hollow test wearing
+ * compile-time clothing").
  */
-const RETRYABLE_SEND_FAILURES: ReadonlySet<SubmissionSendFailure> = new Set<SubmissionSendFailure>([
-  "directory_unreachable",
-  "signaling_reconnecting",
-  "signaling_lost",
-  "submission_unsupported_by_node",
-  "submission_write_timeout",
-]);
+const RETRY_DECISION: Readonly<Record<SubmissionSendFailure, boolean>> = {
+  directory_unreachable: true,
+  signaling_reconnecting: true,
+  signaling_lost: true,
+  submission_unsupported_by_node: true,
+  submission_write_timeout: true,
+  submission_refused_by_node: false,
+  submission_agent_unloaded: false,
+};
+
+const RETRYABLE_SEND_FAILURES: ReadonlySet<SubmissionSendFailure> = new Set(
+  (Object.keys(RETRY_DECISION) as SubmissionSendFailure[]).filter((r) => RETRY_DECISION[r]),
+);
 
 /**
  * Failures that say something about OUR local preconditions rather than about the submission.
@@ -88,8 +101,26 @@ export function isRetryableSendFailure(reason: SubmissionSendFailure): boolean {
   return RETRYABLE_SEND_FAILURES.has(reason);
 }
 
-/** Why a bounded retry stopped. Two axes, two names — they lead to different operator actions. */
-export type SubmissionGiveUpReason = "attempts_exhausted" | "retry_window_elapsed";
+/**
+ * Why a retry stopped. FOUR names, because they lead to four different operator actions and this is
+ * the field a machine consumer branches on.
+ *
+ * `refused_by_node` and `agent_unloaded` exist because of review H3: a refusal arriving on retry
+ * attempt 1 used to be stamped `attempts_exhausted` with `attempts: 0` printed beside it. The
+ * node's own words survived in `guidance`, but EVERY machine-readable field said transport — so an
+ * operator grepping the log for exhaustion found a quota refusal, and one grepping for refusals
+ * found it filed under a transport give-up. The work order's recorded trap is exactly this: *"the
+ * operator must be able to tell 'the network is flaky, hold on' from 'the directory said no.'"*
+ */
+export type SubmissionGiveUpReason =
+  /** Failures that REACHED a node and got no usable answer, until the budget ran out. */
+  | "attempts_exhausted"
+  /** Only ever local preconditions — the stream never came back inside the window. */
+  | "retry_window_elapsed"
+  /** A node decoded it, evaluated it, and said no. Nothing about waiting changes that. */
+  | "refused_by_node"
+  /** This daemon can no longer sign as the submitting agent, so nobody can send these bytes. */
+  | "agent_unloaded";
 
 /** One submission this daemon composed, sealed, and has not yet handed to a directory node. */
 export interface PendingSubmission {
@@ -196,12 +227,37 @@ function gaveUpGuidance(reason: SubmissionGiveUpReason, last: SubmissionSendFail
     "submission id is derived from the content, so a re-send is stored once, not twice — but the " +
     "text is not kept on this machine, so you have to write it again: run cello_attestations_issue " +
     "with the same subject.";
-  return reason === "attempts_exhausted"
-    ? `The daemon retried this submission until it ran out of attempts; the last node answered ` +
-      `'${last}'. ${shared}`
-    : `The daemon held this submission for an hour and the directory signaling stream never came ` +
-      `back (last state '${last}'). Check the daemon's directory connection with cello_status ` +
-      `first — this is a connectivity problem, not a rejection. ${shared}`;
+  switch (reason) {
+    case "attempts_exhausted":
+      // "ANSWERED" WAS WRONG (review L8). The only reason that normally exhausts this budget is
+      // `submission_write_timeout` — where the node answered NOTHING, which is what the reason
+      // means — and `submission_unsupported_by_node`, where it answered `not_authenticated`, a
+      // frame `sendSealedSubmission` deliberately refuses to treat as an answer.
+      return (
+        `The daemon retried this submission until it ran out of attempts; the last attempt ended ` +
+        `in '${last}'. ${shared}`
+      );
+    case "retry_window_elapsed":
+      return (
+        `The daemon held this submission for an hour and the directory signaling stream never came ` +
+        `back (last state '${last}'). Check the daemon's directory connection with cello_status ` +
+        `first — this is a connectivity problem, not a rejection. ${shared}`
+      );
+    case "refused_by_node":
+      // Reached only when a node refuses mid-retry AND gives no reason of its own; the node's
+      // words win whenever it has any. Even here it must not read as a network problem.
+      return (
+        "A directory node decoded this submission and refused it. That is a decision about the " +
+        "submission, not a connectivity problem, so it will not be retried — sending it again " +
+        "unchanged will be refused again. " + shared
+      );
+    case "agent_unloaded":
+      return (
+        "This daemon can no longer sign as the agent that wrote this submission, so the held bytes " +
+        "cannot be sent by anyone. Start the agent with cello_start_agent, then issue it again. " +
+        shared
+      );
+  }
 }
 
 interface QueueItem {
@@ -485,10 +541,17 @@ export class SubmissionRetryQueue {
     // Below here everything is bookkeeping for a FUTURE attempt, and a stopped queue makes none.
     if (this.#stopped) return;
 
-    // A refusal ON THE MERITS arriving mid-retry is terminal here too. The node decoded it and said
-    // no; nothing about a later reconnect changes that.
+    // A NON-RETRYABLE FAILURE ARRIVING MID-RETRY IS TERMINAL, AND IT KEEPS ITS OWN NAME (review
+    // H3). Stamping these `attempts_exhausted` printed a transport story — with `attempts: 0` beside
+    // it — for a quota refusal, in the one field a machine consumer branches on.
     if (!isRetryableSendFailure(result.reason)) {
-      this.#giveUp(key, entry, result.reason, "attempts_exhausted", result.guidance);
+      this.#giveUp(
+        key,
+        entry,
+        result.reason,
+        result.reason === "submission_agent_unloaded" ? "agent_unloaded" : "refused_by_node",
+        result.guidance,
+      );
       return;
     }
 

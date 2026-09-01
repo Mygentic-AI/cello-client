@@ -105,11 +105,20 @@ function fail(reason: SubmissionSendFailure): SendSubmissionResult {
 
 describe("DOD-M15-ENDORSE-RETRY-1 — classification (clauses 1 and 3)", () => {
   /**
-   * THE VALUES COME FROM THE UNION, NOT FROM WHAT CAME TO MIND. `SubmissionSendFailure` enumerates
-   * exactly six members; every one is named here, so a member added later without a decision about
-   * it fails this test rather than defaulting silently into one bucket.
+   * THE EXHAUSTIVENESS CLAIM LIVES IN THE SOURCE, NOT HERE, and the comment that used to sit at
+   * this spot was wrong about that.
+   *
+   * It said naming every member here meant "a member added later without a decision about it fails
+   * this test rather than defaulting silently into one bucket." False: this is a loop over what the
+   * author typed, so a new union member left it green and defaulted to not-retried in silence. The
+   * real pin is `RETRY_DECISION` in `submission-retry.ts` — a total `Record<SubmissionSendFailure,
+   * boolean>` that fails to COMPILE until someone decides. It cannot live in this file:
+   * `core/daemon/tsconfig.json` excludes `src/__tests__`, so a compile-time assertion here is never
+   * evaluated.
+   *
+   * What these two tests are for is the VALUES of that decision, which a type cannot check.
    */
-  it("retries the four failures that are NOT a verdict on the submission", () => {
+  it("retries every failure that is NOT a verdict on the submission", () => {
     expect(isRetryableSendFailure("directory_unreachable")).toBe(true);
     expect(isRetryableSendFailure("signaling_reconnecting")).toBe(true);
     expect(isRetryableSendFailure("signaling_lost")).toBe(true);
@@ -126,6 +135,79 @@ describe("DOD-M15-ENDORSE-RETRY-1 — classification (clauses 1 and 3)", () => {
     // The node decoded it, evaluated it, and said no. A retry cannot change that answer, and a
     // machine asking again is badgering a node that already decided.
     expect(isRetryableSendFailure("submission_refused_by_node")).toBe(false);
+    // Nor one nobody on this daemon can sign for any more — waiting produces no sender.
+    expect(isRetryableSendFailure("submission_agent_unloaded")).toBe(false);
+  });
+});
+
+describe("DOD-M15-ENDORSE-RETRY-1 — a terminal state names its own cause (clause 4)", () => {
+  /**
+   * The give-up reason is the field a machine consumer branches on and the one the CLI prints
+   * first. Stamping a node's refusal `attempts_exhausted` — with `attempts: 0` beside it — sent an
+   * operator to the network for a quota problem, which is the trap the work order recorded
+   * verbatim: they must be able to tell "the network is flaky, hold on" from "the directory said
+   * no."
+   */
+  function terminalHarness(outcome: SendSubmissionResult) {
+    const clock = makeClock();
+    const { logger, events } = makeLogger();
+    const queue = new SubmissionRetryQueue({
+      logger,
+      send: async () => outcome,
+      onAccepted: () => {},
+      now: clock.now,
+      schedule: (fn, ms) => clock.schedule(fn, ms),
+    });
+    return { queue, clock, events };
+  }
+
+  it("a node REFUSAL mid-retry gives up as refused_by_node, not as a transport story", async () => {
+    const h = terminalHarness({
+      ok: false, reason: "submission_refused_by_node",
+      guidance: "The directory node refused the submission: quota_exceeded.",
+    });
+    h.queue.enqueue(item(), "signaling_reconnecting");
+    h.queue.onSignalingConnected("Alice");
+    await h.clock.advance(60_000);
+
+    const d = h.queue.list("agent-alice")[0].delivery;
+    expect(d.state).toBe("gave_up");
+    expect(d.gaveUpBecause).toBe("refused_by_node");
+    expect(d.lastReason).toBe("submission_refused_by_node");
+    // THE NODE'S OWN WORDS WIN over anything this module could write.
+    expect(d.guidance).toContain("quota_exceeded");
+    const gaveUp = h.events.filter((e) => e.event === "signal.submission.retry.gave_up");
+    expect(gaveUp[0].ctx["stoppedBecause"]).toBe("refused_by_node");
+  });
+
+  it("an agent this daemon can no longer sign as gives up as agent_unloaded", async () => {
+    const h = terminalHarness({
+      ok: false, reason: "submission_agent_unloaded",
+      guidance: "This daemon can no longer sign as 'Alice'.",
+    });
+    h.queue.enqueue(item(), "signaling_lost");
+    h.queue.onSignalingConnected("Alice");
+    await h.clock.advance(60_000);
+
+    const d = h.queue.list("agent-alice")[0].delivery;
+    expect(d.gaveUpBecause).toBe("agent_unloaded");
+    // NOT `refused_by_node`: no directory node was involved, and pointing the operator at one for
+    // a purely local cause is the error substitution this reason exists to end.
+    expect(d.lastReason).toBe("submission_agent_unloaded");
+  });
+
+  it("the exhausted guidance does not claim the node ANSWERED — a timeout is silence", async () => {
+    const h = terminalHarness(fail("submission_write_timeout"));
+    h.queue.enqueue(item(), "submission_write_timeout");
+    h.queue.onSignalingConnected("Alice");
+    await h.clock.advance(4 * 60 * 60_000);
+
+    const d = h.queue.list("agent-alice")[0].delivery;
+    expect(d.gaveUpBecause).toBe("attempts_exhausted");
+    // `submission_write_timeout` means nothing came back. "The last node answered 'timeout'" is a
+    // sentence about an answer that does not exist.
+    expect(d.guidance).not.toMatch(/node answered/);
+    expect(d.guidance).toMatch(/attempt ended in/);
   });
 });
 

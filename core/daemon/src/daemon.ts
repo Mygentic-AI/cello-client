@@ -794,28 +794,29 @@ async function startDaemonHoldingLock(
   const submissionRetries = new SubmissionRetryQueue({
     logger,
     send: async (pending: PendingSubmission) => {
+      /**
+       * THE AGENT MUST STILL BE HERE TO SIGN, and this failure has its own name.
+       *
+       * It borrowed `submission_refused_by_node` at first, which states that a directory node
+       * decoded, evaluated and refused the submission — none of which happened. Stacked on the
+       * give-up reason it produced, the operator saw two labels both pointing at the directory for
+       * a cause that is entirely local (review M5).
+       *
+       * Neither branch is reachable in this daemon today — nothing removes from `keyProviders` or
+       * `loadedAgents` — so this is a guard against a future unload path rather than a live case.
+       * That is said plainly instead of being implied by a comment describing a state the code
+       * cannot reach.
+       */
       const kp = keyProviders.get(pending.agentName);
-      if (!kp) {
-        // The agent was unloaded under a pending retry. Not a transport fault and not a verdict on
-        // the submission — but nothing can send it now, so it is reported as the terminal thing it
-        // is rather than retried against an identity this daemon no longer holds.
-        return {
-          ok: false as const,
-          reason: "submission_refused_by_node" as const,
-          guidance:
-            `No signing key is loaded for '${pending.agentName}' any more, so this submission ` +
-            "cannot be re-sent. Start the agent and submit it again — re-sending is safe, the " +
-            "submission id is derived from the content.",
-        };
-      }
       const rec = loadedAgents.find((a) => a.name === pending.agentName);
-      if (!rec) {
+      if (!kp || !rec) {
         return {
           ok: false as const,
-          reason: "submission_refused_by_node" as const,
+          reason: "submission_agent_unloaded" as const,
           guidance:
-            `Agent '${pending.agentName}' is no longer loaded on this daemon, so this submission ` +
-            "cannot be re-sent. Load the agent and submit it again — re-sending is safe.",
+            `This daemon can no longer sign as '${pending.agentName}', so the held submission ` +
+            "cannot be sent by anyone. Start the agent with cello_start_agent and issue it again — " +
+            "re-sending is safe, the submission id is derived from the content.",
         };
       }
       return sendSealedSubmission({
