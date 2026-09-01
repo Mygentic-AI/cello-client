@@ -425,8 +425,9 @@ describe("DOD-M15-INCLUSION-1: prove one message sits under the sealed root", ()
    * DoD 9 — and the database is CLOSED AND DELETED before the verifier runs.
    *
    * Asserting that the verify function "takes only three arguments" would be a claim about the
-   * signature. Deleting the store it might otherwise reach is a fact about the run: if any part of
-   * the path touched the daemon's database, this test could not pass.
+   * signature. CLOSING the database and then deleting it is a fact about the run: a handle that has
+   * been through `gracefulShutdown` cannot be read, so if any part of this path touched the daemon's
+   * store the call below would throw rather than return a verdict.
    */
   it("DoD 9: verification runs from proof + message + certificate with the daemon's DB deleted", async () => {
     const f = await makeFixture(dbPath());
@@ -440,6 +441,10 @@ describe("DOD-M15-INCLUSION-1: prove one message sits under the sealed root", ()
       JSON.stringify((await f.getProof({ message }))["proof"]),
     ) as unknown;
 
+    // ⚠️ `rm` ALONE DOES NOT PROVE THIS — review F7. On POSIX an unlinked SQLite file stays fully
+    // readable through an open handle, so a verifier that DID reach the manager would still have
+    // passed. Closing the handle first is what makes the deletion mean something.
+    await f.mgr.gracefulShutdown();
     await rm(tempDir, { recursive: true, force: true });
 
     expect(verifyInclusionProof(overTheWire, new TextEncoder().encode(f.messages[0]), certifiedRoot).ok).toBe(true);

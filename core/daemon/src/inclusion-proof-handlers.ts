@@ -258,16 +258,61 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
       }
       leafIndex = requestedIndex;
     } else if (matches.length === 0) {
+      /**
+       * BEFORE ASSERTING ABSENCE, CHECK THE OTHER ALGORITHM — review F5, error substitution.
+       *
+       * This handler picks the hash algorithm from salt POSSESSION, and possession is not the same
+       * as use: `#suspendSalt` deliberately keeps the salt bytes on disk while the session hashes
+       * `sha256`, so a session can hold salted leaves next to unsalted ones. For any leaf on the
+       * other side of that split, "no match" is this daemon having guessed the algorithm — and the
+       * guidance said *"this message is genuinely not in this sealed conversation"*, which is an
+       * affirmatively false statement about the product's central claim wearing an exit-point label.
+       *
+       * One extra hash buys the distinction. Finding the message under the other algorithm does NOT
+       * produce a proof: this build issues salted proofs only (DoD 8), and an unsalted leaf is a
+       * value anyone holding the plaintext can recompute. It produces a REFUSAL that names what
+       * actually happened.
+       */
+      const unsaltedHash = Buffer.from(
+        contentHashFor(messageBytes, { alg: CONTENT_HASH_ALGS.SHA256, salt: null }),
+      ).toString("hex");
+      const unsaltedAt = certifiedLeaves.indexOf(unsaltedHash);
+      if (unsaltedAt !== -1) {
+        logger.error("inclusion.alg.split", {
+          agentName,
+          sessionId,
+          leafIndex: unsaltedAt,
+          impact:
+            "this message is in the notarized record but was hashed UNSALTED while the session holds " +
+            "a salt, so the two halves of this conversation are verifiable under different rules and " +
+            "no salted proof can be issued for this one",
+        });
+        return {
+          ok: false,
+          reason: "message_hashed_under_other_alg",
+          sealed_root: cert.sealed_root,
+          leaf_index: unsaltedAt,
+          leaf_count: certifiedLeaves.length,
+          guidance:
+            `THIS MESSAGE IS IN THE SEALED RECORD — at position ${unsaltedAt} — and it was hashed ` +
+            "WITHOUT this session's salt, while the session holds one. That happens when a session " +
+            "stopped using its salt partway through, so half the conversation is verifiable under one " +
+            "rule and half under another. No proof is issued for this message because an unsalted one " +
+            "carries weaker protection than this build will put its name to. Do NOT conclude the " +
+            "message is absent — it is not. Report the session id and this reason; messages hashed " +
+            "under the salt can still be proved normally.",
+        };
+      }
       return {
         ok: false,
         reason: "message_not_in_session",
         sealed_root: cert.sealed_root,
         leaf_count: certifiedLeaves.length,
         guidance:
-          `No leaf in this session's notarized record is this message. Copy the text exactly from ` +
-          `cello_transcript ${sessionId} — the proof is over the bytes, so a changed character, a ` +
-          "trimmed quote or a trailing newline is a different message. If the text IS exact, this " +
-          "message is genuinely not in this sealed conversation.",
+          `No leaf in this session's notarized record is this message, under either the salted or the ` +
+          `unsalted hash. Copy the text exactly from cello_transcript ${sessionId} — the proof is over ` +
+          "the bytes, so a changed character, a trimmed quote or a trailing newline is a different " +
+          "message. If the text IS exact, this message is genuinely not in this sealed conversation.",
       };
     } else if (matches.length > 1) {
       return {
@@ -298,10 +343,18 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
     /**
      * RUN THE VERIFIER BEFORE HANDING THE PROOF OVER.
      *
-     * Not belt-and-braces: a proof that does not verify is worse than no proof, because it is
-     * presented as evidence and fails in front of the person it was shown to. This is the same
-     * derivation a third party will run, against the same certificate root, so it fails HERE — where
-     * it can be named — rather than in the dispute.
+     * ⚠️ UNREACHABLE BY CONSTRUCTION, AND THAT IS STATED RATHER THAN IMPLIED — review F8. The
+     * previous wording ("a proof that does not verify is worse than no proof") implied a live
+     * failure mode and would send a reader hunting for the path that reaches it. There is none:
+     * every field is built from values already checked above, `storedRoot === cert.sealed_root` was
+     * asserted twenty lines up, and the leaf came from `certifiedLeaves` by equality.
+     *
+     * WHAT IT CAN ACTUALLY FIRE ON: a drift between `inclusionProof` and `verifyInclusion` inside
+     * `@cello-protocol/crypto` — the two halves of one RFC 6962 implementation disagreeing. That is
+     * the failure this whole unit is written to avoid causing by hand, and it is worth one Merkle
+     * verification per issued proof to turn it into a named refusal rather than evidence that fails
+     * in front of the person it was shown to. `proof_self_check_failed` therefore has NO test: it
+     * has no reachable input, and a test that reached it would have to break the crypto package.
      */
     const selfCheck = verifyInclusionProof(proof, messageBytes, cert.sealed_root);
     if (!selfCheck.ok) {
@@ -342,6 +395,20 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
       leaf_index: leafIndex,
       leaf_count: certifiedLeaves.length,
       guidance: VERIFY_AFFORDANCE,
+      /**
+       * THE PROOF CARRIES THE SESSION SALT, AND THAT IS A DISCLOSURE — review F2.
+       *
+       * The salt has to travel or the proof is about a number rather than a sentence. But it is
+       * per-SESSION, so handing over one proof hands over the ability to test guessed text against
+       * every leaf hash in that session — which is the exact capability `unsalted_proof_refused`
+       * spends four lines refusing to grant. Saying nothing here would leave this surface arguing
+       * for a privacy property while quietly trading it away.
+       */
+      discloses:
+        "This proof CONTAINS this session's content salt, which it must in order to be checkable. " +
+        "With it, whoever holds the proof can test guessed wording against any leaf hash from this " +
+        "session — so share a proof with the same care you would share the transcript. It does not " +
+        "let them forge a message into the record, or read anything they were not given.",
     };
   });
 
@@ -429,7 +496,9 @@ export function registerInclusionProofHandlers(deps: InclusionProofDeps): void {
       // "partially true is false" failure the claims ledger exists to catch.
       means:
         "This exact message is at position " + result.leaf_index + " of the " + result.leaf_count +
-        " leaves under root " + result.certified_root + ". It has not been altered by a single byte. " +
+        " leaves under root " + result.certified_root + " (that count includes the seal's own control " +
+        "leaves, so it is larger than the number of messages in the conversation). It has not been " +
+        "altered by a single byte. " +
         "This does NOT by itself establish that the root is genuine — verify the certificate's own " +
         "signature (cello_sealed_receipt) to establish that, then this proof binds the message to it. " +
         "The session_id above is copied from the proof and was NOT checked: nothing here binds a " +

@@ -99,7 +99,17 @@ function keepCertifiedLeafSet(
      */
     const state = path === "unilateral_notification" ? "not_carried_absent_party" : "not_carried_present_party";
     deps.sessionNodeManager.noteCertifiedLeafSetUnavailable(agentName, sidHex, state, `no frontier_leaves on the ${path} seal frame`);
-    deps.logger.warn("seal.certified_leaves.not_carried", {
+    /**
+     * INFO on the absent-party path, WARN on the other two — review F6.
+     *
+     * `directory-node.ts` attaches `frontier_leaves` to the PRESENT party's confirm frame only, and
+     * `seal_upgrade_confirmed` carries none either. So this branch is the ONLY outcome the
+     * `unilateral_notification` site can ever take: warning there fires on 100% of a designed path,
+     * which trains a reader to skip the level rather than to read it. The disclosure still happens —
+     * it is the state row and the refusal that carry it — but the level stops pretending an attempt
+     * was made and failed.
+     */
+    deps.logger[state === "not_carried_absent_party" ? "info" : "warn"]("seal.certified_leaves.not_carried", {
       sessionId: sidHex,
       agentName,
       path,
