@@ -282,6 +282,42 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     ).toBe(before);
   }, 60_000);
 
+  it("★★ NO KEY means NO DIRECT SEND — the body never goes out in the open", async () => {
+    /**
+     * ⚠️ THIS RULE HAD NO TEST, AND A MUTATION PROVED IT. Replacing the gate with a fallback to an
+     * all-zero key left every test green — so the one line standing between "encrypted or not sent"
+     * and a session quietly encrypting under a constant was unguarded.
+     *
+     * The rule is absolute on purpose: a plaintext (or fixed-key) fallback is what an attacker
+     * steers a session into by stripping the key frame. With no key the send must NOT go direct; it
+     * parks instead, sealed to the counterparty's long-term identity key, so the message still
+     * arrives and nothing crosses the wire unprotected.
+     */
+    const { A, B } = await liveSession();
+    await wait(600);
+    expect(A.events.find((e) => e.event === "session.key.agreed"), "PRECONDITION: a key was agreed").toBeDefined();
+
+    // Take the key away, exactly as a teardown does, while the session and connection stay up.
+    A.manager.forgetSessionContentKeyForTest("alice", SID);
+
+    const seen: Array<Record<string, unknown>> = [];
+    B.manager.observeInboundContentFramesForTest((f) => { seen.push(f); });
+
+    const text = "this must not travel in the clear";
+    const content = new TextEncoder().encode(text);
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-nokey") as { ok: boolean; delivered?: boolean };
+
+    expect(
+      sent.delivered,
+      "the send went DIRECT with no agreed key — whatever it put on the wire was not encrypted by us",
+    ).not.toBe(true);
+    await wait(300);
+    const leaked = seen.find((f) =>
+      f["type"] === "content_frame" &&
+      Buffer.from(f["content_bytes"] as Uint8Array).toString("hex").includes(Buffer.from(content).toString("hex")));
+    expect(leaked, "the plaintext reached the wire").toBeUndefined();
+  }, 60_000);
+
   it("★★ an UNSIGNED ephemeral STOPS the session — it does not carry on unencrypted", async () => {
     /**
      * The loophole this whole unit is built around: an attacker evading a mismatch check does not
