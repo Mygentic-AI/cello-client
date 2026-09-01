@@ -43,7 +43,9 @@ describe("DOD-M15-RELAYSLOTS-1: a client can reserve AFTER proving itself, not b
   async function client(): Promise<CelloNode> {
     const node = await createNode({
       keyProvider: generateKeypair(),
-      listenAddresses: ["/ip4/127.0.0.1/tcp/0"],
+      // A BARE /p2p-circuit — no relay named, so nothing is reserved at construction, but the
+      // circuit listener exists and can pick up a reservation taken later.
+      listenAddresses: ["/ip4/127.0.0.1/tcp/0", "/p2p-circuit"],
       nodeType: "standing_receiver",
     });
     nodes.push(node);
@@ -71,6 +73,23 @@ describe("DOD-M15-RELAYSLOTS-1: a client can reserve AFTER proving itself, not b
       "the relay is now holding a real reservation for this client — taken AFTER the connection " +
         "existed, which is what lets the relay refuse a stranger at the door instead of granting " +
         "first and regretting it.",
+    ).toBe(true);
+
+    /**
+     * ⚠️ AND THE CLIENT MUST BE ADDRESSABLE, not merely recorded. Everything downstream in the
+     * daemon — reachability, the endpoint it advertises to a counterparty, the reservation watchdog
+     * — reads `listenAddresses()` for a `/p2p-circuit` entry. If an on-demand reservation did not
+     * produce one, the ordering would "work" while every consumer of it silently saw an unreachable
+     * agent. Asserted before anything is built on top of it.
+     */
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && !c.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
+      await new Promise((res) => setTimeout(res, 50));
+    }
+    expect(
+      c.listenAddresses().some((a) => a.includes("/p2p-circuit")),
+      "an on-demand reservation must yield a dialable circuit address, exactly as one taken at " +
+        "construction does",
     ).toBe(true);
   }, 40_000);
 

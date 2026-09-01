@@ -13046,6 +13046,79 @@ export class SessionNodeManager {
    * Candidates are tried in order (directory pool first). The first that actually
    * grants a reservation wins; the rest are never touched.
    */
+  /**
+   * DOD-M15-RELAYSLOTS-1 — prove this transport identity to the relay before a receiver built on it
+   * asks for a reservation. See the note at the call site for why it is a separate connection.
+   *
+   * Best-effort by design. If this fails the reservation will be refused, and the caller's existing
+   * candidate loop treats that exactly as it treats any other relay that would not serve — it tries
+   * the next one. Throwing here would turn one unreachable relay into a failure to build a receiver
+   * at all, which is strictly worse.
+   */
+  async #proveToRelayBeforeReserving(
+    agentName: string,
+    circuitAddr: string,
+    transportSeed: Uint8Array,
+    correlationId: string,
+  ): Promise<void> {
+    const relayPeerId = /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1];
+    const baseRelayAddr = circuitAddr.split("/p2p-circuit")[0];
+    if (!relayPeerId || !baseRelayAddr) return;
+
+    let prover: CelloNode | undefined;
+    try {
+      // No circuit listen address: this node must NOT take a reservation. Its only job is to carry
+      // the proof, on the transport identity the receiver will be rebuilt with.
+      prover = await this.#createAgentNode(agentName, {
+        sessionId: `prove:${relayPeerId}`,
+        nodeType: "standing_receiver",
+        transportPrivateKey: transportSeed,
+      });
+      await prover.start();
+      const client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
+        receiptStore: this.#relayReceiptStore ?? undefined,
+        sealLeafStore: this.#sealLeafStore ?? undefined,
+        onlineToken: () => this.getDirectoryOnlineToken(agentName),
+      });
+      if (!client) {
+        this.#logger.warn("session.standing_receiver.prove.no_builder", {
+          agentName,
+          relayPeerId,
+          correlationId,
+          impact: "no relay client could be built, so this receiver cannot prove itself and the " +
+            "relay will refuse it a reservation. The agent stays reachable only over a direct " +
+            "connection until this is wired.",
+        });
+        return;
+      }
+      const proven = await client.proveReservation(prover);
+      this.#logger.info("session.standing_receiver.prove.result", {
+        agentName,
+        relayPeerId,
+        peerId: prover.getPeerId(),
+        proven,
+        correlationId,
+        ...(proven ? {} : {
+          impact: "the relay would not accept this agent's proof, so it will refuse the reservation " +
+            "that follows. The candidate loop moves on to the next relay.",
+        }),
+      });
+      client.close();
+    } catch (err: unknown) {
+      this.#logger.warn("session.standing_receiver.prove.failed", {
+        agentName,
+        correlationId,
+        error: extractErrorMessage(err),
+        impact: "this receiver could not prove itself to the relay, so the reservation that follows " +
+          "will be refused and the candidate loop will try the next relay.",
+      });
+    } finally {
+      // The proof is remembered by the relay for a short window; this node's work is done and it
+      // MUST go, so the rebuilt receiver holds the identity alone.
+      if (prover) { try { await prover.stop(); } catch { /* best effort */ } }
+    }
+  }
+
   async #startReceiverNode(
     agentName: string,
     sessionId: string,
@@ -13067,6 +13140,25 @@ export class SessionNodeManager {
       //
       // Nothing reads the seed before the winner is installed, so per-candidate costs nothing.
       const candidateSeed = randomBytes(32);
+
+      /**
+       * DOD-M15-RELAYSLOTS-1 — **PROVE FIRST, ON A CONNECTION OF ITS OWN, THEN COME BACK AND
+       * RESERVE.** The relay now refuses a reservation from a peer that has not shown it belongs to
+       * a registered agent, and this is how a real agent satisfies that.
+       *
+       * ⚠️ It has to be two connections, and that is measured rather than chosen. Taking the
+       * reservation by hand on the SAME connection as the proof does get a slot — and libp2p then
+       * announces no circuit address for it, because it only announces addresses for reservations
+       * its own relay-discovery made. The agent would hold a slot nobody could dial through. So the
+       * receiver proves itself, drops the connection, and is rebuilt on the SAME transport identity
+       * (that is what `candidateSeed` buys) to reserve the ordinary way. The relay remembers the
+       * proof across the gap for a couple of minutes.
+       *
+       * Best-effort: a relay that refuses the proof will refuse the reservation too, and the loop
+       * below already treats that as "this candidate did not work, try the next".
+       */
+      await this.#proveToRelayBeforeReserving(agentName, circuitAddr, candidateSeed, correlationId);
+
       const candidate = await this.#createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
@@ -13396,6 +13488,13 @@ export class SessionNodeManager {
     agentName: string,
   ): Promise<CelloNode> {
     for (const circuitAddr of candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES)) {
+      /**
+       * DOD-M15-RELAYSLOTS-1: a revived session takes a reservation too, so it must prove itself
+       * first exactly as a standing receiver does — see `#proveToRelayBeforeReserving`. Missing
+       * this was a second reservation path the gate would have refused, found by an existing test
+       * rather than by reading, which is the argument for having had one.
+       */
+      await this.#proveToRelayBeforeReserving(agentName, circuitAddr, seed, sessionId);
       const candidate = await this.#createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,

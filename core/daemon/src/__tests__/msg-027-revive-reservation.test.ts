@@ -139,9 +139,20 @@ describe("DOD-M12B-SESSION-SEED-1: the revival reservation race", () => {
 
     expect(revived.ok, JSON.stringify(revived)).toBe(true);
     const duringRevival = factory.built.slice(builtBefore);
-    expect(duringRevival.length, "a granting first candidate must end the loop — asking a second " +
+    /**
+     * DOD-M15-RELAYSLOTS-1: nodes built is no longer the same number as relays asked. Each
+     * candidate now costs TWO node constructions — a short-lived one that proves this transport
+     * identity to the relay, then the real one that reserves. The property this test is named for
+     * is about RELAYS, so count the ones that were asked for a reservation: exactly the nodes with
+     * a circuit listen address.
+     */
+    const asksDuring = factory.asks.slice(builtBefore);
+    const reservingIdx = asksDuring
+      .map((a, i) => (a.circuits.length > 0 ? i : -1))
+      .filter((i) => i >= 0);
+    expect(reservingIdx.length, "a granting first candidate must end the loop — asking a second " +
       "relay burns a scarce reservation the first already gave us").toBe(1);
-    expect(duringRevival[0]!.listenAddresses().some((a) => a.includes("/p2p-circuit"))).toBe(true);
+    expect(duringRevival[reservingIdx[0]!]!.listenAddresses().some((a) => a.includes("/p2p-circuit"))).toBe(true);
   }, 30_000);
 
   it("a relay that NEVER answers does not hang the revival — it moves on and the session comes back", async () => {
