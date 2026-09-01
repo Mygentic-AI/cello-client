@@ -102,6 +102,8 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
@@ -153,6 +155,8 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     // counterparty. That is a real limitation of this fix and the operator should be able to see it
     // rather than infer it from a message that parks.
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
 
     const content = new TextEncoder().encode("no way home");

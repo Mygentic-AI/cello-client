@@ -43,12 +43,17 @@
  * under a key that lives for one session, with a birthday bound around 2^32 messages, is not the
  * limiting factor here and needs no state at all.
  *
- * ─── The VERSION byte, and why it is here on day one ───────────────────────────────────────────
+ * ─── The VERSION byte is FRAMING, not compatibility ────────────────────────────────────────────
  *
- * Adding a version to a wire format later is the change this whole line exists to avoid — the same
- * argument that put the PQ hook in the key agreement before there was anything to put in it. A
- * reader that meets a version it does not know REFUSES rather than guessing at the layout, because
- * guessing means feeding attacker-chosen bytes to a decryptor under the wrong framing.
+ * There are no other builds to be compatible with — CELLO is pre-launch with no external installs —
+ * so this byte is not here to interoperate with anything. It is here because the alternative is a
+ * blob whose layout is implied by its length, and a reader that meets bytes it cannot frame would
+ * then hand attacker-chosen input to a decryptor under a guessed layout. One byte, one comparison,
+ * and an unknown value REFUSES rather than parsing.
+ *
+ * That is the only justification, and it is worth stating because the tempting one — "so a future
+ * version can change the format" — would be exactly the speculative scaffolding this codebase has
+ * ruled against building.
  */
 
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";

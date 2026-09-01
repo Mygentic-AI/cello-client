@@ -272,6 +272,36 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     const awaited = await awaitP;
     expect(awaited.type).toBe("new_session");
 
+    /**
+     * 007-CRYPTO: put BOTH sides into the state a completed key exchange leaves them in.
+     *
+     * A live send needs an agreed content key — there is no plaintext path. The real exchange runs
+     * on the peer-connect handler, and this harness never opens a peer connection at all: B's
+     * session peer id is the literal string "bob-session-peer-id", and the two daemons are joined
+     * by an injected assignment frame rather than by libp2p. So the exchange cannot complete here,
+     * and seeding is what keeps these tests about the GATEWAY seam they were written for.
+     *
+     * Same key on both sides, because that is what an agreement produces.
+     */
+    /**
+     * ⚠️ SEEDED AFTER THE REAL EXCHANGE HAS SETTLED, AND THE ORDER MATTERS.
+     *
+     * Connectivity here is one-directional: A dials B, so A's signed ephemeral reaches B and B
+     * really does verify and derive it. B's own announce has nowhere to go — B's session peer id is
+     * the literal string "bob-session-peer-id" — so A never hears back and holds no key, and a live
+     * send has no plaintext path to fall back to.
+     *
+     * Seeding BEFORE the settle left the two ends on different keys and refused every message:
+     * A on the seed, B on the value it derived from A's real frame. Waiting first and writing the
+     * same key to both is what a completed two-way exchange would have produced. It stays put
+     * because deriving is idempotent — a re-announce on a later connect does not overwrite an
+     * agreed key.
+     */
+    await wait(400);
+    const AGREED = new Uint8Array(32).fill(0x7e);
+    A.getSessionNodeManager().setSessionContentKeyForTest("alice", SID_HEX, AGREED);
+    B.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, AGREED);
+
     return { clientA, clientB, alicePubkey, aEvents, bEvents, bHandle: B };
   }
 

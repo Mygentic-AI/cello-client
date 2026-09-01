@@ -116,11 +116,15 @@ describe("DOD-M12B-ACK-1: content streams are not leaked at the receiver", () =>
     expect(bInfo).not.toBeNull();
 
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     expect(accepted.ok).toBe(true);
 
     const received: string[] = [];

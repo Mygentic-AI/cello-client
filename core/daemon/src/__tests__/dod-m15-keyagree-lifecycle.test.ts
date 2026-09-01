@@ -311,10 +311,21 @@ describe("006-CRYPTO: the session SAYS it is not encrypted rather than leaving i
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-keylife-status-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
+    // The fixture seeds an agreed key, because that is the production state and a live send needs
+    // one. Assert BOTH directions from here, so this cannot pass by the field being stuck either way.
+    const agreed = fx.snm.getSessionsForAgent("alice").find((s) => s.session_id === SID);
+    expect(agreed?.["content_encrypted"], "a session with an agreed key is encrypted").toBe(true);
+    expect(
+      agreed?.["content_encryption_reason"],
+      "and a session that IS encrypted carries no reason — absence is the healthy case",
+    ).toBeUndefined();
+
+    // Now take the key away, exactly as a teardown does, and the same surface must say so.
+    fx.snm.forgetSessionContentKeyForTest("alice", SID);
     const row = fx.snm.getSessionsForAgent("alice").find((s) => s.session_id === SID);
     expect(
       row?.["content_encrypted"],
-      "no peer has completed the exchange in this fixture, so this cannot be true",
+      "with no agreed key this cannot be true — a hardcoded field would not notice",
     ).toBe(false);
     expect(
       String(row?.["content_encryption_reason"] ?? ""),

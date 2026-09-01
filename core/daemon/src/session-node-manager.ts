@@ -10717,6 +10717,19 @@ export class SessionNodeManager {
       return;
     }
 
+    /**
+     * ALREADY AGREED — nothing to do, and this is idempotence rather than an optimisation.
+     *
+     * A peer re-announces on every connect, so the same signed ephemeral arrives more than once in
+     * an ordinary session. Re-deriving from the same two halves produces the same bytes, so the only
+     * thing a second derive can do is churn — and it is the same reason `#mintSessionEphemeral` is
+     * idempotent: a value both sides depend on must not move underneath them mid-session.
+     *
+     * A session that legitimately RE-KEYS was torn down first, which cleared this map with the
+     * ephemeral, so a revival finds nothing here and derives fresh.
+     */
+    if (this.#sessionContentKeys.has(this.#k(agentName, sessionId))) return;
+
     const ownEphemeral = this.#sessionEphemeralFor(agentName, sessionId);
     if (!ownEphemeral) {
       this.#logger.error("session.key.refused", {
@@ -10993,6 +11006,37 @@ export class SessionNodeManager {
   setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void {
     this.#sessionContentKeys.set(this.#k(agentName, sessionId), Uint8Array.from(key));
     this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
+   * Test seam: drop the agreed key while leaving the session up — the state before an exchange
+   * completes, and after a teardown evicts one. Its mirror above is what a completed exchange
+   * leaves; both are needed, or a status field stuck in one position passes either test alone.
+   */
+  forgetSessionContentKeyForTest(agentName: string, sessionId: string): void {
+    this.#sessionContentKeys.delete(this.#k(agentName, sessionId));
+  }
+
+  /** This side's ephemeral PUBLIC half, for a harness that has to carry it to the other side. */
+  sessionEphemeralPublicForExchange(agentName: string, sessionId: string): Uint8Array | null {
+    return this.sessionEphemeralPublicForTest(agentName, sessionId);
+  }
+
+  /**
+   * Test seam: deliver a peer's signed ephemeral, exactly as the content-stream decoder does.
+   *
+   * For harnesses whose connectivity is one-directional — one side dials, so only one announce ever
+   * lands — this is what completes the exchange instead of stuffing a key in. It runs the REAL
+   * verification and the REAL derivation, so a test cannot pass against a signature production would
+   * have refused.
+   */
+  async handleEphemeralFrameForTest(
+    agentName: string,
+    sessionId: string,
+    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
+    correlationId = "test",
+  ): Promise<void> {
+    await this.#handleEphemeralFrame(agentName, sessionId, frame, correlationId);
   }
 
   /**

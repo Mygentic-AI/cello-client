@@ -229,6 +229,8 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     const snm = handle.getSessionNodeManager();
     const SID = "f1".repeat(32);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(snm.getSessionRecord("alice", SID)?.status).toBe("active");
 
     await client.send("cello_set_agent_offline", { name: "alice" });

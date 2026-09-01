@@ -106,6 +106,8 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
@@ -156,6 +158,8 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     // Force the true starting state by using a session the connect event never labelled.
     const UNSEEN = "66".repeat(16);
     await A.manager.createSessionNode(UNSEEN, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-U");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", UNSEEN, new Uint8Array(32).fill(0x7e));
     expect(A.manager.getSessionLiveness("alice", UNSEEN)).toBe("unknown");
 
     const content = new TextEncoder().encode("into the void");

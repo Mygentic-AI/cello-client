@@ -279,6 +279,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const contentHash = msgLeafHash(content);
     const res = await mgr.sendContent("alice", sid, content, contentHash);
@@ -290,6 +292,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode({ newStreamFails: true });
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
     const content = new TextEncoder().encode("hello");
     const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content));
@@ -308,6 +312,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #2: appendSessionLeaf keeps sessions.message_count synced to the tree size", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     expect(mgr.getSessionRecord("alice", sid)!.message_count ?? 0).toBe(0);
 
     // A sent leaf advances message_count.
@@ -325,6 +331,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("AC-001 receive: ingestReceivedContent cross-checks, appends the leaf, buffers, fires session.content.received", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("from-bob");
     const contentHash = msgLeafHash(content);
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
@@ -348,6 +356,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("AC-001 receive (tamper): a content_hash MISMATCH is rejected — no append, no buffer, warn event", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("real");
     const wrongHash = msgLeafHash(new TextEncoder().encode("tampered"));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
@@ -366,6 +376,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const correlationId = "flow-abc-123";
     const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
@@ -392,6 +404,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     return mgr.initialize().then(async () => {
       await seedAgents(mgr.getDb(), ["alice"]);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
       const content = new TextEncoder().encode("from-bob");
       const correlationId = "flow-xyz-789";
       await mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content), correlationId);
@@ -408,6 +422,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new LoopbackFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "lb.db"), node as unknown as CelloNode);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("loopback-hi");
     const correlationId = "flow-roundtrip-1";
     const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
@@ -438,6 +454,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "inject.db"), node as unknown as CelloNode);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       // The frame is otherwise perfectly well-formed. Only the sender is wrong.
       node.deliverAs = "stranger-peer-id";
@@ -466,6 +484,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "omit.db"), node as unknown as CelloNode);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       const content = new TextEncoder().encode("no session id on this one");
       // Correct sender, correct everything — except the field simply is not there.
@@ -509,6 +529,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const mgr = await makeManager(logger, join(tempDir, db), node as unknown as CelloNode);
       const cpHex = Buffer.from(await kp.getPublicKey()).toString("hex");
       await mgr.createSessionNode(sid, "alice", cpHex, "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
       return { node, mgr };
     };
 
@@ -611,6 +633,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const mgr = await makeManager(logger, join(tempDir, "cp-unknown.db"), node as unknown as CelloNode);
       // Session created with an EMPTY counterparty pubkey — resolvable session, unresolvable signer.
       await mgr.createSessionNode(sid, "alice", "", "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       const content = new TextEncoder().encode("unverifiable but not refuted");
       const rec = await kpRecord(kp, content, 1);
@@ -661,6 +685,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "ok.db"), node as unknown as CelloNode);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       const content = new TextEncoder().encode("a real message");
       await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok");
@@ -676,6 +702,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("eviction: destroySessionNode clears the buffered received content (no plaintext retention)", async () => {
     const mgr = await makeManager(logger, join(tempDir, "ev.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("secret-payload");
     await mgr.ingestReceivedContent("alice", sid, content, msgLeafHash(content));
     const persistedRoot = mgr.getSessionTreeRootHex("alice", sid);
@@ -697,6 +725,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #5: ingestReceivedContent rejects late content once the session is frozen (not active)", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
     // One leaf arrives while active — accepted, then drained.
     const c1 = new TextEncoder().encode("m1");
@@ -728,6 +758,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #7: markInterruptedWithDetails keeps message_count synced to the daemon-owned tree, not a stale value", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     for (const m of ["a", "b", "c"]) {
       mgr.appendSessionLeaf("alice", sid, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
     }

@@ -319,6 +319,8 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // accepting the connection did not add them). A brand-new empty session → first send needs no
     // read-before-write catch-up (M8C-CURSOR-1 C3).
     await snm.createSessionNode(SID_HEX, "alice", strangerPubkey, "stranger-peer", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     expect(snm.isContact("alice", strangerPubkey)).toBe(false);
 
     const client = await connectAs("alice");
@@ -368,7 +370,11 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const SID_UNKNOWN = "11".repeat(32);
     const SID_KNOWN = "22".repeat(32);
     await snm.createSessionNode(SID_UNKNOWN, "alice", "strangerpubkeyhex", "peer-1", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x7e));
     await snm.createSessionNode(SID_KNOWN, "alice", "knownpubkeyhex", "peer-2", "corr-2");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "knownpubkeyhex", undefined, null, TIER.KNOWN); // pre-established KNOWN; strangerpubkeyhex is not
 
     const m1 = new TextEncoder().encode("from stranger");
