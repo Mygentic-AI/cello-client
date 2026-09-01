@@ -143,6 +143,19 @@ export const SALT_ADOPTION_LABELS = {
   ALREADY_HASHING: "already_hashing",
   FRONTIER_UNREADABLE: "frontier_unreadable",
   PEER_CLOSED_FIRST: "peer_closed_first",
+  /**
+   * The two sides cannot converge and both must stop — 006-CRYPTO finding 1.
+   *
+   * We hold no salt, the peer holds one, and it has answered our half with its fingerprint twice.
+   * A latched salt-holder never re-offers its half, so we can never derive; without this the two
+   * sides repair at each other for the life of the session.
+   *
+   * Closing adoption rather than freezing, because nothing has been hashed under the salt and there
+   * are no sender salts yet: Decision #8's terminal state is that both sides stay unsalted and both
+   * KNOW, which is exactly as verifiable as every session shipped before the salt existed. Freezing
+   * a healthy conversation to defend a value nothing has consumed is the defect review F1 removed.
+   */
+  EXCHANGE_STALLED: "exchange_stalled",
 } as const;
 
 /** The CLOSED set of reasons a salt disagreement stops a session. */
@@ -354,12 +367,25 @@ export function onPeerSaltFrame(state: {
    * a salt yet), each ends up with a second copy of the other's half queued, and after both derive,
    * that second copy lands on a side that now holds a salt.
    *
-   * This flag breaks it. A contribution we have ALREADY answered gets our fingerprint instead, and a
-   * fingerprint drives the peer to `confirmed` or `FINGERPRINT_MISMATCH` — both terminal — so the
-   * cycle cannot re-enter. The FIRST repair against any given half still happens, so F1's
-   * convergence property is untouched.
+   * This flag breaks it. A contribution we have ALREADY answered gets our fingerprint instead. The
+   * FIRST repair against any given half still happens, so F1's convergence property is untouched.
+   *
+   * ⚠️ AND IT CLOSES ONLY THIS DIRECTION. An earlier version of this note said a fingerprint "drives
+   * the peer to `confirmed` or `FINGERPRINT_MISMATCH` — both terminal — so the cycle cannot
+   * re-enter." That is true only of a peer that HOLDS a salt. A peer holding none takes the mirror
+   * repair and answers with its contribution, which a latched holder answers with its fingerprint
+   * again — the same fixed point, mirrored. `alreadyRepairedAgainstPeerFingerprint` is what
+   * terminates that side (006-CRYPTO finding 1); the two latches are only safe together.
    */
   alreadyRepairedAgainstPeerHalf?: boolean;
+  /**
+   * THE MIRROR OF THE ABOVE, and its absence was 006-CRYPTO finding 1.
+   *
+   * True when we have already answered THIS EXACT peer fingerprint with our half. F14's latch covers
+   * the salt-holder's direction only; a saltless side had none, so a latched holder and a saltless
+   * peer repaired at each other forever. See the termination note on the mirror-repair branch.
+   */
+  alreadyRepairedAgainstPeerFingerprint?: boolean;
   frame: SaltAgreementFrame;
 }): SaltAgreementAction {
   const hasContribution = state.frame.contribution instanceof Uint8Array;
@@ -499,8 +525,32 @@ export function onPeerSaltFrame(state: {
   }
 
   if (hasFingerprint) {
+    /**
+     * TERMINATION FOR THE SALTLESS SIDE — 006-CRYPTO finding 1, and it is F14's missing mirror.
+     *
+     * We have already answered this exact fingerprint with our half. A salt-holder that has latched
+     * our half (F14) answers every further offer with its fingerprint and NEVER re-offers its own —
+     * so we can never derive, and repairing again just buys another round trip. Two healthy daemons
+     * reach this after one failed persist plus a reconnect, and then trade frames for the life of
+     * the session, one new stream and one INFO line each per iteration.
+     *
+     * Closing adoption rather than freezing: nothing has been hashed under a salt on this side, no
+     * send site consumes one yet, and Decision #8's terminal state for "a side that cannot adopt" is
+     * that BOTH stay unsalted and both KNOW. Freezing a working conversation to defend a value
+     * nothing has consumed is precisely the defect review F1 removed.
+     */
+    if (state.alreadyRepairedAgainstPeerFingerprint) {
+      return {
+        action: "adoption_closed",
+        detail:
+          "we hold no salt and have already answered this exact peer fingerprint with our half; a peer that holds a salt does not re-offer its own, " +
+          "so this side can never derive it and repairing again would loop. Neither side will use a salt for this session.",
+        announce: { adoptionClosed: SALT_ADOPTION_LABELS.EXCHANGE_STALLED },
+      };
+    }
     // THE MIRROR REPAIR. They hold a salt, we do not. Re-offering our half is what prompts them to
-    // send theirs back, and then we derive the value they already have.
+    // send theirs back, and then we derive the value they already have. The FIRST one always
+    // happens — the latch above fires only on a repeat, or a saltless side would never ask at all.
     return {
       action: "repair",
       frame: { contribution: state.ownContribution },

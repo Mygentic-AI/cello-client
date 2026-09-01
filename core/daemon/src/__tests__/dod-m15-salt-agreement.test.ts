@@ -36,8 +36,11 @@ import { describe, it, expect } from "vitest";
 import {
   onPeerSaltFrame,
   ownSaltFrame,
+  SALT_ADOPTION_LABELS,
   SALT_FREEZE_REASONS,
   SALT_FREEZE_GUIDANCE,
+  type SaltAgreementAction,
+  type SaltAgreementFrame,
 } from "../session-salt-agreement.js";
 import { deriveSessionSalt, saltFingerprint, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
 
@@ -368,5 +371,124 @@ describe("every reason an operator can be shown has something for them to DO", (
       // The move that DOES work has to be named, or the refusal is a dead end.
       expect(SALT_FREEZE_GUIDANCE[reason], `${reason} names no way forward`).toMatch(/new session|another session/i);
     }
+  });
+});
+
+describe("the exchange TERMINATES from every reachable state — 006-CRYPTO finding 1", () => {
+  /**
+   * F14 closed ONE fixed point and opened its mirror, and its comment asserts the safety it lost:
+   *
+   *   *"a fingerprint drives the peer to `confirmed` or `FINGERPRINT_MISMATCH` — both terminal — so
+   *   the cycle cannot re-enter."*
+   *
+   * That holds only for a peer that HOLDS a salt. A peer holding NONE answers a fingerprint with the
+   * mirror repair — its contribution — and the salt-holder, latched by F14, answers with its
+   * fingerprint again. Neither side is faulty and neither can stop.
+   *
+   * ─── How two healthy daemons reach it, with no adversary ─────────────────────────────────────
+   *
+   * 1. Both offer contributions. B derives, persists, announces `fingerprint(S)`.
+   * 2. A derives the same salt and its `#persistSessionSalt` FAILS — a named, designed-for outcome
+   *    (`session.salt.persist.failed`). A holds no salt, but keeps its half: it is minted once per
+   *    session, which is what makes the repair converge in the first place.
+   * 3. A reconnect re-announces both sides (correctly — A still holds nothing). B answers A's half
+   *    with a repair and LATCHES it in `#saltRepairedAgainst`.
+   * 4. From here the two states are fixed: A only ever receives fingerprints, so it never derives;
+   *    B is latched, so it only ever answers with its fingerprint.
+   *
+   * The test starts at step 4 by pre-seeding B's latch, because that is the state the caller reaches
+   * — not because the state is contrived.
+   *
+   * Cost per iteration in production: one `entry.node.newStream(...)` per side against libp2p's
+   * per-protocol stream cap, plus one INFO `session.salt.repair` line per side, for the life of the
+   * session. The conversation looks healthy while it does it.
+   */
+  const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
+
+  /** Drive the two sides against each other, latching exactly as `#handleSaltFrame` does. */
+  function runExchange(maxSteps: number) {
+    const aAnsweredFingerprints = new Set<string>();
+    // B has already answered our half once — step 3 above. This is the caller's `#saltRepairedAgainst`.
+    const bAnsweredHalves = new Set<string>([hex(OURS)]);
+
+    let turn: "A" | "B" = "A";
+    let inbound: SaltAgreementFrame = { fingerprint: saltFingerprint(AGREED) };
+    const trace: string[] = [];
+    let terminal: SaltAgreementAction | null = null;
+
+    for (let step = 0; step < maxSteps && !terminal; step++) {
+      const action = turn === "A"
+        ? onPeerSaltFrame({
+            // A never gains a salt: its persist keeps failing.
+            ownSalt: null,
+            ownContribution: OURS,
+            alreadyRepairedAgainstPeerFingerprint:
+              inbound.fingerprint !== undefined && aAnsweredFingerprints.has(hex(inbound.fingerprint)),
+            frame: inbound,
+          })
+        : onPeerSaltFrame({
+            ownSalt: AGREED,
+            ownContribution: THEIRS,
+            alreadyRepairedAgainstPeerHalf:
+              inbound.contribution !== undefined && bAnsweredHalves.has(hex(inbound.contribution)),
+            frame: inbound,
+          });
+
+      trace.push(`${turn}:${action.action}`);
+
+      if (action.action === "repair") {
+        if (turn === "A" && inbound.fingerprint) aAnsweredFingerprints.add(hex(inbound.fingerprint));
+        if (turn === "B" && inbound.contribution) bAnsweredHalves.add(hex(inbound.contribution));
+        inbound = action.frame;
+        turn = turn === "A" ? "B" : "A";
+      } else {
+        terminal = action;
+      }
+    }
+    return { terminal, trace };
+  }
+
+  it("★ a salt-holder and a saltless side do NOT trade frames forever", () => {
+    const { terminal, trace } = runExchange(12);
+
+    /**
+     * Asserting the OUTCOME, not its shadow. "It terminated" would also pass if the exchange ended
+     * by freezing a healthy session, which is the wrong answer here: nothing has been hashed under
+     * the salt, no sender salts exist yet, and F1's own lesson is that a refusal which breaks
+     * availability to defend an unconsumed value is the defect. Decision #8's terminal state for
+     * "one side cannot adopt" is that BOTH sides stay unsalted and both KNOW — exactly as verifiable
+     * as every session shipped before the salt existed.
+     */
+    expect(terminal?.action, `the exchange never terminated: ${trace.join(" -> ")}`).toBe("adoption_closed");
+    expect(
+      terminal?.action === "adoption_closed" && terminal.announce?.adoptionClosed,
+      "the peer must be TOLD, or it keeps a salt we can never reach and discards every message we send",
+    ).toBe(SALT_ADOPTION_LABELS.EXCHANGE_STALLED);
+  });
+
+  it("★ it terminates within ONE round trip of the repeat, not eventually", () => {
+    /**
+     * A bound, because "terminates" is satisfied by a fix that gives up after fifty round trips and
+     * that is still a flood. The first repair is legitimate — it is F1's convergence — so the shape
+     * is: A repairs once, B answers, A sees the SAME fingerprint a second time and stops.
+     */
+    const { trace } = runExchange(12);
+    expect(trace.join(" -> ")).toBe("A:repair -> B:repair -> A:adoption_closed");
+  });
+
+  it("★ the FIRST repair still happens — F1's convergence is not what this removes", () => {
+    /**
+     * The latch must fire on a REPEAT, never on the first sight of a fingerprint. If it fired
+     * immediately, a saltless side would refuse to ask for the peer's half at all and every session
+     * where one side persisted first would go unsalted.
+     */
+    const action = onPeerSaltFrame({
+      ownSalt: null,
+      ownContribution: OURS,
+      alreadyRepairedAgainstPeerFingerprint: false,
+      frame: { fingerprint: saltFingerprint(AGREED) },
+    });
+    expect(action.action).toBe("repair");
+    expect(action.action === "repair" && action.frame.contribution && hex(action.frame.contribution)).toBe(hex(OURS));
   });
 });

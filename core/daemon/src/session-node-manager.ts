@@ -1149,6 +1149,18 @@ export class SessionNodeManager {
    */
   #saltRepairedAgainst = new Map<string, string>();
   /**
+   * THE MIRROR OF THE ABOVE — the peer FINGERPRINT we last answered with our half, hex.
+   *
+   * 006-CRYPTO finding 1. `#saltRepairedAgainst` terminates the salt-HOLDER's direction only. A side
+   * holding no salt answered every fingerprint with its contribution, and a latched holder answers
+   * every contribution with its fingerprint — so after one failed persist plus a reconnect, two
+   * healthy daemons repair at each other for the life of the session, one new stream and one INFO
+   * line each per round trip. Keyed on the peer's fingerprint BYTES for the same reason the other
+   * map is keyed on its half: a genuinely NEW fingerprint is new information and must still be
+   * answered; only an identical re-offer is the loop.
+   */
+  #saltRepairedAgainstFingerprint = new Map<string, string>();
+  /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
    * `#saltPending` — an agreement that has actually gone out and not yet been answered. The first
@@ -5023,6 +5035,7 @@ export class SessionNodeManager {
     this.#saltContributions.delete(key);
     this.#sessionSalts.delete(key);
     this.#saltRepairedAgainst.delete(key);
+    this.#saltRepairedAgainstFingerprint.delete(key);
     /**
      * B2b-2's three, and the pending one is SETTLED rather than dropped.
      *
@@ -11351,6 +11364,7 @@ export class SessionNodeManager {
   ): Promise<void> {
     const key = this.#k(agentName, sessionId);
     const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
+    const peerFingerprintHex = frame.fingerprint ? Buffer.from(frame.fingerprint).toString("hex") : null;
     const adoption = this.#saltAdoptionClosed(agentName, sessionId);
     const action = onPeerSaltFrame({
       ...this.#saltState(agentName, sessionId),
@@ -11363,6 +11377,10 @@ export class SessionNodeManager {
       // Keyed on the peer's BYTES, not on a repair counter: a genuinely NEW half from the peer must
       // still get our contribution back, and only an identical re-offer is the loop (review F14).
       alreadyRepairedAgainstPeerHalf: peerHalfHex !== null && this.#saltRepairedAgainst.get(key) === peerHalfHex,
+      // The mirror, 006-CRYPTO finding 1: without it a saltless side answers a latched holder's
+      // fingerprint forever. Same keying rule — an identical re-offer is the loop, a new one is not.
+      alreadyRepairedAgainstPeerFingerprint:
+        peerFingerprintHex !== null && this.#saltRepairedAgainstFingerprint.get(key) === peerFingerprintHex,
       frame,
     });
     if (action.action === "confirmed") {
@@ -11576,9 +11594,15 @@ export class SessionNodeManager {
         answeredWith: action.frame.contribution ? "contribution" : "fingerprint",
       });
       // Recorded ONLY for a repair that sent our half, because that is the one a second identical
-      // offer must not repeat (review F14). Recording the fingerprint answer too would be harmless
-      // but says nothing — that branch is already terminal for the peer.
+      // offer must not repeat (review F14).
       if (peerHalfHex && action.frame.contribution) this.#saltRepairedAgainst.set(key, peerHalfHex);
+      // AND THE MIRROR (006-CRYPTO finding 1): we answered the peer's FINGERPRINT with our half. An
+      // earlier note here said recording this "says nothing, that branch is already terminal for the
+      // peer" — it is terminal only for a peer that HOLDS a salt, and the loop is the case where we
+      // do not. A second identical fingerprint now closes adoption instead of repairing again.
+      if (peerFingerprintHex && action.frame.contribution) {
+        this.#saltRepairedAgainstFingerprint.set(key, peerFingerprintHex);
+      }
       void this.#sendSaltFrame(agentName, sessionId, correlationId, action.frame);
       return;
     }
