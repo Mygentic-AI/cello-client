@@ -236,6 +236,19 @@ describe("Seam 4: full daemon-IPC two-daemon local orchestration", () => {
       const awaited = await awaitP;
       expect(awaited.type).toBe("new_session");
       expect(awaited.session_id).toBe(SID_HEX);
+
+      /**
+       * 007-CRYPTO: put BOTH ends on the same agreed key, after the real exchange has settled.
+       *
+       * A live send is encrypted or it is not sent. This harness joins the two daemons through an
+       * injected assignment rather than a two-way link, so only A's ephemeral reaches B — B derives
+       * for real, A never hears back. Writing the same key to both is what a completed two-way
+       * exchange produces, and it stays put because deriving is idempotent.
+       */
+      await wait(400);
+      const AGREED = new Uint8Array(32).fill(0x7e);
+      A.getSessionNodeManager().setSessionContentKeyForTest("alice", SID_HEX, AGREED);
+      B.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, AGREED);
       expect(awaited.counterparty_pubkey).toBe(alicePubkey);
 
       // ── A sends; B receives over the live N_A ↔ B connection.

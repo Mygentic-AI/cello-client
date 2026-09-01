@@ -112,6 +112,10 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
     expect((await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B")).ok).toBe(true);
+    // 007-CRYPTO: BOTH ends need the same agreed key — a live send is encrypted or it is not
+    // sent, and the receiver must be able to open it. This call is wrapped in `expect(...)`, so
+    // the sweep that seeded the plain `await` forms did not reach it and only one side had a key.
+    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     return { A, B };
   }
 
