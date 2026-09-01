@@ -26,6 +26,7 @@ import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
 import {
   onPeerSaltFrame,
   ownSaltFrame,
+  SALT_ADOPTION_LABEL_MAX,
   SALT_ADOPTION_LABELS,
   SALT_FREEZE_GUIDANCE,
   type SaltAgreementFrame,
@@ -12142,7 +12143,14 @@ export class SessionNodeManager {
           ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
           // A non-string stays ABSENT rather than being coerced, exactly like the other two: the
           // decision function refuses a shape it cannot read, and must never be handed a `"42"`.
-          ...(typeof adoptionClosed === "string" && adoptionClosed.length > 0 ? { adoptionClosed } : {}),
+          //
+          // TRUNCATED AT THE BOUNDARY — 006-CRYPTO finding 6. Every label CELLO sends is under
+          // twenty characters, and this one is chosen entirely by the peer. Cutting it here means
+          // no unbounded peer string is stored, logged or rendered anywhere downstream; the
+          // rendering that keeps it out of our own sentences is `renderPeerAdoptionLabel`.
+          ...(typeof adoptionClosed === "string" && adoptionClosed.length > 0
+            ? { adoptionClosed: adoptionClosed.slice(0, SALT_ADOPTION_LABEL_MAX) }
+            : {}),
         }, correlationId);
         return;
       }

@@ -258,6 +258,54 @@ export type SaltAgreementAction =
    */
   | { action: "freeze"; reason: SaltFreezeReason; detail: string; notifyPeer?: SaltAgreementFrame };
 
+/**
+ * The longest `adoptionClosed` label this build will read — 006-CRYPTO finding 6.
+ *
+ * Every label CELLO sends is under twenty characters. The cap is not about memory; it is about a
+ * peer-chosen string reaching an operator inside a sentence that reads as CELLO's own diagnosis.
+ */
+export const SALT_ADOPTION_LABEL_MAX = 64;
+
+const KNOWN_ADOPTION_LABELS: ReadonlySet<string> = new Set<string>(Object.values(SALT_ADOPTION_LABELS));
+
+/** Space, the lowest printable code point. Anything below it is a control character. */
+const FIRST_PRINTABLE = 0x20;
+/** DEL, and the C1 control block that follows it. */
+const DEL = 0x7f;
+const LAST_C1 = 0x9f;
+
+/**
+ * RENDER A PEER-SUPPLIED LABEL — 006-CRYPTO finding 6.
+ *
+ * The peer chooses these bytes, and they were interpolated straight into a `detail` the operator
+ * reads. Measured: a label containing newlines produced a detail carrying what looked like a second
+ * log line — `the counterparty cannot adopt a salt for this session (` then a blank line, then
+ * `session.salt.agreed reason=ok` — so a counterparty could write text that reads as CELLO
+ * reporting agreement at the exact moment it reported the opposite.
+ *
+ * A KNOWN label is rendered verbatim: it is our own vocabulary and the operator should see it. An
+ * unknown one is marked unrecognised and stripped of control characters, because the operator still
+ * needs to see WHAT was sent — `PEER_CLOSED_UNSPECIFIED`'s guidance sends them here to read it — but
+ * must not read it as our conclusion. Sanitising rather than dropping: a label we refuse to show at
+ * all is a diagnosis nobody can complete.
+ *
+ * Filtered by CODE POINT rather than by a regex character class, deliberately. Writing the class
+ * needs control characters in the source, and a raw NUL in a `.ts` file makes `grep` classify the
+ * whole file as binary and report no matches in it — which reads exactly like "this symbol is not
+ * used anywhere". This file paid for that lesson while the fix was being written.
+ */
+export function renderPeerAdoptionLabel(label: string): string {
+  if (KNOWN_ADOPTION_LABELS.has(label)) return label;
+  const printable = Array.from(label)
+    .map((ch) => {
+      const cp = ch.codePointAt(0) ?? 0;
+      return cp < FIRST_PRINTABLE || (cp >= DEL && cp <= LAST_C1) ? " " : ch;
+    })
+    .join("")
+    .slice(0, SALT_ADOPTION_LABEL_MAX);
+  return `unrecognised reason, as sent: "${printable}"`;
+}
+
 function digestsEqual(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;
   return Buffer.from(a).equals(Buffer.from(b));
@@ -408,7 +456,9 @@ export function onPeerSaltFrame(state: {
       // NOT "they have already hashed content" — that is only one of their two reasons, and the
       // label they sent says which. Asserting the wrong one about a counterparty is how an operator
       // ends up asking a peer to change something that was never the problem.
-      detail: `the counterparty cannot adopt a salt for this session (${state.frame.adoptionClosed}); neither side will use one`,
+      // RENDERED, not interpolated — 006-CRYPTO finding 6. The peer chooses this string, and it is
+      // landing inside a sentence the operator reads as ours.
+      detail: `the counterparty cannot adopt a salt for this session (${renderPeerAdoptionLabel(state.frame.adoptionClosed as string)}); neither side will use one`,
       ...(state.ownAdoption?.closed ? {} : { announce: { adoptionClosed: SALT_ADOPTION_LABELS.PEER_CLOSED_FIRST } }),
     };
   }

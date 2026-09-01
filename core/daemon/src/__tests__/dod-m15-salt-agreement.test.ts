@@ -36,6 +36,8 @@ import { describe, it, expect } from "vitest";
 import {
   onPeerSaltFrame,
   ownSaltFrame,
+  renderPeerAdoptionLabel,
+  SALT_ADOPTION_LABEL_MAX,
   SALT_ADOPTION_LABELS,
   SALT_FREEZE_REASONS,
   SALT_FREEZE_GUIDANCE,
@@ -371,6 +373,62 @@ describe("every reason an operator can be shown has something for them to DO", (
       // The move that DOES work has to be named, or the refusal is a dead end.
       expect(SALT_FREEZE_GUIDANCE[reason], `${reason} names no way forward`).toMatch(/new session|another session/i);
     }
+  });
+});
+
+describe("a peer-chosen label never becomes CELLO's own sentence — 006-CRYPTO finding 6", () => {
+  /**
+   * `adoptionClosed` is chosen entirely by the counterparty and was interpolated straight into a
+   * `detail` the operator reads as our diagnosis. Measured before the fix: a label containing
+   * newlines produced a detail carrying what looked like a SECOND log line claiming agreement, at
+   * the exact moment the real one reported the opposite.
+   *
+   * This is not the same as the downgrade question. A peer can always decline to adopt — that is
+   * the accepted trade, and it costs the salt, not the truth of our own log. What it must not get
+   * is the ability to write text that reads as ours.
+   */
+  it("★ a KNOWN label is shown verbatim — it is our own vocabulary", () => {
+    expect(renderPeerAdoptionLabel(SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE)).toBe("frontier_unreadable");
+    expect(renderPeerAdoptionLabel(SALT_ADOPTION_LABELS.ALREADY_HASHING)).toBe("already_hashing");
+  });
+
+  it("★ an unknown label is MARKED unrecognised rather than asserted as a cause", () => {
+    const rendered = renderPeerAdoptionLabel("something_this_build_does_not_know");
+    expect(rendered).toMatch(/unrecognised/i);
+    expect(rendered, "the operator still has to be able to see WHAT was sent").toContain(
+      "something_this_build_does_not_know",
+    );
+  });
+
+  it("★ CONTROL CHARACTERS cannot forge a line break inside our sentence", () => {
+    // Built by code point so this test file cannot itself acquire a raw control byte — a NUL in a
+    // source file makes grep treat the whole file as binary and report no matches in it.
+    const forged = `x${String.fromCharCode(10)}${String.fromCharCode(10)}session.salt.agreed reason=ok`;
+    const rendered = renderPeerAdoptionLabel(forged);
+    expect(
+      rendered.includes(String.fromCharCode(10)) || rendered.includes(String.fromCharCode(13)),
+      "a newline survived, so the peer can write what looks like a second log line of ours",
+    ).toBe(false);
+    expect(rendered.includes(String.fromCharCode(0)), "a NUL survived").toBe(false);
+  });
+
+  it("★ an over-long label is capped, and the cap is asserted as a LITERAL", () => {
+    const rendered = renderPeerAdoptionLabel("a".repeat(5_000));
+    expect(rendered.length).toBeLessThan(200);
+    expect(SALT_ADOPTION_LABEL_MAX, "and the exported cap must agree with reality").toBe(64);
+  });
+
+  it("★ the DETAIL the operator reads is the rendered form, not the raw bytes", () => {
+    // The end-to-end shape of the finding: it is the `detail` string that reaches a person.
+    const action = onPeerSaltFrame({
+      ownSalt: null,
+      ownContribution: OURS,
+      frame: { adoptionClosed: `q${String.fromCharCode(10)}session.salt.agreed reason=ok` },
+    });
+    expect(action.action).toBe("adoption_closed");
+    const detail = action.action === "adoption_closed" ? action.detail : "";
+    expect(detail.includes(String.fromCharCode(10)), "the forged line break reached the operator").toBe(false);
+    expect(detail).toMatch(/unrecognised/i);
   });
 });
 
