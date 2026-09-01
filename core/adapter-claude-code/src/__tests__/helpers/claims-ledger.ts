@@ -413,20 +413,34 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "README.md",
     claim: "'Not yet implemented — registered but the daemon returns not_implemented': inclusion-proof",
-    excerpts: ["inclusion-proof <session-id>"],
+    // ⚠️ THE EXCERPT IS DELIBERATELY EMPTY, AND THAT IS THE CURRENT STATE OF THE CLAIM.
+    //
+    // `DOD-M15-INCLUSION-1` implemented `cello_get_inclusion_proof`, so the block this row audits
+    // had no true entry left and was DELETED — which is one of the two dispositions a claims ledger
+    // recognises (made true / withdrawn), not an escape from the row. The row stays because the
+    // history below is the evidence for why the block existed, and a withdrawn claim with no row is
+    // indistinguishable from a claim nobody audited.
+    excerpts: [],
     enforcedBy: "daemon-local",
     verdict: "corrected",
     evidence:
       "THE CLAIM WAS FALSE IN THE UNDERSTATING DIRECTION, which is the case a claims audit is " +
       "least likely to look for — and it was the most consequential instance in the file. The " +
       "block listed `backup · restore · inclusion-proof`, but the daemon's not_implemented stub " +
-      "loop at `daemon.ts:3926` covers exactly ONE tool, `cello_get_inclusion_proof`. `backup` and " +
+      "loop covered exactly ONE tool, `cello_get_inclusion_proof`. `backup` and " +
       "`restore` are fully built (`registry.ts:345,375` call `createBackup`/`restoreBackup`; " +
       "`DOD-M15-BACKUP-1` is closed and reviewed). So the README told operators 'Don't build on " +
       "these yet' about the only feature that prevents permanent identity loss — five lines under " +
       "its own sentence 'losing them means losing your identity', which also still said automated " +
-      "backup was unimplemented. Both places corrected; inclusion-proof stays listed because it " +
-      "genuinely is the one tool in that stub loop.",
+      "backup was unimplemented. Both places corrected. ⚠️ THE LAST SENTENCE USED TO READ " +
+      "'inclusion-proof stays listed because it genuinely is the one tool in that stub loop' — true " +
+      "when written and false since `DOD-M15-INCLUSION-1`, which implemented the tool, added " +
+      "`cello_verify_inclusion_proof` beside it, and deleted the stub loop that by then held nothing " +
+      "else. The whole 'Not yet implemented' block went with it: its only entry was implemented, and " +
+      "it was never a CLI command in the first place (the tool is MCP-only, which " +
+      "`dispatch-parity.test.ts` records as deliberate). Rewritten rather than dropped, because a " +
+      "line-numbered pointer into a loop that no longer exists is how a reader concludes the " +
+      "reasoning is stale rather than that the code moved on.",
   },
   {
     surface: "README.md",

@@ -348,12 +348,6 @@ bridge hermes --agent <name>   — install the CELLO adapter into a Hermes Agent
                                   re-run after every CELLO upgrade — the adapter is a copy)
 ```
 
-**Not yet implemented** — registered but the daemon returns `not_implemented`.
-Don't build on this yet:
-```
-inclusion-proof <session-id>
-```
-
 `cello --help` and `cello <command> --help` describe every command in full,
 including flags and constraints — that's the canonical reference; this list
 is a map of what exists, not the last word on syntax.

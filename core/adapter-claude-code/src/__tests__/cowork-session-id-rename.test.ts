@@ -37,8 +37,21 @@ const SESSION_ID_TOOLS = [
   "cello_get_inclusion_proof",
 ] as const;
 
+/**
+ * ⚠️ THE ANCHOR WAS `server.tool("${tool}"` — EXACT, AND THAT WAS A HOLE, not a style preference.
+ *
+ * A tool registered across several lines (`server.tool(\n  "name",`) was INVISIBLE to this guard.
+ * For a tool in the list below that surfaces as "is not registered as a tool", which at least fails;
+ * for any OTHER tool it fails silently, and the whole-surface sweep at the foot of this file had the
+ * same blindness in its `^\s{2}` indent anchor — so a multi-line registration could declare the very
+ * `session_id` parameter the Cowork bridge strips and no test here would see it.
+ *
+ * Found when `DOD-M15-INCLUSION-1` reformatted `cello_get_inclusion_proof` onto several lines. The
+ * matcher is now whitespace-tolerant, which WIDENS what the guard can see rather than relaxing what
+ * it demands: every assertion below is unchanged.
+ */
 function blockFor(tool: string): string {
-  const start = source.indexOf(`server.tool("${tool}"`);
+  const start = source.search(new RegExp(`server\\.tool\\(\\s*"${tool}"`));
   expect(start, `${tool} is not registered as a tool`).toBeGreaterThan(-1);
   const next = source.indexOf("server.tool(", start + 1);
   return source.slice(start, next === -1 ? source.length : next);
@@ -51,7 +64,7 @@ describe("Cowork bridge (claude-code#77248): the session id parameter", () => {
     // The bare token as a SCHEMA KEY is what the bridge eats. Anchored to the declaration form so a
     // `session_id` inside the proxy payload or a description string does not trip it.
     expect(block, `${tool} must not re-declare the stripped \`session_id\` param`)
-      .not.toMatch(/^\s{2}session_id: z\./m);
+      .not.toMatch(/^\s+session_id: z\./m);
   });
 
   it.each(SESSION_ID_TOOLS)("%s still sends `session_id` to the daemon — IPC is unchanged", (tool) => {
@@ -64,7 +77,9 @@ describe("Cowork bridge (claude-code#77248): the session id parameter", () => {
   it("leaves the whole surface free of the stripped token as a declared argument", () => {
     // Belt and braces across all 42 tools, including any added later: no tool may declare a
     // parameter literally named `session_id` again, whatever it is for.
-    const declarations = source.match(/^\s{2}session_id: z\./gm) ?? [];
+    // `\s+`, not `\s{2}`: a multi-line `server.tool(` indents its parameter object by four, so the
+    // two-space anchor could not see one at all — the same blindness as `blockFor` above.
+    const declarations = source.match(/^\s+session_id: z\./gm) ?? [];
     expect(declarations, "a tool re-declared the parameter the Cowork bridge strips").toEqual([]);
   });
 });
