@@ -73,6 +73,11 @@ describe("EPHEMERAL-AUTH: a signed key verifies, and only against the right iden
      * The loophole, and the reason the three refusals share an outcome. An attacker evading a
      * mismatch check does not forge a signature — it sends none, and hopes "we could not tell" is
      * treated more gently than "we proved it wrong".
+     *
+     * ⚠️ THIS GUARD CANNOT BE DELETED, and that is stronger than this test. Attempting the mutation
+     * — removing the `=== undefined` branch — does not compile: `peerSignature` is optional, so
+     * every line below narrows on it and TypeScript refuses three ways. The type system enforces the
+     * check's EXISTENCE; this test enforces that it refuses rather than, say, returning ok.
      */
     const a = await alice();
     const eph = generateSessionEphemeral();
