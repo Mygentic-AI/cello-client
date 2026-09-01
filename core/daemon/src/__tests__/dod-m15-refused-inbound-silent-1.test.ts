@@ -537,13 +537,17 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     ).toBe(false);
     const guidance = String(entry!["contentEncryptionGuidance"] ?? "");
     expect(
-      guidance,
+      guidance.length,
       "and it must be GUIDANCE, not a bare code an agent would have to look up",
-    ).toMatch(/no setting that turns this on/i);
+    ).toBeGreaterThan(60);
     expect(
       guidance,
-      "it must not read as 'you are sending plaintext' — the transport still encrypts",
-    ).toMatch(/still encrypted in transit/i);
+      "it must not tell the reader a fault is expected — every reason here is a fault",
+    ).not.toMatch(/this is expected|no setting that turns/i);
+    expect(
+      guidance,
+      "and it must not blame a build version; there are no other builds",
+    ).not.toMatch(/predates|older build|upgrade/i);
   });
 
   it("the salted status reaches cello_list_sessions — the record alone was invisible", async () => {

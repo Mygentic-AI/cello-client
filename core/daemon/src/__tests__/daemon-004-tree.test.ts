@@ -24,6 +24,7 @@
  * Crypto refs: RFC 6962 §2.1, FIPS 180-4.
  */
 
+import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -37,7 +38,7 @@ import { decode as cborDecode } from "cbor-x";
 // CBOR maps. Harmless here, and exactly the drift a hand-rolled copy invites. Importing the real one
 // means the question cannot recur.
 import { encodeCbor, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
-import { generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "../session-relay-client.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
@@ -489,7 +490,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
 
       const content = new TextEncoder().encode("no session id on this one");
       // Correct sender, correct everything — except the field simply is not there.
-      node.deliverFrame({ type: "content_frame", content_bytes: content, content_hash: msgLeafHash(content) }, "bob-peer-id");
+      node.deliverFrame({ type: "content_frame", content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content) }, "bob-peer-id");
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received")).toBeUndefined();
@@ -545,7 +546,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const rec = await kpRecord(attacker, content, 1);
       node.deliverFrame({
         type: "content_frame", session_id: sid,
-        content_bytes: content, content_hash: rec.contentHash,
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
@@ -564,7 +565,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const rec = await kpRecord(counterparty, content, 1, { corruptSig: true });
       node.deliverFrame({
         type: "content_frame", session_id: sid,
-        content_bytes: content, content_hash: rec.contentHash,
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
@@ -588,7 +589,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const rec = await kpRecord(attacker, content, 1);
       node.deliverFrame({
         type: "content_frame", session_id: sid,
-        content_bytes: content, content_hash: rec.contentHash,
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
@@ -640,7 +641,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const rec = await kpRecord(kp, content, 1);
       node.deliverFrame({
         type: "content_frame", session_id: sid,
-        content_bytes: content, content_hash: rec.contentHash,
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
         structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
@@ -671,7 +672,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const content = new TextEncoder().encode("no ordering record");
       node.deliverFrame({
         type: "content_frame", session_id: sid,
-        content_bytes: content, content_hash: msgLeafHash(content),
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content),
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
 

@@ -158,18 +158,25 @@ describe("DOD-M15-SEALWIRE-1 part A: the announcement rides a real connection", 
     fx.snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const addr = dialableAddr(fx, created);
 
+    /**
+     * 007-CRYPTO: the SALT frames only. The signed ephemeral now rides the same content stream and
+     * the same connect, so this inbox holds both kinds and "the last frame" is no longer the salt
+     * one. Selecting by type keeps the test about the property it names — a contribution minted once
+     * per session — instead of about which frame happened to arrive last.
+     */
+    const saltFrames = () => inbox.filter((f) => f["type"] === "session_salt_agreement");
     await peer.dial(addr);
-    expect(await waitUntil(() => inbox.length >= 1, 10_000)).toBe(true);
-    const first = inbox[0]!["contribution"] as Uint8Array;
+    expect(await waitUntil(() => saltFrames().length >= 1, 10_000)).toBe(true);
+    const first = saltFrames()[0]!["contribution"] as Uint8Array;
 
     // Drop the connection and come back, which is the ordinary shape of a session that outlives a
     // network blip — and the moment a per-call mint would diverge.
     await peer.hangUp(fx.snm.getSessionNodePeerId("alice", SID)!);
     await wait(300);
     await peer.dial(addr);
-    expect(await waitUntil(() => inbox.length >= 2, 10_000), "the reconnect must re-announce").toBe(true);
+    expect(await waitUntil(() => saltFrames().length >= 2, 10_000), "the reconnect must re-announce").toBe(true);
 
-    const second = inbox[inbox.length - 1]!["contribution"] as Uint8Array;
+    const second = saltFrames()[saltFrames().length - 1]!["contribution"] as Uint8Array;
     expect(Buffer.from(second).toString("hex"), "a fresh contribution per announcement never converges").toBe(
       Buffer.from(first).toString("hex"),
     );

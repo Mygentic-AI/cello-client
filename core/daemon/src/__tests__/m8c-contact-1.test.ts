@@ -294,6 +294,11 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     const strangerPubkey = "cd".repeat(32);
     expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
+    // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
+    // key map is keyed by (agent, session) and does not need the session to exist yet, so this
+    // pre-registers what a completed exchange would leave. Without it the reply parks — correct
+    // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
+    h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
     await wait(150);
 
@@ -349,6 +354,11 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const knownPubkey = "ef".repeat(32);
     h.getSessionNodeManager().addContact("bob", knownPubkey, undefined, null, TIER.KNOWN); // KNOWN BEFORE this session
 
+    // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
+    // key map is keyed by (agent, session) and does not need the session to exist yet, so this
+    // pre-registers what a completed exchange would leave. Without it the reply parks — correct
+    // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
+    h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(knownPubkey, bobPubkey));
     await wait(150);
 

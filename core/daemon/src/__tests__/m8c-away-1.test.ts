@@ -288,6 +288,11 @@ describe("M8C-AWAY-1: away response", () => {
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
     h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+    // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
+    // key map is keyed by (agent, session) and does not need the session to exist yet, so this
+    // pre-registers what a completed exchange would leave. Without it the reply parks — correct
+    // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
+    h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(150);
 
