@@ -167,7 +167,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     return c;
   }
 
-  it("★ CLAUSES 1 + 5 — the node is down, the operator is told it is HELD, and the reconnect delivers it", async () => {
+  it("★ CLAUSES 1 + 5 — the node is down, the operator is told it is HELD, and it goes out by itself when the node returns", async () => {
     const dirNode = makeControllableDirectory();
     const { logger } = makeLogger();
     await makeAgentDir("alice");
@@ -200,17 +200,31 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     expect(inFlight[0]["submission_id"]).toBe(issued["submission_id"]);
     expect(inFlight[0]["op"]).toBe("submit");
 
-    // ── The node comes back. NOTHING ELSE HAPPENS — no operator action, no second command.
+    /**
+     * ── THE NODE COMES BACK. NOTHING ELSE HAPPENS — no operator action, no second command.
+     *
+     * NAME THE WRITER, because there are two and this seam only exercises one. The queue has a
+     * timer of its own AND a wake on the agent's `onConnected`, and on THIS path only the timer can
+     * fire: injecting `signalingConnect` makes the daemon use `sharedSignaling`, which carries no
+     * `onConnected` callback at all (see daemon.ts — the shared manager is the in-process test
+     * path; production builds a per-agent manager that has one). So deleting the wake leaves this
+     * test green, and an earlier version of it claimed the wake as proven when the timer had done
+     * the work. The wake is pinned separately, below.
+     *
+     * What this DOES prove, and it is the clause: the operator does nothing, and the submission
+     * reaches a node by itself. The timer is a production writer too — it is what covers a stream
+     * that comes back without the callback landing.
+     */
     dirNode.state.up = true;
 
     let landed: Array<Record<string, unknown>> = [];
-    for (let i = 0; i < 60 && landed.length === 0; i++) {
+    for (let i = 0; i < 80 && landed.length === 0; i++) {
       await wait(250);
       const now = (await c.send("wallet_list_issued", {})) as Record<string, unknown>;
       landed = now["issued"] as Array<Record<string, unknown>>;
     }
 
-    expect(dirNode.state.writes, "the reconnect did not carry the submission to the node").toHaveLength(1);
+    expect(dirNode.state.writes, "nothing carried the held submission to the node once it was back").toHaveLength(1);
     // THE SAME content-derived id the operator was given, and the same intake key — a re-compose
     // would have produced a different id, which is a second endorsement rather than a retry.
     expect(dirNode.state.writes[0]["submission_id"]).toBe(issued["submission_id"]);
@@ -220,7 +234,7 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     // And it leaves the in-flight list, or the operator sees one submission twice in two states.
     const after = (await c.send("wallet_list_issued", {})) as Record<string, unknown>;
     expect(after["in_flight"]).toEqual([]);
-  }, 30_000);
+  }, 60_000);
 
   it("CLAUSE 3 — a node that REFUSES on the merits is answered as a failure, and never retried", async () => {
     // The node is UP and answers `submission_write_error`. That is a decision about the submission,
@@ -263,4 +277,50 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
     await wait(500);
     expect(state.writes, "the refusal was re-sent to a node that had already decided").toBe(1);
   }, 30_000);
+});
+
+/**
+ * THE ONE LINK THE LIVE TEST ABOVE CANNOT REACH — the reconnect wake.
+ *
+ * `SubmissionRetryQueue.onSignalingConnected` is proven by the unit tests: it wakes THAT agent's
+ * held submissions and not another's. What no in-process test can reach is the daemon CALLING it,
+ * because the only seam for driving the signaling stream (`signalingConnect`) routes through
+ * `sharedSignaling`, and that manager is constructed with no `onConnected` callback of any kind.
+ * The production manager — one per agent, built from `directoryEndpointResolver` — is the one that
+ * has it, and reaching that path needs a real directory handshake, which is the journey enforcer's
+ * job rather than this file's.
+ *
+ * So the call site is pinned exactly, and the pin is deliberately NOT a loose "the name appears
+ * somewhere in the file": it must sit inside the SAME `onConnected` block as the park drain, which
+ * is the only place that runs on every connect and every reconnect. Moving it out of that block —
+ * to agent start, say — would leave a reconnect delivering nothing, and that is precisely the
+ * defect that cost 46 of 48 reconnects their standing-receiver registration in the 2026-07-31
+ * incident.
+ *
+ * Made to fail on purpose: deleting the call from `onConnected` reddens this, and it reddens by
+ * reporting the callback body rather than by throwing on a missing file.
+ */
+describe("DOD-M15-ENDORSE-RETRY-1 — the reconnect wake is wired into onConnected", () => {
+  it("the agent's onConnected wakes the retry queue, in the same block as the park drain", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const { dirname, resolve } = await import("node:path");
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", "daemon.ts"), "utf8");
+
+    // POSITIVE CONTROL FIRST: prove this search can see. An empty result from a path that does not
+    // exist reads exactly like an absent call site.
+    expect(src.length, "daemon.ts was not read").toBeGreaterThan(1000);
+    expect(src).toContain("onSignalingConnected(agentName)");
+
+    // The `onConnected` callback body, taken as the text between `onConnected: () => {` and its
+    // closing brace — not the whole file, which is what makes this an assertion about WHERE.
+    const at = src.indexOf("onConnected: () => {");
+    expect(at, "the per-agent signaling manager no longer declares onConnected").toBeGreaterThan(-1);
+    const body = src.slice(at, src.indexOf("},", at));
+    expect(
+      body,
+      "the retry queue is not woken on reconnect — a held submission then waits for the queue's own " +
+        "timer instead of going out when the stream returns",
+    ).toContain("submissionRetries.onSignalingConnected(agentName)");
+  });
 });
