@@ -603,6 +603,33 @@ class CelloNodeImpl implements CelloNode {
    * connection may already be gone, and throwing there would turn a recoverable stale handle into
    * a failure of the repair itself.
    */
+  /**
+   * DOD-M15-RELAYSLOTS-1 — release the circuit reservation held for `peerId`. See the interface
+   * declaration for why `hangUp` is not enough and what it cost.
+   *
+   * Reached through the relay service's PUBLIC `reservations` getter (a `PeerMap`), not through the
+   * private reservation store — no cast through a private field, so a libp2p upgrade that changes
+   * the internals cannot silently turn this into a no-op; it would fail to compile.
+   */
+  releaseRelayReservation(peerIdStr: string): boolean {
+    let peerId: ReturnType<typeof peerIdFromString>;
+    try {
+      peerId = peerIdFromString(peerIdStr);
+    } catch {
+      // Same reasoning as hangUp: name it rather than letting a parse error read as a relay fault.
+      return false;
+    }
+    const relay = (this.#libp2p.services as Record<string, unknown>)["relay"] as
+      | { reservations?: { has(p: typeof peerId): boolean; delete(p: typeof peerId): unknown } }
+      | undefined;
+    const reservations = relay?.reservations;
+    // A node with no relay service (every client node) holds no reservations to release.
+    if (!reservations) return false;
+    if (!reservations.has(peerId)) return false;
+    reservations.delete(peerId);
+    return true;
+  }
+
   async hangUp(peerIdStr: string): Promise<void> {
     let peerId;
     try {

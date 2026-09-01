@@ -358,6 +358,25 @@ export interface CelloNode {
   hangUp(peerId: string): Promise<void>;
 
   /**
+   * DOD-M15-RELAYSLOTS-1 — release the circuit RESERVATION this relay is holding for `peerId`.
+   * Returns true if one was held and is now gone.
+   *
+   * ⚠️ **`hangUp` DOES NOT DO THIS, AND THAT IS THE WHOLE REASON THIS EXISTS.** Verified against
+   * `@libp2p/circuit-relay-v2@4.2.3`: the server's `removeReservation` is called from exactly one
+   * place — the catch when writing the confirmation frame fails — and there is no connection-close
+   * or disconnect listener anywhere in its server. A reservation therefore survives its holder's
+   * disconnect for the full `reservationTtl`, which defaults to TWO HOURS.
+   *
+   * The consequence, measured rather than assumed: a relay could evict a peer, watch its own ledger
+   * drop, report itself well under capacity, and still be holding that reservation against libp2p's
+   * 4096 limit for two hours. Every reclaim path the relay has — the grace-window revoke, the
+   * reaper, the unproven-budget eviction — was freeing bookkeeping and not capacity.
+   *
+   * No-op on a node with no relay service, and on a peer holding no reservation.
+   */
+  releaseRelayReservation(peerId: string): boolean;
+
+  /**
    * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed
    * (direct) connection to peerId. Used by the transport selector's dcutr path to
    * observe whether a relay-fallback connection has been hole-punch upgraded to
