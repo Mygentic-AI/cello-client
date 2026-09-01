@@ -559,6 +559,38 @@ describe("WHICH reason the peer gave survives to the operator — 006-CRYPTO fin
     expect(guidance).toMatch(/session\.salt\.persist\.failed/i);
   }, 60_000);
 
+  it("★ the SUSPENDED path asks the same question — it had its own hardcoded answer", async () => {
+    /**
+     * The other half of the finding, and it is a different branch of `#saltForHashing`: here we DO
+     * hold a salt and deliberately do not use it, because the peer has said it can never hold one.
+     * That branch named `PEER_CLOSED_ADOPTION` directly, under a comment claiming it "already
+     * carries exactly the right guidance for that".
+     *
+     * Reached the way production reaches it: agree a real salt from the peer's contribution first,
+     * THEN have the peer close. A mutation restoring the hardcode survived every existing test in
+     * this repo, which is why this test exists rather than being assumed.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-suspended-reason-" });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, saltFrame(), PEER);
+    expect(
+      fx.eventsNamed("session.salt.agreed").length,
+      "PRECONDITION: a salt was actually agreed. Without one this session takes the no-salt branch " +
+        "and the whole test passes for the wrong reason.",
+    ).toBe(1);
+
+    await fx.snm.handleSaltFrameForTest("alice", SID, { adoptionClosed: "frontier_unreadable" });
+    await fx.snm.contentHashForSession("alice", SID, BODY);
+
+    const said = fx.eventsNamed("session.content.unsalted");
+    expect(said.length).toBe(1);
+    expect(
+      String(said[0]!.ctx!["reason"]),
+      "the suspended branch answered with its own hardcoded reason instead of asking what the peer said",
+    ).toBe("peer_frontier_unreadable");
+    expect(String(said[0]!.ctx!["guidance"])).not.toMatch(/already hashed messages/i);
+  }, 60_000);
+
   it("★ an UNKNOWN label asserts nothing about the counterparty", async () => {
     /**
      * The default must be the non-asserting reason, not the most common one. This string is chosen
