@@ -356,6 +356,15 @@ export interface DaemonConfig {
    */
   contentParkFn?: import("./retry-queue.js").ParkFn;
   /**
+   * DOD-M15-ENDORSE-RETRY-1 — timings for the sealed-submission retry queue. Absent in production,
+   * where the module's own defaults apply.
+   *
+   * Same seam as `contentParkTtfMs` below and for the same reason: without it a test's green
+   * depends on the real SignalingManager reconnect ladder racing a real 5-second timer, so a
+   * correct implementation goes red whenever the ladder happens to land late.
+   */
+  submissionRetryIntervalsMs?: { staggerMs?: number; localPreconditionRetryMs?: number };
+  /**
    * The TTF (time-to-flush) window, in ms, the sender waits for a `persisted` delivery ACK
    * before handing un-acked content to the park backstop. Default 20_000. Tests inject a
    * small value to drive TTF expiry deterministically.

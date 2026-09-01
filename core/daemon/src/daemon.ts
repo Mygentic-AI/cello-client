@@ -840,6 +840,12 @@ async function startDaemonHoldingLock(
         stored,
       });
     },
+    ...(config.submissionRetryIntervalsMs?.staggerMs === undefined
+      ? {}
+      : { staggerMs: config.submissionRetryIntervalsMs.staggerMs }),
+    ...(config.submissionRetryIntervalsMs?.localPreconditionRetryMs === undefined
+      ? {}
+      : { localPreconditionRetryMs: config.submissionRetryIntervalsMs.localPreconditionRetryMs }),
   });
 
   /**

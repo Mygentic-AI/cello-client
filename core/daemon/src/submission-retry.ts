@@ -32,9 +32,15 @@
  * ciphertext, and persisting it would mean a new table, a client-side migration, and a blob at rest
  * whose retention outlives the intake key it is sealed to. A daemon restart therefore loses the
  * pending retries — the operator sees them disappear from `cello_attestations_issued` rather than
- * seeing a lie, and re-submitting is safe by the same content-derived id. The retry window below is
- * far shorter than any manifest validity window, so a queued blob cannot outlive the intake key it
- * was sealed to.
+ * seeing a lie, they are NAMED in the log on the way out (`retry.dropped_on_shutdown`), and
+ * re-submitting is safe by the same content-derived id.
+ *
+ * THE INTAKE KEY IS CHECKED BY THE CALLER, not assumed here. An earlier version of this paragraph
+ * asserted that the retry window "is far shorter than any manifest validity window, so a queued
+ * blob cannot outlive the intake key it was sealed to" — which is only true when the manifest has
+ * more than a window left at compose time. The enqueue site in `daemon.ts` holds the manifest and
+ * refuses to hold a submission whose intake key would expire inside the window; see
+ * `DEFAULT_RETRY_WINDOW_MS` below for what goes wrong when nothing checks.
  */
 import type { SubmissionOp } from "@cello-protocol/protocol-types";
 import type { SendSubmissionResult, SubmissionSendFailure } from "./signal-submission.js";
@@ -186,6 +192,14 @@ export interface SubmissionRetryQueueDeps {
   maxAttempts?: number;
   /** Wall-clock ceiling for a submission whose failures were all local preconditions. */
   retryWindowMs?: number;
+  /**
+   * Gap before re-trying a LOCAL PRECONDITION failure. Injectable because it and `baseBackoffMs`
+   * were the only two intervals a test could not vary — which is why the live wiring test's green
+   * depended on a real reconnect ladder racing a real 5-second timer.
+   */
+  localPreconditionRetryMs?: number;
+  /** First non-local backoff; doubles from here. */
+  baseBackoffMs?: number;
   /** Ceiling on pending submissions held at once, across all agents. */
   queueCap?: number;
 }
@@ -300,6 +314,8 @@ export class SubmissionRetryQueue {
   readonly #staggerMs: number;
   readonly #maxAttempts: number;
   readonly #retryWindowMs: number;
+  readonly #localPreconditionRetryMs: number;
+  readonly #baseBackoffMs: number;
   readonly #queueCap: number;
 
   /** Live retries. An entry leaves on acceptance or on give-up. */
@@ -322,6 +338,8 @@ export class SubmissionRetryQueue {
     this.#staggerMs = deps.staggerMs ?? DEFAULT_STAGGER_MS;
     this.#maxAttempts = deps.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
     this.#retryWindowMs = deps.retryWindowMs ?? DEFAULT_RETRY_WINDOW_MS;
+    this.#localPreconditionRetryMs = deps.localPreconditionRetryMs ?? LOCAL_PRECONDITION_RETRY_MS;
+    this.#baseBackoffMs = deps.baseBackoffMs ?? BASE_BACKOFF_MS;
     this.#queueCap = deps.queueCap ?? DEFAULT_QUEUE_CAP;
   }
 
@@ -614,8 +632,8 @@ export class SubmissionRetryQueue {
     }
 
     const waitMs = localPrecondition
-      ? LOCAL_PRECONDITION_RETRY_MS
-      : BASE_BACKOFF_MS * 2 ** Math.max(0, entry.attempts - 1);
+      ? this.#localPreconditionRetryMs
+      : this.#baseBackoffMs * 2 ** Math.max(0, entry.attempts - 1);
     entry.nextAt = this.#now() + waitMs;
     entry.delivery = {
       state: "retrying",

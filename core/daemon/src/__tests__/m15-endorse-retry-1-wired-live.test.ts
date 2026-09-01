@@ -151,6 +151,12 @@ describe("DOD-M15-ENDORSE-RETRY-1 — over a live daemon", () => {
       },
       manifestRootKeys: ["a".repeat(64)],
       manifestThreshold: 1,
+      // Deterministic timings. Without them this test's green depends on the real SignalingManager
+      // reconnect ladder (1s → 2s → 4s → 8s → 16s, cap 30s) landing before the queue's own first
+      // attempt — and when it lands after, the next attempt is a full minute away and a CORRECT
+      // implementation goes red. A 2-second backstop under a 2-second local-precondition retry
+      // means the queue keeps trying throughout the poll window whichever order they fall in.
+      submissionRetryIntervalsMs: { staggerMs: 2_000, localPreconditionRetryMs: 2_000 },
       fetchFn: (async () => { throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
     } as unknown as DaemonConfig;
     const h = await startDaemon(config);
@@ -347,8 +353,12 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the reconnect wake is wired into onConnect
 
     // The `onConnected` callback body, taken as the text between `onConnected: () => {` and its
     // closing brace — not the whole file, which is what makes this an assertion about WHERE.
+    // EXACTLY ONE, so the pin cannot be silently repointed. `indexOf` takes the first match, and a
+    // second `onConnected` block added above this one would move the pin to code it says nothing
+    // about while staying green.
+    const declarations = src.split("onConnected: () => {").length - 1;
+    expect(declarations, "there is no longer exactly one onConnected block for this pin to name").toBe(1);
     const at = src.indexOf("onConnected: () => {");
-    expect(at, "the per-agent signaling manager no longer declares onConnected").toBeGreaterThan(-1);
     const body = src.slice(at, src.indexOf("},", at));
     expect(
       body,
