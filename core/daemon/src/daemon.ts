@@ -726,6 +726,11 @@ async function startDaemonHoldingLock(
   for (const a of loadedAgents) {
     keyProviders.set(a.name, a.keyProvider);
   }
+  // DOD-M15-EPHEMERAL-AUTH-1: the session manager signs each session's throwaway key with the
+  // agent's identity, so it needs the same providers. Injected here rather than through the
+  // constructor because this map is built after the manager exists — the same reason
+  // `setParkedDrainHook` is a setter.
+  sessionNodeManager.setKeyProviderResolver((agentName: string) => keyProviders.get(agentName));
 
   // Constructed HERE, before ANY boot-time caller. autoRecoverForAgent is invoked from an agent's
   // onConnected and from the seal-upgrade content gate — both of which run long before the IPC

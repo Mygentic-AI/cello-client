@@ -536,6 +536,8 @@ export type SessionStatus =
   // (there is nothing to notarize on a dead handshake); it just leaves the open list.
   | "abandoned";
 
+import type { ContentEncryptionReason } from "./content-encryption-status.js";
+
 export interface SessionRecord {
   /**
    * DOD-M15-REFUSED-INBOUND-SILENT-1 — whether this session's content hashes are salted.
@@ -555,7 +557,7 @@ export interface SessionRecord {
    * hash, this stops it READING the message. Absent on records that did not come from a listing.
    */
   content_encrypted?: boolean;
-  content_encryption_reason?: string;
+  content_encryption_reason?: ContentEncryptionReason;
   session_id: string;
   /**
    * The STABLE key this row is scoped by. Every `sessions` query joins on this, never on

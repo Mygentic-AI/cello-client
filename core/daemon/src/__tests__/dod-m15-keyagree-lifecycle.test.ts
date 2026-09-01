@@ -312,38 +312,54 @@ describe("006-CRYPTO: the session SAYS it is not encrypted rather than leaving i
     await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
 
     const row = fx.snm.getSessionsForAgent("alice").find((s) => s.session_id === SID);
-    expect(row?.["content_encrypted"], "no key is agreed in this build, so this cannot be true").toBe(false);
-
-    const guidance = String(row?.["content_encryption_reason"] ?? "");
-    expect(guidance, "and the reason must be a named code, not an empty field").toBe("no_key_exchange");
+    expect(
+      row?.["content_encrypted"],
+      "no peer has completed the exchange in this fixture, so this cannot be true",
+    ).toBe(false);
+    expect(
+      String(row?.["content_encryption_reason"] ?? ""),
+      "and the reason must be a named code, not an empty field",
+    ).toBe("not_yet_agreed");
   }, 60_000);
 
-  it("★ the guidance names no setting, because there is none", async () => {
+  it("★ every reason names a verb the reader can perform, and none calls a fault expected", async () => {
     /**
-     * An affordance that resolves to nothing is worse than none — the reader spends time looking for
-     * it. There is nothing an operator can do about this one, so it says so.
+     * The guidance map is TOTAL over the reason union, so the type enforces that a reason cannot be
+     * added without something to do about it. What the type cannot enforce is that the text is USEFUL,
+     * which is the half that decays.
+     *
+     * ⚠️ NONE of these may read as reassurance. Every one is a fault — local, transient, or a
+     * counterparty that did not finish an exchange it is running the code for. There is no
+     * "your counterparty is on an older build" case, because there are no older builds.
      */
     const { CONTENT_ENCRYPTION_GUIDANCE, CONTENT_ENCRYPTION_REASONS } =
       await import("../content-encryption-status.js");
-    const text = CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.NO_KEY_EXCHANGE];
 
-    expect(text, "it must not send the operator hunting for a toggle").toMatch(/no setting that turns this on/i);
-    expect(text, "and it must not blame the counterparty or their build").toMatch(/nothing is wrong with your setup/i);
-    expect(
-      text,
-      "it must be truthful that the transport still encrypts — otherwise it reads as 'you are sending plaintext'",
-    ).toMatch(/still encrypted in transit/i);
+    for (const reason of Object.values(CONTENT_ENCRYPTION_REASONS)) {
+      const text = CONTENT_ENCRYPTION_GUIDANCE[reason];
+      expect(text.length, `${reason} has no guidance`).toBeGreaterThan(60);
+      expect(
+        text,
+        `${reason} tells the reader a fault is expected — none of these is a steady state`,
+      ).not.toMatch(/this is expected|nothing is wrong with (either|both)|no setting that turns/i);
+      expect(
+        text,
+        `${reason} blames a build version; there are no other builds`,
+      ).not.toMatch(/predates|older build|upgrade/i);
+    }
   });
 
-  it("★ an UNRECOGNISED reason is described as unrecognised — a branch production cannot reach yet", async () => {
-    // Labelled as scaffolding on purpose: there is no `content_encryption_reason` column, so the
-    // value is stamped and read back by the same build and can only be one this file defines. The
-    // branch is kept because 007 adds reasons that depend on what a PEER did, which is where a
-    // mixed-version pair can genuinely disagree. Asserting the wrong cause is how a reader acts on
-    // something that was never the problem.
-    const { contentEncryptionGuidanceFor } = await import("../content-encryption-status.js");
-    const text = contentEncryptionGuidanceFor("some_reason_from_a_later_build");
-    expect(text).toMatch(/does not recognise/i);
-    expect(text).toContain("some_reason_from_a_later_build");
+  it("★ a LOCAL fault points at this machine, and a peer fault does not", async () => {
+    // The substitution this closed set exists to end: an operator whose own machine cannot sign
+    // being sent to raise it with a counterparty that did nothing.
+    const { CONTENT_ENCRYPTION_GUIDANCE, CONTENT_ENCRYPTION_REASONS } =
+      await import("../content-encryption-status.js");
+
+    const local = CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY];
+    expect(local).toMatch(/THIS machine/i);
+    expect(local, "it must say plainly that the counterparty is not involved").toMatch(/counterparty did nothing/i);
+
+    const ours = CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED];
+    expect(ours, "our own failed send must not be raised with them").toMatch(/do not raise it with them/i);
   });
 });

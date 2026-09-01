@@ -1,78 +1,107 @@
 /**
- * WHY A SESSION'S CONTENT IS NOT ENCRYPTED BY CELLO — 006-CRYPTO, `DOD-M15-KEYAGREE-1`.
+ * WHY A SESSION HAS NO AGREED CONTENT KEY — `DOD-M15-EPHEMERAL-AUTH-1` (007-CRYPTO).
  *
- * ─── What this is, and what it is not ──────────────────────────────────────────────────────────
+ * ─── The rule, and it is deliberately absolute ─────────────────────────────────────────────────
  *
- * CELLO agrees a throwaway key per session so that IT controls the confidentiality of a message
- * body, rather than inheriting whatever the transport happens to do. That layer is not finished:
- * `006-CRYPTO` mints the keypair, holds it in memory and destroys it at close; `007-CRYPTO` adds the
- * exchange, the signature over it, and the encryption itself. Until then no message body is
- * encrypted by us.
+ * **A live message body is encrypted under the agreed session key, or it is not sent.** There is no
+ * degraded mode, no "unencrypted but visibly so", and no negotiation.
  *
- * ⚠️ NOT the same question as `content_hashes_salted`. The salt stops a relay CONFIRMING a guess at
- * a stored hash. This stops a relay READING the message. A session can be salted and unencrypted,
- * which is exactly what every session is today.
+ * That is not strictness for its own sake — it is what removes an entire class of defect. A
+ * fallback to plaintext is a thing an attacker steers a session into: strip the key frame, and a
+ * system that "carries on, visibly degraded" hands over exactly the plaintext the attacker wanted,
+ * while the operator sees a warning they have learned to scroll past. The salt can degrade because
+ * a missing salt costs a correlation property; a missing KEY costs the message.
  *
- * ─── Why a closed set and a total map, for one member ──────────────────────────────────────────
+ * ⚠️ AND THERE IS NO COMPATIBILITY CASE TO SERVE. CELLO is pre-launch with no external installs, so
+ * "the counterparty is on a build that predates this" is not a state anything is in. Every reason
+ * below is a FAULT — local, transient, or a counterparty that did not complete an exchange it is
+ * running the code for. None of them is an accepted steady state, and none of them may be described
+ * to an operator as one.
  *
- * The shape is copied from `refusal-reasons.ts`, which exists because a free-form `reason: string`
- * let a new code slip past every test in its own guard file. A `Record` over the union means a
- * reason cannot be added without something for the reader to understand.
+ * ─── Not the same question as the salt ─────────────────────────────────────────────────────────
  *
- * And it exists NOW, with one member, because the alternative is silence — which is precisely how
- * this half of the feature came to read as finished. The key agreement had tests, a public header
- * claiming forward secrecy, and no caller; nothing anywhere said so. A session that states plainly
- * what protects it cannot make that mistake twice.
+ * `content_hashes_salted` is about a relay CONFIRMING a guess at a stored hash. This is about a
+ * relay READING the message. A session can be salted and unencrypted; it cannot send while
+ * unencrypted.
+ *
+ * ─── Why a closed set and a total map ──────────────────────────────────────────────────────────
+ *
+ * Copied from `refusal-reasons.ts`, which exists because a free-form `reason: string` let a new code
+ * slip past every test in its own guard file. A `Record` over the union means a reason cannot be
+ * added without something for the reader to do about it.
  */
 
 export const CONTENT_ENCRYPTION_REASONS = {
-  /** This build agrees no session key at all. Content is protected by the transport only. */
-  NO_KEY_EXCHANGE: "no_key_exchange",
+  /**
+   * The exchange has not finished yet. Transient, and the ordinary state for the instant between a
+   * session opening and its first connect completing.
+   */
+  NOT_YET_AGREED: "not_yet_agreed",
+  /**
+   * THIS machine has no identity key to sign its half with, so it cannot take part at all.
+   *
+   * Local setup fault — a signing-only or threshold provider, or an agent loaded without one. Named
+   * apart from the peer cases because "we could not sign" and "they did not answer" send the
+   * operator to opposite machines.
+   */
+  NO_LOCAL_IDENTITY: "no_local_identity",
+  /** THIS side's half never left the machine. Local and transient; the next connect re-announces. */
+  OUR_ANNOUNCE_FAILED: "our_announce_failed",
+  /**
+   * The counterparty never sent their half.
+   *
+   * NOT "they are on an old build" — they are running this code. Something between the two of you
+   * dropped the frame, or their daemon is not answering.
+   */
+  PEER_SILENT: "peer_silent",
 } as const;
 
 export type ContentEncryptionReason =
   (typeof CONTENT_ENCRYPTION_REASONS)[keyof typeof CONTENT_ENCRYPTION_REASONS];
 
 /**
- * What the operator should understand from each reason. TOTAL over the union by construction.
+ * What the operator should DO. TOTAL over the union by construction.
  *
- * ⚠️ EVERY ENTRY MUST BE TRUE OF WHAT IS ACTUALLY SHIPPING, and must not imply a setting that does
- * not exist. There is nothing an operator can do about this one, so it says so — an affordance that
- * resolves to nothing is worse than none, because they will go looking for it.
+ * ⚠️ EVERY ENTRY NAMES A VERB THE READER CAN PERFORM, and none of them says "this is expected" —
+ * because none of these is. An affordance that resolves to nothing is worse than none, and a
+ * reassurance attached to a fault is worse than both.
  */
 export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string> = {
-  [CONTENT_ENCRYPTION_REASONS.NO_KEY_EXCHANGE]:
-    "This build does not yet agree a per-session encryption key with your counterparty, so CELLO is " +
-    "not encrypting the message body itself. Your messages are still encrypted in transit by the " +
-    "transport, and anything waiting in a relay mailbox is separately encrypted to your long-term " +
-    "key — the relay cannot read either. What is missing is the layer CELLO controls, which is what " +
-    "would protect a recorded conversation from being decrypted years from now. Nothing is wrong " +
-    "with your setup or your counterparty's, and there is no setting that turns this on.",
+  [CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED]:
+    "This session is still agreeing its encryption key with your counterparty, which happens as soon " +
+    "as you are both connected. Sending is held until it completes rather than going out in the " +
+    "open. If it does not clear within a few seconds, your counterparty is not reachable right now — " +
+    "the message can wait for them in their relay mailbox, where it is encrypted to their long-term " +
+    "key instead.",
+  [CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY]:
+    "THIS machine has no identity key available for this agent, so it cannot sign its half of the " +
+    "session encryption key — and every session it opens has the same problem. Your counterparty did " +
+    "nothing and does not need to change anything. Check that this agent was loaded with its identity " +
+    "key, then start a new session.",
+  [CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED]:
+    "THIS side could not send its half of the session encryption key — the frame never left this " +
+    "machine, so your counterparty was never asked. Do not raise it with them. Look for " +
+    "session.key.announce.failed immediately above this line for the connection error; most often the " +
+    "direct link dropped between connecting and sending. It re-announces on the next connect.",
+  [CONTENT_ENCRYPTION_REASONS.PEER_SILENT]:
+    "Your counterparty never sent their half of the session encryption key. They are running the same " +
+    "protocol, so this is not a version difference — either the frame was dropped between you, or " +
+    "their daemon is not answering. Check they are online, then start a new session. Nothing was sent " +
+    "in the open in the meantime.",
 };
 
 /**
  * Render a reason for an agent.
  *
- * An UNRECOGNISED reason is described as unrecognised rather than guessed at, because asserting the
- * wrong cause is how a reader acts on something that was never the problem.
+ * ⚠️ NO UNKNOWN-REASON FALLBACK, deliberately. The value is produced and consumed in one process
+ * from the closed set above — there is no column it is read back from and no other build writing
+ * one, so a "reason this version does not recognise" is a state nothing can be in. An earlier cut
+ * carried that branch anyway and described the value as coming off a database row, which was simply
+ * untrue. Unreachable defensive code that states a false provenance is worse than no code: it reads
+ * as a considered case and it is scaffolding for a world that does not exist.
  *
- * ⚠️ THE FALLBACK IS SCAFFOLDING AND IS UNREACHABLE IN PRODUCTION TODAY — say so rather than imply
- * otherwise. There is no `content_encryption_reason` COLUMN: the value is stamped as a module
- * constant in `#saltStatusOf` and read back by the same build in the same process, so it can only
- * ever be one this file defines. An earlier version of this comment said the value "comes off a
- * database row that an older or newer build may have written", which is the kind of confident
- * provenance that is worth exactly nothing when it is not true.
- *
- * It is kept because `007-CRYPTO` adds reasons that depend on what a PEER did, and those are the
- * ones a mixed-version pair can disagree about. Its test is labelled as covering a branch production
- * does not enter.
+ * The map is TOTAL over the union, so the type is the check.
  */
-export function contentEncryptionGuidanceFor(reason: string): string {
-  const known = CONTENT_ENCRYPTION_GUIDANCE[reason as ContentEncryptionReason];
-  if (known !== undefined) return known;
-  return (
-    `CELLO is not encrypting this session's message bodies, for a reason this build does not ` +
-    `recognise (${reason}). That most likely means the session was written by a different version. ` +
-    `Your messages are still encrypted in transit by the transport.`
-  );
+export function contentEncryptionGuidanceFor(reason: ContentEncryptionReason): string {
+  return CONTENT_ENCRYPTION_GUIDANCE[reason];
 }

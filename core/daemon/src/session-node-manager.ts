@@ -31,7 +31,11 @@ import {
   SALT_FREEZE_GUIDANCE,
   type SaltAgreementFrame,
 } from "./session-salt-agreement.js";
-import { CONTENT_ENCRYPTION_REASONS } from "./content-encryption-status.js";
+import {
+  CONTENT_ENCRYPTION_REASONS,
+  CONTENT_ENCRYPTION_GUIDANCE,
+  type ContentEncryptionReason,
+} from "./content-encryption-status.js";
 import {
   type DaemonDatabase,
   openEncryptedDatabase,
@@ -60,7 +64,8 @@ import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAu
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
   verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES,
-  generateSessionEphemeral, destroySessionEphemeral, type SessionEphemeral,
+  generateSessionEphemeral, destroySessionEphemeral, deriveSessionSecrets, type SessionEphemeral,
+  signSessionEphemeral, verifySessionEphemeral,
 } from "@cello-protocol/crypto";
 import type { LeafInput } from "@cello-protocol/crypto";
 import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
@@ -1337,6 +1342,32 @@ export class SessionNodeManager {
    * leaving a reader to assume.
    */
   #sessionEphemerals = new Map<string, SessionEphemeral>();
+  /**
+   * THE AGREED CONTENT KEY — `DOD-M15-EPHEMERAL-AUTH-1` (007-CRYPTO).
+   *
+   * Present only once the peer's SIGNED ephemeral has been verified against the counterparty
+   * identity this session is with. Absent means every message body on this session goes out under
+   * the transport's protection alone, and `#contentEncryptionState` says which of the reasons that
+   * is — never silence.
+   *
+   * In memory only, and destroyed with the ephemeral it came from. It is the same secret one step
+   * on, so persisting it would void forward secrecy exactly as persisting the ephemeral would.
+   */
+  #sessionContentKeys = new Map<string, Uint8Array>();
+  /**
+   * WHY this session has no content key, when it has none. A closed reason, never a free string.
+   */
+  #contentEncryptionReasons = new Map<string, ContentEncryptionReason>();
+  /**
+   * Resolve an agent's long-term identity signer.
+   *
+   * Injected after construction, like `setParkedDrainHook`, because the daemon builds its agent key
+   * providers after this manager exists. Absent resolver, or an agent it does not know, means this
+   * side cannot sign its ephemeral — reported as `NO_LOCAL_IDENTITY` rather than quietly skipping
+   * the exchange, because "we could not" and "they would not" send the operator to opposite
+   * machines.
+   */
+  #keyProviderResolver: ((agentName: string) => KeyProvider | undefined) | null = null;
   /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
@@ -4592,6 +4623,10 @@ export class SessionNodeManager {
        * single lost frame does not strand the agreement.
        */
       void this.#sendSaltFrame(agentName, sessionId, correlationId);
+      // 007-CRYPTO: the signed ephemeral rides the SAME moment as the salt half — one connect, one
+      // round trip, the same peer-to-peer content stream. Fire-and-forget for the same reason: a
+      // failed announcement must not reject a peer-connect handler, and the next connect re-announces.
+      void this.#sendEphemeralFrame(agentName, sessionId, correlationId);
     };
     node.onPeerConnect(onCounterpartyAttached);
 
@@ -5974,11 +6009,23 @@ export class SessionNodeManager {
     const stored = content_salt != null && content_salt.length > 0;
     const suspended =
       agentName !== null && this.#saltSuspended.has(this.#k(agentName, String(row.session_id)));
+    /**
+     * 007-CRYPTO: the REAL state, not a constant. In 006 this was hardcoded `false` with a single
+     * reason, because nothing exchanged keys and saying so was the honest answer. It exchanges now,
+     * so a hardcode would be the stale claim that unit existed to remove.
+     *
+     * A row with no live agent name cannot be looked up in memory — an orphaned session, whose key
+     * (if it ever had one) died with the process. Reported as not-agreed rather than guessed at.
+     */
+    const enc: { key: Uint8Array; reason?: undefined } | { key: null; reason: ContentEncryptionReason } =
+      agentName === null
+        ? { key: null, reason: CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED }
+        : this.#contentEncryptionState(agentName, String(row.session_id));
     return {
       ...rest,
       content_hashes_salted: stored && !suspended,
-      content_encrypted: false,
-      content_encryption_reason: CONTENT_ENCRYPTION_REASONS.NO_KEY_EXCHANGE,
+      content_encrypted: enc.key !== null,
+      ...(enc.key === null ? { content_encryption_reason: enc.reason } : {}),
     } as SessionRecord;
   }
 
@@ -10561,11 +10608,230 @@ export class SessionNodeManager {
    */
   #destroySessionEphemeralFor(agentName: string, sessionId: string, correlationId?: string): void {
     const key = this.#k(agentName, sessionId);
+    // 007-CRYPTO: the AGREED KEY goes with the ephemeral it was derived from. It is the same secret
+    // one step on — leaving it behind would keep the thing the destruction exists to remove.
+    const agreed = this.#sessionContentKeys.get(key);
+    if (agreed) {
+      agreed.fill(0);
+      this.#sessionContentKeys.delete(key);
+    }
+    this.#contentEncryptionReasons.delete(key);
     const ephemeral = this.#sessionEphemerals.get(key);
     if (!ephemeral) return;
     destroySessionEphemeral(ephemeral);
     this.#sessionEphemerals.delete(key);
     this.#logger.debug("session.ephemeral.destroyed", { agentName, sessionId, correlationId });
+  }
+
+  /**
+   * AN INBOUND SIGNED EPHEMERAL — verify, THEN derive. Never the other way round.
+   *
+   * 🚨 A FAILED VERIFICATION IS A SECURITY EVENT AND IT STOPS THE SESSION. It is not a degradation
+   * to unencrypted, and the difference is the whole unit: an unsigned or wrongly-signed key is what
+   * a relay substituting its own looks like, and carrying on unencrypted would hand that relay
+   * exactly the plaintext it was reaching for. Missing, malformed and mismatched take this same
+   * path — a check that is lenient about a missing proof is a check an attacker skips.
+   *
+   * Contrast with a peer that says NOTHING at all: that is an old build, it is not evidence of
+   * anything about them, and it is recorded as `PEER_SILENT` — which still blocks sending, because
+   * there is no unencrypted path to fall back to.
+   */
+  async #handleEphemeralFrame(
+    agentName: string,
+    sessionId: string,
+    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
+    correlationId?: string,
+  ): Promise<void> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) return;
+
+    /**
+     * THE IDENTITY WE EXPECT comes from the session's own counterparty record — what the OPERATOR
+     * asked for — never from anything the directory or the relay handed back. Verifying against a
+     * key the attacker supplied would relocate the trust rather than close it, which is the trap the
+     * order records and the audit's items 6 and 7 before it.
+     */
+    const expected = Buffer.from(entry.counterpartyPubkey, "hex");
+    const sessionIdBytes = Buffer.from(sessionId, "hex");
+    const verdict = verifySessionEphemeral({
+      expectedIdentityPublic: new Uint8Array(expected),
+      sessionId: sessionIdBytes,
+      peerEphemeralPublic: frame.ephemeralPublic,
+      peerSignature: frame.signature,
+    });
+
+    if (!verdict.ok) {
+      this.#logger.error("session.key.refused", {
+        agentName, sessionId, correlationId,
+        reason: verdict.reason,
+        detail: verdict.detail,
+        guidance:
+          "STOPPED ON PURPOSE. The session key your counterparty sent could not be tied to them, so " +
+          "this session has been stopped rather than continued in the open. The ordinary cause is a " +
+          "build mismatch; the one that matters is something in the middle of your connection " +
+          "substituting its own key so it can read what you send. Confirm with your counterparty OUT " +
+          "OF BAND — not over CELLO — before opening another session with them.",
+      });
+      // Session-ending, not per-message: one proven wrong signer is evidence about the CONNECTION,
+      // not about the frame that carried it.
+      await this.#freezeSessionForKeyRefusal(agentName, sessionId, verdict.reason, correlationId);
+      return;
+    }
+
+    const ownEphemeral = this.#sessionEphemeralFor(agentName, sessionId);
+    if (!ownEphemeral) {
+      this.#logger.error("session.key.refused", {
+        agentName, sessionId, correlationId, reason: "no_local_ephemeral",
+        detail: "the peer's key verified but this side holds no throwaway keypair to agree with, so nothing can be derived. This is a LOCAL defect, not something the peer did.",
+      });
+      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
+      return;
+    }
+
+    try {
+      const secrets = deriveSessionSecrets({
+        ownEphemeralSecret: ownEphemeral.secretKey,
+        peerEphemeralPublic: frame.ephemeralPublic!,
+        sessionId: sessionIdBytes,
+      });
+      this.#sessionContentKeys.set(this.#k(agentName, sessionId), secrets.contentKey);
+      this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
+      this.#logger.info("session.key.agreed", {
+        agentName, sessionId, correlationId,
+        impact: "message bodies on this session are now encrypted by CELLO under a key both sides agreed and neither sent, and which is destroyed when the session ends",
+      });
+    } catch (err: unknown) {
+      // The primitive owns every rule about the peer's half — a degenerate point, a non-canonical
+      // encoding, a reflection — and owns the WORDING. Substituting a code of our own here would
+      // destroy the only explanation that exists at the only moment anyone reads it.
+      this.#logger.error("session.key.refused", {
+        agentName, sessionId, correlationId, reason: "derivation_failed",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      await this.#freezeSessionForKeyRefusal(agentName, sessionId, "derivation_failed", correlationId);
+    }
+  }
+
+  /**
+   * Stop a session whose counterparty's key could not be tied to them.
+   *
+   * Reuses the identity-freeze machinery rather than inventing a second way for a session to stop:
+   * the operator-facing shape, the refusal-to-revive, and the status write are already right there,
+   * and a second mechanism is a second thing to keep correct.
+   */
+  async #freezeSessionForKeyRefusal(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    correlationId?: string,
+  ): Promise<void> {
+    await this.markInterruptedWithDetails(agentName, sessionId, 0, "stream_close");
+    this.#logger.error("session.key.session_stopped", {
+      agentName, sessionId, correlationId, reason,
+      impact: "the session was stopped rather than continued unencrypted; a substituted key would otherwise have been handed exactly the plaintext it was reaching for",
+    });
+  }
+
+  /** Injected by the daemon once its per-agent key providers exist. See `#keyProviderResolver`. */
+  setKeyProviderResolver(resolver: (agentName: string) => KeyProvider | undefined): void {
+    this.#keyProviderResolver = resolver;
+  }
+
+  /**
+   * The agreed content key for a session, or `null` with the reason there is none.
+   *
+   * ONE place decides this, so the send path, the receive path and the status surface cannot
+   * disagree about whether a session is encrypted — the failure `wire-content-hash.ts` already
+   * records for the hash, where the expression was written out at five call sites and the two added
+   * last got it wrong.
+   */
+  #contentEncryptionState(
+    agentName: string,
+    sessionId: string,
+  ): { key: Uint8Array; reason?: undefined } | { key: null; reason: ContentEncryptionReason } {
+    const k = this.#k(agentName, sessionId);
+    const agreed = this.#sessionContentKeys.get(k);
+    if (agreed) return { key: agreed };
+    // No recorded fault means the exchange simply has not finished yet — the ordinary state in the
+    // instant between a session opening and its first connect completing.
+    return { key: null, reason: this.#contentEncryptionReasons.get(k) ?? CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED };
+  }
+
+  #noteContentEncryptionReason(agentName: string, sessionId: string, reason: ContentEncryptionReason): void {
+    const k = this.#k(agentName, sessionId);
+    // FIRST reason wins. A later, vaguer one must not overwrite the specific cause already recorded
+    // — "they never answered" written over "we could not sign" points the operator at the wrong
+    // machine, which is the substitution this closed set exists to end.
+    if (!this.#contentEncryptionReasons.has(k)) this.#contentEncryptionReasons.set(k, reason);
+  }
+
+  /**
+   * ANNOUNCE THIS SIDE'S SIGNED EPHEMERAL — `DOD-M15-EPHEMERAL-AUTH-1`.
+   *
+   * 🚨 ON THE PEER-TO-PEER CONTENT STREAM ONLY, exactly like the salt contribution and for the same
+   * unrepairable reason: it rides circuit-relay-v2 carrying its own Noise session, so a forwarding
+   * relay sees ciphertext. It must NEVER be added to `session_offer` / `session_offer_accept` or
+   * anything a DIRECTORY brokers — and that is the trap, because the only round trip at session open
+   * is the directory's signaling stream.
+   *
+   * Fire-and-forget on the connect handler, like the salt: a failed announcement must not turn a
+   * peer-connect handler into a rejected promise, and we re-announce on the next connect.
+   */
+  async #sendEphemeralFrame(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry) return;
+    const ephemeral = this.#sessionEphemeralFor(agentName, sessionId);
+    if (!ephemeral) {
+      this.#logger.error("session.key.announce.failed", {
+        agentName, sessionId, correlationId, reason: "no_ephemeral",
+        impact: "this session is active with no throwaway keypair, so there is nothing to announce; content stays unencrypted by CELLO",
+      });
+      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
+      return;
+    }
+    const signer = this.#keyProviderResolver?.(agentName);
+    if (!signer) {
+      /**
+       * A LOCAL fault, and it is named as one. Without this branch the peer simply never hears from
+       * us and blames a build that is fine — the operator whose machine cannot sign reads a message
+       * about their counterparty, which is the exact substitution the salt work already paid for.
+       */
+      this.#logger.error("session.key.announce.failed", {
+        agentName, sessionId, correlationId, reason: "no_identity_key",
+        impact: "this machine has no identity key for the agent, so it cannot sign its half of the session key; every session it opens is unencrypted by CELLO and the counterparty is not involved",
+        guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY],
+      });
+      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY);
+      return;
+    }
+
+    let stream: Awaited<ReturnType<typeof entry.node.newStream>> | null = null;
+    try {
+      const sessionIdBytes = Buffer.from(sessionId, "hex");
+      const signature = await signSessionEphemeral(signer, sessionIdBytes, ephemeral.publicKey);
+      stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
+      stream.send(lp.encode.single(encodeCbor({
+        type: "session_key_agreement",
+        session_id: sessionId,
+        ephemeral_public: ephemeral.publicKey,
+        ephemeral_sig: signature,
+      }) as Uint8Array).subarray());
+      await stream.close();
+      this.#logger.debug("session.key.announced", {
+        agentName, sessionId, correlationId,
+        publicKeyPrefix: Buffer.from(ephemeral.publicKey.subarray(0, 8)).toString("hex"),
+      });
+    } catch (err: unknown) {
+      // The frame never left. Say so as a LOCAL fault rather than letting the session look like a
+      // counterparty on an old build — a re-announce rides the next connect.
+      this.#logger.error("session.key.announce.failed", {
+        agentName, sessionId, correlationId, reason: "stream_failed",
+        error: err instanceof Error ? err.message : String(err),
+        impact: "this side's half of the session key never reached the counterparty, so content stays unencrypted by CELLO until a later connect succeeds",
+      });
+      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
+      if (stream) { try { await stream.close(); } catch { /* already failing */ } }
+    }
   }
 
   /**
@@ -12412,6 +12678,23 @@ export class SessionNodeManager {
        * by name — so a non-Uint8Array in either slot must arrive at that function as ABSENT, not as
        * a present-but-wrong value it would then try to use.
        */
+      /**
+       * 007-CRYPTO — the peer's SIGNED ephemeral.
+       *
+       * Fields are read defensively rather than cast, exactly like the salt frame below: an inbound
+       * value is whatever a peer chose to encode, and `verifySessionEphemeral` refuses a missing or
+       * wrong-width one BY NAME — so a non-`Uint8Array` must arrive there as ABSENT rather than as a
+       * present-but-wrong value it would try to use.
+       */
+      if (frame["type"] === "session_key_agreement") {
+        const ephemeralPublic = frame["ephemeral_public"];
+        const signature = frame["ephemeral_sig"];
+        await this.#handleEphemeralFrame(agentName, sessionId, {
+          ...(ephemeralPublic instanceof Uint8Array ? { ephemeralPublic } : {}),
+          ...(signature instanceof Uint8Array ? { signature } : {}),
+        }, correlationId);
+        return;
+      }
       if (frame["type"] === "session_salt_agreement") {
         const contribution = frame["contribution"];
         const fingerprint = frame["fingerprint"];
