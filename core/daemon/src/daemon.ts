@@ -2523,6 +2523,19 @@ async function startDaemonHoldingLock(
           // (cello_status / cello_list_agents), so a deaf agent is visible to the operator.
           standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
           standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
+          /**
+           * DOD-M15-RELAYSLOTS-1: WHY it is not reachable, and what to do about it.
+           *
+           * `standing_receiver_reachability` says `retrying` or `unreachable` and stops there, which
+           * for the person reading it is indistinguishable from the product being broken. The relay
+           * now refuses for reasons someone can act on — no token from a directory yet, too many
+           * sessions still open, this relay is misconfigured — each with a different next step, and
+           * every one of them is wasted if it only reaches a log file. Absent when the last attempt
+           * succeeded.
+           */
+          ...(sessionNodeManager.getStandingReceiverRefusal(a.name)
+            ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
+            : {}),
           // DOD-COATTEND-VISIBLE-1 AC2: how many sessions are driving this agent, including this
           // one. Live, not a high-water mark — it drops when a session disconnects. `selected` says
           // whether YOU hold it; this says whether anyone else does too.
@@ -2770,6 +2783,11 @@ async function startDaemonHoldingLock(
         state: agentStateFor(a),
         standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(a.name),
         standing_receiver_reachability: sessionNodeManager.getStandingReceiverReachability(a.name),
+        // DOD-M15-RELAYSLOTS-1: the same cause-and-advice on the daemon-wide surface — see the note
+        // on the MCP one above. Two surfaces, one reason to exist.
+        ...(sessionNodeManager.getStandingReceiverRefusal(a.name)
+          ? { standing_receiver_refusal: sessionNodeManager.getStandingReceiverRefusal(a.name) }
+          : {}),
       })),
       standing_receiver_ready: sessionNodeManager.getStandingReceiverReady(),
       retryQueueDepth: retryQueue.getTotalDepth(),

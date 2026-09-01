@@ -67,7 +67,7 @@ import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnve
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal } from "./session-relay-client.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
@@ -903,6 +903,20 @@ export class SessionNodeManager {
      * proves possession without rebinding the agent's delivery target away from the live session.
      */
     const proven = await client.proveReservation(node);
+    /**
+     * DOD-M15-RELAYSLOTS-1: keep the relay's refusal where the OPERATOR can reach it.
+     *
+     * The log line below is a good log line and it is not an answer to "why is my agent
+     * unreachable?" — nobody opens the file. The relay now refuses for reasons a person can act on
+     * (no token yet, too many sessions still open, this relay is misconfigured), each with its own
+     * next step, and every one of them is useless if it stops at a log.
+     */
+    if (!proven) {
+      const refusal = client.getLastAuthRefusal();
+      if (refusal) this.#srRelayRefusal.set(agentName, { ...refusal, relayPeerId });
+    } else {
+      this.#srRelayRefusal.delete(agentName);
+    }
     this.#logger.info("session.standing_receiver.relay_auth.result", {
       agentName,
       relayPeerId,
@@ -910,8 +924,29 @@ export class SessionNodeManager {
       // line said `connected: true` for a receiver that had sent nothing.
       nodePeerId: node.getPeerId(),
       proven,
+      ...(proven ? {} : {
+        refusalReason: client.getLastAuthRefusal()?.reason ?? "no_relay_verdict",
+        tryAnotherRelay: client.getLastAuthRefusal()?.tryAnotherRelay ?? false,
+      }),
       correlationId,
     });
+  }
+
+  /**
+   * DOD-M15-RELAYSLOTS-1: the last relay refusal per agent, with the advice that goes with it.
+   * Written where the refusal is actually known; read by whatever tells the operator.
+   */
+  readonly #srRelayRefusal = new Map<string, RelayAuthRefusal & { relayPeerId: string }>();
+
+  /**
+   * Why this agent's standing receiver could not hold a reservation, in words the person running it
+   * can act on — or null when the last attempt succeeded or none has been made.
+   *
+   * This is the surface DoD clause 7 is about: the assertion that matters is what the CLIENT can
+   * show someone, not what the relay wrote in its own log.
+   */
+  getStandingReceiverRefusal(agentName: string): (RelayAuthRefusal & { relayPeerId: string }) | null {
+    return this.#srRelayRefusal.get(agentName) ?? null;
   }
 
   // DOD-LOOP-1: the standing receiver is PER-AGENT, not per-daemon. A daemon hosting two agents

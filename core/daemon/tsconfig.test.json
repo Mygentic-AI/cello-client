@@ -97,6 +97,7 @@
     // deliberate `const x: number = "not a number"` in the same file ALSO reported exit 0. Without
     // that positive control I would have read a green gate as evidence the API was already there.
     "src/__tests__/dod-m15-relayslots-1-online-token-carried.test.ts",
+    "src/__tests__/dod-m15-relayslots-1-refusal-surfaced.test.ts",
     // ⚠️ `m12-p14-seal-readiness.test.ts` is NOT here, and the omission is measured rather than
     // assumed. Its nine-argument `placeOwnLeaf` calls are fixed in the same commit, but adding the
     // file surfaces FIVE pre-existing errors that have nothing to do with this unit: four

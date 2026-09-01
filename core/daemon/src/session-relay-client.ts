@@ -80,6 +80,111 @@ export function isTerminalRelayRefusal(reason: string | undefined): boolean {
   return reason !== undefined && TERMINAL_RELAY_REFUSALS.has(reason);
 }
 
+/**
+ * DOD-M15-RELAYSLOTS-1 — why a relay refused to let this agent hold a reservation slot, in the
+ * shape the daemon and the operator both need.
+ *
+ * `reason` is the relay's own code, unmodified. `advice` is what the person reading it should DO,
+ * chosen for that specific cause. `tryAnotherRelay` is the machine half of the same question.
+ */
+export interface RelayAuthRefusal {
+  reason: string;
+  advice: string;
+  tryAnotherRelay: boolean;
+  /** Present when the relay said how many slots are held and what its cap is. */
+  slotsHeld?: number;
+  slotCap?: number;
+  /** Present when the relay said when to come back. */
+  retryAfterMs?: number;
+}
+
+/**
+ * DOD-M15-RELAYSLOTS-1 — **WHICH REFUSALS JUSTIFY TRYING A DIFFERENT RELAY.**
+ *
+ * We run several relays, so "move on to the next one" is always available — which is exactly why it
+ * needs a rule. Moving on from a problem that every relay will have turns one client-side fault into
+ * what looks like a fleet-wide outage, and the operator then goes looking for a broken relay.
+ *
+ * ENUMERATED, never pattern-matched, for the same reason `TERMINAL_RELAY_REFUSALS` is: a substring
+ * rule would silently absorb a future reason nobody has considered.
+ */
+const RELAY_SIDE_REFUSALS: ReadonlySet<string> = new Set([
+  /**
+   * The relay holds no directory public key, so it can verify nothing and is refusing everyone.
+   * That is this relay being misconfigured, not us being wrong — another relay is the right move,
+   * and it is the whole reason we run more than one.
+   */
+  "online_token_no_directory_key",
+]);
+
+/**
+ * Classify a relay's auth refusal: what to tell the operator, and whether another relay would help.
+ *
+ * Everything not in `RELAY_SIDE_REFUSALS` defaults to "do not try another", and that default is the
+ * safe direction. A token problem reproduces identically on every relay in the fleet, so retrying
+ * around the fleet spends real time turning a client fault into an apparent outage — and a slot cap
+ * IS satisfiable elsewhere, but spreading to another relay papers over sessions that leaked and
+ * brings the same wall back on the next one.
+ */
+export function classifyRelayAuthRefusal(
+  reason: string,
+  extra: { slotsHeld?: number; slotCap?: number; retryAfterMs?: number } = {},
+): RelayAuthRefusal {
+  const tryAnotherRelay = RELAY_SIDE_REFUSALS.has(reason);
+  let advice: string;
+  switch (reason) {
+    case "online_token_required":
+      advice = "This agent has no online token from a directory yet. It is issued when a directory " +
+        "marks the agent online, so this usually clears itself on the next directory connection. If " +
+        "it persists, the agent is not reaching any directory — check that first, not the relay.";
+      break;
+    case "online_token_expired":
+      advice = "The online token has expired and is refreshed on the next directory connection. If " +
+        "it keeps expiring, this machine's clock or its directory connection is the thing to look at.";
+      break;
+    case "online_token_signature_invalid":
+    case "online_token_malformed":
+    case "online_token_lifetime_too_long":
+      advice = "This relay would not accept the token this agent was issued. Most often the relay " +
+        "and the directory are not in the same consortium — check which directories this relay is " +
+        "configured to trust.";
+      break;
+    case "online_token_pubkey_mismatch":
+      advice = "The token names a different key from the one this agent signed with. That is an " +
+        "identity mix-up on this machine, not a relay problem.";
+      break;
+    case "online_token_no_directory_key":
+      advice = "This relay holds no directory public key, so it cannot verify anyone and is " +
+        "refusing every agent. Its operator needs to configure one; another relay will work now.";
+      break;
+    case "slot_cap_exceeded":
+      advice = extra.slotsHeld !== undefined && extra.slotCap !== undefined
+        ? `This agent already holds ${String(extra.slotsHeld)} of a maximum ${String(extra.slotCap)} ` +
+          "reservations on this relay, and none is idle enough to reclaim. That is almost always " +
+          "sessions that were never closed — close some and this clears. Moving to another relay " +
+          "would work now and hit the same wall there."
+        : "This agent already holds the most reservations one agent may hold on this relay. That is " +
+          "almost always sessions that were never closed — close some and this clears.";
+      break;
+    case "rate_limited":
+      advice = extra.retryAfterMs !== undefined
+        ? `This relay is throttling this agent; it clears on its own in about ${String(Math.ceil(extra.retryAfterMs / 1000))}s.`
+        : "This relay is throttling this agent; it clears on its own after the throttle window.";
+      break;
+    default:
+      advice = "This agent could not authenticate to this relay, so it cannot hold a reservation " +
+        "here and is reachable only over a direct connection.";
+  }
+  return {
+    reason,
+    advice,
+    tryAnotherRelay,
+    ...(extra.slotsHeld !== undefined ? { slotsHeld: extra.slotsHeld } : {}),
+    ...(extra.slotCap !== undefined ? { slotCap: extra.slotCap } : {}),
+    ...(extra.retryAfterMs !== undefined ? { retryAfterMs: extra.retryAfterMs } : {}),
+  };
+}
+
 export const LEAF_KIND_MSG = 0x00;
 /** Control leaf (SEAL etc.) — two distinct-sender ctrl leaves trigger directory notarization. */
 export const LEAF_KIND_CTRL = 0x02;
@@ -309,6 +414,17 @@ export class AgentRelayClient {
   readonly #sealLeafStore: SessionSealLeafStore | undefined;
   /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
+  /**
+   * DOD-M15-RELAYSLOTS-1: the last refusal this relay gave us, classified. Kept because a log line
+   * reaches neither the operator asking why their agent is unreachable nor the code deciding
+   * whether a different relay would do any better.
+   */
+  #lastAuthRefusal: RelayAuthRefusal | null = null;
+
+  /** The last classified auth refusal from this relay, or null if the last attempt succeeded. */
+  getLastAuthRefusal(): RelayAuthRefusal | null {
+    return this.#lastAuthRefusal;
+  }
 
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
@@ -813,6 +929,9 @@ export class AgentRelayClient {
         relayPeerId: this.#relayPeerId,
         nodePeerId: node.getPeerId(),
         ok,
+        // DOD-M15-RELAYSLOTS-1: name the cause here too. `ok: false` alone sent people looking at
+        // the transport for what is usually a token or a cap.
+        ...(ok ? {} : { refusalReason: this.#lastAuthRefusal?.reason ?? "no_relay_verdict" }),
       });
       return ok;
     } finally {
@@ -961,6 +1080,24 @@ export class AgentRelayClient {
        */
       const relayReason = typeof ackFrame["reason"] === "string" ? (ackFrame["reason"] as string) : undefined;
       const retryAfterMs = typeof ackFrame["retry_after_ms"] === "number" ? (ackFrame["retry_after_ms"] as number) : undefined;
+      /**
+       * DOD-M15-RELAYSLOTS-1: keep the refusal, do not merely log it.
+       *
+       * Everything below writes an excellent warn line into a file nobody opens. The operator who
+       * runs `cello_use_agent` and finds their agent unreachable never sees it, and the daemon
+       * deciding whether another relay would help cannot read it either. So the classified refusal
+       * — reason, what to do about it, and whether to fail over — is stored where both can reach it.
+       */
+      const slotsHeld = typeof ackFrame["slots_held"] === "number" ? (ackFrame["slots_held"] as number) : undefined;
+      const slotCap = typeof ackFrame["slot_cap"] === "number" ? (ackFrame["slot_cap"] as number) : undefined;
+      this.#lastAuthRefusal = classifyRelayAuthRefusal(
+        ackFrame["type"] === "relay_auth_failed" ? (relayReason ?? "auth_rejected") : "unexpected_frame",
+        {
+          ...(slotsHeld !== undefined ? { slotsHeld } : {}),
+          ...(slotCap !== undefined ? { slotCap } : {}),
+          ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+        },
+      );
       this.#logger.warn("session.relay.auth.failed", {
         relayPeerId: this.#relayPeerId,
         reason: ackFrame["type"] === "relay_auth_failed" ? (relayReason ?? "auth_rejected") : "unexpected_frame",
@@ -971,6 +1108,9 @@ export class AgentRelayClient {
       });
       return false;
     }
+    // DOD-M15-RELAYSLOTS-1: a success clears the stored refusal, so a stale one is never reported
+    // as the current state of a relay that has since started admitting us.
+    this.#lastAuthRefusal = null;
     return true;
   }
 
