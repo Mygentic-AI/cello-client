@@ -57,6 +57,17 @@ const EXEMPT = new Map<string, string>([
    */
   ["cello_backup", "the CLI runs the capability directly (backup-restore.ts) instead of proxying the handler, so an operator can still export their identity when the daemon will not start — which is exactly when a backup matters"],
   ["cello_restore", "restore must run with the daemon STOPPED: a running daemon holds the database open and could flush its own pages over the restored ones, leaving a database that is half one identity and half another. The MCP handler therefore refuses and prints the sequence; only the CLI performs it"],
+  /**
+   * DOD-M15-INCLUSION-1, and this guard is the reason they are listed AT ALL.
+   *
+   * `cello_get_inclusion_proof` existed before this unit and was invisible here: its handler was
+   * registered inside a `for (const tool of [...])` loop, and the scan below looks for a literal
+   * `handlers.set("cello_…")`. So a capability shipped MCP-only for a whole milestone without ever
+   * reaching this list. Giving it a real handler is what surfaced it — which is the inversion
+   * working, one release later than it should have.
+   */
+  ["cello_get_inclusion_proof", "MCP-only, as it was before it was implemented — the caller is an agent holding a session it is already acting in, and the proof is an object to hand on rather than a line to read in a terminal"],
+  ["cello_verify_inclusion_proof", "MCP-only for now, matching the tool it checks. ⚠️ THE WEAKER HALF OF THE PAIR, and stated plainly: the verifier reads no session and no database precisely so a SCEPTIC can run it, and a sceptic is likelier to have a terminal than an MCP client. A CLI twin is recorded under 'Newly discovered' on the 009-PROOF work order rather than built here"],
 ]);
 
 /** Handlers that are not capabilities at all. */
