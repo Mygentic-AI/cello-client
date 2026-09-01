@@ -139,9 +139,23 @@ describe("DOD-M12B-SESSION-SEED-1: the revival reservation race", () => {
 
     expect(revived.ok, JSON.stringify(revived)).toBe(true);
     const duringRevival = factory.built.slice(builtBefore);
-    expect(duringRevival.length, "a granting first candidate must end the loop — asking a second " +
-      "relay burns a scarce reservation the first already gave us").toBe(1);
-    expect(duringRevival[0]!.listenAddresses().some((a) => a.includes("/p2p-circuit"))).toBe(true);
+    /**
+     * ⚠️ COUNT DISTINCT RELAYS, NOT NODES. Under DOD-M15-RELAYSLOTS-1 one relay can cost two node
+     * constructions: the first ask is refused because this peer id has not proved itself, and the
+     * receiver proves and asks again on the same identity.
+     *
+     * An earlier version of this filter selected nodes with a circuit listen address, which was
+     * written for an abandoned design where the prover node had none. Both attempts carry a circuit
+     * address, so it selected both and discriminated nothing — the test would have reddened on a
+     * SECOND ATTEMPT with a message blaming a second relay. The property this test is named for is
+     * about relays, so ask about relays.
+     */
+    const asksDuring = factory.asks.slice(builtBefore);
+    const relaysAsked = new Set(asksDuring.flatMap((a) => a.circuits));
+    expect([...relaysAsked], "a granting first candidate must end the loop — asking a second " +
+      "relay burns a scarce reservation the first already gave us").toEqual([CIRCUIT_A]);
+    const granted = duringRevival.filter((n) => n.listenAddresses().some((a) => a.includes("/p2p-circuit")));
+    expect(granted.length, "exactly one node ends up holding the reservation").toBe(1);
   }, 30_000);
 
   it("a relay that NEVER answers does not hang the revival — it moves on and the session comes back", async () => {
