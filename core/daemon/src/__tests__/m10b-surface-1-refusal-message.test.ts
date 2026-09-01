@@ -44,7 +44,13 @@ describe("M10B-D4 — refusing with a message", () => {
     // EXACT, not a floor. A `>=` threshold permits one of these paths to be DELETED with the test
     // still green — and the account-subject branch is precisely the one a future "let's just allow
     // account messages" change would remove. When this number moves, that failure IS the review.
-    expect(returns.length).toBe(4); // no-message, account-subject, submit-failed, success
+    //
+    // MOVED 4 → 5 by DOD-M15-ENDORSE-RETRY-1, and this is the review the comment above asks for:
+    // the new path is the RETRYING one — the message reached no directory node, the daemon is
+    // holding it, and the refusal itself is recorded and unaffected. It spreads `refused` like the
+    // other four, sets no `ok: false`, and reports `message_delivery: "retrying"` rather than a
+    // `message_error`, because nothing is being asked of the operator.
+    expect(returns.length).toBe(5); // no-message, account-subject, submit-failed, retrying, success
     for (const r of returns) expect(r).not.toMatch(/ok:\s*false/);
   });
 

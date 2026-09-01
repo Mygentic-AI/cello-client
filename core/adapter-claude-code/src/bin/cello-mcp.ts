@@ -275,9 +275,13 @@ server.tool("cello_trust_signals_list", "List the trust signals held in this wal
 // Two calls, not one: `wallet_list_issued` is a local read of what was submitted, `wallet_fetch_results`
 // is a network sweep for outcomes. Joined here so a submission still in flight is VISIBLE as pending —
 // reporting only outcomes would print "nothing waiting" while three submissions sat unanswered.
-server.tool("cello_attestations_issued", "What happened to attestations YOU wrote about other agents — the outgoing direction. NOT the wallet of signals held about you (that is cello_trust_signals_list). Each submission is minted, refused by the subject, rejected by the screening scan, or still pending. A refusal is the subject declining to stand behind your wording — not a fault in the claim — and it may carry a message from them explaining why; re-submitting a corrected version is the intended next step. `unreachable_nodes` means some directory node did not answer, so the list may be incomplete — it never means 'no result'.", {}, async () => {
+server.tool("cello_attestations_issued", "What happened to attestations YOU wrote about other agents — the outgoing direction. NOT the wallet of signals held about you (that is cello_trust_signals_list). Each submission is minted, refused by the subject, rejected by the screening scan, or still pending. A refusal is the subject declining to stand behind your wording — not a fault in the claim — and it may carry a message from them explaining why; re-submitting a corrected version is the intended next step. `in_flight` holds submissions that have not reached any directory node yet: `delivery: \"retrying\"` means the daemon is re-sending it for you and you should NOT send it again, `delivery: \"gave_up\"` means it never got there and each entry carries the reason and what to do. `unreachable_nodes` means some directory node did not answer, so the list may be incomplete — it never means 'no result'.", {}, async () => {
   const [issued, fetched] = await Promise.all([
-    proxy.call("wallet_list_issued", {}) as Promise<{ ok: boolean; issued?: Array<{ submission_id: string }> }>,
+    proxy.call("wallet_list_issued", {}) as Promise<{
+      ok: boolean;
+      issued?: Array<{ submission_id: string }>;
+      in_flight?: Array<{ submission_id: string; delivery: string }>;
+    }>,
     proxy.call("wallet_fetch_results", {}) as Promise<{ ok: boolean; results?: Array<{ submission_id: string }>; unreachable_nodes?: string[] }>,
   ]);
   const byId = new Map((fetched.results ?? []).map((r) => [r.submission_id, r]));
@@ -291,6 +295,10 @@ server.tool("cello_attestations_issued", "What happened to attestations YOU wrot
       // the subject; saying nothing came back would read as a dead end rather than an open question.
       ...(byId.get(s.submission_id) ?? { outcome: "pending" }),
     })),
+    // DOD-M15-ENDORSE-RETRY-1 — SEPARATE FROM `submissions`, not merged into it. These reached no
+    // node, so there is no outcome to fetch and no id for a result to arrive under; folding them in
+    // would print them as `outcome: "pending"`, which claims a node is holding them.
+    in_flight: issued.in_flight ?? [],
     unreachable_nodes: fetched.unreachable_nodes ?? [],
   });
 });
