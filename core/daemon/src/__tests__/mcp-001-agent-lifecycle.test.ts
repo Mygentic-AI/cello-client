@@ -114,9 +114,16 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
     handle = await startDaemon(config);
     const client = await connect(config.socketPath);
 
-    // First call: transitions Registered → Online
+    /**
+     * ⚠️ `toMatchObject`, NOT `toEqual`. AC-002 is about the TRANSITION and its idempotence, and an
+     * exact-shape assertion made this test fail every time anything was ADDED to the reply — which
+     * is what happened: `cello_start_agent` now also reports whether the standing receiver is up
+     * yet, so a session refused in the next moment is not mistaken for an unreachable counterparty.
+     * That is a real improvement and this test was calling it a regression. Assert what the AC is
+     * about; a field this AC does not name is not this AC's business.
+     */
     const result1 = await client.send("cello_start_agent", { name: "alice" });
-    expect(result1).toEqual({ ok: true });
+    expect(result1).toMatchObject({ ok: true });
 
     // Verify agent is now online
     const list1 = await client.send("cello_list_agents") as { agents: Array<{ name: string; state: string; selected?: boolean }> };
@@ -132,7 +139,7 @@ describe("MCP-001: agent lifecycle and per-connection state", () => {
 
     // Second call: idempotent — no second event
     const result2 = await client.send("cello_start_agent", { name: "alice" });
-    expect(result2).toEqual({ ok: true });
+    expect(result2).toMatchObject({ ok: true });
 
     const onlineEventsAfter = logEvents.filter((e) => e.event === "agent.online");
     expect(onlineEventsAfter).toHaveLength(1); // Still just one
