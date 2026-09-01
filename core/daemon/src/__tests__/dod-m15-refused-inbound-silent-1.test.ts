@@ -497,6 +497,59 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     ).not.toMatch(/again to keep waiting/i);
   });
 
+  it("006-CRYPTO: the ENCRYPTION status reaches cello_list_sessions too, with its guidance", async () => {
+    /**
+     * ⚠️ THE SAME DEFECT AGAIN, IN THE FIX FOR IT, FOR THE FOURTH TIME. `006-CRYPTO` added
+     * `content_encrypted` to the session record and a whitelist entry in `selectSessions` — and then
+     * tested it by calling `getSessionsForAgent`, the DAEMON record, under a docblock claiming it
+     * was asserting the agent-facing payload. Deleting the entire whitelist block left every test in
+     * that unit green.
+     *
+     * So this test lives HERE, next to the salt one it should have been copied from, and goes
+     * through the socket: an agent asks for its sessions and must be told, in words, that CELLO is
+     * not encrypting the message bodies yet.
+     *
+     * `filter: "all"` for the same reason the salt test uses it — the default `open` filter drops a
+     * zero-message session as a dead handshake, and the assertion would then fail for a reason that
+     * has nothing to do with encryption.
+     */
+    handle = await startDaemon(await setup("alice"));
+    const client = await connect(join(tempDir, "daemon.sock"));
+    await client.send("cello_use_agent", { name: "alice" });
+
+    const db = handle.getSessionNodeManager().getDb()!;
+    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       VALUES (?, ?, ?, 'active', ?, ?, 0, NULL)`,
+    ).run("s-enc-status", agentId, "bb".repeat(32), now, now);
+
+    const res = (await client.send("cello_list_sessions", { filter: "all" })) as {
+      sessions?: Array<Record<string, unknown>>;
+    };
+    const entry = (res.sessions ?? []).find((s) => s["sessionId"] === "s-enc-status");
+    expect(entry, "PRECONDITION: the session is listed at all").toBeTruthy();
+
+    expect(
+      entry!["contentEncrypted"],
+      "an agent asking for its sessions must be told CELLO is not encrypting the bodies — a field that stops at the daemon record is invisible",
+    ).toBe(false);
+    const guidance = String(entry!["contentEncryptionGuidance"] ?? "");
+    expect(
+      guidance.length,
+      "and it must be GUIDANCE, not a bare code an agent would have to look up",
+    ).toBeGreaterThan(60);
+    expect(
+      guidance,
+      "it must not tell the reader a fault is expected — every reason here is a fault",
+    ).not.toMatch(/this is expected|no setting that turns/i);
+    expect(
+      guidance,
+      "and it must not blame a build version; there are no other builds",
+    ).not.toMatch(/predates|older build|upgrade/i);
+  });
+
   it("the salted status reaches cello_list_sessions — the record alone was invisible", async () => {
     /**
      * ⚠️ THE SAME DEFECT, A THIRD TIME IN ONE UNIT, and only caught by asking "who reads this?"

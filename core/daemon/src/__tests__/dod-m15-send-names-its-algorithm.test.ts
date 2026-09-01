@@ -24,6 +24,8 @@
  * no partial degradation: every message fails, and the log accuses the sender.
  */
 
+import { openSessionContent } from "@cello-protocol/crypto";
+import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -87,7 +89,22 @@ describe("DOD-M15-SEALWIRE-1 part B2b: what the sender puts on the wire", () => 
     const frame = sentFrames(node).find((f) => f["type"] === "content_frame")!;
     const declared = frame["content_hash_alg"] as string;
     const onWire = frame["content_hash"] as Uint8Array;
-    const bytes = frame["content_bytes"] as Uint8Array;
+    /**
+     * 007-CRYPTO: the body on the wire is CIPHERTEXT, and `content_hash` is over the PLAINTEXT — so
+     * the receiver decrypts first and then hashes. Doing the same here keeps this test's property
+     * exactly what it says: a peer can reproduce the hash from the frame alone.
+     */
+    expect(
+      frame["content_encryption"],
+      "the frame must name the scheme its body is under — a receiver must never infer it",
+    ).toBe(SESSION_CONTENT_ENCRYPTION_V1);
+    const wire = frame["content_bytes"] as Uint8Array;
+    const bytes = openSessionContent(new Uint8Array(32).fill(0x7e), wire)!;
+    expect(bytes, "PRECONDITION: the body decrypts under the session key the fixture agreed").not.toBeNull();
+    expect(
+      Buffer.from(wire).toString("hex"),
+      "and the plaintext must NOT be what travelled",
+    ).not.toBe(Buffer.from(bytes).toString("hex"));
 
     // The receiver's computation, done here from the frame alone — no access to what the sender chose.
     const recomputed = contentHashFor(bytes, { alg: declared, salt: null });

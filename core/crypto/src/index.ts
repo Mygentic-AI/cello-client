@@ -87,6 +87,28 @@ export {
   type SessionSecrets,
 } from "./session-key-agreement.js";
 
+// DOD-M15-EPHEMERAL-AUTH-1: the throwaway key is SIGNED with the agent's identity and the peer's is
+// verified BEFORE anything is derived from it — without this a relay substitutes both sides' keys
+// and reads everything while both ends see a working conversation. Plus the AEAD that encrypts a
+// message body under the agreed key: distinct from `content-seal.ts`, which seals PARKED content to
+// a long-term identity key and deliberately has no forward secrecy.
+export {
+  ephemeralSigningMessage,
+  signSessionEphemeral,
+  verifySessionEphemeral,
+  EPHEMERAL_AUTH_REFUSALS,
+  EPHEMERAL_SIG_BYTES,
+  EPHEMERAL_PUBLIC_BYTES,
+  type EphemeralAuthRefusal,
+  type EphemeralAuthResult,
+} from "./session-ephemeral-auth.js";
+export {
+  sealSessionContent,
+  openSessionContent,
+  SESSION_CONTENT_SEAL_V1,
+  SESSION_CONTENT_SEAL_OVERHEAD_BYTES,
+} from "./session-content-seal.js";
+
 // M7-MANIFEST-001: consortium manifest verification and root key constants
 export type { ManifestVerifyResult, ManifestVerifyDiagnostics, ManifestVerifySkipReason, ManifestVerifySkippedEntry, ConsortiumManifestInput } from "./manifest.js";
 export { canonicalManifestBody, verifyManifest } from "./manifest.js";

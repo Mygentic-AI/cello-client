@@ -54,16 +54,20 @@
  *
  * ─── WHAT THIS DOES NOT DEFEND AGAINST, stated plainly (review F6) ─────────────────────────────
  *
- * The ephemerals here are UNAUTHENTICATED. That is sufficient against the threat the DoD line names
- * — harvest-now-decrypt-later, i.e. a PASSIVE recorder, which is what a relay storing traffic is.
+ * The ephemerals reaching THIS FUNCTION are raw public keys — nothing in this API takes an identity
+ * key, so it cannot tell whose they are. On its own that is sufficient only against the threat the
+ * DoD line names: harvest-now-decrypt-later, i.e. a PASSIVE recorder, which is what a relay storing
+ * traffic is. It is NOT sufficient against an ACTIVE on-path relay, which substitutes both
+ * ephemerals and reads everything while both ends see a working conversation.
  *
- * It is NOT sufficient against an ACTIVE on-path relay, which can substitute both ephemerals and
- * read everything. Nothing in this API takes an identity key, so there is nowhere to bind the
- * ephemeral to the peer. `DOD-M15-EPHEMERAL-AUTH-1` carries that: the ephemeral public must be
- * signed with the agent's Ed25519 identity and the peer's verified before deriving.
+ * ✅ THE SYSTEM DOES DEFEND AGAINST THAT NOW — `DOD-M15-EPHEMERAL-AUTH-1` shipped it. The ephemeral
+ * public is signed with the agent's Ed25519 identity, and `verifySessionEphemeral` checks the peer's
+ * against the counterparty identity the SESSION was opened with, BEFORE this function is called. A
+ * failure stops the session rather than continuing in the open.
  *
- * Said here because the file's own headline is "CELLO owns its own confidentiality guarantee", and a
- * reader could otherwise conclude MITM is covered. It is not, yet.
+ * The distinction is kept rather than replaced with "MITM is covered", because it is a property of
+ * the CALL ORDER and not of this module: a future caller that derives before verifying has an
+ * agreement with whoever sent the bytes, and this file would not notice.
  *
  * ─── ONE OUTPUT. The salt used to live here, and that was the defect. ─────────────────────────
  *
@@ -88,17 +92,32 @@
  * the salt no longer rides on this secret, re-keying no longer disturbs the transcript's
  * verifiability.
  *
- * ⚠️ THE DESTRUCTION HAS NO CALLER YET, and this file used to read as though it did — *"that is the
- * forward secrecy, and `destroySessionEphemeral` is what makes it real."* Forward secrecy is a
- * property of the old secret being GONE, so a destroy function nothing calls does not provide it.
- * Nothing in the daemon mints an ephemeral, derives a content key, or destroys one: this module is
- * a library with tests and no consumer, deliberately, because binding the ephemeral to the agent's
- * identity comes first (`DOD-M15-EPHEMERAL-AUTH-1`) and there is no point wiring an unauthenticated
- * agreement into the send path.
+ * ⚠️ ALL THREE ARE WIRED NOW, and the history is kept because this file has been wrong in BOTH
+ * directions. It first claimed *"that is the forward secrecy, and `destroySessionEphemeral` is what
+ * makes it real"* while nothing called it. The correction over-swung to *"nothing in the daemon
+ * mints an ephemeral, derives a content key, or destroys one"*, which `006-CRYPTO` made two thirds
+ * false the same day. Both were confident; neither was measured.
  *
- * Said plainly because `session-salt.ts` states its own reachability boundary and this file stated
- * none, so the two halves of the same exchange read as though both were live. The salt half IS live;
- * this half is not yet.
+ * What is true today, and it is checkable in one grep each:
+ *
+ *   `generateSessionEphemeral` / `destroySessionEphemeral` — `session-node-manager.ts` mints one
+ *   per session at activation and destroys it at every site that drops the session's entry, and at
+ *   shutdown (`006-CRYPTO`).
+ *   `deriveSessionSecrets` — called from the same file, on an inbound signed ephemeral, AFTER the
+ *   peer's signature is verified against the counterparty identity the session was opened with
+ *   (`007-CRYPTO`). Its output encrypts the message body in `session-content-seal.ts`.
+ *
+ * ─── WHAT THIS FILE ALONE STILL DOES NOT DEFEND AGAINST ───────────────────────────────────────
+ *
+ * The ephemerals ARRIVING here are unauthenticated — this module takes raw public keys and cannot
+ * tell whose they are. That check is real but it lives one layer up, in
+ * `session-ephemeral-auth.ts`, which the daemon runs BEFORE calling this. So the property holds for
+ * the system and not for this function: a caller that derives from an unverified peer key has an
+ * agreement with whoever sent it, and against an on-path relay that is a relay who can read
+ * everything.
+ *
+ * Said this precisely because `session-salt.ts` states its own reachability boundary and this file
+ * once stated none, so the two halves of the same exchange read as though both were live.
  *
  * ─── The key and the salt must never be EQUAL, and what actually keeps them apart ──────────────
  *

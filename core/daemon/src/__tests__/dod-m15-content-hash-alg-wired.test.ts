@@ -20,6 +20,7 @@
  * and, worse, how a real tamper gets waved away as a skew.
  */
 
+import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { CONTENT_HASH_ALGS, wireContentHash } from "../wire-content-hash.js";
@@ -27,8 +28,7 @@ import { evaluateSealUpgrade } from "../seal-upgrade.js";
 import { sealParkEnvelope } from "../park-envelope.js";
 import { contentHashFor } from "../wire-content-hash.js";
 import {
-  deriveSessionSalt, saltedContentHash, generateKeypair, sealToRecipient, SALT_CONTRIBUTION_BYTES,
-} from "@cello-protocol/crypto";
+  deriveSessionSalt, saltedContentHash, generateKeypair, sealToRecipient, SALT_CONTRIBUTION_BYTES, sealSessionContent } from "@cello-protocol/crypto";
 import { encodeCbor, buildParkContentTbs } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 
@@ -41,7 +41,7 @@ const SID2 = "ab".repeat(32);
 
 function contentFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
-    type: "content_frame", session_id: SID, content_bytes: CONTENT, ...fields,
+    type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, ...fields,
   }) as Uint8Array).subarray();
 }
 

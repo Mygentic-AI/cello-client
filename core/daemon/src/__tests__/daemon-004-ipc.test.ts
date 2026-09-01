@@ -237,6 +237,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -278,6 +280,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50)); // let signaling connect
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     // Buffer one inbound message so cello_receive has something to return.
     const inbound = new TextEncoder().encode("from-bob");
     await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));
@@ -330,6 +334,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -370,6 +376,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("from-bob");
     await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(content));
 
@@ -397,6 +405,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50)); // let signaling connect
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     // Append two message leaves so the tree has a non-empty, real root.
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m2"))).toString("hex"));
@@ -476,6 +486,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h1 = await start({ logger, node: node1 });
     const snm1 = h1.getSessionNodeManager();
     await snm1.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm1.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     for (const m of ["m1", "m2", "m3"]) {
       snm1.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode(m))).toString("hex"));
     }
@@ -533,6 +545,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h1 = await start({ logger, node: new FakeNode() });
     const snm1 = h1.getSessionNodeManager();
     await snm1.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm1.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     snm1.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
     snm1.appendSessionLeaf("alice", SID, "doc", Buffer.from(docLeafHash(new TextEncoder().encode("update"))).toString("hex"));
     snm1.appendSessionLeaf("alice", SID, "reject", Buffer.from(rejectLeafHash(new TextEncoder().encode("rejected"))).toString("hex"));
@@ -563,6 +577,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -597,6 +613,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
     expect(node.stopped).toBe(false);
 
@@ -627,6 +645,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const initiatorPubkey = "cd".repeat(32);
     // Bob has an ACTIVE session with no content yet — his own tree is empty.
     await snm.createSessionNode(SID, "bob", initiatorPubkey, "alice-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     const bobOwnRoot = snm.getSessionTreeRootHex("bob", SID); // canonical empty-tree root
 
     // The initiator sends a BOGUS merkleRoot. SI-001: Bob must co-sign his OWN root.
@@ -658,6 +678,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
@@ -684,6 +706,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -709,6 +733,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));
     try {
@@ -751,6 +777,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     // One inbound message is buffered but NEVER read (mirrors the live final-message race).
     const inbound = new TextEncoder().encode("unread-final-message");
@@ -792,6 +820,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     let doorbells = 0;
     snm.setOnContentArrived(() => { doorbells += 1; });
@@ -825,6 +855,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h1 = await start({ logger, node });
     const snm = h1.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const inbound = new TextEncoder().encode("[[STANDBY EST:15m]] hold for my next message");
     await snm.ingestReceivedContent("alice", SID, inbound, msgLeafHash(inbound));

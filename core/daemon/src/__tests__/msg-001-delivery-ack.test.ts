@@ -152,7 +152,11 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     await seedAgents(mgrB.getDb(), ["bob"]);
 
     await mgrA.createSessionNode(SID, "alice", "bobpk", nodeB.getPeerId(), "corr-a");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     await mgrB.createSessionNode(SID, "bob", "alicepk", nodeA.getPeerId(), "corr-b");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgrB.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
 
     const content = new TextEncoder().encode("hello over the wire");
     const hash = msgLeafHash(content);
@@ -184,6 +188,8 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     managers.push(mgrA);
     await seedAgents(mgrA.getDb(), ["alice"]);
     await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
     const content = new TextEncoder().encode("level test");
     const hash = msgLeafHash(content);

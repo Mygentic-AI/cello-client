@@ -288,6 +288,11 @@ describe("M8C-AWAY-1: away response", () => {
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
     h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
+    // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
+    // key map is keyed by (agent, session) and does not need the session to exist yet, so this
+    // pre-registers what a completed exchange would leave. Without it the reply parks — correct
+    // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
+    h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey)); // bob never attended — no client connected yet
     await wait(150);
 
@@ -411,6 +416,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -447,6 +454,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     await connectAs("alice"); // attended
 
     await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
@@ -468,7 +477,11 @@ describe("M8C-AWAY-1: away response", () => {
     const SID_1 = "aa".repeat(32);
     const SID_2 = "bb".repeat(32);
     await snm.createSessionNode(SID_1, "alice", "cp1pubkeyhex", "peer-1", "corr-1");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_1, new Uint8Array(32).fill(0x7e));
     await snm.createSessionNode(SID_2, "alice", "cp2pubkeyhex", "peer-2", "corr-2");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_2, new Uint8Array(32).fill(0x7e));
 
     await snm.ingestReceivedContent("alice", SID_1, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
     await snm.ingestReceivedContent("alice", SID_2, new TextEncoder().encode("m2"), msgLeafHash(new TextEncoder().encode("m2")), "c2");
@@ -485,6 +498,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const wrapContent = new TextEncoder().encode("goodbye [[WRAP]]");
@@ -510,6 +525,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const mentionContent = new TextEncoder().encode("can you explain the [[WRAP]] token to me? [[OVER]]");
@@ -528,6 +545,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const first = new TextEncoder().encode("hello, leaving a message [[OVER]]");
@@ -549,6 +568,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const wrapContent = new TextEncoder().encode("done here, thanks [[WRAP]]  \n");
@@ -568,6 +589,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const overContent = new TextEncoder().encode("hello [[OVER]]");
@@ -588,6 +611,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     const overContent = new TextEncoder().encode("hello [[OVER]]");
@@ -662,6 +687,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     // First message: triggers the normal away ack, sets the dedup guard.
@@ -707,6 +734,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     // First message arrives UNATTENDED — sets the dedup guard.
@@ -737,6 +766,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     // First message: normal away ack — dedup guard is now set.
@@ -774,6 +805,8 @@ describe("M8C-AWAY-1: away response", () => {
     const SID_A = "aa".repeat(32);
     const SID_B = "bb".repeat(32);
     await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id", "corr-a");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_A, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
     // Away period 1: first message sets dedup for SID_A.
@@ -789,6 +822,8 @@ describe("M8C-AWAY-1: away response", () => {
 
     // Away period 2: new session, same agent. Dedup was cleared so a fresh ack fires.
     await snm.createSessionNode(SID_B, "alice", "bobpubkeyhex", "bob-peer-id", "corr-b");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_B, new Uint8Array(32).fill(0x7e));
     const m2 = new TextEncoder().encode("hi again [[OVER]]");
     await snm.ingestReceivedContent("alice", SID_B, m2, msgLeafHash(m2), "c2");
     await wait(30);
@@ -818,6 +853,8 @@ describe("M8C-AWAY-1: away response", () => {
       const snm = h.getSessionNodeManager();
 
       await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+      snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
       snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
 
       // Patch a fake relay client onto the active node entry so submitSealLeaf returns ok:true.
@@ -905,6 +942,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, node);
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
     node.failNextStream = true; // the away-ack's own send will fail
     await snm.ingestReceivedContent("alice", SID_HEX, new TextEncoder().encode("hi"), msgLeafHash(new TextEncoder().encode("hi")), "c1");
@@ -937,6 +976,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
     snm.sendContent = async () => ({
       ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
@@ -964,6 +1005,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
     snm.sendContent = async () => ({
       ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: true,
@@ -997,6 +1040,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
     const a = new TextEncoder().encode("first");
     await snm.ingestReceivedContent("alice", SID_HEX, a, msgLeafHash(a), "c1");
@@ -1024,6 +1069,8 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
     snm.sendContent = async () => ({
       ok: false as const, reason: "session_stream_unavailable", error: "connection_lost", durable: false,

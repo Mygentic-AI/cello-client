@@ -124,6 +124,8 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
 
     // A: create N_A (gated to B's standing receiver) and dial it through N_A (seam 1a/1b).
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
@@ -132,6 +134,8 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     // B: accept the inbound session (seam 2 core) — hands off the standing receiver gated
     // to N_A and registers B's content handler. MUST happen before A sends.
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     expect(accepted.ok).toBe(true);
 
     // A: send content over the live N_A ↔ B connection.
@@ -179,11 +183,15 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     expect(accepted.ok).toBe(true);
 
     // Send content under a hash that does NOT match it (wire tamper of a single frame).
