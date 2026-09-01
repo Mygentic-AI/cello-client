@@ -376,23 +376,6 @@ export interface CelloNode {
    */
   releaseRelayReservation(peerId: string): boolean;
 
-  /**
-   * DOD-M15-RELAYSLOTS-1 — ask `relayPeerId` for a circuit reservation NOW, rather than having taken
-   * one automatically at node construction. Resolves true if a reservation is held afterwards.
-   *
-   * ⚠️ **THE ORDERING IS THE POINT, and it is the whole fix for this order.** A reservation is
-   * normally requested from the `/p2p-circuit` entry in `listenAddresses`, which happens before the
-   * client has told the relay anything about itself — so the relay must decide knowing only a peer
-   * id, which is free to generate. That is why a machine with no registered agent could hold slots
-   * at all, and why every attempt to bound it afterwards was a heuristic rather than a gate.
-   *
-   * Build the node WITHOUT a `/p2p-circuit` listen address, dial the relay, prove yourself over
-   * `/cello/relay/1.0.0`, then call this. The relay can now refuse a stranger at the door.
-   *
-   * Requires an existing non-relayed connection to the relay — libp2p will not reserve over a
-   * circuit. Returns false, rather than throwing, on a node with no circuit transport.
-   */
-  reserveRelaySlot(relayPeerId: string): Promise<boolean>;
 
   /**
    * CELLO-M7-TRANSPORT-001: true if there is at least one OPEN, non-relayed

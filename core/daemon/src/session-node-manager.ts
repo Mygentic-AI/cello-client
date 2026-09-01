@@ -721,6 +721,16 @@ export interface SentAuthorship {
   senderSig: Uint8Array;
 }
 
+/**
+ * The relay's peer id out of a circuit listen address, or `null` if the address does not name one.
+ *
+ * Returns null rather than throwing or guessing: an unreadable address means we cannot tell which
+ * relay this candidate was for, and every caller has a real thing to do with that answer.
+ */
+function relayPeerIdOf(circuitAddr: string): string | null {
+  return /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] ?? null;
+}
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -13821,21 +13831,51 @@ export class SessionNodeManager {
    * DOD-M15-RELAYSLOTS-1 — tell the relay this transport identity belongs to a registered agent, so
    * the reservation it just refused is granted on the next attempt.
    *
-   * Best-effort by design. If it fails the retry is refused too, and the caller's candidate loop
-   * treats that exactly as it treats any relay that would not serve — it tries the next one.
-   * Throwing here would turn one unreachable relay into a failure to build a receiver at all.
+   * Returns `"proven"` on success, or the shape of the failure so the candidate loop can act on it.
+   * It never throws: throwing would turn one unreachable relay into a failure to build a receiver
+   * at all.
+   *
+   * ─── Why this returns a verdict instead of a boolean ──────────────────────────────────────────
+   *
+   * Review HIGH-1/HIGH-2. Putting the reservation behind a proof MOVED THE FIRST REFUSAL onto this
+   * path. `#authenticateStandingReceiver` does everything right with a refusal — records it where
+   * `cello_status` can read it, and quarantines a relay whose fault is its own — but it runs only
+   * on a receiver that ALREADY HAS a reservation, so under the new gate a total failure never
+   * reaches it. This method was logging `proven: false` and returning.
+   *
+   * What that cost the operator: an expired token, or an agent at its slot cap, refused by every
+   * relay in the pool. `cello_status` shows an agent that is online and reachable by nobody, with
+   * no cause anywhere the person will look — while the relay had computed the cause, the count, and
+   * the next step, and put them on the wire. And `slot_cap_exceeded` is classified
+   * `tryAnotherRelay: false` precisely so the client STOPS walking the fleet; without the verdict,
+   * the loop walked it anyway, turning one client-side fault into what reads as a fleet outage.
    */
   async #proveToRelay(
     agentName: string,
     circuitAddr: string,
     node: CelloNode,
     correlationId: string,
-  ): Promise<void> {
-    const relayPeerId = /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1];
+  ): Promise<"proven" | "refused_try_another_relay" | "refused_this_agent" | "unavailable"> {
+    const relayPeerId = relayPeerIdOf(circuitAddr);
     const baseRelayAddr = circuitAddr.split("/p2p-circuit")[0];
-    if (!relayPeerId || !baseRelayAddr) return;
+    if (!relayPeerId || !baseRelayAddr) {
+      this.#logger.warn("session.standing_receiver.prove.address_unreadable", {
+        agentName,
+        circuitAddr,
+        correlationId,
+        impact: "this candidate's circuit address does not name a relay peer, so there is nothing " +
+          "to prove to and its reservation will stay refused. Skipped silently before — which made " +
+          "a malformed address look identical to a relay that simply said no.",
+      });
+      return "unavailable";
+    }
+    /**
+     * Declared out here so the `finally` can close it. Scoped inside the `try` before, so a throw
+     * from `proveReservation` skipped the close and left the stream and its pending settles behind.
+     */
+    let client: AgentRelayClient | undefined;
     try {
-      const client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
+      client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
         onlineToken: () => this.getDirectoryOnlineToken(agentName),
@@ -13849,21 +13889,46 @@ export class SessionNodeManager {
             "relay will refuse its reservation again. The agent is reachable only over a direct " +
             "connection until this is wired.",
         });
-        return;
+        return "unavailable";
       }
       const proven = await client.proveReservation(node);
-      client.close();
-      this.#logger.info("session.standing_receiver.prove.result", {
+      if (proven) {
+        this.#srRelayRefusal.delete(agentName);
+        this.#logger.info("session.standing_receiver.prove.result", {
+          agentName, relayPeerId, peerId: node.getPeerId(), proven: true, correlationId,
+        });
+        return "proven";
+      }
+
+      /**
+       * The same two lines `#authenticateStandingReceiver` runs, for the same reason. The `else`
+       * matters as much as the `if`: `proveReservation` also fails for transport reasons, which
+       * leave `getLastAuthRefusal()` null, and leaving a PREVIOUS refusal in the map would have
+       * `cello_status` explaining a cause that is no longer what is wrong.
+       */
+      const refusal = client.getLastAuthRefusal();
+      if (refusal) {
+        this.#srRelayRefusal.set(agentName, { ...this.#withDirectoryCause(agentName, refusal), relayPeerId });
+      } else {
+        this.#srRelayRefusal.delete(agentName);
+      }
+      this.#logger.warn("session.standing_receiver.prove.result", {
         agentName,
         relayPeerId,
         peerId: node.getPeerId(),
-        proven,
+        proven: false,
+        refusalReason: refusal?.reason ?? "no_relay_verdict",
+        tryAnotherRelay: refusal?.tryAnotherRelay ?? true,
         correlationId,
-        ...(proven ? {} : {
-          impact: "the relay would not accept this agent's proof, so it will refuse the retry too " +
-            "and the candidate loop moves on to the next relay.",
-        }),
+        impact: refusal?.advice ??
+          "the relay would not accept this agent's proof and said nothing about why, which is what " +
+          "a transport failure mid-handshake looks like. The candidate loop moves on to the next relay.",
       });
+      if (refusal && !refusal.tryAnotherRelay) return "refused_this_agent";
+      if (refusal?.tryAnotherRelay && !this.#shuttingDown) {
+        this.#quarantineRelay(agentName, relayPeerId, refusal.reason);
+      }
+      return "refused_try_another_relay";
     } catch (err: unknown) {
       this.#logger.warn("session.standing_receiver.prove.failed", {
         agentName,
@@ -13872,6 +13937,9 @@ export class SessionNodeManager {
         impact: "this receiver could not prove itself, so its retry will be refused and the " +
           "candidate loop will try the next relay.",
       });
+      return "unavailable";
+    } finally {
+      client?.close();
     }
   }
 
@@ -13953,16 +14021,51 @@ export class SessionNodeManager {
        * relay; the relay remembers it across the reconnect below.
        */
       if (attempt === 0 && outcome === "started") {
-        await this.#proveToRelay(agentName, circuitAddr, candidate, correlationId);
+        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, correlationId);
         // AWAITED, not fire-and-forget: the retry rebuilds on this same transport identity, and two
         // live nodes sharing one peer id is the defect DOD-M12B-SESSION-SEED-1 exists to prevent.
         try { await candidate.stop(); } catch { /* it may never have finished starting */ }
+        /**
+         * DOD-M15-RELAYSLOTS-1 clause 9 — **A CLIENT-SIDE REFUSAL ENDS THE WALK.**
+         *
+         * `slot_cap_exceeded` and an expired or missing token are classified `tryAnotherRelay:
+         * false` because they reproduce on every relay in the pool: the cap is per AGENT, and the
+         * token comes from the directory, not from here. Walking on costs a node build and two
+         * dials per remaining relay to arrive at the same answer, and it makes one client-side
+         * fault look like a fleet-wide outage in the logs. The refusal is already recorded where
+         * `cello_status` reads it, so stopping is not silence.
+         */
+        if (verdict === "refused_this_agent") {
+          this.#srLastRejectionReason.set(agentName, "relay_refused_this_agent");
+          this.#logger.warn("session.standing_receiver.relay.rejected", {
+            agentName,
+            circuitAddr,
+            reason: "relay_refused_this_agent",
+            attempts: attempt + 1,
+            correlationId,
+            impact: "the relay refused this AGENT rather than this relay being unwilling or " +
+              "unwell, so every other relay would refuse it identically. Stopped here; " +
+              "cello_status carries the cause and what to do about it.",
+          });
+          break;
+        }
         continue;
       }
 
       const rejectionReason =
         outcome === "started"
-          ? "relay_granted_no_reservation"
+          ? /**
+             * ⚠️ Review MEDIUM-7 — **"STARTED" DOES NOT MEAN THE RELAY ANSWERED.** A circuit listen
+             * entry sets `FaultTolerance.NO_FATAL`, and `start()` only throws when the DIRECT
+             * listener fails, so a relay that is simply DOWN resolves `started` with no circuit
+             * address — indistinguishable, here, from a relay that answered and granted nothing.
+             * Reporting that as `relay_granted_no_reservation` sends the operator to look at relay
+             * capacity for what is a network fault. An open connection to the relay peer is the
+             * thing that separates them, and we have one to ask.
+             */
+            (candidate.getConnections().some((c) => c.peerId === relayPeerIdOf(circuitAddr))
+              ? "relay_granted_no_reservation"
+              : "relay_unreachable")
           : outcome === "failed"
             ? "relay_unreachable"
             : "reservation_did_not_complete_in_time";
@@ -14261,6 +14364,24 @@ export class SessionNodeManager {
     agentName: string,
   ): Promise<CelloNode> {
     for (const circuitAddr of candidateAddrs.slice(0, REVIVE_RESERVATION_CANDIDATES)) {
+      /**
+       * DOD-M15-RELAYSLOTS-1 — **A REVIVAL PROVES ITSELF TOO.**
+       *
+       * Review HIGH-3. The relay refuses a reservation to a peer that has not shown it belongs to
+       * a registered agent, and it remembers a proof for two minutes. A revival is almost never
+       * inside that window — the receiver last proved this peer id when the session was created,
+       * possibly days ago — so without this loop every revived session was refused by every
+       * candidate and came up on the plain floor: alive, `active`, and dialable by nobody, with
+       * every message in both directions forced through the relay park route.
+       *
+       * Two attempts, exactly as `#startReceiverNode` does it, and for the same measured reason:
+       * a reservation taken by hand on the same connection as the proof yields no dialable address.
+       * The seed is fixed here — that is what a revival IS — so the second attempt necessarily
+       * carries the identity the relay just recorded.
+       */
+      let revivedNode: CelloNode | undefined;
+      let terminalRefusal = false;
+      for (let attempt = 0; attempt < 2 && !terminalRefusal; attempt++) {
       const candidate = await this.#createAgentNode(agentName, {
         sessionId,
         connectionGater: gater,
@@ -14284,9 +14405,40 @@ export class SessionNodeManager {
       ]).catch((err: unknown) => { startError = err; return false as const; });
 
       if (started && candidate.listenAddresses().some((a) => a.includes("/p2p-circuit"))) {
-        this.#logger.info("session.revive.reservation.granted", { agentName, sessionId });
-        return candidate;
+        this.#logger.info("session.revive.reservation.granted", { agentName, sessionId, attempts: attempt + 1 });
+        revivedNode = candidate;
+        break;
       }
+
+      /**
+       * No reservation on the first attempt is the EXPECTED answer for a peer whose proof has
+       * aged out. Prove and go round once more.
+       *
+       * Only when `started` is true: `libp2p.stop()` opens with `if (this.status !== 'started')
+       * return`, so a timed-out candidate cannot be torn down here and rebuilding on its seed
+       * would put two live nodes on one peer id. That case falls through to the settlement-chained
+       * teardown below, which is the only thing that reliably kills a still-starting node.
+       */
+      if (attempt === 0 && started) {
+        const verdict = await this.#proveToRelay(agentName, circuitAddr, candidate, sessionId);
+        try { await candidate.stop(); } catch { /* best-effort */ }
+        if (verdict === "refused_this_agent") {
+          // The refusal is about this AGENT, so the remaining candidates would answer identically.
+          terminalRefusal = true;
+          this.#logger.warn("session.revive.reservation.declined", {
+            agentName,
+            sessionId,
+            circuitAddr,
+            reason: "relay_refused_this_agent",
+            impact: "the relay refused this agent rather than being unwilling or unwell, so every " +
+              "other relay refuses it the same way. The session comes up reachable only via the " +
+              "relay park route; cello_status carries the cause.",
+          });
+          break;
+        }
+        continue;
+      }
+
       // Started but granted nothing, or never started. Either way this node is not the one.
       //
       // Review MEDIUM-5: name WHICH of the three causes this was, the way `#startReceiverNode` does.
@@ -14317,6 +14469,10 @@ export class SessionNodeManager {
         () => candidate.stop().catch(() => { /* best-effort */ }),
         () => { /* never started; nothing bound */ },
       );
+      break;
+      }
+      if (revivedNode) return revivedNode;
+      if (terminalRefusal) break;
     }
 
     // THE FLOOR. No reservation, so the counterparty cannot dial us directly — but their messages
