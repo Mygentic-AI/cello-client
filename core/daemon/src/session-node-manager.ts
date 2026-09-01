@@ -131,6 +131,16 @@ const MAX_UNREADABLE_ALG_FRAMES = 64;
 const SALT_AGREEMENT_WAIT_MS = 5_000;
 
 /**
+ * How many times this side re-attempts its session-key announce, and the base delay between them.
+ *
+ * Bounded on purpose (review F5): the announce rides `onPeerConnect`, so a connection that stays up
+ * after one failed attempt would never produce another — encryption off for the life of the session,
+ * with guidance pointing at a reconnect that never comes.
+ */
+const SESSION_KEY_ANNOUNCE_RETRIES = 4;
+const SESSION_KEY_ANNOUNCE_RETRY_MS = 250;
+
+/**
  * WHY a session is hashing unsalted — review Finding 1, and this exists because one sentence was
  * carrying five different situations.
  *
@@ -1356,6 +1366,15 @@ export class SessionNodeManager {
    */
   #sessionContentKeys = new Map<string, Uint8Array>();
   /**
+   * WHICH peer ephemeral produced the key we hold, hex — 007-CRYPTO, review F1.
+   *
+   * The idempotence guard keys on THIS rather than on "a key exists", because a re-keying peer sends
+   * a DIFFERENT half and must be adopted, while the same half re-announced on every connect must
+   * not churn. Keying on presence meant the side that never restarted kept a stale key and every
+   * message failed to decrypt — reported to its operator as possible tampering.
+   */
+  #sessionContentKeyPeerHalf = new Map<string, string>();
+  /**
    * WHY this session has no content key, when it has none. A closed reason, never a free string.
    */
   #contentEncryptionReasons = new Map<string, ContentEncryptionReason>();
@@ -1369,6 +1388,8 @@ export class SessionNodeManager {
    * machines.
    */
   #keyProviderResolver: ((agentName: string) => KeyProvider | undefined) | null = null;
+  /** Test-only observer of decoded inbound content frames — see `observeInboundContentFramesForTest`. */
+  #inboundFrameObserver: ((frame: Record<string, unknown>) => void) | null = null;
   /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
@@ -6219,9 +6240,16 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     messageCount: number,
-    source: "relay_frame" | "stream_close",
-  ): Promise<void> {
-    if (!this.#db) return;
+    /**
+     * WHAT ACTUALLY HAPPENED, and it is written to the row — review F3.
+     *
+     * `key_refused` is its own source rather than a borrowed `stream_close`, because the row's
+     * `interrupted_by` is what an operator reads days later: labelling a key-authentication refusal
+     * `relay_stream_close` sends them to the relay fleet for a fault in the payload.
+     */
+    source: "relay_frame" | "stream_close" | "key_refused",
+  ): Promise<boolean> {
+    if (!this.#db) return false;
 
     // H-3 SECURITY: only an 'active' session may transition to 'interrupted'.
     // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
@@ -6235,7 +6263,8 @@ export class SessionNodeManager {
         currentStatus: existing?.status ?? "absent",
         reason: "session_not_active",
       });
-      return;
+      // FALSE, not void — the caller needs to know nothing was torn down (review F11).
+      return false;
     }
 
     const now = Date.now();
@@ -6268,7 +6297,7 @@ export class SessionNodeManager {
           // `relay_stream_close` is its own label and STILL COUNTS (the bound excuses only 'local'),
           // because an attacker who can disturb our relay link must not get a free cap reset. It is
           // recorded honestly rather than blamed on the wrong party.
-          `UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ?, interrupted_by = '${source === "relay_frame" ? "counterparty" : "relay_stream_close"}' WHERE agent_id = ? AND session_id = ? AND status = 'active'`,
+          `UPDATE sessions SET status = 'interrupted', updated_at = ?, message_count = ?, interrupted_at = ?, interrupted_by = '${source === "relay_frame" ? "counterparty" : source === "key_refused" ? "key_refused" : "relay_stream_close"}' WHERE agent_id = ? AND session_id = ? AND status = 'active'`,
         )
         .run(now, authoritativeCount, interruptedAt, this.#requireAgentId(agentName), sessionId);
     } catch (err: unknown) {
@@ -6352,6 +6381,7 @@ export class SessionNodeManager {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+    return true;
   }
 
   /**
@@ -10654,6 +10684,7 @@ export class SessionNodeManager {
       agreed.fill(0);
       this.#sessionContentKeys.delete(key);
     }
+    this.#sessionContentKeyPeerHalf.delete(key);
     this.#contentEncryptionReasons.delete(key);
     const ephemeral = this.#sessionEphemerals.get(key);
     if (!ephemeral) return;
@@ -10685,10 +10716,21 @@ export class SessionNodeManager {
     if (!entry) return;
 
     /**
-     * THE IDENTITY WE EXPECT comes from the session's own counterparty record — what the OPERATOR
-     * asked for — never from anything the directory or the relay handed back. Verifying against a
-     * key the attacker supplied would relocate the trust rather than close it, which is the trap the
-     * order records and the audit's items 6 and 7 before it.
+     * THE IDENTITY WE EXPECT is the session's own counterparty record — and its provenance differs
+     * by side, which review F10 measured and an earlier version of this comment overstated.
+     *
+     *   INITIATOR: what the OPERATOR asked for (`initiate-session-handler` takes `target_pubkey`).
+     *   RESPONDER: the initiator identity the DIRECTORY attested in the offer/assignment.
+     *
+     * So this binds the ephemeral to that identity, whichever it is. The attack it closes is the
+     * RELAY substituting its own key — a different actor from the directory — and that is closed in
+     * both directions. What it does NOT do is move the responder's trust off the directory; the
+     * inbound path says as much itself ("a single compromised directory still controls both frames
+     * here"), and that is a separate line.
+     *
+     * The distinction is written down rather than smoothed over because this is a public repo and
+     * the sentence it replaces — "never from anything the directory handed back" — was absolute and
+     * false on one of the two sides.
      */
     const expected = Buffer.from(entry.counterpartyPubkey, "hex");
     const sessionIdBytes = Buffer.from(sessionId, "hex");
@@ -10718,17 +10760,28 @@ export class SessionNodeManager {
     }
 
     /**
-     * ALREADY AGREED — nothing to do, and this is idempotence rather than an optimisation.
+     * ALREADY AGREED WITH **THIS** PEER HALF — idempotence keyed on the bytes, not on presence.
      *
-     * A peer re-announces on every connect, so the same signed ephemeral arrives more than once in
-     * an ordinary session. Re-deriving from the same two halves produces the same bytes, so the only
-     * thing a second derive can do is churn — and it is the same reason `#mintSessionEphemeral` is
-     * idempotent: a value both sides depend on must not move underneath them mid-session.
+     * ⚠️ KEYING IT ON PRESENCE WAS A DEFECT, and a routine relay roll was enough to trigger it.
+     * Only the side whose witness stream closed interrupts, so only that side destroys its key and
+     * re-keys on revival. The OTHER side is never torn down — nothing else clears this map — so it
+     * saw the peer's NEW ephemeral, found a key already present, and kept the old one.
      *
-     * A session that legitimately RE-KEYS was torn down first, which cleared this map with the
-     * ephemeral, so a revival finds nothing here and derives fresh.
+     * Two different keys, and the damage is worse than a dead path: every message then fails GCM,
+     * and the receiving daemon reports *"the message did not decrypt — it was modified in flight, or
+     * encrypted under a different key"* and tells the operator to confirm OUT OF BAND. Nothing was
+     * modified. Two people have a security conversation about a local key skew.
+     *
+     * I MEASURED THIS TWICE AND CALLED IT A HARNESS QUIRK — the notes in `seam-4` and `m9-core-001`
+     * about seeding "before the settle" leaving the two ends on different keys are this defect,
+     * observed and worked around instead of read.
+     *
+     * So: the same half re-announced on every connect is still a no-op, and a DIFFERENT half — which
+     * only a re-keying peer sends — is adopted. The peer is identity-authenticated by the time we
+     * get here, so letting them move the key is not a new capability.
      */
-    if (this.#sessionContentKeys.has(this.#k(agentName, sessionId))) return;
+    const peerHalfHex = Buffer.from(frame.ephemeralPublic!).toString("hex");
+    if (this.#sessionContentKeyPeerHalf.get(this.#k(agentName, sessionId)) === peerHalfHex) return;
 
     const ownEphemeral = this.#sessionEphemeralFor(agentName, sessionId);
     if (!ownEphemeral) {
@@ -10746,10 +10799,15 @@ export class SessionNodeManager {
         peerEphemeralPublic: frame.ephemeralPublic!,
         sessionId: sessionIdBytes,
       });
+      const prior = this.#sessionContentKeyPeerHalf.get(this.#k(agentName, sessionId));
       this.#sessionContentKeys.set(this.#k(agentName, sessionId), secrets.contentKey);
+      this.#sessionContentKeyPeerHalf.set(this.#k(agentName, sessionId), peerHalfHex);
       this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
       this.#logger.info("session.key.agreed", {
         agentName, sessionId, correlationId,
+        // A RE-KEY is a different event from a first agreement and an operator correlating two
+        // daemons needs to tell them apart: a re-key means the other side restarted.
+        rekey: prior !== undefined && prior !== peerHalfHex,
         impact: "message bodies on this session are now encrypted by CELLO under a key both sides agreed and neither sent, and which is destroyed when the session ends",
       });
     } catch (err: unknown) {
@@ -10777,11 +10835,49 @@ export class SessionNodeManager {
     reason: string,
     correlationId?: string,
   ): Promise<void> {
-    await this.markInterruptedWithDetails(agentName, sessionId, 0, "stream_close");
+    /**
+     * THE REASON IS RECORDED BEFORE THE TEARDOWN, AND SURVIVES IT — review F2.
+     *
+     * The teardown destroys this session's key material and used to clear the reason with it, so the
+     * listing recomputed `NOT_YET_AGREED` and the agent was told *"still agreeing its key, sending is
+     * held"* — a reassurance, for the one detection in this unit that means someone may be
+     * substituting keys on the connection. Its only real consumer was a log line.
+     */
+    this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.KEY_REFUSED);
+    /**
+     * ⚠️ `"key_refused"`, NOT `"stream_close"` — review F3, and this is error substitution of the
+     * exact kind Invariant 3 names. `stream_close` is written to the row as
+     * `interrupted_by = 'relay_stream_close'`, so a key-authentication refusal was durably recorded
+     * as a relay problem and an operator debugging it would go and look at the relay fleet.
+     */
+    const stopped = await this.markInterruptedWithDetails(agentName, sessionId, 0, "key_refused");
+    /**
+     * OBSERVE THE OUTCOME rather than asserting it — review F11. `markInterruptedWithDetails`
+     * returns early when the row is not `active`, so claiming "the session was stopped" here
+     * unconditionally would state something that did not happen.
+     */
     this.#logger.error("session.key.session_stopped", {
       agentName, sessionId, correlationId, reason,
-      impact: "the session was stopped rather than continued unencrypted; a substituted key would otherwise have been handed exactly the plaintext it was reaching for",
+      stopped,
+      impact: stopped
+        ? "the session was stopped rather than continued unencrypted; a substituted key would otherwise have been handed exactly the plaintext it was reaching for"
+        : "the session was already not active, so nothing was torn down here — the refusal stands and no content was accepted",
+      guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.KEY_REFUSED],
     });
+  }
+
+  /**
+   * Test seam: see every decoded inbound content frame, as it arrived.
+   *
+   * Review F4. The "bytes on the wire are ciphertext" claim needs the ACTUAL frame; asserting on a
+   * freshly sealed stand-in tests the crypto primitive and stays green when the send path is
+   * reverted to putting plaintext on the wire. There is no other way to reach the decoded frame from
+   * outside — the handler consumes it and hands ingest the plaintext.
+   *
+   * Read-only by construction: the callback receives the frame and cannot influence routing.
+   */
+  observeInboundContentFramesForTest(cb: (frame: Record<string, unknown>) => void): void {
+    this.#inboundFrameObserver = cb;
   }
 
   /** Injected by the daemon once its per-agent key providers exist. See `#keyProviderResolver`. */
@@ -10882,8 +10978,52 @@ export class SessionNodeManager {
         impact: "this side's half of the session key never reached the counterparty, so content stays unencrypted by CELLO until a later connect succeeds",
       });
       this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
-      if (stream) { try { await stream.close(); } catch { /* already failing */ } }
+      /**
+       * ABORT, don't just close — review F13. A `close()` on a broken stream can itself fail and
+       * leave the slot held, which is the per-protocol stream-cap failure this file's longest
+       * comment documents. Every other failed write on this protocol aborts.
+       */
+      if (stream) { try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ } }
+      /**
+       * AND RETRY — review F5, and without it a single failed stream open kills encryption for the
+       * life of the session.
+       *
+       * The announce otherwise rides `onPeerConnect` only. If the connection then stays up there is
+       * no next connect, so nothing re-announces, every send parks forever, and the guidance's
+       * "it re-announces on the next connect" names an event that never arrives. It also compounds
+       * the re-key path: a revived session announces its FRESH half exactly once, and if that one
+       * attempt loses the race with the reconnect, the two ends sit on different keys.
+       *
+       * Bounded and self-cancelling: it stops when the session is no longer active, when a key has
+       * been agreed, and after `SESSION_KEY_ANNOUNCE_RETRIES` attempts.
+       */
+      this.#retryEphemeralAnnounce(agentName, sessionId, correlationId, 1);
     }
+  }
+
+  /**
+   * Re-announce this side's ephemeral after a failed attempt — review F5.
+   *
+   * Backs off, and gives up rather than looping: a peer that is simply gone must not have a timer
+   * chasing it for the life of the process.
+   */
+  #retryEphemeralAnnounce(agentName: string, sessionId: string, correlationId: string | undefined, attempt: number): void {
+    if (attempt > SESSION_KEY_ANNOUNCE_RETRIES) {
+      this.#logger.warn("session.key.announce.gave_up", {
+        agentName, sessionId, correlationId, attempts: SESSION_KEY_ANNOUNCE_RETRIES,
+        impact: "this side never managed to send its half of the session key, so every message on this session takes the relay mailbox instead of the direct path",
+        guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED],
+      });
+      return;
+    }
+    const timer = setTimeout(() => {
+      // Stop if the session went away, or if a key has since been agreed by any route.
+      if (!this.#activeNodes.has(this.#k(agentName, sessionId))) return;
+      if (this.#sessionContentKeys.has(this.#k(agentName, sessionId))) return;
+      void this.#sendEphemeralFrame(agentName, sessionId, correlationId);
+    }, SESSION_KEY_ANNOUNCE_RETRY_MS * attempt);
+    // Never hold the process open for a retry.
+    if (typeof timer.unref === "function") timer.unref();
   }
 
   /**
@@ -11017,9 +11157,27 @@ export class SessionNodeManager {
     this.#sessionContentKeys.delete(this.#k(agentName, sessionId));
   }
 
-  /** This side's ephemeral PUBLIC half, for a harness that has to carry it to the other side. */
-  sessionEphemeralPublicForExchange(agentName: string, sessionId: string): Uint8Array | null {
-    return this.sessionEphemeralPublicForTest(agentName, sessionId);
+  /**
+   * Test seam: produce THIS side's signed ephemeral, using the manager's own identity resolver.
+   *
+   * For harnesses whose connectivity is one-directional — one side dials, so only one announce ever
+   * lands. Carrying the other side's half across with a REAL signature is what completes the
+   * exchange, and it beats seeding a key: a seeded key has no peer half recorded against it, so the
+   * first genuine announce replaces it and the two ends drift apart (which is correct behaviour —
+   * see the re-key guard — and exactly what made seeding fragile here).
+   *
+   * It signs with the same provider production signs with, so a test cannot pass against a signature
+   * production would have refused.
+   */
+  async signOwnEphemeralForTest(
+    agentName: string,
+    sessionId: string,
+  ): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> {
+    const eph = this.#sessionEphemeralFor(agentName, sessionId);
+    const signer = this.#keyProviderResolver?.(agentName);
+    if (!eph || !signer) return null;
+    const signature = await signSessionEphemeral(signer, Buffer.from(sessionId, "hex"), eph.publicKey);
+    return { ephemeralPublic: Uint8Array.from(eph.publicKey), signature };
   }
 
   /**
@@ -12833,6 +12991,9 @@ export class SessionNodeManager {
       // field was PRESENT and wrong, so omitting it passed. Its own sibling twenty lines up already
       // refused absence, with a comment saying treating a missing field as agreement is how a guard
       // stops guarding. Same file, same switch, opposite conclusion.
+      // Review F4: hand the DECODED frame to a test observer before anything consumes it. Absent in
+      // production — the field is null unless a test installs one.
+      this.#inboundFrameObserver?.(frame as Record<string, unknown>);
       const contentBytes = frame["content_bytes"];
       const contentHash = frame["content_hash"];
       if (!(contentBytes instanceof Uint8Array) || !(contentHash instanceof Uint8Array)) {
@@ -14438,6 +14599,19 @@ export class SessionNodeManager {
     // did, this call found the stale key still in the map and quietly kept it. The salt, which IS
     // persisted, is re-read from the row instead — opposite lifetimes, deliberately.
     this.#mintSessionEphemeral(agentName, sessionId);
+    /**
+     * AND ANNOUNCE IT — review F1, second half. Minting a fresh key achieves nothing on its own: the
+     * COUNTERPARTY has to hear about it, and it is the side that did NOT restart, so it is not
+     * tearing anything down or reconnecting. `#sendEphemeralFrame` otherwise rides `onPeerConnect`,
+     * which does not fire again for a connection that never dropped — the ordinary shape when only
+     * one end's witness stream closed, which is what a relay roll produces.
+     *
+     * Without this the two ends sit on different keys for the life of the session, every message
+     * fails GCM, and the receiving operator is told the content may have been MODIFIED IN FLIGHT for
+     * what is a local key skew. Deferred a tick so the revived node's handlers are registered before
+     * the frame goes out.
+     */
+    setTimeout(() => { void this.#sendEphemeralFrame(agentName, sessionId, "revive-rekey"); }, 0);
     this.#activeNodes.set(key, {
       node,
       agentName,

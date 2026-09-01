@@ -298,9 +298,12 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
      * agreed key.
      */
     await wait(400);
-    const AGREED = new Uint8Array(32).fill(0x7e);
-    A.getSessionNodeManager().setSessionContentKeyForTest("alice", SID_HEX, AGREED);
-    B.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, AGREED);
+    // Carry B's signed half to A, which is what a two-way link would have done. Seeding a key
+    // instead is fragile now: a seeded key records no peer half, so the first genuine announce
+    // replaces it (correctly) and the two ends drift apart.
+    const bHalf = await B.getSessionNodeManager().signOwnEphemeralForTest("bob", SID_HEX);
+    expect(bHalf, "PRECONDITION: B could sign its half").not.toBeNull();
+    await A.getSessionNodeManager().handleEphemeralFrameForTest("alice", SID_HEX, bHalf!);
 
     return { clientA, clientB, alicePubkey, aEvents, bEvents, bHandle: B };
   }

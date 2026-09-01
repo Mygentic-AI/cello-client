@@ -57,6 +57,16 @@ export const CONTENT_ENCRYPTION_REASONS = {
   /** THIS side's half never left the machine. Local and transient; the next connect re-announces. */
   OUR_ANNOUNCE_FAILED: "our_announce_failed",
   /**
+   * TERMINAL. The peer's key could not be tied to them and the session was stopped.
+   *
+   * ⚠️ THIS MUST SURVIVE THE TEARDOWN THAT FOLLOWS IT — review F2. The freeze destroys the session's
+   * key material, and clearing the reason with it left the listing recomputing `NOT_YET_AGREED`, so
+   * the one detection in this unit that means *someone may be substituting keys on your connection*
+   * reached the agent as "still agreeing, please wait". A security refusal that reads as a
+   * reassurance is worse than silence.
+   */
+  KEY_REFUSED: "key_refused",
+  /**
    * The counterparty never sent their half.
    *
    * NOT "they are on an old build" — they are running this code. Something between the two of you
@@ -77,11 +87,12 @@ export type ContentEncryptionReason =
  */
 export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string> = {
   [CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED]:
-    "This session is still agreeing its encryption key with your counterparty, which happens as soon " +
-    "as you are both connected. Sending is held until it completes rather than going out in the " +
-    "open. If it does not clear within a few seconds, your counterparty is not reachable right now — " +
-    "the message can wait for them in their relay mailbox, where it is encrypted to their long-term " +
-    "key instead.",
+    "This session has not finished agreeing its encryption key with your counterparty, which happens " +
+    "as soon as you are both connected. A message sent before it completes is NOT held and is NOT " +
+    "sent in the open: it goes to your counterparty's relay mailbox instead, encrypted to their " +
+    "long-term key, and they receive it when they next collect. It arrives — it just takes the slow " +
+    "route, and that copy does not have the forward secrecy the direct path gives you. If this " +
+    "persists, your counterparty is not reachable right now.",
   [CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY]:
     "THIS machine has no identity key available for this agent, so it cannot sign its half of the " +
     "session encryption key — and every session it opens has the same problem. Your counterparty did " +
@@ -92,6 +103,12 @@ export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string
     "machine, so your counterparty was never asked. Do not raise it with them. Look for " +
     "session.key.announce.failed immediately above this line for the connection error; most often the " +
     "direct link dropped between connecting and sending. It re-announces on the next connect.",
+  [CONTENT_ENCRYPTION_REASONS.KEY_REFUSED]:
+    "STOPPED ON PURPOSE. The session encryption key your counterparty sent could not be tied to " +
+    "them, so this session was stopped rather than carried on in the open. The ordinary cause is a " +
+    "build mismatch. The one that matters is something between you substituting its own key so it " +
+    "can read what you send — which is exactly what this check exists to catch. Confirm with your " +
+    "counterparty OUT OF BAND, not over CELLO, before opening another session with them.",
   [CONTENT_ENCRYPTION_REASONS.PEER_SILENT]:
     "Your counterparty never sent their half of the session encryption key. They are running the same " +
     "protocol, so this is not a version difference — either the frame was dropped between you, or " +

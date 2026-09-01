@@ -180,30 +180,106 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     ).toBe(Buffer.from(content).toString("hex"));
   }, 60_000);
 
-  it("★★ the BYTES on the wire are ciphertext — the plaintext never travels", async () => {
+  it("★★ the BYTES ON THE WIRE are ciphertext — asserted on the FRAME B actually received", async () => {
     /**
-     * "It arrived readable" is satisfied by an implementation that sends the body in the clear and
-     * does nothing at all. This asserts what a relay would actually see.
+     * ⚠️ REPLACES A TEST THAT PROVED NOTHING (review F4). It called `sendContent`, then ignored what
+     * was sent and asserted on a freshly built `sealSessionContent(...)` — a test of the crypto
+     * primitive, which its own suite already covers twice. Reverting `content_bytes: wireBody` back
+     * to `content_bytes: content` left it green, so the clause that makes this feature real was
+     * unproven by one character of revert.
+     *
+     * This captures the frame on B's inbound content stream and asserts against THOSE bytes.
      */
     const { A, B } = await liveSession();
-    await pollFor(() => A.events.find((e) => e.event === "session.key.agreed") ? true : null);
+    await wait(600);
+
+    const seen: Array<Record<string, unknown>> = [];
+    B.manager.observeInboundContentFramesForTest((f) => { seen.push(f); });
 
     const text = "a sentence a relay must not be able to read";
     const content = new TextEncoder().encode(text);
     await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire");
     await pollFor(() => B.manager.takeReceivedContent("bob", SID));
 
-    // The frame B's handler saw, reconstructed from what A put on the wire: the seal is over the
-    // plaintext, so a search for the plaintext in the sealed bytes must find nothing.
-    const sealed = sealSessionContent(new Uint8Array(32).fill(0x11), content);
+    const frame = seen.find((f) => f["type"] === "content_frame");
+    expect(frame, "B never saw a content frame — nothing to assert about the wire").toBeDefined();
+
+    const onWire = frame!["content_bytes"] as Uint8Array;
     expect(
-      Buffer.from(sealed).toString("hex").includes(Buffer.from(content).toString("hex")),
-      "the sealed form contains the plaintext, so nothing is actually hidden",
+      Buffer.from(onWire).toString("hex").includes(Buffer.from(content).toString("hex")),
+      "THE PLAINTEXT IS IN THE FRAME — a relay carrying this reads the message",
     ).toBe(false);
     expect(
-      openSessionContent(new Uint8Array(32).fill(0x22), sealed),
-      "a different key opened it — the key is not what is protecting the body",
-    ).toBeNull();
+      frame!["content_encryption"],
+      "and the frame must name the scheme, so a receiver never infers it from a length",
+    ).toBe(SESSION_CONTENT_ENCRYPTION_V1);
+    expect(
+      onWire.length,
+      "the sealed form must carry the version, IV and tag on top of the body",
+    ).toBe(content.length + 1 + 12 + 16);
+  }, 60_000);
+
+  it("★★ ONE SIDE RESTARTS and the OTHER adopts the new key — DoD 9, review F1", async () => {
+    /**
+     * ⚠️ THE CLAUSE HAD NO TEST AND THE CODE FAILED IT. The idempotence guard keyed on "a key
+     * exists", so only the side that restarted re-keyed. The other one is never torn down — nothing
+     * else clears the key — so it saw the peer's NEW ephemeral, found a key already there, and kept
+     * the old one.
+     *
+     * A relay roll is enough: only the side whose witness stream closes interrupts. From then on
+     * every message fails GCM and the RECEIVER tells its operator the content may have been MODIFIED
+     * IN FLIGHT and to confirm out of band. Nothing was modified — it is a local key skew, and two
+     * people end up having a security conversation about it.
+     *
+     * B restarts for real (interrupt, revive, fresh ephemeral). B's new half then reaches A through
+     * A's REAL inbound handler — signature verified against bob's identity, then derived. The
+     * transport hop is stood in for because a revived node in this harness has no route back to A,
+     * and the defect was never in the transport: it was A declining to adopt a half it already held
+     * a key for.
+     */
+    const { A, B, bobKp } = await liveSession();
+    await wait(600);
+    expect(B.events.find((e) => e.event === "session.key.agreed"), "PRECONDITION: agreed once").toBeDefined();
+    const beforeHalf = B.manager.sessionEphemeralPublicForTest("bob", SID);
+
+    await B.manager.markInterruptedWithDetails("bob", SID, 0, "stream_close");
+    await B.manager.reviveSessionNode("bob", SID);
+    const afterHalf = B.manager.sessionEphemeralPublicForTest("bob", SID);
+    expect(afterHalf, "PRECONDITION: the revived side minted a keypair").not.toBeNull();
+    expect(
+      Buffer.from(afterHalf!).toString("hex"),
+      "PRECONDITION: the restart produced a DIFFERENT half, or there is no re-key to adopt",
+    ).not.toBe(Buffer.from(beforeHalf!).toString("hex"));
+
+    const sig = await signSessionEphemeral(bobKp, Buffer.from(SID, "hex"), afterHalf!);
+    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: afterHalf!, signature: sig });
+
+    expect(
+      A.events.filter((e) => e.event === "session.key.agreed" && e.context["rekey"] === true).length,
+      "A kept its old key after B re-keyed — every message from here fails to decrypt, and B's " +
+        "operator is told the content may have been tampered with for what is a local key skew",
+    ).toBe(1);
+  }, 60_000);
+
+  it("★ the SAME half re-announced does NOT churn the key — idempotence is preserved", async () => {
+    /**
+     * The other half of F1's fix. A peer re-announces on every connect, so the same signed ephemeral
+     * arrives repeatedly in an ordinary session, and re-deriving would move a value both sides depend
+     * on underneath them. Keying the guard on the peer's BYTES has to keep this true while letting a
+     * genuinely different half through.
+     */
+    const { A, B, bobKp } = await liveSession();
+    await wait(600);
+    const half = B.manager.sessionEphemeralPublicForTest("bob", SID)!;
+    const sig = await signSessionEphemeral(bobKp, Buffer.from(SID, "hex"), half);
+
+    const before = A.events.filter((e) => e.event === "session.key.agreed").length;
+    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: half, signature: sig });
+    await A.manager.handleEphemeralFrameForTest("alice", SID, { ephemeralPublic: half, signature: sig });
+    expect(
+      A.events.filter((e) => e.event === "session.key.agreed").length,
+      "the same half re-announced churned the key — both sides depend on it not moving mid-session",
+    ).toBe(before);
   }, 60_000);
 
   it("★★ an UNSIGNED ephemeral STOPS the session — it does not carry on unencrypted", async () => {
