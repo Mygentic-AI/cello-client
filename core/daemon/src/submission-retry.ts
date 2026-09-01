@@ -426,6 +426,28 @@ export class SubmissionRetryQueue {
   }
 
   /**
+   * A submission finally landed by some other route — the operator re-issued it, and the
+   * first-pass send succeeded. Drop any give-up recorded for it (review L9).
+   *
+   * The id is content-derived, so re-issuing the SAME words about the SAME subject produces the
+   * SAME id: this is precisely the "I wrote it again and it worked" case. Without it the operator
+   * sees the old failure and the new accepted row side by side for the life of the daemon, with no
+   * way to dismiss the one that is no longer true.
+   */
+  clearGaveUp(agentId: string, submissionId: string): void {
+    const at = this.#gaveUp.findIndex(
+      (e) => e.item.agentId === agentId && e.item.submissionId === submissionId,
+    );
+    if (at === -1) return;
+    this.#gaveUp.splice(at, 1);
+    this.#deps.logger.info("signal.submission.retry.gave_up.cleared", {
+      agentId,
+      submissionId,
+      impact: "a later send of the same submission succeeded, so the earlier give-up no longer stands",
+    });
+  }
+
+  /**
    * Stop, and start nothing further.
    *
    * EVERY DROPPED SUBMISSION IS NAMED (review H2). The queue is in memory by design, but the
@@ -465,9 +487,20 @@ export class SubmissionRetryQueue {
     }, delayMs);
   }
 
+  /**
+   * Arm for whichever entry is due SOONEST, floored at the stagger so a queue is never a burst.
+   *
+   * It used to arm unconditionally at the stagger, which was right for the "one just finished"
+   * case and wrong for every other: an entry re-armed 60 seconds out would still be woken every 5
+   * seconds, and conversely a failing entry's own long wait used to be armed on behalf of siblings
+   * that were already due (review M7).
+   */
   #armIfWork(): void {
     if (this.#queue.size === 0) return;
-    this.#arm(this.#staggerMs);
+    const now = this.#now();
+    let earliest = Infinity;
+    for (const entry of this.#queue.values()) earliest = Math.min(earliest, entry.nextAt);
+    this.#arm(Math.max(this.#staggerMs, earliest - now));
   }
 
   async #pump(): Promise<void> {
@@ -600,7 +633,11 @@ export class SubmissionRetryQueue {
       localPrecondition,
       retryInMs: waitMs,
     });
-    this.#arm(waitMs);
+    // ARM FOR THE EARLIEST DEADLINE IN THE QUEUE, not for this entry's (review M7). A reconnect
+    // makes EVERY held submission for that agent due at once; arming on the failing entry's own
+    // 60-second wait sent the rest back to sleep on a stream that was up, so throughput collapsed
+    // to one send per minute regardless of queue depth — defeating the stagger this module claims.
+    this.#armIfWork();
   }
 
   #giveUp(

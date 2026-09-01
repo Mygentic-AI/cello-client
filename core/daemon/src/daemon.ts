@@ -828,7 +828,11 @@ async function startDaemonHoldingLock(
       });
     },
     onAccepted: (pending, stored) => {
-      recordIssuedSubmission(pending.agentName, {
+      // THE STABLE ID THE ENQUEUE CAPTURED, not a re-resolution from the mutable name (review M6).
+      // `agentName` is a display label and is reusable after a retire; re-deriving it here would
+      // write the accepted row under a different agent's id if a name were retired and reused
+      // inside the retry window. The correct value is already in the struct.
+      recordIssuedSubmission(pending.agentName, pending.agentId, {
         submissionId: pending.submissionId,
         subject: pending.subject,
         op: pending.op,
@@ -852,12 +856,15 @@ async function startDaemonHoldingLock(
    */
   function recordIssuedSubmission(
     agentName: string,
+    /** The STABLE key, supplied by the caller. Never re-derived from `agentName` here — that is a
+     *  display label, and this table is keyed by identity. */
+    agentId: string,
     s: { submissionId: string; subject: string; op: SubmissionOp; intakeKeyId: string; stored: boolean },
   ): void {
     try {
       const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
       store.recordIssuedSubmission({
-        agentId: sessionNodeManager.resolveAgentId(agentName),
+        agentId,
         submissionId: s.submissionId,
         subjectPubkey: s.subject,
         op: s.op,
@@ -3551,6 +3558,9 @@ async function startDaemonHoldingLock(
         // collapsing into a generic send failure that points at the network.
         return { queued: false, reason: composed.reason, guidance: `${context} ${composed.guidance}` };
       }
+      // Resolved ONCE, and carried. `agent_name` is a display label and is reusable after a
+      // retire; every row and every queue entry below keys on this stable id instead.
+      const agentId = sessionNodeManager.resolveAgentId(sel.name);
       const sent = await sendSealedSubmission({
         signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
         submissionId: composed.submissionId, intakeKeyId: composed.intakeKeyId,
@@ -3598,7 +3608,7 @@ async function startDaemonHoldingLock(
           const held = submissionRetries.enqueue(
             {
               agentName: sel.name,
-              agentId: sessionNodeManager.resolveAgentId(sel.name),
+              agentId,
               submissionId: composed.submissionId,
               intakeKeyId: composed.intakeKeyId,
               // THE SAME SEALED BYTES, carried rather than re-derived. A re-seal is randomised and a
@@ -3641,7 +3651,12 @@ async function startDaemonHoldingLock(
       // verb added after this one is covered by construction, which is the same reasoning as the
       // `storedWarning` below — and by the same helper the RETRY path uses, so the two cannot drift
       // about what a landed submission records.
-      recordIssuedSubmission(sel.name, {
+      // A LANDED SEND RETIRES AN EARLIER GIVE-UP for the same submission. The id is content-derived,
+      // so re-issuing the same words about the same subject produces the same id — this is the "I
+      // wrote it again and it worked" case, and leaving the stale failure on the surface would show
+      // the operator two contradictory states for one submission, forever.
+      submissionRetries.clearGaveUp(agentId, composed.submissionId);
+      recordIssuedSubmission(sel.name, agentId, {
         submissionId: composed.submissionId,
         subject: opts.subject,
         op: opts.op,

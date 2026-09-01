@@ -374,7 +374,15 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     expect(h.events.some((e) => e.event === "signal.submission.retry.queue_full")).toBe(true);
   });
 
-  it("is SERIAL — two queued submissions never have two sends in flight at once", async () => {
+  it("is SERIAL — a second wake during a send in flight does not start a second one", async () => {
+    /**
+     * DRIVES TWO PUMPS CONCURRENTLY, which the earlier version did not. It queued two items and
+     * advanced the clock once — but single-timer scheduling alone guarantees one send per tick, so
+     * deleting the `#running` guard left it green and it was passing for the wrong reason.
+     *
+     * A reconnect landing while a send is still in flight is not exotic: the stream turns over
+     * roughly every 70 seconds, and `onSignalingConnected` arms immediately.
+     */
     const clock = makeClock();
     const { logger } = makeLogger();
     let inFlight = 0;
@@ -398,9 +406,54 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the retry (clauses 1, 4, 5)", () => {
     queue.enqueue(item({ submissionId: "22".repeat(32) }), "signaling_lost");
     queue.onSignalingConnected("Alice");
     await clock.advance(1_000);
-    expect(maxInFlight).toBe(1);
+    expect(inFlight, "the first send should still be waiting on the gate").toBe(1);
+
+    // The stream turns over again while that send is unresolved. Without `#running` this starts a
+    // second concurrent send.
+    queue.onSignalingConnected("Alice");
+    await clock.advance(1_000);
+    queue.onSignalingConnected("Alice");
+    await clock.advance(1_000);
+
+    expect(maxInFlight, "two sends were in flight at once").toBe(1);
     release();
     await clock.advance(1_000);
+  });
+
+  it("a reconnect that wakes SEVERAL submissions works through them, not one per minute", async () => {
+    /**
+     * Review M7. The failure path used to arm for the FAILING entry's own wait, so after a
+     * reconnect made every held submission due at once, the first failure sent all the siblings
+     * back to sleep for a full `LOCAL_PRECONDITION_RETRY_MS` on a stream that was up. Throughput
+     * became one send per minute regardless of queue depth — three submissions would get one
+     * attempt each in three minutes rather than three in fifteen seconds.
+     */
+    const h = harness({ outcomes: [fail("directory_unreachable")] });
+    for (const id of ["11", "22", "33"]) h.queue.enqueue(item({ submissionId: id.repeat(32) }), "signaling_lost");
+    h.queue.onSignalingConnected("Alice");
+    // Three staggers (5 s each), well inside the 60 s local-precondition backoff.
+    await h.clock.advance(20_000);
+
+    // NAME THE VALUE: all three were attempted, and each exactly once.
+    expect(h.sends).toHaveLength(3);
+    expect(h.sends.map((s) => s.submissionId).sort()).toEqual(
+      ["11".repeat(32), "22".repeat(32), "33".repeat(32)],
+    );
+  });
+
+  it("a give-up is RETIRED when the same submission later lands", () => {
+    // The id is content-derived, so re-issuing the same words about the same subject is the same
+    // submission. Leaving the stale failure listed would show two contradictory states at once.
+    const h = harness({ outcomes: [fail("submission_write_timeout")], maxAttempts: 1 });
+    h.queue.enqueue(item(), "submission_write_timeout");
+    h.queue.onSignalingConnected("Alice");
+    return h.clock.advance(60 * 60_000).then(() => {
+      expect(h.queue.list("agent-alice")[0].delivery.state).toBe("gave_up");
+      h.queue.clearGaveUp("agent-alice", item().submissionId);
+      expect(h.queue.list("agent-alice")).toEqual([]);
+      // Scoped by the STABLE id, not the name — a different agent's identical submission stays.
+      expect(h.events.some((e) => e.event === "signal.submission.retry.gave_up.cleared")).toBe(true);
+    });
   });
 
   it("stop() leaves nothing armed — a background retry must not hold a shutdown open", async () => {
