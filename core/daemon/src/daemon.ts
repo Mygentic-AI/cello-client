@@ -807,20 +807,42 @@ async function startDaemonHoldingLock(
        * That is said plainly instead of being implied by a comment describing a state the code
        * cannot reach.
        */
-      const kp = keyProviders.get(pending.agentName);
-      const rec = loadedAgents.find((a) => a.name === pending.agentName);
-      if (!kp || !rec) {
+      /**
+       * READ the agent's manager; never CREATE one, and this ONE guard is the whole check.
+       *
+       * `getAgentSignaling` is not a getter — for an agent with no manager it constructs one, which
+       * dials, authenticates, and installs an unbounded reconnect loop. `dropAgentSignaling` exists
+       * to stop and forget a manager for an agent whose registration failed terminally, and a
+       * background retry that silently rebuilt it would undo that decision from a timer nobody is
+       * watching.
+       *
+       * It replaces a `keyProviders` + `loadedAgents` pair that is now dead: the manager was built
+       * WITH this agent's key provider and pubkey, so its presence is the accurate statement of
+       * "this daemon can still send as this agent", and nothing prunes either of those two maps.
+       *
+       * There is always a manager here in practice — the first-pass send built one before this
+       * submission could ever have been held. Its absence means it was deliberately dropped, and
+       * the right answer is to stop trying, not to resurrect it.
+       */
+      // The SAME resolution `getAgentSignaling` performs, minus the construction: the shared
+      // manager first (the in-process path, where `perAgentSignaling` is never populated at all),
+      // then this agent's own. Reading only the per-agent map would refuse every retry on the
+      // shared path — which is how this fix first failed its own live test.
+      const existing = sharedSignaling
+        ? { signaling: sharedSignaling }
+        : perAgentSignaling.get(pending.agentName);
+      if (!existing) {
         return {
           ok: false as const,
           reason: "submission_agent_unloaded" as const,
           guidance:
-            `This daemon can no longer sign as '${pending.agentName}', so the held submission ` +
-            "cannot be sent by anyone. Start the agent with cello_start_agent and issue it again — " +
+            `The directory connection for '${pending.agentName}' has been torn down, so the held ` +
+            "submission cannot be sent. Start the agent with cello_start_agent and issue it again — " +
             "re-sending is safe, the submission id is derived from the content.",
         };
       }
       return sendSealedSubmission({
-        signaling: getAgentSignaling(pending.agentName, kp, rec.pubkey).signaling,
+        signaling: existing.signaling,
         submissionId: pending.submissionId,
         intakeKeyId: pending.intakeKeyId,
         ciphertext: pending.ciphertext,
