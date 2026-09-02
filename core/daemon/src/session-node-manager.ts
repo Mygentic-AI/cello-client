@@ -3061,6 +3061,50 @@ export class SessionNodeManager {
       : { verdict: "mismatch", ownRootHex, detail: "root_disagrees: same leaf count, different leaves or different order" };
   }
 
+  /**
+   * WHERE THE MUTUALLY-SIGNED PREFIX ENDS, DERIVED FROM THIS DAEMON'S OWN LEAVES —
+   * `DOD-M15-UNILATERAL-1`, review F2.
+   *
+   * ⚠️ **THE FIRST VERSION COMPUTED THIS FROM THE CERTIFICATE'S OWN PARTICIPANT LIST, AND CALLED
+   * THAT "recomputed, cannot be steered".** It could be steered. On the SOLO path the certificate's
+   * TBS binds no legibility at all, and the client verifies only the *live* party's frontier — so
+   * the absent party's `content_frontier_seq` and every `last_authored_seq` arrived unchecked. One
+   * directory node could publish the absent party's frontier as 3 and the receipt would say
+   * "mutually signed through 3" over a transcript that party never signed for. That is the precise
+   * conflation this field exists to prevent, reintroduced by the field itself.
+   *
+   * The carry answers it without trusting anybody. This daemon holds the counterparty's own leaves,
+   * each carrying, inside the bytes THEY signed, both the sequence they authored and the
+   * `last_seen_seq` they acknowledged. So a party's commitment reaches
+   * `max(highest sequence they authored, highest sequence they acknowledged)`, and the transcript is
+   * mutually signed only as far as the LEAST-committed party reaches.
+   *
+   * Fewer than two distinct authors ⇒ `0`: nobody countersigned anything, which is the honest floor
+   * for a conversation where the other side only ever received. `null` when the carry is empty or
+   * unreadable — the caller must then publish NO boundary rather than fall back to a number
+   * somebody else supplied.
+   */
+  countersignedThroughSeqFromCarry(agentPubkeyHex: string, sessionIdHex: string): number | null {
+    const carry = this.getSealCarry(agentPubkeyHex, sessionIdHex);
+    if (carry.length === 0) return null;
+    const reach = new Map<string, number>();
+    for (const leaf of carry) {
+      let signedLastSeen = 0;
+      try {
+        // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
+        const raw = (decode(leaf.structure1Cbor) as unknown[])[4];
+        const n = typeof raw === "bigint" ? Number(raw) : raw;
+        if (typeof n === "number" && Number.isFinite(n)) signedLastSeen = n;
+      } catch {
+        return null; // unreadable: publish no boundary rather than a half-derived one
+      }
+      const prior = reach.get(leaf.senderPubkeyHex) ?? 0;
+      reach.set(leaf.senderPubkeyHex, Math.max(prior, leaf.sequenceNumber, signedLastSeen));
+    }
+    if (reach.size < 2) return 0;
+    return Math.min(...reach.values());
+  }
+
   getSealCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {
     if (!this.#sealLeafStore && this.#db) {
       this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);

@@ -221,6 +221,36 @@ export async function escalateToUnilateralSeal(
     };
   }
   if (uniResult.reason === "seal_unilateral_too_early") {
+    /**
+     * 🚨 THREE REFUSALS, THREE ANSWERS — `DOD-M15-UNILATERAL-1`, review F1.
+     *
+     * **This used to say one thing for all of them, and for two of the three it was false.** A
+     * session refused because the counterparty is ONLINE was told the delivery-grace window had not
+     * elapsed — for a two-hour-old session whose window expired 110 minutes earlier. The operator
+     * was sent to wait out a clock that had already run, while the real cause sat on one directory
+     * node's log line and nowhere they would look. Errors name their cause, not their exit point.
+     *
+     * The `reason` code differs too, because it selects the remedy an operator surface prints and
+     * "the counterparty is here" is not the same remedy as "wait for the clock".
+     */
+    if (uniResult.cause === "counterparty_present") {
+      return {
+        ok: false,
+        // No retry_after_seconds: there is no countdown to somebody leaving, and a number here
+        // would be a promise nothing keeps.
+        reason: "seal_counterparty_present",
+        guidance:
+          "The counterparty is online right now, so a solo seal is refused — it would record them ABSENT on a permanent receipt, which would be false. Nothing is wrong and nothing is lost. Close the conversation together and the seal completes BILATERALLY, which is the stronger receipt anyway. If they do go offline, retry cello_close_session then.",
+      };
+    }
+    if (uniResult.cause === "high_stakes_evidence_required") {
+      return {
+        ok: false,
+        reason: "seal_high_stakes_evidence_required",
+        guidance:
+          "This conversation was opened as HIGH-STAKES, where a receipt may only record the counterparty absent if the relay actually observed them disconnect. It has observed nothing, so no solo receipt is issued rather than one asserting something unproven. Waiting helps ONLY if they connect and then leave — if they never reached a relay for this session, no solo receipt will ever be available at this tier and the way to close is together with them.",
+      };
+    }
     // F20: tell the operator WHEN the unilateral seal becomes available, not just "later".
     const when =
       typeof uniResult.remainingSeconds === "number"
