@@ -110,7 +110,14 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/adapter-claude-code/SKILL.md",
     claim: "Handing someone a proof also hands them this session's salt",
-    excerpts: ["**Handing someone a proof also hands them this session's salt.**"],
+    // The WHOLE paragraph, line by line — it carries four claim words, not one. A row that quotes
+    // only its headline leaves the rest of its own sentence unadjudicated, which is the arithmetic
+    // this ledger switched to verbatim excerpts to make visible.
+    excerpts: [
+      "**Handing someone a proof also hands them this session's salt.** It has to travel, or the proof is",
+      "about a number rather than a sentence. But the salt is per SESSION, so whoever holds one proof can",
+      "test guessed wording against any leaf in that conversation — share a proof with the same care you",
+    ],
     verdict: "true",
     enforcedBy: "structural",
     evidence:
@@ -127,7 +134,14 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "plugins/cello/skills/cello/SKILL.md",
     claim: "Handing someone a proof also hands them this session's salt",
-    excerpts: ["**Handing someone a proof also hands them this session's salt.**"],
+    // The WHOLE paragraph, line by line — it carries four claim words, not one. A row that quotes
+    // only its headline leaves the rest of its own sentence unadjudicated, which is the arithmetic
+    // this ledger switched to verbatim excerpts to make visible.
+    excerpts: [
+      "**Handing someone a proof also hands them this session's salt.** It has to travel, or the proof is",
+      "about a number rather than a sentence. But the salt is per SESSION, so whoever holds one proof can",
+      "test guessed wording against any leaf in that conversation — share a proof with the same care you",
+    ],
     verdict: "true",
     enforcedBy: "structural",
     evidence:
