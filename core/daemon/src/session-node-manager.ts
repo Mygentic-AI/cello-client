@@ -79,6 +79,26 @@ import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
 import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+
+/**
+ * One row in an agent's witness-alert list — DOD-M15-CORROBORATE-1 review F1. Deduped on
+ * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
+ * another slot in a bounded list.
+ */
+export interface WitnessAlertNotice {
+  /** `${relayId}::${sessionIdHex}` — the dedupe key, not shown to anyone. */
+  key: string;
+  alert: RelayWitnessAlert;
+  occurrences: number;
+  /**
+   * When this witness first said it. Held SEPARATELY from `alert.observedAt`, because a later
+   * repeat can replace `alert` (a provable one supersedes an unprovable one) and that must not
+   * silently move the first sighting forward — an operator reading "first observed" wants to know
+   * when this started, not when the strongest version of it arrived.
+   */
+  firstObservedAt: number;
+  lastObservedAt: number;
+}
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
@@ -1027,12 +1047,35 @@ export class SessionNodeManager {
   }
 
   /**
-   * DOD-M15-CORROBORATE-1: witness alerts this agent's relays have reported, newest last, capped.
-   * In memory only — this is a notice, not evidence, and a relay that still holds the observation
-   * re-delivers it on the next authenticated connection.
+   * DOD-M15-CORROBORATE-1: witness alerts this agent's relays have reported, oldest first, capped.
+   *
+   * ⚠️ **IN MEMORY, AND A DAEMON RESTART LOSES THEM** — review F4. This comment used to say a relay
+   * that still holds the observation re-delivers it on the next connection. It does not:
+   * `drainWitnessAlerts` splices, so once an alert has been delivered the relay no longer holds it.
+   * Nothing here is a durable record of anything; the relay operator's own log is, and so is the
+   * signature on the alert, which the operator can keep. Said plainly rather than left as an implied
+   * guarantee.
+   *
+   * Nothing clears the list before that restart, and that is deliberate: an alert an operator can
+   * silence is one an attacker can wait out.
    */
-  readonly #witnessAlerts = new Map<string, RelayWitnessAlert[]>();
+  readonly #witnessAlerts = new Map<string, WitnessAlertNotice[]>();
+  /**
+   * ⚠️ **THE CAP KEEPS THE FIRST, NOT THE LAST** — review F1, and the direction is the whole point.
+   *
+   * The relay's own queue drops the NEWEST when full, precisely so a flood cannot push the first
+   * real observation out. This list did the opposite (`slice(-20)`), which handed the mute button
+   * straight back one layer up: at the relay's 120-submits-per-minute limit, about ten seconds of
+   * fabricated alerts evicted the genuine one before any operator read it. Repeats of one event also
+   * collapse — see the dedupe in `recordRelayWitnessAlert` — so a flood cannot even fill it.
+   */
   static readonly #WITNESS_ALERT_CAP = 20;
+  /**
+   * Review F7: relays that sent a witness alert this build could not read or verify, per agent.
+   * Peer id → cause + count. NO session and NO party: it reports that our witness layer is not
+   * working, never anything about a participant.
+   */
+  readonly #witnessUnreadable = new Map<string, Map<string, { why: string; count: number }>>();
 
   /**
    * Record what one relay says it saw on one of this agent's sessions, for the operator to read.
@@ -1046,20 +1089,69 @@ export class SessionNodeManager {
    */
   recordRelayWitnessAlert(agentName: string, alert: RelayWitnessAlert): void {
     const list = this.#witnessAlerts.get(agentName) ?? [];
-    list.push(alert);
-    this.#witnessAlerts.set(agentName, list.slice(-SessionNodeManager.#WITNESS_ALERT_CAP));
+    /**
+     * ONE ROW PER (WITNESS, SESSION) — review F1's second half. A relay reports every refused
+     * submission, and a determined submitter can produce a great many; twenty rows saying the same
+     * thing is not twenty facts, it is one fact and nineteen ways to push another one off the list.
+     * The repeat updates the count and the last-seen time and leaves the row where it is.
+     */
+    const key = `${alert.relayId ?? "(unnamed)"}::${alert.sessionIdHex}`;
+    const existing = list.find((n) => n.key === key);
+    if (existing) {
+      existing.occurrences += 1;
+      existing.lastObservedAt = alert.observedAt;
+      // A later repeat that IS verifiable upgrades the row: the operator should end up holding the
+      // strongest form of the claim they were sent, never the weakest one that arrived first.
+      existing.alert = alert.verifiable ? alert : existing.alert;
+      // `firstObservedAt` is deliberately untouched — see its note on the type.
+    } else if (list.length >= SessionNodeManager.#WITNESS_ALERT_CAP) {
+      // Keep the first. See the cap's own note for why this direction is load-bearing.
+      this.#logger.warn("session.witness.alert.list_full", {
+        agentName, held: list.length,
+        impact: "this alert was not recorded; the earlier ones are kept and still shown",
+      });
+      return;
+    } else {
+      list.push({ key, alert, occurrences: 1, firstObservedAt: alert.observedAt, lastObservedAt: alert.observedAt });
+    }
+    this.#witnessAlerts.set(agentName, list);
     this.#logger.error("session.witness.alert.recorded", {
       agentName,
       sessionId: alert.sessionIdHex,
       relayId: alert.relayId ?? "(unnamed)",
       submitterIsCounterparty: alert.submitterIsCounterparty,
+      verifiable: alert.verifiable,
       impact: "surfaced to the operator on the next cello_inbox; the session is NOT frozen by it",
     });
   }
 
-  /** The witness alerts an agent has been told about, oldest first. */
-  getWitnessAlerts(agentName: string): ReadonlyArray<RelayWitnessAlert> {
+  /** The witness alerts an agent has been told about, oldest first, one row per witness+session. */
+  getWitnessAlerts(agentName: string): ReadonlyArray<WitnessAlertNotice> {
     return this.#witnessAlerts.get(agentName) ?? [];
+  }
+
+  /**
+   * Review F7: a relay sent a witness alert this build could not read or could not verify.
+   *
+   * Recorded so a version skew that silently kills the witness layer is visible to the operator
+   * instead of living only in a log file. Carries no session and no party by construction.
+   */
+  recordRelayWitnessUnreadable(agentName: string, relayPeerId: string, why: string): void {
+    const byRelay = this.#witnessUnreadable.get(agentName) ?? new Map<string, { why: string; count: number }>();
+    const prior = byRelay.get(relayPeerId);
+    byRelay.set(relayPeerId, { why, count: (prior?.count ?? 0) + 1 });
+    this.#witnessUnreadable.set(agentName, byRelay);
+    this.#logger.error("session.witness.unreadable.recorded", {
+      agentName, relayPeerId, why,
+      impact: "this agent's witness layer is not working against that relay — no observation it " +
+        "sends can be read, and nothing has been concluded about any participant",
+    });
+  }
+
+  /** Relays whose witness alerts this build could not read, for the agent's inbox. */
+  getWitnessUnreadable(agentName: string): ReadonlyArray<{ relayPeerId: string; why: string; count: number }> {
+    return [...(this.#witnessUnreadable.get(agentName) ?? new Map()).entries()]
+      .map(([relayPeerId, v]) => ({ relayPeerId, why: v.why, count: v.count }));
   }
 
   /**
@@ -4460,6 +4552,7 @@ export class SessionNodeManager {
           // DOD-M15-CORROBORATE-1: a relay's witness alert reaches the operator's inbox from here.
           // The DETACHED clients get the same callback from the builder in daemon.ts.
           onWitnessAlert: (alert) => { this.recordRelayWitnessAlert(agentName, alert); },
+          onWitnessUnreadable: (relayPeerId, why) => { this.recordRelayWitnessUnreadable(agentName, relayPeerId, why); },
         });
         this.#relayClients.set(clientKey, client);
       }

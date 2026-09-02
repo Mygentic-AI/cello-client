@@ -2113,6 +2113,7 @@ async function startDaemonHoldingLock(
       // DOD-M15-CORROBORATE-1: the DETACHED client needs this as much as the live one — a session
       // being sealed after a restart is exactly when its operator is not watching.
       onWitnessAlert: (alert) => { sessionNodeManager.recordRelayWitnessAlert(agentName, alert); },
+      onWitnessUnreadable: (peerId, why) => { sessionNodeManager.recordRelayWitnessUnreadable(agentName, peerId, why); },
     });
   });
 

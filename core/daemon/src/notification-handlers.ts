@@ -83,27 +83,55 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
    * who sent it, that anyone acted in bad faith, or that a message was forged. Saying more would
    * make a single relay's word into a finding about a person, which is exactly what this unit
    * exists to avoid on the client side too.
+   *
+   * ⚠️ **AND THE CONVERSE IS THE ONE AN OPERATOR WILL GET WRONG** (review F9). Silence here proves
+   * nothing: a relay only sees what is submitted to it, the submit is best-effort, and a message can
+   * reach an agent over a direct connection that no relay ever witnessed. So the guidance says what
+   * an absent alert means before anyone reads it as an all-clear.
    */
   function witnessSection(agentName: string): Record<string, unknown> {
-    const alerts = sessionNodeManager.getWitnessAlerts(agentName);
-    if (alerts.length === 0) return {};
-    return {
-      relay_witness_alerts: alerts.map((a) => ({
-        session_id: a.sessionIdHex,
-        observed_at: a.observedAt,
-        witness_relay: a.relayId ?? "unnamed",
-        submitter_was_your_counterparty: a.submitterIsCounterparty,
-      })),
-      relay_witness_alerts_guidance:
+    const notices = sessionNodeManager.getWitnessAlerts(agentName);
+    const unreadable = sessionNodeManager.getWitnessUnreadable(agentName);
+    if (notices.length === 0 && unreadable.length === 0) return {};
+    const out: Record<string, unknown> = {};
+    if (notices.length > 0) {
+      out["relay_witness_alerts"] = notices.map((n) => ({
+        session_id: n.alert.sessionIdHex,
+        first_observed_at: n.firstObservedAt,
+        last_observed_at: n.lastObservedAt,
+        times_observed: n.occurrences,
+        witness_relay: n.alert.relayId ?? "unnamed",
+        submitter_was_your_counterparty: n.alert.submitterIsCounterparty,
+        // The difference between something the operator can show a third party and something they
+        // cannot. Named `provable_to_a_third_party` rather than `verified`, which reads as a verdict.
+        provable_to_a_third_party: n.alert.verifiable,
+      }));
+      out["relay_witness_alerts_guidance"] =
         "A relay carrying one of your conversations refused a submission because its signature " +
         "verified against neither your key nor your counterparty's. Nothing was added to the " +
         "conversation record and the session is still open. THIS IS ONE RELAY'S OBSERVATION, NOT A " +
         "FINDING: it establishes only that this relay saw and refused that submission — it does not " +
         "establish who sent it, and it is not evidence that your counterparty did anything. There " +
-        "is currently no second witness to check it against. Tell the operator what was observed, " +
-        "in those terms, and let them decide; if it worries them, the way to end a conversation is " +
-        "cello_close_session, and confirming anything with the counterparty happens outside CELLO.",
-    };
+        "is currently no second witness to check it against. An entry with " +
+        "provable_to_a_third_party: true is signed by the relay, so the operator can show it to " +
+        "someone; false means the relay named no identity and all they have is our word for it. " +
+        "AND THE ABSENCE OF AN ALERT ESTABLISHES NOTHING — a relay only sees what is submitted to " +
+        "it, and a message can reach you without one. Tell the operator what was observed, in those " +
+        "terms, and let them decide; if it worries them, the way to end a conversation is " +
+        "cello_close_session, and confirming anything with the counterparty happens outside CELLO.";
+    }
+    if (unreadable.length > 0) {
+      out["relay_witness_unreadable"] = unreadable.map((u) => ({
+        relay_peer_id: u.relayPeerId, cause: u.why, times: u.count,
+      }));
+      out["relay_witness_unreadable_guidance"] =
+        "A relay sent this agent a witness alert that this build could not read or could not " +
+        "verify, so it was discarded. This says NOTHING about any conversation or any " +
+        "counterparty — it says that against that relay, this agent's second-opinion layer is not " +
+        "working, most often a version skew between the relay and this client. Upgrading the " +
+        "client is the usual fix; until then, treat that relay as silent rather than as clean.";
+    }
+    return out;
   }
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───

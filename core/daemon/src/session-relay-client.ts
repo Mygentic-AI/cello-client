@@ -33,7 +33,7 @@ import { decode } from "cbor-x";
 import { encodeCbor, decodeSealPayload } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
-import type { KeyProvider } from "@cello-protocol/crypto";
+import { verify, type KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
@@ -343,6 +343,12 @@ export interface AgentRelayClientOpts {
    * accused party's client cannot suppress — reaching nobody.
    */
   onWitnessAlert?: (alert: RelayWitnessAlert) => void;
+  /**
+   * DOD-M15-CORROBORATE-1 review F7: this relay sent a witness alert this build could not read or
+   * could not verify. Neutral by construction — a relay peer id and a machine-readable cause, never
+   * a session or a party.
+   */
+  onWitnessUnreadable?: (relayPeerId: string, why: string) => void;
 }
 
 /**
@@ -358,6 +364,37 @@ export interface RelayWitnessAlert {
   observedAt: number;
   /** True iff the relay says the submitter was our counterparty; false = a third party. */
   submitterIsCounterparty: boolean;
+  /**
+   * Whether the relay PROVED it said this — review F3.
+   *
+   * `true` means the signature verified against the key `relayId` names, so the operator holds
+   * something they can show a third party. `false` means the relay named no identity at all, so what
+   * they hold is our word that a relay told us — which is worth exactly as much as the accusation
+   * this is supposed to corroborate, and the inbox says so.
+   *
+   * There is no third state: a relay that DECLARES a `relayId` and fails to prove it is refused
+   * outright, never reported as an unverifiable alert.
+   */
+  verifiable: boolean;
+}
+
+/**
+ * Rebuild the bytes a relay signs when it reports a witnessed forgery.
+ *
+ * ⚠️ **MIRRORED CODEC** — `packages/relay/src/leaf-witness.ts` `buildWitnessAlertTbs` in
+ * trustless-cello is the other half and the two MUST stay in sync. Both call `encodeCbor` from
+ * `@cello-protocol/protocol-types` rather than configuring an encoder, so the only thing that can
+ * drift is the field list, and both list it in one place.
+ */
+const RELAY_WITNESS_DOMAIN = "CELLO-RELAY-WITNESS-v1";
+function buildWitnessAlertTbs(
+  sessionId: Uint8Array,
+  reason: string,
+  observedAt: number,
+  submitterIsCounterparty: boolean,
+): Uint8Array {
+  const body = encodeCbor([RELAY_WITNESS_DOMAIN, sessionId, reason, observedAt, submitterIsCounterparty]);
+  return new Uint8Array(createHash("sha256").update(body).digest());
 }
 
 /**
@@ -449,6 +486,8 @@ export class AgentRelayClient {
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
   /** DOD-M15-CORROBORATE-1 — where a relay's witness alert goes. See the opt of the same name. */
   readonly #onWitnessAlert: ((alert: RelayWitnessAlert) => void) | undefined;
+  /** DOD-M15-CORROBORATE-1 review F7 — where an UNREADABLE witness alert goes. */
+  readonly #onWitnessUnreadable: ((relayPeerId: string, why: string) => void) | undefined;
   /**
    * DOD-M15-RELAYSLOTS-1: the last refusal this relay gave us, classified. Kept because a log line
    * reaches neither the operator asking why their agent is unreachable nor the code deciding
@@ -529,6 +568,7 @@ export class AgentRelayClient {
     this.#sealLeafStore = opts.sealLeafStore;
     this.#onlineToken = opts.onlineToken;
     this.#onWitnessAlert = opts.onWitnessAlert;
+    this.#onWitnessUnreadable = opts.onWitnessUnreadable;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge. */
@@ -946,21 +986,68 @@ export class AgentRelayClient {
         && typeof observedAt === "number" && Number.isFinite(observedAt)
         && typeof submitterIsCounterparty === "boolean"
         && (rawRelayId === undefined || typeof rawRelayId === "string");
-      if (!wellFormed) {
+      const unreadable = (why: string): void => {
         this.#logger.error("session.relay.witness.malformed", {
           relayPeerId: this.#relayPeerId,
+          why,
           impact: "this relay sent a witness alert this build cannot read, so NOTHING has been " +
             "reported to the operator about it. Treat it as a relay fault or a version skew, not " +
             "as evidence about either participant.",
         });
+        /**
+         * Review F7 — **and it reaches a surface, not only this file.** If a version skew makes
+         * every relay's alert unreadable, the witness layer is silently dead and the operator would
+         * have no way to find that out. Deliberately carries NO session and NO party: it says a
+         * relay sent something we could not read, and claims nothing about anyone.
+         */
+        this.#onWitnessUnreadable?.(this.#relayPeerId, why);
+      };
+      if (!wellFormed) { unreadable("field_shape"); return; }
+
+      const sessionIdHex = Buffer.from(sidBytes).toString("hex");
+      /**
+       * ⚠️ **IT MUST BE A SESSION THIS CLIENT ACTUALLY HOLDS ON THIS RELAY** — review F2.
+       *
+       * `wellFormed` checks shape and shape only. Without this, any relay we are authenticated to
+       * could push alerts naming arbitrary session ids — including conversations carried by a
+       * DIFFERENT relay — and they would land in the operator's inbox as statements of fact about
+       * a counterparty. Combined with a bounded notice list that is the cheap mute: flood
+       * fabrications until the real one is gone.
+       */
+      if (!this.#sessions.has(sessionIdHex)) {
+        this.#logger.error("session.relay.witness.unknown_session", {
+          relayPeerId: this.#relayPeerId,
+          session: sessionIdHex,
+          impact: "REFUSED and not reported — this relay named a session it does not carry for us, " +
+            "which is a fabrication or a stale frame, never an observation about our counterparty.",
+        });
         return;
       }
+
+      /**
+       * A DECLARED IDENTITY MUST BE PROVEN — review F3. `relay_id` is the hex of the key that signs
+       * every `hash_submit_ack`, so the same check that verifies a receipt verifies this. Missing,
+       * malformed and mismatched take ONE path: omitting the proof is the cheapest way to dodge it.
+       */
+      const rawSig = frame["witness_signature"];
+      const sigBytes = rawSig instanceof Uint8Array || Buffer.isBuffer(rawSig) ? toU8(rawSig) : null;
+      let verifiable = false;
+      if (typeof rawRelayId === "string") {
+        if (!/^[0-9a-fA-F]{64}$/.test(rawRelayId)) { unreadable("relay_id_not_a_pubkey"); return; }
+        if (!sigBytes || sigBytes.length !== 64) { unreadable("declared_relay_id_without_signature"); return; }
+        const tbs = buildWitnessAlertTbs(sidBytes, "leaf_signed_by_neither_participant", observedAt, submitterIsCounterparty);
+        if (!verify(new Uint8Array(Buffer.from(rawRelayId, "hex")), tbs, sigBytes)) {
+          unreadable("witness_signature_invalid"); return;
+        }
+        verifiable = true;
+      }
       const alert: RelayWitnessAlert = {
-        sessionIdHex: Buffer.from(sidBytes).toString("hex"),
+        sessionIdHex,
         reason: "leaf_signed_by_neither_participant",
         relayId: typeof rawRelayId === "string" ? rawRelayId : null,
         observedAt,
         submitterIsCounterparty,
+        verifiable,
       };
       // BOTH halves, per Invariant 2: the log is the durable forensic record, and the callback is
       // the half that actually reaches a person.
@@ -969,6 +1056,7 @@ export class AgentRelayClient {
         session: alert.sessionIdHex,
         relayId: alert.relayId ?? "(unnamed)",
         submitterIsCounterparty: alert.submitterIsCounterparty,
+        verifiable: alert.verifiable,
         observation: "one relay refused a leaf on this session because it verified against neither participant key",
         impact: "nothing was added to the conversation record. This is ONE relay's observation and " +
           "establishes only that it saw and refused that submission — not who sent it.",

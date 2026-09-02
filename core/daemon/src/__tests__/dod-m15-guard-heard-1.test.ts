@@ -97,6 +97,7 @@ async function inboxFor(
     // DOD-M15-CORROBORATE-1: the inbox reads relay witness alerts too. Empty here — this file is
     // about refusal guidance, and a stub that omitted the method made every case throw.
     getWitnessAlerts: () => [],
+    getWitnessUnreadable: () => [],
     getConsentRequests: () => [],
     listSessions: () => [],
     getPendingAttestationConsents: () => [],
