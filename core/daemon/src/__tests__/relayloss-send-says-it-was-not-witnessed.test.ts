@@ -74,5 +74,57 @@ describe("016-RELAYLOSS — an unwitnessed send is not reported as an ordinary s
       .toMatch(/did not witness/i);
     expect(guidance, "and must tell them NOT to resend — a resend takes a second position in the record")
       .toMatch(/not resend|do not resend/i);
+
+    /**
+     * ─── REVIEW HIGH-1: the remedy must not be the act that makes the loss permanent ────────────
+     *
+     * The first version of this guidance said *"once it is healthy send the next message normally —
+     * ordering re-establishes itself."* It is false: this side's tree is now one leaf ahead of the
+     * relay's counter, so the next witnessed send takes the divergence branch and the session can
+     * never be sealed. Sending again is precisely what converts one missing leaf into a dead
+     * conversation.
+     *
+     * Asserted as a NEGATIVE on the specific false promise, not just as a positive on the true one,
+     * because the true sentence and the false one can coexist in the same string — and it was the
+     * false one that did the damage.
+     */
+    expect(guidance, "guidance must NOT promise that ordering repairs itself — it does not")
+      .not.toMatch(/re-establishes itself|repairs itself|resolves itself/i);
+    expect(guidance, "and must say so outright, since the operator's instinct is to keep talking")
+      .toMatch(/does not repair itself/i);
+  }, 60_000);
+
+  /**
+   * ─── REVIEW HIGH-2: the field is on EVERY outcome, or it cannot be branched on ────────────────
+   *
+   * The first version put `witnessed` on two of `cello_send`'s five return paths. A field present
+   * on some outcomes and absent on others is unusable to a caller: its absence reads as an older
+   * daemon rather than as an answer. The DIVERGED path is the sharpest case — it is reachable only
+   * after an unwitnessed leaf, so the exact condition the guidance tells the operator to watch for
+   * returned an object where `witnessed` was `undefined`.
+   */
+  it("★ the DIVERGED response carries witnessed too — the one path reachable only after this defect", async () => {
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-relayloss-diverged-",
+      node: new FakeNode() as unknown as CelloNode,
+    });
+    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    const conn = await fx.connectAs("alice");
+
+    // Two unwitnessed sends: the first appends ahead of the relay, the second is the "next message"
+    // the operator would send. Both take the same branch here (the fixture has no relay at all), so
+    // this pins the FIELD's presence on the shape, which is what HIGH-2 is about.
+    const first = (await conn.send("cello_send", { session_id: SID, content: "one" })) as Record<string, unknown>;
+    const second = (await conn.send("cello_send", { session_id: SID, content: "two" })) as Record<string, unknown>;
+
+    for (const [label, r] of [["first", first], ["second", second]] as const) {
+      expect(r["ok"], `${label} send must succeed: ${JSON.stringify(r)}`).toBe(true);
+      /**
+       * `toBe(false)`, never `toBeDefined()`. "It carried a field" is a shadow — the value is the
+       * claim, and a response carrying `witnessed: undefined` would satisfy a defined-check while
+       * telling the operator nothing.
+       */
+      expect(r["witnessed"], `${label} send must state witnessed explicitly: ${JSON.stringify(r)}`).toBe(false);
+    }
   }, 60_000);
 });
