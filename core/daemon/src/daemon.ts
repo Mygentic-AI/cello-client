@@ -80,6 +80,7 @@ import { createSignalingConnect } from "./signaling-connect.js";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
 import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import { composeSealedSubmission, sendSealedSubmission, fetchSubmissionResults } from "./signal-submission.js";
+import { SubmissionRetryQueue, isRetryableSendFailure, DEFAULT_RETRY_WINDOW_MS, type PendingSubmission } from "./submission-retry.js";
 import type { SubmissionOp, SignalSubjectKind } from "@cello-protocol/protocol-types";
 
 /**
@@ -782,6 +783,132 @@ async function startDaemonHoldingLock(
     flushSender: (agentName: string) => flushAwaitingContent(agentName),
   });
 
+  /**
+   * DOD-M15-ENDORSE-RETRY-1 — sealed submissions whose send reached no directory node.
+   *
+   * The consortium has three nodes and a submission used to die with whichever one this daemon
+   * happened to be connected to. It is held here instead and re-sent when the SignalingManager
+   * reconnects — that reconnect IS the failover, and nothing in this daemon picks a node for a
+   * submission (`sendSealedSubmission`'s header rules that out). Safe because `submission_id` is
+   * derived from the signed plaintext: a second node stores it once and the portal mints once.
+   */
+  const submissionRetries = new SubmissionRetryQueue({
+    logger,
+    send: async (pending: PendingSubmission) => {
+      /**
+       * THE AGENT MUST STILL BE HERE TO SIGN, and this failure has its own name.
+       *
+       * It borrowed `submission_refused_by_node` at first, which states that a directory node
+       * decoded, evaluated and refused the submission — none of which happened. Stacked on the
+       * give-up reason it produced, the operator saw two labels both pointing at the directory for
+       * a cause that is entirely local (review M5).
+       *
+       * Neither branch is reachable in this daemon today — nothing removes from `keyProviders` or
+       * `loadedAgents` — so this is a guard against a future unload path rather than a live case.
+       * That is said plainly instead of being implied by a comment describing a state the code
+       * cannot reach.
+       */
+      /**
+       * READ the agent's manager; never CREATE one, and this ONE guard is the whole check.
+       *
+       * `getAgentSignaling` is not a getter — for an agent with no manager it constructs one, which
+       * dials, authenticates, and installs an unbounded reconnect loop. `dropAgentSignaling` exists
+       * to stop and forget a manager for an agent whose registration failed terminally, and a
+       * background retry that silently rebuilt it would undo that decision from a timer nobody is
+       * watching.
+       *
+       * It replaces a `keyProviders` + `loadedAgents` pair that is now dead: the manager was built
+       * WITH this agent's key provider and pubkey, so its presence is the accurate statement of
+       * "this daemon can still send as this agent", and nothing prunes either of those two maps.
+       *
+       * There is always a manager here in practice — the first-pass send built one before this
+       * submission could ever have been held. Its absence means it was deliberately dropped, and
+       * the right answer is to stop trying, not to resurrect it.
+       */
+      // The SAME resolution `getAgentSignaling` performs, minus the construction: the shared
+      // manager first (the in-process path, where `perAgentSignaling` is never populated at all),
+      // then this agent's own. Reading only the per-agent map would refuse every retry on the
+      // shared path — which is how this fix first failed its own live test.
+      const existing = sharedSignaling
+        ? { signaling: sharedSignaling }
+        : perAgentSignaling.get(pending.agentName);
+      if (!existing) {
+        return {
+          ok: false as const,
+          reason: "submission_agent_unloaded" as const,
+          guidance:
+            `The directory connection for '${pending.agentName}' has been torn down, so the held ` +
+            "submission cannot be sent. Start the agent with cello_start_agent and issue it again — " +
+            "re-sending is safe, the submission id is derived from the content.",
+        };
+      }
+      return sendSealedSubmission({
+        signaling: existing.signaling,
+        submissionId: pending.submissionId,
+        intakeKeyId: pending.intakeKeyId,
+        ciphertext: pending.ciphertext,
+        logger,
+      });
+    },
+    onAccepted: (pending, stored) => {
+      // THE STABLE ID THE ENQUEUE CAPTURED, not a re-resolution from the mutable name (review M6).
+      // `agentName` is a display label and is reusable after a retire; re-deriving it here would
+      // write the accepted row under a different agent's id if a name were retired and reused
+      // inside the retry window. The correct value is already in the struct.
+      recordIssuedSubmission(pending.agentName, pending.agentId, {
+        submissionId: pending.submissionId,
+        subject: pending.subject,
+        op: pending.op,
+        intakeKeyId: pending.intakeKeyId,
+        stored,
+      });
+    },
+    ...(config.submissionRetryIntervalsMs?.staggerMs === undefined
+      ? {}
+      : { staggerMs: config.submissionRetryIntervalsMs.staggerMs }),
+    ...(config.submissionRetryIntervalsMs?.localPreconditionRetryMs === undefined
+      ? {}
+      : { localPreconditionRetryMs: config.submissionRetryIntervalsMs.localPreconditionRetryMs }),
+  });
+
+  /**
+   * KEEP THE HANDLE, or a withdrawal has nothing to name. The submission id is content-derived and
+   * so reproducible in principle, but only by re-composing the exact original body — which the
+   * operator no longer has once they have sent it.
+   *
+   * Best-effort on purpose: the submission IS accepted by the time this runs, and failing the call
+   * over a local bookkeeping write would turn a success into a reported failure and invite a
+   * re-send of something already queued. Logged loudly instead.
+   *
+   * Shared by the first-pass send and the retry, so the two cannot drift about what a landed
+   * submission records.
+   */
+  function recordIssuedSubmission(
+    agentName: string,
+    /** The STABLE key, supplied by the caller. Never re-derived from `agentName` here — that is a
+     *  display label, and this table is keyed by identity. */
+    agentId: string,
+    s: { submissionId: string; subject: string; op: SubmissionOp; intakeKeyId: string; stored: boolean },
+  ): void {
+    try {
+      const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
+      store.recordIssuedSubmission({
+        agentId,
+        submissionId: s.submissionId,
+        subjectPubkey: s.subject,
+        op: s.op,
+        intakeKeyId: s.intakeKeyId,
+        stored: s.stored,
+      });
+    } catch (err: unknown) {
+      logger.error("signal.submission.record_failed", {
+        agentName,
+        submissionId: s.submissionId,
+        reason: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
   // are wired into every signaling manager below — and the originals were FUNCTION DECLARATIONS,
   // so hoisting silently let them be CALLED 1,900 lines before they were DEFINED. A const in their
@@ -1016,8 +1143,14 @@ async function startDaemonHoldingLock(
       // from every relay it has session history with, so a message parked while signaling was down
       // is not left until the next agent start. The drain needs the node the ensure builds, which
       // is why it no longer runs beside it.
+      //
+      // AND THIRD, DOD-M15-ENDORSE-RETRY-1: re-send any sealed submission that reached no node.
+      // Deliberately outside `createReconnectDrain`'s ensure→drain contract and after it: that
+      // ordering exists because the drain needs the standing receiver the ensure rebuilds, and a
+      // submission needs neither — it needs only the stream that just came up.
       onConnected: () => {
         onSignalingConnected(agentName);
+        submissionRetries.onSignalingConnected(agentName);
       },
     });
     const entry: AgentSignaling = { signaling: mgr, getNode: () => nodeRef };
@@ -3409,8 +3542,15 @@ async function startDaemonHoldingLock(
     /** Prefixed onto every failure guidance so the operator knows what DID happen. */
     context: string;
   }): Promise<
-    | { queued: true; stored: boolean; submissionId: string; storedWarning?: string }
-    | { queued: false; reason: string; guidance: string }
+    | { queued: true; retrying?: false; stored: boolean; submissionId: string; storedWarning?: string }
+    /**
+     * DOD-M15-ENDORSE-RETRY-1 — THE DAEMON HAS IT AND IS TRYING AGAIN. Deliberately a third
+     * outcome and not a dressed-up failure: reporting this as failed sends the operator to re-run a
+     * command whose whole point was that they should not have to, and reporting it as queued claims
+     * a directory node accepted something no node has seen.
+     */
+    | { queued: false; retrying: true; submissionId: string; reason: string; guidance: string }
+    | { queued: false; retrying?: false; reason: string; guidance: string }
   > {
     const { context } = opts;
     const resolved = resolveSelectedAgent(opts.connectionId);
@@ -3447,12 +3587,85 @@ async function startDaemonHoldingLock(
         // collapsing into a generic send failure that points at the network.
         return { queued: false, reason: composed.reason, guidance: `${context} ${composed.guidance}` };
       }
+      // Resolved ONCE, and carried. `agent_name` is a display label and is reusable after a
+      // retire; every row and every queue entry below keys on this stable id instead.
+      const agentId = sessionNodeManager.resolveAgentId(sel.name);
       const sent = await sendSealedSubmission({
         signaling: getAgentSignaling(sel.name, kp, sel.pubkey).signaling,
         submissionId: composed.submissionId, intakeKeyId: composed.intakeKeyId,
         ciphertext: composed.ciphertext, logger,
       });
       if (!sent.ok) {
+        // DOD-M15-ENDORSE-RETRY-1 — WORTH RETRYING, OR A VERDICT? The typed failure decides, never
+        // a string match. `submission_refused_by_node` means a node decoded it, evaluated it and
+        // said no, and it falls straight through to the plain failure below; everything else means
+        // no node ever reached a decision, so the daemon keeps it and re-sends on the reconnect.
+        /**
+         * DO NOT HOLD A BLOB PAST ITS OWN INTAKE KEY (review M4).
+         *
+         * The sealed bytes are opened by the portal's intake key from THIS manifest. Holding them
+         * across that key's expiry produces a submission the portal cannot open and cannot even
+         * attribute — poison, with no reply possible — while the operator has been told it is held
+         * and needs nothing from them. The plain failure is the better answer: they re-run it once
+         * a current manifest is loaded, and they know to.
+         *
+         * The manifest is in hand here and nowhere inside the queue, which is why the check lives
+         * at the call site rather than in the module that owns the window.
+         */
+        const manifestExpiresAt = verifiedManifest ? Date.parse(verifiedManifest.expires) : NaN;
+        const keyOutlivesWindow =
+          Number.isFinite(manifestExpiresAt) && manifestExpiresAt - Date.now() > DEFAULT_RETRY_WINDOW_MS;
+        if (!keyOutlivesWindow) {
+          logger.warn("signal.submission.retry.not_held", {
+            agentName: sel.name,
+            submissionId: composed.submissionId,
+            reason: "intake_key_expires_within_retry_window",
+            manifestExpires: verifiedManifest?.expires ?? null,
+            impact: "the operator is told it failed rather than being told it is held",
+          });
+          return {
+            queued: false,
+            reason: sent.reason,
+            guidance:
+              `${context} it did not reach a directory node (${sent.reason}), and the daemon is NOT ` +
+              "holding it to retry: the portal intake key it is sealed to expires too soon, and a " +
+              "submission sent after that expires is one the portal cannot open or even attribute. " +
+              "Load a current consortium manifest (cello_status shows its validity), then send it again.",
+          };
+        }
+        if (isRetryableSendFailure(sent.reason)) {
+          const held = submissionRetries.enqueue(
+            {
+              agentName: sel.name,
+              agentId,
+              submissionId: composed.submissionId,
+              intakeKeyId: composed.intakeKeyId,
+              // THE SAME SEALED BYTES, carried rather than re-derived. A re-seal is randomised and a
+              // re-compose would take a new `issued_at` — which changes the content-derived id, and
+              // a changed id is a second endorsement rather than a retry.
+              ciphertext: composed.ciphertext,
+              op: opts.op,
+              subject: opts.subject,
+            },
+            sent.reason,
+          );
+          if (held) {
+            return {
+              queued: false,
+              retrying: true,
+              submissionId: composed.submissionId,
+              reason: sent.reason,
+              guidance:
+                `${context.replace(/:$/, "")} — not yet. It did not reach a directory node ` +
+                `(${sent.reason}), so the daemon is holding it and will send it as soon as the ` +
+                "directory signaling stream is back, on whichever node that is. You do NOT need to " +
+                "run this again. Run cello_attestations_issued to see where it got to. It is held IN " +
+                "MEMORY, so if the daemon restarts before it lands you will have to write it again.",
+            };
+          }
+          // The queue is full, so nothing is holding it and saying otherwise would be a lie the
+          // operator acts on. They get the plain failure and the fact that re-sending is safe.
+        }
         return { queued: false, reason: sent.reason, guidance: `${context} ${sent.guidance ?? sent.reason}` };
       }
       // F4: `sendSealedSubmission` ALREADY logs `signal.submission.queued` / `.duplicate`. Logging
@@ -3463,31 +3676,22 @@ async function startDaemonHoldingLock(
       logger.info("signal.submission.attributed", {
         agentName: sel.name, op: opts.op, submissionId: composed.submissionId, stored: sent.stored,
       });
-      // KEEP THE HANDLE, or a withdrawal has nothing to name. The submission id is content-derived,
-      // so it is reproducible in principle — but only by re-composing the exact original body, which
-      // the operator no longer has once they have sent it. Recorded in the SHARED path so every verb
-      // added after this one is covered by construction, which is the same reasoning as the
-      // `storedWarning` below.
-      //
-      // Best-effort on purpose: the submission IS accepted at this point, and failing the call over
-      // a local bookkeeping write would turn a success into a reported failure and invite a re-send
-      // of something already queued. Logged loudly instead.
-      try {
-        const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-        store.recordIssuedSubmission({
-          agentId: sessionNodeManager.resolveAgentId(sel.name),
-          submissionId: composed.submissionId,
-          subjectPubkey: opts.subject,
-          op: opts.op,
-          intakeKeyId: composed.intakeKeyId,
-          stored: sent.stored,
-        });
-      } catch (err: unknown) {
-        logger.error("signal.submission.record_failed", {
-          agentName: sel.name, submissionId: composed.submissionId,
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      }
+      // KEEP THE HANDLE, or a withdrawal has nothing to name. Recorded in the SHARED path so every
+      // verb added after this one is covered by construction, which is the same reasoning as the
+      // `storedWarning` below — and by the same helper the RETRY path uses, so the two cannot drift
+      // about what a landed submission records.
+      // A LANDED SEND RETIRES AN EARLIER GIVE-UP for the same submission. The id is content-derived,
+      // so re-issuing the same words about the same subject produces the same id — this is the "I
+      // wrote it again and it worked" case, and leaving the stale failure on the surface would show
+      // the operator two contradictory states for one submission, forever.
+      submissionRetries.clearGaveUp(agentId, composed.submissionId);
+      recordIssuedSubmission(sel.name, agentId, {
+        submissionId: composed.submissionId,
+        subject: opts.subject,
+        op: opts.op,
+        intakeKeyId: composed.intakeKeyId,
+        stored: sent.stored,
+      });
       // F1: `stored: false` means a node reports it ALREADY HELD this submission id. That is either
       // a benign retry or single-node censorship — an operator pre-inserting garbage under a
       // clear-text id — and they are indistinguishable from here. Reporting it as unqualified
@@ -3642,20 +3846,48 @@ async function startDaemonHoldingLock(
   handlers.set("wallet_list_issued", async (_params, connectionId) => {
     const sel = resolveSelectedAgent(connectionId);
     if (!sel.ok) return sel;
+    const agentId = sessionNodeManager.resolveAgentId(sel.name);
     const store = new TrustSignalStore(sessionNodeManager.getDb(), logger);
-    const rows = store.listIssuedSubmissions(sessionNodeManager.resolveAgentId(sel.name)).map((r) => ({
+    const rows = store.listIssuedSubmissions(agentId).map((r) => ({
       submission_id: r.submissionId,
       subject_pubkey: r.subjectPubkey,
       op: r.op,
       intake_key_id: r.intakeKeyId,
+      // Every row in this table reached a node. The in-flight ones below have not.
+      delivery: "accepted" as const,
       // FALSE means a node already held this id — a benign retry, or single-node censorship. The
       // operator sees the distinction here rather than only in the moment they submitted.
       stored: r.stored,
       submitted_at: r.submittedAt,
     }));
+    /**
+     * DOD-M15-ENDORSE-RETRY-1 — THE SUBMISSIONS THAT REACHED NO NODE, listed here because this is
+     * the verb whose whole question is "what happened to what I sent?".
+     *
+     * Without them a submission the daemon is retrying is INVISIBLE — the durable table only gets a
+     * row once a node accepted one — so the honest answer to that question was silence, which reads
+     * as "you sent nothing". And a give-up whose only consumer is a warn line in `daemon.log` is
+     * indistinguishable from the submission never having existed.
+     *
+     * These are IN MEMORY and do not survive a daemon restart (see submission-retry.ts). That is
+     * why they are a separate array rather than blended into `issued`: a caller must be able to
+     * tell a durable fact from a live one.
+     */
+    const inFlight = submissionRetries.list(agentId).map((p) => ({
+      submission_id: p.submissionId,
+      subject_pubkey: p.subject,
+      op: p.op,
+      intake_key_id: p.intakeKeyId,
+      delivery: p.delivery.state,
+      attempts: p.delivery.attempts,
+      last_reason: p.delivery.lastReason,
+      ...(p.delivery.state === "gave_up" ? { gave_up_because: p.delivery.gaveUpBecause } : {}),
+      guidance: p.delivery.guidance,
+    }));
     return {
       ok: true,
       issued: rows,
+      in_flight: inFlight,
       // NO BODY, and say so rather than letting its absence read as a bug. The text was the
       // operator's own words about a third party; keeping it on disk in the clear is exactly what
       // the sealed-submission path exists to prevent.
@@ -3698,9 +3930,20 @@ async function startDaemonHoldingLock(
       op: "submit", subjectKind: "agent", subject, body,
       context: "The signal was NOT submitted:",
     });
+    // DOD-M15-ENDORSE-RETRY-1 — `ok: true` with `delivery: "retrying"`, and both halves are
+    // deliberate. `ok: false` would send the agent to re-run a command the daemon is already
+    // handling, which is the exact operator work this unit exists to remove; `queued: true` would
+    // claim a directory node accepted something no node has seen. So: not a failure, not an
+    // acceptance, and named.
+    if (!res.queued && res.retrying) {
+      return {
+        ok: true, queued: false, delivery: "retrying" as const,
+        submission_id: res.submissionId, reason: res.reason, guidance: res.guidance,
+      };
+    }
     if (!res.queued) return { ok: false, reason: res.reason, guidance: res.guidance };
     return {
-      ok: true, queued: true, stored: res.stored, submission_id: res.submissionId,
+      ok: true, queued: true, delivery: "accepted" as const, stored: res.stored, submission_id: res.submissionId,
       // Deliberately NOT "issued". Nothing is minted yet: the portal must still drain, authenticate,
       // scan and mint, and the subject must then ACCEPT it before anyone else can see it. Reporting
       // this as a completed endorsement would promise three steps that have not happened.
@@ -3911,6 +4154,16 @@ async function startDaemonHoldingLock(
       op: "refuse", subjectKind: item.subjectKind, subject: item.signalHash, body: message,
       context: "The refusal is recorded. Your message was NOT sent:",
     });
+    // DOD-M15-ENDORSE-RETRY-1: the refusal itself is already recorded and unaffected either way —
+    // what is in question is only the MESSAGE back to the issuer. `message_delivery: "retrying"` is
+    // not `message_queued`, because no node has it yet, and it is not an error, because nothing is
+    // asked of the operator.
+    if (!res.queued && res.retrying) {
+      return {
+        ...refused, message_queued: false, message_delivery: "retrying" as const,
+        submission_id: res.submissionId, guidance: `The refusal is recorded. ${res.guidance}`,
+      };
+    }
     if (!res.queued) {
       return { ...refused, message_queued: false, message_error: res.reason, guidance: res.guidance };
     }
@@ -3922,7 +4175,8 @@ async function startDaemonHoldingLock(
     // under a clear-text submission_id), and folding them together destroys the only information
     // that could ever tell them apart.
     return {
-      ...refused, message_queued: true, stored: res.stored, submission_id: res.submissionId,
+      ...refused, message_queued: true, message_delivery: "accepted" as const,
+      stored: res.stored, submission_id: res.submissionId,
       ...(res.storedWarning ? { guidance: `The refusal is recorded. ${res.storedWarning}` } : {}),
     };
   });
@@ -4017,6 +4271,18 @@ async function startDaemonHoldingLock(
       body: "",
       context: "The revocation was NOT queued:",
     });
+    // DOD-M15-ENDORSE-RETRY-1: the local copy survives either way (see below), so a retrying
+    // revocation is a wait, not a loss — and the operator is told which it is rather than being
+    // sent to re-run a retraction the daemon is already carrying.
+    if (!submitted.queued && submitted.retrying) {
+      return {
+        ok: true, signal_hash: signalHash, submission_id: submitted.submissionId,
+        revoked: false, queued: false, delivery: "retrying" as const,
+        guidance:
+          `Revocation for '${row.type}' is HELD, not yet at a directory. ${submitted.guidance} ` +
+          "Your local copy is KEPT either way, deliberately, so nothing is lost while it waits.",
+      };
+    }
     if (!submitted.queued) {
       return { ok: false, reason: submitted.reason, guidance: submitted.guidance };
     }
@@ -4031,6 +4297,7 @@ async function startDaemonHoldingLock(
       submission_id: submitted.submissionId,
       revoked: false,
       queued: true,
+      delivery: "accepted" as const,
       // M5: CARRIED, not dropped. `submitForAgent`'s own comment says the warning lives in the
       // shared path "because the same omission would otherwise be available to every verb added
       // after this one" — and this was the next verb added. `stored:false` means a node already held
@@ -5449,6 +5716,12 @@ async function startDaemonHoldingLock(
     // outbound work is not draining. Above the `daemon.stopped` log with the other cancels, because
     // this is "stop making new work", not "tear down transports".
     await restartSealResolver?.stop();
+    // DOD-M15-ENDORSE-RETRY-1: same rule, same place — stop making new outbound work. Nothing is
+    // awaited: a submission send is one frame with an ack, not a ceremony, so cutting it leaves no
+    // counterparty holding a half-finished exchange. What IS lost is the pending queue itself,
+    // which is in memory by design (see submission-retry.ts) — re-sending is safe by the same
+    // content-derived id.
+    submissionRetries.stop();
     /**
      * DRAIN THE DETACHED SEAL TAILS — review MEDIUM-6, and it sits HERE for the same reason
      * `restartSealResolver.stop()` does: both are directory ceremonies that must not be cut with

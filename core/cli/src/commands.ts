@@ -802,7 +802,13 @@ export async function attestations(
       const [issued, res] = (await withIpc(lock.socketPath, (client) =>
         Promise.all([client.send("wallet_list_issued"), client.send("wallet_fetch_results")]),
       )) as [
-        { ok: boolean; reason?: string; guidance?: string; issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }> },
+        {
+          ok: boolean; reason?: string; guidance?: string;
+          issued?: Array<{ submission_id: string; subject_pubkey: string; op: string; submitted_at: number }>;
+          // DOD-M15-ENDORSE-RETRY-1: submissions that reached no directory node — the daemon is
+          // re-sending them, or gave up.
+          in_flight?: Array<{ submission_id: string; op: string; delivery: string; last_reason: string; gave_up_because?: string; guidance: string }>;
+        },
         {
           ok: boolean;
           reason?: string;
@@ -831,8 +837,30 @@ export async function attestations(
       const partial = (res.unreachable_nodes ?? []).length > 0
         ? `\n\n  ⚠ ${res.unreachable_nodes!.length} node(s) did not answer (${res.unreachable_nodes!.join(", ")}).\n    This list may be incomplete — an outcome recorded there is not shown yet.`
         : "";
+      /**
+       * DOD-M15-ENDORSE-RETRY-1 — THE ONES THAT NEVER REACHED A NODE, printed in their own block.
+       *
+       * Not merged into the table above: those rows carry an OUTCOME from a directory, and these
+       * have none because no directory has ever seen them. Printing them as `pending` would say the
+       * subject has not answered yet, about a submission nobody was ever asked about.
+       *
+       * Printed BEFORE the empty check too, or an operator whose node was down for the whole
+       * session reads "You have submitted no endorsements" while the daemon is holding three.
+       */
+      const flight = issued.in_flight ?? [];
+      const flightBlock = flight.length === 0 ? "" :
+        "\n\n  Not yet at any directory node (held in memory — a daemon restart loses these):\n" +
+        flight.map((f) => {
+          const state = f.delivery === "gave_up" ? `gave up (${f.gave_up_because ?? "unknown"})` : "retrying";
+          return `  ${state.padEnd(30)}  ${f.submission_id.slice(0, 12)}…  ${f.op}  last: ${f.last_reason}\n      ${f.guidance}`;
+        }).join("\n");
       if (rows.length === 0) {
-        return { exitCode: 0, output: "You have submitted no endorsements. Results are held until you collect them, so nothing has been missed." + partial };
+        return {
+          exitCode: 0,
+          output: (flight.length === 0
+            ? "You have submitted no endorsements. Results are held until you collect them, so nothing has been missed."
+            : "No submission has reached a directory node yet.") + flightBlock + partial,
+        };
       }
       const lines = rows.map((r) => {
         const head = `  ${r.outcome.padEnd(10)}  ${r.submission_id.slice(0, 12)}…  ${r.reason ?? "—"}`;
@@ -844,6 +872,7 @@ export async function attestations(
       return {
         exitCode: 0,
         output: [header, "  " + "─".repeat(60), ...lines].join("\n") +
+          flightBlock +
           "\n\n  A refusal is the subject declining to stand behind your claim — not a fault in it.\n" +
           "  Re-submitting a corrected version is the intended next step.\n" +
           "  'pending' means the subject has not answered yet — the submission is not lost." + partial,

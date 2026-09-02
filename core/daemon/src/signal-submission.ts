@@ -276,7 +276,17 @@ export type SubmissionSendFailure =
   // union, which made the declared type a lie a consumer could branch on: an operator surface that
   // switched on this union would have no case for either of the values it most often receives.
   | "signaling_reconnecting"
-  | "signaling_lost";
+  | "signaling_lost"
+  /**
+   * DOD-M15-ENDORSE-RETRY-1 — this daemon can no longer sign as the submitting agent, so the sealed
+   * bytes cannot be sent by anyone. Produced only by the RETRY path, where a submission composed
+   * earlier outlives the agent that wrote it.
+   *
+   * It has its own name rather than borrowing `submission_refused_by_node` because that reason
+   * states a directory node decoded, evaluated and refused the submission — none of which happened.
+   * An operator reading it would go looking at the directory for a cause that is entirely local.
+   */
+  | "submission_agent_unloaded";
 
 export type SendSubmissionResult =
   | {
