@@ -174,3 +174,74 @@ describe("DOD-M15-SEALWIRE-1: 'I cannot judge' is not 'you are lying'", () => {
     expect(v.verdict === "cannot_judge" && v.reason).toMatch(/content_hash/);
   });
 });
+
+/**
+ * `DOD-M15-UNILATERAL-1` — the completeness predicate above describes a BILATERAL leaf set, and a
+ * SOLO seal can never satisfy it.
+ */
+describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own seal", () => {
+  /** The carry a SOLO close holds: this side's messages and ONE SEAL ctrl leaf — its own. */
+  function soloCarry(msgHashes: Uint8Array[], ownCtrl: Uint8Array) {
+    const rows = msgHashes.map((h, i) => ({
+      sequenceNumber: i + 1, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB,
+      structure1Cbor: structure1(h), structure2Cbor: new Uint8Array(0),
+    }));
+    rows.push({
+      sequenceNumber: rows.length + 1, leafKind: LEAF_KIND_CTRL, senderPubkeyHex: AGENT_PUB,
+      structure1Cbor: structure1(ownCtrl), structure2Cbor: new Uint8Array(0),
+    });
+    return rows;
+  }
+
+  it("★★★ A SOLO CARRY CO-SIGNS ITS OWN SEAL — one SEAL ctrl leaf is the shape, not a gap", () => {
+    /**
+     * The counterparty is gone and never posts a SEAL ctrl leaf, so `ctrlSenders.size === 2` is
+     * unreachable here BY CONSTRUCTION. It returned `cannot_judge`, `session-ceremony.ts` refuses to
+     * co-sign anything that is not `match`, and the sealing party therefore refused to co-sign its
+     * own unilateral seal. The ceremony never reached threshold and the close came back
+     * `seal_unilateral_timeout` — the label that names our own wait rather than the cause.
+     *
+     * Measured against the real binaries before the fix: `j-unilateral` failed here with the
+     * directory having already verified the chain and recorded the counterparty ABSENT.
+     */
+    const hashes = [contentHash(1), contentHash(2), contentHash(0xc1)];
+    const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
+    expect(
+      mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), hashes.length),
+      "the certificate is over exactly the leaves this daemon sent — there is nothing left to judge",
+    ).toEqual({ verdict: "match" });
+  });
+
+  it("★★★ AND IT STILL CANNOT BE FOOLED — a solo carry whose root disagrees does not co-sign", () => {
+    /**
+     * The half that makes the fix safe rather than a hole. Agreement is what buys the early match;
+     * a certificate over anything else falls through to the completeness logic exactly as before,
+     * and a one-ctrl carry cannot accuse — it says it cannot tell.
+     */
+    const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
+    const theirs = [contentHash(9), contentHash(8), contentHash(7)];
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(theirs), 3).verdict).not.toBe("match");
+  });
+
+  it("★★ a matching root with a DISAGREEING leaf count is not a match — the certificate contradicts itself", () => {
+    /**
+     * Both values are required for the early match. A count that disagreed while the root matched
+     * would be a certificate at odds with itself, and waving that through would hand back the
+     * `leaf_count` field as an off-switch: state a count nobody holds and the check is skipped.
+     */
+    const hashes = [contentHash(1), contentHash(2), contentHash(0xc1)];
+    const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
+    expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), 99).verdict).not.toBe("match");
+  });
+
+  it("★★ a SHORT bilateral carry still cannot accuse — the fix did not widen that", () => {
+    // The same case the section above pins, re-asserted here because the early match is new code
+    // sitting directly in front of it: a two-party conversation whose peer SEAL leaf has not landed
+    // produces a different root, falls through, and answers "cannot judge" — never "you are lying".
+    const rows = completeCarry([contentHash(1)], contentHash(0xc1), contentHash(0xc2)).slice(0, 2);
+    const v = managerWith(rows).verifyCertifiedRoot(
+      AGENT_PUB, SESSION, rootOf([contentHash(1), contentHash(0xc1), contentHash(0xc2)]), 3,
+    );
+    expect(v.verdict).toBe("cannot_judge");
+  });
+});
