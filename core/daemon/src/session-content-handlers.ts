@@ -126,6 +126,36 @@ export function wasWitnessed(p: { placed: true; unwitnessed?: true } | { placed:
   return p.placed ? p.unwitnessed !== true : true;
 }
 
+/**
+ * The durably-queued path's guidance: the relay's OWN words, plus what a missing witness costs.
+ *
+ * **Exported so the test can call THIS rather than re-implement it.** The first version of the
+ * composition test rebuilt the string inline and asserted on its own copy — which stays green if
+ * production stops composing entirely, and is therefore the hollow shape this milestone keeps
+ * finding. A rule worth pinning has to be pinned on the code that runs.
+ *
+ * The rule, and why it is a composition rather than a choice: `upstream` is where the relay's own
+ * retry window reaches the operator ("try again in about 45 seconds"), and a rate-limited park is
+ * unwitnessed BY CONSTRUCTION — so choosing between the two messages silently drops the more
+ * specific one exactly when it is most useful. Both are true at once and the operator needs both.
+ *
+ * The default splits on `witnessed` for one reason only: "No action needed" is false for a leaf the
+ * relay never recorded.
+ */
+export function queuedSendGuidance(upstream: string | undefined, witnessed: boolean): string {
+  const base = upstream
+    ?? (witnessed
+      ? "The message is queued and will be re-sent automatically when the relay link is back. No action needed."
+      : "The message is queued and will be re-sent automatically when the relay link is back.");
+  if (witnessed) return base;
+  return base
+    + " The relay did NOT witness this leaf, so your record is now one leaf ahead of it. "
+    + "Ordering does not repair itself: the next message the relay does witness will report this "
+    + "session as diverged, and a diverged session can never be sealed with the counterparty. The "
+    + "re-send is automatic — do not send it again yourself. If the receipt matters, close rather "
+    + "than continuing.";
+}
+
 export function sentAuthorship(
   r: Awaited<ReturnType<SessionNodeManager["sendContent"]>>,
 ): { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined {
@@ -656,23 +686,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
            *
            * Both facts hold at once and the operator needs both — what the relay said to do, and
            * what the missing witness will cost. So upstream is kept VERBATIM and the unwitnessed
-           * note is APPENDED to it.
-           *
-           * The default splits on witnessing for one reason only: "No action needed" is false for a
-           * leaf the relay never recorded.
+           * note is APPENDED to it, by `queuedSendGuidance`, which the test calls directly rather
+           * than re-implementing.
            */
-          guidance:
-            (sendResult.guidance
-              ?? (wasWitnessed(placed)
-                ? "The message is queued and will be re-sent automatically when the relay link is back. No action needed."
-                : "The message is queued and will be re-sent automatically when the relay link is back."))
-            + (wasWitnessed(placed)
-              ? ""
-              : " The relay did NOT witness this leaf, so your record is now one leaf ahead of it. "
-                + "Ordering does not repair itself: the next message the relay does witness will "
-                + "report this session as diverged, and a diverged session can never be sealed with "
-                + "the counterparty. The re-send is automatic — do not send it again yourself. If "
-                + "the receipt matters, close rather than continuing."),
+          guidance: queuedSendGuidance(sendResult.guidance, wasWitnessed(placed)),
         };
       }
       return {

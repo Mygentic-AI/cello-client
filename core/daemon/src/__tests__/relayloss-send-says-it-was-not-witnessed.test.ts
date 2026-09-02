@@ -27,6 +27,7 @@
  */
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { queuedSendGuidance } from "../session-content-handlers.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
 const SID = "5c".repeat(32);
@@ -146,12 +147,15 @@ describe("016-RELAYLOSS — an unwitnessed send is not reported as an ordinary s
    */
   it("★ an unwitnessed queued send keeps the relay's own words and ADDS to them", () => {
     const upstream = "The relay is throttling this agent; try again in about 45 seconds.";
-    // The composition exactly as the handler performs it on the durably-queued path.
-    const compose = (up: string | undefined, witnessed: boolean): string =>
-      (up ?? (witnessed
-        ? "The message is queued and will be re-sent automatically when the relay link is back. No action needed."
-        : "The message is queued and will be re-sent automatically when the relay link is back."))
-      + (witnessed ? "" : " The relay did NOT witness this leaf, so your record is now one leaf ahead of it.");
+    /**
+     * `queuedSendGuidance` is the PRODUCTION function, imported, not a copy of it.
+     *
+     * The first version of this test rebuilt the composition inline and asserted against its own
+     * copy — which stays green if production stops composing altogether, and would have pinned
+     * nothing. That is the hollow shape this milestone keeps finding, and it appeared here in the
+     * test written to close a regression about exactly that kind of silent substitution.
+     */
+    const compose = queuedSendGuidance;
 
     const unwitnessed = compose(upstream, false);
     expect(unwitnessed, "the relay's OWN retry window must survive verbatim").toContain(upstream);
