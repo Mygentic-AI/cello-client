@@ -90,8 +90,9 @@ describe("DOD-M15-CORROBORATE-1 (client): a relay's witness alert reaches the op
   it("★★ an alert from a relay that could not name itself still lands, with the witness marked unnamed", async () => {
     const seen: RelayWitnessAlert[] = [];
     const { client, relay } = await connectedClient({ onWitnessAlert: (a) => { seen.push(a); } });
-    const { relay_id: _omitted, ...noRelayId } = WELL_FORMED;
-    relay.push({ ...noRelayId, submitter_is_counterparty: false });
+    const noRelayId: Record<string, unknown> = { ...WELL_FORMED, submitter_is_counterparty: false };
+    delete noRelayId["relay_id"];
+    relay.push(noRelayId);
     await tick();
     expect(seen.length).toBe(1);
     expect(seen[0]!.relayId, "absent, not invented — the operator must be able to tell").toBeNull();
