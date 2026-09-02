@@ -43,6 +43,17 @@ function contentHash(fill: number): Uint8Array {
   return new Uint8Array(32).fill(fill);
 }
 
+/**
+ * Structure 1 with a REAL `last_seen_seq` — `DOD-M15-UNILATERAL-1`.
+ *
+ * `structure1()` above hardcodes 0, which is fine for a root comparison (it reads index 1 only) and
+ * useless for the countersigned boundary, which reads index 4. A fixture that always says 0 cannot
+ * tell "acknowledged nothing" from "the field is ignored".
+ */
+function s1WithLastSeen(hash: Uint8Array, lastSeenSeq: number): Uint8Array {
+  return new Uint8Array(encode([1, hash, new Uint8Array(32), new Uint8Array(16), lastSeenSeq, 1]));
+}
+
 const COUNTERPARTY_PUB = "cc".repeat(32);
 const LEAF_KIND_MSG = 0x00;
 const LEAF_KIND_CTRL = 0x02;
@@ -232,6 +243,67 @@ describe("DOD-M15-UNILATERAL-1: the solo path must be able to co-sign its own se
     const hashes = [contentHash(1), contentHash(2), contentHash(0xc1)];
     const mgr = managerWith(soloCarry([contentHash(1), contentHash(2)], contentHash(0xc1)));
     expect(mgr.verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf(hashes), 99).verdict).not.toBe("match");
+  });
+
+  it("★★★ THE BOUNDARY IS DERIVED FROM THE CARRY, AND IT IS NOT ALWAYS ZERO", () => {
+    /**
+     * Review T2/F2. The only assertion on this value was a live journey expecting `0`, which
+     * `countersigned_through_seq: 0` as the whole implementation would satisfy. And the first
+     * implementation derived it from the certificate's own participant list — on the solo path
+     * nothing there is bound to the seal signature, so it was arithmetic over somebody else's
+     * claim. It is derived from this daemon's own leaves now, where the counterparty's signature
+     * covers both inputs.
+     *
+     * A speaks (1), B replies (2) acknowledging 1, A speaks again (3), A closes (4). B's signature
+     * reaches 2: they authored it, and they acknowledged nothing later. So leaves 1–2 are mutually
+     * signed and 3–4 are the uncountersigned tail. The expected value is 2 — not 0, and not 4.
+     */
+    const mgr = managerWith([
+      { sequenceNumber: 1, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(1), 0) },
+      { sequenceNumber: 2, leafKind: LEAF_KIND_MSG, senderPubkeyHex: COUNTERPARTY_PUB, structure1Cbor: s1WithLastSeen(contentHash(2), 1) },
+      { sequenceNumber: 3, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(3), 2) },
+      { sequenceNumber: 4, leafKind: LEAF_KIND_CTRL, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(4), 2) },
+    ]);
+    expect(mgr.countersignedThroughSeqFromCarry(AGENT_PUB, SESSION)).toBe(2);
+  });
+
+  it("★★ a party's ACKNOWLEDGEMENT moves the boundary, not just what they authored", () => {
+    /**
+     * Review T3: every earlier fixture satisfied `min(last_authored_seq)` on its own, so a mutation
+     * replacing `max(authored, acknowledged)` with `acknowledged` — or with `authored` — stayed
+     * green. A signature reaches what it ACKNOWLEDGES as well as what it authored: B's leaf at 2
+     * signs "I have seen 3", so B's commitment reaches 3 even though B authored only 2.
+     */
+    const mgr = managerWith([
+      { sequenceNumber: 1, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(1), 0) },
+      { sequenceNumber: 2, leafKind: LEAF_KIND_MSG, senderPubkeyHex: COUNTERPARTY_PUB, structure1Cbor: s1WithLastSeen(contentHash(2), 3) },
+      { sequenceNumber: 3, leafKind: LEAF_KIND_CTRL, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(3), 2) },
+    ]);
+    // B authored 2 but acknowledged 3 ⇒ B reaches 3. A authored 3 ⇒ A reaches 3. min = 3.
+    expect(mgr.countersignedThroughSeqFromCarry(AGENT_PUB, SESSION)).toBe(3);
+  });
+
+  it("★★ ONE author means nothing is countersigned — the receipt may not claim a prefix", () => {
+    /**
+     * The solo shape: the counterparty only ever received, so no leaf anywhere carries their
+     * signature. Deriving `min` over the authors PRESENT would report the whole transcript mutually
+     * signed, which is the conflation the field exists to prevent.
+     */
+    const mgr = managerWith([
+      { sequenceNumber: 1, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(1), 0) },
+      { sequenceNumber: 2, leafKind: LEAF_KIND_CTRL, senderPubkeyHex: AGENT_PUB, structure1Cbor: s1WithLastSeen(contentHash(2), 0) },
+    ]);
+    expect(mgr.countersignedThroughSeqFromCarry(AGENT_PUB, SESSION)).toBe(0);
+  });
+
+  it("★★ an unreadable or empty carry yields NO boundary rather than a guessed one", () => {
+    // null, not 0. `0` is a derived claim ("nobody countersigned"); absence says this daemon could
+    // not establish the boundary at all. Collapsing them would publish a claim it never derived.
+    expect(managerWith([]).countersignedThroughSeqFromCarry(AGENT_PUB, SESSION)).toBeNull();
+    const junk = managerWith([
+      { sequenceNumber: 1, leafKind: LEAF_KIND_MSG, senderPubkeyHex: AGENT_PUB, structure1Cbor: new Uint8Array([0xff, 0xff]) },
+    ]);
+    expect(junk.countersignedThroughSeqFromCarry(AGENT_PUB, SESSION)).toBeNull();
   });
 
   it("★★ a SHORT bilateral carry still cannot accuse — the fix did not widen that", () => {

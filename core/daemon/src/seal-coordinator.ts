@@ -174,9 +174,57 @@ function keepCertifiedLeafSet(
  * seal_unilateral_too_early countdown, so the close can tell the operator WHEN a unilateral seal
  * becomes available.
  */
+/**
+ * WHICH "not now" the directory meant — `DOD-M15-UNILATERAL-1`, review F1.
+ *
+ * The three refusals share one frame because the client's behaviour is the same for all of them
+ * (the session is intact, retry, never force-abandon). They do NOT share guidance: whether waiting
+ * will ever help is different in each, and telling someone to wait out a grace window that expired
+ * two hours ago is worse than saying nothing.
+ */
+export type UnilateralRefusalCause = "too_early" | "counterparty_present" | "high_stakes_evidence_required";
+
+/**
+ * Stamp the receipt with WHERE THE MUTUALLY-SIGNED PREFIX ENDS, derived locally —
+ * `DOD-M15-UNILATERAL-1`, review F2.
+ *
+ * Called on every path that persists a certificate, immediately before it is written, so the stored
+ * receipt's boundary is always this daemon's own arithmetic over leaves the counterparty signed —
+ * never a number the certificate supplied. On a solo seal nothing in that certificate is bound to
+ * the seal signature, so a published boundary is a claim; this replaces it with a derivation.
+ *
+ * When the carry cannot answer, the field is LEFT ABSENT and said so out loud. Absent reads as "this
+ * daemon could not establish the boundary", which is true and checkable; a fallback number would
+ * read as an established one.
+ */
+function stampCountersignedBoundary(
+  deps: { logger: Logger; sessionNodeManager: SessionNodeManager },
+  agentPubkeyHex: string,
+  sessionIdHex: string,
+  legibility: unknown,
+  path: string,
+): void {
+  if (!legibility || typeof legibility !== "object") return;
+  const derived = deps.sessionNodeManager.countersignedThroughSeqFromCarry(agentPubkeyHex, sessionIdHex);
+  if (derived === null) {
+    deps.logger.warn("seal.certificate.countersigned_boundary.underivable", {
+      sessionId: sessionIdHex,
+      path,
+      impact:
+        "the stored receipt does not say where both parties' signatures stop covering it, because " +
+        "this daemon's own leaf record could not answer. The seal itself is unaffected; a reader " +
+        "cannot tell the mutually-signed prefix from the uncountersigned tail from this receipt.",
+      guidance:
+        "Compare with the counterparty's receipt, which is derived from their own copy of the same leaves.",
+    });
+    return;
+  }
+  (legibility as { countersigned_through_seq?: number }).countersigned_through_seq = derived;
+}
+
 export type UnilateralResult =
   | { ok: true; sealedRootHex: string; legibility?: unknown }
-  | { ok: false; reason: string; remainingSeconds?: number };
+  | { ok: false; reason: string; remainingSeconds?: number; cause?: UnilateralRefusalCause };
 
 export interface SealCoordinatorDeps {
   logger: Logger;
@@ -490,6 +538,8 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         }
 
         if (legibility !== undefined) {
+          // F2: the boundary is derived from THIS daemon's signed carry, never from the certificate.
+          stampCountersignedBoundary({ logger, sessionNodeManager }, agentPubkeyHex, sidHex, legibility, "bilateral");
           try {
             sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
           } catch (error) {
@@ -564,10 +614,21 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         // F20: thread the directory's remaining_seconds through so the close guidance can
         // say when the unilateral seal becomes available.
         const rs = frame["remaining_seconds"];
+        /**
+         * Review F1: carry WHICH refusal it was, against the closed set. An unrecognised value is
+         * dropped rather than passed through — the guidance switches on this, and an unknown string
+         * would land on the default anyway; dropping it gets there without pretending we understood.
+         */
+        const rawCause = frame["cause"];
+        const cause: UnilateralRefusalCause | undefined =
+          rawCause === "too_early" || rawCause === "counterparty_present" || rawCause === "high_stakes_evidence_required"
+            ? rawCause
+            : undefined;
         waiter({
           ok: false,
           reason: "seal_unilateral_too_early",
           ...(typeof rs === "number" ? { remainingSeconds: rs } : {}),
+          ...(cause !== undefined ? { cause } : {}),
         });
         return;
       }
@@ -693,6 +754,9 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         }
 
         if (legibility !== undefined) {
+          // F2: the boundary is derived from THIS daemon's signed carry, never from the certificate.
+          // Stamped AFTER the frontier corrections above so nothing downstream can reorder past it.
+          stampCountersignedBoundary({ logger, sessionNodeManager }, agentPubkeyHex, sidHex, legibility, "unilateral");
           try {
             sessionNodeManager.recordSealCertificate(agentName, sidHex, rootHex, JSON.stringify(legibility));
             logger.info("session.unilateral.receipt.persisted", {
@@ -806,6 +870,10 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             const rootHex = frameValueToHex(frame["sealed_root"]);
             const counterpartyHex = frameValueToHex(frame["present_pubkey"]); // A — the present party
             if (legibility !== undefined && rootHex && counterpartyHex) {
+              // F2: derived locally here too. This is the ABSENT party persisting its own copy, and
+              // it holds the same leaves — so it can answer the boundary for itself rather than
+              // inheriting the number from the notification it was sent.
+              stampCountersignedBoundary({ logger, sessionNodeManager }, agentPubkeyHex, sidHex, legibility, "unilateral_notification");
               sessionNodeManager.recordSealCertificateEnsuringRow(agentName, sidHex, counterpartyHex, rootHex, JSON.stringify(legibility));
               logger.info("session.unilateral.receipt.persisted", { sessionId: sidHex, sealedRoot: rootHex, party: "absent" });
               keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "unilateral_notification");

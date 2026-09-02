@@ -64,22 +64,18 @@ export function normalizeLegibility(raw: unknown): unknown | undefined {
     participants,
     final_message,
     /**
-     * `DOD-M15-UNILATERAL-1` — WHERE THIS RECEIPT STOPS BEING AS STRONG AS A BILATERAL ONE.
+     * ⚠️ `countersigned_through_seq` IS DELIBERATELY NOT SET HERE — `DOD-M15-UNILATERAL-1`, F2.
      *
-     * **RECOMPUTED HERE, NEVER READ OFF THE WIRE**, and that is the whole point. The directory
-     * publishes the same number, but it is not folded into the legibility hash the seal signature
-     * binds — so a value taken from the frame would be a value a tampering path could set. Every
-     * INPUT is bound, so deriving it locally costs nothing and cannot be steered.
+     * It was, computed from the participants just above, and described as "recomputed, cannot be
+     * steered". Those participants come off the WIRE. On a solo seal the certificate's TBS binds no
+     * legibility at all, and the client verifies only the live party's frontier — so the absent
+     * party's numbers, which are exactly the ones that decide this boundary, arrive unchecked.
+     * Deriving from them looked like verification and was arithmetic on somebody else's claim.
      *
-     * Everything at or below this sequence carries BOTH parties' signatures. Everything above it is
-     * the uncountersigned tail: composed and witnessed, never signed for by the party who had gone.
-     * A consumer that conflates the two reads "they never answered this" as "they agreed to this".
+     * The boundary is stamped by the seal coordinator instead, from this daemon's own signed carry
+     * (`countersignedThroughSeqFromCarry`), where the counterparty's own signature covers both
+     * inputs. Absent here means "not yet derived", and a receipt that reaches persistence without it
+     * says the boundary could not be established rather than guessing one.
      */
-    countersigned_through_seq: participants.length === 0
-      ? 0
-      : participants.reduce(
-          (lowest, p) => Math.min(lowest, Math.max(p.content_frontier_seq ?? 0, p.last_authored_seq ?? 0)),
-          Number.POSITIVE_INFINITY,
-        ),
   };
 }

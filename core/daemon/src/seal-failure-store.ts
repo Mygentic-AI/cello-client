@@ -151,7 +151,11 @@ export function describeSealFailed(opts: {
         "retrying it right now. Read the reason before acting: seal_counterparty_pending and " +
         "seal_unilateral_timeout mean the other side has not closed yet, and the fix is to wait for " +
         "them (or retry later, once the directory's delivery-grace window has elapsed and a " +
-        "unilateral seal becomes available). Reasons naming this daemon — an agent that is not " +
+        "unilateral seal becomes available). seal_counterparty_present means the opposite — they " +
+        "are ONLINE, so close together and the seal completes bilaterally. " +
+        "seal_high_stakes_evidence_required means this conversation was opened high-stakes and no " +
+        "relay ever saw the counterparty leave, so waiting helps only if they connect and then go. " +
+        "Reasons naming this daemon — an agent that is not " +
         "started, a directory it cannot reach — are fixed locally; check cello_status. Your SEAL " +
         "commitment is durable and the conversation is intact, so the receipt is unproduced rather " +
         "than lost. Retry with cello_close_session. Do NOT use { force: true }: that abandons the " +
