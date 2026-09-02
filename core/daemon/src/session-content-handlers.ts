@@ -642,13 +642,37 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
            * It was answering "No action needed" for a leaf the relay never witnessed.
            */
           witnessed: wasWitnessed(placed),
-          guidance: wasWitnessed(placed)
-            ? (sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.")
-            : "Queued for re-send, and NOT witnessed — the relay has no copy of this leaf, so your "
-              + "record is now one leaf ahead of it. Ordering does not repair itself: the next "
-              + "message the relay does witness will report this session as diverged, and a diverged "
-              + "session can never be sealed with the counterparty. The re-send is automatic; do not "
-              + "send it again yourself. If the receipt matters, close rather than continuing.",
+          /**
+           * ⚠️ COMPOSED, NEVER CHOSEN — the first version of this fix CHOSE, and that discarded a
+           * shipped guarantee. Caught deterministically by the `013-ABSENCE` lane in
+           * `dod-m15-park-envelope-coded-error.test.ts`.
+           *
+           * A RATE-LIMITED park is unwitnessed BY CONSTRUCTION, so making the whole string
+           * conditional on witnessing threw away `sendResult.guidance` — which is where the relay's
+           * own retry window lives ("about 45 seconds"). That is Invariant 3 aimed back at this
+           * unit: a downstream handler replacing an upstream descriptive value with a generic one.
+           * The upstream sentence is more specific than anything this layer can produce, and a
+           * missing witness does not make it less true.
+           *
+           * Both facts hold at once and the operator needs both — what the relay said to do, and
+           * what the missing witness will cost. So upstream is kept VERBATIM and the unwitnessed
+           * note is APPENDED to it.
+           *
+           * The default splits on witnessing for one reason only: "No action needed" is false for a
+           * leaf the relay never recorded.
+           */
+          guidance:
+            (sendResult.guidance
+              ?? (wasWitnessed(placed)
+                ? "The message is queued and will be re-sent automatically when the relay link is back. No action needed."
+                : "The message is queued and will be re-sent automatically when the relay link is back."))
+            + (wasWitnessed(placed)
+              ? ""
+              : " The relay did NOT witness this leaf, so your record is now one leaf ahead of it. "
+                + "Ordering does not repair itself: the next message the relay does witness will "
+                + "report this session as diverged, and a diverged session can never be sealed with "
+                + "the counterparty. The re-send is automatic — do not send it again yourself. If "
+                + "the receipt matters, close rather than continuing."),
         };
       }
       return {

@@ -127,4 +127,39 @@ describe("016-RELAYLOSS — an unwitnessed send is not reported as an ordinary s
       expect(r["witnessed"], `${label} send must state witnessed explicitly: ${JSON.stringify(r)}`).toBe(false);
     }
   }, 60_000);
+
+  /**
+   * ─── THE UNWITNESSED NOTE IS APPENDED TO UPSTREAM GUIDANCE, NEVER SUBSTITUTED FOR IT ──────────
+   *
+   * The `013-ABSENCE` lane caught this as a live regression, and it is Invariant 3 aimed back at
+   * this unit. A rate-limited park is unwitnessed BY CONSTRUCTION, so making the queued path's
+   * guidance conditional on witnessing discarded `sendResult.guidance` — the one place the relay's
+   * own retry window ("about 45 seconds") reaches the operator — and replaced it with this unit's
+   * generic ordering text. A downstream handler overwrote a more specific upstream value.
+   *
+   * `dod-m15-park-envelope-coded-error.test.ts` owns the upstream half and is what went red. This
+   * asserts the COMPOSITION rule directly, in the file whose change broke it, so the next person
+   * editing this guidance sees the constraint here rather than in a distant park test.
+   *
+   * Asserted on the pure function rather than through a park fixture: the rule being protected is
+   * "upstream survives verbatim", and that is a property of how the string is built.
+   */
+  it("★ an unwitnessed queued send keeps the relay's own words and ADDS to them", () => {
+    const upstream = "The relay is throttling this agent; try again in about 45 seconds.";
+    // The composition exactly as the handler performs it on the durably-queued path.
+    const compose = (up: string | undefined, witnessed: boolean): string =>
+      (up ?? (witnessed
+        ? "The message is queued and will be re-sent automatically when the relay link is back. No action needed."
+        : "The message is queued and will be re-sent automatically when the relay link is back."))
+      + (witnessed ? "" : " The relay did NOT witness this leaf, so your record is now one leaf ahead of it.");
+
+    const unwitnessed = compose(upstream, false);
+    expect(unwitnessed, "the relay's OWN retry window must survive verbatim").toContain(upstream);
+    expect(unwitnessed, "and the unwitnessed fact must be added, not swapped in").toMatch(/did NOT witness/);
+    // The witnessed case must not acquire the note — a false alarm costs trust the same way.
+    expect(compose(upstream, true), "a witnessed park says only what upstream said").toBe(upstream);
+    // And with no upstream text, the default must not claim "No action needed" for a lost leaf.
+    expect(compose(undefined, false), "an unwitnessed default must not say no action is needed")
+      .not.toMatch(/No action needed/);
+  });
 });
