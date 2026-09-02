@@ -320,6 +320,12 @@ counterparty, whose copy can issue it), `local_tree_diverged` (this machine's re
 that was certified), `session_unsalted`, and `message_not_in_session` are each a different situation
 with a different next step. A refusal here is information, not a failure to route around.
 
+**Handing someone a proof also hands them this session's salt.** It has to travel, or the proof is
+about a number rather than a sentence. But the salt is per SESSION, so whoever holds one proof can
+test guessed wording against any leaf in that conversation — share a proof with the same care you
+would share the transcript. It does not let them forge anything into the record, or read a message
+they were not given.
+
 **The backup file is as sensitive as a private key.** It contains the agent's encrypted database
 *and* the key that opens it — both, because a database without its key restores to something nobody
 can read, including you. Anyone holding that file can sign as this agent and read every transcript

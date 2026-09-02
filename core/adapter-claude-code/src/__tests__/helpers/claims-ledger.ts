@@ -109,6 +109,40 @@ export function countClaimWords(text: string): number {
 export const ADJUDICATED: AdjudicatedClaim[] = [
   {
     surface: "core/adapter-claude-code/SKILL.md",
+    claim: "Handing someone a proof also hands them this session's salt",
+    excerpts: ["**Handing someone a proof also hands them this session's salt.**"],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "THE DISCLOSURE, not a claim — review F2, and its omission is what made the surrounding block " +
+      "dishonest. `inclusion-proof-handlers.ts` puts `content_salt` in every issued proof, and it must: " +
+      "without it a verifier cannot recompute the leaf and the proof is about a number. But the salt is " +
+      "per SESSION (`sessions.content_salt`, one row), so a recipient can test guessed plaintext against " +
+      "every leaf hash in that session — exactly the correlation the neighbouring `unsalted_proof_refused` " +
+      "guidance spends four lines refusing to grant. Saying nothing left this surface arguing for a " +
+      "privacy property while trading it away. Both stated limits are real: forging needs a preimage of a " +
+      "certified leaf, and the salt reveals no message the holder was not already given. Carried on the " +
+      "tool response too, in `discloses`.",
+  },
+  {
+    surface: "plugins/cello/skills/cello/SKILL.md",
+    claim: "Handing someone a proof also hands them this session's salt",
+    excerpts: ["**Handing someone a proof also hands them this session's salt.**"],
+    verdict: "true",
+    enforcedBy: "structural",
+    evidence:
+      "THE DISCLOSURE, not a claim — review F2, and its omission is what made the surrounding block " +
+      "dishonest. `inclusion-proof-handlers.ts` puts `content_salt` in every issued proof, and it must: " +
+      "without it a verifier cannot recompute the leaf and the proof is about a number. But the salt is " +
+      "per SESSION (`sessions.content_salt`, one row), so a recipient can test guessed plaintext against " +
+      "every leaf hash in that session — exactly the correlation the neighbouring `unsalted_proof_refused` " +
+      "guidance spends four lines refusing to grant. Saying nothing left this surface arguing for a " +
+      "privacy property while trading it away. Both stated limits are real: forging needs a preimage of a " +
+      "certified leaf, and the salt reveals no message the holder was not already given. Carried on the " +
+      "tool response too, in `discloses`.",
+  },
+  {
+    surface: "core/adapter-claude-code/SKILL.md",
     claim: "Backup, restore and message-level proof are all live, and the verifier needs no daemon access",
     excerpts: [
       "estore, and message-level proof are all live",
