@@ -493,10 +493,20 @@ server.tool("cello_initiate_session", "Start a new CELLO session with a target a
     "record saying 'they were absent' would matter to someone.",
   ),
 }, async ({ target_pubkey, agent, high_stakes }) => {
-  const params: Record<string, unknown> = { target_pubkey };
-  if (agent) params["agent"] = agent;
-  if (high_stakes === true) params["high_stakes"] = true;
-  const result = await proxy.call("cello_initiate_session", params);
+  /**
+   * `agent` is forwarded UNCONDITIONALLY. `z.string().optional()` accepts `""`, so a truthiness
+   * test would send the daemon "no agent given" for an operator who named one badly, and the call
+   * would run as whatever desk the connection happens to hold — the exact misroute the parameter
+   * exists to prevent. Let the daemon refuse an empty name; do not silence it here.
+   *
+   * `high_stakes` is different and is deliberately conditional: only a literal `true` may reach the
+   * tier, because the tier can WITHHOLD a receipt.
+   */
+  const result = await proxy.call("cello_initiate_session", {
+    target_pubkey,
+    agent,
+    ...(high_stakes === true ? { high_stakes: true } : {}),
+  });
   return jsonText(result);
 });
 
