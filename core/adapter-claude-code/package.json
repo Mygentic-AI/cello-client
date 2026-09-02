@@ -22,10 +22,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@cello-protocol/crypto": "workspace:*",
-    "@cello-protocol/interfaces": "0.0.3",
-    "@cello-protocol/transport": "workspace:*",
-    "@libp2p/peer-id": "^6.0.8",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.2"
   },
@@ -34,6 +30,7 @@
     "@claude-flow/testing": "3.0.0-alpha.6",
     "@types/node": "^25.6.2",
     "cbor-x": "^1.6.0",
-    "it-length-prefixed": "^10.0.1"
+    "it-length-prefixed": "^10.0.1",
+    "@cello-protocol/crypto": "workspace:*"
   }
 }
