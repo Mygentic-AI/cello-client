@@ -819,13 +819,61 @@ server.tool("cello_transcript", "Get the durable, readable conversation transcri
   return jsonText(result);
 });
 
-server.tool("cello_get_inclusion_proof", "Get inclusion proof for a message in a sealed session", {
-  cello_session_id: z.string().describe("Session ID"),
-  content_hash: z.string().describe("Content hash to prove inclusion of"),
-}, async ({ cello_session_id: session_id, content_hash }) => {
-  const result = await proxy.call("cello_get_inclusion_proof", { session_id, content_hash });
-  return jsonText(result);
-});
+// DOD-M15-INCLUSION-1. The description used to read "Get inclusion proof for a message in a sealed
+// session" while the handler returned `not_implemented`, and it took a `content_hash` — an opaque
+// number, when the operator's question is about a sentence. Both are corrected: the tool takes the
+// MESSAGE, and the description says what the proof does and does not establish.
+server.tool(
+  "cello_get_inclusion_proof",
+  "Prove that ONE message is in a sealed conversation. Returns a Merkle proof binding the message's " +
+    "bytes to the root the directory notarized — check it with cello_verify_inclusion_proof. Refuses " +
+    "(rather than proving something weaker) if the session is not sealed, if this side's record " +
+    "disagrees with the certificate, or if the message is not in the sealed record.",
+  {
+    cello_session_id: z.string().describe("Session ID of the SEALED session"),
+    message: z
+      .string()
+      .describe("The exact text of the message to prove, copied from cello_transcript — the proof is over its bytes"),
+    leaf_index: z
+      .number()
+      .int()
+      .optional()
+      .describe("Only when the same text was sent more than once: which occurrence to prove"),
+    agent: z.string().optional().describe("Agent whose session this is (defaults to the current agent)"),
+  },
+  async ({ cello_session_id: session_id, message, leaf_index, agent }) => {
+    const result = await proxy.call("cello_get_inclusion_proof", {
+      session_id,
+      message,
+      ...(leaf_index === undefined ? {} : { leaf_index }),
+      ...(agent ? { agent } : {}),
+    });
+    return jsonText(result);
+  },
+);
+
+// The other half, and the reason the first one is a proof rather than a data structure. It reads no
+// session and no database — proof, message, root — so a third party who has never spoken to either
+// party can run it against the certificate they were handed.
+server.tool(
+  "cello_verify_inclusion_proof",
+  "Check an inclusion proof from cello_get_inclusion_proof. Needs only the proof, the message text, " +
+    "and the certified root from the sealed receipt — no access to the daemon that issued it. Rejects " +
+    "a message altered by even one byte, and rejects a proof whose root is not the certificate's.",
+  {
+    proof: z
+      .union([z.string(), z.record(z.string(), z.unknown())])
+      .describe("The proof object from cello_get_inclusion_proof (or its JSON text, pasted verbatim)"),
+    message: z.string().describe("The exact message text the proof claims to be about"),
+    certified_root: z
+      .string()
+      .describe("sealed_root from the certificate (cello_sealed_receipt) — NOT the root inside the proof"),
+  },
+  async ({ proof, message, certified_root }) => {
+    const result = await proxy.call("cello_verify_inclusion_proof", { proof, message, certified_root });
+    return jsonText(result);
+  },
+);
 
 // ─── Connect stdio transport ─────────────────────────────────────────────────
 const transport = new StdioServerTransport();

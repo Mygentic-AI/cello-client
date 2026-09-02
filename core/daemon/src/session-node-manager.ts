@@ -85,6 +85,8 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
+import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
+import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { addColumnIfMissing } from "./column-birth.js";
 import {
   GATEWAY_UNAVAILABLE,
@@ -2285,6 +2287,54 @@ export class SessionNodeManager {
         created_at INTEGER NOT NULL,
         -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
         PRIMARY KEY (agent_id, session_id, leaf_index)
+      )
+    `);
+
+    // DOD-M15-INCLUSION-1: the leaf set the DIRECTORY certified — a different tree from the one
+    // above, and the distinction is the whole reason this table exists.
+    //
+    // `session_tree_leaves` holds this agent's CONTENT leaves. The certified root covers every leaf
+    // the relay ordered, CONTROL leaves included, and nothing appends a ctrl leaf to the local tree
+    // (`submitSealLeaf` computes its root without mutating it). So an audit path built from
+    // `session_tree_leaves` lands on a root no certificate names — it proves this machine agrees
+    // with itself, which is worth nothing to the third party a proof is FOR.
+    //
+    // Rows land only after the Merkle root over them reproduces the FROST-signed `sealed_root`
+    // (`certifiedLeafSetFrom`), so what is stored here is the consortium's leaf set and not the
+    // directory's word for it. Written once at seal time; read only by the inclusion-proof surface,
+    // ORDER BY leaf_index.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS session_certified_leaves (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        leaf_index INTEGER NOT NULL,
+        content_hash_hex TEXT NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        -- DOD-LOOP-1: composite key so each agent's end of a loopback session keeps its own set.
+        PRIMARY KEY (agent_id, session_id, leaf_index)
+      )
+    `);
+
+    // WHY a session has no certified leaf set — fallback-finder finding 1, and the reason it is a
+    // TABLE rather than a log line.
+    //
+    // `getCertifiedLeafSet` returns null for four different situations: no seal frame ever carried
+    // the leaves, the directory shipped a set that does not reproduce the root it signed, a leaf was
+    // malformed, or the write failed. The worst of those — a directory contradicting its own FROST
+    // signature — is the strongest misbehaviour signal this client can produce, and it was going to
+    // one ERROR line while the operator was told the most benign of the four: "normal for the party
+    // that was absent at seal time." A detection whose only consumer is a log is not a control.
+    //
+    // One row per session, replaced on every attempt, so the state is the LAST thing that happened
+    // rather than a history. Read only by the inclusion-proof surface, to name the cause.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS session_certified_leaves_state (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        detail TEXT,
+        recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id)
       )
     `);
 
@@ -6235,6 +6285,177 @@ export class SessionNodeManager {
       return null;
     }
     return { sealed_root: row.sealed_root_hex, legibility };
+  }
+
+  /**
+   * DOD-M15-INCLUSION-1: keep the leaf set the certificate is signed over, so one message can later
+   * be proved to sit under it.
+   *
+   * REFUSES unless the hashes reproduce `sealedRootHex` — `certifiedLeafSetFrom` does that check and
+   * this method never bypasses it. That is what separates "the leaves the directory sent" from "the
+   * leaves the consortium signed", and only the second is worth storing: a proof built on the first
+   * would inherit whatever the directory chose to say.
+   *
+   * Idempotent (INSERT OR REPLACE keyed on leaf_index) so a re-delivered seal frame, or a unilateral
+   * seal later upgraded to bilateral, rewrites the same rows instead of failing or doubling them.
+   *
+   * @returns whether the set was accepted and stored.
+   */
+  recordCertifiedLeafSet(
+    agentName: string,
+    sessionId: string,
+    signedLeaves: readonly SealFrontierLeaf[],
+    sealedRootHex: string,
+    correlationId?: string,
+  ): boolean {
+    if (!this.#db) return false;
+    const resolved = certifiedLeafSetFrom(signedLeaves, sealedRootHex);
+    if (!resolved.ok) {
+      // The CAUSE is written where the proof surface can read it — fallback-finder finding 1. Without
+      // this row, `sealed_leaves_root_disagrees` (a directory contradicting its own FROST signature)
+      // and "this side was simply absent" are the same `null` downstream, and the operator is told
+      // the second.
+      this.#noteCertifiedLeafState(agentName, sessionId, resolved.reason, resolved.detail);
+      // LOUD, and it names which of the two it is. `sealed_leaves_root_disagrees` in particular is
+      // the directory shipping a leaf set that is not the one it signed — the receipt still stands
+      // (its own signature is checked elsewhere), but nothing in this session can be proved at
+      // message granularity until a set that reproduces the root arrives.
+      this.#logger.error("seal.certified_leaves.refused", {
+        agentName,
+        sessionId,
+        reason: resolved.reason,
+        detail: resolved.detail,
+        correlationId,
+        impact:
+          "the leaf set shipped with this seal is not the one the certificate is signed over, so no " +
+          "inclusion proof can be issued for this session; the sealed receipt itself is unaffected",
+        guidance:
+          "cello_get_inclusion_proof will refuse this session by name (certified_leaves_unavailable). " +
+          "Nothing local repairs it — the set has to arrive with a seal frame that reproduces the " +
+          "signed root.",
+      });
+      return false;
+    }
+    const now = Date.now();
+    try {
+      const agentId = this.#requireAgentId(agentName);
+      /**
+       * DELETE THEN INSERT, INSIDE A TRANSACTION — fallback-finder finding 5.
+       *
+       * `INSERT OR REPLACE` alone is idempotent only for a set of the SAME length: a shorter
+       * re-delivery overwrites 0..k-1 and leaves stale rows at k..n-1, and an un-transacted loop that
+       * throws halfway leaves a truncated set that `getCertifiedLeafSet` still returns (it tests
+       * `rows.length > 0`, not completeness). Both produce a set that no longer hashes to the
+       * certified root — caught on read, but reported to the operator as *"the local copy has
+       * changed since the seal"*, which points at tampering for a write that never finished.
+       */
+      // `BEGIN` / `COMMIT` / `ROLLBACK` via exec — this file's and `db-identity-store.ts`'s idiom.
+      // `DaemonDatabase` has no `transaction()` helper (node:sqlite's handle does not provide one),
+      // and reaching for better-sqlite3's would compile against the adapter and fail on the other.
+      this.#db.exec("BEGIN");
+      try {
+        this.#db.prepare("DELETE FROM session_certified_leaves WHERE agent_id = ? AND session_id = ?")
+          .run(agentId, sessionId);
+        const stmt = this.#db.prepare(
+          `INSERT INTO session_certified_leaves
+             (agent_id, session_id, leaf_index, content_hash_hex, recorded_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        );
+        for (let i = 0; i < resolved.leafHashes.length; i++) {
+          stmt.run(agentId, sessionId, i, resolved.leafHashes[i], now);
+        }
+        this.#db.exec("COMMIT");
+      } catch (err: unknown) {
+        try { this.#db.exec("ROLLBACK"); } catch { /* the failing statement may have aborted it already */ }
+        throw err;
+      }
+    } catch (err: unknown) {
+      this.#noteCertifiedLeafState(agentName, sessionId, "persist_failed", extractErrorMessage(err));
+      this.#logger.error("seal.certified_leaves.persist.failed", {
+        agentName,
+        sessionId,
+        reason: extractErrorMessage(err),
+        correlationId,
+        impact:
+          "this session's certified leaf set was verified but not written, so cello_get_inclusion_proof " +
+          "will refuse it by name until a later seal frame re-delivers the set",
+      });
+      return false;
+    }
+    this.#noteCertifiedLeafState(agentName, sessionId, "stored", null);
+    this.#logger.info("seal.certified_leaves.recorded", {
+      agentName,
+      sessionId,
+      leafCount: resolved.leafHashes.length,
+      sealedRoot: sealedRootHex,
+      correlationId,
+    });
+    return true;
+  }
+
+  /**
+   * Record WHY this session does or does not have a certified leaf set.
+   *
+   * Public for the one case the manager cannot see: a seal frame that carried no signed leaves at
+   * all never reaches `recordCertifiedLeafSet`, and that absence is a permanent fact about the
+   * session for the party that observed it.
+   */
+  noteCertifiedLeafSetUnavailable(
+    agentName: string,
+    sessionId: string,
+    state: "not_carried_absent_party" | "not_carried_present_party",
+    detail: string,
+  ): void {
+    this.#noteCertifiedLeafState(agentName, sessionId, state, detail);
+  }
+
+  /**
+   * The last thing that happened to this session's certified leaf set, or null if nothing has.
+   *
+   * Null here and a null from `getCertifiedLeafSet` together mean "no seal has been processed on
+   * this side yet" — which is a different sentence again from any of the recorded states.
+   */
+  getCertifiedLeafSetState(agentName: string, sessionId: string): { state: string; detail: string | null } | null {
+    if (!this.#db) return null;
+    const row = this.#db
+      .prepare("SELECT state, detail FROM session_certified_leaves_state WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { state: string; detail: string | null } | undefined;
+    return row ? { state: row.state, detail: row.detail } : null;
+  }
+
+  /** Best-effort: a failure to record WHY must never be the thing that breaks a seal. */
+  #noteCertifiedLeafState(agentName: string, sessionId: string, state: string, detail: string | null): void {
+    if (!this.#db) return;
+    try {
+      this.#db
+        .prepare(
+          `INSERT OR REPLACE INTO session_certified_leaves_state
+             (agent_id, session_id, state, detail, recorded_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(this.#requireAgentId(agentName), sessionId, state, detail, Date.now());
+    } catch (err: unknown) {
+      this.#logger.warn("seal.certified_leaves.state.write.failed", {
+        agentName, sessionId, state, reason: extractErrorMessage(err),
+        impact: "the inclusion-proof surface will not be able to name WHY this session has no certified leaf set; it still refuses rather than proving anything",
+      });
+    }
+  }
+
+  /**
+   * The certified leaf set, in order, or null when none was stored for this session.
+   *
+   * Null is a REFUSAL upstream, never a fallback to the local tree: the two cover different leaves
+   * and substituting one for the other is how a proof comes to land on a root nobody signed.
+   */
+  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null {
+    if (!this.#db) return null;
+    const rows = this.#db
+      .prepare(
+        "SELECT content_hash_hex FROM session_certified_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index ASC",
+      )
+      .all(this.#requireAgentId(agentName), sessionId) as Array<{ content_hash_hex: string }>;
+    return rows.length > 0 ? rows.map((r) => r.content_hash_hex) : null;
   }
 
   /**
@@ -11716,6 +11937,50 @@ export class SessionNodeManager {
 
   getSessionContentSalt(agentName: string, sessionId: string): Uint8Array | null {
     return this.#getSessionSalt(agentName, sessionId);
+  }
+
+  /**
+   * THE SALT, OR WHY THERE ISN'T ONE — `DOD-M15-INCLUSION-1`, fallback-finder finding 2.
+   *
+   * `getSessionContentSalt` above answers `null` for THREE different situations, and a caller that
+   * turns that null into a sentence for an operator gets two of them wrong:
+   *
+   *   `none`       — no salt was ever agreed. The session really is unsalted.
+   *   `unreadable` — a salt row EXISTS and could not be used: the wrong width (corruption on this
+   *                  operator's own disk), or the read threw.
+   *
+   * The distinction is not cosmetic. `unreadable` means the session's leaves WERE hashed under a
+   * salt, so telling its operator *"this session's content hashes are UNSALTED … start a session
+   * while you are both connected"* is an affirmatively false statement about a security property
+   * their session has, and it points them at their counterparty over damage to their own database.
+   * That is the same defect `#getSessionSalt`'s own F8 note was written to end, re-committed one
+   * surface out.
+   *
+   * ⚠️ IT DELEGATES — there is no second read here. Calling `#getSessionSalt` first means the salt
+   * this reports is the salt the hashing path uses, including its cache and its wrong-width refusal.
+   * A parallel query would be free to disagree with it, which is the whole failure this returns a
+   * reason to prevent.
+   */
+  getSessionContentSaltState(
+    agentName: string,
+    sessionId: string,
+  ): { salt: Uint8Array } | { salt: null; reason: "none" | "unreadable" } {
+    const salt = this.#getSessionSalt(agentName, sessionId);
+    if (salt) return { salt };
+    if (!this.#db) return { salt: null, reason: "unreadable" };
+    try {
+      const row = this.#db
+        .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
+        .get(this.#requireAgentId(agentName), sessionId) as { n?: number | null } | undefined;
+      // A row with a non-empty blob that `#getSessionSalt` still refused is the corruption case: the
+      // bytes are there and they are not a salt. NULL or zero-length is a genuine absence.
+      const stored = row?.n ?? 0;
+      return { salt: null, reason: stored > 0 ? "unreadable" : "none" };
+    } catch {
+      // The read that would tell us which case it is has itself failed, so "no salt was agreed" is
+      // exactly the thing we cannot assert.
+      return { salt: null, reason: "unreadable" };
+    }
   }
 
   /**

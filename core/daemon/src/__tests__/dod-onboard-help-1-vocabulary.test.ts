@@ -193,7 +193,10 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
    *  - comments — they document the IPC METHOD, whose name is accurate and does not move,
    *  - `handlers.set("cello_x")` — the IPC wire name. Renaming it would break a new daemon talking
    *    to an OLD connect shim (connect has no daemon dep, so they are not pinned together),
-   *  - the custody stub-tool array (cello_backup / cello_restore / cello_get_inclusion_proof).
+   *  - a `for (const tool of [` array of tool names, if one returns. ⚠️ THE ONE THIS NAMED IS GONE:
+   *    it was the MCP-001 `not_implemented` loop, which ended holding only
+   *    `cello_get_inclusion_proof` and was deleted with it by `DOD-M15-INCLUSION-1`. The skip stays
+   *    because the shape can recur; the claim that such a list EXISTS today does not.
    */
   function scan(re: RegExp): Array<{ file: string; line: number; token: string }> {
     const found: Array<{ file: string; line: number; token: string }> = [];
@@ -204,7 +207,7 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
           const t = raw.trim();
           if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return; // comment
           if (/handlers\.set\(/.test(raw)) return; // IPC method registration
-          if (/for \(const tool of \[/.test(raw)) return; // custody stub list
+          if (/for \(const tool of \[/.test(raw)) return; // a bulk tool-name array (none today)
           const code = raw.replace(/\s\/\/[^"'`]*$/, ""); // drop a trailing inline comment
           for (const m of code.matchAll(re)) {
             found.push({ file, line: i + 1, token: m[0] });
@@ -247,11 +250,20 @@ describe("DOD-ONBOARD-HELP-1 §2b — SOURCE AUDIT: the daemon never names a com
     expect(files).toContain("session-node-manager.ts");
   });
 
-  it("MCP_ONLY_TOOLS are the custody stubs, and are the only allowed non-dual names", () => {
+  /**
+   * ⚠️ THIS TEST WAS NAMED *"MCP_ONLY_TOOLS are the custody stubs"* AND THE WORD "STUBS" IS NO LONGER
+   * TRUE OF ANY OF THEM — `DOD-M15-BACKUP-1` implemented backup/restore, `DOD-M15-INCLUSION-1`
+   * implemented the inclusion proof and added its verifier. Renamed rather than left, because a test
+   * title is read as a statement about the list, and this one asserted a readiness that had lapsed.
+   *
+   * What the list means: implemented capabilities with NO CLI twin. Membership is about SURFACE.
+   */
+  it("MCP_ONLY_TOOLS is exactly the set with no CLI twin — the only allowed non-dual names", () => {
     expect([...MCP_ONLY_TOOLS].sort()).toEqual([
       "cello_backup",
       "cello_get_inclusion_proof",
       "cello_restore",
+      "cello_verify_inclusion_proof",
     ]);
   });
 });

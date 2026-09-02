@@ -46,6 +46,99 @@ export type SealCompletion =
   | { refused: true; reason: string; detail: string; ownRootHex: string | null };
 
 /**
+ * The signed leaves a seal frame carried, or undefined when it carried none.
+ *
+ * Shape-only: every caller re-checks the signatures (`reDeriveFrontiers` / `checkUnilateralFrontier`)
+ * or the root (`recordCertifiedLeafSet`) before believing anything in here.
+ */
+function parseFrontierLeaves(raw: unknown): SealFrontierLeaf[] | undefined {
+  if (!Array.isArray(raw) || raw.length === 0) return undefined;
+  const toU8 = (v: unknown): Uint8Array => (v instanceof Uint8Array ? v : new Uint8Array(v as ArrayLike<number>));
+  return (raw as unknown[]).map((l) => {
+    const o = l as Record<string, unknown>;
+    return {
+      structure1_cbor: toU8(o["structure1_cbor"]),
+      sender_pubkey: toU8(o["sender_pubkey"]),
+      sender_signature: toU8(o["sender_signature"]),
+    };
+  });
+}
+
+/**
+ * DOD-M15-INCLUSION-1: keep the leaf set this certificate is signed over, so a single message can
+ * later be proved to sit under it.
+ *
+ * The local `SessionTree` cannot stand in — it holds content leaves only, while the certified root
+ * covers the seal's CONTROL leaves too, so a path built from it lands on a root no certificate names.
+ * These are the only frames that ever carry the full set.
+ *
+ * `recordCertifiedLeafSet` refuses anything that does not reproduce `sealedRootHex`, so a failure
+ * here costs the SESSION its inclusion proofs and costs the RECEIPT nothing — hence a warn that says
+ * so, and no `return` that would abandon a seal over it.
+ */
+function keepCertifiedLeafSet(
+  deps: { logger: Logger; sessionNodeManager: SessionNodeManager },
+  agentName: string,
+  sidHex: string,
+  frame: Record<string, unknown>,
+  sealedRootHex: string,
+  path: "bilateral" | "unilateral" | "unilateral_notification",
+): void {
+  const leaves = parseFrontierLeaves(frame["frontier_leaves"]);
+  if (!leaves) {
+    /**
+     * ABSENT IS NOT FINE — it is just not fatal. And WHICH absence this is decides what the operator
+     * should do, so it is recorded rather than flattened (fallback-finder findings 1 and 3).
+     *
+     * ⚠️ THIS GUIDANCE USED TO END *"The other party, whose confirm frame carries the leaves, can
+     * still issue proofs."* That is true on the `unilateral_notification` path and FALSE on
+     * `unilateral`: there, WE are the present party and the other party is the ABSENT one, who holds
+     * strictly less. So the one string sent each side to ask the other for something neither has —
+     * a remedy that reads actionable and is not, which spends the reader's trust as well as their
+     * time.
+     */
+    const state = path === "unilateral_notification" ? "not_carried_absent_party" : "not_carried_present_party";
+    deps.sessionNodeManager.noteCertifiedLeafSetUnavailable(agentName, sidHex, state, `no frontier_leaves on the ${path} seal frame`);
+    /**
+     * INFO on the absent-party path, WARN on the other two — review F6.
+     *
+     * `directory-node.ts` attaches `frontier_leaves` to the PRESENT party's confirm frame only, and
+     * `seal_upgrade_confirmed` carries none either. So this branch is the ONLY outcome the
+     * `unilateral_notification` site can ever take: warning there fires on 100% of a designed path,
+     * which trains a reader to skip the level rather than to read it. The disclosure still happens —
+     * it is the state row and the refusal that carry it — but the level stops pretending an attempt
+     * was made and failed.
+     */
+    deps.logger[state === "not_carried_absent_party" ? "info" : "warn"]("seal.certified_leaves.not_carried", {
+      sessionId: sidHex,
+      agentName,
+      path,
+      state,
+      impact:
+        "this seal frame carried no signed leaves, so this side holds no certified leaf set for the " +
+        "session and cannot issue an inclusion proof for any message in it; the sealed receipt itself " +
+        "is complete and unaffected",
+      guidance:
+        state === "not_carried_absent_party"
+          ? "cello_get_inclusion_proof refuses this session by name (certified_leaves_unavailable). This side was the ABSENT party, so the counterparty — whose confirm frame carries the leaves — can still issue proofs."
+          : "cello_get_inclusion_proof refuses this session by name (certified_leaves_not_carried). This side was PRESENT and the directory sent no leaves, so NEITHER side can prove an individual message here; do not send the operator to the counterparty for one.",
+    });
+    return;
+  }
+  try {
+    deps.sessionNodeManager.recordCertifiedLeafSet(agentName, sidHex, leaves, sealedRootHex);
+  } catch (error) {
+    deps.logger.warn("seal.certified_leaves.persist.failed", {
+      sessionId: sidHex,
+      agentName,
+      path,
+      reason: error instanceof Error ? error.message : String(error),
+      impact: "no inclusion proof can be issued for this session; the sealed receipt is unaffected",
+    });
+  }
+}
+
+/**
  * SESSION-002 / M8B FINDING-3: a unilateral seal carries the legibility certificate so the close
  * returns it inline — the same RESPONSE SHAPE as a bilateral close, but NOT cryptographic parity:
  * this cert is directory-attested (FINDING-5). `remainingSeconds` carries the directory's
@@ -322,6 +415,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               reason: error instanceof Error ? error.message : String(error),
             });
           }
+          keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "bilateral");
         }
         const waiter = pendingSealWaiters.get(sealKey(agentName, sidHex));
         if (waiter) {
@@ -532,6 +626,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
               reason: error instanceof Error ? error.message : String(error),
             });
           }
+          keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "unilateral");
         } else {
           // The seal is valid, but no receipt is retrievable — a directory that predates cascade-2.
           logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_frame" });
@@ -630,6 +725,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             if (legibility !== undefined && rootHex && counterpartyHex) {
               sessionNodeManager.recordSealCertificateEnsuringRow(agentName, sidHex, counterpartyHex, rootHex, JSON.stringify(legibility));
               logger.info("session.unilateral.receipt.persisted", { sessionId: sidHex, sealedRoot: rootHex, party: "absent" });
+              keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "unilateral_notification");
             } else if (legibility === undefined) {
               logger.warn("session.unilateral.receipt.absent", { sessionId: sidHex, reason: "no_legibility_on_notification" });
             }

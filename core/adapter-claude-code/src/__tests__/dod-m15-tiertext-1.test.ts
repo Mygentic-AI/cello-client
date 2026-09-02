@@ -45,11 +45,23 @@ const SURFACE_PATH = join(import.meta.dirname, "..", "bin", "cello-mcp.ts");
  * declared multi-line, both carrying claim vocabulary nobody had read. An extractor that
  * under-counts makes every guard built on it narrower than it appears, so the count is asserted
  * below rather than trusted.
+ *
+ * ⚠️ AND THE SAME DEFECT RECURRED IN THE OTHER DIMENSION — `DOD-M15-INCLUSION-1` review F3. The
+ * count was right and the CONTENT was not: a description written as several `+`-joined literals was
+ * captured up to the first closing quote and the rest silently dropped. The two inclusion-proof
+ * descriptions lost roughly three quarters each — the halves carrying `notarized`, `Refuses`,
+ * `Rejects`, `no access to the daemon` — while `★ the extractor sees EVERY tool` stayed green,
+ * because it counts NAMES and says nothing about how much of each description it read.
+ *
+ * So the continuation literals are joined, and truncation is asserted directly below rather than
+ * left to be noticed. Under-reading a description is the same failure as skipping one; it just does
+ * not show up in a count.
  */
 function toolDescriptions(src: string): Array<{ tool: string; desc: string }> {
-  return [...src.matchAll(/server\.tool\(\s*"([a-z_0-9]+)",\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => ({
+  return [...src.matchAll(/server\.tool\(\s*"([a-z_0-9]+)",\s*((?:"(?:[^"\\]|\\.)*"\s*\+\s*)*"(?:[^"\\]|\\.)*")/g)].map((m) => ({
     tool: m[1]!,
-    desc: m[2]!,
+    // Join the `+`-concatenated literals into the one string an operator reads.
+    desc: [...m[2]!.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((q) => q[1]!).join(""),
   }));
 }
 
@@ -63,6 +75,31 @@ describe("DOD-M15-TIERTEXT-1 — the tier descriptions", () => {
       `${declared} server.tool( declarations but the extractor found fewer — a description it cannot ` +
         `see is one the regression guard below cannot protect`,
     ).toBe(declared);
+  });
+
+  /**
+   * A COUNT IS NOT COVERAGE — review F3.
+   *
+   * The test above proves the extractor found every tool NAME. It says nothing about whether it read
+   * every WORD, and a `+`-joined description was being captured up to its first closing quote. This
+   * asserts the other half: whatever was captured is the whole literal, so nothing on this surface
+   * is claim-checked in part.
+   */
+  it("★ the extractor reads every description WHOLE — no captured text is followed by a `+`", () => {
+    const truncated: string[] = [];
+    for (const { tool, desc } of toolDescriptions(src)) {
+      // The last literal of what we captured, located in the source, must not be followed by `+`.
+      const tail = desc.slice(-24);
+      const at = src.indexOf(tail);
+      if (at === -1) continue; // escaped characters shifted it; the join above already covered it
+      const after = src.slice(at + tail.length, at + tail.length + 40);
+      if (/^"\s*\+/.test(after)) truncated.push(tool);
+    }
+    expect(
+      truncated,
+      "a tool description continues past what the extractor captured, so the guards below read only " +
+        "part of what an operator is shown",
+    ).toEqual([]);
   });
 
   it("★ THE FALSE CLAIM IS GONE — no description attributes unattended acceptance to a tier", () => {

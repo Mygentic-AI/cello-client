@@ -135,7 +135,12 @@ describe("§3 bash-adapter contract: JSON out, verbatim structured errors, exit 
   });
 
   it("a not_implemented daemon stub is surfaced as a FAILURE, never as success", () => {
-    // Guards the exact trap in the brief: backup/restore/inclusion-proof are daemon stubs today.
+    // Guards the exact trap in the brief: a daemon answering `not_implemented` must exit non-zero.
+    //
+    // ⚠️ THIS COMMENT USED TO NAME *"backup/restore/inclusion-proof"* as the stubs of the day. All
+    // three are implemented now (DOD-M15-BACKUP-1, DOD-M15-INCLUSION-1) and NO tool returns
+    // not_implemented. The guard is still worth keeping — it is about the SHAPE of the answer, not
+    // about which tools happen to give it — so the example is removed rather than the test.
     const e = emitIpcResult({ ok: false, reason: "not_implemented", guidance: "future milestone" });
     expect(e.exitCode).toBe(1);
     expect(e.stdout).toBe("");

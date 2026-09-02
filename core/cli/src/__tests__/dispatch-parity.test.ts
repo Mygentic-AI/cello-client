@@ -369,10 +369,17 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
   });
 
   it("DoD §9: every in-scope cello_* MCP tool has a CLI command calling the SAME IPC handler", () => {
-    // The parity claim, checkable from the registry itself. The three descoped tools
-    // (cello_backup / cello_restore / cello_get_inclusion_proof) are deliberately ABSENT: their
-    // daemon handlers are not_implemented stubs, so a CLI pass-through would ship a fake command.
-    // They are tracked as known-open under DOD-CUSTODY-DAEMON-1 — NOT silently dropped.
+    // The parity claim, checkable from the registry itself. Four tools are deliberately ABSENT
+    // (cello_backup / cello_restore / cello_get_inclusion_proof / cello_verify_inclusion_proof)
+    // because they are MCP-only BY CHOICE — see MCP_ONLY_TOOLS in vocabulary.ts, which carries the
+    // per-tool reason, and capability-registration-inversion.test.ts, which enforces it.
+    //
+    // ⚠️ THIS COMMENT USED TO SAY *"their daemon handlers are not_implemented stubs, so a CLI
+    // pass-through would ship a fake command"*, and that was true of all three when it was written
+    // and is true of NONE of them now: DOD-M15-BACKUP-1 implemented backup/restore and
+    // DOD-M15-INCLUSION-1 implemented the inclusion proof. Corrected rather than deleted, because
+    // "absent from the CLI" and "not built" were the same sentence here for two milestones, and a
+    // reader who still reads them as one takes a working tool for a stub.
     const expected: Record<string, string> = {
       cello_list_agents: "agents",
       cello_start_agent: "start-agent",
@@ -422,10 +429,20 @@ describe("T1: the --pretty grant and the auditable MCP↔CLI parity table", () =
      *                   database that is half one identity and half another. The `cello_restore`
      *                   MCP tool therefore refuses and prints the sequence instead of attempting it.
      *
-     * `inclusion-proof` stays: its daemon handler is still a stub.
+     * ⚠️ `inclusion-proof` USED TO BE HERE WITH THE REASON *"its daemon handler is still a stub"*.
+     * The handler is real since DOD-M15-INCLUSION-1, and the ASSERTION was still correct — the tool
+     * is MCP-only — so a green test was enforcing the right outcome for a stated reason that had
+     * become a lie, which is worse than a red one: the next reader concludes the tool is pending.
+     *
+     * It stays absent, for the reason it is actually absent: `cello_get_inclusion_proof` and
+     * `cello_verify_inclusion_proof` are MCP-only by choice (MCP_ONLY_TOOLS). The message says so,
+     * so a failure here cannot be misread as "the daemon side is not finished yet".
      */
-    for (const name of ["inclusion-proof"]) {
-      expect(findCommand(name), `'${name}' must NOT exist until the daemon handler is real`).toBeUndefined();
+    for (const name of ["inclusion-proof", "verify-inclusion-proof"]) {
+      expect(
+        findCommand(name),
+        `'${name}' must NOT exist: the inclusion-proof tools are MCP-only by choice (see MCP_ONLY_TOOLS), not unimplemented`,
+      ).toBeUndefined();
     }
   });
 });
