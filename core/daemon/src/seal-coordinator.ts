@@ -43,7 +43,14 @@ import type { Logger } from "./types.js";
  */
 export type SealCompletion =
   | { rootHex: string; legibility?: unknown }
-  | { refused: true; reason: string; detail: string; ownRootHex: string | null };
+  /**
+   * `guidance` — `DOD-M15-SEALPARTIES-1`. A refusal used to have exactly one producer (this
+   * daemon's own root check), so the close handler could hardcode the remedy. There are now two,
+   * and the DIRECTORY's refusals have causes this side cannot infer — a counterparty who approved
+   * nothing, two participants who approved different transcripts. The party that knows the cause
+   * writes the remedy; a close handler guessing it would print the wrong next step confidently.
+   */
+  | { refused: true; reason: string; detail: string; ownRootHex: string | null; guidance?: string };
 
 /**
  * The signed leaves a seal frame carried, or undefined when it carried none.
@@ -161,10 +168,60 @@ export interface SealCoordinatorDeps {
    * sealed root. It never co-signs content it could not verify.
    */
   recoverContent: (agentName: string) => Promise<void>;
+  /**
+   * DOD-M15-SEALPARTIES-1: record a seal that ended without a receipt, so the answer survives the
+   * close call that is waiting on it. Clause 6 asks for the refusal on TWO surfaces — the response
+   * and the session record — and the response is gone the moment the caller reads it.
+   */
+  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
+}
+
+/**
+ * What an operator should DO about a seal the DIRECTORY refused.
+ *
+ * Exported so the wording is testable on its own and so there is one place to keep it true. Each
+ * branch names a different next step, because each reason accuses a different party: a counterparty
+ * whose agent sent no approval, a counterparty whose record disagrees, or a relay that altered the
+ * leaf set. Telling all three to "compare transcripts" would send two of them somewhere useless.
+ */
+export function sealRejectionGuidance(reason: string, detail: string): string {
+  const tail = detail ? ` (${detail})` : "";
+  switch (reason) {
+    case "seal_approval_missing":
+      return (
+        "The seal was REFUSED because your counterparty's own signed record of the conversation did " +
+        `not arrive, so only one side had approved it${tail}. Nothing was signed and your transcript ` +
+        "is untouched. Ask your counterparty to close again — their agent, or the relay carrying it, " +
+        "did not send their approval. Do NOT force-abandon: that permanently forfeits the receipt. If " +
+        "they are gone rather than out of date, closing again will fall through to a solo seal, which " +
+        "still gives you a receipt."
+      );
+    case "seal_parties_disagree":
+      return (
+        "The seal was REFUSED because you and your counterparty signed DIFFERENT records of this " +
+        `conversation${tail}. One of you is missing messages the other has. Nothing was signed. ` +
+        "Compare the message list and count with them directly, out of band — the disagreement is " +
+        "about content, so no answer from inside this session can settle it."
+      );
+    case "seal_leaves_invalid":
+      return (
+        `The seal was REFUSED: the record presented for sealing contained a leaf that does not belong ` +
+        `to this conversation${tail}. Nothing was signed. This is tampering by whoever assembled the ` +
+        "leaf set — the relay serving this session — not something you or your counterparty did. " +
+        "Report the session id. Do NOT force-abandon."
+      );
+    default:
+      return (
+        `The directory refused to certify this seal (${reason})${tail}. Nothing was signed, the ` +
+        "session is NOT marked sealed, and your transcript is untouched. Compare the message count " +
+        "with your counterparty and report the session id. Do NOT force-abandon: that permanently " +
+        "forfeits any receipt."
+      );
+  }
 }
 
 export function createSealCoordinator(deps: SealCoordinatorDeps) {
-  const { logger, sessionNodeManager, getPersistence, getKeyProvider, recoverContent } = deps;
+  const { logger, sessionNodeManager, getPersistence, getKeyProvider, recoverContent, recordSealFailure } = deps;
 
   // DOD-LOOP-1: daemon-level seal bookkeeping is keyed by (agentName, sessionId), NOT sessionId
   // alone — two of the operator's agents can hold both ends of the same session_id on one daemon
@@ -840,12 +897,71 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
    * in-flight guard, the receipt persist is behind the one-way ratchet, and the directory dedups a
    * repeated ratification with `already_bilateral`.
    */
+  /**
+   * THE DIRECTORY REFUSED THE SEAL, AND UNTIL NOW NOBODY IN THIS CLIENT WAS LISTENING —
+   * `DOD-M15-SEALPARTIES-1`, clause 6.
+   *
+   * `session_seal_rejected` is a frame the directory has sent since M1. Searching this repository
+   * for it found exactly one occurrence: the type declaration in `protocol-types`. It had **no
+   * consumer**. So every refusal — a stranger's leaf in the record, a relay that dropped a message,
+   * and now a counterparty who approved nothing — arrived, was decoded, matched no handler, and was
+   * dropped. Both operators then sat out the full close window and were told the counterparty had
+   * not closed, about a seal the directory had already decided against.
+   *
+   * That is the difference this makes to a person: the answer arrives in seconds and says what
+   * actually happened, instead of eleven minutes later saying something false.
+   *
+   * ⚠️ **Guarded on holding the session.** The directory still BROADCASTS this frame to every
+   * authenticated stream on the node for the refusal paths that fire before it has resolved the
+   * roster, so an agent with no part in the conversation can receive one. Acting on it would let a
+   * stranger's session id write a phantom failure into this agent's record.
+   */
+  function registerSealRejectedListener(signaling: SignalingManager, agentName: string): () => void {
+    return signaling.registerInboundHandler((frame) => {
+      if (frame["type"] !== "session_seal_rejected") return;
+      const sidHex = frameValueToHex(frame["session_id"]);
+      if (!sidHex) return;
+      if (!sessionNodeManager.getSessionRecord(agentName, sidHex)) return;
+
+      const reason = typeof frame["reason"] === "string" && frame["reason"].length > 0
+        ? frame["reason"]
+        : "seal_rejected_unstated";
+      const detail = typeof frame["detail"] === "string" ? frame["detail"] : "";
+      const guidance = sealRejectionGuidance(reason, detail);
+
+      // The durable forensic record keeps its half; the response below is the control. Never one
+      // instead of the other.
+      logger.error("session.seal.rejected", {
+        agentName,
+        sessionId: sidHex,
+        reason,
+        detail,
+        impact:
+          "the directory refused to certify this seal, so no signature over it exists and the " +
+          "session is NOT sealed. The transcript is untouched and nothing was signed with this " +
+          "agent's key.",
+        guidance,
+      });
+      // Clause 6's second surface: the response is gone once its caller reads it, and a close that
+      // has already returned (or never ran on this side) has nowhere else to leave the answer.
+      recordSealFailure(agentName, sidHex, reason);
+
+      const key = sealKey(agentName, sidHex);
+      const waiter = pendingSealWaiters.get(key);
+      if (!waiter) return;
+      pendingSealWaiters.delete(key);
+      waiter({ refused: true, reason, detail, ownRootHex: null, guidance });
+    });
+  }
+
   function registerSealListeners(signaling: SignalingManager, agentName: string, agentPubkeyHex: string): () => void {
     const unregisterSealed = registerSessionSealedListener(signaling, agentName, agentPubkeyHex);
+    const unregisterRejected = registerSealRejectedListener(signaling, agentName);
     const unregisterUnilateral = registerUnilateralConfirmedListener(signaling, agentName, agentPubkeyHex);
     const unregisterUpgrade = registerUnilateralUpgradeListener(signaling, agentName, agentPubkeyHex);
     return () => {
       unregisterSealed();
+      unregisterRejected();
       unregisterUnilateral();
       unregisterUpgrade();
     };

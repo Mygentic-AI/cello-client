@@ -145,6 +145,7 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
       getPersistence: vi.fn() as never,
       getKeyProvider: vi.fn(() => undefined),
       recoverContent: vi.fn(async () => { /* nothing parked */ }),
+      recordSealFailure: vi.fn(),
     });
     const signaling = fakeSignaling();
     coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, AGENT_PUB);
@@ -214,6 +215,7 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
       getPersistence: vi.fn() as never,
       getKeyProvider: vi.fn(() => undefined),
       recoverContent: vi.fn(async () => { /* nothing parked */ }),
+      recordSealFailure: vi.fn(),
     });
     const signaling = fakeSignaling();
     coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, AGENT_PUB);

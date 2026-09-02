@@ -1137,7 +1137,17 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             reason: sealedCompletion.reason,
             seal_status: "refused",
             ...(sealedCompletion.ownRootHex ? { own_root: sealedCompletion.ownRootHex } : {}),
-            guidance:
+            /**
+             * ⚠️ THE REMEDY COMES FROM THE PARTY THAT KNOWS THE CAUSE — `DOD-M15-SEALPARTIES-1`.
+             *
+             * The text below was written when this branch had exactly one producer: this daemon's
+             * own root check, where "the directory signed a root that is not your conversation" is
+             * always the right sentence. The directory's own refusals now land here too, and for
+             * those it would be a confident falsehood — it names a signature that was never
+             * produced. So a refusal that carries its own guidance keeps it, and the local
+             * root-mismatch text stays as the fallback for the case it was written for.
+             */
+            guidance: sealedCompletion.guidance ??
               "The directory returned a VALIDLY SIGNED seal whose root does not describe this " +
               `conversation (${sealedCompletion.detail}). This daemon refused it: the session is NOT ` +
               "marked sealed, your transcript is untouched, and nothing was signed with your key. " +

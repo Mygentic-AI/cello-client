@@ -424,12 +424,30 @@ export type SealRejectionReason =
   | "causal_chain_violated"
   | "content_hash_mismatch"
   | "seal_leaves_invalid"
-  | "seal_signature_invalid";
+  | "seal_signature_invalid"
+  /**
+   * DOD-M15-SEALPARTIES-1: fewer than two participants carried their own signed transcript root, so
+   * a bilateral seal had at most one party's approval. Distinct from `merkle_root_mismatch` because
+   * it sends the reader somewhere else entirely — a counterparty build or a relay that dropped the
+   * field, not two transcripts to compare.
+   */
+  | "seal_approval_missing"
+  /**
+   * DOD-M15-SEALPARTIES-1: both participants approved, and approved DIFFERENT transcripts. This is
+   * the one that DOES mean "compare notes with your counterparty".
+   */
+  | "seal_parties_disagree";
 
 export interface SessionSealRejected {
   type: "session_seal_rejected";
   session_id: Uint8Array; // 16 bytes
   reason: SealRejectionReason;
+  /**
+   * DOD-M15-SEALPARTIES-1: the sentence that says which thing was wrong — which leaf, which party,
+   * which of two roots. The `reason` selects the remedy; this is what makes the remedy actionable.
+   * Absent when the refusing node had nothing more specific to say.
+   */
+  detail?: string;
 }
 
 /**

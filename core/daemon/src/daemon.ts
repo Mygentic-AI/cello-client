@@ -918,6 +918,15 @@ async function startDaemonHoldingLock(
   // Bilateral seal, unilateral escalation, and the returning-absent-party upgrade: five pieces of
   // state and the listeners that drive them. Already seal-private; now that is enforced by a module
   // boundary rather than by convention. cello_close_session still drives the waiters directly.
+  //
+  // DOD-M15-SEAL-FAILED-TERMINAL-1: a seal that ended without a receipt is discoverable rather than
+  // being a line in daemon.log. In memory on purpose — a restart makes "failed" the WRONG answer,
+  // because the boot sweep plus the restart seal resolver retry the session, so a marker whose
+  // lifetime is the process matches the lifetime of the condition it describes.
+  //
+  // Declared HERE rather than 600 lines below because the seal coordinator writes to it: a
+  // directory refusal must survive the close call waiting on it (DOD-M15-SEALPARTIES-1).
+  const sealFailures = new SealFailureStore();
   const {
     sealKey,
     sealInterruptedInProgress,
@@ -930,6 +939,11 @@ async function startDaemonHoldingLock(
     getPersistence,
     getKeyProvider: (agentName: string) => keyProviders.get(agentName),
     recoverContent: (agentName: string) => autoRecoverForAgent(agentName, "seal_upgrade_gate"),
+    // DOD-M15-SEALPARTIES-1: a directory refusal has to outlive the close call that is waiting on
+    // it — `cello_status` and the receipt surface both read this store, and a close that already
+    // returned has nowhere else to leave the answer.
+    recordSealFailure: (agentName: string, sessionId: string, reason: string) =>
+      sealFailures.record(agentName, sessionId, reason, new Date().toISOString(), "unresolved"),
   });
 
   // The two seal-initiation flows cello_close_session dispatches into (seal-flows.ts): the
@@ -1520,14 +1534,6 @@ async function startDaemonHoldingLock(
    * every other one.
    */
   const backgroundSeals = new Set<Promise<unknown>>();
-  /**
-   * DOD-M15-SEAL-FAILED-TERMINAL-1 — the last background seal failure per session.
-   *
-   * In memory on purpose: a restart makes "failed" the WRONG answer, because the boot sweep plus the
-   * restart seal resolver retry the session. A marker whose lifetime is the process matches the
-   * lifetime of the condition it describes.
-   */
-  const sealFailures = new SealFailureStore();
   // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
   // the call site so it names the specific away agent.
   // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —

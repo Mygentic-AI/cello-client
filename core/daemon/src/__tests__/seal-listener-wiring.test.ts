@@ -28,7 +28,7 @@
  * every call site uses it.
  */
 import { describe, it, expect, vi } from "vitest";
-import { createSealCoordinator } from "../seal-coordinator.js";
+import { createSealCoordinator, sealRejectionGuidance } from "../seal-coordinator.js";
 import type { SessionNodeManager } from "../session-node-manager.js";
 import type { SignalingManager } from "@cello-protocol/transport";
 
@@ -53,10 +53,14 @@ function fakeSignaling() {
   };
 }
 
-function harness() {
+function harness(opts: { holdsSession?: boolean } = {}) {
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   const recoverContent = vi.fn(async () => { /* pull parked content from the relay */ });
+  const recordSealFailure = vi.fn();
   const store = {
+    // DOD-M15-SEALPARTIES-1: the refusal listener acts only on a session this agent actually holds,
+    // because the directory still broadcasts `session_seal_rejected` on some paths.
+    getSessionRecord: vi.fn(() => (opts.holdsSession === false ? undefined : { agent_name: AGENT, session_id: SESSION })),
     // The KERNEL's gate. Refusing here is what makes B never sign content it could not verify;
     // returning a refusal (rather than throwing) keeps this test focused on the WIRING.
     getSealUpgradeReadiness: vi.fn(() => ({ ok: false, reason: "content_unrecoverable" })),
@@ -73,9 +77,10 @@ function harness() {
     getPersistence: vi.fn() as never,
     getKeyProvider: vi.fn(() => undefined),
     recoverContent,
+    recordSealFailure,
   });
 
-  return { coordinator, recoverContent, store, logger };
+  return { coordinator, recoverContent, store, logger, recordSealFailure };
 }
 
 describe("the seal listener set is a BUNDLE — a stream cannot be wired with only part of it", () => {
@@ -132,6 +137,86 @@ describe("the seal listener set is a BUNDLE — a stream cannot be wired with on
 
     expect(store.getSealUpgradeReadiness).not.toHaveBeenCalled();
     expect(store.destroySessionNode).not.toHaveBeenCalled();
+  });
+
+  /**
+   * `DOD-M15-SEALPARTIES-1` clause 6 — the refusal reaches the operator instead of the floor.
+   *
+   * `session_seal_rejected` is a frame the directory has sent since M1 and this client had NO
+   * consumer for: the only occurrence of the string in the whole repository was the type
+   * declaration. So every refusal was decoded, matched no handler, and vanished — while the close
+   * that was waiting on it sat out its full window and then reported that the counterparty had not
+   * closed, about a seal the directory had already decided against.
+   */
+  it("★★★ a seal REFUSED by the directory answers the waiting close, with the cause and a remedy", async () => {
+    const { coordinator, logger, recordSealFailure } = harness();
+    const signaling = fakeSignaling();
+    coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, PUBKEY);
+
+    let completion: unknown = null;
+    coordinator.pendingSealWaiters.set(coordinator.sealKey(AGENT, SESSION), (c) => { completion = c; });
+
+    signaling.deliver({
+      type: "session_seal_rejected",
+      session_id: SESSION,
+      reason: "seal_approval_missing",
+      detail: "only one participant's signed root was carried",
+    });
+
+    expect(
+      completion,
+      "the close is BLOCKED on this waiter — leaving it unresolved is how the operator was told " +
+        "something false eleven minutes later",
+    ).toEqual(expect.objectContaining({ refused: true, reason: "seal_approval_missing" }));
+    const c = completion as { guidance?: string; detail?: string };
+    expect(c.detail).toContain("only one participant");
+    expect(
+      c.guidance ?? "",
+      "the remedy comes from the party that knows the cause — a close handler guessing it would " +
+        "print 'the directory signed a root that is not your conversation' about a signature that " +
+        "was never produced",
+    ).toMatch(/counterparty/i);
+    expect(c.guidance ?? "").toMatch(/do not force-abandon/i);
+
+    // The durable forensic record keeps its half — the response never replaces the log.
+    expect(logger.error).toHaveBeenCalledWith(
+      "session.seal.rejected",
+      expect.objectContaining({ sessionId: SESSION, reason: "seal_approval_missing" }),
+    );
+    // And the second surface, because the response is gone the moment its caller reads it.
+    expect(recordSealFailure).toHaveBeenCalledWith(AGENT, SESSION, "seal_approval_missing");
+  });
+
+  it("★★ the two refusals send the operator to DIFFERENT places, because they accuse different parties", () => {
+    const approval = sealRejectionGuidance("seal_approval_missing", "");
+    const disagree = sealRejectionGuidance("seal_parties_disagree", "");
+    expect(
+      approval,
+      "nobody's record is wrong here — the counterparty's approval did not arrive, so the next step " +
+        "is to have them close again, NOT to go comparing transcripts",
+    ).toMatch(/close again/i);
+    expect(approval).not.toMatch(/compare the message list/i);
+    expect(
+      disagree,
+      "this one IS a content disagreement, and it cannot be settled from inside the session",
+    ).toMatch(/compare the message list/i);
+  });
+
+  it("★★ a refusal for a session this agent does NOT hold is ignored — the frame is still broadcast", () => {
+    /**
+     * The directory broadcasts `session_seal_rejected` to every authenticated stream on the node for
+     * the refusal paths that fire before it resolves the roster. Acting on one would let any
+     * stranger's session id write a phantom failure into this agent's record and, worse, resolve a
+     * waiter that belongs to a healthy close.
+     */
+    const { coordinator, logger, recordSealFailure } = harness({ holdsSession: false });
+    const signaling = fakeSignaling();
+    coordinator.registerSealListeners(signaling as unknown as SignalingManager, AGENT, PUBKEY);
+
+    signaling.deliver({ type: "session_seal_rejected", session_id: SESSION, reason: "seal_approval_missing" });
+
+    expect(recordSealFailure).not.toHaveBeenCalled();
+    expect(logger.error).not.toHaveBeenCalledWith("session.seal.rejected", expect.anything());
   });
 
   it("the individual listeners are NOT exported — a partial seal wiring must not be expressible", () => {
