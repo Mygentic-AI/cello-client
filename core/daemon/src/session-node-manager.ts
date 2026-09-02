@@ -753,6 +753,33 @@ function relayPeerIdOf(circuitAddr: string): string | null {
   return /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] ?? null;
 }
 
+/**
+ * The Merkle leaf inputs for a seal carry: each leaf's `content_hash`, read out of the bytes its
+ * SENDER SIGNED (`structure1_cbor`), never out of an envelope field somebody else filled in.
+ *
+ * `null` when any leaf is unreadable — the caller must then answer "I cannot judge", never "we
+ * disagree". A decode failure is this daemon's limitation, not evidence against anyone.
+ *
+ * Canonical Structure 1 is
+ * `[protocol_version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]`, and the
+ * content hash is used AS the leaf hash (RFC 6962 §2.1 "hash" leaves are taken as-is), which is the
+ * domain the certified root lives in.
+ */
+function carryContentHashInputs(carry: readonly SealCarryLeaf[]): LeafInput[] | null {
+  const inputs: LeafInput[] = [];
+  for (const leaf of carry) {
+    let contentHash: unknown;
+    try {
+      contentHash = (decode(leaf.structure1Cbor) as unknown[])[1];
+    } catch {
+      return null;
+    }
+    if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) return null;
+    inputs.push({ kind: "hash", data: contentHash });
+  }
+  return inputs;
+}
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -2974,6 +3001,38 @@ export class SessionNodeManager {
     );
     const selfEvidentlyComplete = contiguousFromOne && ctrlSenders.size === 2;
 
+    /**
+     * 🚨 THE CERTIFICATE MAY COVER EXACTLY WHAT THIS SIDE HOLDS — ASK THAT FIRST.
+     *
+     * `DOD-M15-UNILATERAL-1`. The completeness predicate below describes a BILATERAL leaf set: two
+     * SEAL ctrl leaves, from two distinct senders. **A solo seal can never satisfy it**, because the
+     * counterparty is gone and never posts one — that is the entire premise. So on the solo path
+     * this returned `cannot_judge` every time, `session-ceremony.ts` refuses to co-sign on anything
+     * that is not `match`, and **the sealing party refused to co-sign its own unilateral seal.** The
+     * FROST ceremony never reached threshold, the directory never completed, and the close came back
+     * `seal_unilateral_timeout` — the label that names our own wait. Measured against the real
+     * binaries: `j-unilateral` failed on exactly this, with the directory having already verified the
+     * chain and recorded the counterparty ABSENT.
+     *
+     * Completeness was only ever needed to tell TWO KINDS OF DISAGREEMENT apart — "the roots differ
+     * because my carry is behind" (cannot judge) from "the roots differ because the directory
+     * certified something else" (mismatch). It answers nothing when the roots AGREE: a certificate
+     * whose root and leaf count are exactly what this daemon holds is, by construction, over this
+     * daemon's own leaves. Nothing is taken on trust — both values are recomputed here from the
+     * carry, and an adversary who could satisfy them would have to have produced this leaf set.
+     *
+     * Deliberately BOTH values. A count that disagreed while the root matched would be a certificate
+     * contradicting itself, and this is not the place to wave that through.
+     */
+    const carryInputs = carryContentHashInputs(carry);
+    if (
+      carryInputs !== null &&
+      carry.length === certifiedLeafCount &&
+      Buffer.compare(Buffer.from(merkleRoot(buildMerkleTree(carryInputs))), Buffer.from(certifiedRoot)) === 0
+    ) {
+      return { verdict: "match" };
+    }
+
     if (!selfEvidentlyComplete) {
       return {
         verdict: "cannot_judge",
@@ -2991,21 +3050,11 @@ export class SessionNodeManager {
         detail: `leaf_count_disagrees: this daemon holds a provably complete ${carry.length}-leaf set, the certificate claims ${certifiedLeafCount}`,
       };
     }
-    const inputs: LeafInput[] = [];
-    for (const leaf of carry) {
-      let contentHash: unknown;
-      try {
-        // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
-        contentHash = (decode(leaf.structure1Cbor) as unknown[])[1];
-      } catch {
-        return { verdict: "cannot_judge", reason: "structure1_decode_failed" };
-      }
-      if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) {
-        return { verdict: "cannot_judge", reason: "structure1_content_hash_missing" };
-      }
-      inputs.push({ kind: "hash", data: contentHash });
+    if (carryInputs === null) {
+      // A leaf this daemon cannot decode is a leaf it cannot judge. Never an accusation.
+      return { verdict: "cannot_judge", reason: "structure1_content_hash_unreadable" };
     }
-    const ownRoot = merkleRoot(buildMerkleTree(inputs));
+    const ownRoot = merkleRoot(buildMerkleTree(carryInputs));
     const ownRootHex = Buffer.from(ownRoot).toString("hex");
     return Buffer.compare(Buffer.from(ownRoot), Buffer.from(certifiedRoot)) === 0
       ? { verdict: "match" }
