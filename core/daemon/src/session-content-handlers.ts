@@ -759,11 +759,19 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         sequence_number: placement.leafIndex,
         diverged: true,
         /**
-         * ⚠️ REACHABLE ONLY AFTER AN UNWITNESSED LEAF, which is what made its omission the worst of
-         * the three — review HIGH-2. The unwitnessed guidance tells the operator to watch for
-         * `witnessed: false`; without this field the very next send returns an object where
-         * `witnessed` is `undefined`, so the condition they were told to watch for could never be
-         * observed. The advice named a signal the code did not emit.
+         * ⚠️ THIS IS `true`, AND THE FIRST VERSION OF THIS COMMENT SAID OTHERWISE — review HIGH-B.
+         *
+         * The divergence branch is reached only when the relay DID assign a sequence, one behind
+         * this side's frontier (`assignedSeq < nextExpected`). So the relay witnessed this leaf; it
+         * witnessed it at a position our tree has already passed. `witnessed: true` is the honest
+         * answer and `diverged: true` is the field that carries the bad news here.
+         *
+         * I had written that this return was "reachable only after an unwitnessed leaf" and would
+         * otherwise report `witnessed: undefined`, so the operator could never see the `false` the
+         * guidance told them to watch for. The first half is true — divergence is caused by an
+         * earlier unwitnessed append — and the conclusion drawn from it was not: THIS send was
+         * witnessed. Recorded rather than silently corrected, because a comment asserting the wrong
+         * value of the field beside it is how the next reader learns the wrong model.
          */
         witnessed: wasWitnessed(placement),
         ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
@@ -840,18 +848,30 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
          * worse than silence — it named the property that had just been lost as the reason not to
          * worry. Claimed only when true; the rest of the sentence is unchanged and still right.
          */
+        /**
+         * ⚠️ "NO ACTION IS NEEDED" IS CONDITIONAL TOO — review HIGH-C, and the same mistake the
+         * queued path had already fixed one branch away.
+         *
+         * The first version left that reassurance unconditional and then contradicted it three
+         * words later: no action is needed… BUT this session is on its way to being unsealable.
+         * Telling the operator to relax and then telling them the conversation is dying is worse
+         * than either sentence alone, because the one they act on is the first.
+         *
+         * This branch also named no remedy at all, while its two siblings both say to close. Same
+         * situation, same advice.
+         */
         guidance:
           "Sent. This message went via the relay rather than a direct connection, so it is sealed"
           + (wasWitnessed(placement) ? ", witnessed" : "") + " and on its way — the counterparty "
           + "normally has it within seconds. "
           + "`delivered: false` means it did not go over a direct link, NOT that it failed. "
-          + "No action is needed, and re-sending would duplicate it."
           + (wasWitnessed(placement)
-            ? ""
-            : " BUT the relay did NOT witness this leaf, so the ordering authority has no copy of it "
-              + "and your record is a leaf ahead of the relay's. Ordering does not repair itself: the "
-              + "next message the relay does witness will report this session as diverged, and a "
-              + "diverged session can never be sealed with the counterparty."),
+            ? "No action is needed, and re-sending would duplicate it."
+            : "Do not re-send — that would duplicate it. BUT the relay did NOT witness this leaf, so "
+              + "the ordering authority has no copy of it and your record is a leaf ahead of the "
+              + "relay's. Ordering does not repair itself: the next message the relay does witness "
+              + "will report this session as diverged, and a diverged session can never be sealed "
+              + "with the counterparty. If the receipt matters, close rather than continuing."),
         ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
       };
     }
@@ -905,8 +925,18 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         ? {}
         : {
             guidance:
+              /**
+               * ⚠️ NOT "the counterparty's record cannot gain it" — review MED-D. On THIS branch the
+               * direct send succeeded, and the receiving side appends unwitnessed content in arrival
+               * order rather than refusing it (refusing would make the relay a precondition for
+               * reading your mail). So they do get the message. What nobody gets is an independent
+               * record that you sent it — which is the thing actually lost, and the thing the remedy
+               * below is for. The old sentence would have had an operator conclude the conversation
+               * was already broken bilaterally when the two trees may still agree.
+               */
               "Delivered and in your transcript — but the relay did not witness it, so the ordering "
-              + "authority has no copy and the counterparty's record cannot gain it. Do NOT resend: "
+              + "authority has no copy of it: the counterparty has your message, and neither of you "
+              + "has independent proof you sent it. Do NOT resend: "
               + "that adds a second copy to your record and does not witness the first. "
               + "ORDERING DOES NOT REPAIR ITSELF — your record is now one leaf ahead of the relay's, "
               + "so the next message the relay DOES witness will report this session as diverged, "

@@ -518,7 +518,7 @@ server.tool("cello_await_session", "Wait for an inbound session request", {
   return jsonText(result);
 });
 
-server.tool("cello_send", "Send a message in an active session. REQUIRED: every message must include a signal parameter declaring your next action. Every answer carries `witnessed`: true means the relay recorded the message in the ordering authority, false means it did not and this session is on its way to being unsealable — read the `guidance` that comes with it rather than resending.", {
+server.tool("cello_send", "Send a message in an active session. REQUIRED: every message must include a signal parameter declaring your next action. Every answer that placed a leaf carries `witnessed`: true means the relay recorded the message in the ordering authority, false means it did not and this session is on its way to being unsealable — read the `guidance` that comes with it rather than resending. Its ABSENCE means no leaf was placed at all (the send was refused before that point) — read `reason`, not `witnessed`.", {
   cello_session_id: z.string().describe("Session ID"),
   content: z.string().describe("Message content (UTF-8 text)"),
   signal: z.enum(SIGNAL_VALUES).optional().describe(

@@ -96,15 +96,24 @@ describe("016-RELAYLOSS — an unwitnessed send is not reported as an ordinary s
   }, 60_000);
 
   /**
-   * ─── REVIEW HIGH-2: the field is on EVERY outcome, or it cannot be branched on ────────────────
+   * ─── EVERY LEAF-PLACING RETURN STATES IT, so a caller can branch on it ───────────────────────
    *
-   * The first version put `witnessed` on two of `cello_send`'s five return paths. A field present
-   * on some outcomes and absent on others is unusable to a caller: its absence reads as an older
-   * daemon rather than as an answer. The DIVERGED path is the sharpest case — it is reachable only
-   * after an unwitnessed leaf, so the exact condition the guidance tells the operator to watch for
-   * returned an object where `witnessed` was `undefined`.
+   * The first version put `witnessed` on two of the five returns that place a leaf. A field present
+   * on some outcomes and absent on others is unusable: its absence reads as an older daemon rather
+   * than as an answer.
+   *
+   * ⚠️ **THIS TEST WAS NAMED FOR A BRANCH IT NEVER REACHES** — review HIGH-B. It was called "the
+   * DIVERGED response carries witnessed too", and the fixture has no relay, so every send here takes
+   * the unwitnessed-append branch and divergence is unreachable. Deleting `witnessed` from the
+   * diverged return left it green: it was a duplicate of the test above wearing another name.
+   *
+   * Two things came out of measuring that. The diverged return reports `witnessed: **true**` — it is
+   * reached only when the relay DID assign a sequence, behind our frontier — so the name was also
+   * asserting the wrong value. And the branch cannot be driven without a relay, so it is pinned in
+   * the spine journey rather than here. Renamed to what it does: a SECOND unwitnessed send still
+   * says so, which is the sequence an operator actually walks into.
    */
-  it("★ the DIVERGED response carries witnessed too — the one path reachable only after this defect", async () => {
+  it("★ a second unwitnessed send still states witnessed:false (diverged needs a relay; pinned in the journey)", async () => {
     fx = await startTwoConnectionFixture({
       dirPrefix: "cello-relayloss-diverged-",
       node: new FakeNode() as unknown as CelloNode,
