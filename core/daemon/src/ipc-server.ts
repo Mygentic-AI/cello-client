@@ -255,11 +255,21 @@ export function createIpcServer(
         // log, so a failure is diagnosable from the daemon log alone; the response's guidance
         // sends the reader there and is only true because of this log line.
         const message = extractErrorMessage(err);
+        // `reason` alongside the message, because extractErrorMessage returns only the prose and
+        // the transport's structured throws carry the discriminator separately — `no_connection`
+        // vs `connection_lost` is what decides whether re-dialling can help (transport node.ts).
+        // Dropping it here would leave the log the guidance points at unable to answer the first
+        // question its reader has.
+        const reason = err && typeof err === "object" && !(err instanceof Error)
+          && typeof (err as { reason?: unknown }).reason === "string"
+          ? (err as { reason: string }).reason
+          : undefined;
         logger.error("daemon.ipc.request.failed", {
           connectionId: conn.id,
           method: request.method,
           requestId: request.id,
           error: message,
+          ...(reason !== undefined ? { reason } : {}),
         });
         try {
           const resp: IpcResponse = {

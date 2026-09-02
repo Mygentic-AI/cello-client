@@ -346,6 +346,9 @@ describe("ipc-server", () => {
         expect(failed!.level).toBe("error");
         expect(failed!.context.method).toBe("park");
         expect(failed!.context.error).toBe("no relay connection for agent CELLO_Support");
+        // The discriminator survives too. `extractErrorMessage` returns prose only, and
+        // no_connection vs connection_lost is what tells the reader whether re-dialling helps.
+        expect(failed!.context.reason).toBe("no_connection");
         socket.end();
       } finally {
         await server.stop();
