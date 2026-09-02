@@ -19,7 +19,7 @@
  * Lives in its own module because the ordering IS the contract, and a contract that only exists
  * inside a 3,000-line composition root is one refactor away from being two `void`s again.
  */
-import { extractErrorMessage } from "./session-relay-client.js";
+import { extractErrorMessage } from "./error-message.js";
 import type { Logger } from "./types.js";
 
 export interface ReconnectDrainDeps {

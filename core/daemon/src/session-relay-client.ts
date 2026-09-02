@@ -35,6 +35,7 @@ import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
 
@@ -416,23 +417,6 @@ export interface RelayAssignmentCarry {
   initiatorSessionPeerId?: string;     // present for relay-mode sessions (covered by the sig when both present)
   counterpartySessionPeerId?: string;
   assignmentSignature: Uint8Array;     // 64-byte per-node directory sig over the relay TBS (relay_directory_signature)
-}
-
-/**
- * Extract a real message from a thrown value. libp2p / cross-package errors are not
- * always `instanceof Error` in this realm (multi-version split), so fall back to a
- * `message` property or JSON — never the useless "[object Object]".
- */
-export function extractErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string") {
-    return (err as { message: string }).message;
-  }
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
 }
 
 function toU8(v: unknown): Uint8Array {

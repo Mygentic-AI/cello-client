@@ -32,6 +32,7 @@ import { createServer, type Server, type Socket } from "node:net";
 import { chmod, stat, unlink } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import type { Logger, IpcRequest, IpcResponse, IpcNotification } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Everything the server needs of a handler map: resolve a method name when a request arrives. */
 export interface HandlerLookup {
@@ -248,12 +249,24 @@ export function createIpcServer(
         }
       })
       .catch((err: unknown) => {
+        // extractErrorMessage, NOT String(err): handlers reject with structured plain objects as
+        // well as Errors, and String() on a plain object yields the literal "[object Object]" —
+        // the cause is destroyed at the point of reporting. The SAME extracted text goes to the
+        // log, so a failure is diagnosable from the daemon log alone; the response's guidance
+        // sends the reader there and is only true because of this log line.
+        const message = extractErrorMessage(err);
+        logger.error("daemon.ipc.request.failed", {
+          connectionId: conn.id,
+          method: request.method,
+          requestId: request.id,
+          error: message,
+        });
         try {
           const resp: IpcResponse = {
             id: request.id,
             error: {
               code: "internal_error",
-              message: err instanceof Error ? err.message : String(err),
+              message,
               guidance: "An unexpected error occurred. Check daemon logs for details.",
             },
           };
@@ -375,7 +388,7 @@ export function createIpcServer(
             if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
               logger.warn("daemon.ipc.socket.unlink.failed", {
                 socketPath,
-                error: err instanceof Error ? err.message : String(err),
+                error: extractErrorMessage(err),
               });
             }
           }
@@ -402,7 +415,7 @@ export function createIpcServer(
       } catch (err: unknown) {
         logger.debug("daemon.ipc.notification.write.failed", {
           connectionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
         return false;
       }

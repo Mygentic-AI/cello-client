@@ -94,8 +94,9 @@ import type { IManifestVersionStore } from "@cello-protocol/transport";
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
 import type { ISessionNodeFactory, SessionNodeConfig, RelayConnectParams } from "./session-node-manager.js";
-import { LEAF_KIND_MSG, AgentRelayClient, extractErrorMessage } from "./session-relay-client.js";
+import { LEAF_KIND_MSG, AgentRelayClient } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
+import { extractErrorMessage } from "./error-message.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
 import {
   resolveCelloEnv,

@@ -315,4 +315,69 @@ describe("ipc-server", () => {
       await server.stop();
     }
   });
+
+  // DOD-M15-PARKERROR-1 — the catch-all every IPC method inherits used to report
+  // `String(err)`, which on a plain object is the literal "[object Object]": the cause was
+  // destroyed at the point of reporting, in the response AND in the log. Handlers reject with
+  // structured plain objects, not only Errors, so both plain-object shapes are pinned here.
+  describe("a rejected handler names its cause, not [object Object]", () => {
+    // Branch: not an Error, `message` IS a string → extractErrorMessage returns that string.
+    it("carries the message of a rejection that is a plain object with a message", async () => {
+      const socketPath = join(tempDir, "test.sock");
+      const handlers = new Map<string, IpcHandler>();
+      handlers.set("park", async () => {
+        throw { reason: "no_connection", message: "no relay connection for agent CELLO_Support" };
+      });
+      const server = createIpcServer({ socketPath, maxConnections: 16, logger }, handlers);
+      await server.start();
+
+      try {
+        const socket = await connectToSocket(socketPath);
+        const response = await sendAndReceive(socket, JSON.stringify({ id: "req-park", method: "park" }));
+        const parsed = JSON.parse(response);
+
+        expect(parsed.error.code).toBe("internal_error");
+        expect(parsed.error.message).not.toBe("[object Object]");
+        expect(parsed.error.message).toBe("no relay connection for agent CELLO_Support");
+
+        // The guidance sends the reader to the log, so the log must carry the same cause.
+        const failed = logEvents.find((e) => e.event === "daemon.ipc.request.failed");
+        expect(failed).toBeDefined();
+        expect(failed!.level).toBe("error");
+        expect(failed!.context.method).toBe("park");
+        expect(failed!.context.error).toBe("no relay connection for agent CELLO_Support");
+        socket.end();
+      } finally {
+        await server.stop();
+      }
+    });
+
+    // Branch: not an Error, no `message` at all → extractErrorMessage falls through to JSON.
+    it("carries the fields of a rejection that is a plain object with no message", async () => {
+      const socketPath = join(tempDir, "test.sock");
+      const handlers = new Map<string, IpcHandler>();
+      handlers.set("park", async () => {
+        throw { reason: "no_connection", stage: "relay" };
+      });
+      const server = createIpcServer({ socketPath, maxConnections: 16, logger }, handlers);
+      await server.start();
+
+      try {
+        const socket = await connectToSocket(socketPath);
+        const response = await sendAndReceive(socket, JSON.stringify({ id: "req-park2", method: "park" }));
+        const parsed = JSON.parse(response);
+
+        expect(parsed.error.message).not.toBe("[object Object]");
+        expect(parsed.error.message).toContain("no_connection");
+        expect(parsed.error.message).toContain("relay");
+
+        const failed = logEvents.find((e) => e.event === "daemon.ipc.request.failed");
+        expect(failed).toBeDefined();
+        expect(failed!.context.error).toContain("no_connection");
+        socket.end();
+      } finally {
+        await server.stop();
+      }
+    });
+  });
 });
