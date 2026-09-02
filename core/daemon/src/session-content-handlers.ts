@@ -103,6 +103,29 @@ const AUTO_REPLY_GUIDANCE =
  * rather than imply one. `sendContent` returns it per-send rather than stashing it by session,
  * because a side map hands a caller the wrong send's signature the moment two are in flight.
  */
+/**
+ * Did the RELAY witness this leaf — the single fact every `witnessed` in this file is read from.
+ *
+ * `016-RELAYLOSS` review HIGH-2. The first version of the fix put `witnessed` on two of `cello_send`'s
+ * FIVE return paths, which defeats the reason it was added at all: a field that is present on some
+ * outcomes and absent on others cannot be branched on, and its absence reads as an older daemon
+ * rather than as an answer. Worse, the two it missed are the two that matter most — the diverged
+ * path is reachable ONLY after an unwitnessed leaf, and the durably-queued path is the one
+ * production takes when the relay is also the transport (behind NAT, content and witness die
+ * together), where it was telling operators "No action needed."
+ *
+ * Read off the PLACEMENT, not re-derived from the sequence number, so this and the
+ * `session.tree.own_leaf_unwitnessed` ERROR beside it can never disagree about the same send.
+ *
+ * ⚠️ A HELD leaf (`placed: false`) is WITNESSED, and that is not a special case being papered over.
+ * A leaf is held precisely BECAUSE the relay assigned it a position beyond this side's tail — being
+ * held is itself proof of an assignment. Reporting `witnessed: false` there would tell an operator
+ * their record had lost a message when the opposite is true.
+ */
+export function wasWitnessed(p: { placed: true; unwitnessed?: true } | { placed: false }): boolean {
+  return p.placed ? p.unwitnessed !== true : true;
+}
+
 export function sentAuthorship(
   r: Awaited<ReturnType<SessionNodeManager["sendContent"]>>,
 ): { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined {
@@ -609,7 +632,23 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // "queued and not in the record yet".
           ...(placed.placed ? {} : { held: true }),
           sequence_number: queuedLeaf,
-          guidance: sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.",
+          /**
+           * ⚠️ THE BRANCH PRODUCTION ACTUALLY TAKES — review HIGH-2, and the reason the loopback
+           * journey could not find it. Behind NAT the direct path runs over the relay's circuit, so
+           * a relay outage kills the transport and the witness TOGETHER and the send lands here
+           * rather than on the delivered path. On the harness the two are independent, the direct
+           * send succeeds, and this branch is never reached.
+           *
+           * It was answering "No action needed" for a leaf the relay never witnessed.
+           */
+          witnessed: wasWitnessed(placed),
+          guidance: wasWitnessed(placed)
+            ? (sendResult.guidance ?? "The message is queued and will be re-sent automatically when the relay link is back. No action needed.")
+            : "Queued for re-send, and NOT witnessed — the relay has no copy of this leaf, so your "
+              + "record is now one leaf ahead of it. Ordering does not repair itself: the next "
+              + "message the relay does witness will report this session as diverged, and a diverged "
+              + "session can never be sealed with the counterparty. The re-send is automatic; do not "
+              + "send it again yourself. If the receipt matters, close rather than continuing.",
         };
       }
       return {
@@ -651,6 +690,13 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         sequence_number: -1,
         held: true,
         held_at: placement.heldAt,
+        /**
+         * TRUE, and it is not a courtesy default — review HIGH-2. A leaf is HELD precisely because
+         * the relay assigned it a position beyond this side's tail, so being held is itself proof
+         * that the relay witnessed it. Omitting the field here would leave an agent branching on
+         * `witnessed !== true` reading a perfectly healthy message as a lost one.
+         */
+        witnessed: wasWitnessed(placement),
         // The screening verdict must survive this return, or an agent whose message was ALTERED is
         // never told — the one thing a redact verdict exists to surface.
         ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
@@ -671,6 +717,14 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         ok: true,
         sequence_number: placement.leafIndex,
         diverged: true,
+        /**
+         * ⚠️ REACHABLE ONLY AFTER AN UNWITNESSED LEAF, which is what made its omission the worst of
+         * the three — review HIGH-2. The unwitnessed guidance tells the operator to watch for
+         * `witnessed: false`; without this field the very next send returns an object where
+         * `witnessed` is `undefined`, so the condition they were told to watch for could never be
+         * observed. The advice named a signal the code did not emit.
+         */
+        witnessed: wasWitnessed(placement),
         ...(modified ? { modified: true, transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
         guidance: `The message was delivered and is in your transcript. But this session's record has drifted out of step with the relay's ordering, so it can no longer be sealed with the counterparty — there will be no notarized receipt for it. Keep talking if you want to; when you are finished, cello_close_session ${sessionId} { force: true } is the only way it can end. cello_transcript ${sessionId} is the record you keep.`,
       };
@@ -718,7 +772,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         reason: "dispatched_to_relay",
         modified,
         // Same fact, same shape, both branches — see the note on the delivered path below.
-        witnessed: !placement.unwitnessed,
+        witnessed: wasWitnessed(placement),
         /**
          * WHAT IS ACTUALLY TRUE, and the previous wording was neither.
          *
@@ -747,14 +801,16 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
          */
         guidance:
           "Sent. This message went via the relay rather than a direct connection, so it is sealed"
-          + (placement.unwitnessed ? "" : ", witnessed") + " and on its way — the counterparty "
+          + (wasWitnessed(placement) ? ", witnessed" : "") + " and on its way — the counterparty "
           + "normally has it within seconds. "
           + "`delivered: false` means it did not go over a direct link, NOT that it failed. "
           + "No action is needed, and re-sending would duplicate it."
-          + (placement.unwitnessed
-            ? " NOTE: the relay did not witness this leaf, so the ordering authority has no copy of "
-              + "it. Check `cello status` for the relay before continuing."
-            : ""),
+          + (wasWitnessed(placement)
+            ? ""
+            : " BUT the relay did NOT witness this leaf, so the ordering authority has no copy of it "
+              + "and your record is a leaf ahead of the relay's. Ordering does not repair itself: the "
+              + "next message the relay does witness will report this session as diverged, and a "
+              + "diverged session can never be sealed with the counterparty."),
         ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
       };
     }
@@ -785,19 +841,38 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
        * absence is indistinguishable from an older daemon, and "absence is not a pass" is the rule
        * this milestone keeps re-learning. Present always, it is a fact the caller can branch on.
        */
-      witnessed: !placement.unwitnessed,
-      ...(placement.unwitnessed
-        ? {
+      witnessed: wasWitnessed(placement),
+      /**
+       * ⚠️ THIS ONCE SAID *"send the next message normally — ordering re-establishes itself."* It
+       * was false, and it was the most damaging sentence in the unit that added it — review HIGH-1.
+       *
+       * `placeOwnLeaf` states the opposite sixty lines away: an unwitnessed append leaves this
+       * side's tree one leaf AHEAD of the relay's counter, so "from then on every ack comes back
+       * behind our frontier and the two can never agree again — the seal was already lost at the
+       * unwitnessed append, not here." The next WITNESSED send therefore takes the divergence
+       * branch and marks the session permanently unsealable. Telling the operator to keep talking
+       * was telling them to perform the act that makes the loss permanent.
+       *
+       * Which is this unit's own subject — a reassuring sentence asserting a property already lost
+       * — reproduced one clause later in its replacement. Kept as a comment, not quietly deleted,
+       * because the reasoning is the part that stops it coming back.
+       *
+       * `cello status` came out of the advice for the same reason: measured in this unit's own
+       * runs, its relay fields read identically during the outage and before it.
+       */
+      ...(wasWitnessed(placement)
+        ? {}
+        : {
             guidance:
               "Delivered and in your transcript — but the relay did not witness it, so the ordering "
               + "authority has no copy and the counterparty's record cannot gain it. Do NOT resend: "
-              + "that adds a second copy to your record and does not witness the first. Check "
-              + "`cello status` for the relay, and once it is healthy send the next message "
-              + "normally — ordering re-establishes itself. If sends keep coming back "
-              + "`witnessed: false`, close the session while you still can rather than building a "
-              + "longer conversation on a record that cannot be sealed with the counterparty.",
-          }
-        : {}),
+              + "that adds a second copy to your record and does not witness the first. "
+              + "ORDERING DOES NOT REPAIR ITSELF — your record is now one leaf ahead of the relay's, "
+              + "so the next message the relay DOES witness will report this session as diverged, "
+              + "and a diverged session can never be sealed with the counterparty. If the receipt "
+              + "matters, stop sending and close now; if you keep talking, do it knowing this "
+              + "conversation is unlikely to produce one.",
+          }),
       // On a redact, tell the agent exactly what was transformed (the §6 sender-side surface).
       ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
     };
