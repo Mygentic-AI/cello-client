@@ -228,6 +228,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     correlationId: string,
     agentName: string,
     signalFilter?: { include?: string[]; exclude?: string[] },
+    /**
+     * `DOD-M15-UNILATERAL-1`: opt this conversation in to the HIGH-STAKES seal tier.
+     *
+     * It changes nothing about how the session is set up — only what a SOLO seal will later
+     * require. Declared at the start because it is a property of the conversation, and because
+     * neither the relay nor the directory can infer one: the relay is deliberately blind to content
+     * and the directory never sees it.
+     */
+    highStakes?: boolean,
   ): Promise<SessionNegotiationResult> {
     let resolveFrame!: (f: Record<string, unknown>) => void;
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
@@ -425,6 +434,9 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         wants_session_offer: true,
         ...(moniker !== undefined ? { moniker } : {}),
         ...(trustSignals !== undefined ? { trust_signals: trustSignals } : {}),
+        // DOD-M15-UNILATERAL-1: sent ONLY when opted in. The directory reads it strictly (`=== true`)
+        // and every other value, absence included, means the standard tier.
+        ...(highStakes === true ? { high_stakes: true } : {}),
       });
       if (!sent.ok) {
         return { ok: false, reason: sent.reason ?? "directory_unreachable", guidance: sent.guidance ?? "Could not send session_request over the directory signaling stream." };
@@ -592,6 +604,8 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     sr: { peerId: string; addrs: string[] },
     correlationId: string,
     signalFilter?: { include?: string[]; exclude?: string[] },
+    /** DOD-M15-UNILATERAL-1: carried to the brokering node exactly as on the local path. */
+    highStakes?: boolean,
   ): Promise<SessionNegotiationResult> {
     const roster = await resolveConsortiumRoster();
     const target = roster?.find((e) => e.nodeId === owningNodeId) ?? null;
@@ -643,7 +657,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "visiting_connection_unreachable", correlationId });
         return { ok: false, reason: "visiting_connection_unreachable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
       }
-      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName, signalFilter);
+      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName, signalFilter, highStakes);
       if (result.ok) {
         releaseReason = "handoff-complete";
         // Fix #1: remember the broker for this session so cello_close_session can reconnect to complete the seal.
@@ -726,6 +740,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       const signalFilter: { include?: string[]; exclude?: string[] } | undefined =
         includeTypes || excludeTypes ? { include: includeTypes, exclude: excludeTypes } : undefined;
 
+      /**
+       * `DOD-M15-UNILATERAL-1`: the HIGH-STAKES seal tier, opted in per conversation.
+       *
+       * Strict `=== true` at every hop, including this one. The tier can WITHHOLD a receipt when
+       * the counterparty's absence is unproven, so a truthy-but-not-true value must never reach it —
+       * the operator has to have actually asked.
+       */
+      const highStakes = ctx.params["high_stakes"] === true;
+
       const sr = sessionNodeManager.getStandingReceiverInfo(ctx.agentName);
       if (!sr) {
         return {
@@ -791,7 +814,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
-            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter);
+            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter, highStakes);
           }
           // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
           // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.
@@ -845,9 +868,9 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             action.kind === "same_node"
               // SAME-NODE: the target is on the node we're already connected to. The existing path runs
               // unchanged — ZERO visiting connections, ZERO new frames beyond the one discovery_lookup.
-              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter)
+              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter, highStakes)
               // CROSS-NODE: reach into the target's home over a transient visiting connection.
-              : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId, signalFilter);
+              : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId, signalFilter, highStakes);
 
           // RETRY triggers: (a) the broker reported target_offline (stale replicated presence or a
           // re-home between discovery and the request); (b) a transient visiting-connection failure
