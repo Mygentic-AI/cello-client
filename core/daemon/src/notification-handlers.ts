@@ -74,6 +74,38 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
     };
   }
 
+  /**
+   * DOD-M15-CORROBORATE-1 — what a RELAY saw, next to what this daemon saw.
+   *
+   * ⚠️ **THE WORDING IS BOUNDED ON PURPOSE, AND THE BOUND IS THE POINT.** One relay is one witness.
+   * It establishes that this relay received a submission on that session and refused it because the
+   * signature verified against neither participant's key — and nothing else. It does not establish
+   * who sent it, that anyone acted in bad faith, or that a message was forged. Saying more would
+   * make a single relay's word into a finding about a person, which is exactly what this unit
+   * exists to avoid on the client side too.
+   */
+  function witnessSection(agentName: string): Record<string, unknown> {
+    const alerts = sessionNodeManager.getWitnessAlerts(agentName);
+    if (alerts.length === 0) return {};
+    return {
+      relay_witness_alerts: alerts.map((a) => ({
+        session_id: a.sessionIdHex,
+        observed_at: a.observedAt,
+        witness_relay: a.relayId ?? "unnamed",
+        submitter_was_your_counterparty: a.submitterIsCounterparty,
+      })),
+      relay_witness_alerts_guidance:
+        "A relay carrying one of your conversations refused a submission because its signature " +
+        "verified against neither your key nor your counterparty's. Nothing was added to the " +
+        "conversation record and the session is still open. THIS IS ONE RELAY'S OBSERVATION, NOT A " +
+        "FINDING: it establishes only that this relay saw and refused that submission — it does not " +
+        "establish who sent it, and it is not evidence that your counterparty did anything. There " +
+        "is currently no second witness to check it against. Tell the operator what was observed, " +
+        "in those terms, and let them decide; if it worries them, the way to end a conversation is " +
+        "cello_close_session, and confirming anything with the counterparty happens outside CELLO.",
+    };
+  }
+
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
   // Notifications are fire-and-forget (no ack, no redelivery); this is how a client discovers what
   // it missed while its shim was down/busy, and the primary inbox for poll-only clients (Bedrock,
@@ -233,7 +265,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           // exact surface M12-P18 added so a cap firing did not require reading the daemon log.
           ...(refused.length > 0 ? { refused_session_requests: refused } : {}),
           unread,
-          total_unread, rename_notices, ...documentSection(agent),
+          total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
           // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
@@ -276,7 +308,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent) };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

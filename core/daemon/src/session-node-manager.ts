@@ -78,7 +78,7 @@ import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnve
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
@@ -1024,6 +1024,42 @@ export class SessionNodeManager {
       }),
       correlationId,
     });
+  }
+
+  /**
+   * DOD-M15-CORROBORATE-1: witness alerts this agent's relays have reported, newest last, capped.
+   * In memory only — this is a notice, not evidence, and a relay that still holds the observation
+   * re-delivers it on the next authenticated connection.
+   */
+  readonly #witnessAlerts = new Map<string, RelayWitnessAlert[]>();
+  static readonly #WITNESS_ALERT_CAP = 20;
+
+  /**
+   * Record what one relay says it saw on one of this agent's sessions, for the operator to read.
+   *
+   * ⚠️ **IT DOES NOT FREEZE THE SESSION, AND THAT IS THE DESIGN.** A client freezing on its OWN
+   * verification is safe: it limits only what that client trusts. Freezing on a REMOTE party's
+   * say-so hands any single relay the power to end any conversation it carries, and to write an
+   * accusatory record about a counterparty who did nothing. The identity freeze stays where it is —
+   * on this daemon's own check of an inbound frame — and this surfaces a second, independent
+   * observation next to it. One witness reports; it does not rule.
+   */
+  recordRelayWitnessAlert(agentName: string, alert: RelayWitnessAlert): void {
+    const list = this.#witnessAlerts.get(agentName) ?? [];
+    list.push(alert);
+    this.#witnessAlerts.set(agentName, list.slice(-SessionNodeManager.#WITNESS_ALERT_CAP));
+    this.#logger.error("session.witness.alert.recorded", {
+      agentName,
+      sessionId: alert.sessionIdHex,
+      relayId: alert.relayId ?? "(unnamed)",
+      submitterIsCounterparty: alert.submitterIsCounterparty,
+      impact: "surfaced to the operator on the next cello_check_notifications; the session is NOT frozen by it",
+    });
+  }
+
+  /** The witness alerts an agent has been told about, oldest first. */
+  getWitnessAlerts(agentName: string): ReadonlyArray<RelayWitnessAlert> {
+    return this.#witnessAlerts.get(agentName) ?? [];
   }
 
   /**
@@ -4421,6 +4457,9 @@ export class SessionNodeManager {
           sealLeafStore: this.#sealLeafStore ?? undefined,
           // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
           onlineToken: () => this.getDirectoryOnlineToken(agentName),
+          // DOD-M15-CORROBORATE-1: a relay's witness alert reaches the operator's inbox from here.
+          // The DETACHED clients get the same callback from the builder in daemon.ts.
+          onWitnessAlert: (alert) => { this.recordRelayWitnessAlert(agentName, alert); },
         });
         this.#relayClients.set(clientKey, client);
       }

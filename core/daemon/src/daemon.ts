@@ -2110,6 +2110,9 @@ async function startDaemonHoldingLock(
       // DOD-M15-RELAYSLOTS-1: the manager owns the current token and hands the accessor down, so
       // this client reads a fresh one at every auth instead of a snapshot taken here at build time.
       onlineToken: stores.onlineToken,
+      // DOD-M15-CORROBORATE-1: the DETACHED client needs this as much as the live one — a session
+      // being sealed after a restart is exactly when its operator is not watching.
+      onWitnessAlert: (alert) => { sessionNodeManager.recordRelayWitnessAlert(agentName, alert); },
     });
   });
 

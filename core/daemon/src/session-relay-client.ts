@@ -334,6 +334,30 @@ export interface AgentRelayClientOpts {
    * compiles; production always supplies it.
    */
   onlineToken?: () => Uint8Array | undefined;
+  /**
+   * DOD-M15-CORROBORATE-1: the relay saw a leaf on one of this agent's sessions that verified
+   * against neither participant's key, and is telling us directly.
+   *
+   * Optional so a caller with no notice surface still compiles; production always supplies it. A
+   * client that decoded the frame and dropped it would leave the unit's whole point — a record the
+   * accused party's client cannot suppress — reaching nobody.
+   */
+  onWitnessAlert?: (alert: RelayWitnessAlert) => void;
+}
+
+/**
+ * What ONE relay observed. Deliberately not a verdict, and the field names say so: this establishes
+ * that this relay saw and refused that submission, and nothing about who sent it. Corroboration
+ * would need several relays reporting the same hash sequence, which does not exist yet.
+ */
+export interface RelayWitnessAlert {
+  sessionIdHex: string;
+  reason: "leaf_signed_by_neither_participant";
+  /** Which witness. Null when the relay runs without a signing identity and could not name itself. */
+  relayId: string | null;
+  observedAt: number;
+  /** True iff the relay says the submitter was our counterparty; false = a third party. */
+  submitterIsCounterparty: boolean;
 }
 
 /**
@@ -423,6 +447,8 @@ export class AgentRelayClient {
   readonly #sealLeafStore: SessionSealLeafStore | undefined;
   /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
+  /** DOD-M15-CORROBORATE-1 — where a relay's witness alert goes. See the opt of the same name. */
+  readonly #onWitnessAlert: ((alert: RelayWitnessAlert) => void) | undefined;
   /**
    * DOD-M15-RELAYSLOTS-1: the last refusal this relay gave us, classified. Kept because a log line
    * reaches neither the operator asking why their agent is unreachable nor the code deciding
@@ -502,6 +528,7 @@ export class AgentRelayClient {
     this.#receiptStore = opts.receiptStore;
     this.#sealLeafStore = opts.sealLeafStore;
     this.#onlineToken = opts.onlineToken;
+    this.#onWitnessAlert = opts.onWitnessAlert;
   }
 
   /** The agent's K_local public key as hex — the responder identity for auto-acknowledge. */
@@ -899,6 +926,54 @@ export class AgentRelayClient {
           authored_by_us: authoredByUs,
         });
       }
+    } else if (type === "session_witness_alert") {
+      /**
+       * DOD-M15-CORROBORATE-1 — **the relay is telling us what it saw, and this is where it lands.**
+       *
+       * A relay is not trusted to send a well-formed frame any more than a peer is, so every field
+       * is checked before anything is reported. A frame that does not decode is a MISBEHAVING OR
+       * SKEWED RELAY, not an alert: reporting it as one would let a broken build manufacture
+       * accusations against a counterparty who did nothing. It is logged loudly and goes no further.
+       */
+      const sid = frame["session_id"];
+      const rawRelayId = frame["relay_id"];
+      const observedAt = frame["observed_at"];
+      const submitterIsCounterparty = frame["submitter_is_counterparty"];
+      const sidBytes = sid instanceof Uint8Array || Buffer.isBuffer(sid) ? toU8(sid) : new Uint8Array();
+      const wellFormed =
+        sidBytes.length === 16
+        && frame["reason"] === "leaf_signed_by_neither_participant"
+        && typeof observedAt === "number" && Number.isFinite(observedAt)
+        && typeof submitterIsCounterparty === "boolean"
+        && (rawRelayId === undefined || typeof rawRelayId === "string");
+      if (!wellFormed) {
+        this.#logger.error("session.relay.witness.malformed", {
+          relayPeerId: this.#relayPeerId,
+          impact: "this relay sent a witness alert this build cannot read, so NOTHING has been " +
+            "reported to the operator about it. Treat it as a relay fault or a version skew, not " +
+            "as evidence about either participant.",
+        });
+        return;
+      }
+      const alert: RelayWitnessAlert = {
+        sessionIdHex: Buffer.from(sidBytes).toString("hex"),
+        reason: "leaf_signed_by_neither_participant",
+        relayId: typeof rawRelayId === "string" ? rawRelayId : null,
+        observedAt,
+        submitterIsCounterparty,
+      };
+      // BOTH halves, per Invariant 2: the log is the durable forensic record, and the callback is
+      // the half that actually reaches a person.
+      this.#logger.error("session.relay.witness.alert", {
+        relayPeerId: this.#relayPeerId,
+        session: alert.sessionIdHex,
+        relayId: alert.relayId ?? "(unnamed)",
+        submitterIsCounterparty: alert.submitterIsCounterparty,
+        observation: "one relay refused a leaf on this session because it verified against neither participant key",
+        impact: "nothing was added to the conversation record. This is ONE relay's observation and " +
+          "establishes only that it saw and refused that submission — not who sent it.",
+      });
+      if (this.#onWitnessAlert) this.#onWitnessAlert(alert);
     } else if (type === "relay_slot_reclaimed") {
       /**
        * DOD-M15-RELAYSLOTS-1 clause 8 — **the reaped party is told, and this is where it lands.**
