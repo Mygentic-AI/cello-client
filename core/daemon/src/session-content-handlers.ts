@@ -717,6 +717,8 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         delivered: false,
         reason: "dispatched_to_relay",
         modified,
+        // Same fact, same shape, both branches — see the note on the delivered path below.
+        witnessed: !placement.unwitnessed,
         /**
          * WHAT IS ACTUALLY TRUE, and the previous wording was neither.
          *
@@ -734,11 +736,25 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
          *
          * So: say what happened, say what to expect, and claim nothing about their daemon.
          */
+        /**
+         * `016-RELAYLOSS`: **"witnessed" IS NOT SOMETHING THIS STRING GETS TO ASSERT.**
+         *
+         * It said so unconditionally, and it is false on exactly the path this order measured: a
+         * relay that stops answering fails the hash submit and the leaf is appended unwitnessed,
+         * while the content can still reach the counterparty. The reassurance was then strictly
+         * worse than silence — it named the property that had just been lost as the reason not to
+         * worry. Claimed only when true; the rest of the sentence is unchanged and still right.
+         */
         guidance:
-          "Sent. This message went via the relay rather than a direct connection, so it is sealed, "
-          + "witnessed and on its way — the counterparty normally has it within seconds. "
+          "Sent. This message went via the relay rather than a direct connection, so it is sealed"
+          + (placement.unwitnessed ? "" : ", witnessed") + " and on its way — the counterparty "
+          + "normally has it within seconds. "
           + "`delivered: false` means it did not go over a direct link, NOT that it failed. "
-          + "No action is needed, and re-sending would duplicate it.",
+          + "No action is needed, and re-sending would duplicate it."
+          + (placement.unwitnessed
+            ? " NOTE: the relay did not witness this leaf, so the ordering authority has no copy of "
+              + "it. Check `cello status` for the relay before continuing."
+            : ""),
         ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
       };
     }
@@ -754,6 +770,34 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
       sequence_number: leafIndex,
       delivered: true,
       modified,
+      /**
+       * ─── `016-RELAYLOSS`: THE ONE FACT THIS RESPONSE WAS MISSING ─────────────────────────────
+       *
+       * Measured, not supposed: with the relay black-holed mid-conversation, this send stalled ten
+       * seconds and returned exactly the object above — the same `ok`, the same `delivered`, and a
+       * `sequence_number` that is a LOCAL leaf index and therefore looks just as healthy. The
+       * daemon logged `session.tree.own_leaf_unwitnessed` at ERROR, correctly and in detail, into a
+       * file the agent cannot read. The operator's message arrived, they were told it succeeded,
+       * and the ordering authority has no copy of it.
+       *
+       * `witnessed` is stated on BOTH outcomes rather than only the bad one. A field that appears
+       * only when something is wrong cannot be relied on by a reader who has never seen it — its
+       * absence is indistinguishable from an older daemon, and "absence is not a pass" is the rule
+       * this milestone keeps re-learning. Present always, it is a fact the caller can branch on.
+       */
+      witnessed: !placement.unwitnessed,
+      ...(placement.unwitnessed
+        ? {
+            guidance:
+              "Delivered and in your transcript — but the relay did not witness it, so the ordering "
+              + "authority has no copy and the counterparty's record cannot gain it. Do NOT resend: "
+              + "that adds a second copy to your record and does not witness the first. Check "
+              + "`cello status` for the relay, and once it is healthy send the next message "
+              + "normally — ordering re-establishes itself. If sends keep coming back "
+              + "`witnessed: false`, close the session while you still can rather than building a "
+              + "longer conversation on a record that cannot be sealed with the counterparty.",
+          }
+        : {}),
       // On a redact, tell the agent exactly what was transformed (the §6 sender-side surface).
       ...(modified ? { transformations: (outboundVerdict.events ?? []).filter((e) => e.disposition === "redact") } : {}),
     };

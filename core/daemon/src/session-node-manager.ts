@@ -9919,7 +9919,7 @@ export class SessionNodeManager {
      * `undefined` is a claim the author made rather than one the signature made for them.
      */
     authorship: SentAuthorship | undefined,
-  ): { placed: true; leafIndex: number; diverged?: true } | { placed: false; heldAt: number } {
+  ): { placed: true; leafIndex: number; diverged?: true; unwitnessed?: true } | { placed: false; heldAt: number } {
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.
     this.#ensureHeldRestored(agentName, sessionId);
@@ -9956,7 +9956,22 @@ export class SessionNodeManager {
           "because sealing on a record the counterparty cannot match produces a receipt only one " +
           "side can verify.",
       });
-      return { placed: true, leafIndex };
+      /**
+       * ─── `016-RELAYLOSS`: CARRIED TO THE CALLER, because the log is not a consumer ────────────
+       *
+       * Measured with a real relay black-holed mid-conversation: the send stalls for the submit
+       * timeout, then returns `{ok: true, sequence_number: N, delivered: true}` — BYTE-IDENTICAL to
+       * the witnessed send that preceded it. The error above is correct, complete, and read by
+       * nobody the operator can ask.
+       *
+       * Its two siblings twenty lines below already do this: `diverged` and the held case both
+       * refuse to return an ordinary success, on the stated grounds that doing so "reports a
+       * healthy send on a conversation that has silently lost the one thing the protocol exists to
+       * produce." This branch is where that loss OCCURS — `position_behind_frontier`'s own comment
+       * says the seal "was already lost at the unwitnessed append, not here" — so it is the branch
+       * that most needed to say so, and it was the one that said nothing.
+       */
+      return { placed: true, leafIndex, unwitnessed: true };
     }
 
     if (assignedSeq === nextExpected) {
