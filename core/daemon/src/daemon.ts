@@ -1212,6 +1212,39 @@ async function startDaemonHoldingLock(
       if (frame["type"] !== "trust_signal_pickup") return;
       void handleTrustSignalPickup(frame as Record<string, unknown>, agentKeyProvider, mgr, agentName);
     });
+    /**
+     * DOD-M15-SEALPARTIES-1 Part 0: take the relay credential off `register_success`.
+     *
+     * `onOnlineToken` above catches every signaling auth and reconnect, and misses the one case that
+     * matters most: a brand-new agent. Its daemon opens this very stream in order TO register (the
+     * DKG runs over it), so the auth that created the stream happened while the directory still had
+     * no profile for the key and correctly issued nothing. A healthy stream never re-authenticates,
+     * so without this the agent holds no relay credential for the life of the daemon — no circuit
+     * reservation, unwitnessed leaves, and a close that fails with `seal_persist_failed`.
+     *
+     * A frame with no token is left alone rather than clearing what is held: the directory that
+     * issues here is the same one whose auth_ok issues, so overwriting a good token with an absence
+     * would turn one directory's minting failure into a reachability outage the operator cannot
+     * explain. The absence is already reported by the directory's own `online_token.failed`.
+     */
+    mgr.registerInboundHandler((frame) => {
+      if (frame["type"] !== "register_success") return;
+      const raw = frame["online_token"];
+      const token = raw instanceof Uint8Array ? raw : Buffer.isBuffer(raw) ? new Uint8Array(raw) : undefined;
+      if (token && token.length > 0) {
+        sessionNodeManager.setDirectoryOnlineToken(agentName, token);
+        logger.info("directory.online_token.received", { agentName, source: "register_success", bytes: token.length });
+        return;
+      }
+      logger.warn("directory.online_token.absent", {
+        agentName,
+        source: "register_success",
+        impact: "this agent just registered and was handed no relay online token, so no relay will " +
+          "let it hold a circuit reservation until its directory signaling stream reconnects and " +
+          "re-issues one. Until then it is reachable only over a direct connection, and a session " +
+          "it does hold cannot get its leaves witnessed.",
+      });
+    });
     // CELLO-M7-CONN-001 (DOD-CONN-2): inbound session_assignment + seal_interrupted_request
     // on THIS agent's own stream, so a non-primary agent receives inbound sessions (SPINE-5).
     wirePerAgentSessionInbound(mgr);

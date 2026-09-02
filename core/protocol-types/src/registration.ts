@@ -120,6 +120,18 @@ export interface RegisterSuccess {
   agent_id: string;
   /** Hex-encoded FROST group public key (32 bytes) — confirms what directory stored */
   primary_pubkey: string;
+  /**
+   * DOD-M15-SEALPARTIES-1 Part 0 — the relay credential for the agent that has just registered.
+   *
+   * The token normally rides `signaling_auth_ok`, but a registering agent opens its signaling
+   * stream in order TO register (the DKG runs over it), so that auth happens while the directory
+   * still has no profile for the key and correctly issues nothing. A healthy stream never
+   * re-authenticates, so this is the first — and often the only — moment the answer changes.
+   *
+   * Absent when the directory could not mint one; registration still succeeded, and the agent
+   * picks a token up on its next signaling reconnect.
+   */
+  online_token?: Uint8Array;
 }
 
 /**
