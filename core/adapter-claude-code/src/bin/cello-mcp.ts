@@ -484,8 +484,19 @@ server.tool("cello_policy_log", "What the security layer actually did to your me
 server.tool("cello_initiate_session", "Start a new CELLO session with a target agent", {
   target_pubkey: z.string().describe("Hex-encoded public key of the target agent"),
   agent: z.string().optional().describe("Agent to act as for this call (defaults to the current agent)"),
-}, async ({ target_pubkey, agent }) => {
-  const result = await proxy.call("cello_initiate_session", agent ? { target_pubkey, agent } : { target_pubkey });
+  high_stakes: z.boolean().optional().describe(
+    "Treat this conversation as high-stakes (default false). It changes ONE thing: what it takes to " +
+    "close the conversation WITHOUT the other side. Normally, if they vanish, you can seal alone " +
+    "after ten minutes. Set this and that becomes an hour AND the relay must have actually seen them " +
+    "disconnect — if it never saw them go, no solo receipt is issued at all and you must close " +
+    "together. Stricter about what a receipt may claim, and slower to give you one. Use it when a " +
+    "record saying 'they were absent' would matter to someone.",
+  ),
+}, async ({ target_pubkey, agent, high_stakes }) => {
+  const params: Record<string, unknown> = { target_pubkey };
+  if (agent) params["agent"] = agent;
+  if (high_stakes === true) params["high_stakes"] = true;
+  const result = await proxy.call("cello_initiate_session", params);
   return jsonText(result);
 });
 

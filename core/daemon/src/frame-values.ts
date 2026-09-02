@@ -63,5 +63,23 @@ export function normalizeLegibility(raw: unknown): unknown | undefined {
     disclaimer: o["disclaimer"],
     participants,
     final_message,
+    /**
+     * `DOD-M15-UNILATERAL-1` — WHERE THIS RECEIPT STOPS BEING AS STRONG AS A BILATERAL ONE.
+     *
+     * **RECOMPUTED HERE, NEVER READ OFF THE WIRE**, and that is the whole point. The directory
+     * publishes the same number, but it is not folded into the legibility hash the seal signature
+     * binds — so a value taken from the frame would be a value a tampering path could set. Every
+     * INPUT is bound, so deriving it locally costs nothing and cannot be steered.
+     *
+     * Everything at or below this sequence carries BOTH parties' signatures. Everything above it is
+     * the uncountersigned tail: composed and witnessed, never signed for by the party who had gone.
+     * A consumer that conflates the two reads "they never answered this" as "they agreed to this".
+     */
+    countersigned_through_seq: participants.length === 0
+      ? 0
+      : participants.reduce(
+          (lowest, p) => Math.min(lowest, Math.max(p.content_frontier_seq ?? 0, p.last_authored_seq ?? 0)),
+          Number.POSITIVE_INFINITY,
+        ),
   };
 }
