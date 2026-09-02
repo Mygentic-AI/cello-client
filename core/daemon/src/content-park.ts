@@ -26,7 +26,7 @@ import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { ContentParkClient, ContentParkRefusedError } from "./content-park-client.js";
-import { extractErrorMessage } from "./session-relay-client.js";
+import { extractErrorMessage } from "./error-message.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
 

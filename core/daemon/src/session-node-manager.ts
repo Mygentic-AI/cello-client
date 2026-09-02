@@ -78,7 +78,8 @@ import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnve
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, extractErrorMessage, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * One row in an agent's witness-alert list — DOD-M15-CORROBORATE-1 review F1. Deduped on
