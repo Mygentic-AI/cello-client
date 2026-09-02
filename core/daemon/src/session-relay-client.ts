@@ -365,6 +365,11 @@ export interface RelayWitnessAlert {
   /** True iff the relay says the submitter was our counterparty; false = a third party. */
   submitterIsCounterparty: boolean;
   /**
+   * The libp2p peer id of the relay that said it — always known, unlike `relayId`, which is absent
+   * for a relay that could not sign. Used to tell two unnamed witnesses apart.
+   */
+  witnessPeerId: string;
+  /**
    * Whether the relay PROVED it said this — review F3.
    *
    * `true` means the signature verified against the key `relayId` names, so the operator holds
@@ -1015,12 +1020,31 @@ export class AgentRelayClient {
        * fabrications until the real one is gone.
        */
       if (!this.#sessions.has(sessionIdHex)) {
+        /**
+         * ⚠️ **REFUSED AS AN ALERT, BUT NOT BINNED IN SILENCE** — fallback-finder HIGH 1.
+         *
+         * It cannot be reported as an observation about a conversation: a relay naming a session we
+         * do not hold is exactly the fabrication the check above exists to stop, and rendering it
+         * would put a claim about a counterparty in front of an operator on a stranger's say-so.
+         *
+         * But dropping it entirely was worse than it looked, because the relay's own copy is GONE by
+         * then: its queue is keyed by PUBKEY and `drainWitnessAlerts` splices, so it hands over
+         * everything it held for this agent the moment any client authenticates. The detached seal
+         * client registers exactly ONE session and then authenticates — so a restart-then-seal on
+         * one conversation destroyed a held alert about a different one, at both ends, and the
+         * operator's inbox looked clean.
+         *
+         * So it goes to the same neutral surface a version skew does: something arrived that this
+         * daemon could not place. No session, no party, no claim.
+         */
         this.#logger.error("session.relay.witness.unknown_session", {
           relayPeerId: this.#relayPeerId,
           session: sessionIdHex,
-          impact: "REFUSED and not reported — this relay named a session it does not carry for us, " +
-            "which is a fabrication or a stale frame, never an observation about our counterparty.",
+          impact: "not rendered as an observation — this relay named a session this client is not " +
+            "holding. Reported to the operator as an unplaceable witness report, never as a claim " +
+            "about a counterparty.",
         });
+        this.#onWitnessUnreadable?.(this.#relayPeerId, "session_not_held_here");
         return;
       }
 
@@ -1047,6 +1071,7 @@ export class AgentRelayClient {
         relayId: typeof rawRelayId === "string" ? rawRelayId : null,
         observedAt,
         submitterIsCounterparty,
+        witnessPeerId: this.#relayPeerId,
         verifiable,
       };
       // BOTH halves, per Invariant 2: the log is the durable forensic record, and the callback is

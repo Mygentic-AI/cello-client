@@ -1076,6 +1076,12 @@ export class SessionNodeManager {
    * working, never anything about a participant.
    */
   readonly #witnessUnreadable = new Map<string, Map<string, { why: string; count: number }>>();
+  /**
+   * Agents whose alert list hit the cap — fallback-finder LOW 2. Without this the inbox renders a
+   * full list that looks complete, and "twenty alerts" is indistinguishable from "twenty of some
+   * larger number". A marker the operator can see costs one boolean.
+   */
+  readonly #witnessTruncated = new Set<string>();
 
   /**
    * Record what one relay says it saw on one of this agent's sessions, for the operator to read.
@@ -1095,7 +1101,13 @@ export class SessionNodeManager {
      * thing is not twenty facts, it is one fact and nineteen ways to push another one off the list.
      * The repeat updates the count and the last-seen time and leaves the row where it is.
      */
-    const key = `${alert.relayId ?? "(unnamed)"}::${alert.sessionIdHex}`;
+    /**
+     * Keyed on the relay's PEER ID, not on `relayId` — fallback-finder LOW 1. `relayId` is absent
+     * for any relay that could not sign, so two DIFFERENT such relays reporting on one session
+     * collapsed into a single row and the operator read one witness where there were two. The peer
+     * id is the transport identity this client is actually talking to and is always known.
+     */
+    const key = `${alert.witnessPeerId}::${alert.sessionIdHex}`;
     const existing = list.find((n) => n.key === key);
     if (existing) {
       existing.occurrences += 1;
@@ -1106,9 +1118,11 @@ export class SessionNodeManager {
       // `firstObservedAt` is deliberately untouched — see its note on the type.
     } else if (list.length >= SessionNodeManager.#WITNESS_ALERT_CAP) {
       // Keep the first. See the cap's own note for why this direction is load-bearing.
+      this.#witnessTruncated.add(agentName);
       this.#logger.warn("session.witness.alert.list_full", {
         agentName, held: list.length,
-        impact: "this alert was not recorded; the earlier ones are kept and still shown",
+        impact: "this alert was not recorded; the earlier ones are kept and still shown, and the " +
+          "inbox now says the list is incomplete rather than looking whole",
       });
       return;
     } else {
@@ -1128,6 +1142,11 @@ export class SessionNodeManager {
   /** The witness alerts an agent has been told about, oldest first, one row per witness+session. */
   getWitnessAlerts(agentName: string): ReadonlyArray<WitnessAlertNotice> {
     return this.#witnessAlerts.get(agentName) ?? [];
+  }
+
+  /** Whether this agent's alert list hit its cap, so the inbox can say the list is incomplete. */
+  witnessAlertsTruncated(agentName: string): boolean {
+    return this.#witnessTruncated.has(agentName);
   }
 
   /**

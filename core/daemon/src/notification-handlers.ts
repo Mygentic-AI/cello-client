@@ -106,6 +106,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // cannot. Named `provable_to_a_third_party` rather than `verified`, which reads as a verdict.
         provable_to_a_third_party: n.alert.verifiable,
       }));
+      if (sessionNodeManager.witnessAlertsTruncated(agentName)) {
+        // The list is bounded; say so on the list itself, not only in a log nobody opens.
+        out["relay_witness_alerts_incomplete"] = true;
+      }
       out["relay_witness_alerts_guidance"] =
         "A relay carrying one of your conversations refused a submission because its signature " +
         "verified against neither your key nor your counterparty's. Nothing was added to the " +
@@ -118,18 +122,23 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         "AND THE ABSENCE OF AN ALERT ESTABLISHES NOTHING — a relay only sees what is submitted to " +
         "it, and a message can reach you without one. Tell the operator what was observed, in those " +
         "terms, and let them decide; if it worries them, the way to end a conversation is " +
-        "cello_close_session, and confirming anything with the counterparty happens outside CELLO.";
+        "cello_close_session, and confirming anything with the counterparty happens outside CELLO. " +
+        "relay_witness_alerts_incomplete: true means this list hit its cap and there were more.";
     }
     if (unreadable.length > 0) {
       out["relay_witness_unreadable"] = unreadable.map((u) => ({
         relay_peer_id: u.relayPeerId, cause: u.why, times: u.count,
       }));
       out["relay_witness_unreadable_guidance"] =
-        "A relay sent this agent a witness alert that this build could not read or could not " +
-        "verify, so it was discarded. This says NOTHING about any conversation or any " +
-        "counterparty — it says that against that relay, this agent's second-opinion layer is not " +
-        "working, most often a version skew between the relay and this client. Upgrading the " +
-        "client is the usual fix; until then, treat that relay as silent rather than as clean.";
+        "A relay sent this agent a witness report that this daemon could not read, could not " +
+        "verify, or could not place. This says NOTHING about any conversation or any counterparty " +
+        "— it says that against that relay, this agent's second-opinion layer is not working. " +
+        "`cause` says which: a shape or signature problem is usually a version skew between the " +
+        "relay and this client, and upgrading the client is the usual fix. `session_not_held_here` " +
+        "means the report named a conversation this daemon is not currently holding, which happens " +
+        "after a restart or when a relay is confused — the report is gone and cannot be recovered, " +
+        "so if it mattered it is now only in that relay operator's log. Either way, treat that " +
+        "relay as silent rather than as clean.";
     }
     return out;
   }

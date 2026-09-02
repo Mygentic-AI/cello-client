@@ -114,6 +114,7 @@ describe("DOD-M15-CORROBORATE-1 (client): a relay's witness alert reaches the op
       relayId: frame["relay_id"],
       observedAt: OBSERVED_AT,
       submitterIsCounterparty: true,
+      witnessPeerId: "12D3KooWRelay",
       // The relay proved it said this, so the operator holds something showable.
       verifiable: true,
     });
@@ -180,7 +181,7 @@ describe("DOD-M15-CORROBORATE-1 (client): a relay's witness alert reaches the op
     client.close();
   });
 
-  it("★★ an alert naming a session this client does not hold is REFUSED, and is not an inbox notice", async () => {
+  it("★★★ an alert naming a session this client does not hold is refused as an observation — and still reaches the operator", async () => {
     /**
      * `wellFormed` checks shape only. Without this, any relay the agent is authenticated to could
      * push alerts naming arbitrary session ids — including conversations carried by a DIFFERENT
@@ -207,10 +208,13 @@ describe("DOD-M15-CORROBORATE-1 (client): a relay's witness alert reaches the op
 
     expect(seen, "a relay may not speak about a conversation it does not carry for us").toEqual([]);
     expect(errors.map((e) => e.event)).toContain("session.relay.witness.unknown_session");
-    expect(
-      unreadable,
-      "and this is NOT a version skew — the frame was perfectly readable and perfectly signed",
-    ).toEqual([]);
+    /**
+     * ⚠️ REFUSED AS AN OBSERVATION, BUT NOT BINNED IN SILENCE. The relay's queue is keyed by pubkey
+     * and drains destructively, so by this point its copy is already gone — a client that quietly
+     * discarded this would leave the operator a clean inbox and no way to know anything arrived.
+     * It reaches the neutral surface, naming no session and no party.
+     */
+    expect(unreadable).toEqual([{ relayPeerId: "12D3KooWRelay", why: "session_not_held_here" }]);
     client.close();
   });
 

@@ -34,6 +34,7 @@ function alert(over: Partial<RelayWitnessAlert> = {}): RelayWitnessAlert {
     relayId: RELAY_ID,
     observedAt: 1_760_000_000_000,
     submitterIsCounterparty: true,
+    witnessPeerId: "12D3KooWRelayA",
     verifiable: true,
     ...over,
   };
@@ -64,6 +65,7 @@ async function inbox(
     // The two REAL implementations, bound to the real manager.
     getWitnessAlerts: (a: string) => m.getWitnessAlerts(a),
     getWitnessUnreadable: (a: string) => m.getWitnessUnreadable(a),
+    witnessAlertsTruncated: (a: string) => m.witnessAlertsTruncated(a),
   };
   registerNotificationHandlers({
     handlers,
@@ -131,12 +133,12 @@ describe("DOD-M15-CORROBORATE-1: a witness alert reaches the operator's inbox", 
      * back to whoever can generate alerts: at the relay's own submit limit, about ten seconds of
      * fabrications would push the genuine one out before anyone read it.
      */
-    const first = alert({ relayId: "11".repeat(32), sessionIdHex: "aa".repeat(16) });
+    const first = alert({ witnessPeerId: "12D3KooWFirst", relayId: "11".repeat(32), sessionIdHex: "aa".repeat(16) });
     const mine = await inbox((m) => {
       m.recordRelayWitnessAlert(AGENT, first);
       for (let i = 0; i < 200; i++) {
         // Distinct witness+session each time, so dedupe cannot be what saves it.
-        m.recordRelayWitnessAlert(AGENT, alert({ relayId: String(i % 10).repeat(64).slice(0, 64), sessionIdHex: String(i).padStart(2, "0").repeat(16) }));
+        m.recordRelayWitnessAlert(AGENT, alert({ witnessPeerId: `12D3KooWRelay${String(i)}`, relayId: String(i % 10).repeat(64).slice(0, 64), sessionIdHex: String(i).padStart(2, "0").repeat(16) }));
       }
     });
     const rows = mine["relay_witness_alerts"] as Array<Record<string, unknown>>;
@@ -145,6 +147,26 @@ describe("DOD-M15-CORROBORATE-1: a witness alert reaches the operator's inbox", 
       rows[0]!["session_id"],
       "and the FIRST observation is the one that survives — it is the one that mattered",
     ).toBe("aa".repeat(16));
+    expect(
+      mine["relay_witness_alerts_incomplete"],
+      "and the list must SAY it is incomplete — twenty rows that look whole is its own failure",
+    ).toBe(true);
+  });
+
+  it("★★ two UNNAMED relays reporting on one session are two rows, not one", async () => {
+    /**
+     * The dedupe key is the relay's PEER ID, not `relayId` — which is absent for any relay that
+     * could not sign. Keyed on the missing name, two different witnesses collapsed into one row and
+     * the operator read one witness where there were two, which is the opposite of what a
+     * corroboration layer is for.
+     */
+    const mine = await inbox((m) => {
+      m.recordRelayWitnessAlert(AGENT, alert({ witnessPeerId: "12D3KooWOne", relayId: null, verifiable: false }));
+      m.recordRelayWitnessAlert(AGENT, alert({ witnessPeerId: "12D3KooWTwo", relayId: null, verifiable: false }));
+    });
+    const rows = mine["relay_witness_alerts"] as Array<Record<string, unknown>>;
+    expect(rows, "two witnesses is a materially different fact from one saying it twice").toHaveLength(2);
+    expect(rows.every((r) => r["times_observed"] === 1)).toBe(true);
   });
 
   it("★★ an UNPROVABLE alert is shown, and shown as unprovable", async () => {
