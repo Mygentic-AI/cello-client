@@ -168,6 +168,12 @@ describe("the seal listener set is a BUNDLE — a stream cannot be wired with on
       "the close is BLOCKED on this waiter — leaving it unresolved is how the operator was told " +
         "something false eleven minutes later",
     ).toEqual(expect.objectContaining({ refused: true, reason: "seal_approval_missing" }));
+    expect(
+      (completion as { source?: string }).source,
+      "WHO refused decides whether the close is over — a directory refusal must fall through to the " +
+        "solo seal, and without this marker it inherits the terminal branch written for this " +
+        "daemon's own root check (review F1)",
+    ).toBe("directory");
     const c = completion as { guidance?: string; detail?: string };
     expect(c.detail).toContain("only one participant");
     expect(

@@ -58,6 +58,21 @@ const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
 // (see the directory's verifyFrostAuth). The signer is the agent's own K_local, threaded via
 // setBootstrapContext by every ceremony path (session/seal, DKG, refresh).
 export type FrostAuthSigner = (hash: Uint8Array) => Promise<Uint8Array>;
+
+/**
+ * The evidence a seal ceremony forwards to every share-holding directory, plus where their answers
+ * go when they say no.
+ *
+ * `onRefused` — review F6. A holder refusing is the strongest signal this system produces, and its
+ * only trace was a log line on a machine the operator does not own plus a `warn` here. The ceremony
+ * dies with "threshold not met", which is a COUNT and says nothing about why any holder declined, so
+ * the reason has to be carried back to whoever records the failure.
+ */
+export interface SealCeremonyEvidence {
+  leaves: unknown[];
+  closeTimestamp: number;
+  onRefused?: (nodeReason: string) => void;
+}
 const FROST_AUTH_DOMAIN = "CELLO-FROST-AUTH-v1";
 // Domain separation (must match the directory's verifyFrostAuth): 0x00 = commit; 0x01 || framedMsg = sign.
 const FROST_AUTH_COMMIT_TAIL = new Uint8Array([0x00]);
@@ -90,10 +105,10 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
    * Nothing here is trusted: every leaf carries its author's signature, and the counterparty's
    * leaves cannot be forged by the agent forwarding them.
    */
-  #sealEvidence: { leaves: unknown[]; closeTimestamp: number } | null = null;
+  #sealEvidence: SealCeremonyEvidence | null = null;
 
   /** Attach the seal evidence for the ceremony about to run. Cleared by passing `null`. */
-  setSealEvidence(evidence: { leaves: unknown[]; closeTimestamp: number } | null): void {
+  setSealEvidence(evidence: SealCeremonyEvidence | null): void {
     this.#sealEvidence = evidence;
   }
 
@@ -273,6 +288,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
            * the evidence and declined. A co-signer that refuses is the strongest signal this system
            * produces; it belongs at warn, with what the refusing node actually said.
            */
+          this.#sealEvidence?.onRefused?.(resp.reason ?? "unstated");
           this.#logger.warn("frost.directory.sign.refused", {
             directoryPeerId: this.#directoryPeerId?.slice(0, 16),
             epochId: this.#epochId,

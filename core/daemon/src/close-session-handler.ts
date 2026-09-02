@@ -1127,16 +1127,38 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
          * so: `session_sealed` is delivered once, so a retry re-enters the same wait and then finds
          * the relay session gone.
          */
-        if (sealedCompletion !== null && "refused" in sealedCompletion) {
+        const refused = sealedCompletion !== null && "refused" in sealedCompletion ? sealedCompletion : null;
+        if (refused) {
           logger.error("session.seal.refused", {
             sessionId, agentName: record.agent_name, correlationId,
-            reason: sealedCompletion.reason, detail: sealedCompletion.detail,
+            reason: refused.reason, detail: refused.detail, source: refused.source ?? "local",
           });
+        }
+        /**
+         * 🚨 A DIRECTORY REFUSAL IS NOT THE END OF THE CLOSE — `DOD-M15-SEALPARTIES-1`, review F1.
+         *
+         * This branch was written for ONE producer: this daemon's own root check, where terminating
+         * is right because there is nothing further to ask for. `DOD-M15-SEALPARTIES-1` made the
+         * DIRECTORY a second producer of the same shape, and it silently inherited the terminal
+         * semantics — so every directory refusal (`seal_approval_missing`, `seal_leaves_invalid`,
+         * `merkle_root_mismatch`, …) stopped escalating.
+         *
+         * **What that cost a person:** before, a relay that dropped a leaf meant an eleven-minute
+         * wait and then a SOLO receipt. After, the refusal came back in seconds and the close ended
+         * — no receipt, in a case where one used to arrive. Faster and worse, which is the trap this
+         * order names, reached through the refusal listener rather than through the approval rule.
+         *
+         * `seal_leaves_invalid` is the sharpest of them: the relay tampered, and a solo seal over
+         * this side's OWN carried chain is precisely the remedy. Whether a PRESENT counterparty may
+         * be sealed around is the directory's call on the unilateral gate, not this daemon's — so it
+         * asks, rather than deciding not to.
+         */
+        if (refused && (refused.source ?? "local") === "local") {
           return {
             ok: false,
-            reason: sealedCompletion.reason,
+            reason: refused.reason,
             seal_status: "refused",
-            ...(sealedCompletion.ownRootHex ? { own_root: sealedCompletion.ownRootHex } : {}),
+            ...(refused.ownRootHex ? { own_root: refused.ownRootHex } : {}),
             /**
              * ⚠️ THE REMEDY COMES FROM THE PARTY THAT KNOWS THE CAUSE — `DOD-M15-SEALPARTIES-1`.
              *
@@ -1147,9 +1169,9 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
              * produced. So a refusal that carries its own guidance keeps it, and the local
              * root-mismatch text stays as the fallback for the case it was written for.
              */
-            guidance: sealedCompletion.guidance ??
+            guidance: refused.guidance ??
               "The directory returned a VALIDLY SIGNED seal whose root does not describe this " +
-              `conversation (${sealedCompletion.detail}). This daemon refused it: the session is NOT ` +
+              `conversation (${refused.detail}). This daemon refused it: the session is NOT ` +
               "marked sealed, your transcript is untouched, and nothing was signed with your key. " +
               "Do NOT retry the close — the seal notification is delivered once, so a retry waits the " +
               "full window and then finds the relay session gone. Do NOT force-abandon either: that " +
@@ -1158,13 +1180,14 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
               "something you did.",
           };
         }
-        if (sealedCompletion !== null) {
-          logger.info("session.seal.completed", { sessionId, sealedRoot: sealedCompletion.rootHex, role: "bilateral", correlationId });
+        const succeeded = sealedCompletion !== null && !("refused" in sealedCompletion) ? sealedCompletion : null;
+        if (succeeded) {
+          logger.info("session.seal.completed", { sessionId, sealedRoot: succeeded.rootHex, role: "bilateral", correlationId });
           crossNodeBrokerBySession.delete(`${record.agent_name}:${sessionId}`); // Fix #1 review: evict on terminal seal success (a FAILED close keeps the entry so a retry can still reconnect).
           // M7-SESSION-004 (AC-006): return the legibility certificate on the seal completion so
           // a reader gets it on the same surface that proves the seal — receipt-not-assent,
           // per-party frontiers, attestation modes, and final_message.answered.
-          return { ok: true, sealed_root: sealedCompletion.rootHex, legibility: sealedCompletion.legibility };
+          return { ok: true, sealed_root: succeeded.rootHex, legibility: succeeded.legibility };
         }
 
         // M8B FINDING-1: `responder_seal_already_submitted` has two producers — (a) the auto-ack
@@ -1184,6 +1207,21 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
             ? { reportedRootHex: submit.reportedRootHex, sequenceNumber: submit.sequenceNumber }
             : null;
         if (!escalation) {
+          /**
+           * ⚠️ A REFUSAL WITH NOWHERE TO ESCALATE MUST STILL NAME THE REFUSAL — Invariant 3.
+           *
+           * `seal_pending_bilateral` says "it did not finalize within the wait window", which for a
+           * refused seal is a downstream label pasted over an upstream cause the operator was told
+           * one line earlier in the log.
+           */
+          if (refused) {
+            return {
+              ok: false,
+              reason: refused.reason,
+              seal_status: "refused",
+              guidance: `${refused.guidance ?? refused.detail} There was no submitted SEAL leaf to escalate from, so no solo seal was attempted either — close again once the cause above is addressed.`,
+            };
+          }
           return {
             ok: false,
             reason: "seal_pending_bilateral",
@@ -1194,7 +1232,32 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // SESSION-002 (DOD-SEAL): the counterparty did not co-close. Escalate to a UNILATERAL
         // seal. The body now lives in escalateToUnilateralSeal so the INTERRUPTED branch can reach
         // it too — it never could, and that is why an interrupted session could not get a receipt.
-        return await escalateToUnilateralSeal(rec, sid, escalation, correlationId);
+        if (refused) {
+          logger.warn("session.seal.refused.escalating", {
+            sessionId, agentName: record.agent_name, correlationId,
+            reason: refused.reason,
+            impact: "the bilateral seal was refused by the directory, so this close falls through to " +
+              "a SOLO seal over this side's own carried chain rather than ending with no receipt.",
+          });
+        }
+        const escalated = await escalateToUnilateralSeal(rec, sid, escalation, correlationId);
+        /**
+         * ⚠️ THE UPSTREAM CAUSE SURVIVES THE DOWNSTREAM ANSWER — Invariant 3.
+         *
+         * If the solo seal ALSO fails, the operator would otherwise read only the unilateral gate's
+         * reason (`counterparty_not_absent`, say) and never learn that a bilateral seal was refused
+         * first — the two together are the story, and either alone points at the wrong subsystem.
+         */
+        if (refused && escalated !== null && typeof escalated === "object" && (escalated as { ok?: unknown }).ok === false) {
+          const inner = escalated as { guidance?: unknown };
+          return {
+            ...escalated,
+            bilateral_refused_reason: refused.reason,
+            bilateral_refused_detail: refused.detail,
+            guidance: `${refused.guidance ?? refused.detail} The solo seal was then attempted and did not succeed either: ${typeof inner.guidance === "string" ? inner.guidance : "see the reason on this response."}`,
+          };
+        }
+        return escalated;
         };
 
         /**

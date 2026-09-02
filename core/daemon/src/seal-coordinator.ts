@@ -50,7 +50,29 @@ export type SealCompletion =
    * nothing, two participants who approved different transcripts. The party that knows the cause
    * writes the remedy; a close handler guessing it would print the wrong next step confidently.
    */
-  | { refused: true; reason: string; detail: string; ownRootHex: string | null; guidance?: string };
+  | {
+      refused: true;
+      reason: string;
+      detail: string;
+      ownRootHex: string | null;
+      guidance?: string;
+      /**
+       * WHO refused, and it decides whether the close is over — `DOD-M15-SEALPARTIES-1`, review F1.
+       *
+       * `"local"` — THIS daemon refused a certificate whose root does not describe its conversation.
+       * Terminal: there is nothing further to ask for, and the operator is told so.
+       *
+       * `"directory"` — the DIRECTORY refused to certify. The seal did not happen, and that is not
+       * the same as "no receipt is obtainable": the honest party's own carried chain can still be
+       * notarized the solo way. Before this field existed both landed on the same terminal branch,
+       * which took a receipt away from a party who used to get one after the eleven-minute wait —
+       * the exact trap the order names, arriving through the refusal listener rather than through
+       * the approval requirement.
+       *
+       * Optional so the pre-existing local producer keeps its shape; absent reads as `"local"`.
+       */
+      source?: "local" | "directory";
+    };
 
 /**
  * The signed leaves a seal frame carried, or undefined when it carried none.
@@ -191,24 +213,28 @@ export function sealRejectionGuidance(reason: string, detail: string): string {
       return (
         "The seal was REFUSED because your counterparty's own signed record of the conversation did " +
         `not arrive, so only one side had approved it${tail}. Nothing was signed and your transcript ` +
-        "is untouched. Ask your counterparty to close again — their agent, or the relay carrying it, " +
-        "did not send their approval. Do NOT force-abandon: that permanently forfeits the receipt. If " +
-        "they are gone rather than out of date, closing again will fall through to a solo seal, which " +
-        "still gives you a receipt."
+        "is untouched. This close now falls through to a SOLO seal over your own record, so you do " +
+        "not lose the receipt — read the answer below it for whether that succeeded. Ask your " +
+        "counterparty to close again if you want the stronger two-party receipt; their agent, or the " +
+        "relay carrying it, did not send their approval. Do NOT force-abandon: that permanently " +
+        "forfeits any receipt."
       );
     case "seal_parties_disagree":
       return (
         "The seal was REFUSED because you and your counterparty signed DIFFERENT records of this " +
         `conversation${tail}. One of you is missing messages the other has. Nothing was signed. ` +
         "Compare the message list and count with them directly, out of band — the disagreement is " +
-        "about content, so no answer from inside this session can settle it."
+        "about content, so no answer from inside this session can settle it. This close still tries " +
+        "the solo path over YOUR record; the directory decides whether a counterparty who is present " +
+        "and disagreeing may be sealed around, and it is right that it, not this daemon, decides."
       );
     case "seal_leaves_invalid":
       return (
         `The seal was REFUSED: the record presented for sealing contained a leaf that does not belong ` +
         `to this conversation${tail}. Nothing was signed. This is tampering by whoever assembled the ` +
         "leaf set — the relay serving this session — not something you or your counterparty did. " +
-        "Report the session id. Do NOT force-abandon."
+        "The solo path over your OWN carried chain is exactly the remedy for that, and this close " +
+        "takes it. Report the session id. Do NOT force-abandon."
       );
     default:
       return (
@@ -921,7 +947,22 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       if (frame["type"] !== "session_seal_rejected") return;
       const sidHex = frameValueToHex(frame["session_id"]);
       if (!sidHex) return;
-      if (!sessionNodeManager.getSessionRecord(agentName, sidHex)) return;
+      if (!sessionNodeManager.getSessionRecord(agentName, sidHex)) {
+        /**
+         * Not silent — fallback hunt, finding 6. The guard is right (the directory still broadcasts
+         * this frame on the paths that refuse before it resolves the roster), but a LEGITIMATE
+         * refusal can also land here: a record purged before a queued refusal drained. Dropping it
+         * with no trace at any level leaves the operator nothing on either surface.
+         */
+        logger.debug("session.seal.rejected.not_ours", {
+          agentName,
+          sessionId: sidHex,
+          impact: "this agent holds no record for that session, so the refusal was not acted on. " +
+            "Expected for a broadcast refusal about someone else's conversation; unexpected if this " +
+            "agent did close that session.",
+        });
+        return;
+      }
 
       const reason = typeof frame["reason"] === "string" && frame["reason"].length > 0
         ? frame["reason"]
@@ -950,7 +991,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
       const waiter = pendingSealWaiters.get(key);
       if (!waiter) return;
       pendingSealWaiters.delete(key);
-      waiter({ refused: true, reason, detail, ownRootHex: null, guidance });
+      waiter({ refused: true, reason, detail, ownRootHex: null, guidance, source: "directory" });
     });
   }
 

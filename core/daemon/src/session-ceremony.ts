@@ -404,7 +404,7 @@ export async function reconstructThresholdSigner(
    * ceremony and on nothing else — a co-signer requires it under the seal context and ignores it
    * everywhere else.
    */
-  sealEvidence?: { leaves: unknown[]; closeTimestamp: number },
+  sealEvidence?: import("./network-directory-node.js").SealCeremonyEvidence,
 ): Promise<IThresholdSigner | null> {
   const h = await hydrateShareAndStubs(deps);
   if (!h) return null;
@@ -553,10 +553,29 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
        * Absent here means the frame carried none, and the directories refuse on that: it is not
        * this side's place to decide the evidence was optional.
        */
-      const sealEvidenceLeaves = Array.isArray(frame["frontier_leaves"]) ? (frame["frontier_leaves"] as unknown[]) : [];
+      const sealEvidenceLeaves = Array.isArray(frame["frontier_leaves"]) && frame["frontier_leaves"].length > 0
+        ? (frame["frontier_leaves"] as unknown[])
+        : undefined;
       // Reconstruct a FRESH signer per ceremony (same rationale as the session ceremony:
       // fresh directory endpoint, no shared FROST state across concurrent ceremonies).
-      const signer = await reconstructThresholdSigner(deps, { leaves: sealEvidenceLeaves, closeTimestamp: timestamp });
+      /**
+       * ⚠️ ABSENT IS PASSED AS ABSENT — fallback hunt, finding 4. This used to send `[]`, which the
+       * co-signer classified as MALFORMED ("compare builds") rather than MISSING ("someone is asking
+       * for a signature without showing the record"). The seal failed either way; the diagnosis the
+       * module exists to produce was the one case it could never reach.
+       */
+      /**
+       * Review F6: what each holder SAID, kept so the recorded failure can name it. "Threshold not
+       * met" is a count; `SEAL_ROOT_UNSUPPORTED` from a holder is an accusation against the
+       * verifying directory, and the operator surface should be able to tell them apart.
+       */
+      const cosignRefusals = new Set<string>();
+      const signer = await reconstructThresholdSigner(
+        deps,
+        sealEvidenceLeaves
+          ? { leaves: sealEvidenceLeaves, closeTimestamp: timestamp, onRefused: (r) => cosignRefusals.add(r) }
+          : undefined,
+      );
       if (!signer) {
         deps.logger.warn("session.seal.ceremony.abort", { agentName: deps.agentName, sessionId: sidHex, reason: "no_signer" });
         deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_no_signer");
@@ -692,6 +711,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
         deps.logger.error("session.seal.ceremony.no_signature", {
           agentName: deps.agentName,
           sessionId: sidHex,
+          cosignRefusals: [...cosignRefusals].sort(),
           impact:
             "the seal FROST ceremony ended with no signature, so this session has no certificate " +
             "and nothing was signed with this agent's key. Enough share-holding directories " +
@@ -703,7 +723,13 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
             "directory or the relay, not in this agent. Do NOT force-abandon: that forfeits the " +
             "receipt permanently.",
         });
-        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threshold_not_met");
+        deps.recordSealFailure(
+          deps.agentName,
+          sidHex,
+          cosignRefusals.size > 0
+            ? `seal_cosigners_refused:${[...cosignRefusals].sort().join(",")}`
+            : "seal_ceremony_threshold_not_met",
+        );
         return;
       }
 
