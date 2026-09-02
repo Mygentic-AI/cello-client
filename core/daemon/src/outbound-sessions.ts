@@ -55,6 +55,12 @@ export interface OutboundSessionDeps {
    * complete when the true threshold is unmet.
    */
   getDeclaredNodeCount?: () => number | null;
+  /**
+   * DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark. A VISITING stream runs the
+   * seal ceremony too (the cross-node close), so it needs the same sink as a home stream — a
+   * refusal recorded on only one of the two paths is a refusal an operator meets at random.
+   */
+  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
   /** The WHOLE seal listener bundle — a visiting stream needs every one of them. */
   registerSealListeners: (signaling: SignalingManager, agentName: string, agentPubkeyHex: string) => () => void;
   sessionNegotiator?: SessionNegotiator;
@@ -83,7 +89,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     logger, sessionNodeManager, getKeyProvider, getPersistence, getAgentSignaling,
     waitForSignalingConnected, getFailoverEndpoint, resolveConsortiumRoster,
     registerSealListeners, sessionNegotiator, challengeVerifier, getManifestVersion, loadedAgents,
-    getUnresolvedNodes, getDeclaredNodeCount,
+    getUnresolvedNodes, getDeclaredNodeCount, recordSealFailure,
   } = deps;
 
   /**
@@ -521,6 +527,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      recordSealFailure,
     });
     // Fix #1 (cross-node seal-liveness): a visiting connection must ALSO be able to complete the SEAL.
     // The broker (the node this visiting connection targets) pushes seal_verified then session_sealed to
@@ -540,6 +547,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      recordSealFailure,
     });
     // FIX (Seam B review): this VISITING stream used to register only the sealed + unilateral-confirmed
     // listeners. That silently lost seal receipts — the directory drains its DURABLE notification queue

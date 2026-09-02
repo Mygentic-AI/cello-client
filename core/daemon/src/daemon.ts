@@ -1187,6 +1187,10 @@ async function startDaemonHoldingLock(
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
+      // can say it FAILED and why instead of falling through to "no receipt yet".
+      recordSealFailure: (name: string, sid: string, reason: string) =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
     });
     // DOD-SPINE-7: coordinate the SEAL FROST ceremony on this agent's stream too.
     wireSealCeremonyHandler({
@@ -1203,6 +1207,10 @@ async function startDaemonHoldingLock(
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
+      // can say it FAILED and why instead of falling through to "no receipt yet".
+      recordSealFailure: (name: string, sid: string, reason: string) =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
     });
     // DOD-SPINE-7: and resolve session_sealed for this agent's sessions on its own stream.
     registerSealListeners(mgr, agentName, agentPubkeyHex);
@@ -1305,6 +1313,10 @@ async function startDaemonHoldingLock(
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
+      // can say it FAILED and why instead of falling through to "no receipt yet".
+      recordSealFailure: (name: string, sid: string, reason: string) =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
     });
     wireSealCeremonyHandler({
       agentName: agent.name,
@@ -1318,6 +1330,10 @@ async function startDaemonHoldingLock(
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: mgr,
       logger,
+      // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
+      // can say it FAILED and why instead of falling through to "no receipt yet".
+      recordSealFailure: (name: string, sid: string, reason: string) =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
     });
     wireSessionOfferHandler({
       agentName: agent.name,
@@ -2107,6 +2123,10 @@ async function startDaemonHoldingLock(
     // was looking.
     getUnresolvedNodes,
     getDeclaredNodeCount,
+    // DOD-M15-SEALPARTIES-1: the visiting stream runs the seal ceremony too, so it needs the same
+    // failure sink — otherwise a cross-node close that dies leaves no trace while a same-node one does.
+    recordSealFailure: (name: string, sid: string, reason: string) =>
+      sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
   });
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
   // loadFromDb() must complete BEFORE IPC socket opens (AC-007).
@@ -3354,6 +3374,10 @@ async function startDaemonHoldingLock(
       getConsortiumEndpoints: resolveConsortiumRoster,
       signaling: entry.signaling,
       logger,
+      // DOD-M15-SEALPARTIES-1: where a dead seal ceremony leaves its mark, so `cello_sealed_receipt`
+      // can say it FAILED and why instead of falling through to "no receipt yet".
+      recordSealFailure: (name: string, sid: string, reason: string) =>
+        sealFailures.record(name, sid, reason, new Date().toISOString(), "unresolved"),
     });
     if (!result.ok) {
       return { ok: false, reason: result.reason, guidance: "Share refresh did not complete — see the daemon log (refresh.ceremony.*) for the cause." };

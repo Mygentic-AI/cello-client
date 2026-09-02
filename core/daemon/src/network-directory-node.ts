@@ -78,6 +78,24 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
   #epochId: string | null = null;
   // Signs the K_local auth on commit/sign requests (set via setBootstrapContext).
   #signAuth: FrostAuthSigner | null = null;
+  /**
+   * DOD-M15-SEALPARTIES-1: the signed leaves this seal is being certified over, forwarded verbatim
+   * so each directory node can rebuild the root for itself instead of signing a claim.
+   *
+   * Held as ceremony CONTEXT, like `setBootstrapContext`, rather than threaded through
+   * `StubSignParams` — that type lives in `@cello-protocol/crypto` and is shared by the DKG,
+   * refresh and session-establishment ceremonies, none of which have leaves. Widening it for one
+   * caller would put a seal-shaped field in front of three ceremonies that must ignore it.
+   *
+   * Nothing here is trusted: every leaf carries its author's signature, and the counterparty's
+   * leaves cannot be forged by the agent forwarding them.
+   */
+  #sealEvidence: { leaves: unknown[]; closeTimestamp: number } | null = null;
+
+  /** Attach the seal evidence for the ceremony about to run. Cleared by passing `null`. */
+  setSealEvidence(evidence: { leaves: unknown[]; closeTimestamp: number } | null): void {
+    this.#sealEvidence = evidence;
+  }
 
   // Stored during receiveShare — used by tests to get the FrostPublic for signRound calls
   #lastPub: Parameters<DirectoryNodeStub["receiveShare"]>[1] | null = null;
@@ -221,6 +239,12 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       peerIdString: params.ceremonyId,
       // Bound to THIS framedMsg, with the 0x01 sign-frame domain-separation prefix.
       authSig: await this.#buildAuthSig(Buffer.concat([Buffer.from([FROST_AUTH_SIGN_PREFIX]), Buffer.from(params.msg)])),
+      // DOD-M15-SEALPARTIES-1: the evidence, when this is a seal. A directory refuses a seal
+      // signature request that arrives without it — absence is the off-switch a coordinator would
+      // reach for, so it cannot be tolerated.
+      ...(this.#sealEvidence
+        ? { seal_leaves: this.#sealEvidence.leaves, seal_close_timestamp: this.#sealEvidence.closeTimestamp }
+        : {}),
     });
 
     this.#logger.debug("frost.directory.sign.stream.opening", {});
@@ -236,11 +260,29 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
           type: string;
           ok: boolean;
           reason?: string;
+          detail?: string;
           partialSignature?: Uint8Array;
         };
 
         this.#logger.debug("frost.directory.sign.response", { ok: resp.ok, reason: resp.reason, sigLength: resp.partialSignature ? (resp.partialSignature as Uint8Array).length : null });
         if (!resp.ok) {
+          /**
+           * DOD-M15-SEALPARTIES-1: a REFUSAL is not the same event as a slow node, and it used to
+           * leave the same trace — a debug line and a `null`. The ceremony then failed with
+           * "not enough partial signatures" and nothing anywhere said that a holder had looked at
+           * the evidence and declined. A co-signer that refuses is the strongest signal this system
+           * produces; it belongs at warn, with what the refusing node actually said.
+           */
+          this.#logger.warn("frost.directory.sign.refused", {
+            directoryPeerId: this.#directoryPeerId?.slice(0, 16),
+            epochId: this.#epochId,
+            ceremonyId: params.ceremonyId?.slice(0, 16),
+            reason: resp.reason ?? "unstated",
+            detail: resp.detail,
+            impact:
+              "this directory node did not contribute its share, so the ceremony loses one holder. " +
+              "If enough refuse, the signature cannot reach its threshold and nothing is signed.",
+          });
           return null;
         }
 

@@ -263,6 +263,19 @@ export interface CeremonyWiringDeps {
   /** The agent's per-agent signaling seam (where ceremony_request arrives + result is sent). */
   signaling: SignalingSeam;
   logger: Logger;
+  /**
+   * DOD-M15-SEALPARTIES-1: leave a mark when the seal ceremony dies, so the answer outlives it.
+   *
+   * `if (!frostSignature) return;` was the whole handling of a ceremony that produced no signature
+   * — no log line, no record, nothing. Requiring the co-signing directories to judge the leaves adds
+   * a NEW way to land there (they refuse), and a refusal nobody hears is indistinguishable from the
+   * seal simply never happening. It also covers the paths that were already silent: a root this
+   * agent cannot confirm, an inflated frontier, a share it cannot load.
+   *
+   * REQUIRED rather than optional, deliberately: an optional sink is one a call site forgets, and
+   * the whole class of defect this unit is closing is a check that quietly stopped being wired.
+   */
+  recordSealFailure: (agentName: string, sessionId: string, reason: string) => void;
 }
 
 /**
@@ -383,9 +396,19 @@ async function hydrateShareAndStubs(
   return { share, stubs: directoryNodeStubs };
 }
 
-export async function reconstructThresholdSigner(deps: CeremonyWiringDeps): Promise<IThresholdSigner | null> {
+export async function reconstructThresholdSigner(
+  deps: CeremonyWiringDeps,
+  /**
+   * DOD-M15-SEALPARTIES-1: the signed leaves this ceremony's TBS is a root over, forwarded to every
+   * directory node so each reaches its own verdict instead of signing a claim. Supplied on the seal
+   * ceremony and on nothing else — a co-signer requires it under the seal context and ignores it
+   * everywhere else.
+   */
+  sealEvidence?: { leaves: unknown[]; closeTimestamp: number },
+): Promise<IThresholdSigner | null> {
   const h = await hydrateShareAndStubs(deps);
   if (!h) return null;
+  if (sealEvidence) for (const stub of h.stubs ?? []) stub.setSealEvidence(sealEvidence);
   return new FrostThresholdSigner(
     { threshold: h.share.threshold, participants: h.share.participants, directoryNodeStubs: h.stubs },
     Buffer.from(deps.agentPubkeyHex, "hex"),
@@ -518,11 +541,25 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
       }
       const sidHex = Buffer.from(sessionId).toString("hex");
 
+      /**
+       * DOD-M15-SEALPARTIES-1: forward the raw signed leaves to every co-signing directory.
+       *
+       * They arrive on `seal_verified` and are already re-verified on this side (the frontier
+       * re-derivation below reads the same array). Forwarding them is what lets a node that did NOT
+       * run the verification rebuild the root itself and refuse a certificate over a leaf set the
+       * participants never produced — the difference between three signatures that mean three
+       * independent judgements and three that rest on one node's reading.
+       *
+       * Absent here means the frame carried none, and the directories refuse on that: it is not
+       * this side's place to decide the evidence was optional.
+       */
+      const sealEvidenceLeaves = Array.isArray(frame["frontier_leaves"]) ? (frame["frontier_leaves"] as unknown[]) : [];
       // Reconstruct a FRESH signer per ceremony (same rationale as the session ceremony:
       // fresh directory endpoint, no shared FROST state across concurrent ceremonies).
-      const signer = await reconstructThresholdSigner(deps);
+      const signer = await reconstructThresholdSigner(deps, { leaves: sealEvidenceLeaves, closeTimestamp: timestamp });
       if (!signer) {
         deps.logger.warn("session.seal.ceremony.abort", { agentName: deps.agentName, sessionId: sidHex, reason: "no_signer" });
+        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_no_signer");
         return;
       }
       // M7 legibility-TBS-binding: when the directory's seal_verified carries `legibility` (the
@@ -555,10 +592,11 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
         const flRaw = frame["frontier_leaves"];
         const haveLeaves = Array.isArray(flRaw) && flRaw.length > 0;
         if (malformed || (anyClaimed && !haveLeaves)) {
+          const abortReason = malformed ? "frontier_participant_malformed" : "frontier_leaves_missing";
           deps.logger.warn("session.seal.ceremony.abort", {
-            agentName: deps.agentName, sessionId: sidHex,
-            reason: malformed ? "frontier_participant_malformed" : "frontier_leaves_missing",
+            agentName: deps.agentName, sessionId: sidHex, reason: abortReason,
           });
+          deps.recordSealFailure(deps.agentName, sidHex, abortReason);
           return;
         }
         if (haveLeaves) {
@@ -572,11 +610,13 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
             ? findInflatedFrontier(parts as Array<{ pubkey: string; content_frontier_seq: number }>, rederived.frontiers)
             : null;
           if (!rederived.ok || inflated) {
+            const inflatedReason = rederived.ok ? "frontier_unverifiable" : rederived.reason;
             deps.logger.warn("session.seal.ceremony.abort", {
               agentName: deps.agentName, sessionId: sidHex,
-              reason: rederived.ok ? "frontier_unverifiable" : rederived.reason,
+              reason: inflatedReason,
               ...(inflated ? { party: inflated.party, publishedFrontier: inflated.publishedFrontier, derivedFrontier: inflated.derivedFrontier } : {}),
             });
+            deps.recordSealFailure(deps.agentName, sidHex, inflatedReason);
             return; // refuse to co-sign — the directory gets no signature for an inflated cert
           }
         }
@@ -609,6 +649,11 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
             "Compare the leaf count with the counterparty and check the directory and relay logs for " +
             "this session id. Do NOT force-abandon: that forfeits the receipt permanently.",
         });
+        deps.recordSealFailure(
+          deps.agentName,
+          sidHex,
+          rootCheck.verdict === "mismatch" ? "seal_root_mismatch" : "seal_root_unverifiable",
+        );
         return; // refuse to co-sign — the directory gets no signature for a root we cannot verify
       }
 
@@ -626,9 +671,41 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
           sessionId: sidHex,
           detail: err instanceof Error ? err.message : String(err),
         });
+        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threw");
         return;
       }
-      if (!frostSignature) return; // ceremony failed (threshold not met) — no signature to send
+      if (!frostSignature) {
+        /**
+         * ⚠️ THIS WAS `if (!frostSignature) return;` WITH NO LOG AND NO RECORD —
+         * `DOD-M15-SEALPARTIES-1`.
+         *
+         * It is where a seal lands when the FROST ceremony produces nothing, and requiring the
+         * co-signing directories to judge the leaves makes it reachable for a NEW and important
+         * reason: a holder looked at the record, decided it does not support the root, and declined.
+         * That is the strongest signal this system produces, and its entire trace was a bare return.
+         *
+         * The refusing node's own reason is on the coordinating side too — `network-directory-node`
+         * logs `frost.directory.sign.refused` per node with what that node said — because a
+         * threshold failure is a count, and the count does not say WHY any particular holder said
+         * no.
+         */
+        deps.logger.error("session.seal.ceremony.no_signature", {
+          agentName: deps.agentName,
+          sessionId: sidHex,
+          impact:
+            "the seal FROST ceremony ended with no signature, so this session has no certificate " +
+            "and nothing was signed with this agent's key. Enough share-holding directories " +
+            "declined or were unreachable that the threshold was not met.",
+          guidance:
+            "Look for frost.directory.sign.refused in this daemon's log — each line names one " +
+            "directory and the reason it gave. A SEAL_ROOT_UNSUPPORTED there means a holder rebuilt " +
+            "the root from the leaves and got a different answer, which is a fault in the verifying " +
+            "directory or the relay, not in this agent. Do NOT force-abandon: that forfeits the " +
+            "receipt permanently.",
+        });
+        deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threshold_not_met");
+        return;
+      }
 
       await sendSealFrostSignature(deps, sessionId, sidHex, frostSignature);
     })();
