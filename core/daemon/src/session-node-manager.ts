@@ -1053,7 +1053,7 @@ export class SessionNodeManager {
       sessionId: alert.sessionIdHex,
       relayId: alert.relayId ?? "(unnamed)",
       submitterIsCounterparty: alert.submitterIsCounterparty,
-      impact: "surfaced to the operator on the next cello_check_notifications; the session is NOT frozen by it",
+      impact: "surfaced to the operator on the next cello_inbox; the session is NOT frozen by it",
     });
   }
 

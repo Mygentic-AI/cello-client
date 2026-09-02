@@ -94,6 +94,9 @@ async function inboxFor(
         ? [{ session_id: "ff".repeat(16), counterparty_pubkey: "cc".repeat(32), unread_count: 1, status: "sealed" }]
         : [],
     getRenameNotices: () => [],
+    // DOD-M15-CORROBORATE-1: the inbox reads relay witness alerts too. Empty here — this file is
+    // about refusal guidance, and a stub that omitted the method made every case throw.
+    getWitnessAlerts: () => [],
     getConsentRequests: () => [],
     listSessions: () => [],
     getPendingAttestationConsents: () => [],
