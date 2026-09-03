@@ -444,9 +444,13 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
 
     const [notice] = mgr.takeContentRefusals("alice", "s-cap", "op");
     expect(notice!.reason).toBe("session_size_limit_exceeded");
-    expect(notice!.impact, "the consequence, not the event").toMatch(/neither will any later message/);
-    expect(notice!.impact, "the tier by NAME — a number tells the operator nothing").toMatch(/UNKNOWN/);
-    expect(notice!.guidance, "and the only move that actually works").toMatch(/Start a NEW session/);
+    expect(notice!.impact, "the consequence, not the event").toMatch(/neither will anything else they send/);
+    // The size in MB, because "26214400 bytes" is not a number anyone reads as 25 MB — and the
+    // access level as a quoted lowercase LABEL, because "their tier is UNKNOWN" reads as "we could
+    // not determine it", which is the opposite of what it says.
+    expect(notice!.impact, "the limit in MB, not only in bytes").toMatch(/25 MB/);
+    expect(notice!.impact, "and the access level as a label, not a bare word").toMatch(/"unknown"/);
+    expect(notice!.guidance, "and the only move that actually works").toMatch(/Start a NEW conversation/);
   });
 
   it("AN UNATTRIBUTABLE MESSAGE produces a notice — review F2, the producer with no other trace", async () => {

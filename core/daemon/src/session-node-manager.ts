@@ -8909,16 +8909,26 @@ export class SessionNodeManager {
    * would describe a different refusal depending on timing.
    */
   #noteSizeCapRefusal(agentName: string, sessionId: string, cap: number, tier: number): void {
-    // The tier NAME, not its number. `tier: 1` means nothing to the operator being told why a
-    // conversation stopped, and it is the field that says whether raising the tier is even
-    // available to them. An unrecognised value renders as itself rather than being guessed at.
-    const tierName = Object.entries(TIER).find(([, v]) => v === tier)?.[0] ?? String(tier);
+    /**
+     * ⚠️ **IN MEGABYTES, WITH THE BYTES BESIDE THEM.** "26214400 bytes" is not a number anyone reads
+     * as 25 MB, and the operator being told a conversation just ended deserves to understand the
+     * limit that ended it at a glance. The raw figure stays because it is the exact bound.
+     */
+    const mb = Math.round((cap / 1_048_576) * 10) / 10;
+    /**
+     * The access level as a QUOTED LOWERCASE LABEL, never a bare word.
+     *
+     * `their tier is UNKNOWN` reads as "we could not determine their tier" — the opposite of what it
+     * says. UNKNOWN is the NAME of the level a sender has before the operator adds them as a
+     * contact. Quoting it and lowercasing it makes it a label rather than a failure.
+     */
+    const level = (Object.entries(TIER).find(([, v]) => v === tier)?.[0] ?? String(tier)).toLowerCase();
     this.noteContentRefusal(agentName, sessionId, "session_size_limit_exceeded", {
       kind: REFUSAL_KINDS.REFUSED,
       impact:
-        `this session has used its whole byte budget for this sender (${cap} bytes, their tier is ${tierName}), so the message was NOT ingested and NOT shown — and neither will any later message from them on this session. From your chair they simply stop replying, and from theirs the message was sent.`,
+        `This conversation has hit its size limit for this sender: ${mb} MB (${cap} bytes), which is the limit at their access level ("${level}"). The message was not delivered, and neither will anything else they send in this conversation. They were not told — from their side it sent normally.`,
       guidance:
-        "The budget is per session and does not reset, so waiting will not clear it. Start a NEW session with them to keep talking. If they are someone you trust, raising their tier with cello_contact_set_tier raises the budget for the next session — it does not revive this one. Tell them what happened: their side has no way to know.",
+        `The limit is per conversation and does not reset, so waiting will not clear it. Start a NEW conversation with them to keep talking. If you trust them, raising their access level with cello_contact_set_tier gives them a larger limit next time — it does not revive this one. Tell them what happened: they have no way to know.`,
     });
   }
 

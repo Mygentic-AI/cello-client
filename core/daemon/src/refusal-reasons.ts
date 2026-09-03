@@ -81,10 +81,9 @@ export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
     "THIS MACHINE, not a quiet counterparty. Waiting cannot recover them; the text is gone and only " +
     "its hash remains. Fix the local fault below, then ask them to resend.",
   [REFUSAL_KINDS.OUTBOUND]:
-    "NOTHING WAS REFUSED BY THIS AGENT — this is the other direction. Something THIS side tried to " +
-    "send did not get through. Do not go to the counterparty about it and do not resend blindly: " +
-    "cello_status for the session says what became of the message, and some of these clear on their " +
-    "own when the connection recovers.",
+    "NOTHING WAS REFUSED BY THIS AGENT — this is the other direction. A message YOU sent did not get " +
+    "through, and could not be saved to send later, so it is gone. Do not go to the counterparty " +
+    "about it: they never saw it and there is nothing for them to do. Send it again.",
 };
 
 export const REFUSAL_REASONS = {
