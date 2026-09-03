@@ -629,6 +629,72 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     ).toMatch(/\[kind: refused\][\s\S]*\[kind: outbound\]/);
   });
 
+  it("THE CAP AND THE ORDER HOLD ON THE UNPERSISTED HALF TOO — review N2", async () => {
+    /**
+     * The `LIMIT` governs the table. Under a PERSISTENT database fault — a full disk, which is also
+     * the likeliest cause of `transcript_write_failed` and `content_undeliverable` — every refusal
+     * routes to the in-memory fallback instead, so the cap this unit added was undone for exactly
+     * the daemon already in trouble. And a Map yields insertion order, so appending the fallback
+     * after the (newest-first) table half put the newest notices at the bottom of the list.
+     *
+     * This is the shape the fault actually takes: the disk is broken for the whole run, not once.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    const db = mgr.getDb() as unknown as { prepare: (sql: string) => unknown };
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (/INSERT INTO content_refusal_notices/i.test(sql)) throw new Error("SQLITE_FULL: database or disk is full");
+      return realPrepare(sql);
+    };
+    for (let i = 0; i < 30; i++) {
+      mgr.noteContentRefusal("alice", `s-fb-${String(i).padStart(2, "0")}`, "content_hash_mismatch", {
+        kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+      });
+    }
+
+    const { notices, truncated } = mgr.takeAgentContentRefusals("alice", "w");
+    expect(notices.length, "capped on the fallback half as well, or the cap protects only healthy daemons").toBe(25);
+    expect(truncated, "and it still says it was cut").toBe(true);
+    expect(
+      notices[0]!.sessionId,
+      "NEWEST FIRST here too — a broken-DB daemon is where the fallback is the ONLY half, so its " +
+      "order is the whole order",
+    ).toBe("s-fb-29");
+  });
+
+  it("A BROKEN REFUSAL READ DOES NOT TAKE DOWN THE INBOX — review N3", async () => {
+    /**
+     * `noteContentRefusal` was carefully guarded and the READ was not, so any SQLite error from the
+     * drain propagated out and killed `cello_check_notifications` entirely: unread counts, pending
+     * session requests, rename notices, witness alerts, all of it. A failure in the least critical
+     * section taking out the most critical ones is the wrong trade in every case.
+     *
+     * And the section must still SAY it is broken. An inbox that silently omits the refusals reads
+     * as an all-clear, which is the silence this whole line exists to end.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    mgr.noteContentRefusal("alice", "s-readfail", "content_hash_mismatch", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+    });
+    const db = mgr.getDb() as unknown as { prepare: (sql: string) => unknown };
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (/FROM content_refusal_notices/i.test(sql)) throw new Error("SQLITE_CORRUPT: database disk image is malformed");
+      return realPrepare(sql);
+    };
+
+    const agent = await inbox(await connect());
+    expect(agent["agent"], "the inbox still answers — the other sections are not collateral").toBe("alice");
+    expect(agent["total_unread"], "and the sections that do not depend on refusals are intact").toBe(0);
+    expect(
+      agent["refusals_unavailable"],
+      "and it must SAY the door is broken — a clean absence here reads as an all-clear",
+    ).toBe(true);
+    expect(String(agent["refusals_guidance"] ?? "")).toMatch(/means nothing — it is not an all-clear/);
+  });
+
   // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────
 
   it("COUNTERPARTY_GONE names what was observed, and stops steering the operator into a seal", async () => {
