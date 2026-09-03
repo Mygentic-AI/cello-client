@@ -555,8 +555,41 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
       };
     }
 
+    /**
+     * DOD-M15-NO-SILENT-REFUSAL-1: dismissing a conversation clears its REFUSAL NOTICES too.
+     *
+     * Done FIRST and unconditionally, because a refusal can sit on a LIVE conversation — the case
+     * that matters most is a counterparty on an older build whose messages keep being refused, and
+     * that conversation is very much still open. Without this the notice is permanent: "already
+     * shown you" is per window, so every new session opens with a refusal the operator dealt with
+     * weeks ago, which is how an inbox becomes something people stop reading.
+     */
+    const refusalsDismissed = sessionNodeManager.dismissContentRefusals(agentName, sessionId);
+
     const result = sessionNodeManager.dismissSession(agentName, sessionId);
     if (!result.ok) {
+      /**
+       * A LIVE conversation whose refusals were cleared is a SUCCESS, not a refusal.
+       *
+       * `dismissSession` only accepts a finished conversation, and that restriction is right for the
+       * session half — there is nothing to dismiss about a conversation still in progress. But the
+       * operator who just cleared four refusal notices off a live conversation did the thing they
+       * asked for, and answering `ok: false` would send them looking for a second command that does
+       * not exist.
+       */
+      if (result.reason === "session_not_terminal" && refusalsDismissed > 0) {
+        logger.info("session.refusals.dismissed", { agentName, sessionId, refusalsDismissed, sessionStillLive: true });
+        return {
+          ok: true,
+          session_id: sessionId,
+          refusals_dismissed: refusalsDismissed,
+          guidance:
+            `Cleared ${refusalsDismissed} refusal notice(s) from your inbox for this conversation. ` +
+            "The conversation itself is still open and was not dismissed — it is not finished, so there is " +
+            "nothing to clear there. If the same problem happens again you will be told again; dismissing " +
+            "does not switch anything off.",
+        };
+      }
       const guidance = result.reason === "session_not_found"
         ? "No session with this ID belongs to this agent. Check cello_sessions for its sessions and their IDs."
         : result.reason === "session_not_terminal"
@@ -567,8 +600,8 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
 
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     const unreadCount = sessionNodeManager.getUnreadReceivedCount(agentName, sessionId);
-    logger.info("session.dismissed", { agentName, sessionId, status: record?.status ?? "unknown", unreadCount });
-    return { ok: true, session_id: sessionId };
+    logger.info("session.dismissed", { agentName, sessionId, status: record?.status ?? "unknown", unreadCount, refusalsDismissed });
+    return { ok: true, session_id: sessionId, ...(refusalsDismissed > 0 ? { refusals_dismissed: refusalsDismissed } : {}) };
   });
 
   // list_sessions (daemon-wide, for the `cello sessions` CLI which has no current agent): same

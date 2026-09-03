@@ -263,50 +263,85 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
    * surfaces giving an agent opposite instructions about the same message is worse than either.
    */
   /**
-   * DOD-M15-NO-SILENT-REFUSAL-1 review F1 + F2 — the notice, and the RETRACTION that makes it safe.
+   * DOD-M15-NO-SILENT-REFUSAL-1 — the operator is told ONLY when the message is actually gone.
    *
-   * ⚠️ **`delivery_impaired` is the only refusal in the store that self-heals, and it fires on an
-   * ORDINARY path.** A counterparty who is simply offline fails the direct send, the message is
-   * parked with the relay, and it is delivered when they come back — the leave-a-message feature
-   * working as designed. Making that notice durable without a retraction means every new window and
-   * every restart re-announces *"the session looks healthy and is not"* about a message delivered
-   * weeks ago, for the life of the agent. A warning that fires on a designed benign state and then
-   * outlives its own truth buries the one occurrence that means something.
+   * ⚠️ **A FAILED DIRECT SEND IS USUALLY A SUCCESS, and the first version of this notice did not
+   * know that.** When a counterparty is offline the direct send always fails; the message is then
+   * parked with the relay and handed over when they come back. That is the leave-a-message feature
+   * working. Writing a notice at that moment told the operator "a message this side sent did not
+   * reach the counterparty" about a message that was in flight — while `cello_send` was
+   * simultaneously telling them it was parked.
    *
-   * So both halves are asserted here, and the second is the one that was missing.
+   * So the notice moved to where the outcome is KNOWN, and fires on one of the three:
+   *   parked → nothing to tell; durable → nothing to tell; lost → the operator must resend.
+   *
+   * The assertion below is that INVARIANT, not a fixed expectation: whatever this fixture's send
+   * resolves to, a notice exists if and only if the message was lost. Pinning "lost" outright would
+   * pass for the wrong reason the day the fixture grows a relay.
    */
-  it("DOD-M15-NO-SILENT-REFUSAL-1: an impairment leaves a durable notice — and TAKES IT BACK when it clears", async () => {
+  it("DOD-M15-NO-SILENT-REFUSAL-1: a lost message is reported; a parked or queued one is not", async () => {
     const { A, clientA, clientB } = await establishSession();
     try {
       const snm = A.getSessionNodeManager();
       snm.injectSendFault(1);
       await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
-      expect(snm.getSessionLiveness("alice", SID_HEX)).toBe("impaired");
 
-      const [notice] = snm.takeContentRefusals("alice", SID_HEX, "op");
-      expect(notice, "an impairment the operator is not attending must still be recorded").toBeDefined();
-      expect(notice!.reason).toBe("delivery_impaired");
-      expect(
-        notice!.kind,
-        "OUTBOUND, not refused — nothing was received from the counterparty, so a header saying " +
-        "'received and refused' would send the operator to the wrong side of the conversation",
-      ).toBe("outbound");
-      expect(notice!.guidance, "and it must not steer them toward a seal on this evidence").toMatch(/Do not seal/i);
+      const impairment = snm.getSessionImpairment("alice", SID_HEX);
+      expect(impairment, "the send failed, so the session records why").not.toBeNull();
+      const notices = snm.takeContentRefusals("alice", SID_HEX, "op");
 
-      // ── The retraction. A send that SUCCEEDS clears the impairment; the notice must go with it. ──
+      if (impairment!.retained === "lost") {
+        expect(notices.length, "a message that is GONE must be reported — only a resend recovers it").toBe(1);
+        expect(notices[0]!.reason).toBe("outbound_message_lost");
+        expect(
+          notices[0]!.kind,
+          "OUTBOUND — nothing was received from the counterparty, so a header saying 'received and " +
+          "refused' would send the operator to the wrong side of the conversation",
+        ).toBe("outbound");
+        expect(notices[0]!.guidance, "and this is the one case where resending is the right move").toMatch(/Send it again/);
+      } else {
+        expect(
+          notices,
+          `the message was ${impairment!.retained} — it is in flight and will be delivered, so telling ` +
+          "the operator it did not reach the counterparty contradicts what cello_send just told them",
+        ).toEqual([]);
+      }
+    } finally {
+      clientA.close(); clientB.close();
+    }
+  });
+
+  /**
+   * A LOST message stays lost, so the notice is never taken back — and the count is the number of
+   * messages lost in this conversation, which only grows.
+   *
+   * The earlier design retracted this notice when the connection recovered, which reset the count on
+   * every recovery: a link that dropped fifty times reported "1" each time, so a chronically broken
+   * connection was indistinguishable from one bad moment. A recovered connection does not un-lose a
+   * message, so there was never anything to retract.
+   */
+  it("DOD-M15-NO-SILENT-REFUSAL-1: a recovered connection does not un-lose a message", async () => {
+    const { A, clientA, clientB } = await establishSession();
+    try {
+      const snm = A.getSessionNodeManager();
+      snm.injectSendFault(1);
+      await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
+      if (snm.getSessionImpairment("alice", SID_HEX)?.retained !== "lost") return; // covered above
+
       const ok = (await clientA.send("cello_send", {
         session_id: SID_HEX, content: "this one lands", signal: "over",
       })) as Record<string, unknown>;
       expect(ok.ok, `the recovery send must succeed: ${JSON.stringify(ok)}`).toBe(true);
-      expect(snm.getSessionLiveness("alice", SID_HEX), "the session is healthy again").toBe("alive");
+      expect(snm.getSessionLiveness("alice", SID_HEX), "the connection is healthy again").toBe("alive");
 
-      // A DIFFERENT consumer, deliberately: asking as "op" again would be answered by the
-      // per-consumer dedup and pass against a build that never deleted anything.
+      // A DIFFERENT consumer, deliberately: asking as one that has already been told would be
+      // answered by the per-window dedup and pass against a build that deleted the notice.
+      const after = snm.takeContentRefusals("alice", SID_HEX, "a-fresh-window");
       expect(
-        snm.takeContentRefusals("alice", SID_HEX, "a-fresh-window"),
-        "the notice must be GONE, not merely already-shown — a fresh window after a restart is a " +
-        "fresh consumer, and it must not be told a healed session is broken",
-      ).toEqual([]);
+        after.map((n) => n.reason),
+        "the lost message is still lost — a working connection now says nothing about a message " +
+        "that was destroyed before it recovered",
+      ).toEqual(["outbound_message_lost"]);
     } finally {
       clientA.close(); clientB.close();
     }

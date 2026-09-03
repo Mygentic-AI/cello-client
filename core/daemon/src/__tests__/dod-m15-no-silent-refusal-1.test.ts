@@ -611,7 +611,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     mgr.noteContentRefusal("alice", "s-mixed", "content_hash_mismatch", {
       kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
     });
-    mgr.noteContentRefusal("alice", "s-mixed", "delivery_impaired", {
+    mgr.noteContentRefusal("alice", "s-mixed", "outbound_message_lost", {
       kind: REFUSAL_KINDS.OUTBOUND, impact: "x", guidance: "y",
     });
 
@@ -693,6 +693,55 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
       "and it must SAY the door is broken — a clean absence here reads as an all-clear",
     ).toBe(true);
     expect(String(agent["refusals_guidance"] ?? "")).toMatch(/means nothing — it is not an all-clear/);
+  });
+
+  it("AN OPERATOR CAN DISMISS A REFUSAL, on a conversation that is still open", async () => {
+    /**
+     * ⚠️ **WITHOUT THIS THE NOTICE IS PERMANENT, and that is what makes people stop reading an
+     * inbox.** "Already shown you this" is tracked per WINDOW, and a new window has been told
+     * nothing — so it is told everything. Someone on an older build messages you, you sort it out
+     * with them, they upgrade, and every new session you ever open still opens with that refusal.
+     *
+     * The conversation is deliberately LIVE here. `cello_dismiss` refuses a conversation that is
+     * still in progress, and rightly — there is nothing to dismiss about an unfinished one. But the
+     * case that matters most is exactly a live conversation with a peer whose messages keep being
+     * refused, so clearing the notices has to work there or it does not work where it is needed.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    insertSessionRow("s-dismiss");
+    mgr.noteContentRefusal("alice", "s-dismiss", "content_hash_alg_unknown", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+    });
+
+    const client = await connect();
+    await client.send("cello_use_agent", { name: "alice" });
+    const res = (await client.send("cello_dismiss", { session_id: "s-dismiss" })) as Record<string, unknown>;
+    expect(
+      res["ok"],
+      `clearing four notices off a live conversation IS the thing the operator asked for — answering ` +
+      `ok:false sends them looking for a second command that does not exist. Got ${JSON.stringify(res)}`,
+    ).toBe(true);
+    expect(res["refusals_dismissed"], "and it says how many, rather than claiming a silent success").toBe(1);
+    expect(String(res["guidance"]), "and says the conversation itself is untouched").toMatch(/still open/);
+
+    // A FRESH window, which is the one that would otherwise be shown the backlog forever.
+    expect(
+      ((await inbox(await connect()))["refusals"] as Refusal[] | undefined),
+      "gone for every window, not just the one that dismissed it",
+    ).toBeUndefined();
+
+    /**
+     * AND DISMISSING SWITCHES NOTHING OFF. The operator said "I know", not "stop protecting me" —
+     * a build that muted the reason would be a security control turned off by a tidy-up.
+     */
+    mgr.noteContentRefusal("alice", "s-dismiss", "content_hash_alg_unknown", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+    });
+    expect(
+      mgr.takeContentRefusals("alice", "s-dismiss", "op").length,
+      "it happened again, so the operator is told again",
+    ).toBe(1);
   });
 
   // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────

@@ -5202,24 +5202,6 @@ export class SessionNodeManager {
     this.#impairmentCause.set(key, { cause: opts.cause, retained: "unknown" });
     if (prior === "impaired") return;
     this.#sessionLiveness.set(key, "impaired");
-    /**
-     * DOD-M15-NO-SILENT-REFUSAL-1 — durable, because `#impairmentCause` is not.
-     *
-     * The receive surface already explains an impairment beautifully, and only to somebody who is
-     * there to read it, on a daemon that has not restarted. This session's writes are failing NOW;
-     * an operator who walks away and comes back to a restarted daemon has no record that they ever
-     * did. Noted on the TRANSITION (this line runs once per impairment, not per failed write) so
-     * the count means "times this session went impaired", never "times something was polled".
-     */
-    this.noteContentRefusal(agentName, sessionId, "delivery_impaired", {
-      kind: REFUSAL_KINDS.OUTBOUND,
-      impact:
-        opts.cause === "delivery_ack"
-          ? "an acknowledgement this side owed the counterparty could not be sent on the direct path. Their daemon has no receipt for a message it delivered, so it will keep redelivering — this is about a receipt owed to them, not about anything you sent."
-          : "a message this side sent did not reach the counterparty on the direct path. Their connection is still up, so content may still arrive FROM them while nothing is getting THROUGH — the session looks healthy and is not.",
-      guidance:
-        "Do NOT resend blindly: cello_status for this session says what became of the message — parked with the relay, queued locally for automatic retry, or genuinely lost (only the last one wants a resend, and cello_send said so at the time). This can clear on its own when the connection recovers. Do not seal the session on this evidence — the counterparty is not gone.",
-    });
     this.#logger.warn("session.liveness.changed", {
       sessionId,
       counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
@@ -5249,6 +5231,39 @@ export class SessionNodeManager {
     const current = this.#impairmentCause.get(key);
     if (!current) return;
     this.#impairmentCause.set(key, { cause: current.cause, retained });
+    /**
+     * ─── DOD-M15-NO-SILENT-REFUSAL-1: the notice fires HERE, and ONLY on `lost` ─────────────────
+     *
+     * ⚠️ **THE FIRST VERSION WROTE IT ON THE IMPAIRMENT TRANSITION, WHICH IS A SUCCESS PATH.**
+     *
+     * A direct send failing is the ORDINARY case when a counterparty is offline: the message is
+     * then parked with the relay and handed over when they come back, which is the leave-a-message
+     * feature working exactly as designed. Writing a notice at that moment told the operator "a
+     * message this side sent did not reach the counterparty" about a message that was in flight and
+     * would arrive — while `cello_send` was simultaneously telling them it was parked. Two surfaces,
+     * opposite stories, same message.
+     *
+     * By this line the outcome is known, and only one of the three is the operator's problem:
+     *   - `parked`   — with the relay, delivered when they come back. Nothing to tell.
+     *   - `durable`  — queued here, re-sent automatically. Nothing to tell.
+     *   - `lost`     — it could not be queued anywhere. It is gone, and only a resend recovers it.
+     *
+     * A FAILED ACK takes none of these branches (it never reaches this method), and that is correct:
+     * an acknowledgement this side owed them going missing costs the counterparty a redelivery, not
+     * the operator a message.
+     *
+     * NOT retracted when the connection recovers, unlike the impairment state it rides on: a
+     * recovered connection does not un-lose a message. That is also why the count is meaningful —
+     * it is the number of messages lost in this conversation, and it only ever grows.
+     */
+    if (retained !== "lost") return;
+    this.noteContentRefusal(agentName, sessionId, "outbound_message_lost", {
+      kind: REFUSAL_KINDS.OUTBOUND,
+      impact:
+        "a message you sent could not be delivered and could not be saved to send later, so it is gone. Nothing was added to the conversation and the other person never saw it. Everything you sent before it is unaffected.",
+      guidance:
+        "Send it again. This is the one case where resending is right — there is no copy of it anywhere, so nothing will deliver it for you. If it keeps happening, the connection to this person is not working: check cello_status for this conversation before sending anything long.",
+    });
   }
 
   /** DOD-M12B-ACK-1: why this session is impaired, for the surface that has to explain it. Null
@@ -5274,21 +5289,6 @@ export class SessionNodeManager {
     if (this.#sessionLiveness.get(key) !== "impaired") return;
     this.#sessionLiveness.set(key, "alive");
     this.#impairmentCause.delete(key);
-    /**
-     * DOD-M15-NO-SILENT-REFUSAL-1 — and the durable notice goes with it. Review F1.
-     *
-     * This is the ONE refusal in the store that self-heals, and it is also the one that fires on an
-     * ordinary path: a counterparty who is simply offline fails the direct send, gets parked with
-     * the relay, and is delivered when they come back. Left behind, the notice outlives its own
-     * truth — every new window and every restart would re-announce *"the session looks healthy and
-     * is not"* about a message delivered weeks ago, and its own guidance says *"this can clear on
-     * its own when the connection recovers"*, which is exactly what just happened.
-     *
-     * The same rule `getSessionImpairment` already holds one lane over: *"a caller must not narrate
-     * a failure that is not current."* Nothing else in this store self-heals, so nothing else is
-     * cleared here — a refused message stays refused.
-     */
-    this.#clearContentRefusal(agentName, sessionId, "delivery_impaired");
     this.#logger.info("session.liveness.changed", {
       sessionId,
       counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
@@ -8630,52 +8630,30 @@ export class SessionNodeManager {
   }
 
   /**
-   * Drop a notice that has become FALSE — the only retraction in this store.
+   * DOD-M15-NO-SILENT-REFUSAL-1: the operator has seen these and does not want to see them again.
    *
-   * Review F1. `delivery_impaired` is the one refusal here that self-heals: the direct path recovers,
-   * `#clearSessionImpairment` puts the session back to `alive`, and a notice saying "the session
-   * looks healthy and is not" then outlives its own truth for the life of the agent. Everything else
-   * records something that happened and stays true; a refused message stays refused.
+   * ⚠️ **WITHOUT THIS THE NOTICES ARE PERMANENT, and that is what makes people stop reading the
+   * inbox.** "Already shown you" is tracked per WINDOW — a new MCP connection has been told nothing,
+   * so it is told everything. Someone on an older build messages you, you sort it out with them,
+   * they upgrade, and every new session you ever open still opens with that refusal.
    *
-   * Deliberately NOT a general-purpose dismissal — it takes a reason, not a session, so it cannot be
-   * used to tidy away notices nobody acted on.
+   * Dismissing does NOT turn anything off. If the cause fires again the notice comes back, because
+   * a fresh refusal writes a fresh row. The operator is saying "I know", not "stop telling me".
+   *
+   * Returns how many were cleared, so the caller can say so rather than claiming a silent success.
    */
-  #clearContentRefusal(agentName: string, sessionId: string, reason: string): void {
-    /**
-     * ⚠️ THE COUNT GOES WITH THE ROW, and that is a real cost — review N5, recorded rather than
-     * papered over. A session that impairs and heals repeatedly (an intermittent laptop) resets to
-     * zero each time, so the order-of-magnitude re-announce — whose whole job is making a persistent
-     * cause visible — is defeated for the one reason that self-heals: a direct path failing fifty
-     * times is indistinguishable from a counterparty who went out for lunch once.
-     *
-     * Retracting is still right; a stale "the session looks healthy and is not" is worse. So the
-     * count is LOGGED on the way out, which keeps the flapping greppable while the notice is
-     * correctly gone. Keeping the row in the past tense is the better fix and it is a design change,
-     * so it is on the order under Newly discovered rather than taken here.
-     */
-    const key = this.#k(agentName, sessionId);
-    const droppedInMemory = this.#refusalFallback.get(key)?.get(reason)?.count;
-    this.#refusalFallback.get(key)?.delete(reason);
-    if (!this.#db) return;
+  dismissContentRefusals(agentName: string, sessionId: string): number {
+    if (!this.#db) return 0;
     let agentId: string;
-    try { agentId = this.#requireAgentId(agentName); } catch { return; }
-    const row = this.#db
-      .prepare("SELECT count FROM content_refusal_notices WHERE agent_id = ? AND session_id = ? AND reason = ?")
-      .get(agentId, sessionId, reason) as { count: number } | undefined;
-    const had = row?.count ?? droppedInMemory;
-    if (had !== undefined) {
-      this.#logger.info("session.refusal.retracted", {
-        agentName, sessionId, reason, timesBeforeRetraction: had,
-        impact:
-          "the notice said something that has stopped being true and was withdrawn. timesBeforeRetraction is how many times it had fired: a number that keeps reappearing across retractions is a FLAPPING session, which the notice itself can no longer show because its count starts again after every clear.",
-      });
-    }
+    try { agentId = this.#requireAgentId(agentName); } catch { return 0; }
+    this.#refusalFallback.delete(this.#k(agentName, sessionId));
+    const res = this.#db
+      .prepare("DELETE FROM content_refusal_notices WHERE agent_id = ? AND session_id = ?")
+      .run(agentId, sessionId);
     this.#db
-      .prepare("DELETE FROM content_refusal_notices WHERE agent_id = ? AND session_id = ? AND reason = ?")
-      .run(agentId, sessionId, reason);
-    this.#db
-      .prepare("DELETE FROM content_refusal_reads WHERE agent_id = ? AND session_id = ? AND reason = ?")
-      .run(agentId, sessionId, reason);
+      .prepare("DELETE FROM content_refusal_reads WHERE agent_id = ? AND session_id = ?")
+      .run(agentId, sessionId);
+    return Number(res.changes);
   }
 
   /**
