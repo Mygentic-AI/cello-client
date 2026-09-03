@@ -98,6 +98,12 @@
     // that positive control I would have read a green gate as evidence the API was already there.
     "src/__tests__/dod-m15-relayslots-1-online-token-carried.test.ts",
     "src/__tests__/dod-m15-relayslots-1-refusal-surfaced.test.ts",
+    // DOD-M15-NO-SILENT-REFUSAL-1's own file. New and clean on creation, which is this list's
+    // admission criterion — and its predecessor is the argument for it: two calls in
+    // `dod-m15-refused-inbound-silent-1.test.ts` omit `takeContentRefusals`' REQUIRED third
+    // argument, whose own docstring says the protection is being unable to forget it. They ran for
+    // weeks because `undefined` is a usable Map key and no compiler reads that file.
+    "src/__tests__/dod-m15-no-silent-refusal-1.test.ts",
     // ⚠️ `m12-p14-seal-readiness.test.ts` is NOT here, and the omission is measured rather than
     // assumed. Its nine-argument `placeOwnLeaf` calls are fixed in the same commit, but adding the
     // file surfaces FIVE pre-existing errors that have nothing to do with this unit: four
