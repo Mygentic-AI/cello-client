@@ -51,17 +51,17 @@
  * Crypto refs: RFC 6962 §2.1 (Merkle hash trees).
  */
 
-import { decode as cborDecode } from "cbor-x";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 import { rootOverLeafHashes } from "./inclusion-proof.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 
 /**
  * Every leaf's content hash, hex, in the order the directory certified.
  *
- * Structure 1 TBS is `[protocol_version, content_hash, sender_pubkey, session_id, last_seen_seq,
- * timestamp]` — index 1 is the content hash, and it is the same value the directory feeds to
- * `buildMerkleTree`. Decoded here rather than taken from any other field so the hashes are the ones
- * the sender's signature actually covers.
+ * Structure 1 TBS is `[version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]`,
+ * plus `last_seen_hash` at index 6 on a v2 claim (020-ACKHASH). Index 1 is the content hash in both,
+ * and it is the same value the directory feeds to `buildMerkleTree`. Decoded here rather than taken
+ * from any other field so the hashes are the ones the sender's signature actually covers.
  *
  * Returns null on ANY undecodable or wrong-width leaf rather than skipping it. Skipping would build
  * a SHORTER leaf set that still hashes to something, and that something would then be compared to
@@ -77,18 +77,12 @@ export function sealedLeafHashesFromSignedLeaves(leaves: readonly SealFrontierLe
   if (leaves.length === 0) return null;
   const hashes: string[] = [];
   for (const leaf of leaves) {
-    let arr: unknown;
-    try {
-      arr = cborDecode(leaf.structure1_cbor);
-    } catch {
-      return null;
-    }
-    if (!Array.isArray(arr) || arr.length < 2) return null;
-    const raw = arr[1];
-    const bytes =
-      raw instanceof Uint8Array ? raw : Buffer.isBuffer(raw) ? new Uint8Array(raw as Buffer) : null;
-    if (bytes === null || bytes.length !== 32) return null;
-    hashes.push(Buffer.from(bytes).toString("hex"));
+    // `length < 2` before 020-ACKHASH, which read index 1 out of an array of ANY length — a shape
+    // this build cannot name would have contributed a leaf hash to a set compared against a
+    // certified root. An unnamed layout now returns null, exactly as an undecodable leaf does.
+    const s1 = decodeStructure1(leaf.structure1_cbor);
+    if (!s1.ok) return null;
+    hashes.push(Buffer.from(s1.fields.contentHash).toString("hex"));
   }
   return hashes;
 }
