@@ -480,6 +480,19 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
       .toMatch(/READ IT FIRST/);
     expect(guidance, "and a seal must be named as irreversible, never as the way to clear this state")
       .toMatch(/cannot be undone/);
+    /**
+     * ⚠️ THE SEAL AFFORDANCE STAYS — removing it was the over-correction, and the existing
+     * `f16-counterparty-gone` test caught it. An operator whose counterparty never co-closes has
+     * exactly one exit, and a guidance that names no exit strands them (Invariant 4). What changes
+     * is its POSITION and its framing: it is the consequence of a decision the operator has already
+     * made, stated after the causes, not the first thing they are told to do.
+     */
+    expect(guidance, "the exit out of a dead session is still named — stranding them is the other failure")
+      .toMatch(/delivery-grace window/);
+    expect(
+      guidance.indexOf("READ IT FIRST") < guidance.indexOf("delivery-grace window"),
+      "and the refusals come FIRST — the seal is the last resort, not the opening instruction",
+    ).toBe(true);
     expect(
       res["refusals"],
       "and the refusal itself rides along — a wrong explanation next to the right one is still wrong",

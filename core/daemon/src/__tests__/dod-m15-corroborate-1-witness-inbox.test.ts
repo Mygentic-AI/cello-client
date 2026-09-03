@@ -59,6 +59,10 @@ async function inbox(
         ? [{ session_id: "ff".repeat(16), counterparty_pubkey: "cc".repeat(32), unread_count: 1, status: "sealed" }]
         : [],
     getRenameNotices: () => [],
+    // DOD-M15-NO-SILENT-REFUSAL-1: the inbox reads refusal notices too. Empty here — this fake
+    // exists to isolate a DIFFERENT section, and a fake that omits the method makes the whole
+    // handler throw rather than the section it is testing fail.
+    takeAgentContentRefusals: () => [],
     getConsentRequests: () => [],
     listSessions: () => [],
     getPendingAttestationConsents: () => [],
