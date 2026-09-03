@@ -240,3 +240,114 @@ describe("WIRE-001 AC-001: SessionAssignment type completeness", () => {
     expect(assignment.transport_mode).toBe("direct");
   });
 });
+
+// ─── 017-TBS: the 12-field layout ────────────────────────────────────────────
+
+/**
+ * Two fields join the signed bytes, batched because a TBS change is bilateral and the cost is
+ * paid once: `high_stakes`, which the target is currently held to without being told, and
+ * `prior_relay_id`, which names the relay that witnessed a conversation up to a handover. The new
+ * relay verifies the old one's receipts, and the directory's signature is the only trustworthy
+ * source for who the old one was — a relay knows no other relay's identity.
+ */
+describe("017-TBS: 12-field layout", () => {
+  const M7: [string, string[], string, string[], "direct" | "relay"] = [
+    "12D3KooWInit", ["/ip4/127.0.0.1/tcp/9000"],
+    "12D3KooWCounterparty", ["/ip4/127.0.0.1/tcp/9001"],
+    "relay",
+  ];
+
+  it("emits 12 fields whenever the M7 fields are present, on a FRESH session", () => {
+    // high_stakes false and prior_relay_id "" are VALUES, not absences. A fresh session is the
+    // normal path and must still reach the long layout — anything else hands the next reader two
+    // possible layouts for one session shape.
+    const twelve = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "",
+    );
+    const ten = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7,
+    );
+    expect(twelve.length).toBeGreaterThan(ten.length);
+    expect(Buffer.from(twelve).equals(Buffer.from(ten))).toBe(false);
+  });
+
+  it("high_stakes changes the signed bytes", () => {
+    // The defect this closes: the flag rides the initiator's request and was never forwarded, so
+    // the counterparty was held to a longer floor and a mandatory-evidence bar it never saw.
+    const off = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "",
+    );
+    const on = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, true, "",
+    );
+    expect(Buffer.from(off).equals(Buffer.from(on))).toBe(false);
+  });
+
+  it("prior_relay_id changes the signed bytes", () => {
+    const fresh = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "",
+    );
+    const resume = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "a".repeat(64),
+    );
+    expect(Buffer.from(fresh).equals(Buffer.from(resume))).toBe(false);
+  });
+
+  it("a DIFFERENT prior relay produces different bytes — the field is bound, not decorative", () => {
+    // Without this, a signature over one prior relay would carry over to another and the new relay
+    // would accept receipts from a relay the directory never named.
+    const one = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "a".repeat(64),
+    );
+    const two = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, false, "b".repeat(64),
+    );
+    expect(Buffer.from(one).equals(Buffer.from(two))).toBe(false);
+  });
+
+  it("is deterministic — same inputs, same bytes", () => {
+    const a = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, true, "a".repeat(64),
+    );
+    const b = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7, true, "a".repeat(64),
+    );
+    expect(Buffer.from(a).equals(Buffer.from(b))).toBe(true);
+  });
+
+  it("the two legacy layouts are untouched", () => {
+    // Byte-pinned, not merely "still shorter": a change to either legacy path breaks every
+    // assignment already signed under it, and length alone would not notice a reordering.
+    const five = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+    );
+    expect(Buffer.from(five).toString("hex")).toBe(
+      "8550111111111111111111111111111111115820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      + "5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      + "5820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1b0000018bcfe56800",
+    );
+
+    const ten = buildSessionEstablishmentTbs(
+      makeSessionId(), makePubA(), makePubB(), makeGenesisPrevRoot(), TIMESTAMP,
+      ...M7,
+    );
+    expect(Buffer.from(ten).toString("hex")).toBe(
+      "8a50111111111111111111111111111111115820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      + "5820bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      + "5820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc1b0000018bcfe56800"
+      + "6c313244334b6f6f57496e6974781b5b222f6970342f3132372e302e302e312f7463702f39303030225d"
+      + "74313244334b6f6f57436f756e7465727061727479781b5b222f6970342f3132372e302e302e312f7463702f39303031225d"
+      + "6572656c6179",
+    );
+  });
+});

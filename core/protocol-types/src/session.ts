@@ -91,6 +91,10 @@ interface SessionAssignmentCommon {
   counterparty_session_peer_id?: string;    // libp2p session node Peer ID of counterparty
   counterparty_session_addrs?: string[];    // multiaddrs of counterparty's session node
   transport_mode?: 'direct' | 'relay';      // whether session uses direct P2P or relay-mediated transport
+  // 017-TBS — both inside the directory-signed TBS, both always sent by a current directory.
+  // `false` and `""` are VALUES here, not absences: absent means a directory predating this layout.
+  high_stakes?: boolean;    // the session's tier, forwarded so the TARGET can see what it is held to
+  prior_relay_id?: string;  // on a resume, the relay that witnessed up to the handover; "" when fresh
 }
 
 /**
@@ -148,6 +152,8 @@ export type SessionAssignment = SessionAssignmentFrost | SessionAssignmentSingle
  * @param counterpartySessionPeerId - M7: session node Peer ID of counterparty (optional for backward compat)
  * @param counterpartySessionAddrs - M7: multiaddrs of counterparty session node (optional for backward compat)
  * @param transportMode - M7: 'direct' or 'relay' (optional for backward compat)
+ * @param highStakes - 017-TBS: the session's high-stakes tier, forwarded so the TARGET can see it
+ * @param priorRelayId - 017-TBS: on a resume, the relay that witnessed up to the handover; "" fresh
  * @returns canonical CBOR bytes of the TBS array
  */
 export function buildSessionEstablishmentTbs(
@@ -161,6 +167,8 @@ export function buildSessionEstablishmentTbs(
   counterpartySessionPeerId?: string,
   counterpartySessionAddrs?: string[],
   transportMode?: 'direct' | 'relay',
+  highStakes?: boolean,
+  priorRelayId?: string,
 ): Uint8Array {
   const tsEncoded = typeof timestamp === "bigint" || timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
 
@@ -172,7 +180,7 @@ export function buildSessionEstablishmentTbs(
     counterpartySessionAddrs !== undefined &&
     transportMode !== undefined
   ) {
-    return encodeCbor([
+    const m7 = [
       sessionId,
       pubA,
       pubB,
@@ -183,7 +191,28 @@ export function buildSessionEstablishmentTbs(
       counterpartySessionPeerId,
       JSON.stringify(counterpartySessionAddrs.slice().sort()),
       transportMode,
-    ]) as Uint8Array;
+    ];
+
+    /**
+     * 017-TBS: the 12-field layout, and it is the NORMAL path — not a resume-only variant.
+     *
+     * Both new fields are always-present VALUES: `high_stakes` is a boolean where `false` is a real
+     * answer, and `priorRelayId` is `""` on a fresh session and a 64-hex relay id on a resume. So
+     * the arity turns on whether the CALLER supplies them, never on what they contain. Making it
+     * turn on `priorRelayId !== ""` would give a fresh session two possible layouts and leave the
+     * next reader resolving which one a signature was over at runtime.
+     *
+     * `high_stakes` is here because the target was being held to the high-stakes floor and its
+     * mandatory-evidence bar without ever being told: the flag rode the initiator's request and
+     * was not forwarded. `prior_relay_id` is here because a relay knows no other relay's identity,
+     * so when a conversation moves relays the new one can only learn who witnessed it before from
+     * the directory's signature — never from the client.
+     */
+    if (highStakes !== undefined && priorRelayId !== undefined) {
+      return encodeCbor([...m7, highStakes, priorRelayId]) as Uint8Array;
+    }
+
+    return encodeCbor(m7) as Uint8Array;
   }
 
   // Legacy (M1–M6): encode only the original 5 fields

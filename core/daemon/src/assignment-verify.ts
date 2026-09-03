@@ -56,6 +56,8 @@ export async function verifyAssignmentSignature(
     assignment.counterparty_session_peer_id,
     assignment.counterparty_session_addrs,
     assignment.transport_mode,
+    assignment.high_stakes,
+    assignment.prior_relay_id,
   );
 
   /**
@@ -222,6 +224,8 @@ export function verifyInboundAssignment(
     assignment.counterparty_session_peer_id,
     assignment.counterparty_session_addrs,
     assignment.transport_mode,
+    assignment.high_stakes,
+    assignment.prior_relay_id,
   );
 
   if (!verifyFrostSignature(assignment.directory_signature, tbs, CONTEXT_SESSION_ESTABLISHMENT, new Uint8Array(verifyAgainst))) {
