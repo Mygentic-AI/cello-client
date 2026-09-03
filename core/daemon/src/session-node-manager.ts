@@ -9340,7 +9340,7 @@ export class SessionNodeManager {
         impact:
           "the screener could not reach a verdict on an inbound message, so it was NOT ingested and NOT shown. Nothing was recorded and nothing was acknowledged — the message is still with the sender and their daemon will redeliver it once screening works again. Do not read this silence as delivery.",
         guidance:
-          "TRANSIENT — do not ask the counterparty to resend, and do not close the session. Get the local screening gateway healthy and the backlog comes through on its own: look for security.gateway.timeout and security.gateway.unavailable in the daemon log. While it stays down, every message from every counterparty takes this path.",
+          "TRANSIENT — do not ask the counterparty to resend, and do not close the session. Get the local screening gateway healthy and the backlog comes through on its own: look for security.gateway.timeout, security.gateway.unavailable and security.gateway.inbound.blocked in the daemon log — the third is what an internal screen_error logs, and naming only the first two sends you looking for lines that will not be there. While it stays down, every message from every counterparty takes this path.",
       });
       return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
@@ -9376,6 +9376,9 @@ export class SessionNodeManager {
        * The gateway's own `guidance` is appended when it has one, for the same reason: it is the
        * half that names the actual command.
        */
+      // `?? "inbound_screen_blocked"` is a floor, not a live branch: every verdict producer in the
+      // tree sets `reason`, so today it never fires. It stays because `reason` is optional on the
+      // type, and a notice keyed on `undefined` would collapse every future detector into one row.
       this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
         kind: REFUSAL_KINDS.BLOCKED,
         impact:
