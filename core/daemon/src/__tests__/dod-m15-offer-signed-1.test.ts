@@ -388,4 +388,48 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     expect(String(refused?.context["reason"])).toBe("inbound_assignment_signature_invalid");
     expectFullyRefused(h, "inbound_assignment_invalid", /start a new session/i);
   });
+
+  it("does NOT accuse a PINNED counterparty of changing keys when the content was tampered", async () => {
+    /**
+     * 017-TBS review HIGH-2. A signature that fails under a pin has two possible causes, and only
+     * one of them is about identity:
+     *
+     *   - the assignment NAMES a different signer than the pin  → `signer_not_pinned`, a real
+     *     identity claim, and the case this agent should shout about;
+     *   - the assignment names the RIGHT signer and the signature still fails → the CONTENT does
+     *     not match what was signed. The counterparty's key has not changed at all.
+     *
+     * Collapsing the second into the first tells the operator their counterparty re-registered and
+     * sends them to run `cello_contact_remove` — which DESTROYS a correct pin, the one security
+     * anchor that was working, over what is usually a bug on the directory's side. That is not a
+     * cosmetic mislabel: the remedy actively removes the protection.
+     *
+     * This is not hypothetical. 017 shipped a directory that signed twelve fields and encoded ten,
+     * and every repeat counterparty would have been told exactly this.
+     */
+    const signer = generateKeypair();
+    const signerHex = Buffer.from(await signer.getPublicKey()).toString("hex");
+    const { frame } = await makeSignedAssignmentFrame({
+      sessionId: SESSION_ID,
+      initiatorPubkey: Buffer.from(COUNTERPARTY, "hex"),
+      responderPubkey: Buffer.from(AGENT_PUBKEY, "hex"),
+      initiatorSessionPeerId: REAL_DIALER,
+      signWith: signer,
+    });
+    // The signer is EXACTLY the pinned key — identity is not in question. Only the content moved.
+    (frame["assignment"] as Record<string, unknown>)["initiator_session_peer_id"] = "12D3KooWImpostor";
+
+    const h = harness({ offeredDialer: "12D3KooWImpostor", pinnedPrimary: signerHex });
+    h.injectRaw(frame);
+    await settle();
+
+    // Still refused — this is a real failure and must stay loud and blocking.
+    const refused = h.events.find((e) => e.event === "session.inbound.assignment.invalid");
+    expect(refused, "a content mismatch must still refuse the session").toBeDefined();
+
+    // But NOT as an identity change, and the operator must not be told to clear their pin.
+    const accused = h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed");
+    expect(accused, "the signer matched the pin — nothing about their identity changed").toBeUndefined();
+    expect(String(refused?.context["guidance"] ?? "")).not.toMatch(/cello_contact_remove/);
+  });
 });
