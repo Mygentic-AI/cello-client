@@ -1312,9 +1312,24 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       ? { ok: false as const, reason: "inbound_assignment_unparseable", detail: "the assignment object failed shape validation" }
       : verifyInboundAssignment(rawAssignment, pinnedSigner);
     if (!verdict.ok) {
-      const isIdentityChange =
-        verdict.reason === "inbound_assignment_signer_not_pinned" ||
-        (pinnedSigner !== null && verdict.reason === "inbound_assignment_signature_invalid");
+      /**
+       * ONLY `signer_not_pinned` is an identity change, and the distinction is load-bearing.
+       *
+       * `signer_not_pinned` means the assignment NAMES a key other than the one recorded for this
+       * counterparty — a claim about who they are, and worth shouting about.
+       *
+       * `signature_invalid` under a pin means something else entirely: the assignment names the
+       * RIGHT key and the signature still does not verify, so the CONTENT does not match what was
+       * signed. Their identity is not in question at all; a genuine re-registration shows up as
+       * `signer_not_pinned`, because the new key would be the one named.
+       *
+       * Collapsing the second into the first was not a cosmetic mislabel — it told the operator
+       * their counterparty had re-registered and sent them to run `cello_contact_remove`, which
+       * DESTROYS a correct pin. The remedy removed the one anchor that was working, over what is
+       * usually a directory-side encoding bug. 017 shipped a directory that signed twelve fields
+       * and encoded ten; every repeat counterparty would have been given that advice.
+       */
+      const isIdentityChange = verdict.reason === "inbound_assignment_signer_not_pinned";
       logger.error(
         isIdentityChange ? "session.inbound.counterparty_primary_changed" : "session.inbound.assignment.invalid",
         {
