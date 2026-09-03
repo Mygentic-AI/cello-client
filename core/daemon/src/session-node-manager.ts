@@ -9032,9 +9032,9 @@ export class SessionNodeManager {
       this.noteContentRefusal(agentName, sessionId, "session_committed", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
-          `this session's record is closed (status: ${record.status}), so the message could never land here — it was NOT ingested and NOT shown. Nothing can be added to a closed record, so every later message from them on this session takes the same path.`,
+          `This conversation is closed (it ended as "${record.status}"), so the message could not be delivered and neither can anything else they send to it. A closed conversation is signed and cannot be added to — that is what closing it means. Nothing is wrong on your side.`,
         guidance:
-          "Nothing is wrong on your side and there is nothing to repair on this session. If the counterparty still has something to say, ask them to start a NEW session — a closed record cannot be reopened. Read what was said before it closed with cello_transcript.",
+          "There is nothing to repair here. If they still have something to say, ask them to start a NEW conversation — a closed one cannot be reopened, and it is worth telling them, because they may not realise it ended. Read what was said before it closed with cello_transcript.",
       });
       return { ok: false, reason: "session_committed" };
     }
@@ -9183,9 +9183,34 @@ export class SessionNodeManager {
       this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
-          "a message arrived that this daemon could not attribute to any counterparty, so it was NOT ingested and NOT shown. Writing it would have put an unattributable row in the permanent record, which is worse than not having it.",
+          "A message arrived that this daemon could not attribute to anyone, so it was not delivered. This conversation's record does not say who the other party is, which a conversation opened normally always does. TREAT THIS AS HOSTILE: a message that cannot be tied to a sender is far more likely to be a probe or an attack than a fault.",
+        /**
+         * ⚠️ NO "WHEN IN DOUBT" HERE — Andre, 2026-09-03: *"This message has no sender, the chances
+         * that it is hostile are very high. When in doubt? No. Just report it."*
+         *
+         * That hedge belongs on the ambiguous branch in `024-ORPHANTRIAGE`, where a verified
+         * signature from a known contact leaves a real judgement to make. There is no judgement
+         * here. Softening it would teach the operator to weigh a case that does not need weighing.
+         *
+         * ⚠️ AND IT NAMES NO REPORTING VERB, deliberately. `CELLO_Reporting` does not exist yet
+         * (`DOD-M15-ORPHANTRIAGE-1`) and the message itself is not retained
+         * (`DOD-M15-REFUSEDEVIDENCE-1`), so naming a destination would be an instruction the
+         * operator cannot carry out — Invariant 4's failure. It states that reporting is warranted,
+         * which is true, and gains its destination when those land.
+         *
+         * ⚠️ THE ROTATION ADVICE IS MEASURED, NOT ASSUMED. `#startReceiverNode` mints the standing
+         * receiver's transport key with `randomBytes(32)` and never persists it, so a logout/login
+         * genuinely yields a NEW peer id and fresh directory connections. **And the bound is stated
+         * in the same breath:** session nodes DO persist their seed (`DOD-M12B-SESSION-SEED-1`, so a
+         * revived conversation keeps its address), so this rotates the front door and not the doors
+         * already open. Telling an operator to rotate without that bound would have them believe
+         * they had closed something they had not.
+         */
         guidance:
-          "The session row carries no counterparty key, which a session opened normally always has. Treat this session as unusable rather than waiting on it: close it with cello_close_session and start a new one. See session.content.sender_unresolved in the daemon log.",
+          "Report this. Do not try to reply — there is no one to reply to, and answering an unattributable message is what a probe is looking for. " +
+          "Then rotate your address: run cello logout followed by cello login. Your standing receiver's network identity is generated fresh each time it starts and is never stored, so this gives you a new one and rebuilds your connections to the directory — anyone holding the old address is left talking to something that no longer answers. " +
+          "It does NOT change the addresses of conversations you already have open: those identities are kept on purpose so an interrupted conversation can resume. " +
+          "This conversation cannot be repaired: close it with cello_close_session, and open a new one yourself if you were expecting someone. See session.content.sender_unresolved in the daemon log.",
       });
       return { ok: false, reason: "sender_unresolved" };
     }
@@ -9618,9 +9643,23 @@ export class SessionNodeManager {
       this.noteContentRefusal(agentName, sessionId, "transcript_write_failed", {
         kind: REFUSAL_KINDS.LOST,
         impact:
-          "a message was verified and committed to the hash chain, and then its text failed to write to the local transcript — so it can never be delivered. This is a fault on THIS machine, not a quiet counterparty, and the sender is being told the ingest failed.",
+          "A message reached this agent, was verified, and was committed to the conversation's record — and then its text could not be written to local storage, so it can never be delivered. There is a permanent gap in your copy of this conversation. This is a fault on THIS machine; the counterparty did nothing wrong and cannot fix it.",
+        /**
+         * ⚠️ THE READER IS USUALLY ALREADY IN A CODING AGENT, so the guidance says GO AND LOOK
+         * rather than listing symptoms. Andre, 2026-09-03: *"The message should mention to try and
+         * figure out why you cannot store it — it is likely a local machine problem. But if you
+         * truly cannot figure this out using a coding agent, then we advise reaching out to
+         * CELLO_Support."*
+         *
+         * That ordering matters: this is a machine fault with an ordinary cause, and an operator
+         * sent straight to support for a full disk has been wasted. Support is the exit, not the
+         * first step.
+         */
         guidance:
-          "Check free disk space and the permissions on ~/.cello, and look for transcript.message.record.failed in the daemon log. Waiting cannot recover it. Once the local fault is fixed, ask the counterparty to resend — the text is not retrievable from the record, only its hash is.",
+          "Find out why the write failed — this is almost always something ordinary on this machine. " +
+          "If you are reading this through a coding agent, have it check: free disk space, the permissions on ~/.cello, whether the database file is readable and writable, and transcript.message.record.failed in the daemon log, which carries the underlying error. " +
+          "Waiting cannot recover the message. Once the fault is fixed, ask them to resend — the text is gone and only its hash remains. " +
+          "If you genuinely cannot work out the cause, reach out to CELLO_Support.",
       });
       return { ok: false, reason: "transcript_write_failed" };
     }
@@ -10174,7 +10213,9 @@ export class SessionNodeManager {
         impact:
           `a message arrived and was committed to the hash chain at sequence ${leafIndex}, and then its text could not be written to the local transcript. Delivery reads the transcript, so that message can never be handed to any session — it is a permanent hole in this side's copy of the conversation.`,
         guidance:
-          "This is a fault on THIS machine, not a quiet counterparty. Check free disk space and the permissions on ~/.cello, and look for transcript.message.record.failed in the daemon log. Waiting cannot recover it — once the local fault is fixed, ask the counterparty to resend.",
+          "This is a fault on THIS machine; the counterparty did nothing wrong. Find out why the write failed — it is almost always something ordinary. " +
+          "If you are reading this through a coding agent, have it check free disk space, the permissions on ~/.cello, and transcript.message.record.failed in the daemon log, which carries the underlying error. " +
+          "Waiting cannot recover it. Once the fault is fixed, ask them to resend. If you genuinely cannot work out the cause, reach out to CELLO_Support.",
       });
     }
     // Review finding #6: the witness for this hash has done its ordering job once the leaf is

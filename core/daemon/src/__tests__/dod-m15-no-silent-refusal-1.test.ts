@@ -403,8 +403,8 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     const [notice] = mgr.takeContentRefusals("alice", "s-closed", "op");
     expect(notice!.reason).toBe("session_committed");
     expect(notice!.impact, "the REAL status, not the exit-point label").toContain("abandoned");
-    expect(notice!.impact, "and it must not claim a seal this session never got").not.toMatch(/status: sealed/);
-    expect(notice!.guidance).toMatch(/start a NEW session/i);
+    expect(notice!.impact, "and it must not claim a seal this conversation never got").not.toMatch(/"sealed"/);
+    expect(notice!.guidance).toMatch(/start a NEW conversation/i);
   });
 
   it("A SESSION THIS DAEMON DOES NOT HOLD produces a notice — the case with no other trace", async () => {
@@ -476,9 +476,36 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice, "a message this daemon cannot attribute is still a message the operator lost").toBeDefined();
     expect(notice!.reason).toBe("sender_unresolved");
     expect(notice!.kind).toBe("refused");
-    expect(notice!.impact, "and it says WHY nothing was written, not merely that nothing was")
-      .toMatch(/unattributable/);
-    expect(notice!.guidance, "with a move that works — this session cannot be repaired").toMatch(/start a new one/i);
+    expect(notice!.impact, "and it names the SUSPICION, not just the fault — a message with no sender is a probe far more often than a bug")
+      .toMatch(/TREAT THIS AS HOSTILE/);
+    expect(notice!.guidance, "reporting is the action, unconditionally").toMatch(/Report this/);
+    /**
+     * ⚠️ NO "when in doubt" on this branch — Andre, 2026-09-03: "This message has no sender, the
+     * chances that it is hostile are very high. When in doubt? No. Just report it." That hedge
+     * belongs where there is a real judgement to make; softening it here teaches the operator to
+     * weigh a case that does not need weighing.
+     */
+    expect(notice!.guidance, "and it must NOT hedge — there is no judgement to make here")
+      .not.toMatch(/when in doubt/i);
+    /**
+     * And it names no reporting VERB, because CELLO_Reporting does not exist yet and the message
+     * itself is not retained. Naming a destination would be an instruction the operator cannot
+     * carry out. This assertion is the reminder to add one when those land.
+     */
+    expect(notice!.guidance, "it does not name a destination that does not exist yet")
+      .not.toMatch(/CELLO_Reporting/);
+    expect(notice!.guidance, "and it does not invite a reply — that is what a probe wants").toMatch(/Do not try to reply/);
+    /**
+     * Rotating the address is advice that WORKS: `#startReceiverNode` mints the standing receiver's
+     * transport key with `randomBytes(32)` and never persists it, so logout/login yields a new peer
+     * id. And the bound is asserted with it — session seeds ARE persisted, so this does not rotate
+     * conversations already open, and an operator told otherwise would believe they had closed
+     * something they had not.
+     */
+    expect(notice!.guidance, "it names the rotation, which genuinely mints a new receiver identity")
+      .toMatch(/cello logout followed by cello login/);
+    expect(notice!.guidance, "and states what it does NOT rotate, or it over-promises")
+      .toMatch(/does NOT change the addresses of conversations you already have open/);
   });
 
   it("A NOTICE THAT CANNOT BE PERSISTED still reaches the operator — review F6", async () => {

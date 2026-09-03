@@ -101,6 +101,13 @@ describe("DOD-COATTEND-1 F2: a swallowed transcript write is reported as itself"
         "it must name THIS machine — a quiet counterparty is the wrong place to look",
       ).toMatch(/THIS machine/);
       expect(`${n.impact} ${n.guidance}`).toMatch(/disk space/);
+      /**
+       * The reader is usually already in a coding agent, so the guidance sends them to LOOK rather
+       * than listing symptoms — and support is the EXIT, not the first step. An operator sent
+       * straight to support for a full disk has been wasted.
+       */
+      expect(n.guidance, "it tells them to go and find the cause").toMatch(/coding agent/);
+      expect(n.guidance, "and names support only as the last resort").toMatch(/If you genuinely cannot work out the cause, reach out to CELLO_Support/);
     }
   });
 
