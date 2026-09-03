@@ -11,10 +11,10 @@ import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import { Encoder, decode } from "cbor-x";
 import { generateKeypair, verify, buildRelayAckTbs, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import {
   AgentRelayClient,
   buildRelayAuthPayload,
-  encodeStructure1,
   RELAY_AUTH_DOMAIN,
   LEAF_KIND_MSG,
   LEAF_KIND_CTRL,
@@ -64,7 +64,7 @@ describe("session-relay-client: Structure 1", () => {
     const lastSeenSeq = 0;
     const timestamp = 1_750_000_000_000;
 
-    const s1 = encodeStructure1(contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp);
+    const s1 = encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp });
 
     // Mirror the relay's decodeStructure1: a 6-element array with the exact field shapes.
     const arr = decode(s1) as unknown[];
@@ -81,7 +81,13 @@ describe("session-relay-client: Structure 1", () => {
   it("signature over the raw Structure 1 bytes verifies (relay verifies the exact bytes, not a re-encode)", async () => {
     const kp = generateKeypair();
     const senderPubkey = await kp.getPublicKey();
-    const s1 = encodeStructure1(new Uint8Array(32).fill(0x07), senderPubkey, new Uint8Array(16).fill(0x09), 3, 1_750_000_000_001);
+    const s1 = encodeStructure1({
+      contentHash: new Uint8Array(32).fill(0x07),
+      senderPubkey,
+      sessionId: new Uint8Array(16).fill(0x09),
+      lastSeenSeq: 3,
+      timestamp: 1_750_000_000_001,
+    });
 
     const sig = await kp.sign(s1);
     // The relay calls verify(sender_pubkey, frame.structure1_cbor, sender_signature).

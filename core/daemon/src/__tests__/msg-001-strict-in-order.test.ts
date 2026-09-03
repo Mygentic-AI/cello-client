@@ -30,7 +30,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { encodeParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
@@ -313,7 +313,13 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
   ): Promise<{ structure1Cbor: Uint8Array; structure2Cbor: Uint8Array; contentHash: Uint8Array }> {
     const pubkey = await kp.getPublicKey();
     const contentHash = msgLeafHash(content); // 32-byte msg leaf hash, as the sender submits
-    const structure1Cbor = encodeStructure1(contentHash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+    const structure1Cbor = encodeStructure1({
+      contentHash,
+      senderPubkey: pubkey,
+      sessionId: new Uint8Array(16),
+      lastSeenSeq: 0,
+      timestamp: 1_700_000_000_000,
+    });
     let sig = await kp.sign(structure1Cbor); // 64-byte Ed25519 over the exact structure1 bytes
     if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
     const built = buildStructure2(seq, pubkey, contentHash, sig, new Uint8Array(32));

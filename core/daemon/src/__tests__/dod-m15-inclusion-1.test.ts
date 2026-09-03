@@ -42,7 +42,7 @@ import { buildMerkleTree, merkleRoot, type LeafInput } from "@cello-protocol/cry
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import type { SealFrontierLeaf } from "../seal-frontier-verify.js";
 import { registerInclusionProofHandlers } from "../inclusion-proof-handlers.js";
 import { verifyInclusionProof, INCLUSION_VERIFY_REASONS, type InclusionProof } from "../inclusion-proof.js";
@@ -84,13 +84,13 @@ function ctrlLeafHashHex(payload: Uint8Array): string {
 
 function signedLeavesFor(hashesHex: readonly string[]): SealFrontierLeaf[] {
   return hashesHex.map((h, i) => ({
-    structure1_cbor: encodeStructure1(
-      new Uint8Array(Buffer.from(h, "hex")),
-      new Uint8Array(32),
-      SESSION_ID_BYTES,
-      i,
-      1_700_000_000_000 + i,
-    ),
+    structure1_cbor: encodeStructure1({
+      contentHash: new Uint8Array(Buffer.from(h, "hex")),
+      senderPubkey: new Uint8Array(32),
+      sessionId: SESSION_ID_BYTES,
+      lastSeenSeq: i,
+      timestamp: 1_700_000_000_000 + i,
+    }),
     sender_pubkey: new Uint8Array(32),
     sender_signature: new Uint8Array(64),
   }));

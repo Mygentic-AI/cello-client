@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeSealPayload } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeSealPayload, encodeStructure1 } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
@@ -215,22 +215,6 @@ export function buildRelayAuthPayload(nonce: Uint8Array, pubkey: Uint8Array): Ui
   const domain = Buffer.from(RELAY_AUTH_DOMAIN, "utf8");
   const authMsg = Buffer.concat([domain, nonce, pubkey]);
   return new Uint8Array(createHash("sha256").update(authMsg).digest());
-}
-
-/**
- * Canonical Structure 1 CBOR the sender signs and the relay re-verifies byte-for-byte:
- * [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp].
- * The relay decodes this (decodeStructure1) AND verifies Ed25519 over these EXACT bytes,
- * so the encoded bytes — not a re-encoding — are what gets signed and sent.
- */
-export function encodeStructure1(
-  contentHash: Uint8Array,
-  senderPubkey: Uint8Array,
-  sessionId: Uint8Array,
-  lastSeenSeq: number,
-  timestamp: number,
-): Uint8Array {
-  return encodeCbor([1, contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp]) as Uint8Array;
 }
 
 export interface LeafDeliverFrame {
@@ -1736,7 +1720,18 @@ export class AgentRelayClient {
     // This session's OWN high-water mark (NOT an agent-global one) — the relay's seq_counter
     // is per session and rejects last_seen_seq > seq_counter.
     const lastSeenForSession = this.#lastSeen.get(sessionIdHex) ?? 0;
-    const structure1 = encodeStructure1(contentHash, this.#senderPubkey, sessionId, lastSeenForSession, Date.now());
+    // The published encoder from protocol-types — the ONE definition of the field order, pinned by
+    // `structure1-canonical.json`. A second local copy lived here until 020-ACKHASH; it drifted, and
+    // the drift was invisible because both copies "worked": it encoded a timestamp above 2^32-1 as a
+    // CBOR float64 while the published encoder (and every other TBS builder in this package) promotes
+    // it to a uint64. Same value, different signed bytes, and only the vector said which was canonical.
+    const structure1 = encodeStructure1({
+      contentHash,
+      senderPubkey: this.#senderPubkey,
+      sessionId,
+      lastSeenSeq: lastSeenForSession,
+      timestamp: Date.now(),
+    });
     const signature = await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
       type: "hash_submit",
