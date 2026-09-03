@@ -39,7 +39,7 @@ import { decode as cborDecode } from "cbor-x";
 // means the question cannot recur.
 import { encodeCbor, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -517,7 +517,13 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     ) => {
       const pubkey = await kp.getPublicKey();
       const contentHash = msgLeafHash(content);
-      const structure1Cbor = encodeStructure1(contentHash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+      const structure1Cbor = encodeStructure1({
+        contentHash,
+        senderPubkey: pubkey,
+        sessionId: new Uint8Array(16),
+        lastSeenSeq: 0,
+        timestamp: 1_700_000_000_000,
+      });
       let sig = await kp.sign(structure1Cbor);
       if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
       const built = buildStructure2(seq, pubkey, contentHash, sig, new Uint8Array(32));

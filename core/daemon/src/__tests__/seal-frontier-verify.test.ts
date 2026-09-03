@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import {
   reDeriveFrontiers,
   findInflatedFrontier,
@@ -25,7 +25,13 @@ async function signedLeaf(
   opts: { corruptSig?: boolean; sessionId?: Uint8Array } = {},
 ): Promise<SealFrontierLeaf> {
   const pubkey = await kp.getPublicKey();
-  const s1 = encodeStructure1(new Uint8Array(32), pubkey, opts.sessionId ?? SID, lastSeenSeq, 1_700_000_000_000);
+  const s1 = encodeStructure1({
+    contentHash: new Uint8Array(32),
+    senderPubkey: pubkey,
+    sessionId: opts.sessionId ?? SID,
+    lastSeenSeq,
+    timestamp: 1_700_000_000_000,
+  });
   let sig = await kp.sign(s1);
   if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
   return { structure1_cbor: s1, sender_pubkey: pubkey, sender_signature: sig };

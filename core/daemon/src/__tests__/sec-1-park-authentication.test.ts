@@ -35,9 +35,10 @@ import type { Stream } from "@libp2p/interface";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { buildParkContentTbs, buildStructure2, encodeStructure2 } from "@cello-protocol/protocol-types";
-// NOT protocol-types' encodeStructure1 — that one takes an object. This is the positional wire
-// helper the relay client itself uses, which is what msg-001-strict-in-order builds records with.
-import { encodeStructure1 } from "../session-relay-client.js";
+// protocol-types' encodeStructure1 — the ONE builder, and the same one msg-001-strict-in-order
+// builds its records with. The daemon kept a second positional copy until 020-ACKHASH; this comment
+// used to point at it as a deliberate choice, which is exactly how the drift stayed invisible.
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { encodeParkEnvelope, sealParkEnvelope } from "../park-envelope.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 
@@ -160,7 +161,13 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
     // Two ordering records for the SAME bytes at relay sequences 1 and 2 (1-based on the wire).
     const mkRecord = async (seq: number) => {
       const pubkey = await counterparty.getPublicKey();
-      const structure1Cbor = encodeStructure1(hash, pubkey, new Uint8Array(16), 0, 1_700_000_000_000);
+      const structure1Cbor = encodeStructure1({
+        contentHash: hash,
+        senderPubkey: pubkey,
+        sessionId: new Uint8Array(16),
+        lastSeenSeq: 0,
+        timestamp: 1_700_000_000_000,
+      });
       const sig = await counterparty.sign(structure1Cbor);
       const built = buildStructure2(seq, pubkey, hash, sig, new Uint8Array(32));
       if (!built.ok) throw new Error("buildStructure2 failed");

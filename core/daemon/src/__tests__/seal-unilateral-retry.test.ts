@@ -45,7 +45,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
 import { DbRegistrationPersistence } from "../db-identity-store.js";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -390,7 +390,13 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     // ── The COUNTERPARTY's SEAL ctrl leaf arrives via the relay → auto-ack submits OUR leaf.
     const counterpartyKp = generateKeypair();
     const counterpartyPub = await counterpartyKp.getPublicKey();
-    const s1 = encodeStructure1(new Uint8Array(32).fill(0xcd), counterpartyPub, SID_BYTES, 0, TS);
+    const s1 = encodeStructure1({
+      contentHash: new Uint8Array(32).fill(0xcd),
+      senderPubkey: counterpartyPub,
+      sessionId: SID_BYTES,
+      lastSeenSeq: 0,
+      timestamp: TS,
+    });
     relay.push({
       type: "leaf_deliver",
       sequence_number: 1,
@@ -468,7 +474,13 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     // Drive the counterparty's SEAL leaf in so the close seals BILATERALLY (not force, not unilateral).
     const counterpartyKp = generateKeypair();
     const counterpartyPub = await counterpartyKp.getPublicKey();
-    const s1 = encodeStructure1(new Uint8Array(32).fill(0xcd), counterpartyPub, SID_BYTES, 0, TS);
+    const s1 = encodeStructure1({
+      contentHash: new Uint8Array(32).fill(0xcd),
+      senderPubkey: counterpartyPub,
+      sessionId: SID_BYTES,
+      lastSeenSeq: 0,
+      timestamp: TS,
+    });
     relay.push({
       type: "leaf_deliver", sequence_number: 1, leaf_kind: 2, session_id: SID_BYTES,
       structure1_cbor: s1, structure2_cbor: new Uint8Array([1, 2, 3, 4]),

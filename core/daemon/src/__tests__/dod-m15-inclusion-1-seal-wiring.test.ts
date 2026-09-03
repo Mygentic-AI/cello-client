@@ -42,7 +42,7 @@ import type { SignalingManager } from "@cello-protocol/transport";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory } from "../session-node-manager.js";
 import { createSealCoordinator } from "../seal-coordinator.js";
-import { encodeStructure1 } from "../session-relay-client.js";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { contentHashFor, CONTENT_HASH_ALGS } from "../wire-content-hash.js";
 import type { Logger } from "../types.js";
 import { seedAgents } from "./helpers/seed-agents.js";
@@ -134,7 +134,13 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
     const senderPubkey = await signer.getPublicKey();
     const frontierLeaves = await Promise.all(
       certifiedLeaves.map(async (h, i) => {
-        const s1 = encodeStructure1(new Uint8Array(Buffer.from(h, "hex")), senderPubkey, SESSION_ID_BYTES, i, 1_700_000_000_000 + i);
+        const s1 = encodeStructure1({
+          contentHash: new Uint8Array(Buffer.from(h, "hex")),
+          senderPubkey,
+          sessionId: SESSION_ID_BYTES,
+          lastSeenSeq: i,
+          timestamp: 1_700_000_000_000 + i,
+        });
         return { structure1_cbor: s1, sender_pubkey: senderPubkey, sender_signature: await signer.sign(s1) };
       }),
     );
