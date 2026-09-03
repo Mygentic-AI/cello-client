@@ -41,6 +41,13 @@ export interface SignedAssignmentOpts {
   sessionTimestamp?: number;
   /** Sign with this key instead of a fresh one — for pinned-mode tests. */
   signWith?: ReturnType<typeof generateKeypair>;
+  /**
+   * 017-TBS. Supply BOTH to sign and emit the 12-field layout; omit both for the 10-field one.
+   * Defaulting them here would be wrong: an assignment that omits them is what an older directory
+   * sends, and the existing fixtures are entitled to keep testing that shape.
+   */
+  highStakes?: boolean;
+  priorRelayId?: string;
 }
 
 export async function makeSignedAssignmentFrame(
@@ -67,6 +74,10 @@ export async function makeSignedAssignmentFrame(
     counterpartyPeerId,
     counterpartyAddrs,
     "relay",
+    // Passed through as-is, INCLUDING undefined: the builder picks its layout on arity, so
+    // forwarding a default here would silently sign 12 fields for a fixture asking for 10.
+    opts.highStakes,
+    opts.priorRelayId,
   );
 
   // The FROST context framing the directory signs under: context bytes, a 0x00 separator, then TBS.
@@ -96,6 +107,10 @@ export async function makeSignedAssignmentFrame(
         counterparty_session_peer_id: counterpartyPeerId,
         counterparty_session_addrs: counterpartyAddrs,
         transport_mode: "relay",
+        // Only present when signed over — a frame carrying a field the TBS does not cover would
+        // let the verifier rebuild a layout the signature was never taken over.
+        ...(opts.highStakes !== undefined ? { high_stakes: opts.highStakes } : {}),
+        ...(opts.priorRelayId !== undefined ? { prior_relay_id: opts.priorRelayId } : {}),
       },
     },
   };
