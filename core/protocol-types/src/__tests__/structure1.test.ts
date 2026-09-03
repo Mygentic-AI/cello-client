@@ -31,6 +31,7 @@ const toHex = (b: Uint8Array): string => Buffer.from(b).toString("hex");
 
 const CONTENT_HASH = new Uint8Array(32).fill(0xcc);
 const SENDER_PUBKEY = new Uint8Array(32).fill(0xdd);
+const COUNTERPARTY_PUBKEY = new Uint8Array(32).fill(0xbb);
 const SESSION_ID = new Uint8Array(16).fill(0xee);
 const LAST_SEEN_HASH = new Uint8Array(32).fill(0xa7);
 const TIMESTAMP = 1_700_000_000_000;
@@ -132,7 +133,9 @@ describe("020-ACKHASH: the first message of a session has a defined last_seen_ha
     // field and NOT a shorter array. Pinned to computeGenesisPrevRoot so no second genesis constant
     // gets invented later, and so nobody reaches for 32 zero bytes — a value identical across every
     // session is one an attacker can present for any session.
-    const genesis = computeGenesisPrevRoot(SENDER_PUBKEY, CONTENT_HASH, SESSION_ID, TIMESTAMP);
+    // Called with its REAL arguments — two participant pubkeys, not a content hash standing in for
+    // one. A round-trip passes either way, which is exactly why the wrong call was easy to write.
+    const genesis = computeGenesisPrevRoot(SENDER_PUBKEY, COUNTERPARTY_PUBKEY, SESSION_ID, TIMESTAMP);
     expect(genesis.length).toBe(LAST_SEEN_HASH_BYTES);
 
     const res = decodeStructure1(encodeStructure1({ ...V1_FIELDS, lastSeenHash: genesis }));
@@ -143,10 +146,10 @@ describe("020-ACKHASH: the first message of a session has a defined last_seen_ha
   });
 
   it("a genesis root differs per session, so it cannot be replayed into another one", () => {
-    const a = computeGenesisPrevRoot(SENDER_PUBKEY, CONTENT_HASH, SESSION_ID, TIMESTAMP);
+    const a = computeGenesisPrevRoot(SENDER_PUBKEY, COUNTERPARTY_PUBKEY, SESSION_ID, TIMESTAMP);
     const b = computeGenesisPrevRoot(
       SENDER_PUBKEY,
-      CONTENT_HASH,
+      COUNTERPARTY_PUBKEY,
       new Uint8Array(16).fill(0x11),
       TIMESTAMP,
     );

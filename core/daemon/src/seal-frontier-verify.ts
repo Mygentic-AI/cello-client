@@ -62,6 +62,16 @@ export function reDeriveFrontiers(leaves: SealFrontierLeaf[], expectedSessionId:
     // The length check was `< 5`, which admitted an array of any length ≥ 5 and lifted a frontier
     // number out of it. An unnamed layout is now `leaf_malformed`, the same outcome as undecodable
     // bytes: a shape this build cannot name must not contribute to a frontier it cannot interpret.
+    //
+    // TWO NARROWINGS CAME WITH THAT, both recorded because they are changes and not merely a
+    // tightening of the length rule (review F7):
+    //   - a non-numeric `last_seen_seq` used to `continue` (skip this leaf, keep verifying the rest)
+    //     and is now `leaf_malformed`, failing the whole re-derivation;
+    //   - a `bigint` `last_seen_seq` used to be coerced with `Number(raw)` and is now refused.
+    // Both are unreachable in practice — the relay refuses `typeof last_seen_seq !== "number"` at
+    // ingest, so no leaf that reaches a seal can carry either shape — and both move in the
+    // fail-closed direction. A frontier is a published claim about how far a party countersigned;
+    // deriving one from a leaf we could not fully read is the thing worth refusing.
     const s1 = decodeStructure1(leaf.structure1_cbor);
     if (!s1.ok) return { ok: false, reason: "leaf_malformed" };
     if (!bytesEqual(s1.fields.sessionId, expectedSessionId)) {

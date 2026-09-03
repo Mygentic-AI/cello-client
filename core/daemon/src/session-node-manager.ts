@@ -4604,9 +4604,13 @@ export class SessionNodeManager {
               );
             }
           } else {
+            // `structure1Reason`, not `error` — review F6. This is a named refusal code, and putting
+            // it in a field called `error` reads as an exception message to anyone scanning logs.
+            // The old `try` here also wrapped `recordWitnessedSequence`, so a throw from THAT was
+            // reported as a decode failure; the decode no longer throws, and the split is deliberate.
             this.#logger.warn("session.relay.leaf.witness.decode.failed", {
               sessionId,
-              error: s1.reason,
+              structure1Reason: s1.reason,
               correlationId,
             });
           }
@@ -7606,7 +7610,11 @@ export class SessionNodeManager {
                 sentAuthorship = { senderPubkey: pk, senderSig: witnessed.sender_signature };
               }
             } catch (err: unknown) {
-              dropAuthorship("structure1_decode_failed", err);
+              // NOT a decode failure — review F3. `decodeStructure1` never throws and its failure is
+              // handled as the first branch above, with its own reason. What can still throw in here
+              // is `verify()` and the Buffer work, so this names that instead of sending the reader
+              // to audit a CBOR layout that decoded fine.
+              dropAuthorship("authorship_verify_threw", err);
             }
           }
           // 1-BASED → 0-BASED. The relay numbers the first leaf of a session 1
@@ -9469,7 +9477,11 @@ export class SessionNodeManager {
       const s1 = decodeStructure1(own.structure1Cbor);
       if (!s1.ok) {
         this.#logger.warn("session.seal.leaf.recover.failed", {
-          sessionId, agentName, reason: "structure1_content_hash_missing", structure1Reason: s1.reason,
+          // NAMED AT ITS CAUSE — review F2. This read `structure1_content_hash_missing`, which was
+          // accurate when the only check was `contentHash instanceof Uint8Array`. It now fires for an
+          // unknown layout, undecodable CBOR and a malformed field too, and sends an operator to
+          // audit a content hash when the layout is what disagreed. `structure1Reason` carries which.
+          sessionId, agentName, reason: "structure1_decode_failed", structure1Reason: s1.reason,
           impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
         });
         return "unknown";
@@ -9480,8 +9492,12 @@ export class SessionNodeManager {
         sequenceNumber: own.sequenceNumber,
       };
     } catch (err: unknown) {
+      // NOT a decode failure — review F3. `decodeStructure1` never throws, so the only thrower left
+      // inside this try is the tree derivation below it. Calling this `structure1_decode_failed`
+      // pointed at CBOR for a fault in `rootWithAppendedHex`, and made one reason string mean two
+      // unrelated things in the same log event.
       this.#logger.warn("session.seal.leaf.recover.failed", {
-        sessionId, agentName, reason: "structure1_decode_failed",
+        sessionId, agentName, reason: "seal_root_derivation_threw",
         error: err instanceof Error ? err.message : String(err),
         impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
       });

@@ -75,6 +75,18 @@ describe("session-relay-client: Structure 1", () => {
     expect(Buffer.from(arr[2] as Uint8Array).equals(Buffer.from(senderPubkey))).toBe(true);
     expect(Buffer.from(arr[3] as Uint8Array).equals(Buffer.from(sessionId))).toBe(true);
     expect(arr[4]).toBe(lastSeenSeq);
+    /**
+     * NAME THE ENCODING, not just the value — review F5, and this line is why a drift survived.
+     *
+     * This asserted `Number(arr[5])`, which erases the CBOR type: it passes for a float64 and a
+     * uint64 alike. The daemon's own (now deleted) `encodeStructure1` emitted float64 while the
+     * published one promotes to uint64, and this test — whose stated job is to mirror the relay's
+     * decoder — could not see the difference for as long as the two encoders were apart.
+     *
+     * A timestamp above 2^32-1 is the canonical uint64 form, which cbor-x decodes to a bigint.
+     */
+    expect(timestamp).toBeGreaterThan(0xffffffff);
+    expect(typeof arr[5]).toBe("bigint");
     expect(Number(arr[5])).toBe(timestamp);
   });
 
