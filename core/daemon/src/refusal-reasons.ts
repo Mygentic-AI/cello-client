@@ -58,12 +58,32 @@ export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
    * catch-up door destroyed it once already.
    */
   [REFUSAL_KINDS.REFUSED]:
-    "Message(s) from this counterparty WERE received and REFUSED — they were not verified, so they " +
-    "were neither ingested nor shown. See `refusals` for the reason and what to do. Waiting longer " +
-    "will not help until it is resolved, and the counterparty has no way to know: from their side the " +
-    "message was sent. THE REASON BELOW SAYS WHAT TO DO — do not reach for a resend by default: two " +
-    "of the reasons carrying this header are already being redelivered on a loop, and one cannot be " +
-    "fixed for this session at all.",
+    /**
+     * ⚠️ **"THEY WERE NOT VERIFIED" WAS DROPPED, and it is the F4 defect one level further down.**
+     *
+     * That clause was true of the three hash failures this header was written for, and of an
+     * unattributable sender. It is FALSE of a message refused because the conversation had already
+     * closed, and false of one that hit the sender's size limit — those messages may be perfectly
+     * valid and fully verified, and were refused for arriving too late or being too large. A header
+     * that tells the operator their counterparty sent something unverifiable, when the counterparty
+     * did nothing wrong, is an accusation.
+     */
+    "Message(s) from this counterparty were received and refused, so they were not delivered. " +
+    /**
+     * ⚠️ "WAITING HERE WILL NOT HELP" IS LOAD-BEARING and an existing test guards it: the exit this
+     * header rides on is a receive that timed out, and without this sentence the operator is handed
+     * a reason next to an instruction to keep waiting.
+     *
+     * Worded "waiting HERE", not the original "waiting will not help" — which is false for one of
+     * these. The salt branch has a cause that repairs itself on the next reconnect, and its own
+     * guidance says to wait for exactly that. What is universally true is that sitting on this call
+     * fixes nothing; the reason below is where the fix is.
+     */
+    "Waiting here will not help — the reason below says what will. See " +
+    "`refusals` for it. The counterparty has no way to know: from their " +
+    "side the message was sent. DO NOT REACH FOR A RESEND BY DEFAULT — the reason below says what to " +
+    "do, and two of them are already being redelivered on a loop while one cannot be fixed for this " +
+    "conversation at all.",
   [REFUSAL_KINDS.BLOCKED]:
     "Message(s) aimed at this agent were BLOCKED by its screener. They were verified and they ARE " +
     "recorded in the conversation's hash chain, and the sender WAS acknowledged — so they do not " +
@@ -71,15 +91,16 @@ export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
     "and that is the protection working. Do not go looking for the blocked text and do not turn " +
     "screening off to read it.",
   [REFUSAL_KINDS.DEFERRED]:
-    "Message(s) from this counterparty could not be processed and were NOT accepted — nothing was " +
-    "recorded and nothing was acknowledged, so the message is still with them and their daemon will " +
-    "redeliver it once the cause clears. DO NOT read the silence as delivery, and do not ask them to " +
-    "resend: a resend takes a second position in the record. Fix the cause named below.",
+    "Message(s) from this counterparty could not be checked and were not accepted. Nothing was " +
+    "recorded and nothing was acknowledged, so the message is still on their side and their agent " +
+    "will send it again by itself once the cause clears. DO NOT READ THE SILENCE AS DELIVERY, and do " +
+    "not ask them to resend — a resend would take a second place in the record. Fix the cause named " +
+    "below.",
   [REFUSAL_KINDS.LOST]:
-    "Message(s) reached this agent, were verified, and were committed to the hash chain — and then " +
-    "failed to write to the local transcript, so they can never be delivered. THIS IS A FAULT ON " +
-    "THIS MACHINE, not a quiet counterparty. Waiting cannot recover them; the text is gone and only " +
-    "its hash remains. Fix the local fault below, then ask them to resend.",
+    "Message(s) reached this agent and were committed to the conversation's record, and then could " +
+    "not be written to local storage, so they can never be delivered. THIS IS A FAULT ON THIS " +
+    "MACHINE, not a quiet counterparty. Waiting cannot recover them; the text is gone and only its " +
+    "hash remains. Fix the local fault named below, then ask them to resend.",
   [REFUSAL_KINDS.OUTBOUND]:
     "NOTHING WAS REFUSED BY THIS AGENT — this is the other direction. A message YOU sent did not get " +
     "through, and could not be saved to send later, so it is gone. Do not go to the counterparty " +

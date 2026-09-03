@@ -647,7 +647,18 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     });
 
     const guidance = String((await inbox(await connect()))["refusals_guidance"] ?? "");
-    expect(guidance, "the refused header is present").toMatch(/WERE received and REFUSED/);
+    expect(guidance, "the refused header is present").toMatch(/were received and refused/);
+    /**
+     * ⚠️ AND IT MUST NOT CLAIM THEY WERE UNVERIFIED — the F4 defect one level further down.
+     *
+     * That clause was true of the hash failures this header was written for. It is false of a
+     * message refused because the conversation had already closed, or because the sender hit their
+     * size limit: those may be perfectly valid, fully verified messages that arrived too late or too
+     * large. Telling the operator their counterparty sent something unverifiable, when they did
+     * nothing wrong, is an accusation.
+     */
+    expect(guidance, "and it does not accuse the counterparty of sending something unverifiable")
+      .not.toMatch(/were not verified/);
     expect(guidance, "and so is the outbound one — not just whichever came first").toMatch(/NOTHING WAS REFUSED BY THIS AGENT/);
     expect(
       guidance.indexOf("[kind: refused]") < guidance.indexOf("[kind: outbound]"),
