@@ -178,9 +178,16 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
    * before: no client-side reader ever checked this width, and requiring it here would turn a
    * layout reader into a second, quieter place that can reject a session.
    *
-   * Every consumer of this field compares it to an EXPECTED session id (`seal-frontier-verify`), so
-   * a wrong width fails that comparison exactly as a wrong value does. Nothing downstream trusts it
-   * on width alone.
+   * Each consumer is safe for one of two reasons, and it is worth naming both rather than claiming
+   * the stronger one for all of them. `seal-frontier-verify` COMPARES the value against an expected
+   * session id, so a wrong width fails exactly as a wrong value does. `#captureReceipt`
+   * (`session-relay-client.ts`) does NOT compare it — it hexes the value straight into the
+   * `relay_ack_receipts` primary key — and is safe instead because those bytes are
+   * `#pendingStructure1`, which this daemon produced and signed moments earlier.
+   *
+   * An earlier version of this comment said every consumer compares it. That was false for
+   * `#captureReceipt`, and a comment asserting a safety property the code does not have is how
+   * defects survive review in this repo — so it is corrected here rather than deleted.
    */
   const sessionId = arr[3] instanceof Uint8Array
     ? arr[3]

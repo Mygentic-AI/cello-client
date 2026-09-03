@@ -739,8 +739,20 @@ export class AgentRelayClient {
     // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq, ts], plus
     // last_seen_hash at index 6 on a v2 claim (020-ACKHASH). sender_pubkey is index 2 in both.
     const s1 = decodeStructure1(structure1Cbor);
-    // Unreadable, or a layout this build cannot name → treat as NOT ours (conservative: don't
-    // suppress a real counterparty leaf).
+    /**
+     * ⚠️ `false` IS THE DANGEROUS DIRECTION, NOT THE CONSERVATIVE ONE — review F8, correcting a
+     * comment that claimed the opposite.
+     *
+     * It read "conservative: don't suppress a real counterparty leaf." At the call site, `false`
+     * means our OWN echoed leaf gets `#bumpLastSeen` applied — which the comment there says must not
+     * happen — and is written into the seal-leaf log as a COUNTERPARTY leaf. Returning `false`
+     * wrongly corrupts the log; returning `true` wrongly drops one witness signal.
+     *
+     * It stays `false` because the input set is bytes the relay already decoded and accepted, so an
+     * unreadable leaf here means this daemon and the relay disagree about a frame the relay passed —
+     * not a hostile peer. Widening it to every layout failure (it was only a CBOR throw before) does
+     * not change that: the relay's own decoder gates every path that reaches here.
+     */
     if (!s1.ok) return false;
     return Buffer.from(s1.fields.senderPubkey).equals(Buffer.from(this.#senderPubkey));
   }
@@ -908,8 +920,16 @@ export class AgentRelayClient {
       if (this.#sealLeafStore && seq >= 0 && !authoredByUs) {
         const s2 = frame["structure2_cbor"];
         const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
-        let senderHex: string | undefined;
-        try { senderHex = Buffer.from(toU8((decode(s1) as unknown[])[2])).toString("hex"); } catch { senderHex = undefined; }
+        // Review F1: a raw positional read of index 2 with NO version and NO length check lived here
+        // — it accepted a v3 array, a 40-element array, anything with 32 bytes at index 2, and fed
+        // the result into the seal-leaf log as the counterparty's identity. It is in the same file as
+        // #isOwnLeaf and #captureReceipt and was simply missed by the order's reader list, which is
+        // exactly the "next layout change has to find them again" problem the shared decoder exists
+        // to end. Behaviour for every relay-accepted leaf is unchanged; the fail-open closes.
+        const s1Decoded = decodeStructure1(s1);
+        const senderHex = s1Decoded.ok
+          ? Buffer.from(s1Decoded.fields.senderPubkey).toString("hex")
+          : undefined;
         if (structure2Cbor && s1.length > 0 && senderHex) {
           try {
             this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
