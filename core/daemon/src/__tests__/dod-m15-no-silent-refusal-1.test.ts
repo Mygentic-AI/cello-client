@@ -477,6 +477,59 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.guidance, "with a move that works — this session cannot be repaired").toMatch(/start a new one/i);
   });
 
+  it("A NOTICE THAT CANNOT BE PERSISTED still reaches the operator — review F6", async () => {
+    /**
+     * ⚠️ **DURABLE STORAGE MUST NOT MAKE THE FAILURE CASE WORSE THAN THE MAP IT REPLACED.**
+     *
+     * The predecessor kept notices in a Map, which could not fail — recording one was a `set`, so
+     * the receive door always had it for the life of the process. Moving to SQLCipher introduced a
+     * way for the write to fail, and the first version of this unit answered that by logging and
+     * returning: the operator got NOTHING, on either door, where before they always got the notice.
+     * Making storage durable had made it, in the failure case, less available.
+     *
+     * So a failed write falls back to exactly what the Map did. What is lost is the restart
+     * property — which is the property the database was unavailable for anyway.
+     *
+     * Broken at the SQL layer, the way a full or locked disk does, and NOT by stubbing
+     * `noteContentRefusal`: the behaviour under test lives inside that method's own catch, so a stub
+     * would be testing the stub's throw.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    const db = mgr.getDb() as unknown as { prepare: (sql: string) => unknown };
+    const realPrepare = db.prepare.bind(db);
+    db.prepare = (sql: string) => {
+      if (/INSERT INTO content_refusal_notices/i.test(sql)) throw new Error("SQLITE_FULL: database or disk is full");
+      return realPrepare(sql);
+    };
+
+    mgr.noteContentRefusal("alice", "s-nodb", "content_hash_mismatch", {
+      kind: REFUSAL_KINDS.REFUSED,
+      impact: "a message arrived whose bytes do not match the hash the sender committed to.",
+      guidance: "Ask the counterparty to resend.",
+    });
+
+    const [notice] = mgr.takeContentRefusals("alice", "s-nodb", "op");
+    expect(
+      notice,
+      "the operator must still be told — a database failure may cost the restart, never the notice",
+    ).toBeDefined();
+    expect(notice!.reason).toBe("content_hash_mismatch");
+    expect(notice!.guidance, "with its advice, not a bare code").toContain("resend");
+    expect(notice!.kind).toBe("refused");
+    // And under the SAME rules as a persisted one, or a database failure would quietly change WHAT
+    // the operator is told rather than only how long it survives — the harder thing to notice.
+    expect(mgr.takeContentRefusals("alice", "s-nodb", "op"), "the same window is not told twice").toEqual([]);
+    expect(
+      mgr.takeContentRefusals("alice", "s-nodb", "another-window").length,
+      "and a second window is still told — per-consumer holds on the fallback too",
+    ).toBe(1);
+    // The agent-wide door reaches it as well, and reports the session it belongs to. This is the
+    // one that needs the key parsed back apart, so it is the one that would silently return nothing.
+    const viaInbox = mgr.takeAgentContentRefusals("alice", "inbox-window");
+    expect(viaInbox.notices.map((n) => n.sessionId), "the inbox door reaches it and NAMES the session").toEqual(["s-nodb"]);
+  });
+
   // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────
 
   it("COUNTERPARTY_GONE names what was observed, and stops steering the operator into a seal", async () => {
