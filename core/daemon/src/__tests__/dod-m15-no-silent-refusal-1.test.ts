@@ -335,7 +335,10 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
 
     const [notice] = mgr.takeContentRefusals("alice", "s-screen", "op");
     expect(notice, "and it must no longer do that silently").toBeDefined();
-    expect(notice!.reason).toBe("inbound_screen_blocked");
+    // Invariant 3: the DETECTOR's reason, not the seam's generic label. `inbound_screen_blocked` is
+    // the fallback for a verdict that names none. Flattening every detector to one code would also
+    // deduplicate them together, so a second KIND of block would be silent for the session's life.
+    expect(notice!.reason).toBe("injection_detected");
     expect(notice!.impact, "it says the sender was acked, so the operator does not wait for a resend")
       .toMatch(/acknowledged/);
     expect(notice!.guidance, "and it must not send them hunting for the blocked text")
