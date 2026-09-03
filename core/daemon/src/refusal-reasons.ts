@@ -11,6 +11,25 @@
  * guidance table below is keyed by its values, so a reason without guidance cannot be added silently.
  */
 
+/**
+ * DOD-M15-NO-SILENT-REFUSAL-1 — the sentence that makes a CONTENT refusal actionable.
+ *
+ * Distinct from `REFUSAL_GUIDANCE` below, which is per-reason guidance for a refused SESSION
+ * REQUEST. This one is the header carried alongside a list of refused MESSAGES, on every door that
+ * shows them: the `cello_receive` exits and the `cello_inbox` section. It lives here because it now
+ * has two consumers in two modules, and a duplicated copy is a second thing to keep true.
+ *
+ * ⚠️ IT TRAVELS WITH THE NOTICES, NEVER SEPARATELY. When only one exit carried this sentence, a
+ * catch-up read drained the refusals into a payload with no advice at all, and the operator's next
+ * blocking read then said "call again and keep waiting" — the notice was already gone. Both doors
+ * return the two together for that reason.
+ */
+export const CONTENT_REFUSAL_GUIDANCE =
+  "Message(s) from this counterparty WERE received and REFUSED — they were not verified, so they " +
+  "were neither ingested nor shown. See `refusals` for the reason and what to do. Waiting longer " +
+  "will not help until it is resolved, and the counterparty has no way to know: from their side the " +
+  "message was sent. If you need it, ask them to resend after the cause is fixed.";
+
 export const REFUSAL_REASONS = {
   /** The session_offer and the session_assignment named different dialers for one session. */
   OFFER_ASSIGNMENT_DIALER_MISMATCH: "offer_assignment_dialer_mismatch",

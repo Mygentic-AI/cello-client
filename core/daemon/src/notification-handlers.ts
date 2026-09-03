@@ -10,7 +10,7 @@
  * it exists to backstop would be no reconciler at all.
  */
 import type { IpcHandler } from "./ipc-server.js";
-import { REFUSAL_GUIDANCE } from "./refusal-reasons.js";
+import { CONTENT_REFUSAL_GUIDANCE, REFUSAL_GUIDANCE } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -141,6 +141,46 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         "relay as silent rather than as clean.";
     }
     return out;
+  }
+
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1 — the refused messages, in the inbox.
+   *
+   * ⚠️ **THIS IS THE DOOR THE LINE EXISTS FOR.** The other one is `cello_receive`, and it only
+   * opens for somebody who is attending that exact session. The case Andre raised is the opposite:
+   * the connection is live, the daemon is up, and NOBODY IS ATTENDING that agent — so the refusal
+   * reaches no one, and the operator sees a conversation that went quiet.
+   *
+   * **Deliberately not folded into `unread`.** A refusal is not a message from the counterparty; it
+   * is this daemon reporting something that did NOT arrive. Counting it as unread would tell an
+   * agent it has mail to read and hand it an explanation instead.
+   *
+   * Drained per CONSUMER, exactly as the receive door is, and against the same store — so an
+   * operator is told once per reason per window, whichever door they came through, and a reason
+   * whose count has grown by an order of magnitude re-announces with `repeat: true`.
+   */
+  function refusalSection(agentName: string, connectionId: string): Record<string, unknown> {
+    const refusals = sessionNodeManager.takeAgentContentRefusals(agentName, connectionId);
+    if (refusals.length === 0) return {};
+    return {
+      refusals: refusals.map((r) => ({
+        session_id: r.sessionId,
+        reason: r.reason,
+        ...(r.impact !== undefined ? { impact: r.impact } : {}),
+        ...(r.guidance !== undefined ? { guidance: r.guidance } : {}),
+        times: r.count,
+        ...(r.repeat === true ? { repeat: true } : {}),
+      })),
+      // The header travels WITH the list, never separately — see CONTENT_REFUSAL_GUIDANCE. The
+      // second sentence is this door's own: an agent reading an inbox has not asked about any
+      // particular conversation and will not connect a refusal to one unless told to.
+      refusals_guidance:
+        CONTENT_REFUSAL_GUIDANCE +
+        " These are grouped by session_id, and `times` is how many messages that reason has refused " +
+        "on that session — a large number means the cause is still live, not that it happened once. " +
+        "TELL THE OPERATOR. A refusal that reaches an agent and stops there is the same silence it " +
+        "was written to end.",
+    };
   }
 
   // ─── M8C-INBOX-1 (N1/N4): cello_check_notifications — push-loss reconciler + poll-only inbox ───
@@ -303,6 +343,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
           ...(refused.length > 0 ? { refused_session_requests: refused } : {}),
           unread,
           total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent),
+          ...refusalSection(agent, connectionId),
           // DOD-SEALED-INBOX-2 + M12-P17 review F2 — BOTH properties, neither dropped in the merge.
           //
           // The rename half: `session_state` was HARDCODED to "sealed" for every row, on a list that
@@ -345,7 +386,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
               "cello_close_session. Check `status` and `notarized` per entry — do not treat this list as one kind.",
         };
       }
-      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent) };
+      return { agent, pending_session_requests: pending, expired_session_requests: expired, ...pendingGuidance, ...expiredGuidance, ...(refused.length > 0 ? { refused_session_requests: refused } : {}), unread, total_unread, rename_notices, ...documentSection(agent), ...witnessSection(agent), ...refusalSection(agent, connectionId) };
     });
 
     const totalUnread = agents.reduce((sum, a) => sum + a.total_unread, 0);

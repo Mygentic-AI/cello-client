@@ -278,7 +278,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const res = await mgr.ingestReceivedContent("alice", sid, content, wrongHash);
     expect(res.ok, "the tampered message must be refused, not ingested").toBe(false);
 
-    const notices = mgr.takeContentRefusals("alice", sid);
+    const notices = mgr.takeContentRefusals("alice", sid, "op");
     expect(
       notices.length,
       "a REAL refusal must produce a notice — this is the leg every other test in this file skips",
@@ -326,7 +326,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     expect(res.ok, "an algorithm this build cannot resolve must be refused, not ingested").toBe(false);
     expect(res.reason).toBe("content_hash_alg_unknown");
 
-    const [notice] = mgr.takeContentRefusals("alice", sid);
+    const [notice] = mgr.takeContentRefusals("alice", sid, "op");
     expect(
       notice,
       "and the operator must be TOLD — this is the permanent, every-message case, and it was the " +

@@ -137,6 +137,16 @@ const MAX_REFUSED_PARKED_ENTRIES = 512;
 const MAX_UNREADABLE_ALG_FRAMES = 64;
 
 /**
+ * How many consumers' read positions a single refusal notice remembers.
+ *
+ * A consumer id is an IPC connection id, so every reconnect mints a new one and the read state would
+ * otherwise grow without bound in a durable table. Sixteen is far above the real number of windows
+ * attending one agent; past that the OLDEST reader is evicted, which costs at worst one repeated
+ * announcement to a window that has already gone.
+ */
+const MAX_REFUSAL_READERS = 16;
+
+/**
  * How long the first send waits for an in-flight salt agreement before giving up on it —
  * `DOD-M15-SEALWIRE-1` B2b-2 constraint 2.
  *
@@ -2772,6 +2782,44 @@ export class SessionNodeManager {
       )
     `);
 
+    // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices — one per (agent, session, reason). Written every
+    // time an inbound message is refused; read by cello_receive and by the cello_inbox pull. Modelled
+    // on contact_rename_notices above and keyed the same way, on agent_id (the stable key) — the map
+    // this replaced was keyed on agent_name, a mutable display label, which was its second bug.
+    //
+    // DURABLE because the case this exists for is NOBODY ATTENDING. A notice held only in memory is
+    // lost to a restart and is only ever surfaced to whoever happens to call cello_receive on that
+    // exact session, which is a log line with extra steps.
+    //
+    // `content_refusal_reads` is the part rename notices do not need: they clear on operator action,
+    // these are read non-destructively PER CONSUMER. Two MCP windows attending one agent is ordinary,
+    // and under a single surfaced flag the first reader consumed the notice and the second was told
+    // nothing, permanently.
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS content_refusal_notices (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        impact TEXT,
+        guidance TEXT,
+        count INTEGER NOT NULL,
+        first_at INTEGER NOT NULL,
+        last_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id, reason)
+      )
+    `);
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS content_refusal_reads (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        consumer_id TEXT NOT NULL,
+        seen_count INTEGER NOT NULL,
+        seen_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id, reason, consumer_id)
+      )
+    `);
+
     // DOD-SETTINGS-1: a daemon-side per-agent settings store for REACHABILITY POLICY (the tier bounds
     // overrides and the per-tier/agent away messages). A generic key-value table on the stable
     // agent_id, in the same SQLCipher DB. Deliberately NOT M9-CFG-001's gateway config store: this is
@@ -5116,6 +5164,23 @@ export class SessionNodeManager {
     this.#impairmentCause.set(key, { cause: opts.cause, retained: "unknown" });
     if (prior === "impaired") return;
     this.#sessionLiveness.set(key, "impaired");
+    /**
+     * DOD-M15-NO-SILENT-REFUSAL-1 — durable, because `#impairmentCause` is not.
+     *
+     * The receive surface already explains an impairment beautifully, and only to somebody who is
+     * there to read it, on a daemon that has not restarted. This session's writes are failing NOW;
+     * an operator who walks away and comes back to a restarted daemon has no record that they ever
+     * did. Noted on the TRANSITION (this line runs once per impairment, not per failed write) so
+     * the count means "times this session went impaired", never "times something was polled".
+     */
+    this.noteContentRefusal(agentName, sessionId, "delivery_impaired", {
+      impact:
+        opts.cause === "delivery_ack"
+          ? "an acknowledgement this side owed the counterparty could not be sent on the direct path. Their daemon has no receipt for a message it delivered, so it will keep redelivering — this is about a receipt owed to them, not about anything you sent."
+          : "a message this side sent did not reach the counterparty on the direct path. Their connection is still up, so content may still arrive FROM them while nothing is getting THROUGH — the session looks healthy and is not.",
+      guidance:
+        "Do NOT resend blindly: cello_status for this session says what became of the message — parked with the relay, queued locally for automatic retry, or genuinely lost (only the last one wants a resend, and cello_send said so at the time). This can clear on its own when the connection recovers. Do not seal the session on this evidence — the counterparty is not gone.",
+    });
     this.#logger.warn("session.liveness.changed", {
       sessionId,
       counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
@@ -5561,10 +5626,13 @@ export class SessionNodeManager {
     this.#sessionLiveness.delete(key);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
-    // DOD-M15-REFUSED-INBOUND-SILENT-1: and the unshown refusals. Bounded (a fixed set of reasons
-    // per session) so leaving them was a slow leak rather than a bug — but this list IS the
-    // documented teardown set, and a map that is not in it drifts out of everyone's mental model.
-    this.#contentRefusals.delete(key);
+    // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices are NOT torn down here, and the omission is
+    // deliberate — this list is the documented teardown set, so anything absent from it needs a
+    // reason. They live in `content_refusal_notices`, keyed on agent_id + session_id, and the
+    // question they answer ("why did that person stop replying?") is one an operator asks AFTER a
+    // session ends, most sharply for `session_committed` — a refusal that exists only because the
+    // session was already sealed. Dropping them at seal would delete exactly the ones a sealed
+    // session produces. Growth is one row per (session, reason), i.e. proportional to `sessions`.
     this.#unreadableAlgSeen.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
@@ -8403,15 +8471,18 @@ export class SessionNodeManager {
   }
 
   /**
-   * ─── DOD-M15-REFUSED-INBOUND-SILENT-1: refusals the RECEIVING operator can actually see ───────
+   * ─── DOD-M15-NO-SILENT-REFUSAL-1: refusals the RECEIVING operator can actually see ────────────
    *
    * Every inbound refusal already logs a `reason`, an `impact` and a `guidance` — and they are
    * good. They had no reader. From the receiving operator's chair a refused message simply never
    * arrives: the conversation goes quiet with a full explanation sitting in a file they have no
    * reason to open, and they conclude the other person stopped replying.
    *
-   * `content_hash_alg_unknown` is why this matters more than it sounds. It is a VERSION SKEW, so it
-   * affects every message from that counterparty, permanently — not a rare one-off.
+   * **DURABLE, and that is the half that makes this useful.** The predecessor kept notices in a
+   * `Map` on this instance and drained them on the receive path for one session. So a restart lost
+   * them, and an agent NOBODY IS ATTENDING lost them too — the connection is live, the daemon is
+   * up, and the notice only ever reaches whoever happens to call `cello_receive` on that exact
+   * session. `cello_check_notifications` now reads them as its own inbox category.
    *
    * **DEDUPLICATED PER SESSION PER REASON, and that is the design, not an optimisation.** A skewed
    * peer turns one problem into a flood: the first refusal of a kind is the signal, the ninetieth is
@@ -8421,69 +8492,78 @@ export class SessionNodeManager {
    * **NEVER carries the content.** It failed verification; surfacing it is the injection path the
    * cross-check exists to close. The operator learns that a message was refused and why — never
    * what it said.
-   *
-   * In memory, deliberately: a restart re-signalling a still-broken peer is correct behaviour, not
-   * duplication, and durability here would buy nothing the next refusal does not.
    */
   /**
-   * (agentName, sessionId) → reason → the notice. `firstAt` was dropped: it was written and read by
-   * nothing, and a field nobody consumes is a claim the code does not keep.
+   * Record an inbound refusal for the operator. First of its kind per session is the signal.
+   *
+   * ⚠️ **DOES NOT THROW, and that is a decision with a cost — stated so it is not mistaken for an
+   * oversight.** Every call site here has already decided to refuse and is about to return a reason
+   * to its caller; a throw would replace that clean refusal with an exception on the ingest path,
+   * changing what the SENDER observes because this daemon could not file a note. So a persistence
+   * failure is logged at ERROR under `session.refusal.persist.failed`, carrying the reason, the
+   * impact and the guidance verbatim — the forensic record survives even when the operator-facing
+   * one does not. It is not silent; it is one surface short, and the log says which notice was lost.
    */
-  #contentRefusals = new Map<string, Map<string, { reason: string; impact?: string; guidance?: string; count: number; surfacedTo: Map<string, number> }>>();
-
-  /** Record an inbound refusal for the operator. First of its kind per session is the signal. */
   noteContentRefusal(
     agentName: string,
     sessionId: string,
     reason: string,
     detail?: { impact?: string; guidance?: string },
   ): void {
-    const key = this.#k(agentName, sessionId);
-    let perSession = this.#contentRefusals.get(key);
-    if (!perSession) {
-      perSession = new Map();
-      this.#contentRefusals.set(key, perSession);
+    try {
+      if (!this.#db) throw new Error("database is not open");
+      const agentId = this.#requireAgentId(agentName);
+      const now = Date.now();
+      // `count` grows on conflict; impact and guidance are refreshed, because a later refusal of the
+      // same reason may know more than the first (the salt branch has four causes and names them).
+      this.#db
+        .prepare(
+          `INSERT INTO content_refusal_notices
+             (agent_id, session_id, reason, impact, guidance, count, first_at, last_at)
+           VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+           ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
+             count = count + 1, impact = excluded.impact,
+             guidance = excluded.guidance, last_at = excluded.last_at`,
+        )
+        .run(agentId, sessionId, reason, detail?.impact ?? null, detail?.guidance ?? null, now, now);
+    } catch (err: unknown) {
+      this.#logger.error("session.refusal.persist.failed", {
+        agentName, sessionId, reason,
+        impact: detail?.impact,
+        guidance: detail?.guidance,
+        error: extractErrorMessage(err),
+        consequence:
+          "this refusal could not be written to the notice store, so it will NOT appear in cello_receive or cello_inbox. The operator will see the conversation go quiet with no explanation — the exact failure this store exists to remove. The reason, impact and guidance above are the whole notice.",
+      });
     }
-    const existing = perSession.get(reason);
-    if (existing) {
-      existing.count += 1;
-      return;
-    }
-    perSession.set(reason, {
-      reason,
-      impact: detail?.impact,
-      guidance: detail?.guidance,
-      count: 1,
-      // Per CONSUMER, not one global flag. See `takeContentRefusals`.
-      surfacedTo: new Map<string, number>(),
-    });
   }
 
   /**
    * Drain the refusals a GIVEN CONSUMER has not been shown yet, and remember what it was shown.
    *
-   * ─── Why this is keyed by connection, and not by a single flag ─────────────────────────────────
+   * ─── Why this is keyed by consumer, and not by a single flag ──────────────────────────────────
    *
    * It used to set one `surfaced: boolean` on the notice. Two MCP windows attending the same agent
    * is the ordinary case, and under that flag whoever read FIRST consumed the notice — the second
    * window was told nothing, permanently. **That is the same defect `takeReceivedContent` had**, and
    * the comment above the delivery loop in `session-content-handlers.ts` spells out why it was
    * removed: *"reading is non-destructive by construction. Nothing one consumer does mutates state
-   * another consumer reads."* The whole `taken_by_sibling` apparatus exists because this was paid
-   * for once already; re-introducing it on a different surface makes it no less true.
+   * another consumer reads."*
    *
-   * ─── Why the count now has a reader ────────────────────────────────────────────────────────────
+   * ─── Why the count has a reader ───────────────────────────────────────────────────────────────
    *
-   * The old docstring claimed *"count still grows underneath, so a later reader can ask how many
-   * without being told again."* **There was no later reader.** After the first surfacing the count
-   * incremented under a flag the drain skipped unconditionally, so 3 refusals became 903 and nothing
-   * anywhere could say so — while the comment asserted the opposite.
+   * A reason RE-ANNOUNCES to a consumer when its count has grown by an order of magnitude since that
+   * consumer last saw it (1 → 10 → 100 → …), marked `repeat: true`. That keeps the first refusal the
+   * signal and the ninetieth silent, which is the dedup's point, while still making a skew that has
+   * swallowed hundreds of messages visible — at a handful of announcements per session, not one per
+   * message.
    *
-   * So a reason RE-ANNOUNCES to a consumer when its count has grown by an order of magnitude since
-   * that consumer last saw it (1 → 10 → 100 → …), marked `repeat: true`. That keeps the first
-   * refusal the signal and the ninetieth silent, which is the dedup's point, while still making a
-   * skew that has swallowed hundreds of messages visible — at a handful of announcements per
-   * session, not one per message.
+   * ─── What a restart does, deliberately ────────────────────────────────────────────────────────
+   *
+   * The notices survive; the read state is keyed by IPC connection id, which does not. So after a
+   * restart every notice is unseen again and the next reader is told. That is the correct direction:
+   * a fresh window has not been told anything, and re-announcing costs one line where staying silent
+   * costs the whole point of storing it.
    */
   takeContentRefusals(
     agentName: string,
@@ -8499,24 +8579,144 @@ export class SessionNodeManager {
      */
     consumerId: string,
   ): Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
-    const perSession = this.#contentRefusals.get(this.#k(agentName, sessionId));
-    if (!perSession) return [];
-    const out: Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> = [];
-    for (const notice of perSession.values()) {
-      const shownAt = notice.surfacedTo.get(consumerId);
-      const firstTime = shownAt === undefined;
-      // `shownAt` is at least 1 whenever it is set, so this cannot loop on zero.
-      if (!firstTime && notice.count < shownAt * 10) continue;
-      notice.surfacedTo.set(consumerId, notice.count);
+    // `sessionId` is dropped from each entry: the caller passed it in and every entry carries the
+    // same one, so repeating it back would be a field that can never say anything. The agent-wide
+    // door below keeps it, because there it is the only thing that says WHICH conversation.
+    return this.#drainRefusals(agentName, consumerId, sessionId).map(({ sessionId: _drop, ...rest }) => rest);
+  }
+
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1: every unshown refusal for an agent, ACROSS its sessions.
+   *
+   * The inbox's door. `takeContentRefusals` answers for one session because its caller already holds
+   * one; `cello_check_notifications` holds an agent and nothing else, and the case this whole line
+   * exists for is that nobody is attending any of that agent's sessions — so a per-session read
+   * cannot reach it. Same store, same per-consumer rule, same re-announce.
+   */
+  takeAgentContentRefusals(
+    agentName: string,
+    consumerId: string,
+  ): Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
+    return this.#drainRefusals(agentName, consumerId);
+  }
+
+  /**
+   * The one read path behind both doors. `sessionId` narrows it; omitted, it spans the agent.
+   *
+   * A single implementation on purpose: the per-consumer rule and the order-of-magnitude rule are
+   * the two properties this unit must not lose, and two copies of them is two things to keep true.
+   */
+  #drainRefusals(
+    agentName: string,
+    consumerId: string,
+    sessionId?: string,
+  ): Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
+    if (!this.#db) return [];
+    let agentId: string;
+    try {
+      agentId = this.#requireAgentId(agentName);
+    } catch {
+      // A name that resolves to no active agent has no notices by construction. Logged by
+      // #requireAgentId already; re-throwing here would fail a read that has nothing to report.
+      return [];
+    }
+    const rows = (
+      sessionId === undefined
+        ? this.#db
+            .prepare(
+              `SELECT n.session_id, n.reason, n.impact, n.guidance, n.count, r.seen_count
+                 FROM content_refusal_notices n
+                 LEFT JOIN content_refusal_reads r
+                   ON r.agent_id = n.agent_id AND r.session_id = n.session_id
+                  AND r.reason = n.reason AND r.consumer_id = ?
+                WHERE n.agent_id = ? ORDER BY n.first_at ASC`,
+            )
+            .all(consumerId, agentId)
+        : this.#db
+            .prepare(
+              `SELECT n.session_id, n.reason, n.impact, n.guidance, n.count, r.seen_count
+                 FROM content_refusal_notices n
+                 LEFT JOIN content_refusal_reads r
+                   ON r.agent_id = n.agent_id AND r.session_id = n.session_id
+                  AND r.reason = n.reason AND r.consumer_id = ?
+                WHERE n.agent_id = ? AND n.session_id = ? ORDER BY n.first_at ASC`,
+            )
+            .all(consumerId, agentId, sessionId)
+    ) as Array<{
+      session_id: string; reason: string; impact: string | null;
+      guidance: string | null; count: number; seen_count: number | null;
+    }>;
+    const out: Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> = [];
+    const now = Date.now();
+    for (const row of rows) {
+      const firstTime = row.seen_count === null;
+      // `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
+      if (!firstTime && row.count < row.seen_count! * 10) continue;
+      this.#db
+        .prepare(
+          `INSERT INTO content_refusal_reads
+             (agent_id, session_id, reason, consumer_id, seen_count, seen_at)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(agent_id, session_id, reason, consumer_id) DO UPDATE SET
+             seen_count = excluded.seen_count, seen_at = excluded.seen_at`,
+        )
+        .run(agentId, row.session_id, row.reason, consumerId, row.count, now);
+      this.#evictOldestReads(agentId, row.session_id, row.reason);
       out.push({
-        reason: notice.reason,
-        impact: notice.impact,
-        guidance: notice.guidance,
-        count: notice.count,
+        sessionId: row.session_id,
+        reason: row.reason,
+        ...(row.impact !== null ? { impact: row.impact } : {}),
+        ...(row.guidance !== null ? { guidance: row.guidance } : {}),
+        count: row.count,
         ...(firstTime ? {} : { repeat: true }),
       });
     }
     return out;
+  }
+
+  /**
+   * Bound the read state. A consumer id is an IPC connection id, so a daemon that runs for weeks
+   * accumulates one row per notice per connection that ever read it — durable state whose growth is
+   * driven by ordinary reconnects. The OLDEST reader is the one whose window is gone; evicting it
+   * costs at worst one re-announcement to a consumer that no longer exists.
+   */
+  #evictOldestReads(agentId: string, sessionId: string, reason: string): void {
+    if (!this.#db) return;
+    this.#db
+      .prepare(
+        `DELETE FROM content_refusal_reads
+          WHERE agent_id = ? AND session_id = ? AND reason = ? AND consumer_id NOT IN (
+            SELECT consumer_id FROM content_refusal_reads
+             WHERE agent_id = ? AND session_id = ? AND reason = ?
+             ORDER BY seen_at DESC LIMIT ${MAX_REFUSAL_READERS}
+          )`,
+      )
+      .run(agentId, sessionId, reason, agentId, sessionId, reason);
+  }
+
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1 — the per-session byte cap, from the operator's chair.
+   *
+   * This is the harshest refusal on the inbound path and the one that reads least like a fault:
+   * once the cap is crossed, EVERY later message from that sender on that session is refused, for
+   * the life of the session. The counterparty is told nothing either, so from both chairs the other
+   * person simply stopped replying.
+   *
+   * One method rather than two copies because the cap is checked twice — once before the screening
+   * await and once after, against freshly-read totals — and a notice that differs between the two
+   * would describe a different refusal depending on timing.
+   */
+  #noteSizeCapRefusal(agentName: string, sessionId: string, cap: number, tier: number): void {
+    // The tier NAME, not its number. `tier: 1` means nothing to the operator being told why a
+    // conversation stopped, and it is the field that says whether raising the tier is even
+    // available to them. An unrecognised value renders as itself rather than being guessed at.
+    const tierName = Object.entries(TIER).find(([, v]) => v === tier)?.[0] ?? String(tier);
+    this.noteContentRefusal(agentName, sessionId, "session_size_limit_exceeded", {
+      impact:
+        `this session has used its whole byte budget for this sender (${cap} bytes, their tier is ${tierName}), so the message was NOT ingested and NOT shown — and neither will any later message from them on this session. From your chair they simply stop replying, and from theirs the message was sent.`,
+      guidance:
+        "The budget is per session and does not reset, so waiting will not clear it. Start a NEW session with them to keep talking. If they are someone you trust, raising their tier with cello_contact_set_tier raises the budget for the next session — it does not revive this one. Tell them what happened: their side has no way to know.",
+    });
   }
 
   #markContentUnverifiable(agentName: string, sessionId: string, why: "tampered" | "unverifiable"): void {
@@ -8579,6 +8779,16 @@ export class SessionNodeManager {
     // (DOD-INBOUND-GUARD-1) this path is unreachable from the wire — a fail-loud assertion.
     if (!record) {
       this.#logger.warn("session.content.orphaned", { agentName, sessionId, correlationId });
+      // DOD-M15-NO-SILENT-REFUSAL-1. The notice is written even though there is no session row —
+      // the store is keyed (agent_id, session_id) and holds no foreign key to `sessions` precisely
+      // so this case can be recorded. A refusal for a session that does not exist here is the one
+      // the operator has the least other way to learn about.
+      this.noteContentRefusal(agentName, sessionId, "session_orphaned", {
+        impact:
+          "a message arrived for a session this daemon holds no record of, so it was NOT ingested and NOT shown. It was not acknowledged either, so the sender will keep redelivering it and keep being refused.",
+        guidance:
+          "Check cello_sessions. If that session is not listed, this side never opened it or its record is gone, and nothing on this machine can recover it — ask the counterparty to start a NEW session. Do not wait: every redelivery takes the same path.",
+      });
       return { ok: false, reason: "session_orphaned" };
     }
     // DOD-TERMINAL-WAKE-1 (review F1): `abandoned` belongs here too. It is terminal and, unlike
@@ -8601,6 +8811,15 @@ export class SessionNodeManager {
         reason: "session_committed",
         currentStatus: record.status,
         correlationId,
+      });
+      // DOD-M15-NO-SILENT-REFUSAL-1. `currentStatus` on the log line carries the REAL status —
+      // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
+      // one claim, so it names the record as frozen rather than asserting which way it ended.
+      this.noteContentRefusal(agentName, sessionId, "session_committed", {
+        impact:
+          `this session's record is closed (status: ${record.status}), so the message could never land here — it was NOT ingested and NOT shown. Nothing can be added to a closed record, so every later message from them on this session takes the same path.`,
+        guidance:
+          "Nothing is wrong on your side and there is nothing to repair on this session. If the counterparty still has something to say, ask them to start a NEW session — a closed record cannot be reopened. Read what was said before it closed with cello_transcript.",
       });
       return { ok: false, reason: "session_committed" };
     }
@@ -8743,6 +8962,12 @@ export class SessionNodeManager {
       // counterparty_pubkey NOT NULL, so this is unreachable unless a row was hand-crafted empty.
       // Either way, "unknown" is never written to a transcript row — refuse instead.
       this.#logger.warn("session.content.sender_unresolved", { sessionId, agentName, correlationId });
+      this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
+        impact:
+          "a message arrived that this daemon could not attribute to any counterparty, so it was NOT ingested and NOT shown. Writing it would have put an unattributable row in the permanent record, which is worse than not having it.",
+        guidance:
+          "The session row carries no counterparty key, which a session opened normally always has. Treat this session as unusable rather than waiting on it: close it with cello_close_session and start a new one. See session.content.sender_unresolved in the daemon log.",
+      });
       return { ok: false, reason: "sender_unresolved" };
     }
 
@@ -8874,6 +9099,7 @@ export class SessionNodeManager {
           tier: senderTier,
           correlationId,
         });
+        this.#noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
         return { ok: false, reason: "session_size_limit_exceeded" };
       }
     }
@@ -8954,6 +9180,16 @@ export class SessionNodeManager {
           correlationId,
         });
       }
+      // DOD-M15-NO-SILENT-REFUSAL-1 — a TRANSIENT block, and saying which it is, is the whole
+      // value of the notice. Nothing was recorded and nothing was acked, so the sender's daemon
+      // redelivers on its own. An operator who reads the silence as delivery, or who asks the
+      // counterparty to resend, is acting on the opposite of what happened.
+      this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+        impact:
+          "the screener could not reach a verdict on an inbound message, so it was NOT ingested and NOT shown. Nothing was recorded and nothing was acknowledged — the message is still with the sender and their daemon will redeliver it once screening works again. Do not read this silence as delivery.",
+        guidance:
+          "TRANSIENT — do not ask the counterparty to resend, and do not close the session. Get the local screening gateway healthy and the backlog comes through on its own: look for security.gateway.timeout and security.gateway.unavailable in the daemon log. While it stays down, every message from every counterparty takes this path.",
+      });
       return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
     if (terminalBlock) {
@@ -8962,6 +9198,25 @@ export class SessionNodeManager {
         disposition: inboundVerdict.disposition,
         reason: inboundVerdict.reason,
         correlationId,
+      });
+      /**
+       * DOD-M15-NO-SILENT-REFUSAL-1 — **the moment the product catches the attack it exists to
+       * catch, and until now the operator was told nothing about it.**
+       *
+       * This path is not an error path, which is exactly why it had no notice: the block leafs the
+       * original content hash at its canonical position and acknowledges the sender, so nothing
+       * fails and nothing loops. The message is simply never handed to the agent. From the
+       * operator's chair a message they were expecting never arrives and the record shows a leaf
+       * with nothing in it.
+       *
+       * The notice NEVER carries the blocked content, and the guidance says not to go looking for
+       * it: a screener that can be talked into surfacing what it blocked is not a screener.
+       */
+      this.noteContentRefusal(agentName, sessionId, "inbound_screen_blocked", {
+        impact:
+          "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
+        guidance:
+          "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. Do NOT ask for the original text and do not turn screening off to read it — the content was blocked because reading it is the risk. security.gateway.inbound.terminal_block in the daemon log names which detector fired.",
       });
     }
 
@@ -9035,6 +9290,7 @@ export class SessionNodeManager {
           correlationId,
           recheck: true,
         });
+        this.#noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
         return { ok: false, reason: "session_size_limit_exceeded" };
       }
     }
@@ -9116,6 +9372,18 @@ export class SessionNodeManager {
     // tidy up a reporting problem would corrupt the frontier the counterparty already co-signs
     // against. The hole is now crossable by delivery (F1), so it costs a gap, not a stall.
     if (!terminalBlock && this.getUndeliverableSeqs(agentName, sessionId).includes(leafIndex)) {
+      // DOD-M15-NO-SILENT-REFUSAL-1. `#appendVerifiedContent` already noted `content_undeliverable`
+      // at the point the write failed; this is the INGEST's own refusal, and it is a different fact
+      // — the sender is told the ingest failed, so it will redeliver, and every redelivery of the
+      // same hash now dedups against a leaf whose plaintext is not there. Two reasons, because a
+      // reader fixing the disk fault needs to know both that the text is gone and that the sender
+      // is retrying into a hole.
+      this.noteContentRefusal(agentName, sessionId, "transcript_write_failed", {
+        impact:
+          "a message was verified and committed to the hash chain, and then its text failed to write to the local transcript — so it can never be delivered. This is a fault on THIS machine, not a quiet counterparty, and the sender is being told the ingest failed.",
+        guidance:
+          "Check free disk space and the permissions on ~/.cello, and look for transcript.message.record.failed in the daemon log. Waiting cannot recover it. Once the local fault is fixed, ask the counterparty to resend — the text is not retrievable from the record, only its hash is.",
+      });
       return { ok: false, reason: "transcript_write_failed" };
     }
 
@@ -9659,6 +9927,16 @@ export class SessionNodeManager {
       let lost = this.#undeliverableSeqs.get(recvKey);
       if (!lost) { lost = new Set(); this.#undeliverableSeqs.set(recvKey, lost); }
       lost.add(leafIndex);
+      // DOD-M15-NO-SILENT-REFUSAL-1: noted HERE, where the write actually fails, and not on the
+      // cello_receive exit that reports it. `#undeliverableSeqs` is in memory, so the receive exit
+      // stops being able to say this after a restart while the transcript hole stays permanent —
+      // and the exit only runs if somebody is attending, which is the case this whole line is for.
+      this.noteContentRefusal(agentName, sessionId, "content_undeliverable", {
+        impact:
+          `a message arrived and was committed to the hash chain at sequence ${leafIndex}, and then its text could not be written to the local transcript. Delivery reads the transcript, so that message can never be handed to any session — it is a permanent hole in this side's copy of the conversation.`,
+        guidance:
+          "This is a fault on THIS machine, not a quiet counterparty. Check free disk space and the permissions on ~/.cello, and look for transcript.message.record.failed in the daemon log. Waiting cannot recover it — once the local fault is fixed, ask the counterparty to resend.",
+      });
     }
     // Review finding #6: the witness for this hash has done its ordering job once the leaf is
     // appended — drop it so #witnessedSeq stays proportional to held/pending content, not the whole
