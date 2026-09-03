@@ -405,4 +405,54 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.impact, "the tier by NAME — a number tells the operator nothing").toMatch(/UNKNOWN/);
     expect(notice!.guidance, "and the only move that actually works").toMatch(/Start a NEW session/);
   });
+
+  // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────
+
+  it("COUNTERPARTY_GONE names what was observed, and stops steering the operator into a seal", async () => {
+    /**
+     * ⚠️ This one is not about silence — it is about a WRONG explanation, which is worse.
+     *
+     * All that produced this state is `onPeerDisconnect` firing for the peer id recorded as the
+     * counterparty's session peer: one libp2p connection went away. The old wording said they "may
+     * have crashed or gone offline" and then told the operator to call cello_close_session.
+     *
+     * Both halves are wrong in the case that matters. A peer whose messages this side keeps
+     * refusing is never acknowledged, drops the direct path, and arrives here looking exactly like
+     * a crash — so the operator was handed a network story for a verification fault and steered
+     * toward an irreversible seal, which is the truncated close DOD-M15-WITHHOLD-SEAL-1 exists to
+     * stop. Sealing fixes none of the causes.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    insertSessionRow("s-gone");
+    mgr.markSessionLivenessForTest("alice", "s-gone", "gone");
+    mgr.noteContentRefusal("alice", "s-gone", "content_hash_alg_unknown", {
+      impact: "this message could not be verified.",
+      guidance: "Ask which version they are running.",
+    });
+
+    const client = await connect();
+    await client.send("cello_use_agent", { name: "alice" });
+    const res = (await client.send("cello_receive", { session_id: "s-gone", timeout_ms: 150 })) as Record<string, unknown>;
+    expect(res["reason"], "the exit under test").toBe("counterparty_gone");
+
+    const guidance = String(res["guidance"] ?? "");
+    // Matching a bare /crashed/ is the wrong test and it caught me writing it: the new wording says
+    // "it does not establish that they crashed", which is the DENIAL. The property is that no crash
+    // is ASSERTED, so the assertion is against the assertive form.
+    expect(guidance, "it must not assert a crash it never established")
+      .not.toMatch(/may have crashed/i);
+    expect(guidance, "it must say what WAS observed — a dropped connection")
+      .toMatch(/connection to the counterparty's session peer has dropped/);
+    expect(guidance, "and say plainly that this is not evidence of what happened to them")
+      .toMatch(/does not establish that they crashed/i);
+    expect(guidance, "the refusals are the thing to read FIRST, because when present they ARE the reason")
+      .toMatch(/READ IT FIRST/);
+    expect(guidance, "and a seal must be named as irreversible, never as the way to clear this state")
+      .toMatch(/cannot be undone/);
+    expect(
+      res["refusals"],
+      "and the refusal itself rides along — a wrong explanation next to the right one is still wrong",
+    ).toBeDefined();
+  });
 });
