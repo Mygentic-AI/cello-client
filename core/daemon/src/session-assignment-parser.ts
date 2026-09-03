@@ -176,6 +176,24 @@ export function parseSessionAssignment(
   const transportMode: "direct" | "relay" | undefined =
     transportModeRaw === "direct" ? "direct" : transportModeRaw === "relay" ? "relay" : undefined;
 
+  /**
+   * 017-TBS. These two are read DIFFERENTLY from the peer ids above, and the difference is the
+   * whole reason the verifier can reconstruct the right layout.
+   *
+   * A peer id of `""` means "the directory never learned this endpoint", so it becomes `undefined`
+   * and both sides drop to the short layout. These two are not like that: `high_stakes: false` and
+   * `prior_relay_id: ""` are ANSWERS — "not high stakes" and "this is a fresh session, no prior
+   * relay". Mapping either to `undefined` would silently take the verifier to the 10-field layout
+   * while the directory signed 12, and every fresh non-high-stakes session — the common case —
+   * would fail to verify.
+   *
+   * So the test is the TYPE, never truthiness: `typeof === "boolean"` admits `false`, and
+   * `typeof === "string"` admits `""`. `undefined` here means only one thing — the field was
+   * genuinely absent, i.e. a directory that predates this layout.
+   */
+  const highStakes = typeof raw["high_stakes"] === "boolean" ? raw["high_stakes"] : undefined;
+  const priorRelayId = typeof raw["prior_relay_id"] === "string" ? raw["prior_relay_id"] : undefined;
+
   const common = {
     session_id: sessionId,
     participant_a: participantA,
@@ -191,6 +209,8 @@ export function parseSessionAssignment(
     counterparty_session_peer_id: counterpartySessionPeerId,
     counterparty_session_addrs: counterpartySessionAddrs,
     transport_mode: transportMode,
+    high_stakes: highStakes,
+    prior_relay_id: priorRelayId,
   };
 
   if (sigType === "frost") {
