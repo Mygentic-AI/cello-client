@@ -246,6 +246,33 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     ).toEqual([]);
   });
 
+  it("PER CONSUMER in the INBOX too: two windows polling the inbox are BOTH told", async () => {
+    /**
+     * ⚠️ **THIS TEST EXISTS BECAUSE A MUTANT SURVIVED.** Replacing the inbox door's `consumerId`
+     * with one shared bucket left the whole file green: the per-consumer test above exercises
+     * `takeContentRefusals` (the per-session door), and nothing exercised the same property on
+     * `takeAgentContentRefusals` (the agent-wide one). So the door this unit ADDED was the one door
+     * whose per-consumer behaviour nothing checked — and it is the door for the case the unit is
+     * for, where two windows are the ordinary shape.
+     */
+    handle = await startDaemon(await config());
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-two-windows", "content_hash_mismatch", {
+      impact: "x", guidance: "y",
+    });
+    const windowOne = await connect();
+    const windowTwo = await connect();
+
+    expect(((await inbox(windowOne))["refusals"] as Refusal[] | undefined)?.length, "the first window is told").toBe(1);
+    expect(
+      ((await inbox(windowTwo))["refusals"] as Refusal[] | undefined)?.length,
+      "and so is the second — one window reading must not consume the notice for the other",
+    ).toBe(1);
+    expect(
+      (await inbox(windowOne))["refusals"],
+      "while the first window asking again is still deduplicated",
+    ).toBeUndefined();
+  });
+
   it("PER CONSUMER across the two doors: the inbox and the receive path share one read position", async () => {
     /**
      * One consumer, two doors. If they kept separate positions the operator would be told twice for
