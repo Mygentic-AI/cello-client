@@ -67,6 +67,43 @@ describe("DOD-COATTEND-1 F2: a swallowed transcript write is reported as itself"
     expect(r.reason).toBe("transcript_write_failed");
   });
 
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1 review F2 — the two LOST reasons had no notice test.
+   *
+   * W1 and W2 assert the ingest's return and the receive exit's `reason`. Neither touches the
+   * durable notice, so deleting either `noteContentRefusal` call left the whole gate green — the
+   * same hollow shape a mutant already exposed on the inbox door, present here twice.
+   *
+   * Why it matters that these are DURABLE: `#undeliverableSeqs` is in memory, so the receive exit
+   * stops being able to say this after a restart while the hole in the transcript is permanent. And
+   * the exit only runs if somebody is attending, which is the case the whole line exists for.
+   */
+  it("W3: a lost message leaves a DURABLE notice, in both halves — the ingest's and the append's", async () => {
+    await fx.createSession(SID, "alice");
+    breakTranscriptWrites();
+    await fx.ingestReceived("alice", SID, "lost to the disk");
+
+    const notices = fx.snm.takeContentRefusals("alice", SID, "op");
+    const reasons = notices.map((n) => n.reason).sort();
+    expect(
+      reasons,
+      "both producers must file: the APPEND records that the text is gone, and the INGEST records " +
+      "that the sender was told the ingest failed and is now retrying into a leaf whose plaintext " +
+      "is not there. A reader fixing the disk needs both facts.",
+    ).toEqual(["content_undeliverable", "transcript_write_failed"]);
+    for (const n of notices) {
+      expect(n.kind, "these are LOST, not refused — the message was verified and committed").toBe("lost");
+      // Read across BOTH fields: one of these two notices puts the local-fault sentence in its
+      // impact and the other in its guidance, and pinning which would be pinning prose rather than
+      // the property. What must hold is that the operator is not sent to the counterparty.
+      expect(
+        `${n.impact} ${n.guidance}`,
+        "it must name THIS machine — a quiet counterparty is the wrong place to look",
+      ).toMatch(/THIS machine/);
+      expect(`${n.impact} ${n.guidance}`).toMatch(/disk space/);
+    }
+  });
+
   it("W2: cello_receive does not blame the counterparty for a local write failure", async () => {
     await fx.createSession(SID, "alice");
     const conn = await fx.connectAs("alice");

@@ -47,6 +47,7 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { REFUSAL_KINDS, type RefusalKind } from "./refusal-reasons.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
@@ -145,6 +146,17 @@ const MAX_UNREADABLE_ALG_FRAMES = 64;
  * announcement to a window that has already gone.
  */
 const MAX_REFUSAL_READERS = 16;
+
+/**
+ * How many refusal notices one read returns, newest first.
+ *
+ * Review F3. The store is never emptied for an agent — a refusal records something that happened —
+ * and read state is per IPC connection, so a fresh window after a restart is entitled to every
+ * notice ever recorded. Uncapped, the answer to "why did this conversation go quiet?" was at the
+ * bottom of an archive. Capped and newest-first, the recent cause leads and the caller is TOLD the
+ * list was cut (`refusals_incomplete`), rather than the tail vanishing silently.
+ */
+const MAX_REFUSALS_PER_READ = 25;
 
 /**
  * How long the first send waits for an in-flight salt agreement before giving up on it —
@@ -1395,6 +1407,16 @@ export class SessionNodeManager {
   // DOD-M12B-ACK-1: WHY a session is impaired and what became of the content. Separate from the
   // state above because the state is what surfaces print and this is what they must explain.
   #impairmentCause = new Map<string, SessionImpairment>();
+
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1 review F6 — refusal notices that could NOT be persisted.
+   *
+   * Empty in every healthy daemon. It exists so that a database failure costs the restart property
+   * and nothing else: without it, the operator-facing surface for a refusal disappears entirely the
+   * moment the write fails, which is strictly worse than the in-memory Map this store replaced.
+   * `session.refusal.persist.failed` fires at ERROR on every entry that lands here.
+   */
+  #refusalFallback = new Map<string, Map<string, { kind: RefusalKind; impact: string; guidance: string; count: number; surfacedTo: Map<string, number> }>>();
   // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
   // process; the Map is the working copy from then on.
   #heldRestored = new Set<string>();
@@ -2800,8 +2822,9 @@ export class SessionNodeManager {
         agent_id TEXT NOT NULL,
         session_id TEXT NOT NULL,
         reason TEXT NOT NULL,
-        impact TEXT,
-        guidance TEXT,
+        kind TEXT NOT NULL,
+        impact TEXT NOT NULL,
+        guidance TEXT NOT NULL,
         count INTEGER NOT NULL,
         first_at INTEGER NOT NULL,
         last_at INTEGER NOT NULL,
@@ -4349,6 +4372,21 @@ export class SessionNodeManager {
   }
 
   /**
+   * The inverse of `#k`, for the ONE reader that has a key and needs the session id back: the
+   * unpersisted-refusal fallback, which is keyed like every other per-session map but is drained
+   * per AGENT rather than per session.
+   *
+   * Returns null when the key belongs to a different agent. Split on the FIRST separator only —
+   * `agentName` cannot contain 0x1f, so anything after the first one is the session id, and a
+   * greedy split would silently mis-attribute a key rather than reject it.
+   */
+  #unk(key: string, agentName: string): string | null {
+    const sep = key.indexOf("\x1f");
+    if (sep < 0) return null;
+    return key.slice(0, sep) === agentName ? key.slice(sep + 1) : null;
+  }
+
+  /**
    * DOD-AGENT-ID-JOINKEY-1: resolve an agent's NAME to its STABLE agent_id. This is the ONE place a
    * name becomes a key, and it is the boundary between the two worlds:
    *
@@ -5174,6 +5212,7 @@ export class SessionNodeManager {
      * the count means "times this session went impaired", never "times something was polled".
      */
     this.noteContentRefusal(agentName, sessionId, "delivery_impaired", {
+      kind: REFUSAL_KINDS.OUTBOUND,
       impact:
         opts.cause === "delivery_ack"
           ? "an acknowledgement this side owed the counterparty could not be sent on the direct path. Their daemon has no receipt for a message it delivered, so it will keep redelivering — this is about a receipt owed to them, not about anything you sent."
@@ -5235,6 +5274,21 @@ export class SessionNodeManager {
     if (this.#sessionLiveness.get(key) !== "impaired") return;
     this.#sessionLiveness.set(key, "alive");
     this.#impairmentCause.delete(key);
+    /**
+     * DOD-M15-NO-SILENT-REFUSAL-1 — and the durable notice goes with it. Review F1.
+     *
+     * This is the ONE refusal in the store that self-heals, and it is also the one that fires on an
+     * ordinary path: a counterparty who is simply offline fails the direct send, gets parked with
+     * the relay, and is delivered when they come back. Left behind, the notice outlives its own
+     * truth — every new window and every restart would re-announce *"the session looks healthy and
+     * is not"* about a message delivered weeks ago, and its own guidance says *"this can clear on
+     * its own when the connection recovers"*, which is exactly what just happened.
+     *
+     * The same rule `getSessionImpairment` already holds one lane over: *"a caller must not narrate
+     * a failure that is not current."* Nothing else in this store self-heals, so nothing else is
+     * cleared here — a refused message stays refused.
+     */
+    this.#clearContentRefusal(agentName, sessionId, "delivery_impaired");
     this.#logger.info("session.liveness.changed", {
       sessionId,
       counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
@@ -8508,7 +8562,15 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     reason: string,
-    detail?: { impact?: string; guidance?: string },
+    /**
+     * ALL THREE REQUIRED, and that is the enforcement rather than the convention.
+     *
+     * The DoD clause is "every reason calls this with an impact and a guidance", and an optional
+     * field makes that a thing a reviewer checks by reading thirteen call sites. `kind` is required
+     * for the same reason one level up: the header over a list of refusals is composed from it, and
+     * a notice that could omit it would silently inherit whichever header happened to be first.
+     */
+    detail: { kind: RefusalKind; impact: string; guidance: string },
   ): void {
     try {
       if (!this.#db) throw new Error("database is not open");
@@ -8519,23 +8581,67 @@ export class SessionNodeManager {
       this.#db
         .prepare(
           `INSERT INTO content_refusal_notices
-             (agent_id, session_id, reason, impact, guidance, count, first_at, last_at)
-           VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+             (agent_id, session_id, reason, kind, impact, guidance, count, first_at, last_at)
+           VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
            ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
-             count = count + 1, impact = excluded.impact,
+             count = count + 1, kind = excluded.kind, impact = excluded.impact,
              guidance = excluded.guidance, last_at = excluded.last_at`,
         )
-        .run(agentId, sessionId, reason, detail?.impact ?? null, detail?.guidance ?? null, now, now);
+        .run(agentId, sessionId, reason, detail.kind, detail.impact, detail.guidance, now, now);
     } catch (err: unknown) {
       this.#logger.error("session.refusal.persist.failed", {
         agentName, sessionId, reason,
-        impact: detail?.impact,
-        guidance: detail?.guidance,
+        impact: detail.impact,
+        guidance: detail.guidance,
         error: extractErrorMessage(err),
         consequence:
-          "this refusal could not be written to the notice store, so it will NOT appear in cello_receive or cello_inbox. The operator will see the conversation go quiet with no explanation — the exact failure this store exists to remove. The reason, impact and guidance above are the whole notice.",
+          "this refusal could not be written to the notice store, so it will not survive a restart. It is held in memory for this process instead, so the operator is still told while this daemon runs. The reason, impact and guidance above are the whole notice.",
       });
+      /**
+       * DOD-M15-NO-SILENT-REFUSAL-1 review F6 — the fallback, and why it is not the silent kind.
+       *
+       * The store this replaced was an in-memory Map, which could not fail: recording a refusal was
+       * a `set`, so the receive door always had the notice for the life of the process. Making the
+       * store durable made it, in the failure case, LESS available than before — a DB write failure
+       * left no operator-facing surface at all, only a log line.
+       *
+       * So a failed write falls back to exactly what the Map did. This is not a fallback that hides
+       * a fault: the ERROR above fires every time, naming the notice and the cause, and what is lost
+       * is only the restart property — which is the property the database was unavailable for
+       * anyway. A silent fallback is one that makes a broken system look healthy; this one is
+       * announced, and it preserves the surface rather than substituting for it.
+       */
+      const key = this.#k(agentName, sessionId);
+      let perSession = this.#refusalFallback.get(key);
+      if (!perSession) { perSession = new Map(); this.#refusalFallback.set(key, perSession); }
+      const existing = perSession.get(reason);
+      if (existing) { existing.count += 1; existing.kind = detail.kind; existing.impact = detail.impact; existing.guidance = detail.guidance; return; }
+      perSession.set(reason, { ...detail, count: 1, surfacedTo: new Map<string, number>() });
     }
+  }
+
+  /**
+   * Drop a notice that has become FALSE — the only retraction in this store.
+   *
+   * Review F1. `delivery_impaired` is the one refusal here that self-heals: the direct path recovers,
+   * `#clearSessionImpairment` puts the session back to `alive`, and a notice saying "the session
+   * looks healthy and is not" then outlives its own truth for the life of the agent. Everything else
+   * records something that happened and stays true; a refused message stays refused.
+   *
+   * Deliberately NOT a general-purpose dismissal — it takes a reason, not a session, so it cannot be
+   * used to tidy away notices nobody acted on.
+   */
+  #clearContentRefusal(agentName: string, sessionId: string, reason: string): void {
+    this.#refusalFallback.get(this.#k(agentName, sessionId))?.delete(reason);
+    if (!this.#db) return;
+    let agentId: string;
+    try { agentId = this.#requireAgentId(agentName); } catch { return; }
+    this.#db
+      .prepare("DELETE FROM content_refusal_notices WHERE agent_id = ? AND session_id = ? AND reason = ?")
+      .run(agentId, sessionId, reason);
+    this.#db
+      .prepare("DELETE FROM content_refusal_reads WHERE agent_id = ? AND session_id = ? AND reason = ?")
+      .run(agentId, sessionId, reason);
   }
 
   /**
@@ -8578,11 +8684,14 @@ export class SessionNodeManager {
      * forget it is.
      */
     consumerId: string,
-  ): Array<{ reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
+  ): Array<{ reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }> {
     // `sessionId` is dropped from each entry: the caller passed it in and every entry carries the
     // same one, so repeating it back would be a field that can never say anything. The agent-wide
     // door below keeps it, because there it is the only thing that says WHICH conversation.
-    return this.#drainRefusals(agentName, consumerId, sessionId).map(({ sessionId: _drop, ...rest }) => rest);
+    //
+    // `truncated` is dropped too, and only here: one session's notices cannot reach the cap (the
+    // reasons are a bounded set), so a flag that can never be true is a field readers learn to skip.
+    return this.#drainRefusals(agentName, consumerId, sessionId).notices.map(({ sessionId: _drop, ...rest }) => rest);
   }
 
   /**
@@ -8596,7 +8705,7 @@ export class SessionNodeManager {
   takeAgentContentRefusals(
     agentName: string,
     consumerId: string,
-  ): Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
+  ): { notices: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }>; truncated: boolean } {
     return this.#drainRefusals(agentName, consumerId);
   }
 
@@ -8610,76 +8719,111 @@ export class SessionNodeManager {
     agentName: string,
     consumerId: string,
     sessionId?: string,
-  ): Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> {
-    if (!this.#db) return [];
-    let agentId: string;
-    try {
-      agentId = this.#requireAgentId(agentName);
-    } catch {
-      // A name that resolves to no active agent has no notices by construction. Logged by
-      // #requireAgentId already; re-throwing here would fail a read that has nothing to report.
-      return [];
-    }
-    const rows = (
-      sessionId === undefined
-        ? this.#db
-            .prepare(
-              `SELECT n.session_id, n.reason, n.impact, n.guidance, n.count, r.seen_count
-                 FROM content_refusal_notices n
-                 LEFT JOIN content_refusal_reads r
-                   ON r.agent_id = n.agent_id AND r.session_id = n.session_id
-                  AND r.reason = n.reason AND r.consumer_id = ?
-                WHERE n.agent_id = ? ORDER BY n.first_at ASC`,
-            )
-            .all(consumerId, agentId)
-        : this.#db
-            .prepare(
-              `SELECT n.session_id, n.reason, n.impact, n.guidance, n.count, r.seen_count
-                 FROM content_refusal_notices n
-                 LEFT JOIN content_refusal_reads r
-                   ON r.agent_id = n.agent_id AND r.session_id = n.session_id
-                  AND r.reason = n.reason AND r.consumer_id = ?
-                WHERE n.agent_id = ? AND n.session_id = ? ORDER BY n.first_at ASC`,
-            )
-            .all(consumerId, agentId, sessionId)
-    ) as Array<{
-      session_id: string; reason: string; impact: string | null;
-      guidance: string | null; count: number; seen_count: number | null;
-    }>;
-    const out: Array<{ sessionId: string; reason: string; impact?: string; guidance?: string; count: number; repeat?: boolean }> = [];
+  ): { notices: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }>; truncated: boolean } {
+    const out: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }> = [];
+    let truncated = false;
     const now = Date.now();
-    for (const row of rows) {
-      const firstTime = row.seen_count === null;
-      // `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
-      if (!firstTime && row.count < row.seen_count! * 10) continue;
-      this.#db
-        .prepare(
-          `INSERT INTO content_refusal_reads
-             (agent_id, session_id, reason, consumer_id, seen_count, seen_at)
-           VALUES (?, ?, ?, ?, ?, ?)
-           ON CONFLICT(agent_id, session_id, reason, consumer_id) DO UPDATE SET
-             seen_count = excluded.seen_count, seen_at = excluded.seen_at`,
-        )
-        .run(agentId, row.session_id, row.reason, consumerId, row.count, now);
-      this.#evictOldestReads(agentId, row.session_id, row.reason);
-      out.push({
-        sessionId: row.session_id,
-        reason: row.reason,
-        ...(row.impact !== null ? { impact: row.impact } : {}),
-        ...(row.guidance !== null ? { guidance: row.guidance } : {}),
-        count: row.count,
-        ...(firstTime ? {} : { repeat: true }),
-      });
+    let agentId: string | null = null;
+    if (this.#db) {
+      try {
+        agentId = this.#requireAgentId(agentName);
+      } catch {
+        // A name that resolves to no active agent has no notices by construction. Already logged by
+        // #requireAgentId; re-throwing would fail a read that has nothing to report.
+        agentId = null;
+      }
     }
-    return out;
+    if (agentId !== null && this.#db) {
+      /**
+       * ⚠️ NEWEST FIRST, AND CAPPED — review F3, and the ordering is the load-bearing half.
+       *
+       * Read state is keyed on IPC connection id, so every new window and every restart is a
+       * consumer that has been told nothing, and the drain returns every notice ever recorded for
+       * that agent. Oldest-first and uncapped, the first thing an operator saw after a restart was a
+       * chronological archive whose top entry was the oldest refusal on record and whose newest —
+       * the one explaining the conversation that just went quiet — was at the bottom. That is a
+       * section people learn to scroll past, which is the failure this whole line exists to end.
+       *
+       * `LIMIT` is `+ 1` so the cap can be DETECTED rather than assumed; the extra row is dropped
+       * and `truncated` is reported to the caller, which says so on the list itself.
+       */
+      const rows = (
+        sessionId === undefined
+          ? this.#db
+              .prepare(
+                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count
+                   FROM content_refusal_notices n
+                   LEFT JOIN content_refusal_reads r
+                     ON r.agent_id = n.agent_id AND r.session_id = n.session_id
+                    AND r.reason = n.reason AND r.consumer_id = ?
+                  WHERE n.agent_id = ? ORDER BY n.last_at DESC LIMIT ?`,
+              )
+              .all(consumerId, agentId, MAX_REFUSALS_PER_READ + 1)
+          : this.#db
+              .prepare(
+                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count
+                   FROM content_refusal_notices n
+                   LEFT JOIN content_refusal_reads r
+                     ON r.agent_id = n.agent_id AND r.session_id = n.session_id
+                    AND r.reason = n.reason AND r.consumer_id = ?
+                  WHERE n.agent_id = ? AND n.session_id = ? ORDER BY n.last_at DESC LIMIT ?`,
+              )
+              .all(consumerId, agentId, sessionId, MAX_REFUSALS_PER_READ + 1)
+      ) as Array<{
+        session_id: string; reason: string; kind: string; impact: string;
+        guidance: string; count: number; seen_count: number | null;
+      }>;
+      if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
+      for (const row of rows) {
+        const firstTime = row.seen_count === null;
+        // `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
+        if (!firstTime && row.count < row.seen_count! * 10) continue;
+        this.#db
+          .prepare(
+            `INSERT INTO content_refusal_reads
+               (agent_id, session_id, reason, consumer_id, seen_count, seen_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(agent_id, session_id, reason, consumer_id) DO UPDATE SET
+               seen_count = excluded.seen_count, seen_at = excluded.seen_at`,
+          )
+          .run(agentId, row.session_id, row.reason, consumerId, row.count, now);
+        this.#evictOldestReads(agentId, row.session_id, row.reason);
+        out.push({
+          sessionId: row.session_id,
+          reason: row.reason,
+          kind: row.kind as RefusalKind,
+          impact: row.impact,
+          guidance: row.guidance,
+          count: row.count,
+          ...(firstTime ? {} : { repeat: true }),
+        });
+      }
+    }
+    /**
+     * The unpersisted notices (review F6), under the SAME per-consumer and order-of-magnitude rules.
+     *
+     * Reading them differently would make a database failure change what the operator is told rather
+     * than only how long it survives — and that difference is the thing hardest to notice.
+     */
+    for (const [key, perSession] of this.#refusalFallback) {
+      const sid = this.#unk(key, agentName);
+      if (sid === null) continue;
+      if (sessionId !== undefined && sid !== sessionId) continue;
+      for (const [reason, notice] of perSession) {
+        const shownAt = notice.surfacedTo.get(consumerId);
+        const firstTime = shownAt === undefined;
+        if (!firstTime && notice.count < shownAt * 10) continue;
+        notice.surfacedTo.set(consumerId, notice.count);
+        out.push({
+          sessionId: sid, reason, kind: notice.kind, impact: notice.impact,
+          guidance: notice.guidance, count: notice.count,
+          ...(firstTime ? {} : { repeat: true }),
+        });
+      }
+    }
+    return { notices: out, truncated };
   }
 
-  /**
-   * Bound the read state. A consumer id is an IPC connection id, so a daemon that runs for weeks
-   * accumulates one row per notice per connection that ever read it — durable state whose growth is
-   * driven by ordinary reconnects. The OLDEST reader is the one whose window is gone; evicting it
-   * costs at worst one re-announcement to a consumer that no longer exists.
-   */
   #evictOldestReads(agentId: string, sessionId: string, reason: string): void {
     if (!this.#db) return;
     this.#db
@@ -8712,6 +8856,7 @@ export class SessionNodeManager {
     // available to them. An unrecognised value renders as itself rather than being guessed at.
     const tierName = Object.entries(TIER).find(([, v]) => v === tier)?.[0] ?? String(tier);
     this.noteContentRefusal(agentName, sessionId, "session_size_limit_exceeded", {
+      kind: REFUSAL_KINDS.REFUSED,
       impact:
         `this session has used its whole byte budget for this sender (${cap} bytes, their tier is ${tierName}), so the message was NOT ingested and NOT shown — and neither will any later message from them on this session. From your chair they simply stop replying, and from theirs the message was sent.`,
       guidance:
@@ -8784,6 +8929,7 @@ export class SessionNodeManager {
       // so this case can be recorded. A refusal for a session that does not exist here is the one
       // the operator has the least other way to learn about.
       this.noteContentRefusal(agentName, sessionId, "session_orphaned", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact:
           "a message arrived for a session this daemon holds no record of, so it was NOT ingested and NOT shown. It was not acknowledged either, so the sender will keep redelivering it and keep being refused.",
         guidance:
@@ -8816,6 +8962,7 @@ export class SessionNodeManager {
       // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
       // one claim, so it names the record as frozen rather than asserting which way it ended.
       this.noteContentRefusal(agentName, sessionId, "session_committed", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact:
           `this session's record is closed (status: ${record.status}), so the message could never land here — it was NOT ingested and NOT shown. Nothing can be added to a closed record, so every later message from them on this session takes the same path.`,
         guidance:
@@ -8867,6 +9014,7 @@ export class SessionNodeManager {
       // This reason is a version skew, so it affects every message from that counterparty — without
       // this the conversation goes permanently quiet and they conclude the peer stopped replying.
       this.noteContentRefusal(agentName, sessionId, "content_hash_alg_unknown", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact: "this message could not be verified, so it was NOT ingested and NOT shown. The algorithm name is a claim by the sender and is not covered by any signature, so it does not establish what they actually did. This session will not auto-co-sign at close.",
         guidance: "Almost always their CELLO build is newer than this one: ask which version they are running, and upgrade. If they are on the SAME version as you, that explanation does not hold and the frame was malformed or crafted — do not close the session by auto-acknowledgement.",
       });
@@ -8923,6 +9071,7 @@ export class SessionNodeManager {
       // The guidance is passed by reference to the log's own text rather than duplicated: a second
       // copy is a second thing to keep true, and the log's version is the one that gets maintained.
       this.noteContentRefusal(agentName, sessionId, "content_hash_salt_unavailable", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact:
           "this message could not be verified — the sender says it is salted and this side holds no salt for the session — so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
         guidance:
@@ -8947,6 +9096,7 @@ export class SessionNodeManager {
       // DOD-M15-REFUSED-INBOUND-SILENT-1. Deliberately does NOT include the content or the hashes:
       // it failed verification, and showing it is the injection path this cross-check closes.
       this.noteContentRefusal(agentName, sessionId, "content_hash_mismatch", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact:
           "a message arrived whose bytes do not match the hash the sender committed to, so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
         guidance:
@@ -8963,6 +9113,7 @@ export class SessionNodeManager {
       // Either way, "unknown" is never written to a transcript row — refuse instead.
       this.#logger.warn("session.content.sender_unresolved", { sessionId, agentName, correlationId });
       this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
+        kind: REFUSAL_KINDS.REFUSED,
         impact:
           "a message arrived that this daemon could not attribute to any counterparty, so it was NOT ingested and NOT shown. Writing it would have put an unattributable row in the permanent record, which is worse than not having it.",
         guidance:
@@ -9185,6 +9336,7 @@ export class SessionNodeManager {
       // redelivers on its own. An operator who reads the silence as delivery, or who asks the
       // counterparty to resend, is acting on the opposite of what happened.
       this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+        kind: REFUSAL_KINDS.DEFERRED,
         impact:
           "the screener could not reach a verdict on an inbound message, so it was NOT ingested and NOT shown. Nothing was recorded and nothing was acknowledged — the message is still with the sender and their daemon will redeliver it once screening works again. Do not read this silence as delivery.",
         guidance:
@@ -9225,6 +9377,7 @@ export class SessionNodeManager {
        * half that names the actual command.
        */
       this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+        kind: REFUSAL_KINDS.BLOCKED,
         impact:
           "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
         guidance:
@@ -9392,6 +9545,7 @@ export class SessionNodeManager {
       // reader fixing the disk fault needs to know both that the text is gone and that the sender
       // is retrying into a hole.
       this.noteContentRefusal(agentName, sessionId, "transcript_write_failed", {
+        kind: REFUSAL_KINDS.LOST,
         impact:
           "a message was verified and committed to the hash chain, and then its text failed to write to the local transcript — so it can never be delivered. This is a fault on THIS machine, not a quiet counterparty, and the sender is being told the ingest failed.",
         guidance:
@@ -9945,6 +10099,7 @@ export class SessionNodeManager {
       // stops being able to say this after a restart while the transcript hole stays permanent —
       // and the exit only runs if somebody is attending, which is the case this whole line is for.
       this.noteContentRefusal(agentName, sessionId, "content_undeliverable", {
+        kind: REFUSAL_KINDS.LOST,
         impact:
           `a message arrived and was committed to the hash chain at sequence ${leafIndex}, and then its text could not be written to the local transcript. Delivery reads the transcript, so that message can never be handed to any session — it is a permanent hole in this side's copy of the conversation.`,
         guidance:

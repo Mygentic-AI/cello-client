@@ -25,7 +25,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { ContentTakeLedger } from "./co-attendance.js";
 import { isAutoReplyMarked } from "./away-detection.js";
-import { CONTENT_REFUSAL_GUIDANCE } from "./refusal-reasons.js";
+import { REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 
 /**
  * DOD-M12B-AWAY-MARK-1 — what a reader needs to know the moment it sees a marked message.
@@ -71,11 +71,25 @@ function refusalsField(
    */
   consumerId: string,
 ): {
-  refusals?: Array<{ reason: string; impact?: string; guidance?: string; count: number }>;
+  refusals?: Array<{ reason: string; kind: RefusalKind; impact: string; guidance: string; count: number }>;
   refusal_guidance?: string;
 } {
   const refusals = mgr.takeContentRefusals(agentName, sessionId, consumerId);
-  return refusals.length > 0 ? { refusals, refusal_guidance: CONTENT_REFUSAL_GUIDANCE } : {};
+  if (refusals.length === 0) return {};
+  /**
+   * COMPOSED FROM THE KINDS PRESENT — review F4, and the same rule the inbox door follows.
+   *
+   * One fixed sentence said "received and REFUSED — not verified, neither ingested nor shown". True
+   * of the three hash-verification reasons it was written for; false of a screener block, which was
+   * verified, IS in the chain, and WAS acknowledged; false of a transcript write failure; and
+   * pointing at the wrong party entirely for `delivery_impaired`, which is this side's own send.
+   */
+  const kindsPresent = new Set(refusals.map((r) => r.kind));
+  const refusal_guidance = (Object.keys(REFUSAL_KIND_GUIDANCE) as RefusalKind[])
+    .filter((k) => kindsPresent.has(k))
+    .map((k) => REFUSAL_KIND_GUIDANCE[k])
+    .join("\n\n");
+  return { refusals, refusal_guidance };
 }
 
 const AUTO_REPLY_GUIDANCE =
@@ -1407,7 +1421,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
               attendance,
               // Same wording rule as the standalone `counterparty_gone` exit below: name what was
               // observed (a dropped connection), never a crash, and do not lead with the seal.
-              guidance: `${missedText} Note the direct connection to the counterparty's session peer has ALSO dropped (liveness: gone) — that is all that was observed, not that they crashed. No more content will arrive on the direct path and a reply cannot reach them there. Read the history first. If \`refusals\` is present above, that is the actual reason this went quiet and it is not a network fault — fix that before deciding anything. Sealing with cello_close_session ENDS the conversation permanently, so do it only once you are satisfied nothing is outstanding; if they never co-close, a unilateral seal becomes available after the directory's delivery-grace window.`,
+              guidance: `${missedText} Note the direct connection to the counterparty's session peer has ALSO dropped (liveness: gone) — that is all that was observed, not that they crashed. No more content will arrive on the direct path and a reply cannot reach them there. Read the history first, and check \`refusals\` here and in cello_inbox before blaming the network — this side refusing their messages produces exactly this state. Sealing with cello_close_session ENDS the conversation permanently, so do it only once you are satisfied nothing is outstanding; if they never co-close, a unilateral seal becomes available after the directory's delivery-grace window.`,
             };
           }
           return {
@@ -1454,7 +1468,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
              * The refusals spread above are the thing to read first — when they are present they
              * ARE the reason, and none of them is fixed by sealing.
              */
-            guidance: "The direct connection to the counterparty's session peer has dropped (liveness: gone). That is what was observed — it does not establish that they crashed or went offline. No more content will arrive on the direct path and a reply cannot reach them there. IF `refusals` IS PRESENT IN THIS ANSWER, READ IT FIRST: this side has been refusing their messages, a refused sender is never acknowledged and eventually drops the connection, and that is a fault to fix rather than a counterparty who left. Otherwise the ordinary causes are a restart, a network change, or them closing their agent — confirm out of band before concluding anything. Sealing with cello_close_session ENDS the conversation permanently and cannot be undone; do it when you have decided the conversation is over, not to clear this state. If you DO decide it is over and the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window — that is the exit, not the first move.",
+            guidance: "The direct connection to the counterparty's session peer has dropped (liveness: gone). That is what was observed — it does not establish that they crashed or went offline. No more content will arrive on the direct path and a reply cannot reach them there. CHECK `refusals` — HERE IF PRESENT, AND IN cello_inbox EITHER WAY — BEFORE CONCLUDING ANYTHING: if this side has been refusing their messages, a refused sender is never acknowledged and eventually drops the connection, and that is a fault to fix rather than a counterparty who left. A refusal is shown once per window, so another window may already have taken it and this answer can be empty while the cause is real. Otherwise the ordinary causes are a restart, a network change, or them closing their agent — confirm out of band before concluding anything. Sealing with cello_close_session ENDS the conversation permanently and cannot be undone; do it when you have decided the conversation is over, not to clear this state. If you DO decide it is over and the counterparty never co-closes, a unilateral seal becomes available after the directory's delivery-grace window — that is the exit, not the first move.",
           };
         }
         // DOD-M12B-ACK-1: the same rule one step short of 'gone'. A session whose writes are
@@ -1525,8 +1539,10 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           ...quietRefusals,
           // ONE source for the refusal advice (see `refusalsField`). It used to be written out
           // again here, which is how the batch exit came to carry the notice without it.
-          guidance: quietRefusals.refusals
-            ? `No content arrived within timeout_ms. ${CONTENT_REFUSAL_GUIDANCE}`
+          // ONE source for the refusal advice (see `refusalsField`), and it is now the header for
+          // the kinds actually present rather than one sentence that is false for most of them.
+          guidance: quietRefusals.refusal_guidance !== undefined
+            ? `No content arrived within timeout_ms. ${quietRefusals.refusal_guidance}`
             : "No content arrived within timeout_ms. Call cello_receive again to keep waiting — do not resend your last message. Or read cello_transcript for the full session history.",
         };
       }

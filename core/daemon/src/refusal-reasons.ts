@@ -12,23 +12,78 @@
  */
 
 /**
- * DOD-M15-NO-SILENT-REFUSAL-1 — the sentence that makes a CONTENT refusal actionable.
+ * DOD-M15-NO-SILENT-REFUSAL-1 — WHAT KIND of thing happened to the message.
  *
- * Distinct from `REFUSAL_GUIDANCE` below, which is per-reason guidance for a refused SESSION
- * REQUEST. This one is the header carried alongside a list of refused MESSAGES, on every door that
- * shows them: the `cello_receive` exits and the `cello_inbox` section. It lives here because it now
- * has two consumers in two modules, and a duplicated copy is a second thing to keep true.
+ * ⚠️ **THE HEADER OVER A LIST OF REFUSALS CANNOT BE ONE SENTENCE, and review F4 measured why.**
+ * The `refused` sentence below was written for three hash-verification reasons and every clause
+ * of it was true of them: received, not verified, not ingested, not shown, sender never told. Carry
+ * that sentence verbatim onto the nine other reasons and each clause breaks somewhere —
  *
- * ⚠️ IT TRAVELS WITH THE NOTICES, NEVER SEPARATELY. When only one exit carried this sentence, a
- * catch-up read drained the refusals into a payload with no advice at all, and the operator's next
- * blocking read then said "call again and keep waiting" — the notice was already gone. Both doors
- * return the two together for that reason.
+ *  - a SCREENER block was verified and IS in the hash chain, and the sender WAS acknowledged;
+ *  - a transcript write failure was verified and committed, and the sender IS told;
+ *  - `delivery_impaired` is not an inbound message at all — it is this side's own send failing, so
+ *    the sentence names the wrong direction of travel and sends the operator to the counterparty
+ *    about a fault on their own machine.
+ *
+ * So the notice carries its kind and the door composes the header from the kinds actually present.
+ * The `refused` sentence is unchanged, for the set it was written for.
  */
-export const CONTENT_REFUSAL_GUIDANCE =
-  "Message(s) from this counterparty WERE received and REFUSED — they were not verified, so they " +
-  "were neither ingested nor shown. See `refusals` for the reason and what to do. Waiting longer " +
-  "will not help until it is resolved, and the counterparty has no way to know: from their side the " +
-  "message was sent. If you need it, ask them to resend after the cause is fixed.";
+export const REFUSAL_KINDS = {
+  /** Received, could not be accepted. Not ingested, not shown, and the sender was not told. */
+  REFUSED: "refused",
+  /** Received, verified, RECORDED in the chain and ACKNOWLEDGED — deliberately not shown. */
+  BLOCKED: "blocked",
+  /** Received; nothing recorded, nothing acknowledged. The sender's daemon redelivers on its own. */
+  DEFERRED: "deferred",
+  /** Received and committed to the chain, then LOST to a local storage failure. Unrecoverable. */
+  LOST: "lost",
+  /** Nothing was received. This side's own send or acknowledgement failed to reach them. */
+  OUTBOUND: "outbound",
+} as const;
+
+export type RefusalKind = (typeof REFUSAL_KINDS)[keyof typeof REFUSAL_KINDS];
+
+/**
+ * The header for each kind — total over `RefusalKind`, so a new kind cannot be added without one.
+ *
+ * ⚠️ IT TRAVELS WITH THE NOTICES, NEVER SEPARATELY. When only one exit carried a header, a catch-up
+ * read drained the refusals into a payload with no advice at all, and the operator's next blocking
+ * read then said "call again and keep waiting" — the notice was already gone. Every door returns the
+ * two together for that reason.
+ */
+export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
+  /**
+   * VERBATIM, and deliberately so: this is the sentence the previous unit wrote for exactly this
+   * set, it is the one that makes the notice actionable, and a note in the tree records that a
+   * catch-up door destroyed it once already.
+   */
+  [REFUSAL_KINDS.REFUSED]:
+    "Message(s) from this counterparty WERE received and REFUSED — they were not verified, so they " +
+    "were neither ingested nor shown. See `refusals` for the reason and what to do. Waiting longer " +
+    "will not help until it is resolved, and the counterparty has no way to know: from their side the " +
+    "message was sent. If you need it, ask them to resend after the cause is fixed.",
+  [REFUSAL_KINDS.BLOCKED]:
+    "Message(s) aimed at this agent were BLOCKED by its screener. They were verified and they ARE " +
+    "recorded in the conversation's hash chain, and the sender WAS acknowledged — so they do not " +
+    "know, they will not resend, and nothing is waiting on you. They were never shown to the agent, " +
+    "and that is the protection working. Do not go looking for the blocked text and do not turn " +
+    "screening off to read it.",
+  [REFUSAL_KINDS.DEFERRED]:
+    "Message(s) from this counterparty could not be processed and were NOT accepted — nothing was " +
+    "recorded and nothing was acknowledged, so the message is still with them and their daemon will " +
+    "redeliver it once the cause clears. DO NOT read the silence as delivery, and do not ask them to " +
+    "resend: a resend takes a second position in the record. Fix the cause named below.",
+  [REFUSAL_KINDS.LOST]:
+    "Message(s) reached this agent, were verified, and were committed to the hash chain — and then " +
+    "failed to write to the local transcript, so they can never be delivered. THIS IS A FAULT ON " +
+    "THIS MACHINE, not a quiet counterparty. Waiting cannot recover them; the text is gone and only " +
+    "its hash remains. Fix the local fault below, then ask them to resend.",
+  [REFUSAL_KINDS.OUTBOUND]:
+    "NOTHING WAS REFUSED BY THIS AGENT — this is the other direction. Something THIS side tried to " +
+    "send did not get through. Do not go to the counterparty about it and do not resend blindly: " +
+    "cello_status for the session says what became of the message, and some of these clear on their " +
+    "own when the connection recovers.",
+};
 
 export const REFUSAL_REASONS = {
   /** The session_offer and the session_assignment named different dialers for one session. */

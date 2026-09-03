@@ -10,7 +10,7 @@
  * it exists to backstop would be no reconciler at all.
  */
 import type { IpcHandler } from "./ipc-server.js";
-import { CONTENT_REFUSAL_GUIDANCE, REFUSAL_GUIDANCE } from "./refusal-reasons.js";
+import { REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -160,26 +160,52 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
    * whose count has grown by an order of magnitude re-announces with `repeat: true`.
    */
   function refusalSection(agentName: string, connectionId: string): Record<string, unknown> {
-    const refusals = sessionNodeManager.takeAgentContentRefusals(agentName, connectionId);
-    if (refusals.length === 0) return {};
+    const { notices, truncated } = sessionNodeManager.takeAgentContentRefusals(agentName, connectionId);
+    if (notices.length === 0) return {};
+    /**
+     * ⚠️ THE HEADER IS COMPOSED FROM THE KINDS PRESENT, never one fixed sentence — review F4.
+     *
+     * A single header said "received and REFUSED — not verified, neither ingested nor shown … the
+     * counterparty has no way to know". True of a hash-verification failure. False of a screener
+     * block (verified, recorded, and the sender WAS acked), false of a transcript write failure
+     * (verified and committed, and the sender IS told), and pointing at the wrong party entirely for
+     * `delivery_impaired`, which is this side's own send failing and involves no inbound message at
+     * all. An operator reads the header first, so a header that is false for the row underneath it
+     * is worse than none.
+     *
+     * Ordered by `REFUSAL_KIND_GUIDANCE`'s own key order rather than by encounter, so the same set
+     * of kinds always reads the same way.
+     */
+    const kindsPresent = new Set(notices.map((n) => n.kind));
+    const header = (Object.keys(REFUSAL_KIND_GUIDANCE) as RefusalKind[])
+      .filter((k) => kindsPresent.has(k))
+      .map((k) => REFUSAL_KIND_GUIDANCE[k])
+      .join("\n\n");
     return {
-      refusals: refusals.map((r) => ({
+      refusals: notices.map((r) => ({
         session_id: r.sessionId,
         reason: r.reason,
-        ...(r.impact !== undefined ? { impact: r.impact } : {}),
-        ...(r.guidance !== undefined ? { guidance: r.guidance } : {}),
+        // The kind is a field the caller can BRANCH on, ahead of the prose it may not read — the
+        // difference between "they should resend" and "do not ask them to" lives here.
+        kind: r.kind,
+        impact: r.impact,
+        guidance: r.guidance,
         times: r.count,
         ...(r.repeat === true ? { repeat: true } : {}),
       })),
-      // The header travels WITH the list, never separately — see CONTENT_REFUSAL_GUIDANCE. The
-      // second sentence is this door's own: an agent reading an inbox has not asked about any
-      // particular conversation and will not connect a refusal to one unless told to.
+      // Say the list was cut ON THE LIST, not only in a log nobody opens — same rule as
+      // `relay_witness_alerts_incomplete`. Without it the tail vanishes and the answer looks whole.
+      ...(truncated ? { refusals_incomplete: true } : {}),
       refusals_guidance:
-        CONTENT_REFUSAL_GUIDANCE +
-        " These are grouped by session_id, and `times` is how many messages that reason has refused " +
-        "on that session — a large number means the cause is still live, not that it happened once. " +
-        "TELL THE OPERATOR. A refusal that reaches an agent and stops there is the same silence it " +
-        "was written to end.",
+        header +
+        "\n\nThese are grouped by session_id, and `times` is how many messages that reason has " +
+        "refused on that session — a large number means the cause is still live, not that it " +
+        "happened once. `repeat: true` means you have been told about this one before and it has " +
+        "grown by an order of magnitude since. TELL THE OPERATOR. A refusal that reaches an agent " +
+        "and stops there is the same silence it was written to end." +
+        (truncated
+          ? " refusals_incomplete: true means this list hit its cap and there are older ones not shown."
+          : ""),
     };
   }
 

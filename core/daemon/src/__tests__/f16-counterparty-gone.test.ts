@@ -262,6 +262,56 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
    * the durable enqueue dropped, in which case cello_send has already said "send it again". Two
    * surfaces giving an agent opposite instructions about the same message is worse than either.
    */
+  /**
+   * DOD-M15-NO-SILENT-REFUSAL-1 review F1 + F2 — the notice, and the RETRACTION that makes it safe.
+   *
+   * ⚠️ **`delivery_impaired` is the only refusal in the store that self-heals, and it fires on an
+   * ORDINARY path.** A counterparty who is simply offline fails the direct send, the message is
+   * parked with the relay, and it is delivered when they come back — the leave-a-message feature
+   * working as designed. Making that notice durable without a retraction means every new window and
+   * every restart re-announces *"the session looks healthy and is not"* about a message delivered
+   * weeks ago, for the life of the agent. A warning that fires on a designed benign state and then
+   * outlives its own truth buries the one occurrence that means something.
+   *
+   * So both halves are asserted here, and the second is the one that was missing.
+   */
+  it("DOD-M15-NO-SILENT-REFUSAL-1: an impairment leaves a durable notice — and TAKES IT BACK when it clears", async () => {
+    const { A, clientA, clientB } = await establishSession();
+    try {
+      const snm = A.getSessionNodeManager();
+      snm.injectSendFault(1);
+      await clientA.send("cello_send", { session_id: SID_HEX, content: "does not land", signal: "over" });
+      expect(snm.getSessionLiveness("alice", SID_HEX)).toBe("impaired");
+
+      const [notice] = snm.takeContentRefusals("alice", SID_HEX, "op");
+      expect(notice, "an impairment the operator is not attending must still be recorded").toBeDefined();
+      expect(notice!.reason).toBe("delivery_impaired");
+      expect(
+        notice!.kind,
+        "OUTBOUND, not refused — nothing was received from the counterparty, so a header saying " +
+        "'received and refused' would send the operator to the wrong side of the conversation",
+      ).toBe("outbound");
+      expect(notice!.guidance, "and it must not steer them toward a seal on this evidence").toMatch(/Do not seal/i);
+
+      // ── The retraction. A send that SUCCEEDS clears the impairment; the notice must go with it. ──
+      const ok = (await clientA.send("cello_send", {
+        session_id: SID_HEX, content: "this one lands", signal: "over",
+      })) as Record<string, unknown>;
+      expect(ok.ok, `the recovery send must succeed: ${JSON.stringify(ok)}`).toBe(true);
+      expect(snm.getSessionLiveness("alice", SID_HEX), "the session is healthy again").toBe("alive");
+
+      // A DIFFERENT consumer, deliberately: asking as "op" again would be answered by the
+      // per-consumer dedup and pass against a build that never deleted anything.
+      expect(
+        snm.takeContentRefusals("alice", SID_HEX, "a-fresh-window"),
+        "the notice must be GONE, not merely already-shown — a fresh window after a restart is a " +
+        "fresh consumer, and it must not be told a healed session is broken",
+      ).toEqual([]);
+    } finally {
+      clientA.close(); clientB.close();
+    }
+  });
+
   it("DOD-M12B-ACK-1: a session whose sends are failing returns delivery_impaired, and says only what is known", async () => {
     const { A, clientA, clientB } = await establishSession();
     try {

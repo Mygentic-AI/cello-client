@@ -32,6 +32,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
+import { REFUSAL_KINDS } from "../refusal-reasons.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -79,7 +80,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
 
   it("the FIRST refusal of a kind is delivered, with its reason and guidance", async () => {
     const mgr = (await start()).getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s1", "content_hash_alg_unknown", {
+    mgr.noteContentRefusal("alice", "s1", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED,
       impact: "this message could not be verified, so it was NOT ingested and NOT shown.",
       guidance: "Almost always their CELLO build is newer than this one.",
     });
@@ -108,7 +109,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      */
     const mgr = (await start()).getSessionNodeManager();
     for (let i = 0; i < 90; i++) {
-      mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
+      mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
     }
 
     const first = mgr.takeContentRefusals("alice", "s2", "op");
@@ -134,7 +135,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      * one: the operator reads, the skewed peer keeps sending, the operator reads again. That is
      * exactly when a broken dedup would flood them, and exactly what the test above skipped.
      */
-    mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
+    mgr.noteContentRefusal("alice", "s2", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
     expect(
       mgr.takeContentRefusals("alice", "s2", "op"),
       "a refusal arriving AFTER the operator was already told must stay silent — this is the case " +
@@ -153,7 +154,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      * state another consumer reads."* Re-creating it on the refusal surface makes it no less true.
      */
     const mgr = (await start()).getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s-two", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
+    mgr.noteContentRefusal("alice", "s-two", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     expect(mgr.takeContentRefusals("alice", "s-two", "window-1").length, "the first window is told").toBe(1);
     expect(
@@ -178,7 +179,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      */
     const mgr = (await start()).getSessionNodeManager();
     const note = (): void =>
-      mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { impact: "x" });
+      mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     note();
     expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
@@ -242,10 +243,10 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     // Deduplication is per REASON, not per session. Suppressing a second, different problem because
     // a first one was already reported would be the dedup causing the very silence it mitigates.
     const mgr = (await start()).getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s3", "content_hash_alg_unknown", { impact: "a" });
+    mgr.noteContentRefusal("alice", "s3", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "a", guidance: "y" });
     expect(mgr.takeContentRefusals("alice", "s3", "op").length).toBe(1);
 
-    mgr.noteContentRefusal("alice", "s3", "content_hash_mismatch", { impact: "b" });
+    mgr.noteContentRefusal("alice", "s3", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED, impact: "b", guidance: "y" });
     const next = mgr.takeContentRefusals("alice", "s3", "op");
     expect(next.length, "a new KIND of refusal is a new signal").toBe(1);
     expect(next[0]!.reason).toBe("content_hash_mismatch");
@@ -253,7 +254,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
 
   it("refusals are per SESSION — one conversation's problem is not another's", async () => {
     const mgr = (await start()).getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s-a", "content_hash_mismatch", { impact: "a" });
+    mgr.noteContentRefusal("alice", "s-a", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED, impact: "a", guidance: "y" });
     expect(mgr.takeContentRefusals("alice", "s-b", "op"), "a quiet session reports nothing").toEqual([]);
     expect(mgr.takeContentRefusals("alice", "s-a", "op").length).toBe(1);
   });
@@ -347,7 +348,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
      * happens to carry content cannot slip past a check written for today's shape.
      */
     const mgr = (await start()).getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s4", "content_hash_mismatch", {
+    mgr.noteContentRefusal("alice", "s4", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED,
       impact: "a message arrived whose bytes do not match the hash the sender committed to.",
       guidance: "Ask the counterparty to resend.",
     });
@@ -461,7 +462,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
 
   it("a quiet receive carries the refusal — the conversation did not go silent for no reason", async () => {
     handle = await startDaemon(await setup("alice"));
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-1", "content_hash_alg_unknown", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-1", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED,
       impact: "this message could not be verified, so it was NOT ingested and NOT shown.",
       guidance: "Almost always their CELLO build is newer than this one.",
     });
@@ -484,7 +485,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
      * instruction that contradicts it — and the instruction is the part people follow.
      */
     handle = await startDaemon(await setup("alice"));
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-2", "content_hash_alg_unknown", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-2", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED,
       impact: "not ingested", guidance: "their build is newer",
     });
 

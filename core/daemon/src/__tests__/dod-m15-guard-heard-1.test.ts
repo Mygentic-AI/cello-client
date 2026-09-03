@@ -97,7 +97,7 @@ async function inboxFor(
     // DOD-M15-NO-SILENT-REFUSAL-1: the inbox reads refusal notices too. Empty here — this fake
     // exists to isolate a DIFFERENT section, and a fake that omits the method makes the whole
     // handler throw rather than the section it is testing fail.
-    takeAgentContentRefusals: () => [],
+    takeAgentContentRefusals: () => ({ notices: [], truncated: false }),
     // DOD-M15-CORROBORATE-1: the inbox reads relay witness alerts too. Empty here — this file is
     // about refusal guidance, and a stub that omitted the method made every case throw.
     getWitnessAlerts: () => [],

@@ -33,6 +33,7 @@ import { createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import type { GatewayMode, ScreenContext, ScreenVerdict, SecurityGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
+import { REFUSAL_KINDS } from "../refusal-reasons.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -113,7 +114,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
   }
 
   /** DOD-AGENT-ID-JOINKEY-1: `sessions` is keyed by the STABLE `agent_id`, never `agent_name`. */
-  function insertSessionRow(session: string, status = "active"): void {
+  function insertSessionRow(session: string, status = "active", counterparty = "bb".repeat(32)): void {
     const db = handle!.getSessionNodeManager().getDb()!;
     const row = db
       .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
@@ -123,7 +124,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     db.prepare(
       `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
        VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
-    ).run(session, row.agent_id, "bb".repeat(32), status, now, now);
+    ).run(session, row.agent_id, counterparty, status, now, now);
   }
 
   /** The inbox for `alice`, as an operator's window would see it. */
@@ -135,7 +136,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     return res.agents[0]!;
   }
 
-  type Refusal = { session_id: string; reason: string; impact?: string; guidance?: string; times: number; repeat?: boolean };
+  type Refusal = { session_id: string; reason: string; kind: string; impact: string; guidance: string; times: number; repeat?: boolean };
 
   // ─── Part 1: the notice is durable, and the inbox is the door ────────────────────────────────
 
@@ -146,7 +147,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * does. The explanation for the silence is destroyed by the act of investigating it.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-restart", "content_hash_mismatch", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-restart", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED,
       impact: "a message arrived whose bytes do not match the hash the sender committed to.",
       guidance: "Ask the counterparty to resend.",
     });
@@ -168,7 +169,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * happened somewhere.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-inbox", "inbound_screen_blocked", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-inbox", "inbound_screen_blocked", { kind: REFUSAL_KINDS.BLOCKED,
       impact: "the screener blocked an inbound message.",
       guidance: "This is the protection doing its job.",
     });
@@ -179,11 +180,23 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(refusals![0]!.session_id).toBe("s-inbox");
     expect(refusals![0]!.reason).toBe("inbound_screen_blocked");
     expect(refusals![0]!.times).toBe(1);
+    /**
+     * The header must be the one for THIS notice's kind. Review F4: one fixed sentence said
+     * "received and REFUSED — not verified, neither ingested nor shown", which is false of a
+     * screener block in three separate clauses — it WAS verified, it IS in the chain, and the
+     * sender WAS acknowledged. An operator reads the header first, so a header that contradicts the
+     * row beneath it is worse than none.
+     */
     expect(
       String(agent["refusals_guidance"] ?? ""),
       "the advice travels WITH the notices — a catch-up door that drained them without it is the " +
         "regression this pairing exists to prevent",
-    ).toMatch(/Waiting longer will not help/);
+    ).toMatch(/BLOCKED by its screener/);
+    expect(
+      String(agent["refusals_guidance"] ?? ""),
+      "and it must NOT carry the refused-kind sentence, which is false of a block in three clauses",
+    ).not.toMatch(/were not verified/);
+    expect(refusals![0]!.kind, "the kind is a field the caller can branch on, ahead of the prose").toBe("blocked");
     expect(
       String(agent["refusals_guidance"] ?? ""),
       "and the inbox's own half: an agent that reads this and says nothing is the same silence",
@@ -196,7 +209,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * explanation of something that did not arrive. Its own category, like `rename_notices`.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-unread", "session_orphaned", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-unread", "session_orphaned", { kind: REFUSAL_KINDS.REFUSED,
       impact: "not ingested", guidance: "start a new session",
     });
 
@@ -212,7 +225,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * is a table; an inbox section over an in-memory map is the old defect with a new surface.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-both", "session_size_limit_exceeded", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-both", "session_size_limit_exceeded", { kind: REFUSAL_KINDS.REFUSED,
       impact: "this session has used its whole byte budget for this sender.",
       guidance: "Start a NEW session with them to keep talking.",
     });
@@ -233,7 +246,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      */
     handle = await startDaemon(await config());
     const mgr = handle.getSessionNodeManager();
-    mgr.noteContentRefusal("alice", "s-two", "content_hash_alg_unknown", { impact: "x", guidance: "y" });
+    mgr.noteContentRefusal("alice", "s-two", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     expect(mgr.takeContentRefusals("alice", "s-two", "window-1").length, "the first window is told").toBe(1);
     expect(
@@ -256,7 +269,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * for, where two windows are the ordinary shape.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-two-windows", "content_hash_mismatch", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-two-windows", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED,
       impact: "x", guidance: "y",
     });
     const windowOne = await connect();
@@ -279,7 +292,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      * one refusal, which is the flood the dedup exists to prevent, and they would learn to skip it.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().noteContentRefusal("alice", "s-doors", "content_hash_mismatch", {
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-doors", "content_hash_mismatch", { kind: REFUSAL_KINDS.REFUSED,
       impact: "x", guidance: "y",
     });
     const client = await connect();
@@ -297,7 +310,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
      */
     handle = await startDaemon(await config());
     const mgr = handle.getSessionNodeManager();
-    const note = () => mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { impact: "x" });
+    const note = () => mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     note();
     expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
@@ -436,6 +449,34 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.guidance, "and the only move that actually works").toMatch(/Start a NEW session/);
   });
 
+  it("AN UNATTRIBUTABLE MESSAGE produces a notice — review F2, the producer with no other trace", async () => {
+    /**
+     * The session row carries no counterparty key, which a session opened normally always has. The
+     * ingest refuses rather than writing a row it can never attribute — an unattributable transcript
+     * row is worse than a missing one — and until now it refused without telling anyone.
+     *
+     * Driven through the real `ingestReceivedContent`, not by seeding the store: this call site had
+     * no test at all, so deleting it left the gate green.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    // The breaking shape, not a neighbouring one: an EMPTY counterparty_pubkey is what makes
+    // `senderPubkey` falsy at the guard. A row with a real key takes a different exit entirely.
+    insertSessionRow("s-anon", "active", "");
+
+    const content = new TextEncoder().encode("from nobody in particular");
+    const res = await mgr.ingestReceivedContent("alice", "s-anon", content, msgLeafHash(content));
+    expect((res as { reason: string }).reason).toBe("sender_unresolved");
+
+    const [notice] = mgr.takeContentRefusals("alice", "s-anon", "op");
+    expect(notice, "a message this daemon cannot attribute is still a message the operator lost").toBeDefined();
+    expect(notice!.reason).toBe("sender_unresolved");
+    expect(notice!.kind).toBe("refused");
+    expect(notice!.impact, "and it says WHY nothing was written, not merely that nothing was")
+      .toMatch(/unattributable/);
+    expect(notice!.guidance, "with a move that works — this session cannot be repaired").toMatch(/start a new one/i);
+  });
+
   // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────
 
   it("COUNTERPARTY_GONE names what was observed, and stops steering the operator into a seal", async () => {
@@ -456,7 +497,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     const mgr = handle.getSessionNodeManager();
     insertSessionRow("s-gone");
     mgr.markSessionLivenessForTest("alice", "s-gone", "gone");
-    mgr.noteContentRefusal("alice", "s-gone", "content_hash_alg_unknown", {
+    mgr.noteContentRefusal("alice", "s-gone", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED,
       impact: "this message could not be verified.",
       guidance: "Ask which version they are running.",
     });
@@ -476,8 +517,17 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
       .toMatch(/connection to the counterparty's session peer has dropped/);
     expect(guidance, "and say plainly that this is not evidence of what happened to them")
       .toMatch(/does not establish that they crashed/i);
-    expect(guidance, "the refusals are the thing to read FIRST, because when present they ARE the reason")
-      .toMatch(/READ IT FIRST/);
+    /**
+     * Review F5: the guidance used to branch on `refusals` being PRESENT in this answer — and both
+     * doors share one read position per consumer, so a window that polled cello_inbox first had
+     * already drained the notice. The receive exit then took the "otherwise it is the network"
+     * branch and handed the operator the exact wrong explanation, through the door this unit added.
+     * So the pointer is unconditional and it names both doors.
+     */
+    expect(guidance, "it must point at the refusals unconditionally, not only when they survived to this answer")
+      .toMatch(/CHECK `refusals`/);
+    expect(guidance, "and name the other door, since a sibling window may already have taken the notice")
+      .toMatch(/cello_inbox/);
     expect(guidance, "and a seal must be named as irreversible, never as the way to clear this state")
       .toMatch(/cannot be undone/);
     /**
@@ -490,7 +540,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(guidance, "the exit out of a dead session is still named — stranding them is the other failure")
       .toMatch(/delivery-grace window/);
     expect(
-      guidance.indexOf("READ IT FIRST") < guidance.indexOf("delivery-grace window"),
+      guidance.indexOf("CHECK `refusals`") < guidance.indexOf("delivery-grace window"),
       "and the refusals come FIRST — the seal is the last resort, not the opening instruction",
     ).toBe(true);
     expect(
