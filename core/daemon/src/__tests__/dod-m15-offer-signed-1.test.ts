@@ -427,9 +427,33 @@ describe("DOD-M15-OFFER-SIGNED-1: a counterparty's pinned identity cannot change
     const refused = h.events.find((e) => e.event === "session.inbound.assignment.invalid");
     expect(refused, "a content mismatch must still refuse the session").toBeDefined();
 
+    // F6: name the reason. Without it, any EARLIER refusal that also emits assignment.invalid —
+    // `inbound_assignment_unparseable`, say — would satisfy every assertion in this test.
+    expect(String(refused?.context["reason"])).toBe("inbound_assignment_signature_invalid");
+
     // But NOT as an identity change, and the operator must not be told to clear their pin.
     const accused = h.events.find((e) => e.event === "session.inbound.counterparty_primary_changed");
     expect(accused, "the signer matched the pin — nothing about their identity changed").toBeUndefined();
-    expect(String(refused?.context["guidance"] ?? "")).not.toMatch(/cello_contact_remove/);
+    const guidance = String(refused?.context["guidance"] ?? "");
+    expect(guidance).not.toMatch(/cello_contact_remove/);
+
+    /**
+     * F3: and it must not assert a cause it did not check. Under a pin the signature is verified
+     * against a key recorded EARLIER, so a failure is equally well explained by the two sides
+     * running different builds and disagreeing about what bytes get signed — which is exactly what
+     * a half-finished version rollout looks like. Telling that operator the frame "was altered"
+     * sends them to the network for something no retry can fix, and every directory node runs the
+     * same build, so "try another node" is dead advice.
+     */
+    // Naming tampering as ONE of two causes is right; asserting it as the established one is not.
+    // So this pins both halves rather than banning the word: the version cause must be named, and
+    // the reader must be given the check that distinguishes them.
+    expect(guidance, "the second cause must be named — a half-rolled upgrade produces this exact failure")
+      .toMatch(/different CELLO versions/);
+    expect(guidance, "name the check that separates the two causes; a retry cannot close a version gap")
+      .toMatch(/cello -v/);
+    // And specifically not the unpinned sentence, which asserts a conclusion this branch never reached.
+    expect(guidance, "the unpinned wording asserts transit tampering as fact — wrong under a pin")
+      .not.toMatch(/does not match its own contents/);
   });
 });

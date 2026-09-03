@@ -1344,7 +1344,16 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           : "the session assignment did not verify, so this agent refused it rather than opening its receiver to a peer named by a document it could not check; nothing was accepted and no receiver was handed over",
         guidance: isIdentityChange
           ? "this is not transient. Either that counterparty genuinely re-registered — confirm OUT OF BAND (on a channel that is not this one), then run cello_contact_remove for them, which clears the pinned identity so the next session re-pins — or a directory is producing assignments for them that they did not authorise. From here the two look identical and only they can tell you which."
-          : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
+          // Two DIFFERENT causes, and which one it is depends on what the signature was checked
+          // AGAINST. Unpinned, the check is internal consistency, so a failure really does mean the
+          // frame was altered. Pinned, the check is against a key recorded earlier — and the frame
+          // can be perfectly intact while the two sides simply disagree about what bytes get
+          // signed, which is what a half-rolled version upgrade looks like. Telling a pinned
+          // operator "it was altered in transit" points them at the network for something no retry
+          // can fix, and every node runs the same build so "try another node" is dead advice.
+          : pinnedSigner !== null
+            ? "the signature did not verify under the key this agent recorded for that counterparty. Two things produce this and they need different actions: the frame was altered in transit, OR the two of you are running different CELLO versions and disagree about what gets signed. Check `cello -v` on both sides and upgrade the older one before retrying — a retry alone will not fix a version gap, and every directory node runs the same build."
+            : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
         },
       );
       refuseInboundSession({
@@ -1362,10 +1371,15 @@ export function createInboundSessions(deps: InboundSessionDeps) {
             "them to run cello_contact_remove for you so the next session re-pins. If you did not " +
             "re-register, something is issuing assignments in your name and neither of you should " +
             "proceed until you know what."
-          : "They refused this session: the assignment you dialled on did not verify against its own " +
-            "contents, so it was altered somewhere between the directory signing it and them reading " +
-            "it. Start a new session to get a fresh one. If it repeats, the directory node you are " +
-            "reaching is not producing valid assignments — nothing is wrong with your agent.",
+          : pinnedSigner !== null
+            ? "They refused this session: the assignment you dialled on did not verify under the key " +
+              "they recorded for you earlier. Either it was altered in transit, or the two of you are " +
+              "on different CELLO versions and disagree about what gets signed. Compare `cello -v` " +
+              "with them and upgrade the older side — retrying will not close a version gap."
+            : "They refused this session: the assignment you dialled on did not verify against its own " +
+              "contents, so it was altered somewhere between the directory signing it and them reading " +
+              "it. Start a new session to get a fresh one. If it repeats, the directory node you are " +
+              "reaching is not producing valid assignments — nothing is wrong with your agent.",
         correlationId,
       });
       return;
