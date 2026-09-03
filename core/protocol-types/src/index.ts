@@ -41,7 +41,19 @@ export type {
 } from "./types.js";
 
 export { MAX_CONTENT_BYTES } from "./limits.js";
-export { encodeStructure1, STRUCTURE1_VERSION } from "./structure1.js";
+export {
+  encodeStructure1,
+  decodeStructure1,
+  STRUCTURE1_VERSION,
+  STRUCTURE1_VERSION_V2,
+  LAST_SEEN_HASH_BYTES,
+  STRUCTURE1_DECODE_REASONS,
+} from "./structure1.js";
+export type {
+  Structure1Fields,
+  Structure1DecodeResult,
+  Structure1DecodeReason,
+} from "./structure1.js";
 
 export type { ScanResultSentinel, Structure2, BuildStructure2Result } from "./structure2.js";
 export {
