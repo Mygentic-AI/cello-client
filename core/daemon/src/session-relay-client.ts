@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeSealPayload, encodeStructure1 } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1 } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
@@ -736,15 +736,13 @@ export class AgentRelayClient {
 
   /** True if this Structure-1 leaf was authored by US (sender_pubkey === our K_local). */
   #isOwnLeaf(structure1Cbor: Uint8Array): boolean {
-    try {
-      const arr = decode(structure1Cbor) as unknown[];
-      // Structure 1 = [1, content_hash, sender_pubkey, session_id, last_seen_seq, ts].
-      const senderPubkey = toU8(arr[2]);
-      return Buffer.from(senderPubkey).equals(Buffer.from(this.#senderPubkey));
-    } catch {
-      // Undecodable → treat as NOT ours (conservative: don't suppress a real counterparty leaf).
-      return false;
-    }
+    // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq, ts], plus
+    // last_seen_hash at index 6 on a v2 claim (020-ACKHASH). sender_pubkey is index 2 in both.
+    const s1 = decodeStructure1(structure1Cbor);
+    // Unreadable, or a layout this build cannot name → treat as NOT ours (conservative: don't
+    // suppress a real counterparty leaf).
+    if (!s1.ok) return false;
+    return Buffer.from(s1.fields.senderPubkey).equals(Buffer.from(this.#senderPubkey));
   }
 
   /**
@@ -756,18 +754,19 @@ export class AgentRelayClient {
    */
   #captureReceipt(frame: Record<string, unknown>, structure1Cbor: Uint8Array | undefined, seq: number): boolean {
     if (seq < 0 || !structure1Cbor) return false;
-    let contentHash: Uint8Array;
-    let sessionId: Uint8Array;
-    try {
-      // Structure 1 = [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts].
-      const arr = decode(structure1Cbor) as unknown[];
-      contentHash = toU8(arr[1]);
-      sessionId = toU8(arr[3]);
-    } catch {
+    // Structure 1 = [version, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq,
+    // ts], plus last_seen_hash(32) at index 6 on a v2 claim (020-ACKHASH). content_hash is index 1
+    // and session_id index 3 in both.
+    const s1 = decodeStructure1(structure1Cbor);
+    if (!s1.ok) {
       // Our OWN just-signed bytes — near-impossible to fail; surface it rather than drop silently.
-      this.#logger.warn("relay.receipt.undecodable_leaf", { seq });
+      // The reason is carried because "we cannot read what we just wrote" and "we wrote a layout we
+      // cannot name" are different faults with the same symptom.
+      this.#logger.warn("relay.receipt.undecodable_leaf", { seq, structure1Reason: s1.reason });
       return false;
     }
+    const contentHash = s1.fields.contentHash;
+    const sessionId = s1.fields.sessionId;
     const ev = evaluateRelayAck({
       contentHash,
       sessionIdHex: Buffer.from(sessionId).toString("hex"),

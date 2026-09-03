@@ -23,7 +23,7 @@
  */
 
 import { verify } from "@cello-protocol/crypto";
-import { decode } from "cbor-x";
+import { decodeStructure1 } from "@cello-protocol/protocol-types";
 
 export interface SealFrontierLeaf {
   structure1_cbor: Uint8Array;
@@ -55,21 +55,20 @@ export function reDeriveFrontiers(leaves: SealFrontierLeaf[], expectedSessionId:
     if (!verify(leaf.sender_pubkey, leaf.structure1_cbor, leaf.sender_signature)) {
       return { ok: false, reason: "leaf_signature_invalid" };
     }
-    let arr: unknown;
-    try {
-      arr = decode(leaf.structure1_cbor);
-    } catch {
-      return { ok: false, reason: "leaf_malformed" };
-    }
-    // Structure 1 = [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, ts]
-    if (!Array.isArray(arr) || arr.length < 5) return { ok: false, reason: "leaf_malformed" };
-    const sid = arr[3];
-    if (!(sid instanceof Uint8Array) || !bytesEqual(sid, expectedSessionId)) {
+    // Structure 1 = [version, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq,
+    // ts], plus last_seen_hash(32) at index 6 on a v2 claim (020-ACKHASH). session_id is index 3 and
+    // last_seen_seq index 4 in both — the field was appended, so neither read moved.
+    //
+    // The length check was `< 5`, which admitted an array of any length ≥ 5 and lifted a frontier
+    // number out of it. An unnamed layout is now `leaf_malformed`, the same outcome as undecodable
+    // bytes: a shape this build cannot name must not contribute to a frontier it cannot interpret.
+    const s1 = decodeStructure1(leaf.structure1_cbor);
+    if (!s1.ok) return { ok: false, reason: "leaf_malformed" };
+    if (!bytesEqual(s1.fields.sessionId, expectedSessionId)) {
       return { ok: false, reason: "leaf_session_mismatch" };
     }
-    const raw = arr[4];
-    const lss = typeof raw === "bigint" ? Number(raw) : raw;
-    if (typeof lss !== "number" || !Number.isFinite(lss)) continue; // leaf carries no signed last_seen
+    const lss = s1.fields.lastSeenSeq;
+    if (!Number.isFinite(lss)) continue; // leaf carries no usable signed last_seen
     const senderHex = Buffer.from(leaf.sender_pubkey).toString("hex").toLowerCase();
     const cur = frontiers.get(senderHex) ?? 0;
     if (lss > cur) frontiers.set(senderHex, lss);

@@ -275,11 +275,23 @@ describe("020-ACKHASH: decodeStructure1 refuses an unnamed shape by name", () =>
     }
   });
 
+  it("a session_id of a NON-WIRE width still decodes — the 16-byte rule lives at the wire edge", () => {
+    // The relay and the directory each refuse a session_id that is not 16 bytes, and they keep
+    // doing so. This decoder is also handed leaves the daemon just produced, and no client-side
+    // reader ever checked this width — enforcing it here would newly reject sessions that work.
+    // Consumers compare the value against an expected session id, so width is never load-bearing
+    // on its own.
+    const res = decodeStructure1(rawArray(1, CONTENT_HASH, SENDER_PUBKEY, new Uint8Array(32).fill(0x11), 3, TIMESTAMP));
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    expect(res.fields.sessionId.length).toBe(32);
+  });
+
   it("a malformed field at an unchanged index ⇒ field malformed", () => {
     const bad: Array<[string, unknown[]]> = [
       ["content_hash wrong width", [1, new Uint8Array(31), SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP]],
       ["sender_pubkey wrong width", [1, CONTENT_HASH, new Uint8Array(31), SESSION_ID, 3, TIMESTAMP]],
-      ["session_id wrong width", [1, CONTENT_HASH, SENDER_PUBKEY, new Uint8Array(15), 3, TIMESTAMP]],
+      ["session_id not bytes", [1, CONTENT_HASH, SENDER_PUBKEY, "not-bytes", 3, TIMESTAMP]],
       ["last_seen_seq not a number", [1, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, "3", TIMESTAMP]],
       ["timestamp not numeric", [1, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, "now"]],
     ];

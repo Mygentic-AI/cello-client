@@ -169,7 +169,22 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
 
   const contentHash = bytesAt(arr, 1, 32);
   const senderPubkey = bytesAt(arr, 2, 32);
-  const sessionId = bytesAt(arr, 3, 16);
+  /**
+   * SESSION ID: THE WIDTH IS NOT CHECKED HERE, AND THAT IS DELIBERATE.
+   *
+   * The wire contract is 16 bytes, and it is enforced where peer-supplied bytes arrive — the relay's
+   * and the directory's own decoders each refuse anything else, and both keep doing so. This decoder
+   * also reads leaves THIS daemon just produced, and it must not newly refuse a leaf it accepted
+   * before: no client-side reader ever checked this width, and requiring it here would turn a
+   * layout reader into a second, quieter place that can reject a session.
+   *
+   * Every consumer of this field compares it to an EXPECTED session id (`seal-frontier-verify`), so
+   * a wrong width fails that comparison exactly as a wrong value does. Nothing downstream trusts it
+   * on width alone.
+   */
+  const sessionId = arr[3] instanceof Uint8Array
+    ? arr[3]
+    : Buffer.isBuffer(arr[3]) ? new Uint8Array(arr[3] as Buffer) : null;
   const lastSeenSeq = arr[4];
   const timestamp = arr[5];
   if (contentHash === null || senderPubkey === null || sessionId === null) {

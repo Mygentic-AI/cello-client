@@ -54,7 +54,7 @@ import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeStructure1 } from "@cello-protocol/protocol-types";
 import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
@@ -761,22 +761,17 @@ function relayPeerIdOf(circuitAddr: string): string | null {
  * `null` when any leaf is unreadable — the caller must then answer "I cannot judge", never "we
  * disagree". A decode failure is this daemon's limitation, not evidence against anyone.
  *
- * Canonical Structure 1 is
- * `[protocol_version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]`, and the
- * content hash is used AS the leaf hash (RFC 6962 §2.1 "hash" leaves are taken as-is), which is the
- * domain the certified root lives in.
+ * Canonical Structure 1 is `[version, content_hash, sender_pubkey, session_id, last_seen_seq,
+ * timestamp]`, plus `last_seen_hash` at index 6 on a v2 claim (020-ACKHASH). The content hash is at
+ * index 1 in both and is used AS the leaf hash (RFC 6962 §2.1 "hash" leaves are taken as-is), which
+ * is the domain the certified root lives in.
  */
 function carryContentHashInputs(carry: readonly SealCarryLeaf[]): LeafInput[] | null {
   const inputs: LeafInput[] = [];
   for (const leaf of carry) {
-    let contentHash: unknown;
-    try {
-      contentHash = (decode(leaf.structure1Cbor) as unknown[])[1];
-    } catch {
-      return null;
-    }
-    if (!(contentHash instanceof Uint8Array) || contentHash.length !== 32) return null;
-    inputs.push({ kind: "hash", data: contentHash });
+    const s1 = decodeStructure1(leaf.structure1Cbor);
+    if (!s1.ok) return null;
+    inputs.push({ kind: "hash", data: s1.fields.contentHash });
   }
   return inputs;
 }
@@ -3090,15 +3085,17 @@ export class SessionNodeManager {
     if (carry.length === 0) return null;
     const reach = new Map<string, number>();
     for (const leaf of carry) {
-      let signedLastSeen = 0;
-      try {
-        // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
-        const raw = (decode(leaf.structure1Cbor) as unknown[])[4];
-        const n = typeof raw === "bigint" ? Number(raw) : raw;
-        if (typeof n === "number" && Number.isFinite(n)) signedLastSeen = n;
-      } catch {
-        return null; // unreadable: publish no boundary rather than a half-derived one
-      }
+      // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp],
+      // plus last_seen_hash at 6 on a v2 claim. `last_seen_seq` is index 4 in both — 020-ACKHASH
+      // APPENDS, so this read did not move. The hash is not consulted here: this derives a
+      // POSITIONAL boundary, which is the job last_seen_seq keeps doing alongside the new field.
+      const s1 = decodeStructure1(leaf.structure1Cbor);
+      // Unreadable, or a layout this build cannot name: publish no boundary rather than a
+      // half-derived one somebody else could have shaped.
+      if (!s1.ok) return null;
+      const signedLastSeen = Number.isFinite(Number(s1.fields.lastSeenSeq))
+        ? Number(s1.fields.lastSeenSeq)
+        : 0;
       const prior = reach.get(leaf.senderPubkeyHex) ?? 0;
       reach.set(leaf.senderPubkeyHex, Math.max(prior, leaf.sequenceNumber, signedLastSeen));
     }
@@ -4590,26 +4587,26 @@ export class SessionNodeManager {
         });
         // DOD-MSG-4 (strict in-order): record the relay-witnessed canonical sequence for the
         // counterparty's MSG leaves. The relay is the ordering authority; structure1_cbor =
-        // [1, content_hash(32), sender_pubkey, session_id, last_seen_seq, ts]. The relay sequence
+        // [version, content_hash(32), sender_pubkey, session_id, last_seen_seq, ts] (+ last_seen_hash
+        // at index 6 on a v2 claim — 020-ACKHASH; content_hash stays at 1). The relay sequence
         // is 1-based and global per session; the daemon tree is 0-based — normalize with -1. Only
         // COUNTERPARTY leaves (the ones B will ingest); our own echoed leaf already lands via the
         // send path. The gate (ingestReceivedContent) reads this map to hold out-of-order arrivals.
         if (!frame.authored_by_us && frame.leaf_kind !== LEAF_KIND_CTRL) {
-          try {
-            const s1 = decode(frame.structure1_cbor) as unknown[];
-            const contentHash = s1?.[1];
-            if (contentHash instanceof Uint8Array && frame.sequence_number > 0) {
+          const s1 = decodeStructure1(frame.structure1_cbor);
+          if (s1.ok) {
+            if (frame.sequence_number > 0) {
               this.recordWitnessedSequence(
                 agentName,
                 sessionId,
-                Buffer.from(contentHash).toString("hex"),
+                Buffer.from(s1.fields.contentHash).toString("hex"),
                 frame.sequence_number - 1,
               );
             }
-          } catch (err: unknown) {
+          } else {
             this.#logger.warn("session.relay.leaf.witness.decode.failed", {
               sessionId,
-              error: err instanceof Error ? err.message : String(err),
+              error: s1.reason,
               correlationId,
             });
           }
@@ -7561,10 +7558,14 @@ export class SessionNodeManager {
               });
             };
             try {
-              // Structure 1 = [1, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]
-              // — the same decode `#recordFrameOrdering` does for the received half, index 2.
-              const s1 = decode(witnessed.structure1_cbor) as unknown[];
-              const pk = s1[2];
+              // Structure 1 = [version, content_hash, sender_pubkey, session_id, last_seen_seq,
+              // timestamp] (+ last_seen_hash at 6 on a v2 claim — 020-ACKHASH). The sender pubkey is
+              // index 2 in both; the same read `#recordFrameOrdering` does for the received half.
+              const s1Decoded = decodeStructure1(witnessed.structure1_cbor);
+              // NAMED AT ITS CAUSE. A failed decode falling through to the shape check below would
+              // report `pubkey_shape` for bytes that never yielded a pubkey at all, sending the next
+              // reader to audit a key when the layout is what disagreed.
+              const pk = s1Decoded.ok ? s1Decoded.fields.senderPubkey : undefined;
               // The SIGNATURE is length-checked too (review F2): the guard checked the pubkey's 32
               // bytes and only truthiness on the signature, so a zero-length one would have stored an
               // uncheckable BLOB. Not reachable today — `sign()` returns 64 — and the asymmetry is
@@ -7593,7 +7594,9 @@ export class SessionNodeManager {
                * identity problem. Here it means our own encoder and decoder disagree — bad, but it
                * must not cost the operator a delivered message.
                */
-              if (!(pk instanceof Uint8Array) || pk.length !== 32) {
+              if (!s1Decoded.ok) {
+                dropAuthorship("structure1_decode_failed", undefined, { structure1Reason: s1Decoded.reason });
+              } else if (!(pk instanceof Uint8Array) || pk.length !== 32) {
                 dropAuthorship("pubkey_shape", undefined, { pubkeyLen: pk instanceof Uint8Array ? pk.length : -1 });
               } else if (witnessed.sender_signature.length !== 64) {
                 dropAuthorship("signature_shape", undefined, { sigLen: witnessed.sender_signature.length });
@@ -9460,17 +9463,18 @@ export class SessionNodeManager {
     }
     if (!own) return "none";
     try {
-      // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp].
-      const fields = decode(own.structure1Cbor) as unknown[];
-      const contentHash = fields[1];
-      if (!(contentHash instanceof Uint8Array)) {
+      // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq,
+      // timestamp], plus last_seen_hash at index 6 on a v2 claim (020-ACKHASH). content_hash is
+      // index 1 in both.
+      const s1 = decodeStructure1(own.structure1Cbor);
+      if (!s1.ok) {
         this.#logger.warn("session.seal.leaf.recover.failed", {
-          sessionId, agentName, reason: "structure1_content_hash_missing",
+          sessionId, agentName, reason: "structure1_content_hash_missing", structure1Reason: s1.reason,
           impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
         });
         return "unknown";
       }
-      const contentHashHex = Buffer.from(contentHash).toString("hex");
+      const contentHashHex = Buffer.from(s1.fields.contentHash).toString("hex");
       return {
         reportedRootHex: this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex),
         sequenceNumber: own.sequenceNumber,
@@ -13229,16 +13233,26 @@ export class SessionNodeManager {
     senderSig?: Uint8Array;
   } {
     try {
-      const s1 = decode(structure1Cbor) as unknown[];
+      // Structure 1 content_hash is index 1 and sender_pubkey index 2 in BOTH layouts — 020-ACKHASH
+      // appended last_seen_hash at 6 rather than inserting it, so neither read moved. A v2 claim
+      // decodes here exactly as a v1 one does; its hash is not consulted, because this unit ships
+      // reading and not enforcing.
+      const s1 = decodeStructure1(structure1Cbor);
       const s2 = decode(structure2Cbor) as unknown[];
-      const s1Hash = s1?.[1];
-      const s1Pubkey = s1?.[2];
+      const s1Hash = s1.ok ? s1.fields.contentHash : undefined;
+      const s1Pubkey = s1.ok ? s1.fields.senderPubkey : undefined;
       const seq = typeof s2?.[0] === "number" ? s2[0] : -1;
       const s2Sig = s2?.[3];
       if (!(s1Hash instanceof Uint8Array) || !(s1Pubkey instanceof Uint8Array) || !(s2Sig instanceof Uint8Array) || seq < 1) {
         // SOFT: we could not read the record, so we learned nothing about the signer either way.
         // Position falls back to the witness stream, exactly as an absent record does.
-        this.#logger.warn("session.content.ordering.malformed", { sessionId, correlationId });
+        // The Structure 1 reason is carried so an unreadable RECORD and an unnamed LAYOUT are
+        // distinguishable in the log — they arrive at the same soft outcome by different routes.
+        this.#logger.warn("session.content.ordering.malformed", {
+          sessionId,
+          correlationId,
+          ...(s1.ok ? {} : { structure1Reason: s1.reason }),
+        });
         return { seq: null };
       }
       // The framed ordering record must bind to THIS content (its hash) — else it orders the wrong bytes.
