@@ -1,0 +1,14 @@
+{
+  "description": "020-ACKHASH: Structure 1 v2 canonical CBOR fixture — last_seen_hash appended at index 6. RFC 8949 §4.2.1.",
+  "_note": "Canonical CBOR of the 7-element positional TBS array for protocol_version=2. Inputs 1-5 are byte-for-byte the ones in structure1-canonical.json, so the two files together prove the field is APPENDED and no existing index moved: strip the leading '8702' and the trailing 32-byte hash from this hex and the remainder is the v1 hex after its leading '8601'.",
+  "inputs": {
+    "protocol_version": 2,
+    "content_hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sender_pubkey_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "session_id_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "last_seen_seq": 3,
+    "timestamp": 1700000000000,
+    "last_seen_hash_hex": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+  },
+  "expected_cbor_hex": "87025820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd50eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee031b0000018bcfe568005820a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7"
+}
