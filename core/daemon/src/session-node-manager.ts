@@ -5680,7 +5680,16 @@ export class SessionNodeManager {
     this.#sessionLiveness.delete(key);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
-    // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices are NOT torn down here, and the omission is
+    /**
+     * DOD-M15-NO-SILENT-REFUSAL-1 review N2: the UNPERSISTED half IS torn down, and only that half.
+     *
+     * `#refusalFallback` is in memory and restores exactly what the deleted Map did, so it belongs
+     * in the teardown set exactly as that Map did. Leaving it out meant a daemon that could not
+     * write to disk — already in trouble — grew without bound in memory as well. The durable rows
+     * stay, for the reason below.
+     */
+    this.#refusalFallback.delete(key);
+    // DOD-M15-NO-SILENT-REFUSAL-1: the DURABLE notices are NOT torn down here, and the omission is
     // deliberate — this list is the documented teardown set, so anything absent from it needs a
     // reason. They live in `content_refusal_notices`, keyed on agent_id + session_id, and the
     // question they answer ("why did that person stop replying?") is one an operator asks AFTER a
@@ -8632,10 +8641,35 @@ export class SessionNodeManager {
    * used to tidy away notices nobody acted on.
    */
   #clearContentRefusal(agentName: string, sessionId: string, reason: string): void {
-    this.#refusalFallback.get(this.#k(agentName, sessionId))?.delete(reason);
+    /**
+     * ⚠️ THE COUNT GOES WITH THE ROW, and that is a real cost — review N5, recorded rather than
+     * papered over. A session that impairs and heals repeatedly (an intermittent laptop) resets to
+     * zero each time, so the order-of-magnitude re-announce — whose whole job is making a persistent
+     * cause visible — is defeated for the one reason that self-heals: a direct path failing fifty
+     * times is indistinguishable from a counterparty who went out for lunch once.
+     *
+     * Retracting is still right; a stale "the session looks healthy and is not" is worse. So the
+     * count is LOGGED on the way out, which keeps the flapping greppable while the notice is
+     * correctly gone. Keeping the row in the past tense is the better fix and it is a design change,
+     * so it is on the order under Newly discovered rather than taken here.
+     */
+    const key = this.#k(agentName, sessionId);
+    const droppedInMemory = this.#refusalFallback.get(key)?.get(reason)?.count;
+    this.#refusalFallback.get(key)?.delete(reason);
     if (!this.#db) return;
     let agentId: string;
     try { agentId = this.#requireAgentId(agentName); } catch { return; }
+    const row = this.#db
+      .prepare("SELECT count FROM content_refusal_notices WHERE agent_id = ? AND session_id = ? AND reason = ?")
+      .get(agentId, sessionId, reason) as { count: number } | undefined;
+    const had = row?.count ?? droppedInMemory;
+    if (had !== undefined) {
+      this.#logger.info("session.refusal.retracted", {
+        agentName, sessionId, reason, timesBeforeRetraction: had,
+        impact:
+          "the notice said something that has stopped being true and was withdrawn. timesBeforeRetraction is how many times it had fired: a number that keeps reappearing across retractions is a FLAPPING session, which the notice itself can no longer show because its count starts again after every clear.",
+      });
+    }
     this.#db
       .prepare("DELETE FROM content_refusal_notices WHERE agent_id = ? AND session_id = ? AND reason = ?")
       .run(agentId, sessionId, reason);
@@ -8746,6 +8780,12 @@ export class SessionNodeManager {
        *
        * `LIMIT` is `+ 1` so the cap can be DETECTED rather than assumed; the extra row is dropped
        * and `truncated` is reported to the caller, which says so on the list itself.
+       *
+       * ⚠️ `rowid DESC` is the TIEBREAK and it is load-bearing, not tidiness. `last_at` is
+       * `Date.now()`, so notices recorded in the same millisecond have no defined order and "newest
+       * first" was true only on average — measured by a test that recorded 30 notices in one tick
+       * and got them back in an order SQLite was free to choose. rowid is monotonic per insert, so
+       * the tiebreak is insertion order, which for a same-millisecond batch is exactly recency.
        */
       const rows = (
         sessionId === undefined
@@ -8756,7 +8796,9 @@ export class SessionNodeManager {
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
                     AND r.reason = n.reason AND r.consumer_id = ?
-                  WHERE n.agent_id = ? ORDER BY n.last_at DESC LIMIT ?`,
+                  WHERE n.agent_id = ?
+                    AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
+                  ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
               )
               .all(consumerId, agentId, MAX_REFUSALS_PER_READ + 1)
           : this.#db
@@ -8766,7 +8808,9 @@ export class SessionNodeManager {
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
                     AND r.reason = n.reason AND r.consumer_id = ?
-                  WHERE n.agent_id = ? AND n.session_id = ? ORDER BY n.last_at DESC LIMIT ?`,
+                  WHERE n.agent_id = ? AND n.session_id = ?
+                    AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
+                  ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
               )
               .all(consumerId, agentId, sessionId, MAX_REFUSALS_PER_READ + 1)
       ) as Array<{
@@ -8776,7 +8820,16 @@ export class SessionNodeManager {
       if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
       for (const row of rows) {
         const firstTime = row.seen_count === null;
-        // `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
+        /**
+         * ⚠️ The unseen test is IN THE QUERY (review N4), and this line is a belt, not the gate.
+         *
+         * Applied only here, the `LIMIT` cut the newest 25 notices and THEN discarded the ones this
+         * consumer had already seen — so a consumer holding read rows for the newest 25 got an empty
+         * answer forever and a genuinely unseen notice at position 26 could never be reached. The
+         * cap has to cut UNSHOWN notices, which means the filter has to run before it.
+         *
+         * `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
+         */
         if (!firstTime && row.count < row.seen_count! * 10) continue;
         this.#db
           .prepare(
@@ -8801,10 +8854,15 @@ export class SessionNodeManager {
     }
     /**
      * The unpersisted notices (review F6), under the SAME per-consumer and order-of-magnitude rules.
-     *
-     * Reading them differently would make a database failure change what the operator is told rather
+     * Reading them differently would make a database failure change WHAT the operator is told rather
      * than only how long it survives — and that difference is the thing hardest to notice.
+     *
+     * Collected separately and REVERSED before joining, not appended in place — review N2. A Map
+     * yields insertion order, which is oldest-first, so appending them straight after the DB half
+     * (which is newest-first) put the newest notices at the bottom on exactly the daemon where the
+     * fallback is the only half there is.
      */
+    const fromFallback: typeof out = [];
     for (const [key, perSession] of this.#refusalFallback) {
       const sid = this.#unk(key, agentName);
       if (sid === null) continue;
@@ -8814,12 +8872,34 @@ export class SessionNodeManager {
         const firstTime = shownAt === undefined;
         if (!firstTime && notice.count < shownAt * 10) continue;
         notice.surfacedTo.set(consumerId, notice.count);
-        out.push({
+        // Bounded like the table's read rows are (review N2): a consumer id is an IPC connection id,
+        // so without this a long-running daemon grows one entry per reconnect, in memory, on the
+        // very path that exists because the disk is already failing.
+        if (notice.surfacedTo.size > MAX_REFUSAL_READERS) {
+          const oldest = notice.surfacedTo.keys().next();
+          if (!oldest.done) notice.surfacedTo.delete(oldest.value);
+        }
+        fromFallback.push({
           sessionId: sid, reason, kind: notice.kind, impact: notice.impact,
           guidance: notice.guidance, count: notice.count,
           ...(firstTime ? {} : { repeat: true }),
         });
       }
+    }
+    out.push(...fromFallback.reverse());
+    /**
+     * ONE cap over BOTH halves — review N2.
+     *
+     * `LIMIT` governs the table only. A persistent database fault (a full disk, which is also the
+     * likeliest cause of `transcript_write_failed`) routes EVERY refusal to the fallback, so the cap
+     * this unit added was undone for exactly the daemon already in trouble.
+     *
+     * The truncation keeps the DB half preferentially, and that is the right bias: those rows are
+     * the ones that survive a restart, and they are already ordered newest-first.
+     */
+    if (out.length > MAX_REFUSALS_PER_READ) {
+      truncated = true;
+      out.length = MAX_REFUSALS_PER_READ;
     }
     return { notices: out, truncated };
   }

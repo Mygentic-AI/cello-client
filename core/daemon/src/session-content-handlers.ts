@@ -87,7 +87,10 @@ function refusalsField(
   const kindsPresent = new Set(refusals.map((r) => r.kind));
   const refusal_guidance = (Object.keys(REFUSAL_KIND_GUIDANCE) as RefusalKind[])
     .filter((k) => kindsPresent.has(k))
-    .map((k) => REFUSAL_KIND_GUIDANCE[k])
+    // Prefixed with the kind (review N7) so two paragraphs that read as contradicting each other —
+    // "received and REFUSED" beside "NOTHING WAS REFUSED BY THIS AGENT" — can each be joined to the
+    // rows they are about.
+    .map((k) => `[kind: ${k}] ${REFUSAL_KIND_GUIDANCE[k]}`)
     .join("\n\n");
   return { refusals, refusal_guidance };
 }

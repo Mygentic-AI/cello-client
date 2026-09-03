@@ -528,6 +528,105 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     // one that needs the key parsed back apart, so it is the one that would silently return nothing.
     const viaInbox = mgr.takeAgentContentRefusals("alice", "inbox-window");
     expect(viaInbox.notices.map((n) => n.sessionId), "the inbox door reaches it and NAMES the session").toEqual(["s-nodb"]);
+
+    /**
+     * ⚠️ AND THE CONTRACT'S OTHER HALF, asserted rather than claimed — review N1.
+     *
+     * The claim this fallback rests on is "a database failure costs the restart property and
+     * nothing else". Without this line only the first half was tested, and a fallback that
+     * accidentally DID survive a restart would be a different design nobody had agreed to.
+     */
+    await handle.stop("test_restart");
+    handle = await startDaemon(await config());
+    expect(
+      handle.getSessionNodeManager().takeContentRefusals("alice", "s-nodb", "after-restart"),
+      "an unpersisted notice must NOT survive the restart — that is exactly the property lost, and " +
+      "the only one",
+    ).toEqual([]);
+  });
+
+  it("THE LIST IS CAPPED AND NEWEST FIRST, and says when it was cut — review N1/F3", async () => {
+    /**
+     * Read state is keyed on IPC connection id, so a fresh window after a restart has been told
+     * nothing and is entitled to every notice ever recorded for that agent. Oldest-first and
+     * uncapped, the top of that list was the oldest refusal on record and the one explaining the
+     * conversation that just went quiet was at the bottom — a section people learn to scroll past,
+     * which is the failure this whole line exists to end.
+     *
+     * Written because the fix shipped with no test: reverting the ORDER BY and the LIMIT left the
+     * whole gate green, so the finding and its fix were both invisible.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    for (let i = 0; i < 30; i++) {
+      mgr.noteContentRefusal("alice", `s-bulk-${String(i).padStart(2, "0")}`, "content_hash_mismatch", {
+        kind: REFUSAL_KINDS.REFUSED, impact: `impact ${i}`, guidance: `guidance ${i}`,
+      });
+    }
+
+    const { notices, truncated } = mgr.takeAgentContentRefusals("alice", "fresh-window");
+    expect(notices.length, "capped, so the answer is readable rather than an archive").toBe(25);
+    expect(truncated, "and the caller is TOLD it was cut, rather than the tail vanishing").toBe(true);
+    expect(
+      notices[0]!.sessionId,
+      "NEWEST FIRST — the recent cause is the one the operator is asking about, so it leads",
+    ).toBe("s-bulk-29");
+    expect(notices[24]!.sessionId, "and the cut falls at the far end, on the oldest").toBe("s-bulk-05");
+  });
+
+  it("the cap cuts UNSHOWN notices, not all notices — review N4", async () => {
+    /**
+     * The unseen test used to run in JS, AFTER the LIMIT. So a consumer already holding read rows
+     * for the newest 25 got those 25 back, discarded every one, and never looked past them: a
+     * genuinely unseen notice at position 26 was unreachable for that consumer, permanently, with
+     * `refusals_incomplete` the only trace.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    for (let i = 0; i < 26; i++) {
+      mgr.noteContentRefusal("alice", `s-deep-${String(i).padStart(2, "0")}`, "content_hash_mismatch", {
+        kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+      });
+    }
+    // First read: told about the newest 25. The 26th (oldest) is still unseen by this consumer.
+    expect(mgr.takeAgentContentRefusals("alice", "w").notices.length).toBe(25);
+    const second = mgr.takeAgentContentRefusals("alice", "w").notices;
+    expect(
+      second.map((n) => n.sessionId),
+      "the one it has NOT been shown must now be reachable — under the old order it never was",
+    ).toEqual(["s-deep-00"]);
+  });
+
+  it("THE HEADER CARRIES EVERY KIND PRESENT, in one order — review N1/F4", async () => {
+    /**
+     * The composition IS the F4 fix, and nothing tested it: every other assertion in this file uses
+     * one kind, so replacing the join with "take the first kind present" left the gate green.
+     *
+     * Two kinds whose headers say opposite things about the same word, which is the pairing that
+     * makes the labelling load-bearing: `refused` opens "received and REFUSED", `outbound` opens
+     * "NOTHING WAS REFUSED BY THIS AGENT". Both are true, of different rows.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    mgr.noteContentRefusal("alice", "s-mixed", "content_hash_mismatch", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y",
+    });
+    mgr.noteContentRefusal("alice", "s-mixed", "delivery_impaired", {
+      kind: REFUSAL_KINDS.OUTBOUND, impact: "x", guidance: "y",
+    });
+
+    const guidance = String((await inbox(await connect()))["refusals_guidance"] ?? "");
+    expect(guidance, "the refused header is present").toMatch(/WERE received and REFUSED/);
+    expect(guidance, "and so is the outbound one — not just whichever came first").toMatch(/NOTHING WAS REFUSED BY THIS AGENT/);
+    expect(
+      guidance.indexOf("[kind: refused]") < guidance.indexOf("[kind: outbound]"),
+      "in the constant's key order, so the same set of kinds always reads the same way",
+    ).toBe(true);
+    expect(
+      guidance,
+      "each paragraph names its kind, or two paragraphs that contradict each other cannot be " +
+      "joined to the rows they are about",
+    ).toMatch(/\[kind: refused\][\s\S]*\[kind: outbound\]/);
   });
 
   // ─── counterparty_gone: a FIX, not a notice ──────────────────────────────────────────────────

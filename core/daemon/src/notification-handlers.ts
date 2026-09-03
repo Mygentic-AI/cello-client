@@ -160,7 +160,38 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
    * whose count has grown by an order of magnitude re-announces with `repeat: true`.
    */
   function refusalSection(agentName: string, connectionId: string): Record<string, unknown> {
-    const { notices, truncated } = sessionNodeManager.takeAgentContentRefusals(agentName, connectionId);
+    /**
+     * ⚠️ **A FAULT HERE MUST NOT TAKE DOWN THE INBOX — review N3.**
+     *
+     * `noteContentRefusal` is carefully guarded and the READ was not, so any SQLite error from the
+     * drain propagated out of this function and killed `cello_check_notifications` entirely: unread
+     * counts, pending session requests, rename notices, witness alerts, all of it. A failure in the
+     * least critical section taking out the most critical ones is the wrong trade in every case.
+     *
+     * It is NOT swallowed. The ERROR names the cause, and the section still renders — carrying
+     * `refusals_unavailable` so the operator is TOLD this door is broken rather than shown a clean
+     * absence, which is the silence this whole line exists to end.
+     */
+    let notices: ReturnType<typeof sessionNodeManager.takeAgentContentRefusals>["notices"];
+    let truncated: boolean;
+    try {
+      ({ notices, truncated } = sessionNodeManager.takeAgentContentRefusals(agentName, connectionId));
+    } catch (err: unknown) {
+      logger.error("inbox.refusals.read.failed", {
+        agentName, connectionId,
+        error: err instanceof Error ? err.message : String(err),
+        consequence:
+          "the refusal notices could not be read, so this inbox cannot say whether any message was refused. The rest of the inbox is unaffected and is answered normally. Refusals are still being RECORDED; this is a read fault.",
+      });
+      return {
+        refusals_unavailable: true,
+        refusals_guidance:
+          "THIS AGENT'S REFUSAL NOTICES COULD NOT BE READ, so the absence of a `refusals` list here " +
+          "means nothing — it is not an all-clear. If a conversation has gone quiet, that is exactly " +
+          "the thing this section would have explained. See inbox.refusals.read.failed in the daemon " +
+          "log for the cause; the rest of this inbox is unaffected.",
+      };
+    }
     if (notices.length === 0) return {};
     /**
      * ⚠️ THE HEADER IS COMPOSED FROM THE KINDS PRESENT, never one fixed sentence — review F4.
@@ -177,9 +208,14 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
      * of kinds always reads the same way.
      */
     const kindsPresent = new Set(notices.map((n) => n.kind));
+    // Each paragraph is PREFIXED WITH ITS KIND (review N7). An inbox holding a `refused` and an
+    // `outbound` notice opens with "Message(s) from this counterparty WERE received and REFUSED"
+    // followed immediately by "NOTHING WAS REFUSED BY THIS AGENT". Both are true, of different rows,
+    // and nothing joined a paragraph to a row — the prefix is what lets the reader match them to the
+    // `kind` field it already has.
     const header = (Object.keys(REFUSAL_KIND_GUIDANCE) as RefusalKind[])
       .filter((k) => kindsPresent.has(k))
-      .map((k) => REFUSAL_KIND_GUIDANCE[k])
+      .map((k) => `[kind: ${k}] ${REFUSAL_KIND_GUIDANCE[k]}`)
       .join("\n\n");
     return {
       refusals: notices.map((r) => ({

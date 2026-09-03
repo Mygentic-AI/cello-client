@@ -61,7 +61,9 @@ export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
     "Message(s) from this counterparty WERE received and REFUSED — they were not verified, so they " +
     "were neither ingested nor shown. See `refusals` for the reason and what to do. Waiting longer " +
     "will not help until it is resolved, and the counterparty has no way to know: from their side the " +
-    "message was sent. If you need it, ask them to resend after the cause is fixed.",
+    "message was sent. THE REASON BELOW SAYS WHAT TO DO — do not reach for a resend by default: two " +
+    "of the reasons carrying this header are already being redelivered on a loop, and one cannot be " +
+    "fixed for this session at all.",
   [REFUSAL_KINDS.BLOCKED]:
     "Message(s) aimed at this agent were BLOCKED by its screener. They were verified and they ARE " +
     "recorded in the conversation's hash chain, and the sender WAS acknowledged — so they do not " +
