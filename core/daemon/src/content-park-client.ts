@@ -31,6 +31,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { CONTENT_PARK_PROTOCOL_ID, buildContentParkAuthMsg } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 const FRAME_TIMEOUT_MS = 8_000;
 
@@ -291,16 +292,61 @@ export class ContentParkClient {
   }
 
   /** Dial the relay (best-effort per addr) and open a content-park stream. */
+  /**
+   * Open a content-park stream, dialling the relay first.
+   *
+   * WHY THE DIAL ERRORS ARE KEPT. `newStream` does not dial — it requires an already-open
+   * connection and otherwise throws `no_connection`, naming only the peer. So when every dial
+   * here fails, the caller sees "No open connection to peer 12D3Koo…" and the reason the dial
+   * failed is gone. That is the exit point reported as the cause, and it is what made an
+   * intermittent deposit failure undiagnosable: the one fact needed to explain it was discarded
+   * by an empty catch one line earlier.
+   *
+   * Proceeding to `newStream` after a failed dial is still correct — a connection opened by
+   * another part of the daemon may already exist, and the peerstore may hold a route this
+   * address list does not. What is not correct is doing so silently. `session-relay-client.ts`
+   * has kept `lastDialError` and logged `session.relay.dial.failed` for exactly this reason;
+   * this is the same pattern, applied to the path that lacked it.
+   */
   async #open(node: CelloNode): Promise<Stream> {
+    let dialed = false;
+    let lastDialError: string | undefined;
     for (const addr of this.#relayAddrs) {
       try {
         await node.dial(addr);
+        dialed = true;
         break;
-      } catch {
-        /* try the next addr; newStream below may still succeed from the peerstore */
+      } catch (err: unknown) {
+        lastDialError = extractErrorMessage(err);
       }
     }
-    return node.newStream(this.#relayPeerId, CONTENT_PARK_PROTOCOL_ID);
+    if (!dialed && this.#relayAddrs.length > 0) {
+      // WARN, not error: the stream may still open on a pre-existing connection, and this is only
+      // fatal if `newStream` then throws. It is logged before that attempt so the reason survives
+      // even when it does.
+      this.#logger.warn("content.park.dial.failed", {
+        relayPeerId: this.#relayPeerId,
+        relayAddrs: this.#relayAddrs,
+        error: lastDialError,
+      });
+    }
+    try {
+      return await node.newStream(this.#relayPeerId, CONTENT_PARK_PROTOCOL_ID);
+    } catch (err: unknown) {
+      /**
+       * The caller gets `no_connection`, which names the peer and nothing else. Carry the dial
+       * failure with it so whoever reads this knows WHY there was no connection — that is the
+       * difference between "the relay is unreachable from here" and "we never tried".
+       */
+      this.#logger.warn("content.park.stream.failed", {
+        relayPeerId: this.#relayPeerId,
+        error: extractErrorMessage(err),
+        dialAttempted: this.#relayAddrs.length > 0,
+        dialSucceeded: dialed,
+        ...(lastDialError !== undefined ? { dialError: lastDialError } : {}),
+      });
+      throw err;
+    }
   }
 
   #iter(stream: Stream): AsyncIterator<unknown> {
