@@ -282,6 +282,7 @@ export const IPC_METHODS = {
   inbox: "cello_check_notifications",
   sessions: "cello_list_sessions",
   transcript: "cello_get_transcript",
+  quarantined: "cello_get_quarantined",
   "sealed-receipt": "cello_get_sealed_receipt",
   "initiate-session": "cello_initiate_session",
   send: "cello_send",
@@ -440,6 +441,25 @@ export function listSessions(
 /** `cello transcript <session-id>` → cello_get_transcript (durable, survives a daemon restart). */
 export function transcript(celloDir: string, sessionId: string, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(celloDir, IPC_METHODS.transcript, { session_id: sessionId }, opts);
+}
+
+/**
+ * `cello quarantined <session-id> [sequence]` → cello_get_quarantined — a message CELLO REFUSED.
+ *
+ * DOD-M15-REFUSEDEVIDENCE-1. With no sequence it lists what is retained (metadata only); with one
+ * it returns that message's original text wrapped in a warning, as the LAST field of the response.
+ * The CLI exists alongside the MCP tool for the same reason the MCP tool exists at all: an operator
+ * who cannot reach it here will get their agent to go looking, and find it unframed.
+ */
+export function quarantined(celloDir: string, sessionId: string, sequence: number | undefined, opts: ParityOptions): Promise<CliOutput> {
+  return ipcCommand(
+    celloDir,
+    IPC_METHODS.quarantined,
+    // `defined` drops undefined, and a real sequence may be 0 or negative — so this must not be a
+    // truthiness test. Both values are legitimate positions and both would be dropped by one.
+    defined({ session_id: sessionId, sequence }),
+    opts,
+  );
 }
 
 /**

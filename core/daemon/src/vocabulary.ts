@@ -62,6 +62,7 @@ export const DUAL_SURFACE_VERBS: readonly DualSurfaceVerb[] = [
   // Sessions & receipts
   { mcp: "cello_sessions", cli: "cello sessions" },
   { mcp: "cello_transcript", cli: "cello transcript" },
+  { mcp: "cello_quarantined", cli: "cello quarantined" },
   { mcp: "cello_sealed_receipt", cli: "cello sealed-receipt" },
   // Contacts
   { mcp: "cello_contacts", cli: "cello contacts" },

@@ -354,8 +354,19 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.reason).toBe("injection_detected");
     expect(notice!.impact, "it says the sender was acked, so the operator does not wait for a resend")
       .toMatch(/acknowledged/);
-    expect(notice!.guidance, "and it must not send them hunting for the blocked text")
-      .toMatch(/Do NOT ask for the original text/);
+    /**
+     * DOD-M15-REFUSEDEVIDENCE-1 CHANGED THIS CLAUSE, and the new one is the stronger property.
+     *
+     * It used to demand "Do NOT ask for the original text", written when the text did not exist to
+     * ask for. It is retained now, so that sentence became false — and the friction it created was
+     * never protection: an operator who wants to see what was sent directs their agent to go and
+     * find it, and the agent finds it UNFRAMED. What must hold instead is that the guidance names
+     * the framed route AND still refuses the one action that makes things worse.
+     */
+    expect(notice!.guidance, "it must point at the route that returns the original SAFELY")
+      .toMatch(/cello_quarantined/);
+    expect(notice!.guidance, "and must still refuse the action that actually makes things worse")
+      .toMatch(/Do NOT turn screening off/);
     expect(
       JSON.stringify(notice),
       "THE CONTENT NEVER TRAVELS — a screener that can be talked into surfacing what it blocked is not one",

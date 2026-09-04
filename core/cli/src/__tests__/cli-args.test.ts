@@ -49,7 +49,10 @@ describe("F1: usage string lists every command", () => {
         // Messaging
         "initiate-session", "await-session", "close-session", "name-session", "dismiss", "send", "receive", "inbox",
         // Sessions & receipts
-        "sessions", "transcript", "sealed-receipt", "relay-receipts",
+        // DOD-M15-REFUSEDEVIDENCE-1: `quarantined` is the read surface for a message CELLO refused
+        // and kept. It sits with the conversation reads because it IS one — the same session, the
+        // messages that never reached the agent.
+        "sessions", "transcript", "quarantined", "sealed-receipt", "relay-receipts",
         // Documents (M14)
         "doc",
         // Contacts

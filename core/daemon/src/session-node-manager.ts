@@ -9315,8 +9315,12 @@ export class SessionNodeManager {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
           "a message arrived for a session this daemon holds no record of, so it was NOT ingested and NOT shown. It was not acknowledged either, so the sender will keep redelivering it and keep being refused.",
+        // DOD-M15-REFUSEDEVIDENCE-1: the message is retained now, so the operator is told where it
+        // is. A message for a session this daemon has no record of is as likely to be a probe as a
+        // fault, and until this it left nothing behind to look at.
         guidance:
-          "Check cello_sessions. If that session is not listed, this side never opened it or its record is gone, and nothing on this machine can recover it — ask the counterparty to start a NEW session. Do not wait: every redelivery takes the same path.",
+          "Check cello_sessions. If that session is not listed, this side never opened it or its record is gone, and nothing on this machine can recover it — ask the counterparty to start a NEW session. Do not wait: every redelivery takes the same path. " +
+          "The message was KEPT: read it with cello_quarantined " + sessionId + ", which returns it wrapped in a warning. If you were not expecting anything on this conversation, treat it as a probe rather than a mistake.",
       });
       return { ok: false, reason: "session_orphaned" };
     }
@@ -9546,11 +9550,15 @@ export class SessionNodeManager {
          * signature from a known contact leaves a real judgement to make. There is no judgement
          * here. Softening it would teach the operator to weigh a case that does not need weighing.
          *
-         * ⚠️ AND IT NAMES NO REPORTING VERB, deliberately. `CELLO_Reporting` does not exist yet
-         * (`DOD-M15-ORPHANTRIAGE-1`) and the message itself is not retained
-         * (`DOD-M15-REFUSEDEVIDENCE-1`), so naming a destination would be an instruction the
-         * operator cannot carry out — Invariant 4's failure. It states that reporting is warranted,
-         * which is true, and gains its destination when those land.
+         * ⚠️ IT NAMES NO REPORTING DESTINATION, and that is still true — but HALF of the reason has
+         * gone, so the sentence is rewritten rather than left to read as though nothing changed.
+         *
+         * It used to rest on two facts: `CELLO_Reporting` does not exist (`DOD-M15-ORPHANTRIAGE-1`,
+         * still open) and **the message itself is not retained**. The second is no longer true —
+         * `DOD-M15-REFUSEDEVIDENCE-1` retains it, and the guidance below now says so and names where
+         * it is. Telling an operator to report something while keeping nothing to report was the
+         * gap; naming a destination nobody can reach would be Invariant 4's failure. So: the
+         * artifact is named now, the destination when 024 lands.
          *
          * ⚠️ THE ROTATION ADVICE IS MEASURED, NOT ASSUMED. `#startReceiverNode` mints the standing
          * receiver's transport key with `randomBytes(32)` and never persists it, so a logout/login
@@ -9561,7 +9569,8 @@ export class SessionNodeManager {
          * they had closed something they had not.
          */
         guidance:
-          "Report this. Do not try to reply — there is no one to reply to, and answering an unattributable message is what a probe is looking for. " +
+          "Report this. The message itself was KEPT: read it with cello_quarantined " + sessionId + ", which returns it wrapped in a warning — that is the artifact to show someone. " +
+          "Do not try to reply — there is no one to reply to, and answering an unattributable message is what a probe is looking for. " +
           "Then rotate your address: run cello logout followed by cello login. Your standing receiver's network identity is generated fresh each time it starts and is never stored, so this gives you a new one and rebuilds your connections to the directory — anyone holding the old address is left talking to something that no longer answers. " +
           "It does NOT change the addresses of conversations you already have open: those identities are kept on purpose so an interrupted conversation can resume. " +
           "This conversation cannot be repaired: close it with cello_close_session, and open a new one yourself if you were expecting someone. See session.content.sender_unresolved in the daemon log.",
@@ -9828,8 +9837,20 @@ export class SessionNodeManager {
        * operator's chair a message they were expecting never arrives and the record shows a leaf
        * with nothing in it.
        *
-       * The notice NEVER carries the blocked content, and the guidance says not to go looking for
-       * it: a screener that can be talked into surfacing what it blocked is not a screener.
+       * The notice NEVER carries the blocked content — a screener that can be talked into surfacing
+       * what it blocked is not a screener.
+       *
+       * ⚠️ **THE GUIDANCE USED TO SAY "DO NOT ASK FOR THE ORIGINAL TEXT", AND THAT IS NOW WRONG.**
+       * Rewritten rather than deleted, per the claim-comment rule, because the reasoning is what
+       * changed and not just the sentence. It rested on the content being unavailable; under
+       * `DOD-M15-REFUSEDEVIDENCE-1` it is retained and there is a route that returns it FRAMED. And
+       * the friction was never protection: Andre, 2026-09-03 — *"eventually the LLM is going to go
+       * searching for it, because human beings are going to direct their LLMs to find it, and it's
+       * going to come back and say 'Hey, I found it here, the message says…' — which is far
+       * worse."* Withholding the route removes the WARNING from the read, not the read.
+       *
+       * What survives unchanged: do not turn screening off. That is still the one action that makes
+       * things worse, and it is the one the guidance still refuses.
        */
       /**
        * ⚠️ THE DETECTOR'S OWN REASON SURVIVES — `inbound_screen_blocked` is only the fallback.
@@ -9851,7 +9872,9 @@ export class SessionNodeManager {
         impact:
           "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
         guidance:
-          "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. Do NOT ask for the original text and do not turn screening off to read it — the content was blocked because reading it is the risk. security.gateway.inbound.terminal_block in the daemon log names which detector fired." +
+          "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. " +
+          `The message itself was KEPT as evidence and is NOT lost: if you need to see what was actually sent — to show someone, or to judge whether this was an attack — read it with cello_quarantined ${sessionId}, which returns it wrapped in a warning. There is no reason to read it otherwise. ` +
+          "Do NOT turn screening off to read it: that is the one action here that makes things worse. security.gateway.inbound.terminal_block in the daemon log names which detector fired." +
           (inboundVerdict.guidance !== undefined ? ` The detector says: ${inboundVerdict.guidance}` : ""),
       });
     }
