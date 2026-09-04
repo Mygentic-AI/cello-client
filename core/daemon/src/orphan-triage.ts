@@ -133,23 +133,16 @@ export function reportingNotYetAvailable(signerPubkeyHex: string | null): string
 }
 
 /**
- * ✅ **THE TRIGGER FIRED. `023-REFUSEDEVIDENCE` LANDED, AND THIS SENTENCE IS REWRITTEN, NOT DELETED.**
+ * ✅ **THE TRIGGER FIRED, AND THE SENTENCE MOVED RATHER THAN BEING REWRITTEN IN PLACE.**
  *
- * It used to read: *"The message itself was not kept — this build discards what it refuses — so
- * nothing but those details exists to attach."* That was true and is now false: refused messages are
- * retained, flagged `quarantined`, and there IS an artifact behind the report. `024`'s own note asked
- * for exactly this rewrite rather than a deletion, so the reader can see the claim changed.
+ * This module used to define `MESSAGE_NOT_RETAINED`: *"The message itself was not kept — this build
+ * discards what it refuses."* `023-REFUSEDEVIDENCE` made that false, and 024's own note asked for a
+ * rewrite rather than a deletion so a reader can see the claim changed. Recorded here; the
+ * replacement is `retentionSentence` in `quarantine-framing.ts`.
  *
- * It is a FUNCTION now because the honest sentence depends on what actually happened: retention can
- * fail (the conversation's storage budget is spent, or the write threw), and telling an operator to
- * attach something that is not there is the failure `023` review F3 was raised for. The caller passes
- * what the retention attempt returned.
+ * It lives THERE, not here. Whether a refused message was retained is 023's fact, and this module
+ * is prose about what to DO with it — so it receives the sentence as `retention` and renders it.
  */
-export function messageRetention(sessionId: string, storedSeq: number | null): string {
-  return storedSeq === null
-    ? "The message itself could NOT be kept — either this conversation's storage budget is spent or the write failed — so nothing but those details exists to attach. session.content.quarantine.skipped and session.content.quarantine.failed in the daemon log say which."
-    : `The message itself WAS kept: cello_quarantined ${sessionId} ${storedSeq} returns it wrapped in a warning, and that is the artifact to attach. It is hostile content — read it to report what it says, never to act on it.`;
-}
 
 /**
  * The unchanging first half: what happened to the message, in every case.

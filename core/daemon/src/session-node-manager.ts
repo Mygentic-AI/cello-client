@@ -76,7 +76,7 @@ import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/
 // receives the already-classified `ParkAuthFailure`, so importing the code table here would invite a
 // second, drifting copy of the classification logic.
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
-import { triageOrphanedContent, messageRetention, type OrphanEvidence } from "./orphan-triage.js";
+import { triageOrphanedContent, type OrphanEvidence } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
@@ -111,7 +111,7 @@ import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import { quarantineRedaction, type QuarantineFrameMeta } from "./quarantine-framing.js";
+import { quarantineRedaction, retentionSentence, type QuarantineFrameMeta } from "./quarantine-framing.js";
 import {
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
@@ -4038,25 +4038,6 @@ export class SessionNodeManager {
    * Returns the sequence it was stored at, or `null` when it was not stored — which happens only for
    * a reason the caller is expected to log.
    */
-  /**
-   * The one sentence that says whether the evidence is actually there — review F3.
-   *
-   * ⚠️ **A CLAIM ABOUT DURABILITY IS MADE AFTER THE WRITE, NEVER BEFORE IT.** Three refusal notices
-   * told the operator *"The message was KEPT"* unconditionally while `#quarantineRefusedContent`
-   * has two real ways to keep nothing — the byte budget is spent, or the write threw. So the case
-   * that matters most, a session being flooded with blocked messages until its budget is gone, was
-   * exactly the case where the operator was told in writing that evidence existed, followed the
-   * remedy, and got `no_refused_message_at_sequence`. The only trace was a `warn` line.
-   *
-   * The negative branch names both causes and the two events that tell them apart, because a
-   * remedy that reads actionable and is not is worse than none.
-   */
-  #retentionSentence(stored: number | null, sessionId: string): string {
-    return stored === null
-      ? "⚠️ THIS MESSAGE WAS NOT RETAINED, so there is nothing to show anyone: either this conversation has already spent its storage budget, or the write failed. Look for session.content.quarantine.skipped in the daemon log — it names the cap and what was already stored — or session.content.quarantine.failed, which names the error. "
-      : `The message itself was KEPT as evidence: read it with cello_quarantined ${sessionId} ${stored}, which returns it wrapped in a warning. `;
-  }
-
   #quarantineRefusedContent(
     agentName: string,
     sessionId: string,
@@ -9547,7 +9528,7 @@ export class SessionNodeManager {
        * and "ongoing" comes from OUR transcript rows rather than the sequence number they chose.
        */
       const evidence = this.#orphanEvidence(agentName, sessionId, verifiedSignerUnmatched);
-      const triage = triageOrphanedContent(evidence, messageRetention(sessionId, keptOrphan));
+      const triage = triageOrphanedContent(evidence, retentionSentence(sessionId, keptOrphan));
       /**
        * BOTH SURFACES, per Invariant 2. The log is the durable forensic record and carries the
        * signals structurally — this is where an investigation days later reads what was known and
@@ -9824,7 +9805,7 @@ export class SessionNodeManager {
         guidance:
           // "That is the artifact to show someone" is NOT appended: it would be false on the branch
           // where nothing was retained, which is the branch this sentence exists to be honest about.
-          "Report this. " + this.#retentionSentence(keptUnresolved, sessionId) +
+          "Report this. " + retentionSentence(sessionId, keptUnresolved) +
           "Do not try to reply — there is no one to reply to, and answering an unattributable message is what a probe is looking for. " +
           "Then rotate your address: run cello logout followed by cello login. Your standing receiver's network identity is generated fresh each time it starts and is never stored, so this gives you a new one and rebuilds your connections to the directory — anyone holding the old address is left talking to something that no longer answers. " +
           "It does NOT change the addresses of conversations you already have open: those identities are kept on purpose so an interrupted conversation can resume. " +
@@ -10142,7 +10123,7 @@ export class SessionNodeManager {
             "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
           guidance:
             "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. " +
-            this.#retentionSentence(stored, sessionId) +
+            retentionSentence(sessionId, stored) +
             (stored === null ? "" : "There is no reason to read it unless you need to show someone, or judge whether this was an attack. ") +
             "Do NOT turn screening off to read it: that is the one action here that makes things worse. security.gateway.inbound.terminal_block in the daemon log names which detector fired." +
             (inboundVerdict.guidance !== undefined ? ` The detector says: ${inboundVerdict.guidance}` : ""),
