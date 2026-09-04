@@ -248,6 +248,10 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
   it("a NON-terminal refusal still retries — the healthy case is not silenced", async () => {
     /**
+     * ⚠️ **A GUARD, NOT COVERAGE. This test PASSES with the whole fix reverted** — with no gate at
+     * all, everything retries. It is here to catch the unit OVER-applying itself, which is the
+     * failure this unit can create, and it is worth more than a test that only proves the fix ran.
+     *
      * The failure this unit can create. A transient screener block is refused, nothing is acked, and
      * the sender's daemon redelivers — the fetch must still be scheduled, or the message that was
      * only momentarily refusable is lost for good.
@@ -269,6 +273,10 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
 
   it("a HASH MISMATCH is refused, retained, and still retried — the set is what decides", async () => {
     /**
+     * ⚠️ **A GUARD, NOT COVERAGE — it passes with the fix reverted.** It is nonetheless the test
+     * that killed mutant 5, because it is the one that goes red when the terminal SET stops being
+     * consulted and every refusal is treated as permanent.
+     *
      * The mutation that made this test necessary: dropping the `TERMINAL_REFUSAL_REASONS` check
      * survived the whole suite, because the only caller passed `session_committed` anyway. The set
      * was decorative and a reviewer could not have told.
@@ -458,6 +466,8 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
   });
 
   it("nothing interpolates the refused content — not into a log line, an error or a notice", async () => {
+    // A NON-REGRESSION guard, not coverage: it passes with the fix reverted. Its job is to fail if
+    // any of the new log lines or fields ever starts carrying the bytes instead of a hash.
     await boot();
     insertSessionRow("s-closed", "sealed");
     const client = await connect();

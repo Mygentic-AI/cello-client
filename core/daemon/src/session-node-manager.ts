@@ -780,6 +780,12 @@ export const LEAF_FETCH_GRACE_MS = 2_000;
  *     operator who raises it must be able to un-stick the conversation.
  *   - a transient screener block — transient is in its name.
  */
+/**
+ * ⚠️ NOT the same concept as `session-terminal-refusal.ts` (`DOD-MP-SESSION-RETIRE-1`), which is the
+ * RELAY terminally refusing one of OUR SENDS. This set is about INBOUND content this side will
+ * never accept. Two "terminal refusal" ideas live in this daemon and they point in opposite
+ * directions — review F9.
+ */
 export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set(["session_committed"]);
 
 /**
