@@ -19,7 +19,7 @@ import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
-import type { RefusalNotice, SessionNodeManager } from "./session-node-manager.js";
+import type { SessionNodeManager } from "./session-node-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
