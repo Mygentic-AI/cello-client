@@ -403,10 +403,22 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     if (!agentName) return NO_CURRENT_AGENT_RESPONSE;
 
     const raw = params?.["sequence"];
-    // The exemplar check: `undefined` means "list them all" and a real position may be NEGATIVE
-    // (a refusal that never joined the chain), so this must not be a truthiness test — `0` is a
+    // The exemplar check: ABSENT means "list them all" and a real position may be NEGATIVE (a
+    // refusal that never joined the chain), so this must not be a truthiness test — `0` is a
     // legitimate sequence and `-1` is the commonest one for an orphaned refusal.
-    const sequence = typeof raw === "number" && Number.isInteger(raw) ? raw : undefined;
+    //
+    // ⚠️ PRESENT-BUT-UNUSABLE IS REFUSED, NOT COERCED — review F9. Folding a string `"3"`, a float
+    // or a typo into `undefined` answered a different question than the one asked, silently: the
+    // operator wanted one message and got the index. Nothing leaked (the index is metadata only),
+    // but "I could not read your argument" and "you asked for the list" are different facts.
+    if (raw !== undefined && !(typeof raw === "number" && Number.isInteger(raw))) {
+      return {
+        ok: false,
+        reason: "sequence_not_an_integer",
+        guidance: `sequence must be a whole number — it may be negative, and cello_transcript names the ones this conversation has. Omit it entirely to list them. Received: ${JSON.stringify(raw)}.`,
+      };
+    }
+    const sequence = raw as number | undefined;
     const records = sessionNodeManager.readQuarantined(agentName, sessionId, sequence);
 
     if (sequence === undefined) {

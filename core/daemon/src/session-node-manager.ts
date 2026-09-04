@@ -782,6 +782,9 @@ export interface TranscriptEntry {
   createdAt: number;
   refusalReason?: string;
   withheld?: true;
+  /** Named to end in `guidance` on purpose: that suffix is what the vocabulary layer rewrites, so a
+   *  CLI reader is told `cello quarantined` and an MCP reader `cello_quarantined`. */
+  withheld_guidance?: string;
 }
 
 /** A retained refused message, read back whole. The payload is handed out FRAMED, never raw. */
@@ -2702,12 +2705,16 @@ export class SessionNodeManager {
      * `'quarantined'` is not `'sent'` — so a verified frame lands `verified_signature` and an
      * unverified one `local_session_state`, which is the distinction the column exists for.
      */
-    try {
-      this.#db.exec("ALTER TABLE transcript ADD COLUMN quarantine_reason TEXT");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
+    // Through `addColumnIfMissing`, not a hand-rolled try/catch — review F7. A bare `ADD COLUMN`
+    // wrapped in a duplicate-name test had already been written twice in this codebase, which is
+    // why the helper exists; a third copy rethrows correctly but emits no `db.column_birth.failed`,
+    // so a failure on a fresh operator's database would name neither the table nor the column. That
+    // is exactly the case — the FIRST run on a new machine — the helper was extracted for.
+    addColumnIfMissing(this.#db, this.#logger, {
+      table: "transcript",
+      column: "quarantine_reason",
+      sql: "ALTER TABLE transcript ADD COLUMN quarantine_reason TEXT",
+    });
 
     // M8C-INBOX-1 (N2): per-agent, per-session read watermark. `last_delivered_seq` is the highest
     // RECEIVED transcript sequence the operator has been shown via cello_receive (delivery marks
@@ -3396,10 +3403,16 @@ export class SessionNodeManager {
       const direction: TranscriptEntry["direction"] =
         r.direction === "sent" ? "sent" : r.direction === "quarantined" ? "quarantined" : "received";
       if (direction === "quarantined") {
-        const reason = r.quarantine_reason ?? "refused";
+        // No `?? "refused"` default — review F11. See `readQuarantined` for why a generic label for
+        // an impossible state is worse than an empty one.
+        const reason = r.quarantine_reason as string;
+        const redaction = quarantineRedaction(reason, sessionId, r.sequence);
         messages.push({
           sequence: r.sequence, direction, createdAt: r.created_at,
-          text: quarantineRedaction(reason, sessionId, r.sequence),
+          text: redaction.text,
+          // The key ENDS in `guidance` so `vocabulary.ts` rewrites the verb for a CLI reader — see
+          // the note on `quarantineRedaction`.
+          withheld_guidance: redaction.guidance,
           refusalReason: reason,
           withheld: true,
         });
@@ -4024,6 +4037,25 @@ export class SessionNodeManager {
    * Returns the sequence it was stored at, or `null` when it was not stored — which happens only for
    * a reason the caller is expected to log.
    */
+  /**
+   * The one sentence that says whether the evidence is actually there — review F3.
+   *
+   * ⚠️ **A CLAIM ABOUT DURABILITY IS MADE AFTER THE WRITE, NEVER BEFORE IT.** Three refusal notices
+   * told the operator *"The message was KEPT"* unconditionally while `#quarantineRefusedContent`
+   * has two real ways to keep nothing — the byte budget is spent, or the write threw. So the case
+   * that matters most, a session being flooded with blocked messages until its budget is gone, was
+   * exactly the case where the operator was told in writing that evidence existed, followed the
+   * remedy, and got `no_refused_message_at_sequence`. The only trace was a `warn` line.
+   *
+   * The negative branch names both causes and the two events that tell them apart, because a
+   * remedy that reads actionable and is not is worse than none.
+   */
+  #retentionSentence(stored: number | null, sessionId: string): string {
+    return stored === null
+      ? "⚠️ THIS MESSAGE WAS NOT RETAINED, so there is nothing to show anyone: either this conversation has already spent its storage budget, or the write failed. Look for session.content.quarantine.skipped in the daemon log — it names the cap and what was already stored — or session.content.quarantine.failed, which names the error. "
+      : `The message itself was KEPT as evidence: read it with cello_quarantined ${sessionId} ${stored}, which returns it wrapped in a warning. `;
+  }
+
   #quarantineRefusedContent(
     agentName: string,
     sessionId: string,
@@ -4043,6 +4075,44 @@ export class SessionNodeManager {
     if (!this.#db) return null;
     try {
       const agentId = this.#requireAgentId(agentName);
+      /**
+       * ⚠️ **DEDUP FIRST — review F1, and without it retention KILLS THE CONVERSATION IT PROTECTS.**
+       *
+       * Six of the seven retaining exits refuse WITHOUT ACKNOWLEDGING, which is exactly what makes
+       * the sender's daemon redeliver. Each redelivery re-enters here, above the leaf dedup, and
+       * would take a fresh negative sequence — another full copy of the same bytes. The park drain's
+       * own comment measures that loop at *"~120 repeats per message, forever"*.
+       *
+       * **And retained bytes spend the delivery budget** (`#getReceivedBytesTotal` counts them, which
+       * is what makes the bound honest). So a counterparty on a newer build sends ONE message, the
+       * version skew refuses it un-acked, and twenty-five drains later the conversation's 25 MB is
+       * gone — permanently, because the cap does not reset. Honest traffic then hits
+       * `session_size_limit_exceeded` and the daemon tells the operator to start a new conversation.
+       *
+       * The counterbalance, stated properly this time: **evidence and delivery share one monotonic
+       * budget, and when evidence wins the conversation stops working.** Entry 69 claimed there was
+       * nothing to trade off, and this is what that claim was hiding.
+       *
+       * Keyed on (session, reason, bytes) rather than a hash column: SQLite compares BLOBs directly
+       * and short-circuits on length, the candidate set is one session's refusals, and it needs no
+       * schema change. Same bytes refused the same way is ONE piece of evidence — how many times it
+       * arrived is already counted by the refusal notice. The same bytes refused for a DIFFERENT
+       * reason is a different fact and keeps its own row.
+       */
+      const already = this.#db
+        .prepare(
+          `SELECT sequence FROM transcript
+           WHERE agent_id = ? AND session_id = ? AND direction = 'quarantined'
+             AND quarantine_reason = ? AND blob = ?`,
+        )
+        .get(agentId, sessionId, reason, Buffer.from(content)) as { sequence: number } | undefined;
+      if (already) {
+        this.#logger.debug("session.content.quarantine.duplicate", {
+          agentName, sessionId, reason, sequence: already.sequence,
+          contentHash: contentHashHex, correlationId: opts.correlationId,
+        });
+        return already.sequence;
+      }
       /**
        * THE BOUND. A session at its byte cap retains no more.
        *
@@ -4106,6 +4176,32 @@ export class SessionNodeManager {
   }
 
   /**
+   * DOD-M15-REFUSEDEVIDENCE-1 — retain a message refused OUTSIDE `ingestReceivedContent`.
+   *
+   * Review F6. The park drain terminally-blocks a message that arrived for an already-committed
+   * session, then confirm-deletes the relay copy — the one other route in the tree that discarded
+   * refused content, and the highest-suspicion combination in the product: hostile bytes aimed at a
+   * conversation somebody has already sealed. Shipped guidance now tells every operator that
+   * refused messages are kept, so this is made true rather than the promise narrowed.
+   *
+   * A thin delegate, not a second implementation: the bound, the dedup, the sequence allocation and
+   * the logging are the ones every other refusal uses.
+   */
+  quarantineRefusedInbound(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    content: Uint8Array,
+    contentHashHex: string,
+    senderPubkeyHex: string | null,
+    correlationId?: string,
+  ): number | null {
+    return this.#quarantineRefusedContent(agentName, sessionId, reason, content, contentHashHex, {
+      senderPubkeyHex, correlationId,
+    });
+  }
+
+  /**
    * DOD-M15-REFUSEDEVIDENCE-1: read retained refused messages back — all of a session's, or the one
    * at `sequence`.
    *
@@ -4131,7 +4227,14 @@ export class SessionNodeManager {
         }>;
     return rows.map((r) => ({
       sequence: r.sequence,
-      reason: r.quarantine_reason ?? "refused",
+      /**
+       * ⚠️ NOT `?? "refused"` — review F11. A generic default here is a label for a state that
+       * cannot occur: the column exists before any `'quarantined'` row can be written and
+       * `#quarantineRefusedContent` always supplies a reason. A default reads to the next maintainer
+       * as a supported case and would quietly stand in for a real bug. If a NULL ever appears, the
+       * empty reason travels to the frame and the caller, which is loud enough to chase.
+       */
+      reason: r.quarantine_reason as string,
       content: r.blob instanceof Uint8Array ? r.blob : new Uint8Array(r.blob),
       senderPubkeyHex: r.sender_pubkey,
       senderSig: r.sender_sig === null ? null : (r.sender_sig instanceof Uint8Array ? r.sender_sig : new Uint8Array(r.sender_sig)),
@@ -9306,7 +9409,7 @@ export class SessionNodeManager {
        * counterparty, so no tier — `#quarantineRefusedContent` bounds it at UNKNOWN and files it at
        * a negative position, outside the chain it never joined.
        */
-      this.#quarantineRefusedContent(agentName, sessionId, "session_orphaned", content, contentHashHex, { correlationId });
+      const keptOrphan = this.#quarantineRefusedContent(agentName, sessionId, "session_orphaned", content, contentHashHex, { correlationId });
       // DOD-M15-NO-SILENT-REFUSAL-1. The notice is written even though there is no session row —
       // the store is keyed (agent_id, session_id) and holds no foreign key to `sessions` precisely
       // so this case can be recorded. A refusal for a session that does not exist here is the one
@@ -9320,7 +9423,8 @@ export class SessionNodeManager {
         // fault, and until this it left nothing behind to look at.
         guidance:
           "Check cello_sessions. If that session is not listed, this side never opened it or its record is gone, and nothing on this machine can recover it — ask the counterparty to start a NEW session. Do not wait: every redelivery takes the same path. " +
-          "The message was KEPT: read it with cello_quarantined " + sessionId + ", which returns it wrapped in a warning. If you were not expecting anything on this conversation, treat it as a probe rather than a mistake.",
+          this.#retentionSentence(keptOrphan, sessionId) +
+          "If you were not expecting anything on this conversation, treat it as a probe rather than a mistake.",
       });
       return { ok: false, reason: "session_orphaned" };
     }
@@ -9537,7 +9641,7 @@ export class SessionNodeManager {
       // absence is the evidence. The guidance below says to report this; this is the artifact there
       // is to report. Bounded at the UNKNOWN tier — there is no contact to look a tier up on, which
       // is the same fact that made it unattributable.
-      this.#quarantineRefusedContent(agentName, sessionId, "sender_unresolved", content, contentHashHex, { correlationId });
+      const keptUnresolved = this.#quarantineRefusedContent(agentName, sessionId, "sender_unresolved", content, contentHashHex, { correlationId });
       this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
@@ -9569,7 +9673,9 @@ export class SessionNodeManager {
          * they had closed something they had not.
          */
         guidance:
-          "Report this. The message itself was KEPT: read it with cello_quarantined " + sessionId + ", which returns it wrapped in a warning — that is the artifact to show someone. " +
+          // "That is the artifact to show someone" is NOT appended: it would be false on the branch
+          // where nothing was retained, which is the branch this sentence exists to be honest about.
+          "Report this. " + this.#retentionSentence(keptUnresolved, sessionId) +
           "Do not try to reply — there is no one to reply to, and answering an unattributable message is what a probe is looking for. " +
           "Then rotate your address: run cello logout followed by cello login. Your standing receiver's network identity is generated fresh each time it starts and is never stored, so this gives you a new one and rebuilds your connections to the directory — anyone holding the old address is left talking to something that no longer answers. " +
           "It does NOT change the addresses of conversations you already have open: those identities are kept on purpose so an interrupted conversation can resume. " +
@@ -9810,6 +9916,8 @@ export class SessionNodeManager {
       });
       return { ok: false, reason: inboundVerdict.reason ?? "inbound_screen_blocked" };
     }
+    // Assigned only on the terminal-block branch and invoked beside each retention attempt below.
+    let noteTerminalBlock: ((stored: number | null) => void) | undefined;
     if (terminalBlock) {
       this.#logger.warn("security.gateway.inbound.terminal_block", {
         sessionId,
@@ -9867,16 +9975,30 @@ export class SessionNodeManager {
       // `?? "inbound_screen_blocked"` is a floor, not a live branch: every verdict producer in the
       // tree sets `reason`, so today it never fires. It stays because `reason` is optional on the
       // type, and a notice keyed on `undefined` would collapse every future detector into one row.
-      this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
-        kind: REFUSAL_KINDS.BLOCKED,
-        impact:
-          "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
-        guidance:
-          "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. " +
-          `The message itself was KEPT as evidence and is NOT lost: if you need to see what was actually sent — to show someone, or to judge whether this was an attack — read it with cello_quarantined ${sessionId}, which returns it wrapped in a warning. There is no reason to read it otherwise. ` +
-          "Do NOT turn screening off to read it: that is the one action here that makes things worse. security.gateway.inbound.terminal_block in the daemon log names which detector fired." +
-          (inboundVerdict.guidance !== undefined ? ` The detector says: ${inboundVerdict.guidance}` : ""),
-      });
+      /**
+       * ⚠️ **DEFERRED UNTIL THE RETENTION HAS ACTUALLY RUN — review F3.** The notice used to be
+       * written here, above both append sites, and claimed the message was kept before anything had
+       * tried to keep it. It is now a closure invoked beside each `#quarantineRefusedContent` call,
+       * carrying that call's own answer.
+       *
+       * Two paths between here and there deliberately write NO notice now, and both are the better
+       * answer: a post-screen dedup means this exact message was already noticed the first time, and
+       * a size-cap refusal writes `#noteSizeCapRefusal` instead — which is what actually happened,
+       * where before the operator got both stories at once.
+       */
+      noteTerminalBlock = (stored: number | null): void => {
+        this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+          kind: REFUSAL_KINDS.BLOCKED,
+          impact:
+            "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
+          guidance:
+            "This is the protection doing its job, and nothing is required of you. If you were expecting something from this counterparty around now, tell them it was blocked and ask them to say it differently. " +
+            this.#retentionSentence(stored, sessionId) +
+            (stored === null ? "" : "There is no reason to read it unless you need to show someone, or judge whether this was an attack. ") +
+            "Do NOT turn screening off to read it: that is the one action here that makes things worse. security.gateway.inbound.terminal_block in the daemon log names which detector fired." +
+            (inboundVerdict.guidance !== undefined ? ` The detector says: ${inboundVerdict.guidance}` : ""),
+        });
+      };
     }
 
     // M9-IN-001: a `redact` verdict (inbound sanitization) DELIVERS the sanitized text to the agent,
@@ -9992,11 +10114,12 @@ export class SessionNodeManager {
       // retaining at release is not available — it is retained here, at the position the leaf will
       // take. `held_content` is not a substitute: that row is deleted the moment the gap fills.
       if (terminalBlock) {
-        this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
+        const keptHeld = this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
           senderPubkeyHex: senderPubkey, canonicalSeq,
           ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
           correlationId,
         });
+        noteTerminalBlock?.(keptHeld);
       }
       this.#logger.info("session.content.held", {
         sessionId,
@@ -10046,11 +10169,12 @@ export class SessionNodeManager {
      * sent, not what a filter made of it.
      */
     if (terminalBlock) {
-      this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
+      const keptBlocked = this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
         senderPubkeyHex: senderPubkey, canonicalSeq: leafIndex,
         ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
         correlationId,
       });
+      noteTerminalBlock?.(keptBlocked);
       /**
        * ⚠️ **DROP THE WITNESS — A BLOCKED MESSAGE MADE THE SESSION PERMANENTLY UNSEALABLE.**
        *

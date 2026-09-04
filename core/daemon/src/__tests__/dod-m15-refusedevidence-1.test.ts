@@ -37,6 +37,7 @@ import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { frameQuarantinedPayload } from "../quarantine-framing.js";
 import type { Logger } from "../types.js";
 import type { SecurityGatewayClient, ScreenContext, ScreenVerdict, GatewayMode } from "@cello-protocol/gateway";
+import { connectToDaemon } from "../ipc-client.js";
 
 /** The screening seam's own interface, supplying a TERMINAL block — the verdict that leafs the
  *  content hash, acknowledges the sender, and never hands the message to the agent. */
@@ -183,8 +184,46 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     expect(entry, "the transcript must show that something was refused HERE — a hole is the evidence gap again").toBeDefined();
     expect(entry!.text, "the payload must not travel on the transcript read").not.toContain(ATTACK);
     expect(entry!.text, "it names the reason").toContain("content_hash_mismatch");
-    expect(entry!.text, "and where the original is — Invariant 4: name the verb").toContain("cello_quarantined");
     expect(entry!.refusalReason).toBe("content_hash_mismatch");
+    /**
+     * THE VERB LIVES IN A `*_guidance` KEY, NOT IN `text` — review F8, and this assertion is the
+     * one that keeps it there. `vocabulary.ts` rewrites keys ending in `guidance` for the surface
+     * that asked, so a CLI reader is told `cello quarantined`; a command left in `text` is printed
+     * verbatim, and `cello transcript` handed a terminal operator an MCP tool name they cannot type.
+     */
+    expect(entry!.text, "text states the fact and names NO command").not.toContain("cello_quarantined");
+    expect(entry!.withheld_guidance, "and the command lives where the rewrite can reach it").toContain("cello_quarantined");
+    expect(entry!.withheld_guidance, "naming the position, so the operator can read THIS one").toContain(String(entry!.sequence));
+  });
+
+  it("F4: an orphan-quarantine session id does not become a session cello_receive knows about", async () => {
+    const handleRef = await start();
+    const snm = handleRef.getSessionNodeManager();
+    const sid = "9a".repeat(32);
+    const content = new TextEncoder().encode("a probe at an id nobody opened");
+    await snm.ingestReceivedContent("alice", sid, content, msgLeafHash(content), "corr-p");
+    expect(snm.readQuarantined("alice", sid).length, "precondition: the probe was retained").toBe(1);
+
+    /**
+     * Clause 4 names `cello_receive` BY SURFACE, and every other proof of it goes through the
+     * readers rather than the handler — which is exactly the gap this finding came through. The
+     * handler's own "does this session exist" test counted transcript rows with no direction
+     * filter, so a retained probe made an id nobody opened start answering `session_not_live` with
+     * *"This session exists only as a durable transcript"*. Nothing deliverable is there.
+     */
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "mcp" });
+      await client.send("cello_use_agent", { name: "alice" });
+      // The IPC method takes `session_id`; `cello_session_id` is the MCP shim's argument name.
+      const res = (await client.send("cello_receive", { session_id: sid, timeout_ms: 200 })) as { ok?: boolean; reason?: string };
+      expect(
+        res.reason,
+        "a quarantined row is not a conversation — the id must stay unknown to cello_receive",
+      ).toBe("session_not_found");
+    } finally {
+      client.close();
+    }
   });
 
   // ─── 4. FRAMED, WITH NO CLOSING DELIMITER ────────────────────────────────────────────────────
@@ -271,6 +310,73 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
       "the witness must be retired with its leaf. Left outstanding, cello_close_session refuses " +
       "session_incomplete for the life of the session and the receipt is unreachable.",
     ).toBe(0);
+  });
+
+  // ─── Review findings, each with the property it protects ─────────────────────────────────────
+
+  it("F1: a REDELIVERED refusal is retained ONCE — evidence must not eat the delivery budget", async () => {
+    const snm = (await start()).getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
+    const content = new TextEncoder().encode(ATTACK);
+    const wrong = msgLeafHash(new TextEncoder().encode("other"));
+
+    // Six of the seven retaining exits refuse WITHOUT acking, which is precisely what makes the
+    // sender's daemon redeliver — the park drain measures that loop at ~120 repeats per message.
+    for (let i = 0; i < 5; i++) await snm.ingestReceivedContent("alice", SID, content, wrong, `corr-${i}`);
+
+    const kept = snm.readQuarantined("alice", SID);
+    expect(
+      kept.length,
+      "one message is ONE piece of evidence however many times it is redelivered. Retained bytes " +
+      "spend the same monotonic budget that gates delivery, so a copy per redelivery kills the " +
+      "conversation for honest traffic — with the cap's own guidance saying it does not reset.",
+    ).toBe(1);
+    // How often it arrived is not lost — it is what the refusal notice counts.
+    const [notice] = snm.takeContentRefusals("alice", SID, "op");
+    expect(notice?.count, "the arrival count lives on the notice, not in duplicate rows").toBe(5);
+  });
+
+  it("F1: the same bytes refused for a DIFFERENT reason keep their own row — that is a different fact", async () => {
+    const snm = (await start()).getSessionNodeManager();
+    const sid2 = "ef".repeat(32);
+    const content = new TextEncoder().encode(ATTACK);
+    // No session at all → session_orphaned.
+    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(content), "c1");
+    // Now the session exists and the same bytes fail the hash cross-check instead.
+    await snm.createSessionNode(sid2, "alice", "ff".repeat(32), "peer-1", "corr");
+    await snm.ingestReceivedContent("alice", sid2, content, msgLeafHash(new TextEncoder().encode("x")), "c2");
+
+    const reasons = snm.readQuarantined("alice", sid2).map((q) => q.reason).sort();
+    expect(reasons, "dedup is keyed on (reason, bytes), not bytes alone").toEqual(["content_hash_mismatch", "session_orphaned"]);
+  });
+
+  it("F3: when the budget is spent the operator is told the evidence is NOT there, not that it is", async () => {
+    const snm = (await start()).getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
+    const cap = snm.resolveTierBound("alice", 1 /* TIER.UNKNOWN */, "max_bytes");
+    // Fill the budget with a delivered message, so the NEXT refusal cannot be retained.
+    const { leafIndex } = snm.appendSessionLeaf("alice", SID, "msg", "aa".repeat(32), "seed");
+    snm.recordTranscriptMessage("alice", SID, leafIndex, "received", new Uint8Array(cap - 8), "seed");
+
+    const content = new TextEncoder().encode(ATTACK);
+    await snm.ingestReceivedContent("alice", SID, content, msgLeafHash(new TextEncoder().encode("other")), "c1");
+    expect(snm.readQuarantined("alice", SID).length, "precondition: nothing could be retained").toBe(0);
+
+    // The tampered frame's own notice does not claim retention, so the property is checked on the
+    // one that does — an orphaned refusal, whose guidance names the artifact to report.
+    const sid3 = "1a".repeat(32);
+    snm.recordTranscriptMessage("alice", sid3, 0, "received", new Uint8Array(cap - 8), "seed3");
+    await snm.ingestReceivedContent("alice", sid3, content, msgLeafHash(content), "c2");
+    expect(snm.readQuarantined("alice", sid3).length, "precondition: this one could not be retained either").toBe(0);
+    const [notice] = snm.takeContentRefusals("alice", sid3, "op");
+    expect(notice?.reason).toBe("session_orphaned");
+    expect(
+      notice!.guidance,
+      "a claim about durability is made AFTER the write. Telling an operator the evidence is kept " +
+      "and then answering no_refused_message_at_sequence spends their trust as well as their time.",
+    ).not.toMatch(/was KEPT as evidence/);
+    expect(notice!.guidance, "and it names the cause, not just the absence").toMatch(/NOT RETAINED/);
+    expect(notice!.guidance, "with the event that says which cause it was").toMatch(/quarantine\.skipped/);
   });
 
   // ─── The bound this retention rests on ───────────────────────────────────────────────────────

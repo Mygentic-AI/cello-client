@@ -499,12 +499,20 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.guidance, "and it must NOT hedge — there is no judgement to make here")
       .not.toMatch(/when in doubt/i);
     /**
-     * And it names no reporting VERB, because CELLO_Reporting does not exist yet and the message
-     * itself is not retained. Naming a destination would be an instruction the operator cannot
-     * carry out. This assertion is the reminder to add one when those land.
+     * And it names no reporting DESTINATION, because `CELLO_Reporting` does not exist yet —
+     * `DOD-M15-ORPHANTRIAGE-1` owns it. Naming one would be an instruction the operator cannot carry
+     * out. This assertion is the reminder to add one when it lands.
+     *
+     * ⚠️ HALF THE OLD REASON IS GONE, and the sentence is corrected rather than left: it also said
+     * *"and the message itself is not retained"*. `DOD-M15-REFUSEDEVIDENCE-1` retains it, and the
+     * guidance now names the artifact — so what is missing is a place to send it, not a thing to
+     * send. The source comment this mirrors was rewritten with the fix; this copy was not, which is
+     * how a stale claim survives.
      */
     expect(notice!.guidance, "it does not name a destination that does not exist yet")
       .not.toMatch(/CELLO_Reporting/);
+    expect(notice!.guidance, "but it DOES name the retained artifact, which now exists")
+      .toMatch(/cello_quarantined/);
     expect(notice!.guidance, "and it does not invite a reply — that is what a probe wants").toMatch(/Do not try to reply/);
     /**
      * Rotating the address is advice that WORKS: `#startReceiverNode` mints the standing receiver's

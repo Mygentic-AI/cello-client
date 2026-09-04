@@ -330,13 +330,37 @@ export function createContentPark(deps: ContentParkDeps) {
               });
               screenDeferred = true;
             } else if (terminalBlock) {
-              // TERMINAL: the detector rejected the CONTENT itself, so identical bytes would be
-              // rejected identically forever — keeping it would restore the very re-pull loop this
-              // unit removes. Drop it from the relay and do NOT store it. Logged at warn with the
-              // hash, so the operator can see something was discarded and what it was.
+              /**
+               * TERMINAL: the detector rejected the CONTENT itself, so identical bytes would be
+               * rejected identically forever — leaving it on the relay would restore the re-pull
+               * loop this drain exists to end. It is still dropped from the relay and still never
+               * annexed (the annex is a READABLE record of the conversation, and this was never part
+               * of it).
+               *
+               * ⚠️ **BUT IT IS NO LONGER DISCARDED — review F6.** This comment used to end *"and do
+               * NOT store it"*, and that was the last route in the tree that threw a refused message
+               * away. `DOD-M15-REFUSEDEVIDENCE-1` retains every other one, and shipped guidance now
+               * tells operators that refused messages are kept — so this branch falsified a promise
+               * on the case with the most evidence value in the product: hostile bytes aimed at a
+               * conversation that has already been sealed.
+               *
+               * Quarantined, not annexed. The two are different answers to different questions: the
+               * annex is what arrived late and is readable, quarantine is what was refused and is
+               * withheld. Bounded by the same tier cap and deduped by content, so the loop stays
+               * closed.
+               */
+              const kept = sessionNodeManager.quarantineRefusedInbound(
+                recipientAgent.name, e.sessionIdHex, verdict.reason ?? "inbound_screen_blocked",
+                env.content, e.contentHashHex,
+                env.senderPubkey ? Buffer.from(env.senderPubkey).toString("hex") : null,
+                correlationId,
+              );
               logger.warn("content.recover.annex.screened_out", {
                 sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
-                impact: "content was terminally blocked by the inbound screen — discarded, NOT annexed",
+                retained: kept !== null,
+                impact: kept !== null
+                  ? "content was terminally blocked by the inbound screen — NOT annexed, and RETAINED as quarantined evidence"
+                  : "content was terminally blocked by the inbound screen and could NOT be retained — see session.content.quarantine.skipped or .failed",
                 correlationId,
               });
               screenedOut = true;

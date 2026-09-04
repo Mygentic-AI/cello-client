@@ -985,14 +985,14 @@ export const COMMANDS: readonly CommandSpec[] = [
       const { agent, pretty, positional } = parityOpts(args);
       // Same exemplar trap as the parity function: `0` and a negative are both real positions, so
       // presence is tested rather than truthiness.
+      //
+      // A value that will not parse is passed THROUGH rather than dropped — review F9. Coercing it
+      // to `undefined` here silently answered a different question (the index instead of the one
+      // message) with nothing saying so; the daemon refuses it by name, which is the honest answer
+      // and keeps one rule in one place.
       const raw = positional[1];
-      const seq = raw === undefined ? undefined : Number(raw);
-      return quarantined(
-        ctx.celloDir,
-        positional[0] ?? "",
-        seq !== undefined && Number.isInteger(seq) ? seq : undefined,
-        { agent, pretty },
-      );
+      const seq = raw === undefined ? undefined : Number.isInteger(Number(raw)) ? Number(raw) : raw;
+      return quarantined(ctx.celloDir, positional[0] ?? "", seq, { agent, pretty });
     },
   },
   {

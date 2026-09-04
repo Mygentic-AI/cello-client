@@ -451,7 +451,7 @@ export function transcript(celloDir: string, sessionId: string, opts: ParityOpti
  * The CLI exists alongside the MCP tool for the same reason the MCP tool exists at all: an operator
  * who cannot reach it here will get their agent to go looking, and find it unframed.
  */
-export function quarantined(celloDir: string, sessionId: string, sequence: number | undefined, opts: ParityOptions): Promise<CliOutput> {
+export function quarantined(celloDir: string, sessionId: string, sequence: number | string | undefined, opts: ParityOptions): Promise<CliOutput> {
   return ipcCommand(
     celloDir,
     IPC_METHODS.quarantined,
