@@ -411,6 +411,70 @@ describe("B: the deposit handler refuses like its siblings", () => {
     expect(events.filter((e) => e.event === "content.park.deposit.ipc.result")[0]!.context["retryAfterMs"]).toBe(45_000);
   });
 
+  /**
+   * E — **`#open` IS SHARED, SO THE REFUSAL HAS TO BE** (review MEDIUM-2).
+   *
+   * The deposit handler was fixed and its two siblings were not, so an unreachable relay still
+   * reached the operator as `internal_error` + "An unexpected error occurred. Check daemon logs for
+   * details." one handler over — on `content_park_recover`, which is one of the three failures this
+   * order was written from. A mutation restoring the rethrow survived every test until these.
+   */
+  const RECIPIENT = "aa".repeat(32);
+  function parkFor(clientImpl: Record<string, unknown>): { handlers: Map<string, IpcHandler>; events: LogEvent[] } {
+    const { logger, events } = makeLogger();
+    const park = createContentPark({
+      logger,
+      sessionNodeManager: {
+        getStandingReceiverNode: () => fakeNode({ dial: async () => {}, newStream: async () => inertStream() }),
+        standingReceiverAbsenceReason: () => "no_standing_receiver",
+      } as never,
+      agents: [{ name: "alice", state: "online", pubkey: RECIPIENT }] as never,
+      getKeyProvider: () => ({ sign: async () => new Uint8Array(64), openContentSeal: async () => null }) as never,
+      securityGateway: { screenInbound: async () => ({ verdict: "allow" }), screenOutbound: async () => ({ verdict: "allow" }) } as never,
+      makeContentParkClient: () => clientImpl as never,
+    });
+    const handlers = new Map<string, IpcHandler>();
+    park.registerHandlers(handlers);
+    return { handlers, events };
+  }
+
+  it("E1: content_park_pull maps the transport wrap instead of throwing into internal_error", async () => {
+    const { handlers } = parkFor({
+      pull: async () => { throw unreachable("no_connection"); },
+    });
+
+    const res = (await handlers.get("content_park_pull")!(
+      { relayMultiaddr: ADDR_A, recipientPubkey: RECIPIENT }, "c1",
+    )) as { ok?: boolean; reason?: string; guidance?: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("relay_unreachable:no_connection");
+    expect(res.guidance).toContain("cello_initiate_session");
+  });
+
+  it("E2: content_park_pull tells a version skew apart from an outage, like deposit does", async () => {
+    const { handlers } = parkFor({ pull: async () => { throw unreachable("protocol_not_supported"); } });
+    const res = (await handlers.get("content_park_pull")!(
+      { relayMultiaddr: ADDR_A, recipientPubkey: RECIPIENT }, "c1",
+    )) as { reason?: string; guidance?: string };
+    expect(res.reason).toBe("relay_protocol_unsupported");
+    expect(res.guidance).not.toContain("Retry once the relay is up");
+  });
+
+  it("E3: content_park_recover maps it too — the handler the order's own evidence names", async () => {
+    const { handlers } = parkFor({ pull: async () => { throw unreachable("no_connection"); } });
+
+    const res = (await handlers.get("content_park_recover")!(
+      { relayMultiaddr: ADDR_A, recipientPubkey: RECIPIENT }, "c1",
+    )) as { ok?: boolean; reason?: string; guidance?: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("relay_unreachable:no_connection");
+    // NOT the bare "Recover failed." default, which names no next step at all.
+    expect(res.guidance).toContain("cello_initiate_session");
+    expect(res.guidance).not.toBe("Recover failed.");
+  });
+
   it("B3: a refusal the relay ITSELF returned is still passed through unchanged", async () => {
     const { handlers, events } = handlersFor(async () => ({ ok: false, reason: "rate_limited" }));
 
