@@ -374,8 +374,8 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
       notice!.guidance,
       "a claim about durability is made AFTER the write. Telling an operator the evidence is kept " +
       "and then answering no_refused_message_at_sequence spends their trust as well as their time.",
-    ).not.toMatch(/was KEPT as evidence/);
-    expect(notice!.guidance, "and it names the cause, not just the absence").toMatch(/NOT RETAINED/);
+    ).not.toMatch(/The message itself WAS kept/);
+    expect(notice!.guidance, "and it names the cause, not just the absence").toMatch(/could NOT be kept/);
     expect(notice!.guidance, "with the event that says which cause it was").toMatch(/quarantine\.skipped/);
   });
 
