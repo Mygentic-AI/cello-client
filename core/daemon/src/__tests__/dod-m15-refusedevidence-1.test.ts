@@ -333,7 +333,7 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     ).toBe(1);
     // How often it arrived is not lost — it is what the refusal notice counts.
     const [notice] = snm.takeContentRefusals("alice", SID, "op");
-    expect(notice?.count, "the arrival count lives on the notice, not in duplicate rows").toBe(5);
+    expect(notice?.timesSinceDismissed, "the arrival count lives on the notice, not in duplicate rows").toBe(5);
   });
 
   it("F1: the same bytes refused for a DIFFERENT reason keep their own row — that is a different fact", async () => {

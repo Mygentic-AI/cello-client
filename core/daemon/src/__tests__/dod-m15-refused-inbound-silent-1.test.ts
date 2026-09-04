@@ -115,7 +115,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const first = mgr.takeContentRefusals("alice", "s2", "op");
     expect(first.length, "told once").toBe(1);
     expect(
-      first[0]!.count,
+      first[0]!.timesSinceDismissed,
       "and the count carries the scale — deduplication must not make 90 look like 1",
     ).toBe(90);
 
@@ -182,7 +182,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     note();
-    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.timesSinceDismissed, "first refusal is the signal").toBe(1);
 
     for (let i = 0; i < 8; i++) note(); // 9 total — under the next order of magnitude
     expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "nine is not news").toEqual([]);
@@ -190,7 +190,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     note(); // 10
     const [again] = mgr.takeContentRefusals("alice", "s-scale", "op");
     expect(again, "ten times is a different fact about the problem than once").toBeDefined();
-    expect(again!.count).toBe(10);
+    expect(again!.timesSinceDismissed).toBe(10);
     expect(again!.repeat, "and it says it is a repeat, so a reader can present it as an escalation").toBe(true);
 
     for (let i = 0; i < 89; i++) note(); // 99

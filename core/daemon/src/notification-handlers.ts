@@ -226,7 +226,15 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         kind: r.kind,
         impact: r.impact,
         guidance: r.guidance,
-        times: r.count,
+        /**
+         * DOD-M15-REFUSALTERMINAL-1 — TWO NUMBERS, AND NEITHER IS CALLED `times`.
+         *
+         * `times` was the drained-by-dismissal counter wearing a lifetime name. Live on 2026-09-04
+         * an operator read `times: 58` for a refusal that had fired tens of thousands of times over
+         * two and a half days, and concluded it was minor.
+         */
+        times_since_dismissed: r.timesSinceDismissed,
+        ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
         ...(r.repeat === true ? { repeat: true } : {}),
       })),
       // Say the list was cut ON THE LIST, not only in a log nobody opens — same rule as
@@ -234,11 +242,16 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       ...(truncated ? { refusals_incomplete: true } : {}),
       refusals_guidance:
         header +
-        "\n\nThese are grouped by session_id, and `times` is how many messages that reason has " +
-        "refused on that session — a large number means the cause is still live, not that it " +
-        "happened once. `repeat: true` means you have been told about this one before and it has " +
-        "grown by an order of magnitude since. TELL THE OPERATOR. A refusal that reaches an agent " +
-        "and stops there is the same silence it was written to end." +
+        "\n\nThese are grouped by session_id, and they carry TWO counts. `times_total` is how many " +
+        "messages that reason has refused on that session since the first one — the real scale, and " +
+        "the number to judge severity by. `times_since_dismissed` counts only the refusals since the " +
+        "operator last ran cello_dismiss on that conversation, so it can be small while " +
+        "`times_total` is enormous; dismissing clears the notice, never the cause. If `times_total` " +
+        "is missing, this notice could not be written to disk (see session.refusal.persist.failed) " +
+        "and its true scale is unknown — do not read the smaller number as the total. " +
+        "`repeat: true` means you have been told about this one before and `times_since_dismissed` " +
+        "has grown by an order of magnitude since. TELL THE OPERATOR. A refusal that reaches an " +
+        "agent and stops there is the same silence it was written to end." +
         (truncated
           ? " refusals_incomplete: true means this list hit its cap and there are older ones not shown."
           : ""),

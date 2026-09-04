@@ -19,7 +19,7 @@ import { MAX_CONTENT_BYTES } from "@cello-protocol/protocol-types";
 import { TIER } from "./contacts-tier-migration.js";
 import { GATEWAY_UNAVAILABLE, GOVERNANCE_TIMEOUT, type SecurityGatewayClient } from "@cello-protocol/gateway";
 import type { IpcHandler } from "./ipc-server.js";
-import type { SessionNodeManager } from "./session-node-manager.js";
+import type { RefusalNotice, SessionNodeManager } from "./session-node-manager.js";
 import type { RetryQueue } from "./retry-queue.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -71,7 +71,9 @@ function refusalsField(
    */
   consumerId: string,
 ): {
-  refusals?: Array<{ reason: string; kind: RefusalKind; impact: string; guidance: string; count: number }>;
+  // DOD-M15-REFUSALTERMINAL-1: the drain's own shape, so the two counts and their names reach this
+  // door too. Naming them again here is how the receive door and the inbox drifted apart before.
+  refusals?: Array<Omit<RefusalNotice, "sessionId">>;
   refusal_guidance?: string;
 } {
   const refusals = mgr.takeContentRefusals(agentName, sessionId, consumerId);

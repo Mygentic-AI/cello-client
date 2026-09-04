@@ -757,6 +757,61 @@ export const REVIVE_RESERVATION_CANDIDATES = 2;
 export const LEAF_FETCH_GRACE_MS = 2_000;
 
 /**
+ * DOD-M15-REFUSALTERMINAL-1 — the refusal reasons no retry can ever get past.
+ *
+ * MEASURED LIVE 2026-09-04: one message aimed at a conversation the counterparty had already
+ * closed, refused `session_committed` and re-fetched roughly twice a second for 62 hours across
+ * several daemon restarts — 232,056 refusal events on that one session and a 484 MB `daemon.log`.
+ *
+ * **WHY `session_committed` QUALIFIES.** A committed session carries a signature over its contents.
+ * Nothing can be appended to it by anyone — not the counterparty, not us — so there is no future
+ * state in which this content is accepted. That is the bar, and it is the whole bar.
+ *
+ * **⚠️ DO NOT ADD A REASON WITHOUT MEETING IT.** A reason wrongly called terminal silently drops a
+ * message that would have arrived on the next try, which is worse than the loop this set exists to
+ * end. The tempting ones and why each fails:
+ *
+ *   - `content_hash_mismatch` — the fetch is BY CONTENT HASH, and a later fetch may retrieve a
+ *     correct copy from a different relay. Retrying can succeed.
+ *   - `sender_unresolved` — the sender may become resolvable when a profile arrives or a directory
+ *     syncs. Retrying can succeed.
+ *   - `session_orphaned` — `024-ORPHANTRIAGE` owns that path and decides its disposition.
+ *   - `session_size_limit_exceeded` — the cap IS monotonic, but its bound is a setting, and an
+ *     operator who raises it must be able to un-stick the conversation.
+ *   - a transient screener block — transient is in its name.
+ */
+export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set(["session_committed"]);
+
+/**
+ * DOD-M15-REFUSALTERMINAL-1 — ONE refusal, TWO counts, and the NAMES are the fix.
+ *
+ * The inbox reported `times: 58` for a refusal that had fired tens of thousands of times, and the
+ * code was not wrong — the sentence describing it was. One number is "since you last dismissed this
+ * conversation" and the other is "ever". Neither may be called `times`, because that is the word an
+ * operator, and an agent deciding whether to escalate, reads as a lifetime figure.
+ */
+export interface RefusalNotice {
+  sessionId: string;
+  reason: string;
+  kind: RefusalKind;
+  impact: string;
+  guidance: string;
+  /** Refusals of this reason on this session since the last `cello_dismiss` — which DELETES the
+   *  notice row, restarting this counter at 1. Zero dismissals and it equals `timesTotal`. */
+  timesSinceDismissed: number;
+  /**
+   * Every refusal of this reason on this session, from the first one, untouched by dismissal.
+   *
+   * OMITTED, never guessed, when the notice is served from the in-memory fallback — that path
+   * exists precisely because the database write failed, so no durable total was ever written, and
+   * reporting the smaller number twice would put the original lie back with two names on it.
+   */
+  timesTotal?: number;
+  repeat?: boolean;
+}
+
+
+/**
  * DOD-M15-SEALWIRE-1 bullet 5, SENT half — our own authorship proof for a message we sent.
  *
  * Deliberately the SAME shape as the received half's `verifiedAuthorship`, because the transcript
@@ -1342,6 +1397,20 @@ export class SessionNodeManager {
   /** In-flight grace timers, keyed session+hash, so a redelivered leaf does not schedule a second
    *  fetch for the same content — a slow relay must not be turned into a storm against itself. */
   #leafFetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  /**
+   * DOD-M15-REFUSALTERMINAL-1: content hashes refused for a reason no retry can get past — a READ
+   * CACHE over `terminal_content_refusals`, never the record itself.
+   *
+   * ⚠️ **NOT the same fact as `#resolvedContent`, and collapsing them is the trap.** "Resolved"
+   * means we HAVE the content. Terminally refused means we have it and are never accepting it.
+   * Filing one under the other tells the next reader that refused content was delivered.
+   */
+  #terminallyRefused = new Map<string, Set<string>>();
+
+  /** Sessions whose terminal-refusal rows have been read from the database into the map above.
+   *  Nothing ever un-marks content, so a loaded set only grows and can never go stale. */
+  #terminalRefusalsLoaded = new Set<string>();
 
   /** Test seam: collapse the grace window so a test does not have to wait two real seconds. The
    *  window itself is covered by its own case. */
@@ -2905,6 +2974,55 @@ export class SessionNodeManager {
         first_at INTEGER NOT NULL,
         last_at INTEGER NOT NULL,
         PRIMARY KEY (agent_id, session_id, reason)
+      )
+    `);
+    /**
+     * DOD-M15-REFUSALTERMINAL-1 — the lifetime refusal count, which `content_refusal_notices` is
+     * NOT and never was.
+     *
+     * `cello_dismiss` DELETEs the notice row (`dismissContentRefusals`), so `notices.count` restarts
+     * at 1 after every dismissal. That is correct for the notice — the operator said "I know" and
+     * the next announcement should describe what happened since — and it is exactly why the number
+     * shown beside it cannot be described as a lifetime figure. Live on 2026-09-04 an inbox reported
+     * `times: 58` for a refusal that had fired tens of thousands of times.
+     *
+     * A separate table rather than a column, because the two have different lifetimes: this one is
+     * never deleted by anything an operator does. Same key, so the read is one LEFT JOIN.
+     */
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS content_refusal_totals (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        total INTEGER NOT NULL,
+        first_at INTEGER NOT NULL,
+        last_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id, reason)
+      )
+    `);
+    /**
+     * DOD-M15-REFUSALTERMINAL-1 — content this agent will never accept, so the daemon stops going
+     * to fetch it.
+     *
+     * **DURABLE BECAUSE THE DEFECT CROSSED RESTARTS.** The 62-hour loop spanned several `cello
+     * login` cycles; a marker held in a `Set` on the manager would have passed every test and
+     * shipped nothing.
+     *
+     * NOT the `'quarantined'` transcript row, which is the natural candidate and does not work: it
+     * is keyed on the BYTES, and the fetch scheduler is keyed on the content hash the sender
+     * committed to. On the two refusals where those provably differ (a tamper, an algorithm we
+     * cannot read) the row cannot answer the question this table is asked.
+     *
+     * Keyed on `agent_id` — the stable key. `agent_name` is a display label.
+     */
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS terminal_content_refusals (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        marked_at INTEGER NOT NULL,
+        PRIMARY KEY (agent_id, session_id, content_hash)
       )
     `);
     this.#db.exec(`
@@ -9014,6 +9132,23 @@ export class SessionNodeManager {
              guidance = excluded.guidance, last_at = excluded.last_at`,
         )
         .run(agentId, sessionId, reason, detail.kind, detail.impact, detail.guidance, now, now);
+      /**
+       * DOD-M15-REFUSALTERMINAL-1 — the lifetime tally, in the SAME `try` on purpose.
+       *
+       * If the notice write failed there is no notice to hang a total off, and the fallback below
+       * has no durable counterpart to read — so the two must fail together. A total that survived a
+       * failed notice would be a number nobody could see, and one that was written twice for a
+       * retried notice would be worse than absent.
+       */
+      this.#db
+        .prepare(
+          `INSERT INTO content_refusal_totals
+             (agent_id, session_id, reason, total, first_at, last_at)
+           VALUES (?, ?, ?, 1, ?, ?)
+           ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
+             total = total + 1, last_at = excluded.last_at`,
+        )
+        .run(agentId, sessionId, reason, now, now);
     } catch (err: unknown) {
       this.#logger.error("session.refusal.persist.failed", {
         agentName, sessionId, reason,
@@ -9113,7 +9248,7 @@ export class SessionNodeManager {
      * forget it is.
      */
     consumerId: string,
-  ): Array<{ reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }> {
+  ): Array<Omit<RefusalNotice, "sessionId">> {
     // `sessionId` is dropped from each entry: the caller passed it in and every entry carries the
     // same one, so repeating it back would be a field that can never say anything. The agent-wide
     // door below keeps it, because there it is the only thing that says WHICH conversation.
@@ -9134,7 +9269,7 @@ export class SessionNodeManager {
   takeAgentContentRefusals(
     agentName: string,
     consumerId: string,
-  ): { notices: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }>; truncated: boolean } {
+  ): { notices: RefusalNotice[]; truncated: boolean } {
     return this.#drainRefusals(agentName, consumerId);
   }
 
@@ -9148,8 +9283,8 @@ export class SessionNodeManager {
     agentName: string,
     consumerId: string,
     sessionId?: string,
-  ): { notices: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }>; truncated: boolean } {
-    const out: Array<{ sessionId: string; reason: string; kind: RefusalKind; impact: string; guidance: string; count: number; repeat?: boolean }> = [];
+  ): { notices: RefusalNotice[]; truncated: boolean } {
+    const out: RefusalNotice[] = [];
     let truncated = false;
     const now = Date.now();
     let agentId: string | null = null;
@@ -9186,11 +9321,15 @@ export class SessionNodeManager {
         sessionId === undefined
           ? this.#db
               .prepare(
-                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count
+                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
+                        t.total AS lifetime_total
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
                     AND r.reason = n.reason AND r.consumer_id = ?
+                   LEFT JOIN content_refusal_totals t
+                     ON t.agent_id = n.agent_id AND t.session_id = n.session_id
+                    AND t.reason = n.reason
                   WHERE n.agent_id = ?
                     AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
                   ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
@@ -9198,11 +9337,15 @@ export class SessionNodeManager {
               .all(consumerId, agentId, MAX_REFUSALS_PER_READ + 1)
           : this.#db
               .prepare(
-                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count
+                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
+                        t.total AS lifetime_total
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
                     AND r.reason = n.reason AND r.consumer_id = ?
+                   LEFT JOIN content_refusal_totals t
+                     ON t.agent_id = n.agent_id AND t.session_id = n.session_id
+                    AND t.reason = n.reason
                   WHERE n.agent_id = ? AND n.session_id = ?
                     AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
                   ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
@@ -9211,6 +9354,7 @@ export class SessionNodeManager {
       ) as Array<{
         session_id: string; reason: string; kind: string; impact: string;
         guidance: string; count: number; seen_count: number | null;
+        lifetime_total: number | null;
       }>;
       if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
       for (const row of rows) {
@@ -9242,7 +9386,13 @@ export class SessionNodeManager {
           kind: row.kind as RefusalKind,
           impact: row.impact,
           guidance: row.guidance,
-          count: row.count,
+          timesSinceDismissed: row.count,
+          /**
+           * DOD-M15-REFUSALTERMINAL-1. `null` here means the totals row is genuinely absent — a
+           * notice written before this table existed — and is reported as ABSENT rather than as the
+           * smaller number, which is the substitution this unit exists to remove.
+           */
+          ...(row.lifetime_total === null ? {} : { timesTotal: row.lifetime_total }),
           ...(firstTime ? {} : { repeat: true }),
         });
       }
@@ -9274,9 +9424,12 @@ export class SessionNodeManager {
           const oldest = notice.surfacedTo.keys().next();
           if (!oldest.done) notice.surfacedTo.delete(oldest.value);
         }
+        // `timesTotal` is deliberately absent: this notice exists because the durable write failed,
+        // so there is no lifetime record to report and inventing one from `notice.count` would
+        // restore the exact misreading this unit removes.
         fromFallback.push({
           sessionId: sid, reason, kind: notice.kind, impact: notice.impact,
-          guidance: notice.guidance, count: notice.count,
+          guidance: notice.guidance, timesSinceDismissed: notice.count,
           ...(firstTime ? {} : { repeat: true }),
         });
       }
@@ -9637,6 +9790,16 @@ export class SessionNodeManager {
       this.#quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
+      /**
+       * DOD-M15-REFUSALTERMINAL-1 — STOP THE WORK. Recorded AFTER the bytes are retained, so the
+       * evidence exists before anything stops going to look for it.
+       *
+       * Without this, the relay's next redelivery of the witness leaf armed another park fetch,
+       * which drained, verified, arrived here, and was refused again — measured at ~2 per second for
+       * 62 hours on one message. `#markContentResolved` cannot be reused for it: this content did
+       * not land, and saying that it did is a lie a future reader would act on.
+       */
+      this.#considerTerminalRefusal(agentName, sessionId, contentHashHex, "session_committed");
       // DOD-M15-NO-SILENT-REFUSAL-1. `currentStatus` on the log line carries the REAL status —
       // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
       // one claim, so it names the record as frozen rather than asserting which way it ended.
@@ -10518,9 +10681,107 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * DOD-M15-REFUSALTERMINAL-1 — the funnel. A refusal stops the work ONLY if its reason is in
+   * `TERMINAL_REFUSAL_REASONS`; every other reason keeps retrying, which is what makes a transient
+   * screener block or a version skew recoverable.
+   *
+   * One place decides, so "is this reason terminal?" is answerable from the set rather than from
+   * thirteen call sites.
+   */
+  #considerTerminalRefusal(agentName: string, sessionId: string, contentHashHex: string, reason: string): void {
+    if (!TERMINAL_REFUSAL_REASONS.has(reason)) return;
+    this.#markContentTerminallyRefused(agentName, sessionId, contentHashHex, reason);
+  }
+
+  /**
+   * DOD-M15-REFUSALTERMINAL-1: this content can NEVER be accepted on this session — cancel the
+   * pending fetch and make sure no future one is scheduled, across restarts.
+   *
+   * The durable write comes FIRST and the in-memory cache second, so a process that dies between
+   * them wakes up with the stop still in force. A failed write is announced at ERROR and the
+   * in-memory mark is still taken: the loop stops for the life of THIS process, and the log says
+   * plainly that it will resume after a restart. That is a degraded stop, not a silent one.
+   */
+  #markContentTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string, reason: string): void {
+    const key = this.#k(agentName, sessionId);
+    try {
+      if (!this.#db) throw new Error("database is not open");
+      this.#db
+        .prepare(
+          `INSERT OR IGNORE INTO terminal_content_refusals
+             (agent_id, session_id, content_hash, reason, marked_at)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(this.#requireAgentId(agentName), sessionId, contentHashHex, reason, Date.now());
+    } catch (err: unknown) {
+      this.#logger.error("session.content.terminal_refusal.persist.failed", {
+        agentName, sessionId, reason,
+        contentHash: contentHashHex,
+        error: extractErrorMessage(err),
+        impact:
+          "this message can never be accepted on this conversation, and that fact could not be written down. Fetching for it stops while this daemon runs, and RESUMES after the next restart — which is the loop that filled a log with a quarter of a million refusals for one message.",
+        guidance:
+          "This is a fault on THIS machine, not with the counterparty. Check free disk space and the permissions on ~/.cello; session.refusal.persist.failed in this log usually appears alongside it with the underlying error.",
+      });
+    }
+    let set = this.#terminallyRefused.get(key);
+    if (!set) { set = new Set(); this.#terminallyRefused.set(key, set); }
+    set.add(contentHashHex);
+    // The same cancellation `#markContentResolved` performs, for the opposite fact: an already-armed
+    // grace timer must not fire for content we have just decided never to accept.
+    const timerKey = `${key}::${contentHashHex}`;
+    const t = this.#leafFetchTimers.get(timerKey);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.#leafFetchTimers.delete(timerKey);
+    }
+    this.#logger.info("session.content.terminal_refusal", {
+      agentName, sessionId, reason,
+      contentHash: contentHashHex,
+      impact:
+        "no further attempt will be made to fetch this message. The conversation it was sent to is closed and signed, so no retry could ever have succeeded.",
+    });
+  }
+
+  /**
+   * DOD-M15-REFUSALTERMINAL-1: has this content already been refused terminally?
+   *
+   * Reads the durable rows for a session ONCE and caches them, so the hot path — a witnessed leaf
+   * on a healthy session — costs one `Set` lookup rather than a query per message. A read failure
+   * returns `false`: the cost is the loop continuing, which is the pre-fix behaviour, and it is
+   * announced rather than swallowed. Answering `true` on a failed read would be the dangerous
+   * direction, because it silently stops fetching content that was never refused.
+   */
+  #isTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string): boolean {
+    const key = this.#k(agentName, sessionId);
+    if (!this.#terminalRefusalsLoaded.has(key) && this.#db) {
+      try {
+        const rows = this.#db
+          .prepare("SELECT content_hash FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ?")
+          .all(this.#requireAgentId(agentName), sessionId) as Array<{ content_hash: string }>;
+        let set = this.#terminallyRefused.get(key);
+        if (!set) { set = new Set(); this.#terminallyRefused.set(key, set); }
+        for (const r of rows) set.add(r.content_hash);
+        this.#terminalRefusalsLoaded.add(key);
+      } catch (err: unknown) {
+        this.#logger.error("session.content.terminal_refusal.read.failed", {
+          agentName, sessionId,
+          error: extractErrorMessage(err),
+          impact:
+            "the record of messages this conversation can never accept could not be read, so this daemon may keep fetching one of them. Nothing is lost; the cost is repeated work and log noise.",
+        });
+      }
+    }
+    return this.#terminallyRefused.get(key)?.has(contentHashHex) === true;
+  }
+
   #scheduleLeafFetchIfUnresolved(agentName: string, sessionId: string, contentHashHex: string): void {
     const key = this.#k(agentName, sessionId);
     if (this.#resolvedContent.get(key)?.has(contentHashHex)) return;
+    // DOD-M15-REFUSALTERMINAL-1: a refusal nothing can get past is the end of the work, not a
+    // reason to come back in two seconds.
+    if (this.#isTerminallyRefused(agentName, sessionId, contentHashHex)) return;
     const timerKey = `${key}::${contentHashHex}`;
     // ONE fetch per content hash. The relay redelivers, and a redelivery carries the same sequence —
     // scheduling per redelivery turns a slow relay into a storm against itself.
