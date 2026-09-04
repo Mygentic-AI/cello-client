@@ -370,6 +370,18 @@ describe("B: the deposit handler refuses like its siblings", () => {
     expect(dialed, "nothing is dialled for an address that cannot name a peer").toBe(false);
   });
 
+  it("D9: a CIRCUIT relay address resolves to the RELAY, not to `<relay>/p2p-circuit`", async () => {
+    // The old extraction took everything after the first `/p2p/`, so a circuit address produced a
+    // "peer id" with a path glued to it that only `newStream` rejected. Taking the segment is both
+    // more correct and what stops the shape check above refusing a legitimate address.
+    const { handlers } = handlersFor(async () => ({ ok: true }));
+    const res = (await handlers.get("content_park_deposit")!(
+      { ...params, relayMultiaddr: `/ip4/127.0.0.1/tcp/4001/p2p/${RELAY_PEER}/p2p-circuit/p2p/${RELAY_PEER}` },
+      "c1",
+    )) as { ok?: boolean; reason?: string };
+    expect(res.ok, "a circuit address is a legitimate address, not a malformed one").toBe(true);
+  });
+
   it("B4: EVERY refusal is logged, not only the two that reach the relay", async () => {
     // Review MEDIUM-3: eleven exits returned in silence, including `agent_not_found` and
     // `session_not_found` — both live spine-failure shapes. This is the same hole 019-PARKERROR

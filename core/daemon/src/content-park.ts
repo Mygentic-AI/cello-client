@@ -76,7 +76,10 @@ export function createContentPark(deps: ContentParkDeps) {
   const PEER_ID_SHAPE = /^(1[1-9A-HJ-NP-Za-km-z]{47,52}|Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3Koo[1-9A-HJ-NP-Za-km-z]{45,50})$/;
   const parseRelayPeer = (multiaddr: string | undefined): { peerId: string; addr: string } | null => {
     if (!multiaddr) return null;
-    const peerId = multiaddr.split("/p2p/")[1];
+    // Up to the next `/`, so a CIRCUIT address (`…/p2p/<relay>/p2p-circuit/p2p/<target>`) yields the
+    // relay rather than `<relay>/p2p-circuit` — which the old form produced and only `newStream`
+    // ever rejected, four layers down, as an invalid peer id.
+    const peerId = multiaddr.split("/p2p/")[1]?.split("/")[0];
     return peerId && PEER_ID_SHAPE.test(peerId) ? { peerId, addr: multiaddr } : null;
   };
 
