@@ -134,16 +134,47 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
      * `#freezeOnIdentityFailure` is for a proof that FAILED — a positive identity fault. An absent
      * proof is a version skew until proven otherwise, and freezing on it would turn every
      * un-upgraded peer into an incident that only a new session can clear.
+     *
+     * ⚠️ **THIS TEST WAS HOLLOW AND THE REVIEWER MEASURED IT.** It asserted the no-freeze half
+     * alone — which was ALREADY TRUE before this unit, because the frame was simply ingested. So it
+     * was green on `origin/main`, failed the revert test, and its name promised two facts while it
+     * held the one that needed no holding. Both halves are asserted now: the refusal is the fact
+     * this unit adds, and the no-freeze is the fact it must not break.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-nofreeze-" });
     await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
 
     await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({}), PEER);
 
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice, "the message is REFUSED — this is the half that was not asserted").toBeDefined();
+    expect(notice!.reason).toBe("authorship_proof_absent");
     expect(
       fx.eventsNamed("session.content.identity.frozen"),
       "a missing passport is not evidence about the counterparty's key",
     ).toHaveLength(0);
+  }, 60_000);
+
+  it("★ a sender_signature with NO structure1_cbor is refused, and the log says WHICH half is missing", async () => {
+    /**
+     * Review T3: the `hasStructure1` / `hasSenderSignature` fields were added so an investigator
+     * would not have to guess which half a peer omitted, and nothing asserted either of them. A
+     * sender on an older build supplies neither; a frame stripped in flight is likelier to be
+     * missing one, and the two must be tellable apart.
+     */
+    const kp = generateKeypair();
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-halfproof-" });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({
+      sender_signature: await kp.sign(new Uint8Array([1, 2, 3])),
+    }), PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice!.reason).toBe("authorship_proof_absent");
+    const logged = fx.eventsNamed("session.content.refused").at(-1)!;
+    expect(logged.ctx["hasStructure1"], "there were no signed bytes to check the signature against").toBe(false);
+    expect(logged.ctx["hasSenderSignature"], "and the signature itself did arrive — that is the distinction").toBe(true);
   }, 60_000);
 
   it("★ a signature that DOES NOT VERIFY still freezes — the existing FATAL verdict, unchanged", async () => {
