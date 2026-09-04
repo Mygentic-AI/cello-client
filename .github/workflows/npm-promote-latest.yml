@@ -1,0 +1,103 @@
+# Promote the published packages from `beta` to `latest`.
+#
+# ─── Why this exists ──────────────────────────────────────────────────────────────────────────
+#
+# CI publishes to `beta`. The default operator install path — `npx @cello-protocol/connect`,
+# `npm i -g @cello-protocol/cli@latest` — reads `latest`. So a release is not actually delivered
+# until `latest` moves, and until then the published code is invisible to every install.
+#
+# Moving it was a manual `npm dist-tag add` run from a laptop. That has two problems:
+#
+#   1. it needs a working local npm token, and the laptop's token expires silently — `npm whoami`
+#      answers 401 long before anyone notices, always at the moment a release is waiting;
+#   2. seven packages promoted by hand is seven chances to skip one, and a half-promoted graph is
+#      worse than an unpromoted one — `latest` then resolves to a mix of old and new.
+#
+# NPM_TOKEN already lives here and is proven publishable by `npm-credential-check.yml`. So the
+# promotion runs here too, all seven together, or not at all.
+#
+# ⚠️ EVERY PACKAGE IS PROMOTED, not just the ones that changed. An unchanged package re-pointed at
+# the version it already carries is a harmless no-op, and it is what guarantees the whole `latest`
+# graph is internally consistent afterwards.
+#
+# The version promoted is whatever that package's `beta` tag currently points at. `confirm_connect`
+# is the guard on that: it must match connect's current beta version, so a run cannot silently
+# promote a build nobody looked at.
+
+name: npm promote to latest
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_connect:
+        description: "connect's beta version, exactly (guards against promoting an unexpected build)"
+        required: true
+        type: string
+
+jobs:
+  promote:
+    name: beta -> latest, all seven
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: The build being promoted is the one that was asked for
+        run: |
+          # Read connect's beta version and compare it to the input. If someone tagged another
+          # release between the verify and this run, this is what catches it.
+          actual=$(npm view @cello-protocol/connect@beta version)
+          echo "connect beta = $actual, expected = ${{ inputs.confirm_connect }}"
+          if [ "$actual" != "${{ inputs.confirm_connect }}" ]; then
+            echo "FAIL: connect's beta is $actual, not ${{ inputs.confirm_connect }}."
+            echo "Something else published since you read the version. Re-verify before promoting."
+            exit 1
+          fi
+
+      - name: Promote
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          # Dependency order, so that at no point does a promoted package's `latest` depend on an
+          # unpromoted one. The cross-pins are exact versions, so this is belt-and-braces — but a
+          # partial failure halfway down leaves a coherent prefix rather than a broken middle.
+          FAILED=0
+          for pkg in crypto protocol-types transport gateway daemon cli connect; do
+            ver=$(npm view "@cello-protocol/$pkg@beta" version 2>/dev/null || echo "")
+            if [ -z "$ver" ]; then
+              echo "FAIL: @cello-protocol/$pkg has no beta version to promote"
+              FAILED=1
+              continue
+            fi
+            if out=$(npm dist-tag add "@cello-protocol/$pkg@$ver" latest 2>&1); then
+              echo "$out"
+            else
+              echo "$out"
+              echo "FAIL: could not promote @cello-protocol/$pkg@$ver"
+              FAILED=1
+            fi
+          done
+          exit $FAILED
+
+      - name: Verify latest resolves to the promoted versions
+        run: |
+          # npm's CDN can lag a just-set dist-tag by a minute or two, so this retries rather than
+          # false-failing a promotion that actually took. The `+latest:` lines above are the
+          # authoritative confirmation; this step is the second opinion.
+          FAILED=0
+          for pkg in crypto protocol-types transport gateway daemon cli connect; do
+            want=$(npm view "@cello-protocol/$pkg@beta" version)
+            for attempt in $(seq 1 6); do
+              got=$(npm view "@cello-protocol/$pkg@latest" version 2>/dev/null || echo "missing")
+              if [ "$want" = "$got" ]; then echo "OK: @cello-protocol/$pkg latest=$got"; break; fi
+              echo "… @cello-protocol/$pkg latest=$got expected=$want (attempt $attempt/6) — waiting for npm propagation"
+              sleep 10
+              if [ "$attempt" = "6" ]; then
+                echo "FAIL: @cello-protocol/$pkg latest=$got expected=$want after retries"
+                FAILED=1
+              fi
+            done
+          done
+          exit $FAILED
