@@ -30,7 +30,7 @@ import { generateKeypair, msgLeafHash } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
-import { seedAgents } from "./helpers/seed-agents.js";
+import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -88,30 +88,48 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
   }
 
   const SID = "9a".repeat(16);
-  const A_PUB = "aa".repeat(32);
-  const B_PUB = "bb".repeat(32);
+  /**
+   * DOD-M15-AUTHORSHIP-ABSENT-1: THE COUNTERPARTY KEYS ARE THE REAL ONES NOW.
+   *
+   * They were `"aa".repeat(32)` / `"bb".repeat(32)` — placeholders standing in for identities
+   * nothing checked. Every content frame carries the sender's signature over its own Structure 1
+   * and the receiver matches the signer against `counterparty_pubkey`; against a placeholder, alice
+   * signing with alice's own key is a stranger and her message is refused. Seeded per test, since
+   * each builds its own managers with their own agent rows.
+   */
 
   async function liveSession() {
     const A = makeManager();
     const B = makeManager();
     await A.manager.initialize();
     await B.manager.initialize();
-    await seedAgents(A.manager.getDb(), ["alice"]);
-    await seedAgents(B.manager.getDb(), ["bob"]);
+    const A_PUB = (await seedAgentKeys(A.manager.getDb(), ["alice"])).get("alice")!.pubkeyHex;
+    const B_PUB = (await seedAgentKeys(B.manager.getDb(), ["bob"])).get("bob")!.pubkeyHex;
+    // Production always wires the key providers too — without them A cannot sign what it sends.
+    await wireAgentKeyProviders(A.manager, A.manager.getDb());
+    await wireAgentKeyProviders(B.manager, B.manager.getDb());
     await B.manager.ensureStandingReceiverForAgent("bob");
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
     expect((await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs)).ok).toBe(true);
     expect((await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B")).ok).toBe(true);
-    // 007-CRYPTO: BOTH ends need the same agreed key — a live send is encrypted or it is not
-    // sent, and the receiver must be able to open it. This call is wrapped in `expect(...)`, so
-    // the sweep that seeded the plain `await` forms did not reach it and only one side had a key.
-    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
+    /**
+     * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
+     * `DOD-M15-AUTHORSHIP-ABSENT-1`.
+     *
+     * Both ends used to be handed `0x7e…`, because a FakeNode counterparty can never complete the
+     * ephemeral key exchange. This file's transport is REAL, and the identity keys wired above were
+     * the last thing that exchange was missing — so it completes on its own now, moments after the
+     * seed would have been written, and overwrites it on whichever side finishes last. Two ends
+     * sealing under different keys is `decrypt_failed` on every message.
+     *
+     * So the seed is gone and the test waits for the agreement it was standing in for.
+     */
+    expect(await pollFor(() => A.events.find((e) => e.event === "session.key.agreed")), "A must hold an agreed content key before it can send").not.toBeNull();
+    expect(await pollFor(() => B.events.find((e) => e.event === "session.key.agreed")), "and B must hold the same one before it can open the message").not.toBeNull();
     return { A, B };
   }
 
@@ -154,12 +172,21 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
   it("a session this side never dialled has no address to dial back with, and says so", async () => {
     const A = makeManager();
     await A.manager.initialize();
-    await seedAgents(A.manager.getDb(), ["alice"]);
+    await seedAgentKeys(A.manager.getDb(), ["alice"]);
+    await wireAgentKeyProviders(A.manager, A.manager.getDb());
+    // A counterparty key nobody will ever check: this session has no peer, never connects, and the
+    // assertion is about the RE-DIAL. Review L6 — this held alice's OWN key under the name `B_PUB`,
+    // which read as though a counterparty match were being exercised. None is.
+    const B_PUB = "bb".repeat(32);
     // The responder's half: it accepted a session it never dialled, so it holds no address for the
     // counterparty. That is a real limitation of this fix and the operator should be able to see it
     // rather than infer it from a message that parks.
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-A");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
+    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key. STILL
+    // SEEDED HERE, unlike the connected cases above: this session has no counterparty and never
+    // dials one, so nothing can complete the real exchange and there is no race to lose. Without a
+    // key the send refuses as `content_not_encryptable` and never reaches the re-dial branch this
+    // test is about.
     A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
 

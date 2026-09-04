@@ -438,6 +438,10 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
       content_bytes: sealSessionContent(CONTENT_KEY, BODY),
       content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
       structure1_cbor: s1,
+      // DOD-M15-AUTHORSHIP-ABSENT-1: the signature now rides on the FRAME, beside the bytes it
+      // signs, and that is where the receiver checks authorship from. Same value the relay commits
+      // inside Structure 2 — a real sender puts one signature in both places.
+      sender_signature: sig,
       structure2_cbor: s2,
     }) as Uint8Array).subarray();
     return { framed, signerHex: Buffer.from(senderPubkey).toString("hex") };
@@ -551,10 +555,20 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     ).toBeGreaterThan(0);
   }, 60_000);
 
-  it("★ the same frame with its ordering record REMOVED yields no key at all", async () => {
+  it("★ the same frame with its SIGNATURE removed never reaches triage at all", async () => {
     /**
      * The other half of the same measurement. Identical bytes, identical session, one field gone —
      * so a green above cannot be coming from anywhere except the verification.
+     *
+     * ⚠️ **WHAT THE MISSING FIELD NOW COSTS CHANGED WITH `DOD-M15-AUTHORSHIP-ABSENT-1`.** This test
+     * used to strip the whole ordering record and assert the orphan branch fired with `no key at
+     * all` — because an unprovable message was ingested and merely noted as unverified. It is
+     * refused before ingest now, so it never reaches triage, and the operator is told a message was
+     * turned away rather than being handed a report about a signer nobody could name.
+     *
+     * Rewritten, not deleted: the differential is the point and it still holds. The unsigned orphan
+     * prose is unchanged and still reachable — parked content recovered from the relay mailbox
+     * carries no ordering record and proves its sender by the envelope instead.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-wire-b-" });
     await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
@@ -570,7 +584,26 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     await fx.snm.handleContentFrameForTest("alice", SID, bare, PEER);
 
     const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
-    expect(notice!.guidance).toBe(REPORT_ONLY_UNSIGNED(retentionSentence(SID, -1)));
-    expect(fx.eventsNamed("session.content.orphaned").at(-1)!.ctx!["signatureVerified"]).toBe(false);
+    expect(notice!.reason, "no proof, no entry — and the orphan branch is downstream of that").toBe("authorship_proof_absent");
+    expect(
+      fx.eventsNamed("session.content.orphaned"),
+      "triage runs on messages that got IN far enough to have no home; this one did not get in",
+    ).toHaveLength(0);
+    /**
+     * ⚠️ **A LINE COMPARING A CONSTANT TO ITSELF WAS HERE** — review T2. It asserted that
+     * `REPORT_ONLY_UNSIGNED` contains a phrase `REPORT_ONLY_UNSIGNED` is built from, which cannot
+     * fail for a code reason, and it was doing the work of a claim it could not support: that the
+     * unsigned prose "is still what the park path renders". Nothing here drives the park path.
+     *
+     * What is true and worth pinning is narrower: the unsigned branch is unreachable from THIS
+     * path, because a frame with no checkable proof no longer reaches triage at all. The park route
+     * still can reach it — recovered mail carries no ordering record and proves its sender by the
+     * envelope — and no test in this file covers that, which is said out loud rather than implied
+     * by a tautology.
+     */
+    expect(
+      fx.eventsNamed("session.content.refused").at(-1)!.ctx["reason"],
+      "the forensic record names the same refusal the operator was shown — one fact, two surfaces",
+    ).toBe("authorship_proof_absent");
   }, 60_000);
 });

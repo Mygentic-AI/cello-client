@@ -25,7 +25,7 @@ import { Encoder } from "cbor-x";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
-import { seedAgents } from "./helpers/seed-agents.js";
+import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -148,13 +148,23 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const mgrB = await makeManager(b.logger, join(tempDir, "b.db"), nodeB);
     managers.push(mgrA, mgrB);
     // Production always has these rows: the daemon creates an agent long before it has a session.
-    await seedAgents(mgrA.getDb(), ["alice"]);
-    await seedAgents(mgrB.getDb(), ["bob"]);
+    /**
+     * DOD-M15-AUTHORSHIP-ABSENT-1: the counterparty keys are the REAL ones. They were `"bobpk"` and
+     * `"alicepk"` — placeholders for identities nothing checked. Every content frame now carries the
+     * sender's signature over its own Structure 1, and the receiver matches the signer against
+     * `counterparty_pubkey`; against a placeholder, alice signing with alice's key is a stranger and
+     * B refuses her message before it can ever be ACKed.
+     */
+    const alicePub = (await seedAgentKeys(mgrA.getDb(), ["alice"])).get("alice")!.pubkeyHex;
+    const bobPub = (await seedAgentKeys(mgrB.getDb(), ["bob"])).get("bob")!.pubkeyHex;
+    // And production always wires the key providers — without them A cannot sign what it sends.
+    await wireAgentKeyProviders(mgrA, mgrA.getDb());
+    await wireAgentKeyProviders(mgrB, mgrB.getDb());
 
-    await mgrA.createSessionNode(SID, "alice", "bobpk", nodeB.getPeerId(), "corr-a");
+    await mgrA.createSessionNode(SID, "alice", bobPub, nodeB.getPeerId(), "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
-    await mgrB.createSessionNode(SID, "bob", "alicepk", nodeA.getPeerId(), "corr-b");
+    await mgrB.createSessionNode(SID, "bob", alicePub, nodeA.getPeerId(), "corr-b");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrB.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
 
@@ -186,7 +196,8 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     const a = makeLogger();
     const mgrA = await makeManager(a.logger, join(tempDir, "a2.db"), nodeA);
     managers.push(mgrA);
-    await seedAgents(mgrA.getDb(), ["alice"]);
+    await seedAgentKeys(mgrA.getDb(), ["alice"]);
+    await wireAgentKeyProviders(mgrA, mgrA.getDb());
     await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));

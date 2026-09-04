@@ -46,7 +46,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
-import { seedAgents } from "./helpers/seed-agents.js";
+import { seedAgents, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -194,7 +194,18 @@ async function makeManager(logger: Logger, dbPath: string, node: CelloNode): Pro
   // DOD-AGENT-ID-JOINKEY-1: every test in this file drives the manager as "alice" — production
   // always has an `agents` row before a session exists, so seed one here rather than at every call site.
   await seedAgents(mgr.getDb(), ["alice"]);
+  // DOD-M15-AUTHORSHIP-ABSENT-1: and production always has the key providers too. Without them the
+  // manager cannot sign the Structure 1 that now rides on every content frame, so every send here
+  // would be exercising the refusal path instead of the behaviour the test is named for.
+  await wireAgentKeyProviders(mgr, mgr.getDb());
   return mgr;
+}
+
+/** Alice's own K_local pubkey, hex — what a counterparty on the other end of a LOOPBACK is. */
+function alicePubkeyHex(mgr: SessionNodeManager): string {
+  return (mgr.getDb()
+    .prepare("SELECT k_local_pubkey FROM agents WHERE agent_name = ?")
+    .get("alice") as { k_local_pubkey: string }).k_local_pubkey;
 }
 
 describe("DAEMON-004: SessionNodeManager tree persistence", () => {
@@ -422,7 +433,16 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("AC-001 correlationId (round-trip): content sent over the stream is ingested with the SAME correlationId", async () => {
     const node = new LoopbackFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "lb.db"), node as unknown as CelloNode);
-    await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    /**
+     * DOD-M15-AUTHORSHIP-ABSENT-1: ON A LOOPBACK, ALICE IS HER OWN COUNTERPARTY.
+     *
+     * The frame is now signed by the sending agent's identity key and the receiver checks the signer
+     * against `counterparty_pubkey`. With the placeholder `"bobpubkey"` here, this loopback would be
+     * a session whose counterparty is nobody — the receiving half would correctly refuse a message
+     * from a signer it has no record of, and the test would be measuring that instead of the
+     * round trip it is named for.
+     */
+    await mgr.createSessionNode(sid, "alice", alicePubkeyHex(mgr), "bob-peer-id", "corr-1");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("loopback-hi");
@@ -528,7 +548,11 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }
       const built = buildStructure2(seq, pubkey, contentHash, sig, new Uint8Array(32));
       if (!built.ok) throw new Error("buildStructure2 failed");
-      return { structure1Cbor, structure2Cbor: encodeStructure2(built.structure2), contentHash };
+      // DOD-M15-AUTHORSHIP-ABSENT-1: the signature rides on the FRAME as well, which is where the
+      // receiver now checks authorship from. Same bytes the relay commits at Structure 2 index 3 —
+      // a real sender puts one value in both places, so a fixture that used two would be testing a
+      // sender nobody ships.
+      return { structure1Cbor, structure2Cbor: encodeStructure2(built.structure2), contentHash, senderSignature: sig };
     };
 
     const sessionWithCounterparty = async (kp: ReturnType<typeof generateKeypair>, db: string) => {
@@ -553,11 +577,20 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       node.deliverFrame({
         type: "content_frame", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
-        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+        structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
 
-      expect(events.find((e) => e.event === "session.content.ordering.wrong_signer")).toBeDefined();
+      /**
+       * DOD-M15-AUTHORSHIP-ABSENT-1: the event moved with the check. It used to be
+       * `session.content.ordering.wrong_signer`, because the signer was only ever checked while
+       * reading the relay's ordering record; the frame's own signature is checked first now, and
+       * says so under its own name. The relay-record event still exists and still fires for a
+       * Structure 2 whose committed signature disagrees with the frame — a different fault.
+       */
+      const refuted = events.find((e) => e.event === "session.content.authorship.refuted");
+      expect(refuted).toBeDefined();
+      expect(refuted!.context.reason).toBe("signer_not_counterparty");
       expect(events.find((e) => e.event === "session.content.identity.frozen"), "the check must ACT, not just fire").toBeDefined();
       expect(events.find((e) => e.event === "session.content.received"), "nothing may be ingested").toBeUndefined();
       expect(mgr.readTranscript("alice", sid).messages.filter((m) => m.direction === "received")).toHaveLength(0);
@@ -572,7 +605,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       node.deliverFrame({
         type: "content_frame", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
-        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+        structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
 
@@ -596,7 +629,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       node.deliverFrame({
         type: "content_frame", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
-        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+        structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
       expect(events.find((e) => e.event === "session.content.identity.frozen"), "precondition").toBeDefined();
@@ -648,7 +681,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       node.deliverFrame({
         type: "content_frame", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
-        structure1_cbor: rec.structure1Cbor, structure2_cbor: rec.structure2Cbor,
+        structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature, structure2_cbor: rec.structure2Cbor,
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
 
@@ -669,29 +702,73 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       expect(events.find((e) => e.event === "session.content.sender_unresolved")).toBeDefined();
     });
 
-    it("a frame with NO ordering record still ingests, and SAYS it was unverified", async () => {
-      // The relay-degraded path: refusing here would make the relay a precondition for reading mail.
-      // But the weaker guarantee must not look identical to the stronger one in the log.
+    it("a frame with NO RELAY RECORD but a real signature still ingests — position is soft, identity is not", async () => {
+      /**
+       * ⚠️ **THIS TEST USED TO ASSERT THE DEFECT `DOD-M15-AUTHORSHIP-ABSENT-1` FIXED.** It was
+       * called *"a frame with NO ordering record still ingests, and SAYS it was unverified"*, and it
+       * pinned exactly that: a frame carrying nothing checkable was delivered, with a log line
+       * admitting nobody had checked who wrote it. Rewritten rather than deleted, because the half
+       * it was protecting is real and a careless fix breaks it.
+       *
+       * The half that survives: refusing on an absent RELAY record would make the relay a
+       * precondition for reading mail. So a message whose sender could not reach a relay still
+       * lands — its POSITION falls back to the witness stream — and it lands with its author proven,
+       * because the signature travels on the frame beside the bytes it signs.
+       *
+       * The half that is gone: "ingests and says it was unverified". A message nobody can be held to
+       * is refused now, which is the case below.
+       */
       const counterparty = generateKeypair();
-      const { node } = await sessionWithCounterparty(counterparty, "no-record.db");
+      const { node, mgr } = await sessionWithCounterparty(counterparty, "no-record.db");
 
-      const content = new TextEncoder().encode("no ordering record");
+      const content = new TextEncoder().encode("no relay record, still signed");
+      const rec = await kpRecord(counterparty, content, 1);
+      node.deliverFrame({
+        type: "content_frame", session_id: sid,
+        content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: rec.contentHash,
+        // Structure 1 and its signature — and deliberately NO `structure2_cbor`.
+        structure1_cbor: rec.structure1Cbor, sender_signature: rec.senderSignature,
+      }, "bob-peer-id");
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(events.find((e) => e.event === "session.content.received"), "relay-degraded delivery must still work").toBeDefined();
+      expect(events.find((e) => e.event === "session.content.identity.frozen"), "and it is not an identity fault").toBeUndefined();
+      const absent = events.find((e) => e.event === "session.content.ordering.absent");
+      expect(absent, "the POSITION is what is unknown, and the log says so").toBeDefined();
+      expect(String(absent!.context.impact)).toMatch(/POSITION/);
+      expect(mgr.readTranscript("alice", sid).messages.filter((m) => m.direction === "received")).toHaveLength(1);
+    });
+
+    it("a frame with NO PROOF AT ALL is refused — the passport case", async () => {
+      /**
+       * The other half of the same measurement, and the reason the test above is not enough on its
+       * own: identical bytes, one field gone. A frame that supplies nothing checkable used to be
+       * ingested and attributed to the counterparty; it is refused now, by name, and the operator
+       * is told rather than watching the conversation go quiet.
+       */
+      const counterparty = generateKeypair();
+      const { node, mgr } = await sessionWithCounterparty(counterparty, "no-proof.db");
+
+      const content = new TextEncoder().encode("who wrote this? nobody can say");
       node.deliverFrame({
         type: "content_frame", session_id: sid,
         content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), content), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, content_hash: msgLeafHash(content),
       }, "bob-peer-id");
       await new Promise((r) => setTimeout(r, 30));
 
-      expect(events.find((e) => e.event === "session.content.received"), "relay-degraded delivery must still work").toBeDefined();
-      const absent = events.find((e) => e.event === "session.content.ordering.absent");
-      expect(absent, "and it must be visible that the signer was not verified for this message").toBeDefined();
+      expect(events.find((e) => e.event === "session.content.received"), "nothing unattributable may be ingested").toBeUndefined();
+      expect(events.find((e) => e.event === "session.content.identity.frozen"), "and a refusal is not a freeze").toBeUndefined();
+      const refused = events.find((e) => e.event === "session.content.refused" && e.context.reason === "authorship_proof_absent");
+      expect(refused, "refused BY NAME").toBeDefined();
+      expect(mgr.readTranscript("alice", sid).messages.filter((m) => m.direction === "received")).toHaveLength(0);
     });
 
     it("a legitimate frame from the real counterparty is untouched — no new false positive", async () => {
       // The gate must not be the thing that breaks messaging. Same fixture, correct sender.
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "ok.db"), node as unknown as CelloNode);
-      await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // On a loopback the sender IS the counterparty — see the round-trip test above.
+      await mgr.createSessionNode(sid, "alice", alicePubkeyHex(mgr), "bob-peer-id", "corr-1");
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 

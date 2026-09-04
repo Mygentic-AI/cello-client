@@ -233,15 +233,24 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
       .toMatch(/^[0-9a-f]{64}$/);
   });
 
-  it("★ an UNWITNESSED send stores no proof, and does not fabricate one", async () => {
+  it("★ an UNWITNESSED send stores a REAL proof now, and still never fabricates one", async () => {
     /**
-     * The pair, and the one that keeps the fix honest. Without a relay there is no submit, so no
-     * Structure 1 goes on the wire and there is nothing signed to store. The row must record
-     * `self_authored` with NO signature — the truthful answer — rather than a placeholder that
-     * would make an unprovable row look provable.
+     * ⚠️ **THIS TEST ASSERTED "stores no proof", AND `DOD-M15-AUTHORSHIP-ABSENT-1` MADE THAT FALSE.**
      *
-     * This is also the discriminator the schema comment now names: `self_authored` covers both, and
-     * `sender_sig IS NOT NULL` is what separates them.
+     * Its old reasoning: *"Without a relay there is no submit, so no Structure 1 goes on the wire
+     * and there is nothing signed to store."* The first half was true and the second was the
+     * defect — there was always something to sign; nobody signed it. Every content frame now
+     * carries the sender's signature over its own Structure 1 whether or not a relay witnessed the
+     * leaf, so this side produces a proof on exactly this path and stores it.
+     *
+     * Rewritten rather than deleted, because the half it was really protecting is untouched and is
+     * the harder half: the row must never carry a PLACEHOLDER that makes an unprovable row look
+     * provable. So the assertion moves from "is null" to "verifies" — which is strictly stronger,
+     * and is the only form that cannot be satisfied by 64 bytes of anything.
+     *
+     * The NULL case has not gone away; it moved. `self_authored` with no signature now means this
+     * side could not sign at all (no identity key) or the row came from a path that carries no
+     * proof — not simply "no relay".
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-sentproof-bare-" });
     await fx.createSession(SID, "alice", "bobpubkeyhex");
@@ -256,11 +265,22 @@ describe("DOD-M15-SEALWIRE-1 bullet 5 — a real send stores a real proof", () =
     // ASSERTED, not skipped: an early return here would let this pass while proving nothing, which
     // is the shape the whole bullet keeps producing.
     expect(rows.length, "the send must still commit a leaf and write its row").toBeGreaterThan(0);
-    expect(rows[0]!.attribution).toBe("self_authored");
+    expect(rows[0]!.attribution, "we wrote it, so self_authored whatever proof it carries").toBe("self_authored");
     expect(
       rows[0]!.sender_sig,
-      "nothing was signed, so nothing is stored — never a placeholder that implies a proof",
-    ).toBeNull();
+      "an unwitnessed send signs its own claim now — a NULL here means the proof was produced and dropped",
+    ).not.toBeNull();
+    /**
+     * VERIFIED, not shape-checked. A length assertion passes for 64 bytes of anything, which is the
+     * placeholder this test was originally written to forbid — so the forbidding has to be done by
+     * the check that a placeholder cannot survive.
+     */
+    const pubkeyHex = rows[0]!.sender_pubkey!;
+    expect(pubkeyHex, "and the key it verifies against, taken from inside the signed bytes").toMatch(/^[0-9a-f]{64}$/);
+    const identity = (fx.snm.getDb()
+      .prepare("SELECT k_local_pubkey FROM agents WHERE agent_name = ?")
+      .get("alice") as { k_local_pubkey: string }).k_local_pubkey;
+    expect(pubkeyHex, "signed by THIS agent's identity, not by an arbitrary key").toBe(identity);
   });
 
   it("★★★ THE HELD PATH — the ONE case where placeOwnLeaf's authorship argument is load-bearing", async () => {
