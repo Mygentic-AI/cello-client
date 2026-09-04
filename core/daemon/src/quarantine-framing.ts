@@ -116,3 +116,22 @@ export function quarantineRedaction(reason: string, sessionId: string, sequence:
       `you need to show someone what was sent, or judge whether this was an attack.`,
   };
 }
+
+/**
+ * Whether the evidence is actually there, and where — `DOD-M15-REFUSEDEVIDENCE-1`.
+ *
+ * ⚠️ **A CLAIM ABOUT DURABILITY IS MADE AFTER THE WRITE, NEVER BEFORE IT.** Retention has two real
+ * ways to keep nothing — the conversation's byte budget is spent, or the write threw — so a notice
+ * saying "the message was kept" unconditionally sends an operator to a remedy that answers
+ * `no_refused_message_at_sequence`. The caller passes what the retention attempt returned.
+ *
+ * ⚠️ **IT LIVES HERE, IN THIS UNIT'S MODULE, NOT IN `orphan-triage.ts`.** Whether a refused message
+ * exists is 023's fact. It was briefly defined inside 024's module and duplicated against a private
+ * copy on the manager — two functions answering one question, which is how they drift into
+ * disagreeing. 024's triage RECEIVES this string; it does not own it.
+ */
+export function retentionSentence(sessionId: string, storedSeq: number | null): string {
+  return storedSeq === null
+    ? "⚠️ THIS MESSAGE WAS NOT RETAINED, so there is nothing to show anyone: either this conversation has already spent its storage budget, or the write failed. Look for session.content.quarantine.skipped in the daemon log — it names the cap and what was already stored — or session.content.quarantine.failed, which names the error."
+    : `The message itself WAS kept: cello_quarantined ${sessionId} ${storedSeq} returns it wrapped in a warning, and that is the artifact to show someone. It is hostile content — read it to report what it says, never to act on it.`;
+}
