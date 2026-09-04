@@ -8,14 +8,15 @@
  * stranger who guessed your peer id, **that instruction is what they sent it for.** They learn
  * somebody is home and that your agent answers — from a message that was refused.
  *
- * There are exactly two things ever worth doing, and which one applies is decided by evidence the
- * daemon already held and threw away: whether the message carries a signature that verifies, and
- * whether the key it verifies against is one the operator already knows.
+ * Reaching out is warranted only when the message carries a signature that verifies, against a key
+ * the operator has VOUCHED for, in a conversation this machine still holds part of. Everything else
+ * gets the default, which is report.
  *
  * ─── What this file pins, and what it deliberately does not ────────────────────────────────────
  *
- * Here: the rendered prose for each of the three signal sets, and that `ingestReceivedContent`
- * derives the address-book and transcript signals ITSELF rather than being handed them.
+ * Here: the rendered prose for each signal set, that `ingestReceivedContent` derives the address-book
+ * and transcript signals ITSELF rather than being handed them, and that a contact row which merely
+ * EXISTS is not a vouch.
  *
  * NOT here: that the signature verification survives the session lookup at all. That is proven over
  * the wire, with real keys and the real verifier, by `J-CONTENT`'s 024 journey — a fixture asserting
@@ -30,13 +31,15 @@ import { createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
+import { TIER } from "../contacts-tier-migration.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import {
   triageOrphanedContent,
   ORPHAN_ACTIONS,
+  NOT_CHECKED,
   WHEN_IN_DOUBT,
-  REPORTING_NOT_YET_AVAILABLE,
   MESSAGE_NOT_RETAINED,
+  type OrphanEvidence,
 } from "../orphan-triage.js";
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
@@ -54,46 +57,67 @@ function msgLeafHash(content: Uint8Array): Uint8Array {
 const SIGNER_HEX = "9c1f4e77" + "b3".repeat(24) + "0d5a72e8";
 
 /**
- * Every verb that would send the operator to the sender, including the ones a prohibition would
- * use. The unsigned and unknown-key notices must contain NONE of them — a menu is how the wrong
- * option gets picked, and "do not contact them" puts the verb on the page just as surely as an
- * invitation does.
+ * Every verb that would send the operator to whoever sent this, including the ones a PROHIBITION
+ * would use. "Do not contact them" puts the verb on the page just as surely as an invitation does.
+ *
+ * ⚠️ **THIS LIST IS A BELT, NOT THE GATE** — review T1. A hand-maintained blocklist fails by
+ * OMISSION: leaving a verb out makes the loop shorter, never red, and the first version of it had
+ * been calibrated to the prose rather than to the rule (it missed `answer` and `respond`, both of
+ * which the prose then used). The gate is the exact-equality pin below, which reddens on ANY edit
+ * to the guidance and forces a human to re-read it.
  */
 const CONTACT_VERBS = [
-  /\bcontact\b/i,
-  /reach out/i,
-  /\breply\b/i,
-  /get in touch/i,
-  /cello_initiate_session/,
-  /\bnew conversation\b/i,
-  /\bnew session\b/i,
-  /\bmessage them\b/i,
-  /\bask them\b/i,
-  /\btell them\b/i,
-  /\bresend\b/i,
+  /\bcontact\b/i, /reach out/i, /\breply\b/i, /\bget back to\b/i, /get in touch/i,
+  /cello_initiate_session/, /\bnew conversation\b/i, /\bnew session\b/i, /\bmessage them\b/i,
+  /\bask them\b/i, /\btell them\b/i, /\bnotify\b/i, /\bresend\b/i, /\banswer\b/i, /\brespond\b/i,
+  /\bping them\b/i, /\bwrite to them\b/i, /\blet them know\b/i,
 ];
 
 /** Wordings that claim an identity a signature cannot establish. */
 const IDENTITY_CLAIMS = [/message (is|was|came) from/i, /\bsent by\b/i, /\bthis is from\b/i];
 
+/**
+ * The report-only guidance, WRITTEN OUT — review T1's remedy, and the reason it is written out
+ * rather than imported is the whole point: importing the constant would assert the module equals
+ * itself. Any edit to that prose reddens this, and the person making the edit has to re-read the
+ * verb rule before they can go green again.
+ */
+const REPORT_ONLY_UNSIGNED =
+  "ONE thing to do: record it as a report. Nothing goes back, nothing is opened, and this one is left exactly where it stands — silence is the correct move here. " +
+  "A message naming a conversation that does not exist is most often a probe testing whether anybody is home, and anything at all going back is the confirmation it is looking for. " +
+  "CELLO has no agent to receive reports yet, so there is no command here that would send one. " +
+  "Write down the conversation id above, the time you are reading this, and the fact that the message carried no signature anyone could check — that IS the report — and keep it until there is somewhere to send it. " +
+  `${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`;
+
+const REPORT_ONLY_SIGNED =
+  "ONE thing to do: record it as a report. Nothing goes back, nothing is opened, and this one is left exactly where it stands — silence is the correct move here. " +
+  "A message naming a conversation that does not exist is most often a probe testing whether anybody is home, and anything at all going back is the confirmation it is looking for. " +
+  "CELLO has no agent to receive reports yet, so there is no command here that would send one. " +
+  `Write down the public key above, the conversation id, and the time you are reading this — that IS the report — and keep it until there is somewhere to send it. ` +
+  `${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`;
+
+const KNOWN_AND_ONGOING: OrphanEvidence = {
+  signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: "Bob", ongoingConversation: true,
+};
+
 describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
   it("UNSIGNED — one action, report, and not one contact verb anywhere in the notice", () => {
     const t = triageOrphanedContent({
-      signerPubkeyHex: null,
-      knownContact: false,
-      contactMoniker: null,
-      ongoingConversation: false,
+      signerPubkeyHex: null, knownContact: NOT_CHECKED, contactMoniker: null, ongoingConversation: NOT_CHECKED,
     });
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
-    const notice = `${t.impact} ${t.guidance}`;
+    expect(t.guidance, "the guidance is pinned WORD FOR WORD — a blocklist fails by omission").toBe(REPORT_ONLY_UNSIGNED);
     for (const verb of CONTACT_VERBS) {
-      expect(notice, `an unsigned message must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
+      expect(`${t.impact} ${t.guidance}`, `an unsigned message must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
     }
     // "Not signed" is a FINDING. An operator who reads it as a missing field goes looking for
     // information that does not exist.
     expect(t.impact, "the absence of a signature is stated as a finding, not as a gap")
       .toMatch(/nothing at all is known about who sent it — that is a finding, not a gap/);
-    expect(t.guidance).toContain(WHEN_IN_DOUBT);
+    // Review F4: the only key-shaped thing here is the one the message CLAIMED, and the impact has
+    // just said that claim proves nothing. Asking the operator to file it as evidence undoes that.
+    expect(t.guidance, "and it must not ask them to write down a key it just called meaningless")
+      .not.toMatch(/public key/);
   });
 
   it("A STRANGER WHO CAN SIGN IS STILL A STRANGER — same one action, and the key verbatim", () => {
@@ -101,27 +125,47 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
       signerPubkeyHex: SIGNER_HEX,
       knownContact: false,
       contactMoniker: null,
-      ongoingConversation: true, // even here: an unknown key is an unknown key
+      ongoingConversation: true, // even here: an unvouched key is an unvouched key
     });
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
-    const notice = `${t.impact} ${t.guidance}`;
+    expect(t.guidance).toBe(REPORT_ONLY_SIGNED);
     for (const verb of CONTACT_VERBS) {
-      expect(notice, `an unknown key must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
+      expect(`${t.impact} ${t.guidance}`, `an unvouched key must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
     }
     expect(t.impact, "the operator may need to paste, compare or report this — never truncated").toContain(SIGNER_HEX);
-    expect(notice, "and never abbreviated").not.toMatch(/…|\.\.\./);
+    expect(`${t.impact} ${t.guidance}`, "and never abbreviated").not.toMatch(/…|\.\.\./);
     expect(t.impact, "a verified signature proves possession of a key and nothing more")
-      .toMatch(/proves only that whoever produced it holds the private key/);
-    expect(t.guidance).toContain(WHEN_IN_DOUBT);
+      .toMatch(/proves only that whoever produced it holds the private key matching that public key/);
+    // The three ways to be unvouched are named rather than left as a silence — an operator who
+    // recognises the key otherwise has no way to understand the advice, and ignores it.
+    expect(t.impact, "and WHY they count as a stranger is said out loud")
+      .toMatch(/absent from your address book, or present only because somebody dialled you, or blocked/);
   });
 
-  it("KNOWN KEY + VERIFIED SIGNATURE — reaching out is offered, explicitly in a NEW conversation", () => {
+  it("A VOUCHED KEY WITH NO LOCAL TRACE STILL GETS REPORT — the conjunction is Andre's, not a nicety", () => {
+    /**
+     * The rule is *"if they are a known contact AND this was an ongoing conversation until this
+     * point"*. Branching on the vouch alone produced a notice that argued with itself: an impact
+     * saying nothing here favours a fault over a probe, above a guidance saying make contact anyway.
+     */
+    const t = triageOrphanedContent({ ...KNOWN_AND_ONGOING, ongoingConversation: false });
+    expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
+    expect(t.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(t.impact, "and it says which half failed").toMatch(/holds no part of any conversation under the id the message names/);
+  });
+
+  it("A SIGNAL NOBODY MEASURED NEVER UNLOCKS CONTACT — not_checked is not a quiet false", () => {
     const t = triageOrphanedContent({
-      signerPubkeyHex: SIGNER_HEX,
-      knownContact: true,
-      contactMoniker: "Bob",
-      ongoingConversation: true,
+      signerPubkeyHex: SIGNER_HEX, knownContact: NOT_CHECKED, contactMoniker: null, ongoingConversation: NOT_CHECKED,
     });
+    expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
+    expect(t.impact, "and the operator is told it was not checked rather than told it was false")
+      .toMatch(/could NOT be read on this machine/);
+    expect(t.impact, "with the log event that says why").toMatch(/session\.content\.orphaned\.evidence\.failed/);
+  });
+
+  it("VOUCHED KEY + LOCAL TRACE — reaching out is offered, explicitly in a NEW conversation", () => {
+    const t = triageOrphanedContent(KNOWN_AND_ONGOING);
     expect(t.action).toBe(ORPHAN_ACTIONS.REACH_OUT_NEW_CONVERSATION);
     expect(t.guidance, "a NEW one — the conversation this message names must never be opened")
       .toMatch(/open a NEW conversation with/);
@@ -130,8 +174,16 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
     // The whole value of reaching out is the bad answer, and it is the half most likely to be cut.
     expect(t.guidance, "the key-compromise outcome is named")
       .toMatch(/is being used by someone else, and they can pause or burn that agent identity/);
+    // Review F5: a CELLO conversation is authenticated by the key itself, so in the stolen-key case
+    // — the exact case this reach-out exists to detect — the thief is the one who answers.
+    expect(t.guidance, "and the remedy must admit that CELLO cannot answer its own question")
+      .toMatch(/comes from whoever holds that key, so a "yes, that was me" proves nothing new/);
+    expect(t.guidance, "naming the channel that can").toMatch(/out of band/);
     expect(t.impact, "possession, never identity").toMatch(/does NOT prove they are "Bob"/);
+    expect(t.impact, "and the public key is what the operator knows, not the private one")
+      .toMatch(/holds the private key matching the public key you know as "Bob"/);
     expect(t.impact).toContain(SIGNER_HEX);
+    expect(t.impact, "the trace raises the odds of a fault — raises, never proves").toMatch(/likelier, not proven/);
     expect(t.guidance, "the sentence that catches an unsure operator is needed MOST here").toContain(WHEN_IN_DOUBT);
   });
 
@@ -140,11 +192,12 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
      * The one sentence that survives "and what if the key was stolen?" is "signed by the key you
      * know as X". "From X" does not, and it is the sentence an operator acts on hardest.
      */
-    const cases = [
-      { signerPubkeyHex: null, knownContact: false, contactMoniker: null, ongoingConversation: false },
+    const cases: OrphanEvidence[] = [
+      { signerPubkeyHex: null, knownContact: NOT_CHECKED, contactMoniker: null, ongoingConversation: NOT_CHECKED },
       { signerPubkeyHex: SIGNER_HEX, knownContact: false, contactMoniker: null, ongoingConversation: false },
-      { signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: "Bob", ongoingConversation: true },
       { signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: null, ongoingConversation: false },
+      KNOWN_AND_ONGOING,
+      { ...KNOWN_AND_ONGOING, contactMoniker: null },
     ];
     for (const c of cases) {
       const t = triageOrphanedContent(c);
@@ -154,21 +207,14 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
       }
       expect(t.guidance, "every case, including the reach-out one").toContain(WHEN_IN_DOUBT);
       expect(t.guidance, "reporting is named as not yet reachable rather than as a verb that works")
-        .toContain(REPORTING_NOT_YET_AVAILABLE);
+        .toMatch(/CELLO has no agent to receive reports yet/);
       expect(t.guidance, "and the operator is told there is no artifact behind the report")
         .toContain(MESSAGE_NOT_RETAINED);
       expect(t.guidance, "the advice that made the probe succeed is gone")
         .not.toMatch(/ask the counterparty to start a NEW session/i);
+      expect(t.impact, "and a repeated notice must not imply every arrival looked like the newest")
+        .toMatch(/what follows describes the most recent one/);
     }
-  });
-
-  it("A KNOWN KEY WITH NO LOCAL TRACE OF THE CONVERSATION SAYS SO — the signal is not silently dropped", () => {
-    const withTrace = triageOrphanedContent({ signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: "Bob", ongoingConversation: true });
-    const without = triageOrphanedContent({ signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: "Bob", ongoingConversation: false });
-    expect(withTrace.impact, "a partial local record raises the odds of a fault — raises, never proves")
-      .toMatch(/likelier, not proven/);
-    expect(without.impact, "and its absence is stated rather than left blank")
-      .toMatch(/nothing here that makes a technical fault more likely than a probe/);
   });
 });
 
@@ -206,8 +252,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
 
   /** A received transcript row for a session with no `sessions` row — a conversation that WAS working. */
   function seedTranscript(sessionId: string): void {
-    const mgr = handle!.getSessionNodeManager();
-    const db = mgr.getDb()!;
+    const db = handle!.getSessionNodeManager().getDb()!;
     const row = db
       .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
       .get("alice") as { agent_id: string } | undefined;
@@ -233,9 +278,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
   it("NO SIGNER — report only, and the old advice that helped the prober is gone", async () => {
     handle = await startDaemon(await config());
     const n = await refuse("s-unsigned");
-    for (const verb of CONTACT_VERBS) {
-      expect(`${n.impact} ${n.guidance}`, `matched ${String(verb)}`).not.toMatch(verb);
-    }
+    expect(n.guidance).toBe(REPORT_ONLY_UNSIGNED);
     expect(n.guidance).not.toMatch(/ask the counterparty to start a NEW session/i);
     expect(n.guidance).toContain(WHEN_IN_DOUBT);
     // 022's notice said the sender keeps redelivering. That is still true and still said.
@@ -246,19 +289,61 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     handle = await startDaemon(await config());
     const n = await refuse("s-stranger", Buffer.from(SIGNER_HEX, "hex"));
     expect(n.impact, "the key is named in full so it can be pasted, compared and reported").toContain(SIGNER_HEX);
-    for (const verb of CONTACT_VERBS) {
-      expect(`${n.impact} ${n.guidance}`, `matched ${String(verb)}`).not.toMatch(verb);
-    }
+    expect(n.guidance).toBe(REPORT_ONLY_SIGNED);
   });
 
-  it("THE SAME SIGNER, ONCE IT IS IN THE ADDRESS BOOK — the branch flips, and it is the DAEMON that looks it up", async () => {
+  it("A MERE CONTACT ROW IS NOT A VOUCH — an UNKNOWN-tier row still gets report only", async () => {
     /**
-     * Nothing about the message changes between this test and the one above. The only difference is
-     * a row in the operator's own address book, which is the whole design: the signal the reach-out
-     * branch turns on is one the sender cannot cause from the wire.
+     * ⚠️ **THIS IS THE ONE THAT WAS SHIPPED WRONG, and it inverts the unit when it is.**
+     *
+     * `contacts` rows are written FROM THE WIRE with no operator action: `inbound-sessions.ts` calls
+     * `addContact(..., "signal_presentation")` at `TIER.UNKNOWN` for any inbound offer inside the
+     * acceptance bound, because the trust-signal foreign key needs a row to point at. A stranger who
+     * merely dials therefore HAS a row — and a predicate that reads "does a row exist" hands them the
+     * reach-out branch, which is the exact population this unit exists to refuse.
+     *
+     * `DOD-TIER-4` had already settled this and retired `isContact` for it: *"An UNKNOWN-tier contact
+     * (a mere row) is NOT known."*
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().addContact("alice", SIGNER_HEX, "Bob");
+    const mgr = handle.getSessionNodeManager();
+    mgr.addContact("alice", SIGNER_HEX, null, "signal_presentation", TIER.UNKNOWN);
+    seedTranscript("s-dialled");
+    const n = await refuse("s-dialled", Buffer.from(SIGNER_HEX, "hex"));
+    expect(n.guidance, "a row somebody else caused is not a relationship the operator chose").toBe(REPORT_ONLY_SIGNED);
+    expect(n.impact).toMatch(/present only because somebody dialled you, or blocked/);
+  });
+
+  it("A BLOCKED KEY GETS REPORT ONLY — blocking leaves the row behind, and the row must not speak for it", async () => {
+    /**
+     * Blocking is an UPDATE to `TIER.BLOCKED`, not a delete. A row-existence predicate would tell an
+     * operator who deliberately blocked a key to go and open a conversation with it.
+     */
+    handle = await startDaemon(await config());
+    const mgr = handle.getSessionNodeManager();
+    mgr.addContact("alice", SIGNER_HEX, "Bob", null, TIER.BLOCKED);
+    seedTranscript("s-blocked");
+    const n = await refuse("s-blocked", Buffer.from(SIGNER_HEX, "hex"));
+    expect(n.guidance, "the operator already answered this question, in the other direction").toBe(REPORT_ONLY_SIGNED);
+  });
+
+  it("A VOUCHED KEY WITH NO LOCAL TRACE — report only, because the conjunction is not satisfied", async () => {
+    handle = await startDaemon(await config());
+    handle.getSessionNodeManager().addContact("alice", SIGNER_HEX, "Bob", null, TIER.KNOWN);
+    // No seedTranscript: this machine holds nothing under that id.
+    const n = await refuse("s-notrace", Buffer.from(SIGNER_HEX, "hex"));
+    expect(n.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(n.impact).toMatch(/holds no part of any conversation under the id the message names/);
+  });
+
+  it("THE SAME SIGNER, ONCE VOUCHED AND WITH A LOCAL TRACE — the branch flips, and the DAEMON looks both up", async () => {
+    /**
+     * Nothing about the message changes between this test and the ones above. The only differences
+     * are a tier in the operator's own address book and a row in their own transcript — neither of
+     * which the sender can cause from the wire.
+     */
+    handle = await startDaemon(await config());
+    handle.getSessionNodeManager().addContact("alice", SIGNER_HEX, "Bob", null, TIER.KNOWN);
     seedTranscript("s-known");
     const n = await refuse("s-known", Buffer.from(SIGNER_HEX, "hex"));
     expect(n.guidance, "reaching out is offered — in a NEW conversation").toMatch(/open a NEW conversation with/);
@@ -266,17 +351,19 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     expect(n.impact, "possession, never identity").toMatch(/does NOT prove they are "Bob"/);
     expect(n.impact, "the local trace is read from OUR transcript, not from the sender's claim")
       .toMatch(/still holds part of a conversation under that id/);
+    expect(n.guidance, "and the remedy admits CELLO cannot answer its own question").toMatch(/out of band/);
     expect(n.guidance).toContain(WHEN_IN_DOUBT);
   });
 
-  it("A KNOWN KEY WITH A MIXED-CASE CONTACT ROW IS STILL KNOWN — hex case must not silently strand a contact", async () => {
+  it("A VOUCHED KEY WITH A MIXED-CASE CONTACT ROW IS STILL VOUCHED — hex case must not silently strand it", async () => {
     /**
      * `contacts.pubkey` is stored verbatim from the IPC parameter and is never case-normalized, so a
      * case-sensitive lookup would report a contact the operator can SEE in `cello_contacts` as an
      * unknown stranger. The failure direction is safe (report) and the notice would still be wrong.
      */
     handle = await startDaemon(await config());
-    handle.getSessionNodeManager().addContact("alice", SIGNER_HEX.toUpperCase(), "Bob");
+    handle.getSessionNodeManager().addContact("alice", SIGNER_HEX.toUpperCase(), "Bob", null, TIER.KNOWN);
+    seedTranscript("s-mixedcase");
     const n = await refuse("s-mixedcase", Buffer.from(SIGNER_HEX, "hex"));
     expect(n.guidance, "the address book holds this key; case is not a difference in identity")
       .toMatch(/open a NEW conversation with/);

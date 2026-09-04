@@ -8959,6 +8959,17 @@ export class SessionNodeManager {
    * one. It is answered from OUR transcript rows instead — a partial local record of that
    * conversation is something an attacker cannot put there from the wire.
    *
+   * ⚠️ **"KNOWN" IS A TIER, NOT A ROW — review F1/F2, and reading it as a row inverted the unit.**
+   * `contacts` rows are written from the WIRE with no operator action: `inbound-sessions.ts` calls
+   * `addContact(..., "signal_presentation")` at `TIER.UNKNOWN` for any inbound offer inside the
+   * acceptance bound, because the trust-signal foreign key needs a row to point at. And BLOCKING a
+   * contact is an UPDATE to `TIER.BLOCKED`, so the row survives that too. A `SELECT … WHERE pubkey`
+   * therefore answers "yes, known" for a stranger who merely dialled, AND for a key the operator
+   * deliberately blocked — handing both the reach-out branch, which is the exact population this
+   * unit exists to refuse. `DOD-TIER-4` had already settled this and retired `isContact` for it:
+   * *"An UNKNOWN-tier contact (a mere row) is NOT known."* The tier is read from the row already
+   * being fetched, so the case-insensitivity below survives (`getTier` compares case-sensitively).
+   *
    * ⚠️ **HEX CASE IS NOT A DIFFERENCE IN IDENTITY.** `contacts.pubkey` is stored verbatim from the
    * IPC parameter and is never normalized, so an exact-match lookup would report a contact the
    * operator can see in `cello_contacts` as an unknown stranger — and quietly downgrade the notice.
@@ -8971,38 +8982,62 @@ export class SessionNodeManager {
     const signerPubkeyHex = verifiedSignerUnmatched === undefined
       ? null
       : Buffer.from(verifiedSignerUnmatched).toString("hex");
-    const base = { signerPubkeyHex, knownContact: false, contactMoniker: null, ongoingConversation: false };
+    /**
+     * ⚠️ `"not_checked"` IS NOT A COSMETIC THIRD STATE — review F6.
+     *
+     * These two were `false` on every path that did not look, and the log event then reported them
+     * as readings. An investigator filtering `session.content.orphaned` days later would read
+     * `ongoingConversation: false` and conclude there was no local trace, when nothing had been
+     * asked. Clause 1 says the branch RECORDS these; a default wearing the shape of a measurement
+     * is not a record, and it is the cheapest possible way to mislead the one person who comes
+     * looking.
+     */
+    const notChecked: OrphanEvidence = {
+      signerPubkeyHex, knownContact: "not_checked", contactMoniker: null, ongoingConversation: "not_checked",
+    };
     // With no verifiable signature the other two signals mean nothing — a claimed key is a string
     // anyone can type — so they are not looked up at all rather than looked up and ignored.
-    if (signerPubkeyHex === null || !this.#db) return base;
+    if (signerPubkeyHex === null) return notChecked;
     try {
+      /**
+       * ⚠️ NO `!this.#db` SHORT-CIRCUIT — review F7, and it was the silent half of this guard.
+       *
+       * The catch below logs ERROR for exactly this outcome; a bare `if (!this.#db) return` did not,
+       * and the state is reachable while the operator still gets a notice — `noteContentRefusal`
+       * keeps its own in-memory fallback when the write fails, so a daemon with an unusable store
+       * still surfaces a refusal saying "that key is not in your address book" about a key that may
+       * well be in it, with nothing anywhere recording that the address book was never opened.
+       * Throwing into the catch is also what this file's other contact reads do (`getTier`,
+       * `addContact`), and for the same reason: a read that decides how to treat a sender must not
+       * degrade to "unclassified" in silence.
+       */
+      if (!this.#db) throw new Error("database is not open");
       const agentId = this.#requireAgentId(agentName);
       const contact = this.#db
-        .prepare("SELECT moniker FROM contacts WHERE agent_id = ? AND lower(pubkey) = ?")
-        .get(agentId, signerPubkeyHex.toLowerCase()) as { moniker: string | null } | undefined;
+        .prepare("SELECT moniker, tier FROM contacts WHERE agent_id = ? AND lower(pubkey) = ?")
+        .get(agentId, signerPubkeyHex.toLowerCase()) as { moniker: string | null; tier: number | null } | undefined;
       const trace = this.#db
         .prepare("SELECT 1 AS present FROM transcript WHERE agent_id = ? AND session_id = ? LIMIT 1")
         .get(agentId, sessionId) as { present: number } | undefined;
       return {
         signerPubkeyHex,
-        knownContact: contact !== undefined,
+        knownContact: contact !== undefined && normalizeTier(contact.tier) >= TIER.KNOWN,
         contactMoniker: contact?.moniker ?? null,
         ongoingConversation: trace !== undefined,
       };
     } catch (err: unknown) {
       /**
-       * NOT A SILENT FALLBACK. The two signals it could not read both resolve to their conservative
-       * value, which routes the operator to REPORT — the action that is safe when nothing is known.
-       * A read failure here must never invent the reach-out branch, and it must never be invisible:
-       * the operator is about to be told a stranger sent this, and the reason we could not tell them
-       * otherwise is the log line.
+       * NOT A SILENT FALLBACK. Both signals come back `"not_checked"`, which the triage treats
+       * exactly as it treats a stranger — REPORT, the action that is safe when nothing is known — and
+       * which the log distinguishes from a measured `false`. A read failure here must never invent
+       * the reach-out branch, and it must never be invisible.
        */
       this.#logger.error("session.content.orphaned.evidence.failed", {
         agentName, sessionId,
         error: extractErrorMessage(err),
         impact: "the address book and transcript could not be read, so a message whose signature DID verify is being reported to the operator as coming from a key nothing is known about. The advice is the safe one; it may be more cautious than the evidence warrants.",
       });
-      return base;
+      return notChecked;
     }
   }
 
@@ -9093,6 +9128,8 @@ export class SessionNodeManager {
         agentName, sessionId, correlationId,
         signerPubkey: evidence.signerPubkeyHex ?? "(no verifiable signature)",
         signatureVerified: evidence.signerPubkeyHex !== null,
+        // Review F6: `"not_checked"` where nothing was measured, never a `false` that reads as a
+        // reading. An investigator filtering this event is the only person who will ever ask.
         knownContact: evidence.knownContact,
         ongoingConversation: evidence.ongoingConversation,
         action: triage.action,
