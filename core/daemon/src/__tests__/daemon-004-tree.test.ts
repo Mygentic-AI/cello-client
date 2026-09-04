@@ -540,7 +540,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const structure1Cbor = encodeStructure1({
         contentHash,
         senderPubkey: pubkey,
-        sessionId: new Uint8Array(16),
+        // DOD-M15-AUTHORSHIP-ABSENT-1: the claim binds the CONVERSATION too, so this must be the
+        // session's real id. It was 16 zero bytes — a claim for no conversation in particular,
+        // which is precisely what the binding refuses.
+        sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
         lastSeenSeq: 0,
         timestamp: 1_700_000_000_000,
       });

@@ -913,6 +913,27 @@ type AuthorshipVerdict =
 const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 
 /**
+ * The `unusable` reason for a proof that is real, is by the right signer, describes this content —
+ * and was signed for a DIFFERENT conversation. A replay, not a forgery.
+ *
+ * Every one of those properties has been ESTABLISHED by the time this is returned; see the ordering
+ * note in `#verifyAuthorshipClaim`. An earlier version of this sentence was true of the intent and
+ * not of the code, because the check ran before the signature was verified.
+ */
+const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
+
+/**
+ * Constant-shape byte equality for the two binding checks. Lifted rather than hand-rolled a second
+ * time — `seal-frontier-verify` has the same helper for the same comparison, and two copies of
+ * "are these the same bytes" is two things to keep true.
+ */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
  * One row of a session's durable transcript as a reader sees it.
  *
  * DOD-M15-REFUSEDEVIDENCE-1: `'quarantined'` is a message that was received and REFUSED. Its `text`
@@ -15354,12 +15375,6 @@ export class SessionNodeManager {
     if (!s1.ok) return { verdict: "unusable", reason: s1.reason };
     const s1Hash = s1.fields.contentHash;
     const s1Pubkey = s1.fields.senderPubkey;
-    // The claim must bind to THIS content. A signature over somebody else's bytes verifies perfectly
-    // and proves nothing about this message — without this, one signed claim could be replayed onto
-    // every frame that follows it.
-    if (Buffer.from(s1Hash).toString("hex") !== Buffer.from(contentHash).toString("hex")) {
-      return { verdict: "unusable", reason: AUTHORSHIP_CONTENT_HASH_MISMATCH };
-    }
     // The SENDER's Ed25519 signature over the exact signed bytes — the same check the relay
     // performs. `verify` never throws, so a wrong-width or garbage signature lands here as `false`:
     // supplied and refuted, which is a different fact from not supplied at all.
@@ -15399,6 +15414,67 @@ export class SessionNodeManager {
         ? { verdict: "refuted", reason: "signer_not_counterparty" }
         : { verdict: "verified_unmatched", senderPubkey: s1Pubkey };
     }
+    /**
+     * ─── THE BINDING CHECKS RUN LAST, AND THE ORDER IS A SECURITY PROPERTY ───────────────────────
+     *
+     * ⚠️ **THEY USED TO RUN FIRST, AND THAT HANDED THE ATTACKER A FREEZE-SUPPRESSION SWITCH** —
+     * review of `029b`, and it is the finding that mattered most.
+     *
+     * Everything below this line is `unusable`: the message is REFUSED and the session lives.
+     * Everything above it is `refuted`: the session FREEZES. So a check that can answer `unusable`
+     * before the signature has been verified lets a peer choose the softer outcome — flip one
+     * unauthenticated byte of `session_id` inside your own claim and a garbage signature, or a
+     * signature by a MITM's own key, stops being an identity incident and becomes a quiet refusal.
+     * The session-open MITM detection this function exists to serve was bypassable by exactly the
+     * party it detects.
+     *
+     * So the order is: decode → SIGNATURE → SIGNER → then what the proof is about. By the time
+     * either check below runs, the claim provably came from this session's counterparty, and the
+     * only question left is which message and which conversation they made it for.
+     *
+     * `seal-frontier-verify` already does it in this order (verify at :55, session id at :77). This
+     * code had it inverted.
+     */
+    // The claim must bind to THIS content. A signature over somebody else's bytes verifies perfectly
+    // and proves nothing about this message — without this, one signed claim could be replayed onto
+    // every frame that follows it.
+    if (!bytesEqual(s1Hash, contentHash)) {
+      return { verdict: "unusable", reason: AUTHORSHIP_CONTENT_HASH_MISMATCH };
+    }
+    /**
+     * ⚠️ **AND IT MUST BIND TO THIS CONVERSATION** — review M4, ruled in by Andre 2026-09-04.
+     *
+     * Binding the content and the signer is not enough on its own: a claim the counterparty
+     * genuinely signed in another session verifies unchanged here for the same bytes. Not a
+     * stranger and not forged content — a real line of theirs, landing in a transcript it was never
+     * written for, with a signature that checks out. That is worse than an unsigned message,
+     * because the receipt then PROVES something that did not happen.
+     *
+     * `session_id` has been in Structure 1 since v1 and this path never read it.
+     * `seal-frontier-verify` already compares it; the live receive path simply did not.
+     *
+     * **THE TWO VALUES CANNOT DIVERGE, and that is what makes this safe to enforce.** Both are
+     * derived from ONE session id on each side, by construction:
+     *   initiator — `sessionId = hex(assignment.session_id)` (`initiate-session-handler`) and
+     *               `relayParams.sessionIdBytes = assignment.session_id` (`daemon.ts`);
+     *   responder — `acceptSession(parsed.sessionIdHex)` and
+     *               `sessionIdBytes = Buffer.from(parsed.sessionIdHex, "hex")` (`inbound-sessions`);
+     *   direct/persisted — `relaySessionIdBytes = Buffer.from(sessionId, "hex")`.
+     * The two names exist because one keys the in-memory maps and one goes on the wire, not because
+     * they can hold different values. Getting this wrong would refuse EVERY message on EVERY live
+     * session, so it is stated rather than assumed.
+     *
+     * REFUSED, not frozen — and the sentence is TRUE where it now stands. The signature has
+     * verified and the signer has been matched to this session's counterparty three lines above;
+     * what is wrong is only the conversation the claim was made for, which is a replay rather than
+     * an identity fault. Said because an earlier version of this comment made the same claim from
+     * ABOVE the verification, where none of it had happened yet.
+     */
+    const expectedSessionId = this.#activeNodes.get(this.#k(agentName, sessionId))?.relaySessionIdBytes
+      ?? Uint8Array.from(Buffer.from(sessionId, "hex"));
+    if (!bytesEqual(s1.fields.sessionId, expectedSessionId)) {
+      return { verdict: "unusable", reason: AUTHORSHIP_SESSION_MISMATCH };
+    }
     return { verdict: "verified", senderPubkey: s1Pubkey, senderSig: senderSignature };
   }
 
@@ -15413,15 +15489,28 @@ export class SessionNodeManager {
   #refuseUnprovenAuthorship(
     agentName: string,
     sessionId: string,
-    reason: "authorship_proof_absent" | "authorship_proof_unusable",
+    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation",
     contentHash: Uint8Array,
     detail: Record<string, unknown>,
     correlationId?: string,
   ): void {
+    /**
+     * ⚠️ **THREE REASONS, THREE SENTENCES — AND THE THIRD USED TO BORROW THE SECOND'S** (review of
+     * `029b`, and it is the operator half of the same finding as the check order).
+     *
+     * A replayed claim is the one branch on this path that is potentially ADVERSARIAL: a real,
+     * valid, correctly-signed line of your counterparty's, presented in a conversation it was not
+     * written for. It was reaching the operator under the `unusable` wording, which says the proof
+     * was "unreadable, or signed over different content" — neither is true — and under guidance
+     * telling them to go and ask their counterparty to upgrade. A version number is not the
+     * question, and sending someone to chase one spends their attention on the wrong thing.
+     */
     const impact =
       reason === "authorship_proof_absent"
         ? "a message arrived carrying no proof of who wrote it, so it was NOT ingested, NOT shown and NOT attributed to anyone. Every message in this conversation has to be provable to whoever reads its receipt later, and this one could not be."
-        : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
+        : reason === "authorship_wrong_conversation"
+          ? "a message arrived carrying a VALID signature by this conversation's counterparty — made for a DIFFERENT conversation. The same message, or an old one of theirs, was presented here. It was NOT ingested, NOT shown and NOT added to this conversation's record."
+          : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
     /**
      * ⚠️ THE VERB IS THE COUNTERPARTY'S, AND THE GUIDANCE SAYS SO. The reader is the RECEIVING
      * operator, and there is nothing on their machine to change — the missing signature is produced
@@ -15441,8 +15530,14 @@ export class SessionNodeManager {
      * actually true of this path: nothing was shown YET, and this refusal does not stop the copy
      * coming the other way.
      */
-    const guidance =
-      "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. IT MAY STILL " +
+    const guidance = reason === "authorship_wrong_conversation"
+      ? "STOPPED ON PURPOSE, and this one is NOT a version problem — do not go and ask them about " +
+        "their build. The signature is real and it is theirs; what is wrong is that it was made for " +
+        "another conversation, so something replayed it into this one. That is either software on " +
+        "one of your machines re-sending an old message into the wrong session, or someone in " +
+        "between doing it deliberately. ONE thing to do: ask your counterparty OUT OF BAND (a " +
+        "channel that is not this one) whether they meant to send this, before you continue here."
+      : +
       "REACH YOU BY THE OTHER ROUTE: refusing sends back no acknowledgement, so their agent parks a " +
       "copy in the relay mailbox and this side accepts that one on the strength of the mailbox " +
       "envelope — delivered, but with no proof of who wrote that individual message. Almost always " +
@@ -15528,6 +15623,13 @@ export class SessionNodeManager {
           // SOFT: the record does not describe this content. Nothing is proven about the signer's
           // identity — only that this record and these bytes do not belong together.
           this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
+        } else if (auth.reason === AUTHORSHIP_SESSION_MISMATCH) {
+          // Its own name, because `…malformed` points a reader at a decoder and this record decoded
+          // perfectly — it belongs to another conversation. Unreachable in practice on this path:
+          // `authenticateParkedEntry` binds `session_id` in the park TBS before anything is
+          // unsealed, so a mismatched record cannot get this far. Named anyway, because an event
+          // that lies about its cause is worse the day it does fire.
+          this.#logger.warn("session.content.ordering.session_mismatch", { sessionId, correlationId });
         } else {
           this.#logger.warn("session.content.ordering.malformed", {
             sessionId, correlationId, structure1Reason: auth.reason,
@@ -15945,9 +16047,14 @@ export class SessionNodeManager {
         return;
       }
       if (authorship.verdict === "unusable") {
-        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
-          detail: authorship.reason,
-        }, correlationId);
+        // A replayed claim gets its own name on BOTH surfaces, not just in the log context: it is
+        // the one `unusable` cause that may be adversarial, and it is the one the operator can act
+        // on. The others are a peer whose build or bytes we could not read.
+        this.#refuseUnprovenAuthorship(
+          agentName, sessionId,
+          authorship.reason === AUTHORSHIP_SESSION_MISMATCH ? "authorship_wrong_conversation" : "authorship_proof_unusable",
+          contentHash, { detail: authorship.reason }, correlationId,
+        );
         return;
       }
       if (authorship.verdict === "verified") {

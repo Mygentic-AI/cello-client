@@ -164,7 +164,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
       const structure1Cbor = encodeStructure1({
         contentHash: hash,
         senderPubkey: pubkey,
-        sessionId: new Uint8Array(16),
+        // DOD-M15-AUTHORSHIP-ABSENT-1: the claim binds the CONVERSATION too — the real id, not zeros.
+        sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
         lastSeenSeq: 0,
         timestamp: 1_700_000_000_000,
       });

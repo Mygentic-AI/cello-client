@@ -57,7 +57,9 @@ async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array
   const structure1 = encodeStructure1({
     contentHash,
     senderPubkey: await COUNTERPARTY.getPublicKey(),
-    sessionId: Buffer.from(SID, "hex").subarray(0, 16),
+    // DOD-M15-AUTHORSHIP-ABSENT-1: production signs the WHOLE session id; a truncated one is a
+    // claim for a different conversation and is refused.
+    sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
   });
