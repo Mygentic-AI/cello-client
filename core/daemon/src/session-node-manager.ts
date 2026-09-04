@@ -8616,6 +8616,37 @@ export class SessionNodeManager {
     let sendStream: Stream | undefined;
     try {
       /**
+       * ─── EVERY FRAME CARRIES ITS OWN PROOF — `DOD-M15-AUTHORSHIP-ABSENT-1` ────────────────────
+       *
+       * Structure 1 used to be built and signed INSIDE the relay submit, so a send the relay never
+       * witnessed put a frame on the wire with nothing on it to check — and the receiver, having no
+       * proof to compare, ingested it and attributed it anyway. There was always something to sign;
+       * nobody signed it.
+       *
+       * ⚠️ `structure2_cbor` IS DROPPED WHEN WE BUILD OUR OWN, and that pairing is load-bearing. The
+       * relay's record commits its copy of the sender's signature to the EXACT Structure 1 that was
+       * submitted; put it beside a Structure 1 built here (different timestamp, different
+       * last_seen_seq) and the receiver's cross-check fails against bytes that were never altered —
+       * a freeze on an honest message. The two travel together or the relay's half does not travel.
+       *
+       * ⚠️ SIGNED HERE, BEFORE THE SESSION KEY IS READ, and the order is load-bearing rather than
+       * tidy. `sessionKey` below is read once and used to seal the body several `await`s later; a
+       * key agreed with the counterparty inside that window leaves this side sealing under the key
+       * it captured while the far side has already moved on, and every message is refused as
+       * `decrypt_failed`. Signing costs two awaits, and putting them between the read and the seal
+       * widened that window enough to break the live two-node round trip. Measured, not reasoned
+       * about: seam-3 went red and both daemons logged `session.key.agreed` before the refusal.
+       */
+      let frameS1 = orderingS1;
+      let frameSig = orderingSig;
+      let frameS2 = orderingS2;
+      if (frameS1 === undefined || frameSig === undefined) {
+        const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
+        frameS1 = own.structure1;
+        frameSig = own.signature;
+        frameS2 = undefined;
+      }
+      /**
        * 🚨 NO KEY, NO DIRECT SEND — `DOD-M15-EPHEMERAL-AUTH-1`, and there is no plaintext fallback.
        *
        * Throwing here rather than sending in the open, because the catch below PARKS the content —
@@ -8661,29 +8692,6 @@ export class SessionNodeManager {
        * the receiver decrypts before it verifies.
        */
       const wireBody = sealSessionContent(sessionKey, content);
-      /**
-       * ─── EVERY FRAME CARRIES ITS OWN PROOF — `DOD-M15-AUTHORSHIP-ABSENT-1` ────────────────────
-       *
-       * Structure 1 used to be built and signed INSIDE the relay submit, so a send the relay never
-       * witnessed put a frame on the wire with nothing on it to check — and the receiver, having no
-       * proof to compare, ingested it and attributed it anyway. There was always something to sign;
-       * nobody signed it.
-       *
-       * ⚠️ `structure2_cbor` IS DROPPED WHEN WE BUILD OUR OWN, and that pairing is load-bearing. The
-       * relay's record commits its copy of the sender's signature to the EXACT Structure 1 that was
-       * submitted; put it beside a Structure 1 built here (different timestamp, different
-       * last_seen_seq) and the receiver's cross-check fails against bytes that were never altered —
-       * a freeze on an honest message. The two travel together or the relay's half does not travel.
-       */
-      let frameS1 = orderingS1;
-      let frameSig = orderingSig;
-      let frameS2 = orderingS2;
-      if (frameS1 === undefined || frameSig === undefined) {
-        const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
-        frameS1 = own.structure1;
-        frameSig = own.signature;
-        frameS2 = undefined;
-      }
       const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,

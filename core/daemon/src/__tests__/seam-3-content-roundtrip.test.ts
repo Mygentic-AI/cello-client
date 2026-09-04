@@ -32,7 +32,7 @@ import { generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
-import { seedAgents } from "./helpers/seed-agents.js";
+import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -104,8 +104,15 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
   }
 
   const SID = "33".repeat(16);
-  const A_PUB = "aa".repeat(32);
-  const B_PUB = "bb".repeat(32);
+  /**
+   * DOD-M15-AUTHORSHIP-ABSENT-1: THE COUNTERPARTY KEYS ARE THE REAL ONES NOW.
+   *
+   * They were `"aa".repeat(32)` and `"bb".repeat(32)` — placeholders that stood in for identities
+   * nothing checked. Every content frame carries the sender's signature over its own Structure 1,
+   * and the receiver matches the signer against `counterparty_pubkey`; against a placeholder, alice
+   * signing with alice's key is a stranger, and B refuses her message. Seeded per test, because each
+   * one builds its own pair of managers with their own agent rows.
+   */
 
   it("A→B content is ingested + tree-appended + delivery-ACKed, resolving A's awaiting-ACK", async () => {
     const A = makeManager();
@@ -113,8 +120,11 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     await A.manager.initialize();
     await B.manager.initialize();
     // Production always has these rows: the daemon creates an agent long before it has a session.
-    await seedAgents(A.manager.getDb(), ["alice"]);
-    await seedAgents(B.manager.getDb(), ["bob"]);
+    const A_PUB = (await seedAgentKeys(A.manager.getDb(), ["alice"])).get("alice")!.pubkeyHex;
+    const B_PUB = (await seedAgentKeys(B.manager.getDb(), ["bob"])).get("bob")!.pubkeyHex;
+    // And production always wires the key providers — without them A cannot sign what it sends.
+    await wireAgentKeyProviders(A.manager, A.manager.getDb());
+    await wireAgentKeyProviders(B.manager, B.manager.getDb());
     // DOD-LOOP-1: bob comes online → his per-agent standing receiver is created.
     await B.manager.ensureStandingReceiverForAgent("bob");
 
@@ -124,8 +134,6 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
 
     // A: create N_A (gated to B's standing receiver) and dial it through N_A (seam 1a/1b).
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
@@ -134,9 +142,23 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     // B: accept the inbound session (seam 2 core) — hands off the standing receiver gated
     // to N_A and registers B's content handler. MUST happen before A sends.
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     expect(accepted.ok).toBe(true);
+    /**
+     * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
+     * `DOD-M15-AUTHORSHIP-ABSENT-1`.
+     *
+     * Both sides used to be handed `0x7e…` because a FakeNode counterparty can never complete the
+     * ephemeral exchange. This file's transport is REAL, and the identity keys wired above are the
+     * last thing the exchange was missing — so it now completes on its own, moments after the seed
+     * would have been written, and overwrites it on whichever side finishes last. Two ends sealing
+     * under different keys is `decrypt_failed` on every message.
+     *
+     * So the seed is gone and the test waits for the agreement it was standing in for. This is the
+     * state 007-CRYPTO's comment describes as the one the short-circuit imitates; here it is the
+     * genuine article.
+     */
+    expect(await pollFor(() => A.events.find((e) => e.event === "session.key.agreed")), "A must hold an agreed content key before it can send").not.toBeNull();
+    expect(await pollFor(() => B.events.find((e) => e.event === "session.key.agreed")), "and B must hold the same one before it can open the message").not.toBeNull();
 
     // A: send content over the live N_A ↔ B connection.
     const text = "hello over real libp2p";
@@ -147,7 +169,9 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
 
     // B: the content arrives, cross-checks, appends to B's daemon-owned tree, and buffers.
     const received = await pollFor(() => B.manager.takeReceivedContent("bob", SID));
-    expect(received).not.toBeNull();
+    // The receiver's own refusals, in the failure message: a round trip that stops at B says nothing
+    // about WHY on its own, and every refusal on that path names itself.
+    expect(received, JSON.stringify(B.events.filter((e) => e.event.startsWith("session.content.")))).not.toBeNull();
     expect(Buffer.from(received!.contentHex, "hex").toString()).toBe(text);
     expect(received!.sequenceNumber).toBe(0);
     expect(B.manager.getSessionTree("bob", SID).size()).toBe(1);
@@ -176,23 +200,38 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     await A.manager.initialize();
     await B.manager.initialize();
     // Production always has these rows: the daemon creates an agent long before it has a session.
-    await seedAgents(A.manager.getDb(), ["alice"]);
-    await seedAgents(B.manager.getDb(), ["bob"]);
+    const A_PUB = (await seedAgentKeys(A.manager.getDb(), ["alice"])).get("alice")!.pubkeyHex;
+    const B_PUB = (await seedAgentKeys(B.manager.getDb(), ["bob"])).get("bob")!.pubkeyHex;
+    // And production always wires the key providers — without them A cannot sign what it sends.
+    await wireAgentKeyProviders(A.manager, A.manager.getDb());
+    await wireAgentKeyProviders(B.manager, B.manager.getDb());
     await B.manager.ensureStandingReceiverForAgent("bob");
 
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    A.manager.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const connected = await A.manager.connectToCounterparty("alice", SID, bInfo!.addrs);
     expect(connected.ok).toBe(true);
     const accepted = await B.manager.acceptSession(SID, "bob", A_PUB, created.peerId, "corr-B");
-    // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
-    B.manager.setSessionContentKeyForTest("bob", SID, new Uint8Array(32).fill(0x7e));
     expect(accepted.ok).toBe(true);
+    /**
+     * ⚠️ **THE CONTENT KEY IS THE REAL ONE HERE, NOT A SEEDED CONSTANT** —
+     * `DOD-M15-AUTHORSHIP-ABSENT-1`.
+     *
+     * Both sides used to be handed `0x7e…` because a FakeNode counterparty can never complete the
+     * ephemeral exchange. This file's transport is REAL, and the identity keys wired above are the
+     * last thing the exchange was missing — so it now completes on its own, moments after the seed
+     * would have been written, and overwrites it on whichever side finishes last. Two ends sealing
+     * under different keys is `decrypt_failed` on every message.
+     *
+     * So the seed is gone and the test waits for the agreement it was standing in for. This is the
+     * state 007-CRYPTO's comment describes as the one the short-circuit imitates; here it is the
+     * genuine article.
+     */
+    expect(await pollFor(() => A.events.find((e) => e.event === "session.key.agreed")), "A must hold an agreed content key before it can send").not.toBeNull();
+    expect(await pollFor(() => B.events.find((e) => e.event === "session.key.agreed")), "and B must hold the same one before it can open the message").not.toBeNull();
 
     // Send content under a hash that does NOT match it (wire tamper of a single frame).
     const content = new TextEncoder().encode("genuine content");
