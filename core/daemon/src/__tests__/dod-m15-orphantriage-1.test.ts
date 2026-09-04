@@ -463,6 +463,42 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     expect(logged.ctx!["signerPubkey"]).toBe(signerHex);
   }, 60_000);
 
+  it("★ AN UNREADABLE ADDRESS BOOK IS RECORDED AS UNREAD, never as a measured 'no'", async () => {
+    /**
+     * ⚠️ **THIS TEST EXISTS BECAUSE ITS MUTANT SURVIVED.** The `"not_checked"` state was added for
+     * review F6 — the log used to publish `knownContact: false` on paths that never looked — and the
+     * mutation loop then turned it straight back into `false` with the whole suite still green.
+     * Nothing exercised the manager's failure path, so the fix was prose with no consumer.
+     *
+     * The fault is injected the only way it happens for real: the read throws. An investigator
+     * filtering `session.content.orphaned` days later is the ONLY person who will ever ask whether
+     * that `false` was a reading, and a default wearing the shape of one is the cheapest possible
+     * way to mislead them.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-wire-c-" });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+    const { framed, signerHex } = await signedFrame();
+    dropSessionRow("alice");
+    // The address book becomes unreadable. Not a stub: the real SELECT throws, the real catch runs.
+    fx.snm.getDb().prepare("DROP TABLE contacts").run();
+
+    await fx.snm.handleContentFrameForTest("alice", SID, framed, PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice!.guidance, "and it still routes to the safe action").toBe(REPORT_ONLY_SIGNED);
+    expect(notice!.impact, "the operator is told it could not be checked, not told the answer was no")
+      .toMatch(/could NOT be read on this machine/);
+    expect(notice!.impact).toContain(signerHex);
+
+    const logged = fx.eventsNamed("session.content.orphaned").at(-1)!;
+    expect(logged.ctx!["knownContact"], "the forensic record must not publish a reading nobody took").toBe(NOT_CHECKED);
+    expect(logged.ctx!["ongoingConversation"]).toBe(NOT_CHECKED);
+    expect(
+      fx.eventsNamed("session.content.orphaned.evidence.failed").length,
+      "and the reason it could not be read is on the record — this is the half that was silent",
+    ).toBeGreaterThan(0);
+  }, 60_000);
+
   it("★ the same frame with its ordering record REMOVED yields no key at all", async () => {
     /**
      * The other half of the same measurement. Identical bytes, identical session, one field gone —
