@@ -10736,6 +10736,16 @@ export class SessionNodeManager {
    */
   #markContentTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string, reason: string): void {
     const key = this.#k(agentName, sessionId);
+    /**
+     * Read BEFORE the write, so the announcement below fires on the TRANSITION rather than on every
+     * re-refusal. The same message can be refused again by a drain triggered for another reason, and
+     * an INFO line per repeat is a smaller version of the noise this unit exists to remove.
+     *
+     * The durable write is still ATTEMPTED every time, deliberately: `INSERT OR IGNORE` costs
+     * nothing when the row is already there, and skipping it would mean a write that failed once —
+     * the branch that logs the error below — never got another chance to succeed.
+     */
+    const alreadyKnown = this.#isTerminallyRefused(agentName, sessionId, contentHashHex);
     try {
       if (!this.#db) throw new Error("database is not open");
       this.#db
@@ -10767,12 +10777,14 @@ export class SessionNodeManager {
       clearTimeout(t);
       this.#leafFetchTimers.delete(timerKey);
     }
-    this.#logger.info("session.content.terminal_refusal", {
-      agentName, sessionId, reason,
-      contentHash: contentHashHex,
-      impact:
-        "no further attempt will be made to fetch this message. The conversation it was sent to is closed and signed, so no retry could ever have succeeded.",
-    });
+    if (!alreadyKnown) {
+      this.#logger.info("session.content.terminal_refusal", {
+        agentName, sessionId, reason,
+        contentHash: contentHashHex,
+        impact:
+          "no further attempt will be made to fetch this message. The conversation it was sent to is closed and signed, so no retry could ever have succeeded.",
+      });
+    }
   }
 
   /**

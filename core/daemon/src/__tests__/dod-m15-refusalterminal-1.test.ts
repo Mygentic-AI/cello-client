@@ -343,6 +343,24 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     );
   });
 
+  it("the terminal event is announced ONCE, on the transition — not on every re-refusal", async () => {
+    /**
+     * Measured live: four drains fired in the first three minutes after the fix went in (agent
+     * start, receiver ready, and a manual start), and each one re-refused the same message. An INFO
+     * line per repeat is a smaller version of the noise this unit exists to remove — the event has
+     * to mean "this became terminal", or it means nothing.
+     */
+    await boot();
+    insertSessionRow("s-closed", "sealed");
+    const content = new TextEncoder().encode("too late");
+    const mgr = handle!.getSessionNodeManager();
+
+    for (let i = 0; i < 3; i++) {
+      await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+    }
+    expect(logged.filter((l) => l.event === "session.content.terminal_refusal")).toHaveLength(1);
+  });
+
   it("nothing interpolates the refused content — not into a log line, an error or a notice", async () => {
     await boot();
     insertSessionRow("s-closed", "sealed");
