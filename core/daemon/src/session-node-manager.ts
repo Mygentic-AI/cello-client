@@ -1922,6 +1922,23 @@ export class SessionNodeManager {
    * entry is removed the moment it is reconciled.
    */
   #unreadableAlgSeen = new Map<string, Map<string, string>>();
+  /**
+   * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1 — the content hashes this side refused for having no
+   * usable proof of authorship, so the park path can say so when the same message arrives the
+   * other way.
+   *
+   * **The silence this closes.** A direct-path refusal sends no delivery ACK, so the sender's TTF
+   * backstop parks the message and it arrives through the relay mailbox seconds later — where the
+   * ENVELOPE's signature is what authenticates it, and recovery correctly accepts it. So the
+   * message is delivered, with no per-message proof, moments after the operator was told it was
+   * refused. Nothing tied the two events together, which is the same shape the algorithm refusal
+   * above already had and the same remedy.
+   *
+   * Same bounded shape and the same reason: it is fed entirely by a remote party, so losing an
+   * entry costs one reconciliation line and an unbounded map would be a leak with a peer's hand on
+   * the tap.
+   */
+  #unprovenAuthorshipSeen = new Map<string, Set<string>>();
   // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
   // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
   // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
@@ -6423,6 +6440,7 @@ export class SessionNodeManager {
     this.#terminalRefusalsLoaded.delete(key);
     this.#terminalRefusalsReadFailedAt.delete(key);
     this.#unreadableAlgSeen.delete(key);
+    this.#unprovenAuthorshipSeen.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
@@ -9312,6 +9330,24 @@ export class SessionNodeManager {
       if (!oldest.done) byHash.delete(oldest.value);
     }
     byHash.set(Buffer.from(contentHash).toString("hex"), declaredAlg);
+  }
+
+  /**
+   * Remember that THIS frame was refused for carrying no usable proof of who wrote it, so the park
+   * path can say so when the same content arrives through the relay mailbox — review H1.
+   *
+   * Bounded for the same reason and by the same cap as `#noteUnreadableAlgFrame`: a peer sending
+   * unprovable frames feeds this map, so it drops the oldest rather than growing.
+   */
+  #noteUnprovenAuthorshipFrame(agentName: string, sessionId: string, contentHash: Uint8Array): void {
+    const key = this.#k(agentName, sessionId);
+    let hashes = this.#unprovenAuthorshipSeen.get(key);
+    if (!hashes) { hashes = new Set(); this.#unprovenAuthorshipSeen.set(key, hashes); }
+    if (hashes.size >= MAX_UNREADABLE_ALG_FRAMES) {
+      const oldest = hashes.values().next();
+      if (!oldest.done) hashes.delete(oldest.value);
+    }
+    hashes.add(Buffer.from(contentHash).toString("hex"));
   }
 
   /**
@@ -12853,6 +12889,14 @@ export class SessionNodeManager {
      */
     const memoKey = this.#k(agentName, sessionId);
     const priorDeclaredAlg = this.#unreadableAlgSeen.get(memoKey)?.get(contentHashHex);
+    /**
+     * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1 — READ BEFORE THE INGEST, reported after it.
+     *
+     * Same reasoning as `priorDeclaredAlg` directly above: the memo says what THIS side did to this
+     * content on the direct path, and the ingest below is what decides whether the other route
+     * succeeded. Reading it after would race the clear.
+     */
+    const refusedForAuthorship = this.#unprovenAuthorshipSeen.get(memoKey)?.has(contentHashHex) === true;
     const result = await this.ingestReceivedContent(
       agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
       // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
@@ -12892,6 +12936,38 @@ export class SessionNodeManager {
         priorDeclaredAlg,
         recoveredAlg: env.contentHashAlg ?? "(absent → sha256)",
         impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content has now been accepted via the relay park under an algorithm this build CAN read. The refusal did not hold: the message was delivered by the other route.",
+      });
+    }
+    /**
+     * ⚠️ **THE AUTHORSHIP REFUSAL DOES NOT HOLD EITHER, AND THIS IS WHERE IT SAYS SO** — review H1.
+     *
+     * `DOD-M15-AUTHORSHIP-ABSENT-1` refuses a direct-path frame with no usable proof of who wrote
+     * it. Refusing sends no delivery ACK, so the sender's TTF backstop parks the message and it
+     * arrives here — where the ENVELOPE's signature over (session_id, recipient_pubkey,
+     * content_hash) is what authenticates it, and `authenticateParkedEntry` above has already
+     * accepted it. That is correct and it is deliberately NOT changed here: gating mail retrieval
+     * on a per-message record the relay-degraded path is allowed to omit is the false-positive shape
+     * this whole unit is careful to avoid, and the order that added the refusal scopes the park
+     * envelope out explicitly.
+     *
+     * What must not stand is the SILENCE. Without this line the operator reads "refused" and then
+     * watches the message appear, with nothing connecting the two — the same reconciliation gap the
+     * algorithm refusal above already pays for. What they need to know is the part that is really
+     * lost: the message arrived, and its INDIVIDUAL author is attested by the mailbox envelope
+     * rather than by a signature over that message's own bytes.
+     *
+     * Same `ok && !held && !screenedOut` predicate as above, and for the same reason: `ok` is not
+     * "delivered".
+     */
+    if (refusedForAuthorship && result.ok && result.held !== true && result.screenedOut !== true) {
+      const hashes = this.#unprovenAuthorshipSeen.get(memoKey);
+      hashes?.delete(contentHashHex);
+      if (hashes && hashes.size === 0) this.#unprovenAuthorshipSeen.delete(memoKey);
+      this.#logger.warn("content.recover.authorship_refusal_reconciled", {
+        agentName, sessionId, correlationId,
+        contentHash: contentHashHex,
+        impact: "THIS EXACT MESSAGE was refused on the direct path for carrying no usable proof of who wrote it, and the same content has now been accepted from the relay mailbox, where the sealed envelope proves the sender. The refusal did not hold: the message WAS delivered by the other route. What is missing is narrower than the refusal implied — this message has no signature of its own in the record, so the receipt can show it arrived and cannot prove which of them wrote that individual line.",
+        guidance: "Nothing to do about this message. The upgrade you were told to ask for is still the fix: once they are on a build that signs each message, the direct path stops refusing and the receipt regains its per-message proof.",
       });
     }
     return result;
@@ -15272,6 +15348,7 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
     reason: "authorship_proof_absent" | "authorship_proof_unusable",
+    contentHash: Uint8Array,
     detail: Record<string, unknown>,
     correlationId?: string,
   ): void {
@@ -15285,17 +15362,35 @@ export class SessionNodeManager {
      * on the sender's. Telling them to do something local would be an affordance that resolves to
      * nothing. So it names the one move that works (tell them to upgrade) and the one that settles
      * the other explanation (confirm out of band), and it stops at two.
+     *
+     * ⚠️ **IT USED TO OPEN "Nothing was shown and nothing was stored." THAT SENTENCE WAS FALSE** —
+     * review H1, and it is kept here rather than deleted because it is the exact shape this
+     * milestone exists to catch: a refusal that announces a stronger outcome than it delivers.
+     *
+     * Refusing sends no delivery ACK, so the sender's TTF backstop parks the message and it arrives
+     * through the relay mailbox seconds later, where the ENVELOPE's signature authenticates it and
+     * recovery accepts it — correctly, and with no per-message proof. So the message may well be
+     * delivered, moments after the operator was told it was not. The reconciliation is logged
+     * (`content.recover.authorship_refusal_reconciled`) and the sentence below now says what is
+     * actually true of this path: nothing was shown YET, and this refusal does not stop the copy
+     * coming the other way.
      */
     const guidance =
-      "STOPPED ON PURPOSE. Nothing was shown and nothing was stored. Almost always their CELLO build " +
-      "is older than this one: a build from before message signing does not attach a signature at " +
-      "all. Ask which version they are running, and tell them to upgrade — this will keep happening " +
-      "until they do, and only they can fix it. If they are on the SAME version as you, that " +
-      "explanation does not hold: confirm with them OUT OF BAND before opening another session.";
+      "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. IT MAY STILL " +
+      "REACH YOU BY THE OTHER ROUTE: refusing sends back no acknowledgement, so their agent parks a " +
+      "copy in the relay mailbox and this side accepts that one on the strength of the mailbox " +
+      "envelope — delivered, but with no proof of who wrote that individual message. Almost always " +
+      "their CELLO build is older than this one: a build from before message signing does not attach " +
+      "a signature at all. Ask which version they are running, and tell them to upgrade — this will " +
+      "keep happening until they do, and only they can fix it. If they are on the SAME version as " +
+      "you, that explanation does not hold: confirm with them OUT OF BAND before opening another " +
+      "session.";
     this.#logger.error("session.content.refused", {
       agentName, sessionId, correlationId, reason, ...detail, impact, guidance,
     });
     this.noteContentRefusal(agentName, sessionId, reason, { kind: REFUSAL_KINDS.REFUSED, impact, guidance });
+    // Armed AFTER the refusal is filed, so the memo can never claim a refusal that did not happen.
+    this.#noteUnprovenAuthorshipFrame(agentName, sessionId, contentHash);
   }
 
   #recordFrameOrdering(
@@ -15759,7 +15854,7 @@ export class SessionNodeManager {
        * about their key.
        */
       if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
-        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", {
+        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
           // WHICH half is missing. A sender on an older build supplies neither; a stripped frame is
           // likelier to be missing one, and an investigator should not have to guess which.
           hasStructure1: s1Cbor instanceof Uint8Array,
@@ -15784,7 +15879,7 @@ export class SessionNodeManager {
         return;
       }
       if (authorship.verdict === "unusable") {
-        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", {
+        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
           detail: authorship.reason,
         }, correlationId);
         return;

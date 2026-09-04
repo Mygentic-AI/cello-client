@@ -31,6 +31,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { encodeCbor, encodeStructure1 } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent, verify } from "@cello-protocol/crypto";
+import { sealParkEnvelope } from "../park-envelope.js";
 import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -264,6 +265,84 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
     expect(notice, "a proof that does not describe this message is not a proof of it").toBeDefined();
     expect(notice!.reason).toBe("authorship_proof_unusable");
     expect(fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+  }, 60_000);
+});
+
+describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the operator is told so", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  it("★ the refused message arrives via the relay mailbox, and the two events become one story", async () => {
+    /**
+     * ⚠️ **REVIEW H1 — THE REFUSAL ANNOUNCED MORE THAN IT DELIVERED.**
+     *
+     * Walked as the operator lives it: their counterparty is on an older build → the message is
+     * refused on the direct path for carrying no proof of who wrote it → **no delivery ACK goes
+     * back**, so the sender's backstop parks a sealed copy in the relay mailbox → this side pulls
+     * it, the ENVELOPE's signature authenticates it, and it is delivered. The operator had just
+     * been told "nothing was stored", and then watched the message appear.
+     *
+     * The park path is deliberately NOT changed — gating mail retrieval on a per-message record the
+     * relay-degraded path may omit is the false positive this whole unit avoids, and the order
+     * scopes the envelope out. What is fixed is the silence: the two events are one story now.
+     */
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const recipientPub = await recipient.getPublicKey();
+    const contentHash = wireContentHash(BODY);
+
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-reconcile-" });
+    await fx.createSession(SID, "alice", Buffer.from(await sender.getPublicKey()).toString("hex"), PEER);
+
+    // 1. The direct frame, with no proof. Refused by name.
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({}), PEER);
+    expect(fx.snm.takeContentRefusals("alice", SID, "op")[0]!.reason).toBe("authorship_proof_absent");
+
+    // 2. The SAME content, arriving the other way — sealed to this recipient, exactly as the
+    //    sender's park backstop deposits it.
+    const sealed = await sealParkEnvelope({
+      signer: sender, sessionIdHex: SID, recipientPubkey: recipientPub, content: BODY, contentHash,
+    });
+    const plaintext = await recipient.openContentSeal!(sealed);
+    const recovered = await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr");
+
+    expect(recovered.ok, "the mailbox copy is accepted on the envelope's signature — unchanged, and correct").toBe(true);
+    const reconciled = fx.eventsNamed("content.recover.authorship_refusal_reconciled").at(-1);
+    expect(
+      reconciled,
+      "without this line the operator reads REFUSED, watches the message arrive, and has nothing connecting the two",
+    ).toBeDefined();
+    expect(reconciled!.ctx["contentHash"]).toBe(Buffer.from(contentHash).toString("hex"));
+    expect(
+      String(reconciled!.ctx["impact"]),
+      "and it must name what is ACTUALLY lost — the per-message proof, not the delivery",
+    ).toMatch(/WAS delivered by the other route/);
+  }, 60_000);
+
+  it("★ a message that was never refused produces NO reconciliation line", async () => {
+    /**
+     * The other half, and the reason the memo is keyed on the content hash rather than the session:
+     * a warning that fires on the benign steady state is not a signal. Every ordinary parked message
+     * would otherwise carry an alarm about a refusal that never happened.
+     */
+    const sender = generateKeypair();
+    const recipient = generateKeypair();
+    const recipientPub = await recipient.getPublicKey();
+    const contentHash = wireContentHash(BODY);
+
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-noreconcile-" });
+    await fx.createSession(SID, "alice", Buffer.from(await sender.getPublicKey()).toString("hex"), PEER);
+
+    const sealed = await sealParkEnvelope({
+      signer: sender, sessionIdHex: SID, recipientPubkey: recipientPub, content: BODY, contentHash,
+    });
+    const plaintext = await recipient.openContentSeal!(sealed);
+    expect((await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr")).ok).toBe(true);
+
+    expect(
+      fx.eventsNamed("content.recover.authorship_refusal_reconciled"),
+      "an ordinary parked message must not carry an alarm about a refusal that never happened",
+    ).toHaveLength(0);
   }, 60_000);
 });
 
