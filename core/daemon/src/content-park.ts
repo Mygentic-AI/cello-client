@@ -25,7 +25,7 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
-import { ContentParkClient, ContentParkRefusedError } from "./content-park-client.js";
+import { ContentParkClient, ContentParkRefusedError, ContentParkUnreachableError } from "./content-park-client.js";
 import { extractErrorMessage } from "./error-message.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
@@ -692,13 +692,56 @@ export function createContentPark(deps: ContentParkDeps) {
         payload = Buffer.from(ciphertext, "hex");
       }
 
-      const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
-      return await client.deposit(node, {
-        recipientPubkey: Buffer.from(recipientPubkey, "hex"),
-        contentHash: Buffer.from(contentHash, "hex"),
-        sessionId: Buffer.from(sessionId, "hex"),
-        ciphertext: payload,
-      });
+      /**
+       * DOD-M15-PARKCONN-1 — **THE ODD HANDLER OUT NOW REFUSES LIKE ITS SIBLINGS, AND SAYS SO ONCE.**
+       *
+       * Every other exit above returns `{ ok: false, reason, guidance }`; this one ended in a bare
+       * `return await client.deposit(...)` with no catch and no log. An unreachable relay — the
+       * ordinary condition park exists for — therefore left the daemon as a THROW, which IPC shapes
+       * into `internal_error` + "An unexpected error occurred. Check daemon logs for details." The
+       * daemon logs held nothing either: this handler logged NOTHING AT ALL, which is why
+       * `019-PARKERROR` went looking for a deposit line and found none.
+       *
+       * Only `ContentParkUnreachableError` is converted. Anything else still throws, because a
+       * blanket catch here would turn a genuine defect into a tidy refusal — the failure this
+       * milestone is named for.
+       */
+      const client = newParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+      const logDepositResult = (r: { ok: boolean; reason?: string }): void => {
+        // NOT `content.park.deposit.result` — the ContentParkClient already emits that name one
+        // layer down, and two events from different layers under one name make an aggregated log
+        // unreadable (the same review finding as `content.park.pull.refused_by_relay`).
+        const line = { relayPeerId: relay.peerId, sessionId, contentHash, ok: r.ok, ...(r.reason !== undefined ? { reason: r.reason } : {}) };
+        if (r.ok) logger.info("content.park.deposit.ipc.result", line);
+        else logger.warn("content.park.deposit.ipc.result", line);
+      };
+      try {
+        const res = await client.deposit(node, {
+          recipientPubkey: Buffer.from(recipientPubkey, "hex"),
+          contentHash: Buffer.from(contentHash, "hex"),
+          sessionId: Buffer.from(sessionId, "hex"),
+          ciphertext: payload,
+        });
+        logDepositResult(res);
+        return res;
+      } catch (err: unknown) {
+        if (!(err instanceof ContentParkUnreachableError)) throw err;
+        const reason = `relay_unreachable:${err.reason}`;
+        logDepositResult({ ok: false, reason });
+        return {
+          ok: false,
+          reason,
+          // DoD 1: the per-address reasons are readable from the RESPONSE, not only the log — the
+          // caller of this IPC has no daemon log in front of it.
+          dialFailures: err.dialFailures,
+          guidance:
+            `Relay ${relay.peerId} could not be reached from this daemon (${err.reason}), so nothing was deposited and no content was lost. ` +
+            (err.dialFailures.length > 0
+              ? `Every address failed to dial: ${err.dialFailures.map((f) => `${f.addr} → ${f.error}`).join("; ")}. `
+              : `No dial was refused, so the connection existed a moment ago and was gone by the time the stream opened. `) +
+            `Retry this call once the relay is up. A conversation cannot be moved to a different relay from here — the park relay comes from the session assignment — so if this relay stays down, broker a new session with cello_initiate_session.`,
+        };
+      }
     });
 
     handlers.set("content_park_pull", async (params, _connectionId) => {

@@ -30,6 +30,7 @@ import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import { CONTENT_PARK_PROTOCOL_ID, buildContentParkAuthMsg } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 import type { Logger } from "./types.js";
 
 const FRAME_TIMEOUT_MS = 8_000;
@@ -58,6 +59,44 @@ export class ContentParkRefusedError extends Error {
     super(`the relay refused to release parked content: ${reason}`);
     this.name = "ContentParkRefusedError";
     this.reason = reason;
+  }
+}
+
+/** One relay address `#open` tried to dial, and why that dial failed. */
+export interface ParkDialFailure {
+  addr: string;
+  error: string;
+}
+
+/**
+ * DOD-M15-PARKCONN-1 — the content-park stream could not be opened, WITH the reason there was
+ * nothing to open it on.
+ *
+ * `#open` dials before it opens a stream, and it used to discard every dial failure in an empty
+ * `catch`. That catch was the only place the reason for a missing connection ever existed, so an
+ * operator messaging an offline counterparty was told `No open connection to peer 12D3Koo…` — that
+ * there was no connection, never why — and the same action parked or failed with nothing to tell
+ * the two apart.
+ *
+ * A real `Error` (so `instanceof Error` and `extractErrorMessage` both work on it — the transport
+ * throws plain object literals, which stringify to "[object Object]") carrying the transport's own
+ * `reason` under the same field name the literal used, so existing `err.reason` readers are
+ * unaffected.
+ */
+export class ContentParkUnreachableError extends Error {
+  readonly reason: string;
+  readonly relayPeerId: string;
+  readonly dialFailures: readonly ParkDialFailure[];
+
+  constructor(args: { reason: string; relayPeerId: string; dialFailures: readonly ParkDialFailure[]; cause: string }) {
+    const dials = args.dialFailures.length > 0
+      ? ` Dials tried: ${args.dialFailures.map((f) => `${f.addr} → ${f.error}`).join("; ")}`
+      : " No dial failed, so the connection existed or was never attempted.";
+    super(`content park relay ${args.relayPeerId} is unreachable (${args.reason}): ${args.cause}.${dials}`);
+    this.name = "ContentParkUnreachableError";
+    this.reason = args.reason;
+    this.relayPeerId = args.relayPeerId;
+    this.dialFailures = args.dialFailures;
   }
 }
 
@@ -290,17 +329,70 @@ export class ContentParkClient {
     }
   }
 
-  /** Dial the relay (best-effort per addr) and open a content-park stream. */
+  /**
+   * Dial the relay (best-effort per addr) and open a content-park stream.
+   *
+   * DOD-M15-PARKCONN-1 — **A DIAL FAILURE IS A NON-EVENT UNTIL THE STREAM ALSO FAILS, AND THEN IT
+   * IS THE ONLY EVIDENCE THERE IS.**
+   *
+   * The loop stays best-effort on purpose: the peerstore may already hold a connection, so a dial
+   * that fails while `newStream` succeeds anyway explains nothing and must stay silent. What used to
+   * happen as well is that the dial errors were discarded in ALL cases, including the one where
+   * `newStream` then reported `no_connection` — and the throw site's own comment calls that "the one
+   * condition a dial fixes". A dial had run; its verdict had been deleted by this catch.
+   *
+   * Collected here and surfaced only on the failing path, which splits the two causes an operator
+   * otherwise cannot tell apart: every address was unusable, or a dial succeeded and the connection
+   * was gone again a moment later.
+   */
   async #open(node: CelloNode): Promise<Stream> {
+    const dialFailures: ParkDialFailure[] = [];
     for (const addr of this.#relayAddrs) {
       try {
         await node.dial(addr);
         break;
-      } catch {
-        /* try the next addr; newStream below may still succeed from the peerstore */
+      } catch (err: unknown) {
+        // extractErrorMessage, NOT String(err): the transport rejects with plain object literals.
+        dialFailures.push({ addr, error: extractErrorMessage(err) });
       }
     }
-    return node.newStream(this.#relayPeerId, CONTENT_PARK_PROTOCOL_ID);
+    try {
+      return await node.newStream(this.#relayPeerId, CONTENT_PARK_PROTOCOL_ID);
+    } catch (err: unknown) {
+      // The transport's own reason (`no_connection`, `node_stopped`, `invalid_peer_id`, …) survives
+      // to the caller — Invariant 3: a downstream handler must not overwrite it with a generic one.
+      const reason =
+        err !== null && typeof err === "object" && typeof (err as { reason?: unknown }).reason === "string"
+          ? (err as { reason: string }).reason
+          : "stream_open_failed";
+      // The loop `break`s on the first success, so fewer failures than addresses means one worked.
+      const dialOutcome =
+        this.#relayAddrs.length === 0
+          ? "no_address_configured"
+          : dialFailures.length < this.#relayAddrs.length
+            ? "dialed_then_lost"
+            : "all_addresses_failed";
+      this.#logger.warn("content.park.open.failed", {
+        relayPeerId: this.#relayPeerId,
+        reason,
+        dialOutcome,
+        addrsTried: this.#relayAddrs.length,
+        dialFailures,
+        error: extractErrorMessage(err),
+        impact:
+          dialOutcome === "all_addresses_failed"
+            ? "every relay address failed to dial, so there was no connection for the stream to use — the dial errors above are the cause, not the missing connection"
+            : dialOutcome === "dialed_then_lost"
+              ? "a dial SUCCEEDED and the connection was gone again by the time the stream was opened — re-dialling this relay is not the remedy"
+              : "no relay address was configured for this content-park client, so no dial was attempted at all",
+      });
+      throw new ContentParkUnreachableError({
+        reason,
+        relayPeerId: this.#relayPeerId,
+        dialFailures,
+        cause: extractErrorMessage(err),
+      });
+    }
   }
 
   #iter(stream: Stream): AsyncIterator<unknown> {
