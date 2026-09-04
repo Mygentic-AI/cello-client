@@ -217,6 +217,71 @@ describe("B: the deposit handler refuses like its siblings", () => {
     expect(result[0]!.context["reason"]).toBeUndefined();
   });
 
+  /**
+   * C — the OTHER face of the coin flip, measured on the live spine on 2026-09-04.
+   *
+   * Two runs of DOD-MSG-7 minutes apart refused for two different reasons, and the second was not a
+   * transport failure at all: `standing_receiver_unavailable`. That branch already returned a
+   * refusal — the spine test was discarding it — and it returned the EXIT-POINT LABEL, the one
+   * `standingReceiverAbsenceReason()` was added to replace after it misnamed a live incident 102
+   * times. `recoverParkedFromRelay` has named the cause since M12-P12; this handler never did.
+   *
+   * The four causes demand opposite responses, which is why one label for all four is not a detail:
+   * "still being built" clears on a retry, "agent offline" never does.
+   */
+  function handlersWithoutReceiver(absence: string, agentNames: string[]): { handlers: Map<string, IpcHandler>; events: LogEvent[] } {
+    const { logger, events } = makeLogger();
+    const park = createContentPark({
+      logger,
+      sessionNodeManager: {
+        getStandingReceiverNode: () => undefined,
+        standingReceiverAbsenceReason: () => absence,
+      } as never,
+      agents: agentNames.map((name) => ({ name, state: "online", pubkey: "aa".repeat(32) })) as never,
+      getKeyProvider: () => undefined,
+      securityGateway: { screenInbound: async () => ({ verdict: "allow" }), screenOutbound: async () => ({ verdict: "allow" }) } as never,
+      makeContentParkClient: () => ({ deposit: async () => ({ ok: true }) }) as never,
+    });
+    const handlers = new Map<string, IpcHandler>();
+    park.registerHandlers(handlers);
+    return { handlers, events };
+  }
+
+  it("C1: no standing receiver names WHICH of the four causes, not the label that stood for all of them", async () => {
+    const { handlers, events } = handlersWithoutReceiver("standing_receiver_creating", ["alice"]);
+
+    const res = (await handlers.get("content_park_deposit")!({ ...params, senderAgentName: "alice" }, "c1")) as {
+      ok?: boolean; reason?: string; cause?: string; guidance?: string;
+    };
+
+    expect(res.ok).toBe(false);
+    // The wire reason is UNCHANGED — a caller matching on it keeps working; the cause rides alongside.
+    expect(res.reason).toBe("standing_receiver_unavailable");
+    expect(res.cause).toBe("standing_receiver_creating");
+    expect(res.guidance).toContain("retry");
+    expect(events.filter((e) => e.event === "content.park.deposit.ipc.result")[0]!.context["cause"]).toBe("standing_receiver_creating");
+  });
+
+  it("C2: an OFFLINE agent is told to start it — the cause that a retry never fixes", async () => {
+    const { handlers } = handlersWithoutReceiver("agent_offline", ["alice"]);
+
+    const res = (await handlers.get("content_park_deposit")!({ ...params, senderAgentName: "alice" }, "c1")) as {
+      cause?: string; guidance?: string;
+    };
+    expect(res.cause).toBe("agent_offline");
+    // Invariant 4: the verb has to be real and reachable from where the caller stands.
+    expect(res.guidance).toContain("cello_start_agent");
+  });
+
+  it("C3: with several agents and no name, it says it cannot tell rather than picking one", async () => {
+    const { handlers } = handlersWithoutReceiver("agent_offline", ["alice", "bob"]);
+
+    const res = (await handlers.get("content_park_deposit")!(params, "c1")) as { cause?: string; guidance?: string };
+    // Guessing an agent would report a cause about the WRONG one — a confident wrong answer.
+    expect(res.cause).toBe("unknown_agent");
+    expect(res.guidance).toContain("senderAgentName");
+  });
+
   it("B3: a refusal the relay ITSELF returned is still passed through unchanged", async () => {
     const { handlers, events } = handlersFor(async () => ({ ok: false, reason: "rate_limited" }));
 

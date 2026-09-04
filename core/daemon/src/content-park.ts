@@ -624,7 +624,32 @@ export function createContentPark(deps: ContentParkDeps) {
       }
 
       const node = sessionNodeManager.getStandingReceiverNode();
-      if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+      if (!node) {
+        /**
+         * DOD-M15-PARKCONN-1 — **NAME THE CAUSE, NOT THE EXIT POINT** (Invariant 3).
+         *
+         * `standing_receiver_unavailable` is the label that already misnamed this incident 102
+         * times, which is why `standingReceiverAbsenceReason()` exists — and `recoverParkedFromRelay`
+         * has used it since M12-P12 while this handler kept returning the bare label. The four causes
+         * demand opposite responses: `standing_receiver_creating` clears in seconds and a retry
+         * works; `agent_offline` never clears until the agent is started; `daemon_shutting_down`
+         * means stop.
+         *
+         * The wire reason is unchanged — a caller matching on it keeps working — and the cause rides
+         * alongside, which is the same shape the send path settled on.
+         */
+        const namedAgent = senderAgentName ?? (agents.length === 1 ? agents[0]!.name : undefined);
+        const cause = namedAgent ? sessionNodeManager.standingReceiverAbsenceReason(namedAgent) : "unknown_agent";
+        const guidanceByCause: Record<string, string> = {
+          standing_receiver_creating: "The standing receiver is still being built; retry this deposit in a few seconds.",
+          agent_offline: `Agent '${namedAgent}' is not online, so this daemon has no node to deposit from. Start it with cello_start_agent.`,
+          no_standing_receiver: "No agent on this daemon has a standing receiver; start an agent with cello_start_agent first.",
+          daemon_shutting_down: "The daemon is shutting down — nothing was deposited, and retrying will not help until it is back up.",
+          unknown_agent: "This daemon has no standing receiver and more than one agent, so it cannot say which; pass senderAgentName, or start an agent with cello_start_agent.",
+        };
+        logger.warn("content.park.deposit.ipc.result", { relayPeerId: relay.peerId, sessionId, contentHash, ok: false, reason: "standing_receiver_unavailable", cause });
+        return { ok: false, reason: "standing_receiver_unavailable", cause, guidance: guidanceByCause[cause] ?? "The daemon's standing receiver is not ready yet; retry after startup." };
+      }
 
       let payload: Uint8Array;
       if (hasContent) {
