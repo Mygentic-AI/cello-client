@@ -181,6 +181,38 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
     expect(frozen[0]!.ctx["reason"]).toBe("signer_not_counterparty");
   }, 60_000);
 
+  it("★ an UNREADABLE structure1_cbor is refused — a claim we cannot read is not a claim", async () => {
+    /**
+     * ⚠️ **THIS TEST EXISTS BECAUSE THE MUTATION LOOP FOUND ITS ABSENCE.** Turning the verifier's
+     * unreadable-layout branch into a soft `verified_unmatched` — the shape a peer speaking a
+     * layout this build cannot name would take — left the whole suite green. Missing, malformed and
+     * mismatched are supposed to share one path, and only two of the three were held.
+     *
+     * The bytes are valid CBOR and not a Structure 1 at all, so this is the SHAPE failure rather
+     * than the decode failure: it reaches `decodeStructure1` and comes back named.
+     */
+    const kp = generateKeypair();
+    const junk = encodeCbor([9, "not a structure 1"]) as Uint8Array;
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-junk-" });
+    await fx.createSession(SID, "alice", Buffer.from(await kp.getPublicKey()).toString("hex"), PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({
+      structure1_cbor: junk,
+      // A real signature over the junk: the sender is not being careless, they are speaking a
+      // layout we cannot read. It must not matter that the signature itself is well-formed.
+      sender_signature: await kp.sign(junk),
+    }), PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice, "a claim in a layout this build cannot name is not a proof of anything").toBeDefined();
+    expect(notice!.reason).toBe("authorship_proof_unusable");
+    expect(
+      fx.eventsNamed("session.content.identity.frozen"),
+      "and an unreadable layout is a version skew, not an accusation",
+    ).toHaveLength(0);
+    expect(fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+  }, 60_000);
+
   it("★ a signature over DIFFERENT content is refused — it proves nothing about THIS message", async () => {
     /**
      * The proof is present, verifies, and is by the right key — over somebody else's bytes. Reading
