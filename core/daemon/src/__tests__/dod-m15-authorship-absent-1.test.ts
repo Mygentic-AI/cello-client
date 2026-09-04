@@ -284,7 +284,6 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
 
     const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
     expect(notice, "a claim for another conversation is not a claim about this one").toBeDefined();
-    expect(notice!.reason).toBe("authorship_proof_unusable");
     expect(
       fx.eventsNamed("session.content.refused").at(-1)!.ctx["detail"],
       "and the forensic record names WHICH way it was unusable",
@@ -293,7 +292,78 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
       fx.eventsNamed("session.content.identity.frozen"),
       "refused, not frozen: the signature verified — it is about a different conversation",
     ).toHaveLength(0);
+    /**
+     * THE OPERATOR SURFACE, asserted — review of `029b`. This refusal reached the inbox under the
+     * generic `unusable` wording, which says the proof was "unreadable, or signed over different
+     * content" (neither is true here) and tells the reader to ask their counterparty to upgrade. A
+     * replayed signature is not a version problem, and sending someone to chase a version number
+     * spends their attention on the wrong thing.
+     */
+    expect(notice!.reason, "its own name on the surface the operator reads, not only in the log").toBe("authorship_wrong_conversation");
+    expect(notice!.impact, "the impact says a VALID signature of theirs arrived for another conversation").toMatch(/VALID signature .* DIFFERENT conversation/);
+    expect(notice!.guidance, "and the guidance must NOT send them to chase a build number").not.toMatch(/upgrade/i);
+    expect(notice!.guidance, "the one move that works is out of band").toMatch(/OUT OF BAND/);
     expect(fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+  }, 60_000);
+
+  it("★★★ A WRONG SESSION ID CANNOT BUY A SOFTER OUTCOME — the freeze-suppression switch", async () => {
+    /**
+     * ⚠️ **THIS IS THE TEST THE REVIEW WAS RIGHT ABOUT, AND IT WAS RED WHEN IT WAS WRITTEN.**
+     *
+     * The session-binding check was placed BEFORE the signature verification. Everything below that
+     * line refuses the message and lets the session live; everything above it freezes the session.
+     * So a peer could pick the softer outcome: send a garbage signature — or a valid signature by a
+     * MITM's own key — and ALSO flip one unauthenticated byte of `session_id` inside the claim. The
+     * session-mismatch refusal answered first, the freeze never fired, and the session-open MITM
+     * detection was switched off by the party it exists to detect, for free.
+     *
+     * Both halves are driven here, because they are two different attackers: one who cannot sign at
+     * all, and one who signs perfectly with the wrong key. Neither may escape the freeze by lying
+     * about which conversation they are in.
+     */
+    const stranger = generateKeypair();
+    const OTHER = "7b".repeat(32);
+    const claimFor = async (kp: { getPublicKey(): Promise<Uint8Array>; sign(d: Uint8Array): Promise<Uint8Array> }) => {
+      const structure1 = encodeStructure1({
+        contentHash: wireContentHash(BODY),
+        senderPubkey: await kp.getPublicKey(),
+        sessionId: Buffer.from(OTHER, "hex"),
+        lastSeenSeq: 0,
+        timestamp: 1_750_000_000_000,
+      });
+      return { structure1, signature: await kp.sign(structure1) };
+    };
+
+    // (a) an UNSIGNABLE attacker: right key in the claim, garbage signature, wrong session id.
+    const counterparty = generateKeypair();
+    const cpHex = Buffer.from(await counterparty.getPublicKey()).toString("hex");
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-suppress-a-" });
+    await fx.createSession(SID, "alice", cpHex, PEER);
+    const good = await claimFor(counterparty);
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({
+      structure1_cbor: good.structure1,
+      sender_signature: new Uint8Array(64).fill(0x11),
+    }), PEER);
+    expect(
+      fx.eventsNamed("session.content.identity.frozen"),
+      "a signature that does not verify freezes, WHATEVER conversation the claim names",
+    ).toHaveLength(1);
+    expect(fx.eventsNamed("session.content.identity.frozen")[0]!.ctx["reason"]).toBe("bad_signature");
+    await fx.cleanup();
+
+    // (b) a MITM: a perfect signature by their OWN key, plus the wrong session id.
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-suppress-b-" });
+    await fx.createSession(SID, "alice", cpHex, PEER);
+    const mitm = await claimFor(stranger);
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({
+      structure1_cbor: mitm.structure1,
+      sender_signature: mitm.signature,
+    }), PEER);
+    expect(
+      fx.eventsNamed("session.content.identity.frozen"),
+      "and a signer who is not the counterparty freezes too — this is the session-open MITM detection",
+    ).toHaveLength(1);
+    expect(fx.eventsNamed("session.content.identity.frozen")[0]!.ctx["reason"]).toBe("signer_not_counterparty");
   }, 60_000);
 
   it("★ a signature over DIFFERENT content is refused — it proves nothing about THIS message", async () => {
