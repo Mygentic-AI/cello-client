@@ -18,9 +18,15 @@
  * and transcript signals ITSELF rather than being handed them, and that a contact row which merely
  * EXISTS is not a vouch.
  *
- * NOT here: that the signature verification survives the session lookup at all. That is proven over
- * the wire, with real keys and the real verifier, by `J-CONTENT`'s 024 journey — a fixture asserting
- * "we were told it verified" would prove nothing about the branch that has to do the verifying.
+ * Also here, since review T5: that the verified signature SURVIVES the session lookup, driven through
+ * the real inbound content handler with a real Ed25519 signature over real `encodeStructure1` bytes.
+ * The last describe block is that guard. Until it existed the unit's central mechanism was held by
+ * the spine journey alone — the file most likely to be skipped, or waved off as already red.
+ *
+ * The spine journey remains the stronger evidence and is not replaced: it proves the same thing with
+ * two operating-system processes and a real relay, where nothing in this file can. What no fixture
+ * anywhere may do is assert "we were told it verified" — that proves nothing about the branch whose
+ * job is to do the verifying.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
@@ -32,6 +38,12 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import { TIER } from "../contacts-tier-migration.js";
+import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { encodeCbor, encodeStructure1 } from "@cello-protocol/protocol-types";
+import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
+import { wireContentHash } from "../wire-content-hash.js";
+import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
+import * as lp from "it-length-prefixed";
 import type { Logger, DaemonConfig } from "../types.js";
 import {
   triageOrphanedContent,
@@ -368,4 +380,109 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     expect(n.guidance, "the address book holds this key; case is not a difference in identity")
       .toMatch(/open a NEW conversation with/);
   });
+});
+
+/**
+ * ─── The mechanism, guarded a SECOND time and in-process — review T5 ───────────────────────────
+ *
+ * The unit's whole subject is a proof the daemon was computing and throwing away: the sender's
+ * signature is verified against the key inside their own signed bytes, and then discarded because
+ * the counterparty cross-check has no session record to compare it to. Until now the only guard on
+ * that line was the spine journey — the file most likely to be skipped, or dismissed as already red.
+ *
+ * This drives the REAL inbound content handler with a REAL Ed25519 signature over REAL
+ * `encodeStructure1` bytes, on a session whose row has been deleted underneath it. Nothing tells the
+ * daemon the signature verified; it has to do that itself, and the key it names in the notice is the
+ * proof it did.
+ */
+describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lookup, in-process", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  const SID = "ef".repeat(32);
+  const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
+  const BODY = new TextEncoder().encode("for a conversation you do not have");
+  /** The key the fixture's `createSession` agrees for content encryption. */
+  const CONTENT_KEY = new Uint8Array(32).fill(0x7e);
+
+  /** A content frame carrying a genuinely signed ordering record, exactly as a real sender emits. */
+  async function signedFrame(): Promise<{ framed: Uint8Array; signerHex: string }> {
+    const kp = generateKeypair();
+    const senderPubkey = await kp.getPublicKey();
+    const contentHash = wireContentHash(BODY);
+    const s1 = encodeStructure1({
+      contentHash,
+      senderPubkey,
+      sessionId: Buffer.from(SID, "hex").subarray(0, 16),
+      lastSeenSeq: 0,
+      timestamp: 1_750_000_000_000,
+    });
+    // The signature the receiver verifies — over the EXACT bytes, by the key inside them.
+    const sig = await kp.sign(s1);
+    const s2 = encodeCbor([1, senderPubkey, contentHash, sig, null, null]) as Uint8Array;
+    const framed = lp.encode.single(encodeCbor({
+      type: "content_frame",
+      session_id: SID,
+      content_hash: contentHash,
+      content_bytes: sealSessionContent(CONTENT_KEY, BODY),
+      content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
+      structure1_cbor: s1,
+      structure2_cbor: s2,
+    }) as Uint8Array).subarray();
+    return { framed, signerHex: Buffer.from(senderPubkey).toString("hex") };
+  }
+
+  /** Remove the row the way production loses it: underneath a session node that is still live. */
+  function dropSessionRow(agent: string): void {
+    const db = fx!.snm.getDb();
+    const { agent_id } = db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get(agent) as { agent_id: string };
+    db.prepare("DELETE FROM sessions WHERE agent_id = ? AND session_id = ?").run(agent_id, SID);
+  }
+
+  it("★ a REAL signature on a rowless session reaches the notice — nothing hands the daemon the answer", async () => {
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-wire-" });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+    const { framed, signerHex } = await signedFrame();
+    dropSessionRow("alice");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, framed, PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice, `the orphan branch must file a notice.\n${JSON.stringify(fx.eventsNamed("session.content.orphaned"))}`).toBeDefined();
+    expect(notice!.reason).toBe("session_orphaned");
+    expect(
+      notice!.impact,
+      "the daemon verified this signature itself and must say WHICH key it verified against — this is " +
+      "the whole unit, and the only other guard on it is the spine",
+    ).toContain(signerHex);
+    // Unvouched, so the action is still report — the point is that the KEY survived, not the branch.
+    expect(notice!.guidance).toBe(REPORT_ONLY_SIGNED);
+
+    const logged = fx.eventsNamed("session.content.orphaned").at(-1)!;
+    expect(logged.ctx!["signatureVerified"], "and the forensic record says the signature was checked").toBe(true);
+    expect(logged.ctx!["signerPubkey"]).toBe(signerHex);
+  }, 60_000);
+
+  it("★ the same frame with its ordering record REMOVED yields no key at all", async () => {
+    /**
+     * The other half of the same measurement. Identical bytes, identical session, one field gone —
+     * so a green above cannot be coming from anywhere except the verification.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-wire-b-" });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+    const bare = lp.encode.single(encodeCbor({
+      type: "content_frame",
+      session_id: SID,
+      content_hash: wireContentHash(BODY),
+      content_bytes: sealSessionContent(CONTENT_KEY, BODY),
+      content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
+    }) as Uint8Array).subarray();
+    dropSessionRow("alice");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, bare, PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice!.guidance).toBe(REPORT_ONLY_UNSIGNED);
+    expect(fx.eventsNamed("session.content.orphaned").at(-1)!.ctx!["signatureVerified"]).toBe(false);
+  }, 60_000);
 });
