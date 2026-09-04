@@ -15761,6 +15761,17 @@ export class SessionNodeManager {
       }
       const authorship = this.#verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
       if (authorship.verdict === "refuted") {
+        /**
+         * THE FORENSIC LINE, BEFORE THE FREEZE. `session.content.identity.frozen` records that a
+         * session was stopped; this records WHICH check stopped it and on WHICH proof — the frame's
+         * own signature, not the relay's copy of it. The two used to be the same event because there
+         * was only one place a signer was checked; there are two now, and an investigation that
+         * cannot tell them apart is looking at the wrong half of the wire.
+         */
+        this.#logger.warn("session.content.authorship.refuted", {
+          agentName, sessionId, correlationId, reason: authorship.reason,
+          impact: "a message arrived with a proof of authorship that FAILED — it does not verify, or it is signed by a key that is not this session's counterparty. Nothing was ingested and the session is being frozen.",
+        });
         await this.#freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
         return;
       }

@@ -29,7 +29,7 @@ import { sealParkEnvelope } from "../park-envelope.js";
 import { contentHashFor } from "../wire-content-hash.js";
 import {
   deriveSessionSalt, saltedContentHash, generateKeypair, sealToRecipient, SALT_CONTRIBUTION_BYTES, sealSessionContent } from "@cello-protocol/crypto";
-import { encodeCbor, buildParkContentTbs } from "@cello-protocol/protocol-types";
+import { encodeCbor, buildParkContentTbs, encodeStructure1 } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 
 const SID = "ef".repeat(32);
@@ -39,9 +39,32 @@ const CONTENT = new TextEncoder().encode("the number is 4200");
 const PEER_HALF = new Uint8Array(SALT_CONTRIBUTION_BYTES).fill(0x5c);
 const SID2 = "ab".repeat(32);
 
-function contentFrame(fields: Record<string, unknown>): Uint8Array {
+/**
+ * The counterparty these frames come from — `DOD-M15-AUTHORSHIP-ABSENT-1`.
+ *
+ * A content frame carries the sender's signature over its own Structure 1 now, and the receiver
+ * refuses one that does not. The sessions below name this key as their counterparty, so the frames
+ * arrive from someone the session is actually with — a placeholder string would put every test in
+ * this file on the refusal path instead of the algorithm path it is named for, and pass for the
+ * wrong reason (`cross_check.failed` never fires for a frame that never reaches the cross-check).
+ */
+const COUNTERPARTY = generateKeypair();
+const counterpartyHex = async (): Promise<string> =>
+  Buffer.from(await COUNTERPARTY.getPublicKey()).toString("hex");
+
+async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array> {
+  const contentHash = fields["content_hash"] as Uint8Array;
+  const structure1 = encodeStructure1({
+    contentHash,
+    senderPubkey: await COUNTERPARTY.getPublicKey(),
+    sessionId: Buffer.from(SID, "hex").subarray(0, 16),
+    lastSeenSeq: 0,
+    timestamp: 1_750_000_000_000,
+  });
   return lp.encode.single(encodeCbor({
-    type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1, ...fields,
+    type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
+    structure1_cbor: structure1, sender_signature: await COUNTERPARTY.sign(structure1),
+    ...fields,
   }) as Uint8Array).subarray();
 }
 
@@ -594,7 +617,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
      * salt says nothing about whether they used it.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-h-" });
-    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.createSession(SID, "alice", await counterpartyHex(), PEER);
     await fx.snm.handleContentFrameForTest("alice", SID, saltFrame({ contribution: PEER_HALF }), PEER);
     await wait(200);
     expect(agreedSalt(fx).length, "precondition: this side holds a salt").toBe(32);
@@ -602,7 +625,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
     // The peer has NOT upgraded: it sends an unsalted hash and names nothing. A daemon reading its
     // own row would salt the comparison and refuse this.
     await fx.snm.handleContentFrameForTest(
-      "alice", SID, contentFrame({ content_hash: wireContentHash(CONTENT) }), PEER,
+      "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT) }), PEER,
     );
     await wait(300);
 
@@ -626,11 +649,11 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
      * `"42"`, which reads like a real algorithm name they should go and look up.
      */
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-j-" });
-    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.createSession(SID, "alice", await counterpartyHex(), PEER);
 
     // Explicit null — a peer that encoded the field but left it empty. Legacy, so it must ingest.
     await fx.snm.handleContentFrameForTest(
-      "alice", SID, contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: null }), PEER,
+      "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: null }), PEER,
     );
     await wait(300);
     expect(
@@ -640,7 +663,7 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
 
     // A number — not a name at all. Refused, and the log must say it was the wrong SHAPE.
     await fx.snm.handleContentFrameForTest(
-      "alice", SID, contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }), PEER,
+      "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }), PEER,
     );
     await wait(300);
     const failure = fx.eventsNamed("session.content.cross_check.failed").at(-1);
@@ -653,11 +676,11 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
 
   it("★ an unknown algorithm arriving on the REAL stream is refused there too", async () => {
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-alg-i-" });
-    await fx.createSession(SID, "alice", "bobpubkeyhex", PEER);
+    await fx.createSession(SID, "alice", await counterpartyHex(), PEER);
 
     await fx.snm.handleContentFrameForTest(
       "alice", SID,
-      contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: "sha3-512-v2" }),
+      await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: "sha3-512-v2" }),
       PEER,
     );
     await wait(300);
