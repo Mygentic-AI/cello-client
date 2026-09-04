@@ -589,7 +589,21 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
       fx.eventsNamed("session.content.orphaned"),
       "triage runs on messages that got IN far enough to have no home; this one did not get in",
     ).toHaveLength(0);
-    // The unsigned triage prose still exists and is still what the park path renders.
-    expect(REPORT_ONLY_UNSIGNED(retentionSentence(SID, -1))).toMatch(/carried no signature anyone could check/);
+    /**
+     * ⚠️ **A LINE COMPARING A CONSTANT TO ITSELF WAS HERE** — review T2. It asserted that
+     * `REPORT_ONLY_UNSIGNED` contains a phrase `REPORT_ONLY_UNSIGNED` is built from, which cannot
+     * fail for a code reason, and it was doing the work of a claim it could not support: that the
+     * unsigned prose "is still what the park path renders". Nothing here drives the park path.
+     *
+     * What is true and worth pinning is narrower: the unsigned branch is unreachable from THIS
+     * path, because a frame with no checkable proof no longer reaches triage at all. The park route
+     * still can reach it — recovered mail carries no ordering record and proves its sender by the
+     * envelope — and no test in this file covers that, which is said out loud rather than implied
+     * by a tautology.
+     */
+    expect(
+      fx.eventsNamed("session.content.refused").at(-1)!.ctx["reason"],
+      "the forensic record names the same refusal the operator was shown — one fact, two surfaces",
+    ).toBe("authorship_proof_absent");
   }, 60_000);
 });

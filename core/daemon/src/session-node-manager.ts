@@ -902,8 +902,15 @@ type AuthorshipVerdict =
   /** Nothing checkable arrived. Refuses the message; says nothing about the counterparty's key. */
   | { verdict: "unusable"; reason: string };
 
-/** The `unusable` reason for a proof that is real and describes some OTHER message. */
-const AUTHORSHIP_CONTENT_HASH_MISMATCH = "content_hash_mismatch";
+/**
+ * The `unusable` reason for a proof that is real and describes some OTHER message.
+ *
+ * ⚠️ NOT `"content_hash_mismatch"` — review §6. That string is already the refusal reason for the
+ * RECEIVER's own recompute failing (`ingestReceivedContent`), which is a tamper signal about the
+ * BODY. This one says the sender's signed claim is about different content. Two different failures
+ * sharing one name is a collision an operator grepping the log walks straight into.
+ */
+const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 
 /**
  * One row of a session's durable transcript as a reader sees it.
@@ -2827,9 +2834,17 @@ export class SessionNodeManager {
         -- else — which is the whole point of a notarized record.
         --
         -- sender_sig holds one of TWO things, and which one is told by direction:
-        --   RECEIVED row -> the Structure-2 signature, stored ONLY after the receiver verified it
-        --                   against the pubkey inside the sender's own signed bytes
-        --                   (#recordFrameOrdering). Verified, never claimed.
+        --   RECEIVED row -> the sender's signature over their own Structure-1 bytes, carried on the
+        --                   content frame BESIDE those bytes, stored ONLY after the receiver
+        --                   verified it against the pubkey inside them (#verifyAuthorshipClaim).
+        --                   Verified, never claimed.
+        --                   ⚠️ THIS USED TO READ "the Structure-2 signature ... (#recordFrameOrdering)"
+        --                   and it named a real place: until DOD-M15-AUTHORSHIP-ABSENT-1 the only
+        --                   copy of that signature this side ever saw was the one the RELAY had
+        --                   committed at Structure-2 index 3, so a message with no relay record had
+        --                   no checkable author at all. Rewritten rather than deleted: an auditor
+        --                   reading the old sentence goes looking for Structure-2 bytes that, on a
+        --                   relay-degraded message, do not exist.
         --   SENT row     -> OUR OWN signature over the Structure-1 bytes we put on the wire, taken
         --                   from the submit result. Produced, not verified — there was no
         --                   counterparty in the act, so it must NEVER be labelled verified_signature.
@@ -2851,7 +2866,7 @@ export class SessionNodeManager {
         -- nothing distinguishes them. Forcing every writer to name which it is makes silent NULL
         -- impossible rather than merely discouraged.
         sender_pubkey TEXT,             -- from INSIDE the sender's signed bytes; NULL unless verified
-        sender_sig BLOB,                -- the VERIFIED Structure-2 signature; NULL unless verified
+        sender_sig BLOB,                -- the VERIFIED sender signature over structure1_cbor (see above); NULL unless verified
         attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- verified_signature | self_authored | local_session_state
         PRIMARY KEY (agent_id, session_id, sequence, direction)
       )
@@ -8418,8 +8433,10 @@ export class SessionNodeManager {
              * tell "the relay never witnessed this" from "we witnessed it, held the proof, and
              * dropped it decoding our own bytes."
              *
-             * And the asymmetry with the received half is the argument. `#recordFrameOrdering` is
-             * soft because the COUNTERPARTY supplied those bytes — an absence we cannot resolve.
+             * And the asymmetry with the received half is the argument. The received half is soft
+             * about a missing ORDERING record (`#recordFrameOrdering`) because the COUNTERPARTY
+             * supplied those bytes — an absence we cannot resolve. It is not soft about a missing
+             * authorship proof any more; `DOD-M15-AUTHORSHIP-ABSENT-1` refuses that outright.
              * Here **we produced them**, in `session-relay-client.ts`, moments earlier. A failure
              * means our own encoder and decoder disagree: an internal invariant break that would
              * strip authorship from every sent row for the life of the process. Soft is still right
@@ -8470,7 +8487,7 @@ export class SessionNodeManager {
                * two different submits would all have been persisted as a row that **looks checkable
                * to an auditor and fails** — strictly worse than the honest unproven row it replaced.
                *
-               * The received half has always done this (`#recordFrameOrdering` verifies before
+               * The received half has always done this (`#verifyAuthorshipClaim` verifies before
                * storing and treats a failure as fatal). The sent half did not, and every ingredient
                * was already in scope on this line.
                *
@@ -8663,6 +8680,39 @@ export class SessionNodeManager {
         frameS1 = own.structure1;
         frameSig = own.signature;
         frameS2 = undefined;
+        /**
+         * ⚠️ **AND OUR OWN TRANSCRIPT ROW GETS THE PROOF TOO** — review M3.
+         *
+         * `sentAuthorship` is set above only when the relay witnessed the leaf, because that was
+         * the only path that ever produced a signature. This path produces one — and dropping it
+         * here would leave the counterparty's transcript able to prove we wrote the message while
+         * ours recorded `self_authored` with a NULL signature. That is exactly the half-provable
+         * transcript `DOD-M15-SEALWIRE-1` bullet 5 exists to close, reappearing on the one path
+         * that had no proof to lose before this unit and has one now.
+         *
+         * VERIFIED BEFORE IT IS STORED, the same discipline as the witnessed path: the pubkey comes
+         * from INSIDE the bytes we signed, never from an agent lookup, and a pair that does not
+         * verify is dropped loudly rather than persisted as a row that looks checkable and fails.
+         * A failure here means this daemon's own encoder and decoder disagree.
+         */
+        const s1Decoded = decodeStructure1(own.structure1);
+        const pk = s1Decoded.ok ? s1Decoded.fields.senderPubkey : undefined;
+        if (!s1Decoded.ok) {
+          this.#logger.warn("session.sent.authorship.unavailable", {
+            agentName, sessionId, correlationId, reason: "own_structure1_decode_failed",
+            structure1Reason: s1Decoded.reason,
+            impact: "this sent message is recorded with attribution 'self_authored' and NO signature, so the row asserts its author rather than proving one — even though this side signed the claim it put on the wire.",
+            guidance: "We produced these bytes ourselves moments ago, so a decode failure here means this daemon's own encoder and decoder disagree. Treat it as an internal invariant break, not a peer problem.",
+          });
+        } else if (!verify(pk!, own.structure1, own.signature)) {
+          this.#logger.warn("session.sent.authorship.unavailable", {
+            agentName, sessionId, correlationId, reason: "own_pair_does_not_verify",
+            impact: "this sent message is recorded with attribution 'self_authored' and NO signature. The signature this side just produced does not verify against the key inside the bytes it signed.",
+            guidance: "An internal invariant break: the signer and the encoder disagree. The message still went out; only the local proof was dropped.",
+          });
+        } else {
+          sentAuthorship = { senderPubkey: pk!, senderSig: own.signature };
+        }
       }
       /**
        * 🚨 NO KEY, NO DIRECT SEND — `DOD-M15-EPHEMERAL-AUTH-1`, and there is no plaintext fallback.
@@ -9975,12 +10025,19 @@ export class SessionNodeManager {
     contentHashAlgIn?: string | null,
     /**
      * DOD-M15-SEALWIRE-1 bullet 5: the VERIFIED authorship proof for this message, when the caller
-     * has one. The caller is the only place that has it — `#recordFrameOrdering` verifies the
-     * signature against the key inside the sender's own signed bytes and matches the signer to this
-     * session's counterparty, and that result reaches here or nowhere.
+     * has one. The caller is the only place that has it — `#verifyAuthorshipClaim` verifies the
+     * signature the frame carries beside the sender's own signed bytes, against the key inside those
+     * bytes, and matches the signer to this session's counterparty. That result reaches here or
+     * nowhere.
      *
-     * Optional, because the soft decode-failure path ingests without it. The row records which it
-     * was, so absence is never silent.
+     * ⚠️ IT USED TO NAME `#recordFrameOrdering`, and that was accurate until
+     * `DOD-M15-AUTHORSHIP-ABSENT-1`: the signature arrived only inside the RELAY's Structure 2, so
+     * checking authorship needed a relay record. It does not now, and the old name sends a reader to
+     * a method that answers a different question. Rewritten, not deleted — that dependence is the
+     * defect the unit removed.
+     *
+     * Optional, because the PARK route ingests without it: recovered mail proves its sender by the
+     * mailbox envelope instead. The row records which it was, so absence is never silent.
      */
     verifiedAuthorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
     /**
@@ -11512,9 +11569,13 @@ export class SessionNodeManager {
     originalContent?: Uint8Array,
     /**
      * DOD-M15-SEALWIRE-1 bullet 5: threaded from `ingestReceivedContent`, which is the only place
-     * that has it — `#recordFrameOrdering` verified this signature against the pubkey inside the
-     * sender's own signed bytes and matched the signer to this session's counterparty. It reaches
-     * the transcript row from here or not at all.
+     * that has it — `#verifyAuthorshipClaim` verified this signature (carried on the frame beside
+     * the bytes it signs) against the pubkey inside those bytes, and matched the signer to this
+     * session's counterparty. It reaches the transcript row from here or not at all.
+     *
+     * ⚠️ IT USED TO NAME `#recordFrameOrdering`, true until `DOD-M15-AUTHORSHIP-ABSENT-1` moved the
+     * check off the relay's record and onto the frame's own signature. Rewritten rather than
+     * deleted: the old name is the evidence of what authorship used to depend on.
      *
      * Undefined on the held-release and soft-fallback paths; the row records that as
      * `local_session_state` rather than leaving it indistinguishable from a proven one.

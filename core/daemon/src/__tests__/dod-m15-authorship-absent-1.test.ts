@@ -76,6 +76,11 @@ function inboundFrame(fields: Record<string, unknown>): Uint8Array {
   }) as Uint8Array).subarray();
 }
 
+/** The `structure1_cbor` the daemon actually put on the wire — read back, never reconstructed. */
+function frameStructure1(node: CelloNode | null): Uint8Array {
+  return sentFrames(node).find((f) => f["type"] === "content_frame")!["structure1_cbor"] as Uint8Array;
+}
+
 /** Structure 1 over THIS body, signed by `kp` — exactly what the send path now emits. */
 async function signedClaim(
   kp: { getPublicKey(): Promise<Uint8Array>; sign(d: Uint8Array): Promise<Uint8Array> },
@@ -397,8 +402,22 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — every outbound content frame carries i
     await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
 
     const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, BODY);
-    await fx.snm.sendContent("alice", SID, BODY, hash, "corr", LEAF_KIND_MSG, alg);
+    const res = await fx.snm.sendContent("alice", SID, BODY, hash, "corr", LEAF_KIND_MSG, alg);
     await wait(200);
+
+    /**
+     * Review M3 — OUR OWN ROW GETS THE PROOF TOO. `authorship` used to be set only when the relay
+     * witnessed the leaf, so on this path the counterparty's transcript could prove we wrote the
+     * message and ours could not: `self_authored`, signature NULL, indistinguishable from a send
+     * nothing ever witnessed. The proof was produced three lines earlier and thrown away.
+     */
+    expect(res.ok).toBe(true);
+    const authorship = res.authorship;
+    expect(authorship, "a proof this side produced must reach this side's transcript row").toBeDefined();
+    expect(
+      verify(authorship!.senderPubkey, frameStructure1(node), authorship!.senderSig),
+      "and it must verify against the key inside the bytes it signs — not merely be present",
+    ).toBe(true);
 
     const frame = sentFrames(node).find((f) => f["type"] === "content_frame");
     expect(frame, "the send must reach the wire for this to prove anything").toBeDefined();

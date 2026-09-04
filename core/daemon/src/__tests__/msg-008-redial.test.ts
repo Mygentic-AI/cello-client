@@ -172,8 +172,12 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
   it("a session this side never dialled has no address to dial back with, and says so", async () => {
     const A = makeManager();
     await A.manager.initialize();
-    const B_PUB = (await seedAgentKeys(A.manager.getDb(), ["alice"])).get("alice")!.pubkeyHex;
+    await seedAgentKeys(A.manager.getDb(), ["alice"]);
     await wireAgentKeyProviders(A.manager, A.manager.getDb());
+    // A counterparty key nobody will ever check: this session has no peer, never connects, and the
+    // assertion is about the RE-DIAL. Review L6 — this held alice's OWN key under the name `B_PUB`,
+    // which read as though a counterparty match were being exercised. None is.
+    const B_PUB = "bb".repeat(32);
     // The responder's half: it accepted a session it never dialled, so it holds no address for the
     // counterparty. That is a real limitation of this fix and the operator should be able to see it
     // rather than infer it from a message that parks.
