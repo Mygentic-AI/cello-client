@@ -913,6 +913,12 @@ type AuthorshipVerdict =
 const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 
 /**
+ * The `unusable` reason for a proof that is real, is by the right signer, describes this content —
+ * and was signed for a DIFFERENT conversation. A replay, not a forgery.
+ */
+const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
+
+/**
  * One row of a session's durable transcript as a reader sees it.
  *
  * DOD-M15-REFUSEDEVIDENCE-1: `'quarantined'` is a message that was received and REFUSED. Its `text`
@@ -15359,6 +15365,38 @@ export class SessionNodeManager {
     // every frame that follows it.
     if (Buffer.from(s1Hash).toString("hex") !== Buffer.from(contentHash).toString("hex")) {
       return { verdict: "unusable", reason: AUTHORSHIP_CONTENT_HASH_MISMATCH };
+    }
+    /**
+     * ⚠️ **AND IT MUST BIND TO THIS CONVERSATION** — review M4, ruled in by Andre 2026-09-04.
+     *
+     * Binding the content and the signer is not enough on its own: a claim the counterparty
+     * genuinely signed in another session verifies unchanged here for the same bytes. Not a
+     * stranger and not forged content — a real line of theirs, landing in a transcript it was never
+     * written for, with a signature that checks out. That is worse than an unsigned message,
+     * because the receipt then PROVES something that did not happen.
+     *
+     * `session_id` has been in Structure 1 since v1 and this path never read it.
+     * `seal-frontier-verify` already compares it; the live receive path simply did not.
+     *
+     * **THE TWO VALUES CANNOT DIVERGE, and that is what makes this safe to enforce.** Both are
+     * derived from ONE session id on each side, by construction:
+     *   initiator — `sessionId = hex(assignment.session_id)` (`initiate-session-handler`) and
+     *               `relayParams.sessionIdBytes = assignment.session_id` (`daemon.ts`);
+     *   responder — `acceptSession(parsed.sessionIdHex)` and
+     *               `sessionIdBytes = Buffer.from(parsed.sessionIdHex, "hex")` (`inbound-sessions`);
+     *   direct/persisted — `relaySessionIdBytes = Buffer.from(sessionId, "hex")`.
+     * The two names exist because one keys the in-memory maps and one goes on the wire, not because
+     * they can hold different values. Getting this wrong would refuse EVERY message on EVERY live
+     * session, so it is stated rather than assumed.
+     *
+     * REFUSED, not frozen. The signature verified and the signer is the counterparty — what is
+     * wrong is the conversation it was signed for, which is a replay rather than an identity fault.
+     * `#freezeOnIdentityFailure` is for a proof that failed against their key; this one did not.
+     */
+    const expectedSessionId = this.#activeNodes.get(this.#k(agentName, sessionId))?.relaySessionIdBytes
+      ?? Uint8Array.from(Buffer.from(sessionId, "hex"));
+    if (Buffer.compare(Buffer.from(s1.fields.sessionId), Buffer.from(expectedSessionId)) !== 0) {
+      return { verdict: "unusable", reason: AUTHORSHIP_SESSION_MISMATCH };
     }
     // The SENDER's Ed25519 signature over the exact signed bytes — the same check the relay
     // performs. `verify` never throws, so a wrong-width or garbage signature lands here as `false`:

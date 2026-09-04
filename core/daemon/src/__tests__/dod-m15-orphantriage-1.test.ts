@@ -424,7 +424,9 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     const s1 = encodeStructure1({
       contentHash,
       senderPubkey,
-      sessionId: Buffer.from(SID, "hex").subarray(0, 16),
+      // DOD-M15-AUTHORSHIP-ABSENT-1: production signs the WHOLE session id; a truncated one is a
+      // claim for a different conversation and is refused.
+      sessionId: Buffer.from(SID, "hex"),
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
     }, RETAINED);

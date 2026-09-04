@@ -90,7 +90,7 @@ async function signedClaim(
   const structure1 = encodeStructure1({
     contentHash: opts.contentHash ?? wireContentHash(BODY),
     senderPubkey,
-    sessionId: Buffer.from(SID, "hex").subarray(0, 16),
+    sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
   });
@@ -246,6 +246,52 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
     expect(
       fx.eventsNamed("session.content.identity.frozen"),
       "and an unreadable layout is a version skew, not an accusation",
+    ).toHaveLength(0);
+    expect(fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received")).toHaveLength(0);
+  }, 60_000);
+
+  it("★ a claim signed for ANOTHER SESSION is refused — a real message, the wrong conversation", async () => {
+    /**
+     * ⚠️ **THE REPLAY THIS UNIT'S FIRST PASS LEFT OPEN** — review M4, ruled in by Andre 2026-09-04.
+     *
+     * The claim binds the CONTENT and the SIGNER and nothing else, so a claim your counterparty
+     * genuinely signed in conversation X verifies unchanged in conversation Y for the same bytes.
+     * Not a stranger, not forged content — a real line of theirs, appearing in a transcript it was
+     * never written for, carrying a signature that checks out. That is worse than an unsigned
+     * message, because the receipt then PROVES something that did not happen.
+     *
+     * The signed session id has been in Structure 1 since v1 and nothing on this path ever read it.
+     * `seal-frontier-verify` already compares it — this side simply did not.
+     */
+    const kp = generateKeypair();
+    const senderPubkey = await kp.getPublicKey();
+    const OTHER_SESSION = "7b".repeat(32);
+    // Everything is right except the conversation it was signed for.
+    const structure1 = encodeStructure1({
+      contentHash: wireContentHash(BODY),
+      senderPubkey,
+      sessionId: Buffer.from(OTHER_SESSION, "hex"),
+      lastSeenSeq: 0,
+      timestamp: 1_750_000_000_000,
+    });
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-othersession-" });
+    await fx.createSession(SID, "alice", Buffer.from(senderPubkey).toString("hex"), PEER);
+
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({
+      structure1_cbor: structure1,
+      sender_signature: await kp.sign(structure1),
+    }), PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice, "a claim for another conversation is not a claim about this one").toBeDefined();
+    expect(notice!.reason).toBe("authorship_proof_unusable");
+    expect(
+      fx.eventsNamed("session.content.refused").at(-1)!.ctx["detail"],
+      "and the forensic record names WHICH way it was unusable",
+    ).toBe("session_mismatch");
+    expect(
+      fx.eventsNamed("session.content.identity.frozen"),
+      "refused, not frozen: the signature verified — it is about a different conversation",
     ).toHaveLength(0);
     expect(fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received")).toHaveLength(0);
   }, 60_000);
