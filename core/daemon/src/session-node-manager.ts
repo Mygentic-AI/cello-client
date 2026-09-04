@@ -4212,6 +4212,38 @@ export class SessionNodeManager {
     content: Uint8Array,
     contentHashHex: string,
     opts: {
+      senderPubkeyHex?: string | null;
+      authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array };
+      canonicalSeq?: number;
+      correlationId?: string;
+    },
+  ): number | null {
+    const sequence = this.#retainRefusedContent(agentName, sessionId, reason, content, contentHashHex, opts);
+    /**
+     * DOD-M15-REFUSALTERMINAL-1 — **THE FUNNEL, and the reason it lives here.**
+     *
+     * Every refusal that retains evidence passes through this method carrying its reason and its
+     * content hash, so this is the one place where "which reasons stop the work" can be a LIST
+     * rather than a decision copied into seven branches. `TERMINAL_REFUSAL_REASONS` decides; the
+     * six other reasons that reach here — a hash mismatch, an unreadable algorithm, a missing salt,
+     * an unresolved sender, an orphaned session, a terminal screen block — all keep retrying, and
+     * each of them can succeed on a later attempt.
+     *
+     * AFTER the retention, deliberately: the evidence has to exist before anything stops going to
+     * look for the message.
+     */
+    this.#considerTerminalRefusal(agentName, sessionId, contentHashHex, reason);
+    return sequence;
+  }
+
+  /** DOD-M15-REFUSEDEVIDENCE-1: the retention itself. Reached only through the funnel above. */
+  #retainRefusedContent(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    content: Uint8Array,
+    contentHashHex: string,
+    opts: {
       /** The sender's key when this side resolved one. `null` is itself evidence. */
       senderPubkeyHex?: string | null;
       /** The VERIFIED authorship proof, when the frame carried one that checked out. */
@@ -9791,15 +9823,14 @@ export class SessionNodeManager {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
       /**
-       * DOD-M15-REFUSALTERMINAL-1 — STOP THE WORK. Recorded AFTER the bytes are retained, so the
-       * evidence exists before anything stops going to look for it.
+       * DOD-M15-REFUSALTERMINAL-1 — the retention call above is also what STOPS THE WORK: it runs
+       * the terminal funnel, and `session_committed` is the one reason in it.
        *
-       * Without this, the relay's next redelivery of the witness leaf armed another park fetch,
-       * which drained, verified, arrived here, and was refused again — measured at ~2 per second for
-       * 62 hours on one message. `#markContentResolved` cannot be reused for it: this content did
+       * Without that, the relay's next redelivery of the witness leaf armed another park fetch,
+       * which drained, verified, arrived here, and was refused again — measured at ~2 per second
+       * for 62 hours on one message. `#markContentResolved` could not be reused: this content did
        * not land, and saying that it did is a lie a future reader would act on.
        */
-      this.#considerTerminalRefusal(agentName, sessionId, contentHashHex, "session_committed");
       // DOD-M15-NO-SILENT-REFUSAL-1. `currentStatus` on the log line carries the REAL status —
       // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
       // one claim, so it names the record as frozen rather than asserting which way it ended.

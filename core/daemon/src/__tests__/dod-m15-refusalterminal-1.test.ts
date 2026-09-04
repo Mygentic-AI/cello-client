@@ -267,6 +267,32 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     expect(drains, "a transient refusal must keep retrying").toEqual(["alice"]);
   });
 
+  it("a HASH MISMATCH is refused, retained, and still retried — the set is what decides", async () => {
+    /**
+     * The mutation that made this test necessary: dropping the `TERMINAL_REFUSAL_REASONS` check
+     * survived the whole suite, because the only caller passed `session_committed` anyway. The set
+     * was decorative and a reviewer could not have told.
+     *
+     * `content_hash_mismatch` is the sharpest of the six non-terminal reasons that reach the same
+     * funnel: the fetch is BY CONTENT HASH, so a later fetch may retrieve a correct copy from a
+     * different relay. Calling it terminal would silently drop a message that was going to arrive.
+     */
+    await boot();
+    insertSessionRow("s-live", "active");
+    const content = new TextEncoder().encode("bytes that do not match their hash");
+    // The hash the sender COMMITTED to, which these bytes do not produce.
+    const claimed = msgLeafHash(new TextEncoder().encode("something else entirely"));
+    const mgr = handle!.getSessionNodeManager();
+
+    const res = await mgr.ingestReceivedContent("alice", "s-live", content, claimed);
+    expect((res as { reason: string }).reason).toBe("content_hash_mismatch");
+    drains.length = 0;
+
+    mgr.recordWitnessedSequence("alice", "s-live", Buffer.from(claimed).toString("hex"), 4);
+    await settle();
+    expect(drains, "a mismatch can be resolved by a correct copy from another relay").toEqual(["alice"]);
+  });
+
   it("the inbox reports BOTH counts, and a dismissal moves only one of them", async () => {
     /**
      * The production reading was `times: 58` against a true figure four orders of magnitude larger.
