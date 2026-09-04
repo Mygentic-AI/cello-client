@@ -10,7 +10,7 @@
  * it exists to backstop would be no reconciler at all.
  */
 import type { IpcHandler } from "./ipc-server.js";
-import { REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
+import { REFUSAL_COUNT_GUIDANCE, REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -226,7 +226,18 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         kind: r.kind,
         impact: r.impact,
         guidance: r.guidance,
-        times: r.count,
+        /**
+         * DOD-M15-REFUSALTERMINAL-1 — TWO NUMBERS, AND NEITHER IS CALLED `times`.
+         *
+         * `times` was the drained-by-dismissal counter wearing a lifetime name. Live on 2026-09-04
+         * an operator read `times: 58` for a refusal that had fired tens of thousands of times over
+         * two and a half days, and concluded it was minor.
+         */
+        times_since_dismissed: r.timesSinceDismissed,
+        ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
+        // A FLOOR, not a figure — a row seeded at upgrade from a notice that already existed. It
+        // gets its own field name so it cannot be read as a count (review F1c).
+        ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
         ...(r.repeat === true ? { repeat: true } : {}),
       })),
       // Say the list was cut ON THE LIST, not only in a log nobody opens — same rule as
@@ -234,11 +245,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       ...(truncated ? { refusals_incomplete: true } : {}),
       refusals_guidance:
         header +
-        "\n\nThese are grouped by session_id, and `times` is how many messages that reason has " +
-        "refused on that session — a large number means the cause is still live, not that it " +
-        "happened once. `repeat: true` means you have been told about this one before and it has " +
-        "grown by an order of magnitude since. TELL THE OPERATOR. A refusal that reaches an agent " +
-        "and stops there is the same silence it was written to end." +
+        "\n\nThese are grouped by session_id. " + REFUSAL_COUNT_GUIDANCE +
+        " `repeat: true` means you have been told about this one before and " +
+        "`times_since_dismissed` has grown by an order of magnitude since. TELL THE OPERATOR. A " +
+        "refusal that reaches an agent and stops there is the same silence it was written to end." +
         (truncated
           ? " refusals_incomplete: true means this list hit its cap and there are older ones not shown."
           : ""),

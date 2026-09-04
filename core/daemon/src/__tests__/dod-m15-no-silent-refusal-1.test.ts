@@ -136,7 +136,7 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     return res.agents[0]!;
   }
 
-  type Refusal = { session_id: string; reason: string; kind: string; impact: string; guidance: string; times: number; repeat?: boolean };
+  type Refusal = { session_id: string; reason: string; kind: string; impact: string; guidance: string; times_since_dismissed: number; times_total?: number; repeat?: boolean };
 
   // ─── Part 1: the notice is durable, and the inbox is the door ────────────────────────────────
 
@@ -179,7 +179,9 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(refusals, "nobody was attending, and the inbox is the only door left").toBeDefined();
     expect(refusals![0]!.session_id).toBe("s-inbox");
     expect(refusals![0]!.reason).toBe("inbound_screen_blocked");
-    expect(refusals![0]!.times).toBe(1);
+    expect(refusals![0]!.times_since_dismissed).toBe(1);
+    // DOD-M15-REFUSALTERMINAL-1: the lifetime figure rides beside it, and with no dismissal they agree.
+    expect(refusals![0]!.times_total).toBe(1);
     /**
      * The header must be the one for THIS notice's kind. Review F4: one fixed sentence said
      * "received and REFUSED — not verified, neither ingested nor shown", which is false of a
@@ -313,12 +315,12 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     const note = () => mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     note();
-    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.timesSinceDismissed, "first refusal is the signal").toBe(1);
     for (let i = 2; i <= 9; i++) note();
     expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "nine is not news").toEqual([]);
     note(); // the tenth — one order of magnitude
     const again = mgr.takeContentRefusals("alice", "s-scale", "op")[0]!;
-    expect(again.count, "and the count says how big it got").toBe(10);
+    expect(again.timesSinceDismissed, "and the count says how big it got").toBe(10);
     expect(again.repeat, "marked as a repeat so it is not read as a new cause").toBe(true);
     for (let i = 11; i <= 99; i++) note();
     expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "still inside the same magnitude").toEqual([]);

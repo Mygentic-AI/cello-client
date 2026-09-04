@@ -115,7 +115,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const first = mgr.takeContentRefusals("alice", "s2", "op");
     expect(first.length, "told once").toBe(1);
     expect(
-      first[0]!.count,
+      first[0]!.timesSinceDismissed,
       "and the count carries the scale — deduplication must not make 90 look like 1",
     ).toBe(90);
 
@@ -182,7 +182,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
       mgr.noteContentRefusal("alice", "s-scale", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED, impact: "x", guidance: "y" });
 
     note();
-    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.count, "first refusal is the signal").toBe(1);
+    expect(mgr.takeContentRefusals("alice", "s-scale", "op")[0]!.timesSinceDismissed, "first refusal is the signal").toBe(1);
 
     for (let i = 0; i < 8; i++) note(); // 9 total — under the next order of magnitude
     expect(mgr.takeContentRefusals("alice", "s-scale", "op"), "nine is not news").toEqual([]);
@@ -190,7 +190,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     note(); // 10
     const [again] = mgr.takeContentRefusals("alice", "s-scale", "op");
     expect(again, "ten times is a different fact about the problem than once").toBeDefined();
-    expect(again!.count).toBe(10);
+    expect(again!.timesSinceDismissed).toBe(10);
     expect(again!.repeat, "and it says it is a repeat, so a reader can present it as an escalation").toBe(true);
 
     for (let i = 0; i < 89; i++) note(); // 99
@@ -459,6 +459,29 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
       session_id: session, timeout_ms: 150,
     })) as Record<string, unknown>;
   }
+
+  it("DOD-M15-REFUSALTERMINAL-1 F4: the receive door names the counts the SAME way the inbox does", async () => {
+    /**
+     * The second door. Review F4 caught this one shipping the drain's internal camelCase straight
+     * into an MCP response — `timesSinceDismissed` in a payload that is snake_case everywhere else —
+     * with no sentence saying the small number is not the lifetime one. That is the misreading this
+     * unit exists to remove, moved to the other door rather than fixed.
+     */
+    handle = await startDaemon(await setup("alice"));
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-counts", "session_committed", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "closed", guidance: "start a new one",
+    });
+
+    const res = await quietReceive("s-ipc-counts");
+    const refusals = res["refusals"] as Array<Record<string, unknown>>;
+    expect(refusals[0]!["times_since_dismissed"]).toBe(1);
+    expect(refusals[0]!["times_total"]).toBe(1);
+    expect(refusals[0]!, "the drain's internal camelCase must not reach an MCP response")
+      .not.toHaveProperty("timesSinceDismissed");
+    // And the sentence, from the one shared constant — a second copy is a second thing to keep true.
+    expect(String(res["refusal_guidance"])).toContain("times_total_at_least");
+    expect(String(res["refusal_guidance"])).toContain("cello_dismiss");
+  });
 
   it("a quiet receive carries the refusal — the conversation did not go silent for no reason", async () => {
     handle = await startDaemon(await setup("alice"));

@@ -25,7 +25,7 @@ import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
 import type { ContentTakeLedger } from "./co-attendance.js";
 import { isAutoReplyMarked } from "./away-detection.js";
-import { REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
+import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 
 /**
  * DOD-M12B-AWAY-MARK-1 — what a reader needs to know the moment it sees a marked message.
@@ -71,7 +71,19 @@ function refusalsField(
    */
   consumerId: string,
 ): {
-  refusals?: Array<{ reason: string; kind: RefusalKind; impact: string; guidance: string; count: number }>;
+  /**
+   * DOD-M15-REFUSALTERMINAL-1 review F4 — MAPPED, not spread.
+   *
+   * Widening this to the drain's internal type spread `timesSinceDismissed` / `timesTotal` straight
+   * into an MCP response that is snake_case everywhere else, and — worse — with no sentence saying
+   * what the two numbers mean. That is the same misreading this unit removes, on the other door.
+   * The names are the fix, so they have to be the same names at both doors.
+   */
+  refusals?: Array<{
+    reason: string; kind: RefusalKind; impact: string; guidance: string;
+    times_since_dismissed: number; times_total?: number; times_total_at_least?: number;
+    repeat?: boolean;
+  }>;
   refusal_guidance?: string;
 } {
   const refusals = mgr.takeContentRefusals(agentName, sessionId, consumerId);
@@ -92,7 +104,19 @@ function refusalsField(
     // rows they are about.
     .map((k) => `[kind: ${k}] ${REFUSAL_KIND_GUIDANCE[k]}`)
     .join("\n\n");
-  return { refusals, refusal_guidance };
+  return {
+    refusals: refusals.map((r) => ({
+      reason: r.reason, kind: r.kind, impact: r.impact, guidance: r.guidance,
+      times_since_dismissed: r.timesSinceDismissed,
+      ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
+      ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
+      ...(r.repeat === true ? { repeat: true } : {}),
+    })),
+    // DOD-M15-REFUSALTERMINAL-1 review F4: the counts need their sentence at BOTH doors. Without
+    // it this one hands an agent the small number with nothing saying it is not the lifetime one —
+    // which is the whole defect, moved rather than fixed.
+    refusal_guidance: `${refusal_guidance}\n\n${REFUSAL_COUNT_GUIDANCE}`,
+  };
 }
 
 const AUTO_REPLY_GUIDANCE =
