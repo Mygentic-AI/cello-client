@@ -379,6 +379,42 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     expect(notice!.guidance, "with the event that says which cause it was").toMatch(/quarantine\.skipped/);
   });
 
+  it("F5: a BLOCKED leaf no longer wedges the read watermark — later messages still catch up", async () => {
+    const handleRef = await start(new TerminalBlockGateway());
+    const snm = handleRef.getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
+
+    // Leaf 0: an ordinary delivered message.
+    const first = new TextEncoder().encode("the one before");
+    snm.recordWitnessedSequence("alice", SID, Buffer.from(msgLeafHash(first)).toString("hex"), 0);
+    // Leaf 1: blocked, so it has a quarantined row and no deliverable one.
+    const blocked = new TextEncoder().encode(ATTACK);
+    await snm.ingestReceivedContent("alice", SID, blocked, msgLeafHash(blocked), "c-blocked", 0);
+    // Leaf 2 would be the next real message; seed it directly as a delivered row at sequence 1.
+    snm.recordTranscriptMessage("alice", SID, 1, "received", new TextEncoder().encode("the one after"), "seed");
+
+    /**
+     * The since_seq catch-up walks a CONTIGUOUS run of present sequences. Before retention a
+     * screened-out leaf had no transcript row at all, so the walk stopped there permanently and
+     * every later message stayed uncatchable — the same defect already fixed for document leaves.
+     * A quarantined row fills that position, so the walk crosses it. That is the intended
+     * consequence, and it is asserted here rather than left as an incidental side effect.
+     */
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    try {
+      await client.send("ipc.connect", { clientType: "mcp" });
+      await client.send("cello_use_agent", { name: "alice" });
+      await client.send("cello_receive", { session_id: SID, since_seq: -1, timeout_ms: 500 });
+      expect(
+        snm.getLastDeliveredSeq("alice", SID),
+        "the watermark must cross the blocked leaf at 0 and reach the real message at 1. Wedged at " +
+        "-1, every later message in this conversation is uncatchable forever.",
+      ).toBe(1);
+    } finally {
+      client.close();
+    }
+  });
+
   // ─── The bound this retention rests on ───────────────────────────────────────────────────────
 
   it("quarantined bytes COUNT toward the session's byte cap, so retention cannot grow unbounded", async () => {
