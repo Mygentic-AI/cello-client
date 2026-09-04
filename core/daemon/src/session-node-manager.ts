@@ -76,6 +76,7 @@ import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/
 // receives the already-classified `ParkAuthFailure`, so importing the code table here would invite a
 // second, drifting copy of the classification logic.
 import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
+import { triageOrphanedContent, type OrphanEvidence } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
@@ -8949,6 +8950,97 @@ export class SessionNodeManager {
     this.#contentDesynced.set(key, why);
   }
 
+  /**
+   * 024-ORPHANTRIAGE — the three signals, read from evidence this side owns.
+   *
+   * ⚠️ **THE SEQUENCE NUMBER ON THE FRAME IS NOT ONE OF THEM.** "Was there an ongoing conversation
+   * up to this point" is tempting to answer from the position the sender wrote, and that answer is
+   * worthless: the sender picks the number, so anyone wanting the reach-out branch writes a large
+   * one. It is answered from OUR transcript rows instead — a partial local record of that
+   * conversation is something an attacker cannot put there from the wire.
+   *
+   * ⚠️ **"KNOWN" IS A TIER, NOT A ROW — review F1/F2, and reading it as a row inverted the unit.**
+   * `contacts` rows are written from the WIRE with no operator action: `inbound-sessions.ts` calls
+   * `addContact(..., "signal_presentation")` at `TIER.UNKNOWN` for any inbound offer inside the
+   * acceptance bound, because the trust-signal foreign key needs a row to point at. And BLOCKING a
+   * contact is an UPDATE to `TIER.BLOCKED`, so the row survives that too. A `SELECT … WHERE pubkey`
+   * therefore answers "yes, known" for a stranger who merely dialled, AND for a key the operator
+   * deliberately blocked — handing both the reach-out branch, which is the exact population this
+   * unit exists to refuse. `DOD-TIER-4` had already settled this and retired `isContact` for it:
+   * *"An UNKNOWN-tier contact (a mere row) is NOT known."* The tier is read from the row already
+   * being fetched, so the case-insensitivity below survives (`getTier` compares case-sensitively).
+   *
+   * ⚠️ **HEX CASE IS NOT A DIFFERENCE IN IDENTITY.** `contacts.pubkey` is stored verbatim from the
+   * IPC parameter and is never normalized, so an exact-match lookup would report a contact the
+   * operator can see in `cello_contacts` as an unknown stranger — and quietly downgrade the notice.
+   */
+  #orphanEvidence(
+    agentName: string,
+    sessionId: string,
+    verifiedSignerUnmatched: Uint8Array | undefined,
+  ): OrphanEvidence {
+    const signerPubkeyHex = verifiedSignerUnmatched === undefined
+      ? null
+      : Buffer.from(verifiedSignerUnmatched).toString("hex");
+    /**
+     * ⚠️ `"not_checked"` IS NOT A COSMETIC THIRD STATE — review F6.
+     *
+     * These two were `false` on every path that did not look, and the log event then reported them
+     * as readings. An investigator filtering `session.content.orphaned` days later would read
+     * `ongoingConversation: false` and conclude there was no local trace, when nothing had been
+     * asked. Clause 1 says the branch RECORDS these; a default wearing the shape of a measurement
+     * is not a record, and it is the cheapest possible way to mislead the one person who comes
+     * looking.
+     */
+    const notChecked: OrphanEvidence = {
+      signerPubkeyHex, knownContact: "not_checked", contactMoniker: null, ongoingConversation: "not_checked",
+    };
+    // With no verifiable signature the other two signals mean nothing — a claimed key is a string
+    // anyone can type — so they are not looked up at all rather than looked up and ignored.
+    if (signerPubkeyHex === null) return notChecked;
+    try {
+      /**
+       * ⚠️ NO `!this.#db` SHORT-CIRCUIT — review F7, and it was the silent half of this guard.
+       *
+       * The catch below logs ERROR for exactly this outcome; a bare `if (!this.#db) return` did not,
+       * and the state is reachable while the operator still gets a notice — `noteContentRefusal`
+       * keeps its own in-memory fallback when the write fails, so a daemon with an unusable store
+       * still surfaces a refusal saying "that key is not in your address book" about a key that may
+       * well be in it, with nothing anywhere recording that the address book was never opened.
+       * Throwing into the catch is also what this file's other contact reads do (`getTier`,
+       * `addContact`), and for the same reason: a read that decides how to treat a sender must not
+       * degrade to "unclassified" in silence.
+       */
+      if (!this.#db) throw new Error("database is not open");
+      const agentId = this.#requireAgentId(agentName);
+      const contact = this.#db
+        .prepare("SELECT moniker, tier FROM contacts WHERE agent_id = ? AND lower(pubkey) = ?")
+        .get(agentId, signerPubkeyHex.toLowerCase()) as { moniker: string | null; tier: number | null } | undefined;
+      const trace = this.#db
+        .prepare("SELECT 1 AS present FROM transcript WHERE agent_id = ? AND session_id = ? LIMIT 1")
+        .get(agentId, sessionId) as { present: number } | undefined;
+      return {
+        signerPubkeyHex,
+        knownContact: contact !== undefined && normalizeTier(contact.tier) >= TIER.KNOWN,
+        contactMoniker: contact?.moniker ?? null,
+        ongoingConversation: trace !== undefined,
+      };
+    } catch (err: unknown) {
+      /**
+       * NOT A SILENT FALLBACK. Both signals come back `"not_checked"`, which the triage treats
+       * exactly as it treats a stranger — REPORT, the action that is safe when nothing is known — and
+       * which the log distinguishes from a measured `false`. A read failure here must never invent
+       * the reach-out branch, and it must never be invisible.
+       */
+      this.#logger.error("session.content.orphaned.evidence.failed", {
+        agentName, sessionId,
+        error: extractErrorMessage(err),
+        impact: "the address book and transcript could not be read, so a message whose signature DID verify is being reported to the operator as coming from a key nothing is known about. The advice is the safe one; it may be more cautious than the evidence warrants.",
+      });
+      return notChecked;
+    }
+  }
+
   async ingestReceivedContent(
     agentName: string,
     sessionId: string,
@@ -8982,6 +9074,18 @@ export class SessionNodeManager {
      * was, so absence is never silent.
      */
     verifiedAuthorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
+    /**
+     * 024-ORPHANTRIAGE — the key whose signature VERIFIED on a frame we could not tie to a session.
+     *
+     * Read by the orphan branch below and NOWHERE ELSE. It exists because the daemon establishes,
+     * cryptographically, that the sender holds a private key — and then discarded that the instant
+     * the session lookup came back empty, leaving the operator advised to go and make contact with
+     * whoever sent a message for a conversation that does not exist.
+     *
+     * Absent on the park-recovery caller, which cannot reach the orphan branch at all:
+     * `authenticateParkedEntry` refuses `counterparty_unknown` from the same missing record first.
+     */
+    verifiedSignerUnmatched?: Uint8Array,
   ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
@@ -9002,17 +9106,43 @@ export class SessionNodeManager {
     // un-acked, so a live sender redelivers once the session actually exists. After D3
     // (DOD-INBOUND-GUARD-1) this path is unreachable from the wire — a fail-loud assertion.
     if (!record) {
-      this.#logger.warn("session.content.orphaned", { agentName, sessionId, correlationId });
+      /**
+       * 024-ORPHANTRIAGE — TWO ACTIONS EXIST AND THE EVIDENCE DECIDES WHICH.
+       *
+       * The advice here used to be *"ask the counterparty to start a NEW session."* When the message
+       * is a stranger probing a peer id, obeying that advice is the probe succeeding: it confirms
+       * somebody is home and that this agent answers, from a message that was refused.
+       *
+       * All three signals are read from things the sender does not control — their signature is
+       * checked against the key inside their own signed bytes, "known" comes from OUR address book,
+       * and "ongoing" comes from OUR transcript rows rather than the sequence number they chose.
+       */
+      const evidence = this.#orphanEvidence(agentName, sessionId, verifiedSignerUnmatched);
+      const triage = triageOrphanedContent(evidence);
+      /**
+       * BOTH SURFACES, per Invariant 2. The log is the durable forensic record and carries the
+       * signals structurally — this is where an investigation days later reads what was known and
+       * when. The notice below is the control: it is what the agent actually reads and acts on.
+       */
+      this.#logger.warn("session.content.orphaned", {
+        agentName, sessionId, correlationId,
+        signerPubkey: evidence.signerPubkeyHex ?? "(no verifiable signature)",
+        signatureVerified: evidence.signerPubkeyHex !== null,
+        // Review F6: `"not_checked"` where nothing was measured, never a `false` that reads as a
+        // reading. An investigator filtering this event is the only person who will ever ask.
+        knownContact: evidence.knownContact,
+        ongoingConversation: evidence.ongoingConversation,
+        action: triage.action,
+        impact: triage.impact,
+      });
       // DOD-M15-NO-SILENT-REFUSAL-1. The notice is written even though there is no session row —
       // the store is keyed (agent_id, session_id) and holds no foreign key to `sessions` precisely
       // so this case can be recorded. A refusal for a session that does not exist here is the one
       // the operator has the least other way to learn about.
       this.noteContentRefusal(agentName, sessionId, "session_orphaned", {
         kind: REFUSAL_KINDS.REFUSED,
-        impact:
-          "a message arrived for a session this daemon holds no record of, so it was NOT ingested and NOT shown. It was not acknowledged either, so the sender will keep redelivering it and keep being refused.",
-        guidance:
-          "Check cello_sessions. If that session is not listed, this side never opened it or its record is gone, and nothing on this machine can recover it — ask the counterparty to start a NEW session. Do not wait: every redelivery takes the same path.",
+        impact: triage.impact,
+        guidance: triage.guidance,
       });
       return { ok: false, reason: "session_orphaned" };
     }
@@ -13805,6 +13935,20 @@ export class SessionNodeManager {
      */
     senderPubkey?: Uint8Array;
     senderSig?: Uint8Array;
+    /**
+     * 024-ORPHANTRIAGE: the key whose signature over `structure1_cbor` VERIFIED, on the one soft
+     * path where it could not be matched to a counterparty because this side has no session record
+     * to match it against.
+     *
+     * ⚠️ **DELIBERATELY NOT `senderPubkey`/`senderSig`.** That pair means *verified AND matched to
+     * this session's counterparty*; the transcript column it feeds is documented as exactly that
+     * ("verified, never claimed") and seal-time attribution rests on it. Returning an unmatched
+     * signer under those names would silently widen a proof the rest of the system reads as
+     * stronger. This one carries the weaker fact under its own name, and has exactly one consumer:
+     * the orphan branch, which needs to tell an operator whether anything at all is known about who
+     * sent a message for a conversation that does not exist here.
+     */
+    verifiedSignerUnmatched?: Uint8Array;
   } {
     try {
       // Structure 1 content_hash is index 1 and sender_pubkey index 2 in BOTH layouts — 020-ACKHASH
@@ -13880,7 +14024,21 @@ export class SessionNodeManager {
          */
         const reason = counterparty ? "signer_not_counterparty" : "counterparty_unknown";
         this.#logger.warn("session.content.ordering.wrong_signer", { sessionId, reason, correlationId });
-        return counterparty ? { seq: null, fatal: { reason } } : { seq: null };
+        /**
+         * 024-ORPHANTRIAGE — THE VERIFIED SIGNER SURVIVES THE SESSION LOOKUP NOW.
+         *
+         * The `verify(...)` three lines above has already passed: whoever produced this record holds
+         * the private key for the key inside their own signed bytes. That is session-independent —
+         * it needs no `sessions` row and never did. The soft branch then threw it away, so the
+         * orphan branch downstream had nothing to go on and told the operator to go and talk to
+         * whoever sent it.
+         *
+         * Carried out only on the `counterparty_unknown` half. The fatal half needs nothing: the
+         * session freezes and no triage runs.
+         */
+        return counterparty
+          ? { seq: null, fatal: { reason } }
+          : { seq: null, verifiedSignerUnmatched: s1Pubkey };
       }
       // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
       this.recordWitnessedSequence(agentName, sessionId, contentHashHex, seq - 1);
@@ -14210,6 +14368,12 @@ export class SessionNodeManager {
        * and the transcript row must say so rather than imply a proof it does not have.
        */
       let verifiedAuthorship: { senderPubkey: Uint8Array; senderSig: Uint8Array } | undefined;
+      /**
+       * 024-ORPHANTRIAGE: the signer when the signature verified but there was no counterparty to
+       * match it against. Its ONLY consumer is the orphan branch inside ingest — everywhere else a
+       * session record exists, so this stays `undefined` and nothing reads it.
+       */
+      let verifiedSignerUnmatched: Uint8Array | undefined;
       if (s1Cbor instanceof Uint8Array && s2Cbor instanceof Uint8Array) {
         const ordering = this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
         if (ordering.fatal) {
@@ -14220,6 +14384,7 @@ export class SessionNodeManager {
         if (ordering.senderPubkey !== undefined && ordering.senderSig !== undefined) {
           verifiedAuthorship = { senderPubkey: ordering.senderPubkey, senderSig: ordering.senderSig };
         }
+        verifiedSignerUnmatched = ordering.verifiedSignerUnmatched;
       } else {
         /**
          * Review F3 — THE WEAKER GUARANTEE MUST NOT BE INDISTINGUISHABLE FROM THE STRONGER ONE.
@@ -14258,6 +14423,7 @@ export class SessionNodeManager {
         agentName, sessionId, plaintextBody, contentHash, correlationId, framedSeq ?? undefined,
         declaredAlg === undefined ? undefined : (declaredAlg as string | null),
         verifiedAuthorship,
+        verifiedSignerUnmatched,
       );
       // AC-001: after the content is durably ingested AND its hash cross-check
       // succeeds, emit an unsigned `persisted` delivery ACK back to the sender. A
