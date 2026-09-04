@@ -39,7 +39,13 @@ export interface LanguageOptions {
   minShare?: number;
 }
 
-function scriptOf(cp: number): Script | null {
+/**
+ * Exported for tests that need to MEASURE an exemplar's script composition. A test that hand-copies
+ * this bucketing drifts the moment a bucket is added here, and its "measured" counts quietly stop
+ * describing the classifier they claim to measure. Not re-exported from the package index — this is
+ * the module's own boundary, not public API.
+ */
+export function scriptOf(cp: number): Script | null {
   // Returns the script for a LETTER codepoint, or null for non-letters (digits/punct/space/emoji).
   if ((cp >= 0x41 && cp <= 0x5a) || (cp >= 0x61 && cp <= 0x7a) ||
       (cp >= 0xc0 && cp <= 0x24f) || (cp >= 0x1e00 && cp <= 0x1eff)) return "latin";
