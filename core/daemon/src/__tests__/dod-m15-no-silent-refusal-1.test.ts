@@ -354,8 +354,19 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.reason).toBe("injection_detected");
     expect(notice!.impact, "it says the sender was acked, so the operator does not wait for a resend")
       .toMatch(/acknowledged/);
-    expect(notice!.guidance, "and it must not send them hunting for the blocked text")
-      .toMatch(/Do NOT ask for the original text/);
+    /**
+     * DOD-M15-REFUSEDEVIDENCE-1 CHANGED THIS CLAUSE, and the new one is the stronger property.
+     *
+     * It used to demand "Do NOT ask for the original text", written when the text did not exist to
+     * ask for. It is retained now, so that sentence became false — and the friction it created was
+     * never protection: an operator who wants to see what was sent directs their agent to go and
+     * find it, and the agent finds it UNFRAMED. What must hold instead is that the guidance names
+     * the framed route AND still refuses the one action that makes things worse.
+     */
+    expect(notice!.guidance, "it must point at the route that returns the original SAFELY")
+      .toMatch(/cello_quarantined/);
+    expect(notice!.guidance, "and must still refuse the action that actually makes things worse")
+      .toMatch(/Do NOT turn screening off/);
     expect(
       JSON.stringify(notice),
       "THE CONTENT NEVER TRAVELS — a screener that can be talked into surfacing what it blocked is not one",
@@ -488,12 +499,20 @@ describe("DOD-M15-NO-SILENT-REFUSAL-1", () => {
     expect(notice!.guidance, "and it must NOT hedge — there is no judgement to make here")
       .not.toMatch(/when in doubt/i);
     /**
-     * And it names no reporting VERB, because CELLO_Reporting does not exist yet and the message
-     * itself is not retained. Naming a destination would be an instruction the operator cannot
-     * carry out. This assertion is the reminder to add one when those land.
+     * And it names no reporting DESTINATION, because `CELLO_Reporting` does not exist yet —
+     * `DOD-M15-ORPHANTRIAGE-1` owns it. Naming one would be an instruction the operator cannot carry
+     * out. This assertion is the reminder to add one when it lands.
+     *
+     * ⚠️ HALF THE OLD REASON IS GONE, and the sentence is corrected rather than left: it also said
+     * *"and the message itself is not retained"*. `DOD-M15-REFUSEDEVIDENCE-1` retains it, and the
+     * guidance now names the artifact — so what is missing is a place to send it, not a thing to
+     * send. The source comment this mirrors was rewritten with the fix; this copy was not, which is
+     * how a stale claim survives.
      */
     expect(notice!.guidance, "it does not name a destination that does not exist yet")
       .not.toMatch(/CELLO_Reporting/);
+    expect(notice!.guidance, "but it DOES name the retained artifact, which now exists")
+      .toMatch(/cello_quarantined/);
     expect(notice!.guidance, "and it does not invite a reply — that is what a probe wants").toMatch(/Do not try to reply/);
     /**
      * Rotating the address is advice that WORKS: `#startReceiverNode` mints the standing receiver's

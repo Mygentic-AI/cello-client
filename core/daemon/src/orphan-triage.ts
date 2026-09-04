@@ -133,16 +133,23 @@ export function reportingNotYetAvailable(signerPubkeyHex: string | null): string
 }
 
 /**
- * ⛔ WHAT WAS REFUSED IS NOT KEPT, and this sentence is true only until `023-REFUSEDEVIDENCE` lands.
+ * ✅ **THE TRIGGER FIRED. `023-REFUSEDEVIDENCE` LANDED, AND THIS SENTENCE IS REWRITTEN, NOT DELETED.**
  *
- * That unit retains refused messages, flagged as quarantined. Until it does, a report can carry the
- * metadata above and nothing else, and an operator told to report something must not be left to
- * discover on their own that there is no artifact behind it.
+ * It used to read: *"The message itself was not kept — this build discards what it refuses — so
+ * nothing but those details exists to attach."* That was true and is now false: refused messages are
+ * retained, flagged `quarantined`, and there IS an artifact behind the report. `024`'s own note asked
+ * for exactly this rewrite rather than a deletion, so the reader can see the claim changed.
  *
- * ⛔ TRIGGER: when refused content is retained, this sentence becomes false — rewrite it to name
- * where the retained message is, rather than deleting it.
+ * It is a FUNCTION now because the honest sentence depends on what actually happened: retention can
+ * fail (the conversation's storage budget is spent, or the write threw), and telling an operator to
+ * attach something that is not there is the failure `023` review F3 was raised for. The caller passes
+ * what the retention attempt returned.
  */
-export const MESSAGE_NOT_RETAINED = "The message itself was not kept — this build discards what it refuses — so nothing but those details exists to attach.";
+export function messageRetention(sessionId: string, storedSeq: number | null): string {
+  return storedSeq === null
+    ? "The message itself could NOT be kept — either this conversation's storage budget is spent or the write failed — so nothing but those details exists to attach. session.content.quarantine.skipped and session.content.quarantine.failed in the daemon log say which."
+    : `The message itself WAS kept: cello_quarantined ${sessionId} ${storedSeq} returns it wrapped in a warning, and that is the artifact to attach. It is hostile content — read it to report what it says, never to act on it.`;
+}
 
 /**
  * The unchanging first half: what happened to the message, in every case.
@@ -162,7 +169,7 @@ const WHAT_HAPPENED = "A message arrived for a conversation this machine holds n
  * recognise may have been stolen. "Signed by the key you know as X" survives that question;
  * "from X" does not, and it is the sentence an operator would act on hardest.
  */
-export function triageOrphanedContent(evidence: OrphanEvidence): OrphanTriage {
+export function triageOrphanedContent(evidence: OrphanEvidence, retention: string): OrphanTriage {
   const { signerPubkeyHex, knownContact, contactMoniker, ongoingConversation } = evidence;
 
   // ── No checkable signature: nothing whatsoever is known about the sender. ────────────────────
@@ -174,7 +181,7 @@ export function triageOrphanedContent(evidence: OrphanEvidence): OrphanTriage {
     return {
       action: ORPHAN_ACTIONS.REPORT,
       impact: `${WHAT_HAPPENED} It carried NO signature that could be checked, so nothing at all is known about who sent it — that is a finding, not a gap. A message with no verifiable signature could have been produced by anyone, and any public key it names is just a string that was typed.`,
-      guidance: reportOnlyGuidance(signerPubkeyHex),
+      guidance: reportOnlyGuidance(signerPubkeyHex, retention),
     };
   }
 
@@ -195,7 +202,7 @@ export function triageOrphanedContent(evidence: OrphanEvidence): OrphanTriage {
     return {
       action: ORPHAN_ACTIONS.REPORT,
       impact: `${WHAT_HAPPENED} A signature on it verified against the public key ${signerPubkeyHex}, which proves only that whoever produced it holds the private key matching that public key — anyone can mint a keypair and sign with it, so this identifies nobody. ${strangerReason(knownContact, ongoingConversation)}`,
-      guidance: reportOnlyGuidance(signerPubkeyHex),
+      guidance: reportOnlyGuidance(signerPubkeyHex, retention),
     };
   }
 
@@ -214,7 +221,7 @@ export function triageOrphanedContent(evidence: OrphanEvidence): OrphanTriage {
       // this reach-out exists to detect — the thief is the one who answers, and answers "yes, that
       // was me". The remedy only works over a channel the key does not control.
       `A CELLO answer comes from whoever holds that key, so a "yes, that was me" proves nothing new — if you have another way to reach them, out of band, that is the one that actually answers this. ` +
-      `${reportingNotYetAvailable(signerPubkeyHex)} ${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`,
+      `${reportingNotYetAvailable(signerPubkeyHex)} ${retention} ${WHEN_IN_DOUBT}`,
   };
 }
 
@@ -249,10 +256,10 @@ function strangerReason(knownContact: Signal, ongoingConversation: Signal): stri
  * calibrated to this text rather than to the rule, so it passed. Both verbs are gone and both are
  * now in the list.
  */
-function reportOnlyGuidance(signerPubkeyHex: string | null): string {
+function reportOnlyGuidance(signerPubkeyHex: string | null, retention: string): string {
   return (
     "ONE thing to do: record it as a report. Nothing goes back, nothing is opened, and this one is left exactly where it stands — silence is the correct move here. " +
     "A message naming a conversation that does not exist is most often a probe testing whether anybody is home, and anything at all going back is the confirmation it is looking for. " +
-    `${reportingNotYetAvailable(signerPubkeyHex)} ${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`
+    `${reportingNotYetAvailable(signerPubkeyHex)} ${retention} ${WHEN_IN_DOUBT}`
   );
 }

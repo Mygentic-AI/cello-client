@@ -50,7 +50,7 @@ import {
   ORPHAN_ACTIONS,
   NOT_CHECKED,
   WHEN_IN_DOUBT,
-  MESSAGE_NOT_RETAINED,
+  messageRetention,
   type OrphanEvidence,
 } from "../orphan-triage.js";
 
@@ -94,19 +94,28 @@ const IDENTITY_CLAIMS = [/message (is|was|came) from/i, /\bsent by\b/i, /\bthis 
  * itself. Any edit to that prose reddens this, and the person making the edit has to re-read the
  * verb rule before they can go green again.
  */
-const REPORT_ONLY_UNSIGNED =
+/**
+ * `023-REFUSEDEVIDENCE` landed and `MESSAGE_NOT_RETAINED` is gone — refused messages ARE kept now,
+ * so the sentence 024 wrote became false and its own trigger asked for a rewrite rather than a
+ * deletion. It is a function of what the retention attempt actually returned, because retention can
+ * still fail (budget spent, write threw) and an operator must never be told to attach something that
+ * is not there. These fixtures use the SUCCESS wording, which is the case they exercise.
+ */
+const RETAINED = messageRetention("ef".repeat(32), 3);
+
+const REPORT_ONLY_UNSIGNED = (retention: string): string =>
   "ONE thing to do: record it as a report. Nothing goes back, nothing is opened, and this one is left exactly where it stands — silence is the correct move here. " +
   "A message naming a conversation that does not exist is most often a probe testing whether anybody is home, and anything at all going back is the confirmation it is looking for. " +
   "CELLO has no agent to receive reports yet, so there is no command here that would send one. " +
   "Write down the conversation id above, the time you are reading this, and the fact that the message carried no signature anyone could check — that IS the report — and keep it until there is somewhere to send it. " +
-  `${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`;
+  `${retention} ${WHEN_IN_DOUBT}`;
 
-const REPORT_ONLY_SIGNED =
+const REPORT_ONLY_SIGNED = (retention: string): string =>
   "ONE thing to do: record it as a report. Nothing goes back, nothing is opened, and this one is left exactly where it stands — silence is the correct move here. " +
   "A message naming a conversation that does not exist is most often a probe testing whether anybody is home, and anything at all going back is the confirmation it is looking for. " +
   "CELLO has no agent to receive reports yet, so there is no command here that would send one. " +
   `Write down the public key above, the conversation id, and the time you are reading this — that IS the report — and keep it until there is somewhere to send it. ` +
-  `${MESSAGE_NOT_RETAINED} ${WHEN_IN_DOUBT}`;
+  `${retention} ${WHEN_IN_DOUBT}`;
 
 const KNOWN_AND_ONGOING: OrphanEvidence = {
   signerPubkeyHex: SIGNER_HEX, knownContact: true, contactMoniker: "Bob", ongoingConversation: true,
@@ -116,9 +125,9 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
   it("UNSIGNED — one action, report, and not one contact verb anywhere in the notice", () => {
     const t = triageOrphanedContent({
       signerPubkeyHex: null, knownContact: NOT_CHECKED, contactMoniker: null, ongoingConversation: NOT_CHECKED,
-    });
+    }, RETAINED);
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
-    expect(t.guidance, "the guidance is pinned WORD FOR WORD — a blocklist fails by omission").toBe(REPORT_ONLY_UNSIGNED);
+    expect(t.guidance, "the guidance is pinned WORD FOR WORD — a blocklist fails by omission").toBe(REPORT_ONLY_UNSIGNED(RETAINED));
     for (const verb of CONTACT_VERBS) {
       expect(`${t.impact} ${t.guidance}`, `an unsigned message must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
     }
@@ -138,9 +147,9 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
       knownContact: false,
       contactMoniker: null,
       ongoingConversation: true, // even here: an unvouched key is an unvouched key
-    });
+    }, RETAINED);
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
-    expect(t.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(t.guidance).toBe(REPORT_ONLY_SIGNED(RETAINED));
     for (const verb of CONTACT_VERBS) {
       expect(`${t.impact} ${t.guidance}`, `an unvouched key must name no way to answer it; matched ${String(verb)}`).not.toMatch(verb);
     }
@@ -160,16 +169,16 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
      * point"*. Branching on the vouch alone produced a notice that argued with itself: an impact
      * saying nothing here favours a fault over a probe, above a guidance saying make contact anyway.
      */
-    const t = triageOrphanedContent({ ...KNOWN_AND_ONGOING, ongoingConversation: false });
+    const t = triageOrphanedContent({ ...KNOWN_AND_ONGOING, ongoingConversation: false }, RETAINED);
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
-    expect(t.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(t.guidance).toBe(REPORT_ONLY_SIGNED(RETAINED));
     expect(t.impact, "and it says which half failed").toMatch(/holds no part of any conversation under the id the message names/);
   });
 
   it("A SIGNAL NOBODY MEASURED NEVER UNLOCKS CONTACT — not_checked is not a quiet false", () => {
     const t = triageOrphanedContent({
       signerPubkeyHex: SIGNER_HEX, knownContact: NOT_CHECKED, contactMoniker: null, ongoingConversation: NOT_CHECKED,
-    });
+    }, RETAINED);
     expect(t.action).toBe(ORPHAN_ACTIONS.REPORT);
     expect(t.impact, "and the operator is told it was not checked rather than told it was false")
       .toMatch(/could NOT be read on this machine/);
@@ -177,7 +186,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
   });
 
   it("VOUCHED KEY + LOCAL TRACE — reaching out is offered, explicitly in a NEW conversation", () => {
-    const t = triageOrphanedContent(KNOWN_AND_ONGOING);
+    const t = triageOrphanedContent(KNOWN_AND_ONGOING, RETAINED);
     expect(t.action).toBe(ORPHAN_ACTIONS.REACH_OUT_NEW_CONVERSATION);
     expect(t.guidance, "a NEW one — the conversation this message names must never be opened")
       .toMatch(/open a NEW conversation with/);
@@ -212,7 +221,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
       { ...KNOWN_AND_ONGOING, contactMoniker: null },
     ];
     for (const c of cases) {
-      const t = triageOrphanedContent(c);
+      const t = triageOrphanedContent(c, RETAINED);
       const notice = `${t.impact} ${t.guidance}`;
       for (const claim of IDENTITY_CLAIMS) {
         expect(notice, `a signature identifies nobody; matched ${String(claim)}`).not.toMatch(claim);
@@ -220,8 +229,8 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the triage prose", () => {
       expect(t.guidance, "every case, including the reach-out one").toContain(WHEN_IN_DOUBT);
       expect(t.guidance, "reporting is named as not yet reachable rather than as a verb that works")
         .toMatch(/CELLO has no agent to receive reports yet/);
-      expect(t.guidance, "and the operator is told there is no artifact behind the report")
-        .toContain(MESSAGE_NOT_RETAINED);
+      expect(t.guidance, "and the operator is told WHERE the artifact behind the report is")
+        .toContain(RETAINED);
       expect(t.guidance, "the advice that made the probe succeed is gone")
         .not.toMatch(/ask the counterparty to start a NEW session/i);
       expect(t.impact, "and a repeated notice must not imply every arrival looked like the newest")
@@ -290,7 +299,9 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
   it("NO SIGNER — report only, and the old advice that helped the prober is gone", async () => {
     handle = await startDaemon(await config());
     const n = await refuse("s-unsigned");
-    expect(n.guidance).toBe(REPORT_ONLY_UNSIGNED);
+    // The retention sentence names THIS session and the position the row actually took, so the
+    // assertion also proves the operator is pointed at the right artifact rather than a plausible one.
+    expect(n.guidance).toBe(REPORT_ONLY_UNSIGNED(messageRetention("s-unsigned", -1)));
     expect(n.guidance).not.toMatch(/ask the counterparty to start a NEW session/i);
     expect(n.guidance).toContain(WHEN_IN_DOUBT);
     // 022's notice said the sender keeps redelivering. That is still true and still said.
@@ -301,7 +312,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     handle = await startDaemon(await config());
     const n = await refuse("s-stranger", Buffer.from(SIGNER_HEX, "hex"));
     expect(n.impact, "the key is named in full so it can be pasted, compared and reported").toContain(SIGNER_HEX);
-    expect(n.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(n.guidance).toBe(REPORT_ONLY_SIGNED(messageRetention("s-stranger", -1)));
   });
 
   it("A MERE CONTACT ROW IS NOT A VOUCH — an UNKNOWN-tier row still gets report only", async () => {
@@ -322,7 +333,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     mgr.addContact("alice", SIGNER_HEX, null, "signal_presentation", TIER.UNKNOWN);
     seedTranscript("s-dialled");
     const n = await refuse("s-dialled", Buffer.from(SIGNER_HEX, "hex"));
-    expect(n.guidance, "a row somebody else caused is not a relationship the operator chose").toBe(REPORT_ONLY_SIGNED);
+    expect(n.guidance, "a row somebody else caused is not a relationship the operator chose").toBe(REPORT_ONLY_SIGNED(messageRetention("s-dialled", -1)));
     expect(n.impact).toMatch(/present only because somebody dialled you, or blocked/);
   });
 
@@ -336,7 +347,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     mgr.addContact("alice", SIGNER_HEX, "Bob", null, TIER.BLOCKED);
     seedTranscript("s-blocked");
     const n = await refuse("s-blocked", Buffer.from(SIGNER_HEX, "hex"));
-    expect(n.guidance, "the operator already answered this question, in the other direction").toBe(REPORT_ONLY_SIGNED);
+    expect(n.guidance, "the operator already answered this question, in the other direction").toBe(REPORT_ONLY_SIGNED(messageRetention("s-blocked", -1)));
   });
 
   it("A VOUCHED KEY WITH NO LOCAL TRACE — report only, because the conjunction is not satisfied", async () => {
@@ -344,7 +355,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the orphan branch derives its own signals",
     handle.getSessionNodeManager().addContact("alice", SIGNER_HEX, "Bob", null, TIER.KNOWN);
     // No seedTranscript: this machine holds nothing under that id.
     const n = await refuse("s-notrace", Buffer.from(SIGNER_HEX, "hex"));
-    expect(n.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(n.guidance).toBe(REPORT_ONLY_SIGNED(messageRetention("s-notrace", -1)));
     expect(n.impact).toMatch(/holds no part of any conversation under the id the message names/);
   });
 
@@ -416,7 +427,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
       sessionId: Buffer.from(SID, "hex").subarray(0, 16),
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
-    });
+    }, RETAINED);
     // The signature the receiver verifies — over the EXACT bytes, by the key inside them.
     const sig = await kp.sign(s1);
     const s2 = encodeCbor([1, senderPubkey, contentHash, sig, null, null]) as Uint8Array;
@@ -456,11 +467,52 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
       "the whole unit, and the only other guard on it is the spine",
     ).toContain(signerHex);
     // Unvouched, so the action is still report — the point is that the KEY survived, not the branch.
-    expect(notice!.guidance).toBe(REPORT_ONLY_SIGNED);
+    expect(notice!.guidance).toBe(REPORT_ONLY_SIGNED(messageRetention(SID, -1)));
 
     const logged = fx.eventsNamed("session.content.orphaned").at(-1)!;
     expect(logged.ctx!["signatureVerified"], "and the forensic record says the signature was checked").toBe(true);
     expect(logged.ctx!["signerPubkey"]).toBe(signerHex);
+  }, 60_000);
+
+  it("★ A PROBE CANNOT MANUFACTURE ITS OWN 'ongoing conversation' BY SENDING TWICE", async () => {
+    /**
+     * ⚠️ **WHERE `023-REFUSEDEVIDENCE` MEETS THIS UNIT, AND THE ATTACKER WINS IF THEY ARE NOT
+     * RECONCILED.** Found by merging the two.
+     *
+     * The reach-out branch needs BOTH signals: a vouched key AND this machine already holding part
+     * of a conversation under the id the message names. That second signal was
+     * `SELECT 1 FROM transcript` — and 023 makes a refused message write a transcript row.
+     *
+     * So: a stranger whose key the operator has vouched for probes an id nobody ever opened. The
+     * first probe is refused and RETAINED. The second probe finds the first one's row, reads as an
+     * ongoing conversation, and the operator is offered a reach-out — **the attacker supplying the
+     * missing condition by sending twice**, which is the outcome this unit exists to prevent.
+     *
+     * The fix is one predicate (`direction != 'quarantined'`), and this is the test that holds it:
+     * remove it and the second probe flips to the reach-out branch.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-orphan-probe-" });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+    const first = await signedFrame();
+    // VOUCHED, so the only thing standing between this key and a reach-out is the local trace.
+    fx.snm.addContact("alice", first.signerHex, "Bob", null, TIER.KNOWN);
+    dropSessionRow("alice");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, first.framed, PEER);
+    await fx.snm.handleContentFrameForTest("alice", SID, first.framed, PEER);
+
+    // A FRESH consumer id, not a second read by "op". The notice store deduplicates per consumer
+    // and re-announces only on an order-of-magnitude climb, so reading twice as "op" would return
+    // nothing and the assertion would pass on an absent notice rather than a correct one.
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op-second-look");
+    expect(notice, "the second probe is refused too").toBeDefined();
+    expect(
+      notice!.guidance,
+      "a key whose only local trace is the record of its OWN refused probes must not earn a " +
+      "reach-out. The record of a refusal is not a conversation.",
+    ).toBe(REPORT_ONLY_SIGNED(messageRetention(SID, -1)));
+    const logged = fx.eventsNamed("session.content.orphaned").at(-1)!;
+    expect(logged.ctx!["ongoingConversation"], "and the forensic record says so too").toBe(false);
   }, 60_000);
 
   it("★ AN UNREADABLE ADDRESS BOOK IS RECORDED AS UNREAD, never as a measured 'no'", async () => {
@@ -485,7 +537,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     await fx.snm.handleContentFrameForTest("alice", SID, framed, PEER);
 
     const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
-    expect(notice!.guidance, "and it still routes to the safe action").toBe(REPORT_ONLY_SIGNED);
+    expect(notice!.guidance, "and it still routes to the safe action").toBe(REPORT_ONLY_SIGNED(messageRetention(SID, -1)));
     expect(notice!.impact, "the operator is told it could not be checked, not told the answer was no")
       .toMatch(/could NOT be read on this machine/);
     expect(notice!.impact).toContain(signerHex);
@@ -518,7 +570,7 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
     await fx.snm.handleContentFrameForTest("alice", SID, bare, PEER);
 
     const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
-    expect(notice!.guidance).toBe(REPORT_ONLY_UNSIGNED);
+    expect(notice!.guidance).toBe(REPORT_ONLY_UNSIGNED(messageRetention(SID, -1)));
     expect(fx.eventsNamed("session.content.orphaned").at(-1)!.ctx!["signatureVerified"]).toBe(false);
   }, 60_000);
 });

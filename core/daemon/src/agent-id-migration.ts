@@ -168,6 +168,11 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         sender_pubkey TEXT,
         sender_sig BLOB,
         attribution TEXT NOT NULL DEFAULT 'local_session_state',
+        -- DOD-M15-REFUSEDEVIDENCE-1. THE THIRD ENTRY, and the note above is why it is here: the
+        -- rebuild copies only the INTERSECTION of columns, so leaving this out would silently drop
+        -- every retained refusal's REASON on the one boot a legacy database upgrades — turning
+        -- kept evidence into an unexplained blob. Same trap, third column.
+        quarantine_reason TEXT,
         PRIMARY KEY (agent_id, session_id, sequence, direction)
       )`,
     indexSql: () => [],

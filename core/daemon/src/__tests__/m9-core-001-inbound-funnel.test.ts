@@ -242,7 +242,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       return { mgr, events };
     }
 
-    it("AC1-AC4: no sessions row → refused loudly; no transcript row, no leaf, no buffer, no unread minted", async () => {
+    it("AC1-AC4: no sessions row → refused loudly; no DELIVERABLE row, no leaf, no buffer, no unread minted", async () => {
       const { mgr, events } = await setupCapturing();
       // Deliberately NO createSessionNode — the session does not exist for alice.
       const content = enc("reply into the void");
@@ -258,8 +258,26 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       expect(orphaned!.context["agentName"]).toBe("alice");
       expect(orphaned!.context["sessionId"]).toBe(SID);
       expect(orphaned!.context["correlationId"]).toBe("corr-orphan");
-      // AC3 (drop, visibly): nothing was recorded anywhere.
-      expect(mgr.readTranscript("alice", SID).messages).toHaveLength(0);
+      /**
+       * ─── AC3, RESTATED BY DOD-M15-REFUSEDEVIDENCE-1 ───────────────────────────────────────────
+       *
+       * This used to read "nothing was recorded anywhere", asserting an EMPTY transcript. That was
+       * the right way to state D4a's invariant while a refused message was thrown away, and it is
+       * now the wrong way: the message IS retained, flagged `quarantined`, because a probe at a
+       * session this daemon has never heard of is exactly the thing an operator would want to show
+       * someone and had no way to.
+       *
+       * **The invariant itself is unchanged and is asserted more sharply below.** D4a's harm was
+       * never "a row exists" — it was a row that LOOKS DELIVERABLE: unattributable forever, counted
+       * unread by `getUnreadSummary`, unreadable by `cello_receive`. A quarantined row causes none
+       * of those, and each is checked here rather than inferred from an empty table.
+       */
+      const rows = mgr.readTranscript("alice", SID).messages;
+      expect(rows, "the refused message is KEPT — one row, not none").toHaveLength(1);
+      expect(rows[0]!.direction, "and it is flagged, which is what keeps it out of every delivery path").toBe("quarantined");
+      expect(rows[0]!.text, "the transcript read is redacted; the payload never travels on it").not.toContain("reply into the void");
+      // The three D4a harms, each asserted directly.
+      expect(mgr.findNextReceivedAfter("alice", SID, -1), "cello_receive's reader never sees it").toBeNull();
       expect(mgr.getSessionTree("alice", SID).size()).toBe(0);
       expect(mgr.takeReceivedContent("alice", SID)).toBeNull();
       // THE INVARIANT: no unread is minted for a session cello_receive cannot read.

@@ -5135,9 +5135,27 @@ async function startDaemonHoldingLock(
          */
         const store: { notice?: Record<string, unknown> } = {};
         const result = await fallbackNoticeStore.run(store, () => handler(params, connectionId));
+        /**
+         * ⚠️ **THE NOTICE GOES FIRST, AND THAT ORDERING IS A SECURITY PROPERTY — review F2.**
+         *
+         * It used to be spread LAST, which reads as harmless because these keys are additive. It is
+         * not: `cello_get_quarantined` returns a REFUSED MESSAGE as its final key, and the framing
+         * that makes hostile content safe to read has NO CLOSING DELIMITER — the reader's one
+         * structural guarantee is that nothing follows the payload. Three keys of genuine
+         * CELLO-authored prose landing after it is exactly the shape a forged ending imitates, and
+         * once a reader has seen real framing follow the payload, a forged one is credible.
+         *
+         * Not a corner case: `withIpc` in the CLI never sends `ipc.connect`, so a single-agent
+         * daemon takes the sole-online fallback on EVERY plain `cello quarantined` invocation.
+         *
+         * Spreading first is safe in general and needs no per-handler knowledge: these keys cannot
+         * collide with a handler's own (a collision would mean a handler already answered the
+         * question the notice exists to answer), and every response then keeps its own key order at
+         * the tail — which is where a payload-terminal key has to stay.
+         */
         const annotated =
           store.notice && result !== null && typeof result === "object" && !Array.isArray(result)
-            ? { ...(result as Record<string, unknown>), ...store.notice }
+            ? { ...store.notice, ...(result as Record<string, unknown>) }
             : result;
         // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
         // the CLI verb is the safe answer — it is at least a real command an operator can run,

@@ -992,7 +992,23 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
     // NOR transcript rows is truly not found.
     let transcriptOnly = false;
     if (!record) {
-      if (sessionNodeManager.readTranscript(agentName, sessionId).messages.length === 0) {
+      /**
+       * ⚠️ **QUARANTINED ROWS DO NOT MAKE A SESSION — review F4, and this is the clause
+       * `DOD-M15-REFUSEDEVIDENCE-1` names by surface.**
+       *
+       * Every other reader of this table pins `direction = 'received'`, which is what makes a
+       * refused message excluded by construction. This one counted rows. So after a
+       * `session_orphaned` retention — no `sessions` row, one quarantined row — `cello_receive`
+       * stopped answering `session_not_found` and began answering `session_not_live`, with guidance
+       * saying *"This session exists only as a durable transcript"*. Nothing deliverable is there
+       * and nobody opened it: the row is a probe someone aimed at an id. That is a milder shape of
+       * the phantom-session residue this whole design exists to avoid — a session id materialising
+       * in an operator surface because a stranger sent bytes at it.
+       */
+      const deliverable = sessionNodeManager
+        .readTranscript(agentName, sessionId)
+        .messages.filter((m) => m.direction !== "quarantined");
+      if (deliverable.length === 0) {
         return { ok: false, reason: "session_not_found", guidance: "No session found with this ID. Check cello_sessions." };
       }
       transcriptOnly = true;
@@ -1105,8 +1121,16 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         //     The same received-only-view mistake as DOD-COATTEND-1 review F1, made a second time
         //     one file over: `daemon.ts` already says "every sibling send is a hole" in as many
         //     words. `cello_get_transcript` gets this right by walking both directions; so does this
-        //     now. What still stops the walk is a genuinely absent index — an undecryptable row or a
-        //     screened-out leaf, which have no transcript row at all and ARE unread.
+        //     now. What still stops the walk is a genuinely absent index — an undecryptable row,
+        //     which has no transcript row at all and IS unread.
+        //
+        // ⚠️ **A SCREENED-OUT LEAF USED TO BE IN THAT LIST AND NO LONGER BELONGS — review F5.**
+        // Corrected rather than deleted, because the sentence was true when written and its change
+        // is a behaviour change worth seeing. `DOD-M15-REFUSEDEVIDENCE-1` gives a blocked message a
+        // transcript row (flagged `quarantined`), so the walk now CROSSES it — which is the right
+        // answer and the same one already reached for `doc` leaves below: a blocked message is not
+        // unread, never will be, and can never be delivered, so wedging the watermark behind it
+        // strands every later message forever. It is included deliberately, not incidentally.
         let frontier = sinceSeq;
         const presentSeqs = new Set(messages.map((m) => m.sequence));
         // A DOCUMENT LEAF IS NOT A HOLE — it is a frame that was never a message.
