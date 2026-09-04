@@ -56,7 +56,7 @@ import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeStructure1 } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeStructure1, encodeStructure1 } from "@cello-protocol/protocol-types";
 import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
@@ -863,6 +863,47 @@ export interface SentAuthorship {
   senderPubkey: Uint8Array;
   senderSig: Uint8Array;
 }
+
+/**
+ * `DOD-M15-AUTHORSHIP-ABSENT-1` — the answer to "did the sender prove they wrote this message?",
+ * with the three NOT-YES cases kept apart because they are three different facts about the peer.
+ *
+ * The distinction that matters is between `refuted` and `unusable`, and getting it backwards is the
+ * trap this unit was written against:
+ *
+ *   - `refuted`   — a proof was supplied and it FAILED. That is evidence about the counterparty's
+ *                   key, and it freezes the session (`#freezeOnIdentityFailure`).
+ *   - `unusable`  — there is nothing here that could be checked against this message. Almost always
+ *                   a peer on an older build; possibly someone stripping the field. It refuses THE
+ *                   MESSAGE and leaves the session alone, because freezing on it would turn every
+ *                   version skew into an incident only a new session can clear.
+ *
+ * Absent is not a fourth case: a frame with no `sender_signature` never reaches the verifier, and
+ * its caller refuses it on the same path an `unusable` verdict takes. Missing, malformed and
+ * mismatched arrive at one outcome, which is the rule this whole class of defect comes from.
+ */
+type AuthorshipVerdict =
+  /** Signature verified against the key inside the signed bytes, and that key IS this session's counterparty. */
+  | { verdict: "verified"; senderPubkey: Uint8Array; senderSig: Uint8Array }
+  /**
+   * 024-ORPHANTRIAGE: the signature VERIFIED and there was no session record to match it against.
+   *
+   * ⚠️ **DELIBERATELY A SEPARATE VERDICT, NOT A `verified` WITH A FLAG.** `verified` means *verified
+   * AND matched to this session's counterparty*; the transcript column it feeds is documented as
+   * exactly that ("verified, never claimed") and seal-time attribution rests on it. Returning an
+   * unmatched signer under that name would silently widen a proof the rest of the system reads as
+   * stronger. This one carries the weaker fact under its own name, and has exactly one consumer:
+   * the orphan branch, which needs to tell an operator whether anything at all is known about who
+   * sent a message for a conversation that does not exist here.
+   */
+  | { verdict: "verified_unmatched"; senderPubkey: Uint8Array }
+  /** A proof was supplied and it is WRONG. Identity failure — fatal for the session. */
+  | { verdict: "refuted"; reason: "bad_signature" | "signer_not_counterparty" }
+  /** Nothing checkable arrived. Refuses the message; says nothing about the counterparty's key. */
+  | { verdict: "unusable"; reason: string };
+
+/** The `unusable` reason for a proof that is real and describes some OTHER message. */
+const AUTHORSHIP_CONTENT_HASH_MISMATCH = "content_hash_mismatch";
 
 /**
  * One row of a session's durable transcript as a reader sees it.
@@ -8302,6 +8343,12 @@ export class SessionNodeManager {
     let orderingS1: Uint8Array | undefined;
     let orderingS2: Uint8Array | undefined;
     /**
+     * `DOD-M15-AUTHORSHIP-ABSENT-1`: the sender's signature over `orderingS1`, when the relay
+     * witnessed this leaf. Undefined when it did not — and the frame builder below then signs a
+     * Structure 1 of its own rather than shipping a frame with nothing to check.
+     */
+    let orderingSig: Uint8Array | undefined;
+    /**
      * DOD-M15-SEALWIRE-1 bullet 5, SENT half. Our own Ed25519 signature over `orderingS1`.
      *
      * The submit path already computes this — `keyProvider.sign(structure1)` — and puts it on the
@@ -8329,6 +8376,11 @@ export class SessionNodeManager {
         if (witnessed.ok) {
           orderingS1 = witnessed.structure1_cbor;
           orderingS2 = witnessed.structure2_cbor;
+          // `DOD-M15-AUTHORSHIP-ABSENT-1`: the signature that goes ON THE FRAME beside `orderingS1`.
+          // Captured here, next to the bytes it signs, because a signature assigned anywhere else
+          // could end up beside a different Structure 1 — a proof next to the wrong signed bytes is
+          // worse than no proof, since it looks checkable and fails.
+          orderingSig = witnessed.sender_signature;
           /**
            * PAIRED WITH THE BYTES IT SIGNS, in one place, so the two can never be assigned apart.
            *
@@ -8609,6 +8661,29 @@ export class SessionNodeManager {
        * the receiver decrypts before it verifies.
        */
       const wireBody = sealSessionContent(sessionKey, content);
+      /**
+       * ─── EVERY FRAME CARRIES ITS OWN PROOF — `DOD-M15-AUTHORSHIP-ABSENT-1` ────────────────────
+       *
+       * Structure 1 used to be built and signed INSIDE the relay submit, so a send the relay never
+       * witnessed put a frame on the wire with nothing on it to check — and the receiver, having no
+       * proof to compare, ingested it and attributed it anyway. There was always something to sign;
+       * nobody signed it.
+       *
+       * ⚠️ `structure2_cbor` IS DROPPED WHEN WE BUILD OUR OWN, and that pairing is load-bearing. The
+       * relay's record commits its copy of the sender's signature to the EXACT Structure 1 that was
+       * submitted; put it beside a Structure 1 built here (different timestamp, different
+       * last_seen_seq) and the receiver's cross-check fails against bytes that were never altered —
+       * a freeze on an honest message. The two travel together or the relay's half does not travel.
+       */
+      let frameS1 = orderingS1;
+      let frameSig = orderingSig;
+      let frameS2 = orderingS2;
+      if (frameS1 === undefined || frameSig === undefined) {
+        const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
+        frameS1 = own.structure1;
+        frameSig = own.signature;
+        frameS2 = undefined;
+      }
       const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,
@@ -8621,9 +8696,12 @@ export class SessionNodeManager {
         // DOD-MSG-4 (self-ordering): the relay's signed ordering record, so the receiver verifies +
         // orders from the frame ALONE (no dependence on the separate leaf_deliver witness timing).
         // structure1_cbor = sender-signed bytes (verify); structure2_cbor = relay's committed seq +
-        // prev_root (order). Omitted if the relay was unreachable — receiver falls back to the witness.
-        structure1_cbor: orderingS1,
-        structure2_cbor: orderingS2,
+        // prev_root (order). Structure 2 is omitted if the relay was unreachable — the receiver
+        // falls back to the witness stream for POSITION. Structure 1 and its signature are never
+        // omitted: `DOD-M15-AUTHORSHIP-ABSENT-1`, and a frame without them is refused on arrival.
+        structure1_cbor: frameS1,
+        sender_signature: frameSig,
+        structure2_cbor: frameS2,
         // DOD-M15-SEALWIRE-1 part B2b: HOW `content_hash` was produced. An older peer ignores an
         // unknown CBOR key, so emitting it is safe for every build in existence; a newer one reads
         // it and verifies under the named algorithm instead of assuming.
@@ -15045,6 +15123,173 @@ export class SessionNodeManager {
     }
   }
 
+  /**
+   * `DOD-M15-AUTHORSHIP-ABSENT-1` — SIGN OUR OWN CLAIM, with no relay involved.
+   *
+   * The relay submit has always built these bytes and signed them (`session-relay-client.ts`); this
+   * is the same construction, for the path where no submit happens. It is not a fallback in the
+   * silent sense — it produces exactly the artifact the witnessed path produces, minus the relay's
+   * countersigned position, which was never part of the authorship claim.
+   *
+   * ⚠️ THROWS when this agent has no identity key, and the throw is the correct outcome. It lands in
+   * the direct-send catch, which parks the message to the relay mailbox exactly as a failed dial
+   * does — so the message is not lost, and the operator hears about a local fault instead of a
+   * counterparty who mysteriously stopped receiving. Shipping the frame unsigned would guarantee a
+   * refusal at the far end and blame the wrong machine for it.
+   */
+  async #signOwnContentClaim(
+    agentName: string,
+    sessionId: string,
+    entry: ActiveSessionEntry,
+    contentHash: Uint8Array,
+  ): Promise<{ structure1: Uint8Array; signature: Uint8Array }> {
+    const signer = this.#keyProviderResolver?.(agentName);
+    if (!signer) {
+      throw new Error(
+        "content_not_signable: this machine has no identity key for this agent, so it cannot sign " +
+        "the message it is about to send and the counterparty would refuse it as unattributable",
+      );
+    }
+    // The 16-byte relay session id when this session has one, so a frame built here is
+    // byte-comparable with one built by the submit. Falling back to the local id is not a
+    // second meaning: for every session created without an assignment the two are the same value
+    // (`relaySessionIdBytes` is set from `sessionId` on exactly those paths).
+    const sessionIdBytes = entry.relaySessionIdBytes ?? Uint8Array.from(Buffer.from(sessionId, "hex"));
+    const structure1 = encodeStructure1({
+      contentHash,
+      senderPubkey: await signer.getPublicKey(),
+      sessionId: sessionIdBytes,
+      // The highest counterparty position this session has seen, from the same source the submit
+      // reads. Zero when there is no relay client at all, which is honest: nothing has been
+      // witnessed on this session, so there is no position to acknowledge.
+      lastSeenSeq: entry.relayClient?.lastSeenSeq(Buffer.from(sessionIdBytes).toString("hex")) ?? 0,
+      timestamp: Date.now(),
+      // v1 DELIBERATELY. `last_seen_hash` (v2) is `WITHHOLD-SEAL-1`'s emitter and is not owed here;
+      // a v1 claim makes no content acknowledgement at all, which is honest, where an invented one
+      // would not be.
+    });
+    return { structure1, signature: await signer.sign(structure1) };
+  }
+
+  /**
+   * `DOD-M15-AUTHORSHIP-ABSENT-1` — DID THIS SENDER PROVE THEY WROTE THIS MESSAGE?
+   *
+   * The one place that answers it, for both callers, so "checked" cannot mean two different things
+   * in two places. It takes the signature as an ARGUMENT rather than digging it out of a structure,
+   * which is the whole of the fix: the signature used to be read only from `structure2_cbor` — the
+   * RELAY's record — so a receiver could not check authorship without a relay record, and refusing
+   * on its absence would have made the relay a precondition for reading mail. The content frame now
+   * carries the signature beside the bytes it signs, exactly as `hash_submit` always has, and this
+   * method does not care which of the two handed it over.
+   *
+   * It VERIFIES and it does not LOG. The severity of each verdict differs by caller — the content
+   * frame refuses an `unusable`, the park path shrugs at one — and a method that logged its own
+   * conclusion would either report a refusal that did not happen or stay silent on one that did.
+   */
+  #verifyAuthorshipClaim(
+    agentName: string,
+    sessionId: string,
+    structure1Cbor: Uint8Array,
+    senderSignature: Uint8Array,
+    contentHash: Uint8Array,
+  ): AuthorshipVerdict {
+    // Structure 1 content_hash is index 1 and sender_pubkey index 2 in BOTH layouts — 020-ACKHASH
+    // appended last_seen_hash at 6 rather than inserting it, so neither read moved. A v2 claim
+    // decodes here exactly as a v1 one does; its hash is not consulted, because this unit ships
+    // reading and not enforcing.
+    const s1 = decodeStructure1(structure1Cbor);
+    // A layout this build cannot name yields no pubkey and no hash, so there is nothing to check the
+    // signature against. Its reason is carried out so an unreadable CLAIM and a wrong SIGNATURE stay
+    // distinguishable — they take the same outcome by different routes.
+    if (!s1.ok) return { verdict: "unusable", reason: s1.reason };
+    const s1Hash = s1.fields.contentHash;
+    const s1Pubkey = s1.fields.senderPubkey;
+    // The claim must bind to THIS content. A signature over somebody else's bytes verifies perfectly
+    // and proves nothing about this message — without this, one signed claim could be replayed onto
+    // every frame that follows it.
+    if (Buffer.from(s1Hash).toString("hex") !== Buffer.from(contentHash).toString("hex")) {
+      return { verdict: "unusable", reason: AUTHORSHIP_CONTENT_HASH_MISMATCH };
+    }
+    // The SENDER's Ed25519 signature over the exact signed bytes — the same check the relay
+    // performs. `verify` never throws, so a wrong-width or garbage signature lands here as `false`:
+    // supplied and refuted, which is a different fact from not supplied at all.
+    if (!verify(s1Pubkey, structure1Cbor, senderSignature)) {
+      return { verdict: "refuted", reason: "bad_signature" };
+    }
+    // Sovereign-node cross-check: the signer MUST be THIS session's counterparty, not an unrelated
+    // key. Review M1: compare BYTES, not hex strings — `counterparty_pubkey` is stored verbatim from
+    // the IPC param and is never case-normalized, so a string compare would fail for a mixed-case
+    // pubkey and silently strip the canonical ordering from every message in that session.
+    const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
+    if (!pubkeyMatchesHex(s1Pubkey, counterparty)) {
+      /**
+       * REFUTED when the counterparty is KNOWN and the signer is someone else.
+       *
+       * This is the session-open MITM detection from the 2026-08-21 T-of-N investigation, which
+       * found this check *"fires correctly, and its answer is thrown away."* A rogue quorum of the
+       * directories holding shares for agent B can sign a false SessionAssignment naming M's key as
+       * B's, and everything downstream is genuinely real — M signs with M's own valid key. Nothing
+       * is missing for A to notice. This comparison is where the substitution shows, because
+       * `counterparty_pubkey` comes from A's own request and is untouched by anything the directory
+       * returns.
+       *
+       * ⚠️ AN EARLIER VERSION OF THIS COMMENT ADDED "it shows only when the record is present" —
+       * true when the proof was optional, and no longer the shape of the code: a content frame with
+       * no checkable proof is refused before it reaches ingest, so M cannot decline to supply one
+       * and be admitted anyway. Rewritten rather than deleted, because that sentence is the evidence
+       * of what the gap was. The park envelope is the remaining path where the ordering record is
+       * genuinely optional, and there the sender's authorship is proven by the envelope's own
+       * signature instead.
+       *
+       * `verified_unmatched` stays soft deliberately: with no counterparty on record we cannot prove
+       * the signer either way, and refusing there would strand a session whose row we failed to read
+       * rather than one that is under attack. It is also the only signal the orphan branch has.
+       */
+      return counterparty
+        ? { verdict: "refuted", reason: "signer_not_counterparty" }
+        : { verdict: "verified_unmatched", senderPubkey: s1Pubkey };
+    }
+    return { verdict: "verified", senderPubkey: s1Pubkey, senderSig: senderSignature };
+  }
+
+  /**
+   * `DOD-M15-AUTHORSHIP-ABSENT-1` — the refusal an inbound frame gets when its authorship cannot be
+   * established. NOT a freeze: see `AuthorshipVerdict` for why those are different facts.
+   *
+   * Both surfaces, always. The ERROR is the durable forensic record an investigation reads days
+   * later; the notice is the CONTROL — the thing that actually reaches the operator, who otherwise
+   * watches a conversation go quiet and concludes the other person stopped replying.
+   */
+  #refuseUnprovenAuthorship(
+    agentName: string,
+    sessionId: string,
+    reason: "authorship_proof_absent" | "authorship_proof_unusable",
+    detail: Record<string, unknown>,
+    correlationId?: string,
+  ): void {
+    const impact =
+      reason === "authorship_proof_absent"
+        ? "a message arrived carrying no proof of who wrote it, so it was NOT ingested, NOT shown and NOT attributed to anyone. Every message in this conversation has to be provable to whoever reads its receipt later, and this one could not be."
+        : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
+    /**
+     * ⚠️ THE VERB IS THE COUNTERPARTY'S, AND THE GUIDANCE SAYS SO. The reader is the RECEIVING
+     * operator, and there is nothing on their machine to change — the missing signature is produced
+     * on the sender's. Telling them to do something local would be an affordance that resolves to
+     * nothing. So it names the one move that works (tell them to upgrade) and the one that settles
+     * the other explanation (confirm out of band), and it stops at two.
+     */
+    const guidance =
+      "STOPPED ON PURPOSE. Nothing was shown and nothing was stored. Almost always their CELLO build " +
+      "is older than this one: a build from before message signing does not attach a signature at " +
+      "all. Ask which version they are running, and tell them to upgrade — this will keep happening " +
+      "until they do, and only they can fix it. If they are on the SAME version as you, that " +
+      "explanation does not hold: confirm with them OUT OF BAND before opening another session.";
+    this.#logger.error("session.content.refused", {
+      agentName, sessionId, correlationId, reason, ...detail, impact, guidance,
+    });
+    this.noteContentRefusal(agentName, sessionId, reason, { kind: REFUSAL_KINDS.REFUSED, impact, guidance });
+  }
+
   #recordFrameOrdering(
     agentName: string,
     sessionId: string,
@@ -15069,66 +15314,59 @@ export class SessionNodeManager {
     // the relay a precondition for reading mail), while IDENTITY may never be. A bad signature, or
     // a signature by a key that is not this session's counterparty, is an identity failure that the
     // sender supplied and that we verified — not an absence we could not resolve.
+    // `DOD-M15-AUTHORSHIP-ABSENT-1` — THE AUTHORSHIP FIELDS ARE GONE FROM THIS RETURN, and their
+    // absence is the point rather than a tidy-up. This method used to be the only place that
+    // verified a signer, so the content frame had to take its proof from here; the proof now
+    // arrives on the frame beside the bytes it signs and is verified before this is ever called.
+    // Returning a second copy would give the caller two answers to one question, and the day they
+    // disagreed the caller would have picked whichever it read first.
   ): {
     seq: number | null;
     fatal?: { reason: string };
-    /**
-     * DOD-M15-SEALWIRE-1 bullet 5. Present ONLY on the verified path — the signature checked
-     * against the pubkey inside the sender's own signed bytes, and the signer matched to this
-     * session's counterparty. Absent everywhere else, including the SOFT decode-failure fallback,
-     * so a caller cannot mistake "we did not check" for "it did not verify".
-     */
-    senderPubkey?: Uint8Array;
-    senderSig?: Uint8Array;
-    /**
-     * 024-ORPHANTRIAGE: the key whose signature over `structure1_cbor` VERIFIED, on the one soft
-     * path where it could not be matched to a counterparty because this side has no session record
-     * to match it against.
-     *
-     * ⚠️ **DELIBERATELY NOT `senderPubkey`/`senderSig`.** That pair means *verified AND matched to
-     * this session's counterparty*; the transcript column it feeds is documented as exactly that
-     * ("verified, never claimed") and seal-time attribution rests on it. Returning an unmatched
-     * signer under those names would silently widen a proof the rest of the system reads as
-     * stronger. This one carries the weaker fact under its own name, and has exactly one consumer:
-     * the orphan branch, which needs to tell an operator whether anything at all is known about who
-     * sent a message for a conversation that does not exist here.
-     */
-    verifiedSignerUnmatched?: Uint8Array;
   } {
     try {
-      // Structure 1 content_hash is index 1 and sender_pubkey index 2 in BOTH layouts — 020-ACKHASH
-      // appended last_seen_hash at 6 rather than inserting it, so neither read moved. A v2 claim
-      // decodes here exactly as a v1 one does; its hash is not consulted, because this unit ships
-      // reading and not enforcing.
-      const s1 = decodeStructure1(structure1Cbor);
       const s2 = decode(structure2Cbor) as unknown[];
-      const s1Hash = s1.ok ? s1.fields.contentHash : undefined;
-      const s1Pubkey = s1.ok ? s1.fields.senderPubkey : undefined;
       const seq = typeof s2?.[0] === "number" ? s2[0] : -1;
       const s2Sig = s2?.[3];
-      if (!(s1Hash instanceof Uint8Array) || !(s1Pubkey instanceof Uint8Array) || !(s2Sig instanceof Uint8Array) || seq < 1) {
+      if (!(s2Sig instanceof Uint8Array) || seq < 1) {
         // SOFT: we could not read the record, so we learned nothing about the signer either way.
         // Position falls back to the witness stream, exactly as an absent record does.
         // The Structure 1 reason is carried so an unreadable RECORD and an unnamed LAYOUT are
         // distinguishable in the log — they arrive at the same soft outcome by different routes.
+        const s1Layout = decodeStructure1(structure1Cbor);
         this.#logger.warn("session.content.ordering.malformed", {
           sessionId,
           correlationId,
-          ...(s1.ok ? {} : { structure1Reason: s1.reason }),
+          ...(s1Layout.ok ? {} : { structure1Reason: s1Layout.reason }),
         });
         return { seq: null };
       }
-      // The framed ordering record must bind to THIS content (its hash) — else it orders the wrong bytes.
-      const contentHashHex = Buffer.from(contentHash).toString("hex");
-      if (Buffer.from(s1Hash).toString("hex") !== contentHashHex) {
-        // SOFT: the record does not describe this content. Nothing is proven about the signer's
-        // identity — only that this record and these bytes do not belong together.
-        this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
+      /**
+       * `DOD-M15-AUTHORSHIP-ABSENT-1` — the same verifier the content frame uses, handed the
+       * signature the RELAY committed (`structure2_cbor` index 3) instead of the one the frame
+       * carries. Two claims about the same message, and both must hold: if the relay's copy of the
+       * sender's signature does not verify against the bytes on the frame, one of them has been
+       * altered in flight.
+       *
+       * The verdicts map to this path's own severities, which are NOT the content frame's:
+       * an `unusable` record leaves POSITION unknown and is soft here, because position may always
+       * fall back to the witness stream. Identity is the half that may never be soft, and it is
+       * established before this is called.
+       */
+      const auth = this.#verifyAuthorshipClaim(agentName, sessionId, structure1Cbor, s2Sig, contentHash);
+      if (auth.verdict === "unusable") {
+        if (auth.reason === AUTHORSHIP_CONTENT_HASH_MISMATCH) {
+          // SOFT: the record does not describe this content. Nothing is proven about the signer's
+          // identity — only that this record and these bytes do not belong together.
+          this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
+        } else {
+          this.#logger.warn("session.content.ordering.malformed", {
+            sessionId, correlationId, structure1Reason: auth.reason,
+          });
+        }
         return { seq: null };
       }
-      // Verify the SENDER's Ed25519 signature over the exact signed bytes (structure1_cbor) — the same
-      // check the relay performs. Proves the counterparty committed to this (content_hash @ sequence).
-      if (!verify(s1Pubkey, structure1Cbor, s2Sig)) {
+      if (auth.verdict === "refuted" && auth.reason === "bad_signature") {
         // FATAL. The sender supplied a signature and it does not verify against the key inside its
         // own record. That is not an absence we could not resolve — it is a proof that failed.
         this.#logger.warn("session.content.ordering.bad_signature", { sessionId, correlationId });
@@ -15138,55 +15376,23 @@ export class SessionNodeManager {
       // key. FAIL CLOSED (review L) — if the counterparty pubkey is unknown we cannot prove the signer,
       // so we do NOT trust the framed ordering record (fall back to the witness stream / arrival). The
       // "B does not trust the counterparty for ordering" invariant is non-negotiable; never fail open.
-      // Review M1: compare BYTES, not hex strings — `counterparty_pubkey` is stored verbatim from the
-      // IPC param and is never case-normalized, so a string compare would fail for a mixed-case
-      // pubkey and silently strip the canonical ordering from every message in that session.
-      const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-      if (!pubkeyMatchesHex(s1Pubkey, counterparty)) {
+      if (auth.verdict !== "verified") {
         /**
-         * FATAL when the counterparty is KNOWN and the signer is someone else. SOFT when we simply
-         * do not know who the counterparty is.
+         * FATAL when the counterparty is KNOWN and the signer is someone else (`refuted`). SOFT when
+         * we simply do not know who the counterparty is (`verified_unmatched`) — the reasoning for
+         * both, and the MITM substitution this catches, lives on `#verifyAuthorshipClaim`.
          *
-         * The fatal half is the session-open MITM detection from the 2026-08-21 T-of-N
-         * investigation, which found this check *"fires correctly, and its answer is thrown away."*
-         * A rogue quorum of the directories holding shares for agent B can sign a false
-         * SessionAssignment naming M's key as B's, and everything downstream is genuinely real —
-         * M signs with M's own valid key. Nothing is missing for A to notice. This comparison is
-         * where the substitution shows, because `counterparty_pubkey` comes from A's own request
-         * and is untouched by anything the directory returns.
-         *
-         * ⚠️ IT SHOWS ONLY WHEN THE RECORD IS PRESENT (review F3). An earlier version of this
-         * comment said this was "the one place the substitution shows", full stop — and that
-         * asserted a property the code does not have: M can decline to supply an ordering record
-         * and be ingested without ever reaching this line. The caller logs
-         * `session.content.ordering.absent` so the weaker case is at least visible, and closing it
-         * needs a check that does not depend on the sender's cooperation — the relay's independent
-         * copy, `DOD-M15-CORROBORATE-1`.
-         *
-         * The soft half stays soft deliberately: `counterparty_unknown` means we cannot prove the
-         * signer either way, and refusing there would strand sessions whose record we failed to
-         * read rather than sessions that are under attack.
+         * The soft half is the one that matters HERE: `counterparty_unknown` means we cannot prove
+         * the signer either way, so we decline to take a POSITION from a record we cannot attribute,
+         * and the caller falls back to the witness stream. Nothing about the message is refused on
+         * this path — that decision was already made, on the frame's own proof.
          */
-        const reason = counterparty ? "signer_not_counterparty" : "counterparty_unknown";
+        const reason = auth.verdict === "refuted" ? auth.reason : "counterparty_unknown";
         this.#logger.warn("session.content.ordering.wrong_signer", { sessionId, reason, correlationId });
-        /**
-         * 024-ORPHANTRIAGE — THE VERIFIED SIGNER SURVIVES THE SESSION LOOKUP NOW.
-         *
-         * The `verify(...)` three lines above has already passed: whoever produced this record holds
-         * the private key for the key inside their own signed bytes. That is session-independent —
-         * it needs no `sessions` row and never did. The soft branch then threw it away, so the
-         * orphan branch downstream had nothing to go on and told the operator to go and talk to
-         * whoever sent it.
-         *
-         * Carried out only on the `counterparty_unknown` half. The fatal half needs nothing: the
-         * session freezes and no triage runs.
-         */
-        return counterparty
-          ? { seq: null, fatal: { reason } }
-          : { seq: null, verifiedSignerUnmatched: s1Pubkey };
+        return auth.verdict === "refuted" ? { seq: null, fatal: { reason } } : { seq: null };
       }
       // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
-      this.recordWitnessedSequence(agentName, sessionId, contentHashHex, seq - 1);
+      this.recordWitnessedSequence(agentName, sessionId, Buffer.from(contentHash).toString("hex"), seq - 1);
       this.#logger.info("session.content.ordering.recorded", {
         sessionId,
         canonicalSeq: seq - 1,
@@ -15194,18 +15400,15 @@ export class SessionNodeManager {
         correlationId,
       });
       /**
-       * DOD-M15-SEALWIRE-1 bullet 5: return the VERIFIED proof, not just the position.
+       * THE POSITION, AND ONLY THE POSITION — `DOD-M15-AUTHORSHIP-ABSENT-1`.
        *
-       * Three lines above, `verify(s1Pubkey, structure1Cbor, s2Sig)` has already passed and the
-       * signer has been matched to this session's counterparty. That is the strongest statement
-       * this daemon ever makes about who wrote a message — and until now it was made, used to
-       * decide a sequence number, and then discarded. The transcript row that outlives it recorded
-       * only a direction.
-       *
-       * Returned rather than stashed, for the same reason `seq` is: a caller that has to go looking
-       * for it in a side map is a caller that will not.
+       * `DOD-M15-SEALWIRE-1` bullet 5 had this return the verified proof as well, because this was
+       * the only place a signer was ever checked and the transcript row needed it from somewhere.
+       * The frame now carries the sender's signature beside the bytes it signs and the caller
+       * verifies it before calling this at all, so the proof reaches the transcript from there. What
+       * this answers is the question it is named for: WHERE the relay says this message sits.
        */
-      return { seq: seq - 1, senderPubkey: s1Pubkey, senderSig: s2Sig };
+      return { seq: seq - 1 };
     } catch (err: unknown) {
       this.#logger.warn("session.content.ordering.decode_failed", {
         sessionId,
@@ -15504,6 +15707,12 @@ export class SessionNodeManager {
       // different fact, and it is now refused.
       const s1Cbor = frame["structure1_cbor"];
       const s2Cbor = frame["structure2_cbor"];
+      /**
+       * `DOD-M15-AUTHORSHIP-ABSENT-1` — the sender's own signature, carried BESIDE the bytes it
+       * signs, exactly as `hash_submit` has always carried it. This field is why identity no longer
+       * depends on the relay: it arrives whether or not a relay witnessed the message.
+       */
+      const senderSig = frame["sender_signature"];
       let framedSeq: number | null = null;
       /**
        * DOD-M15-SEALWIRE-1 bullet 5. Set ONLY when the ordering record verified — the signature
@@ -15519,36 +15728,73 @@ export class SessionNodeManager {
        * session record exists, so this stays `undefined` and nothing reads it.
        */
       let verifiedSignerUnmatched: Uint8Array | undefined;
-      if (s1Cbor instanceof Uint8Array && s2Cbor instanceof Uint8Array) {
+      /**
+       * ─── NO PASSPORT, NO ENTRY — `DOD-M15-AUTHORSHIP-ABSENT-1` ───────────────────────────────
+       *
+       * ⚠️ **THIS COMMENT USED TO SAY THE OPPOSITE, AND THE SENTENCE IT REPLACES IS THE DEFECT.**
+       * It read: *"it means the per-message signer check is **opt-in for the sender** — a party that
+       * passed the peer gate and wants to avoid the comparison simply omits the proof."* That was an
+       * accurate description of the code, which is why it is rewritten here rather than deleted: it
+       * is the sentence a reader with a coding agent finds, and it must now describe what the code
+       * does. A frame that supplies nothing checkable is REFUSED. Omitting the proof buys the sender
+       * nothing except a message that does not arrive.
+       *
+       * The old reasoning was sound as far as it went — the signature was only ever DELIVERED inside
+       * the relay's Structure 2, so refusing on its absence would have made the relay a precondition
+       * for reading mail. It stopped one field short: the signature travels beside the bytes it
+       * signs now, on every content frame, so identity no longer needs the relay and position still
+       * does not require identity.
+       *
+       * ⚠️ REFUSED, NOT FROZEN. A frozen session is only cleared by opening a new one, and the
+       * overwhelmingly likely cause of an absent proof is a counterparty on an older build. The
+       * freeze is for a proof that FAILED (below, and in `#recordFrameOrdering`) — a positive fact
+       * about their key.
+       */
+      if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
+        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", {
+          // WHICH half is missing. A sender on an older build supplies neither; a stripped frame is
+          // likelier to be missing one, and an investigator should not have to guess which.
+          hasStructure1: s1Cbor instanceof Uint8Array,
+          hasSenderSignature: senderSig instanceof Uint8Array,
+        }, correlationId);
+        return;
+      }
+      const authorship = this.#verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
+      if (authorship.verdict === "refuted") {
+        await this.#freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
+        return;
+      }
+      if (authorship.verdict === "unusable") {
+        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", {
+          detail: authorship.reason,
+        }, correlationId);
+        return;
+      }
+      if (authorship.verdict === "verified") {
+        verifiedAuthorship = { senderPubkey: authorship.senderPubkey, senderSig: authorship.senderSig };
+      } else {
+        verifiedSignerUnmatched = authorship.senderPubkey;
+      }
+      if (s2Cbor instanceof Uint8Array) {
         const ordering = this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
         if (ordering.fatal) {
           await this.#freezeOnIdentityFailure(agentName, sessionId, ordering.fatal.reason, correlationId);
           return;
         }
         framedSeq = ordering.seq;
-        if (ordering.senderPubkey !== undefined && ordering.senderSig !== undefined) {
-          verifiedAuthorship = { senderPubkey: ordering.senderPubkey, senderSig: ordering.senderSig };
-        }
-        verifiedSignerUnmatched = ordering.verifiedSignerUnmatched;
       } else {
         /**
-         * Review F3 — THE WEAKER GUARANTEE MUST NOT BE INDISTINGUISHABLE FROM THE STRONGER ONE.
+         * POSITION IS THE ONLY THING THAT CAN BE ABSENT NOW, and this event is about position.
          *
-         * A frame with no ordering record is still ingested, and that is correct: it is the
-         * documented relay-degraded path, and refusing it would make the relay a precondition for
-         * reading mail. But it means the per-message signer check is **opt-in for the sender** — a
-         * party that passed the peer gate and wants to avoid the comparison simply omits the proof.
-         * Silently, until now: nothing recorded that a message arrived unverified, so the log looked
-         * identical to one where every message had been checked.
-         *
-         * Not fatal, and deliberately not: an absent record proves nothing about the signer, and
-         * refusing on an absence would strand every relay-degraded session. What closes the omission
-         * case is relay-side corroboration — `DOD-M15-CORROBORATE-1` — where the relay holds the
-         * sender's signed hash independently and never routes it through this daemon.
+         * It fires on the relay-degraded path, where the sender had no witnessed record to stamp
+         * on. The message is ingested — its author is proven, above, by the frame's own signature —
+         * and only its place in the canonical sequence falls back to the witness stream. Refusing
+         * here would make the relay a precondition for reading mail, which is the thing this unit
+         * was careful NOT to do.
          */
         this.#logger.info("session.content.ordering.absent", {
           agentName, sessionId, correlationId,
-          impact: "this frame carried no signed ordering record, so its SIGNER was not verified for this message — it was ingested on the strength of the authenticated transport alone",
+          impact: "this frame carried no relay ordering record, so its POSITION in the canonical sequence is not known from the frame and falls back to the witness stream. Its AUTHOR was verified from the frame's own signature.",
         });
       }
       // AC-001: carry the sender's correlationId from the frame into the receive
