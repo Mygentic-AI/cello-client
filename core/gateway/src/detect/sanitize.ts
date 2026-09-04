@@ -10,6 +10,11 @@
  * RE2 engine (no native RegExp — ReDoS). The RE2 binding is a pending decision, so that step is
  * not wired here yet; this module exposes the sanitized text + notes that the pattern matcher and
  * the M9-IN-002 scanner will consume.
+ *
+ * THREE texts come out, and which one a caller takes is a security decision. `text` is the delivered
+ * form (everything applied). `decodedForScan` is that plus encodings decoded, for detection only.
+ * `scriptScanText` is the text as WRITTEN with only invisibles removed — the language screen's
+ * input, because confusables normalization destroys the very evidence that screen reads.
  */
 import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 
@@ -25,6 +30,40 @@ export interface SanitizationNote {
 export interface SanitizeResult {
   /** The DELIVERED text: invisible-strip + confusables + special-token strip. Empty on `blocked`. */
   text: string;
+  /**
+   * The text as it was WRITTEN, with only invisibles stripped — for the LANGUAGE screen, which asks
+   * a question `text` can no longer answer. Empty on `blocked`.
+   *
+   * `normalizeConfusables` rewrites every Cyrillic/Greek letter that has a Latin lookalike, so by
+   * the time `text` exists the script composition of the original is gone: a jailbreak measured live
+   * on 2026-09-04 arrived 165/165 Cyrillic and reached the screen as 123 Latin / 42 Cyrillic — a
+   * 0.255 share, under the 0.5 bar — and was delivered. Normalization is doing its job; the defect
+   * was feeding its output to a check that needed its input.
+   *
+   * The rule for what this text has had done to it: **remove anything that distorts a letter count,
+   * keep everything that carries script identity.** Three things distort the count, and all three
+   * are handled before capture —
+   *
+   *  - **invisibles**, because `scriptOf` buckets variation selectors and Tag characters as letters,
+   *    so a sender can pad with codepoints nobody can see;
+   *  - **special-token markers**, because `stripSpecialTokens` deletes them from the DELIVERED text —
+   *    they are dilution letters the recipient never sees, so they cost the attacker nothing
+   *    (28 `[SYSTEM]`s dropped the live jailbreak under the bar and it was delivered verbatim);
+   *  - **compatibility forms**, because `scriptOf` reads fullwidth and math-alphanumeric Latin as a
+   *    non-Latin script, which held ordinary English typed on a CJK-locale IME.
+   *
+   * VISIBLE Latin padding still dilutes, and that is left alone deliberately: it stays in the
+   * delivered message, so the recipient can see the text they were sent. The distinction this text
+   * draws is not "attacker input" versus "clean" — it is between letters the agent will read and
+   * letters that vanish before the agent reads anything.
+   *
+   * Neither NFKC nor the marker strip touches Cyrillic/Greek lookalikes — those are separate
+   * characters, not compatibility forms — so the cross-script evidence survives both.
+   *
+   * Nothing else consumes this. The pattern scanner, the special-token strip, the semantic
+   * classifier and the delivered form all read the confusables-normalized `text`.
+   */
+  scriptScanText: string;
   /**
    * The delivered text with encodings additionally decoded — for DETECTION ONLY (the pattern
    * matcher / entropy). Never delivered to the agent: decoding %XX / &#..; / \x.. in a legitimate
@@ -222,6 +261,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   if (content.length > maxBytes) {
     return {
       text: "",
+      scriptScanText: "",
       decodedForScan: "",
       notes: [],
       entropySuspicion: 0,
@@ -238,6 +278,21 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   const inv = stripInvisible(text);
   if (inv.removed > 0) notes.push({ step: "invisible_strip", detail: "stripped invisible/smuggled-Unicode codepoints", count: inv.removed });
   text = inv.text;
+
+  // The language screen's input: everything that can distort a LETTER COUNT is removed, and the one
+  // thing that carries the answer — cross-script identity — is left alone. See `scriptScanText`.
+  //
+  // NFKC folds compatibility forms (fullwidth, math-alphanumeric) back to plain Latin; without it
+  // ordinary English off a CJK-locale IME reads as a non-Latin script and gets held. The marker
+  // strip runs because markers are dilution letters the recipient never sees — `stripSpecialTokens`
+  // deletes them from the delivered text, so an attacker spends them for free. Neither step touches
+  // Cyrillic/Greek lookalikes: those are separate characters, not compatibility forms, so the
+  // evidence this screen exists to read survives both.
+  //
+  // `normalizeConfusables` below keeps its OWN NFKC and still takes the un-folded `text` — its
+  // `changed`/`count` are reported against what arrived, and passing it pre-folded text would drop
+  // NFKC-only changes out of the redact note.
+  const scriptScanText = stripSpecialTokens(text.normalize("NFKC")).text;
 
   const conf = normalizeConfusables(text);
   if (conf.changed) notes.push({ step: "confusables", detail: "normalized lookalike characters to their base form", count: conf.count });
@@ -257,5 +312,5 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   const entropySuspicion = scoreEntropy(decodedForScan);
   if (entropySuspicion > 0) notes.push({ step: "entropy", detail: "high-entropy encoded-blob segment(s) detected", count: entropySuspicion });
 
-  return { text, decodedForScan, notes, entropySuspicion };
+  return { text, scriptScanText, decodedForScan, notes, entropySuspicion };
 }

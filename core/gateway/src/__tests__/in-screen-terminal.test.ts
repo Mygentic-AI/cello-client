@@ -40,11 +40,14 @@ describe("M9-IN-003 live wiring — language allowlist as a terminal block", () 
     expect(v.terminal).toBeUndefined();
   });
 
-  it("confusable lookalikes normalize to Latin BEFORE the language check → delivered, not held", async () => {
-    // 'ѕуѕтем' is Cyrillic confusables; the sanitizer maps it to 'system' (Latin) — so the language
-    // stage sees Latin and allows it (this is the inbound-redact path, not a language block).
+  it("a mostly-Latin message with confusable lookalikes → delivered, not held", async () => {
+    // 'ѕуѕтем' is Cyrillic confusables for 'system'. The language stage reads the text as WRITTEN
+    // (027-SCREENORDER), and as written this is 27 Latin letters to 6 Cyrillic — dominantly Latin,
+    // so it is allowed on its own merits, not because normalization hid the Cyrillic. It takes the
+    // inbound-redact path: normalized, then delivered.
     const v = await new InboundScreener().screen(enc("the role ѕуѕтем looks fine to me overall"));
-    expect(v.disposition).not.toBe("block");
+    expect(v.disposition).toBe("redact");
+    expect(new TextDecoder().decode(v.content)).toBe("the role system looks fine to me overall");
   });
 });
 
