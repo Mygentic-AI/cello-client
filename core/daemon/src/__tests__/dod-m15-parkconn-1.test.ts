@@ -111,6 +111,29 @@ describe("A: #open stops eating the dial failure", () => {
     expect(String(open!.context["dialOutcome"])).toBe("all_addresses_failed");
   });
 
+  it("A2b: NO relay address configured is its own cause, not 'every address failed'", async () => {
+    // Review: deleting the `no_address_configured` arm left the ternary yielding
+    // `all_addresses_failed`, so the log claimed "every relay address failed to dial" about ZERO
+    // addresses — a confident sentence about something that never happened. No test passed `[]`.
+    const { logger, events } = makeLogger();
+    const client = new ContentParkClient({ relayPeerId: RELAY_PEER, relayAddrs: [], logger });
+    let dials = 0;
+    const node = fakeNode({
+      dial: async () => { dials++; },
+      newStream: async () => { throw noConnection(); },
+    });
+
+    const err = await client
+      .deposit(node, { recipientPubkey: randomBytes(32), contentHash: randomBytes(32), sessionId: randomBytes(16), ciphertext: randomBytes(8) })
+      .then(() => null, (e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ContentParkUnreachableError);
+    expect(dials, "with no address there is nothing to dial").toBe(0);
+    const open = events.find((e) => e.event === "content.park.open.failed");
+    expect(String(open!.context["dialOutcome"])).toBe("no_address_configured");
+    expect(String(open!.context["impact"])).toContain("no relay address was configured");
+  });
+
   it("A2: a dial SUCCEEDS and the connection is gone anyway → recorded as a different cause", async () => {
     const { logger, events } = makeLogger();
     const client = new ContentParkClient({ relayPeerId: RELAY_PEER, relayAddrs: [ADDR_A, ADDR_B], logger });
@@ -130,7 +153,19 @@ describe("A: #open stops eating the dial failure", () => {
     expect(String(open!.context["dialOutcome"])).toBe("dialed_then_lost");
   });
 
-  it("A3: a dial fails and the stream opens anyway → still a non-event", async () => {
+  /**
+   * ⚠️ **A GUARD, NOT COVERAGE — and it FAILS THE REVERT TEST, which is why the name says so.**
+   *
+   * Every assertion below passes on the tree BEFORE this unit: the old `#open` emitted no
+   * `content.park.open.failed` at all, both addresses were already dialled, and `ok` was already
+   * false. So it proves nothing about the fix. It is here to stop the fix growing louder later —
+   * the natural next change is to report the dial failures unconditionally, and that would make a
+   * dial nobody needed into an error line an operator has to dismiss.
+   *
+   * Recorded explicitly because a passing test sitting beside a fix reads as proof of the fix, and
+   * this one is not.
+   */
+  it("A3 (guard, not coverage — passes pre-fix by construction): a dial fails and the stream opens anyway → still a non-event", async () => {
     const { logger, events } = makeLogger();
     const client = new ContentParkClient({ relayPeerId: RELAY_PEER, relayAddrs: [ADDR_A, ADDR_B], logger });
     const dialed: string[] = [];
@@ -280,6 +315,88 @@ describe("B: the deposit handler refuses like its siblings", () => {
     // Guessing an agent would report a cause about the WRONG one — a confident wrong answer.
     expect(res.cause).toBe("unknown_agent");
     expect(res.guidance).toContain("senderAgentName");
+  });
+
+  /**
+   * D — **ONE STREAM FAILURE IS SIX FAULTS, AND ONLY TWO ARE ABOUT REACHING THE RELAY** (review
+   * HIGH-1).
+   *
+   * `#open` wraps every `newStream` rejection, so the handler received `invalid_peer_id` (a
+   * malformed ARGUMENT), `node_stopped` (THIS daemon's transport) and `protocol_not_supported` (the
+   * connection worked; the relay does not speak content-park) and told the operator, for all three,
+   * that the relay could not be reached and to retry once it is up. That is the substitution this
+   * milestone is named for, minted at the mapping site this unit added.
+   */
+  const unreachable = (reason: string) =>
+    new ContentParkUnreachableError({ reason, relayPeerId: RELAY_PEER, dialFailures: [], cause: `transport said ${reason}` });
+
+  it.each([
+    ["no_connection", "relay_unreachable:no_connection", "retry once the relay is up", "Retry once the relay is up"],
+    ["connection_lost", "relay_unreachable:connection_lost", "retry once the relay is up", "Retry once the relay is up"],
+    ["invalid_peer_id", "relay_address_invalid", "the argument, not the network", "retrying will not help"],
+    ["node_stopped", "daemon_transport_stopped", "this daemon, not the relay", "This is local"],
+    ["protocol_not_supported", "relay_protocol_unsupported", "version skew, not an outage", "version skew"],
+    ["limited_connection_refused", "relay_limited_connection", "a defect on this side", "defect on this side"],
+    ["something_new", "park_stream_failed:something_new", "no reachability claim for an unknown reason", "specific remedy"],
+  ])("D: %s → %s (%s)", async (transportReason, expectedReason, _why, guidanceSubstring) => {
+    const { handlers } = handlersFor(async () => { throw unreachable(transportReason); });
+
+    const res = (await handlers.get("content_park_deposit")!(params, "c1")) as { ok?: boolean; reason?: string; guidance?: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe(expectedReason);
+    expect(res.guidance).toContain(guidanceSubstring);
+    // The three non-reachability faults must NOT be dressed as one.
+    if (!expectedReason.startsWith("relay_unreachable")) {
+      expect(res.reason, "a non-reachability fault must not carry the reachability label").not.toContain("relay_unreachable");
+      expect(res.guidance, "…nor the reachability remedy").not.toContain("Retry once the relay is up");
+    }
+  });
+
+  it("D8: a malformed /p2p/ segment is refused BEFORE a dial, not reported as an unreachable relay", async () => {
+    // Defence in depth on the cheapest fault: `parseRelayPeer` accepted anything after `/p2p/`, so a
+    // truncated paste only failed four layers down in `newStream`.
+    let dialed = false;
+    const { handlers } = handlersFor(async () => { dialed = true; return { ok: true }; });
+
+    const res = (await handlers.get("content_park_deposit")!(
+      { ...params, relayMultiaddr: "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWDQJ8" },
+      "c1",
+    )) as { ok?: boolean; reason?: string; guidance?: string };
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("missing_params");
+    expect(res.guidance).toContain("/p2p/");
+    expect(dialed, "nothing is dialled for an address that cannot name a peer").toBe(false);
+  });
+
+  it("B4: EVERY refusal is logged, not only the two that reach the relay", async () => {
+    // Review MEDIUM-3: eleven exits returned in silence, including `agent_not_found` and
+    // `session_not_found` — both live spine-failure shapes. This is the same hole 019-PARKERROR
+    // fell into, in this very handler, for a different reason.
+    for (const [label, p] of [
+      ["missing_params", { ...params, contentHash: "zz" }],
+      ["conflicting_params", { ...params, content: "aabb" }],
+      ["unknown_content_hash_alg", { ...params, ciphertext: undefined, content: "aabb", contentHashAlg: "sha3-nope" }],
+    ] as const) {
+      const { handlers, events } = handlersFor(async () => ({ ok: true }));
+      const res = (await handlers.get("content_park_deposit")!(p as Record<string, unknown>, "c1")) as { ok?: boolean; reason?: string };
+      expect(res.ok, label).toBe(false);
+      const lines = events.filter((e) => e.event === "content.park.deposit.ipc.result");
+      expect(lines, `${label} must be logged`).toHaveLength(1);
+      expect(lines[0]!.context["ok"]).toBe(false);
+      expect(lines[0]!.context["reason"]).toBe(res.reason);
+      // Correlatable: the line names WHICH deposit, read off the caller's own params.
+      expect(lines[0]!.context["relayMultiaddr"]).toBe(ADDR_A);
+    }
+  });
+
+  it("B5: the relay's retryAfterMs reaches the log, not only the response", async () => {
+    // Review LOW-8: DOD-M15-RELAYABUSE-1 went to some length to give that number a reader; an
+    // aggregated log that drops it cannot say when a throttled deposit clears.
+    const { handlers, events } = handlersFor(async () => ({ ok: false, reason: "rate_limited", retryAfterMs: 45_000 }));
+    await handlers.get("content_park_deposit")!(params, "c1");
+    expect(events.filter((e) => e.event === "content.park.deposit.ipc.result")[0]!.context["retryAfterMs"]).toBe(45_000);
   });
 
   it("B3: a refusal the relay ITSELF returned is still passed through unchanged", async () => {

@@ -383,7 +383,10 @@ export class ContentParkClient {
           dialOutcome === "all_addresses_failed"
             ? "every relay address failed to dial, so there was no connection for the stream to use — the dial errors above are the cause, not the missing connection"
             : dialOutcome === "dialed_then_lost"
-              ? "a dial SUCCEEDED and the connection was gone again by the time the stream was opened — re-dialling this relay is not the remedy"
+              // Review LOW-7: state the FACT, not a prescription. "re-dialling is not the remedy"
+              // generalised from one sample, and a connection lost right after a successful dial is
+              // often exactly a re-dial case.
+              ? "a dial SUCCEEDED and the connection was gone by the time the stream was opened — the loss is AFTER the dial, so the question is what closed it, not whether the relay is reachable"
               : "no relay address was configured for this content-park client, so no dial was attempted at all",
       });
       throw new ContentParkUnreachableError({
