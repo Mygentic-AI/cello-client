@@ -805,8 +805,21 @@ export interface RefusalNotice {
    * OMITTED, never guessed, when the notice is served from the in-memory fallback — that path
    * exists precisely because the database write failed, so no durable total was ever written, and
    * reporting the smaller number twice would put the original lie back with two names on it.
+   *
+   * MUTUALLY EXCLUSIVE with `timesTotalAtLeast`: a figure and a floor are different claims and
+   * must not share a name.
    */
   timesTotal?: number;
+  /**
+   * A LOWER BOUND on the lifetime count, for a row SEEDED at upgrade from a notice that already
+   * existed — review F1c.
+   *
+   * The seed is that notice's `count`, which is refusals since the last dismissal, so the true
+   * figure is at least this and may be far more: on the machine this unit was written for, the
+   * notice read 58 and the log held 232,056 refusal events. Reporting 58 as `timesTotal` would be
+   * the original defect with the new name on it. "At least 58" is true; "58" is not.
+   */
+  timesTotalAtLeast?: number;
   repeat?: boolean;
 }
 
@@ -2997,8 +3010,51 @@ export class SessionNodeManager {
         total INTEGER NOT NULL,
         first_at INTEGER NOT NULL,
         last_at INTEGER NOT NULL,
+        -- 1 when this row was SEEDED from an existing notice at upgrade rather than counted from
+        -- the first refusal. Its total is then a LOWER BOUND, not a figure, and the drain reports
+        -- it under a different field name so a reader cannot mistake one for the other.
+        seeded INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (agent_id, session_id, reason)
       )
+    `);
+    /**
+     * ⚠️ **THE BACKFILL, and without it this unit ships the original lie with the new name on it.**
+     *
+     * Review finding 1. A new table is created EMPTY. Every daemon that already has refusal notices
+     * — including the one that produced this incident, whose notice sat at 58 — would report
+     * `times_since_dismissed: 59` beside a `times_total` of **1**, on the very field the guidance
+     * tells an operator to judge severity by. Smaller than the number it exists to dwarf.
+     *
+     * `count` is the best figure available at upgrade and it is a LOWER BOUND: dismissals before
+     * this build deleted history nothing can recover. So the row is marked `seeded` and reported as
+     * "at least", never as a total. A lower bound is a true statement; `total = 1` is not.
+     *
+     * `INSERT OR IGNORE` makes it idempotent and self-healing — it fills only rows that do not
+     * exist, so a real counted total is never overwritten by a seeded one, and running it at every
+     * boot costs one indexed scan of a table bounded by (sessions × reasons).
+     */
+    /**
+     * ⚠️ **AND `CREATE TABLE IF NOT EXISTS` IS A NO-OP AGAINST A TABLE THAT ALREADY EXISTS** —
+     * review F1b, and it is the same hazard `DOD-M12B-INDEX-1` records for `held_content.origin`
+     * three hundred lines above.
+     *
+     * The table shipped one commit earlier WITHOUT `seeded`, and that build ran on a real daemon to
+     * take this unit's live measurement. On that machine the `CREATE` does nothing, the backfill
+     * below names a column that is not there, and the throw comes out of schema init — **the daemon
+     * does not open at all.** The one machine that most needs the backfill is the one it would have
+     * bricked.
+     */
+    try {
+      this.#db.exec("ALTER TABLE content_refusal_totals ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/duplicate column name/i.test(msg)) throw err;
+    }
+    this.#db.exec(`
+      INSERT OR IGNORE INTO content_refusal_totals
+        (agent_id, session_id, reason, total, first_at, last_at, seeded)
+      SELECT agent_id, session_id, reason, count, first_at, last_at, 1
+        FROM content_refusal_notices
     `);
     /**
      * DOD-M15-REFUSALTERMINAL-1 — content this agent will never accept, so the daemon stops going
@@ -9174,9 +9230,13 @@ export class SessionNodeManager {
        */
       this.#db
         .prepare(
+          // `seeded` stays whatever the row already has. A row seeded at upgrade remains a LOWER
+          // BOUND for the life of that (session, reason) — counting forward from an incomplete
+          // figure does not recover the refusals dismissal already erased, and clearing the flag
+          // would turn "at least 58" into a claimed total of 59.
           `INSERT INTO content_refusal_totals
-             (agent_id, session_id, reason, total, first_at, last_at)
-           VALUES (?, ?, ?, 1, ?, ?)
+             (agent_id, session_id, reason, total, first_at, last_at, seeded)
+           VALUES (?, ?, ?, 1, ?, ?, 0)
            ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
              total = total + 1, last_at = excluded.last_at`,
         )
@@ -9354,7 +9414,7 @@ export class SessionNodeManager {
           ? this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total
+                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
@@ -9370,7 +9430,7 @@ export class SessionNodeManager {
           : this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total
+                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
@@ -9386,7 +9446,7 @@ export class SessionNodeManager {
       ) as Array<{
         session_id: string; reason: string; kind: string; impact: string;
         guidance: string; count: number; seen_count: number | null;
-        lifetime_total: number | null;
+        lifetime_total: number | null; lifetime_seeded: number | null;
       }>;
       if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
       for (const row of rows) {
@@ -9420,11 +9480,19 @@ export class SessionNodeManager {
           guidance: row.guidance,
           timesSinceDismissed: row.count,
           /**
-           * DOD-M15-REFUSALTERMINAL-1. `null` here means the totals row is genuinely absent — a
-           * notice written before this table existed — and is reported as ABSENT rather than as the
-           * smaller number, which is the substitution this unit exists to remove.
+           * DOD-M15-REFUSALTERMINAL-1 — three states, and they are three different claims.
+           *
+           * A counted total is a FIGURE. A seeded row is a FLOOR, and says so by using a different
+           * field name (review F1c). `null` means no totals row at all, which after the upgrade
+           * backfill can only happen when the notice write itself failed — reported as ABSENT
+           * rather than as the smaller number, because substituting it is the defect this unit
+           * exists to remove.
            */
-          ...(row.lifetime_total === null ? {} : { timesTotal: row.lifetime_total }),
+          ...(row.lifetime_total === null
+            ? {}
+            : row.lifetime_seeded === 1
+              ? { timesTotalAtLeast: row.lifetime_total }
+              : { timesTotal: row.lifetime_total }),
           ...(firstTime ? {} : { repeat: true }),
         });
       }

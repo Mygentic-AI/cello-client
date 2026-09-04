@@ -235,6 +235,9 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
          */
         times_since_dismissed: r.timesSinceDismissed,
         ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
+        // A FLOOR, not a figure — a row seeded at upgrade from a notice that already existed. It
+        // gets its own field name so it cannot be read as a count (review F1c).
+        ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
         ...(r.repeat === true ? { repeat: true } : {}),
       })),
       // Say the list was cut ON THE LIST, not only in a log nobody opens — same rule as
@@ -242,16 +245,18 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       ...(truncated ? { refusals_incomplete: true } : {}),
       refusals_guidance:
         header +
-        "\n\nThese are grouped by session_id, and they carry TWO counts. `times_total` is how many " +
-        "messages that reason has refused on that session since the first one — the real scale, and " +
-        "the number to judge severity by. `times_since_dismissed` counts only the refusals since the " +
-        "operator last ran cello_dismiss on that conversation, so it can be small while " +
-        "`times_total` is enormous; dismissing clears the notice, never the cause. If `times_total` " +
-        "is missing, this notice could not be written to disk (see session.refusal.persist.failed) " +
-        "and its true scale is unknown — do not read the smaller number as the total. " +
-        "`repeat: true` means you have been told about this one before and `times_since_dismissed` " +
-        "has grown by an order of magnitude since. TELL THE OPERATOR. A refusal that reaches an " +
-        "agent and stops there is the same silence it was written to end." +
+        "\n\nThese are grouped by session_id, and they carry TWO counts. `times_since_dismissed` " +
+        "counts only the refusals since the operator last ran cello_dismiss on that conversation — " +
+        "dismissing clears the notice, never the cause — so it can be small while the real figure " +
+        "is enormous. Judge severity by the lifetime one instead, which arrives as ONE of these " +
+        "two: `times_total` is an exact count from the first refusal; `times_total_at_least` is a " +
+        "FLOOR, for a conversation whose tally began when this daemon was upgraded, and the true " +
+        "figure may be far higher. If NEITHER is present this notice could not be written to disk " +
+        "(see session.refusal.persist.failed) and its scale is unknown — in that case do not read " +
+        "the smaller number as the total. `repeat: true` means you have been told about this one " +
+        "before and `times_since_dismissed` has grown by an order of magnitude since. " +
+        "TELL THE OPERATOR. A refusal that reaches an agent and stops there is the same silence it " +
+        "was written to end." +
         (truncated
           ? " refusals_incomplete: true means this list hit its cap and there are older ones not shown."
           : ""),
