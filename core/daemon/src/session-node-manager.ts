@@ -783,6 +783,16 @@ export const LEAF_FETCH_GRACE_MS = 2_000;
 export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set(["session_committed"]);
 
 /**
+ * DOD-M15-REFUSALTERMINAL-1 review F3 — how long a FAILED read of the terminal-refusal rows is
+ * backed off for, per session.
+ *
+ * A minute: long enough that a database throwing on every witnessed leaf produces one ERROR rather
+ * than one per message (the exact log growth this unit exists to end), short enough that a disk
+ * which recovers is noticed within a message or two rather than at the next restart.
+ */
+export const TERMINAL_REFUSAL_READ_RETRY_MS = 60_000;
+
+/**
  * DOD-M15-REFUSALTERMINAL-1 — ONE refusal, TWO counts, and the NAMES are the fix.
  *
  * The inbox reported `times: 58` for a refusal that had fired tens of thousands of times, and the
@@ -1424,6 +1434,10 @@ export class SessionNodeManager {
   /** Sessions whose terminal-refusal rows have been read from the database into the map above.
    *  Nothing ever un-marks content, so a loaded set only grows and can never go stale. */
   #terminalRefusalsLoaded = new Set<string>();
+
+  /** DOD-M15-REFUSALTERMINAL-1 review F3: when the load above last FAILED, per session. Bounds the
+   *  retry and the ERROR to once a minute instead of once per witnessed leaf. */
+  #terminalRefusalsReadFailedAt = new Map<string, number>();
 
   /** Test seam: collapse the grace window so a test does not have to wait two real seconds. The
    *  window itself is covered by its own case. */
@@ -9208,6 +9222,22 @@ export class SessionNodeManager {
       if (!this.#db) throw new Error("database is not open");
       const agentId = this.#requireAgentId(agentName);
       const now = Date.now();
+      /**
+       * ⚠️ **BOTH WRITES OR NEITHER — review F6, and the comment this replaces was wrong.**
+       *
+       * It argued that putting the totals insert in the same `try` made the two "fail together".
+       * It does not: each `.run()` autocommits, so the notice could persist and the total throw —
+       * and the `catch` then ALSO writes an in-memory fallback entry for a notice that is already
+       * in the table. The drain unions the two halves without deduplicating on (session, reason),
+       * so the operator would see the same refusal TWICE, once with a lifetime figure and once
+       * without, one of them blaming a disk fault. Before this unit a single statement made that
+       * state impossible; the second statement is what created it.
+       *
+       * `ROLLBACK` is best-effort because SQLite may have aborted the transaction already — the
+       * same shape `agent-id-migration.ts` uses — and it must never mask the original error.
+       */
+      this.#db.exec("BEGIN");
+      try {
       // `count` grows on conflict; impact and guidance are refreshed, because a later refusal of the
       // same reason may know more than the first (the salt branch has four causes and names them).
       this.#db
@@ -9241,6 +9271,11 @@ export class SessionNodeManager {
              total = total + 1, last_at = excluded.last_at`,
         )
         .run(agentId, sessionId, reason, now, now);
+        this.#db.exec("COMMIT");
+      } catch (inner: unknown) {
+        try { this.#db.exec("ROLLBACK"); } catch { /* already aborted by SQLite */ }
+        throw inner;
+      }
     } catch (err: unknown) {
       this.#logger.error("session.refusal.persist.failed", {
         agentName, sessionId, reason,
@@ -10866,7 +10901,21 @@ export class SessionNodeManager {
    */
   #isTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string): boolean {
     const key = this.#k(agentName, sessionId);
-    if (!this.#terminalRefusalsLoaded.has(key) && this.#db) {
+    /**
+     * ⚠️ **A FAILING READ MUST NOT BE RETRIED PER MESSAGE — review F3.**
+     *
+     * The loaded flag is set only on success, so a database that throws (a full disk, a corrupt
+     * page) sent this method back to SQLite on EVERY witnessed leaf, logged an ERROR each time, and
+     * — because nothing was ever cached — made `alreadyKnown` false forever, so the mark's INFO
+     * fired on every refusal too. That is the ~2/s log growth this unit exists to end, reproduced
+     * by its own fix in the failure mode.
+     *
+     * Backed off instead: one attempt per session per minute, so the read still recovers when the
+     * disk does, and the ERROR is bounded rather than proportional to traffic.
+     */
+    const failedAt = this.#terminalRefusalsReadFailedAt.get(key);
+    const backedOff = failedAt !== undefined && Date.now() - failedAt < TERMINAL_REFUSAL_READ_RETRY_MS;
+    if (!this.#terminalRefusalsLoaded.has(key) && !backedOff && this.#db) {
       try {
         const rows = this.#db
           .prepare("SELECT content_hash FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ?")
@@ -10875,12 +10924,17 @@ export class SessionNodeManager {
         if (!set) { set = new Set(); this.#terminallyRefused.set(key, set); }
         for (const r of rows) set.add(r.content_hash);
         this.#terminalRefusalsLoaded.add(key);
+        this.#terminalRefusalsReadFailedAt.delete(key);
       } catch (err: unknown) {
+        this.#terminalRefusalsReadFailedAt.set(key, Date.now());
         this.#logger.error("session.content.terminal_refusal.read.failed", {
           agentName, sessionId,
           error: extractErrorMessage(err),
+          retryInMs: TERMINAL_REFUSAL_READ_RETRY_MS,
           impact:
-            "the record of messages this conversation can never accept could not be read, so this daemon may keep fetching one of them. Nothing is lost; the cost is repeated work and log noise.",
+            "the record of messages this conversation can never accept could not be read, so this daemon may keep fetching one of them. Nothing is lost; the cost is repeated work and log noise. The read is retried once a minute rather than on every message, so this line is bounded — its absence for a while does NOT mean the fault cleared.",
+          guidance:
+            "This is a fault on THIS machine, not with any counterparty. Check free disk space and the permissions on ~/.cello; the error above carries SQLite's own message.",
         });
       }
     }
