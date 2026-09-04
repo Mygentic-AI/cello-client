@@ -47,6 +47,7 @@ import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { normalizeContactPubkey, foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { REFUSAL_KINDS, type RefusalKind } from "./refusal-reasons.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
@@ -2864,6 +2865,21 @@ export class SessionNodeManager {
       )
     `);
 
+    /**
+     * A PUBLIC KEY IS BYTES; ITS HEX CASE IS NOT PART OF ITS IDENTITY.
+     *
+     * ⚠️ **PLACED HERE FOR TWO ORDERING REASONS, and getting either wrong is a crash at boot.** It
+     * touches all three contact-keyed tables, so it runs after the LAST of them exists
+     * (`contact_rename_notices`, directly above); and the merge it performs on a collision keeps the
+     * more restrictive TIER, which it cannot read until `migrateContactsAddTierMetadata` has added
+     * that column.
+     *
+     * Normalizing the accessors alone would be worse than the bug for anyone who already has a
+     * mixed-case row: the row becomes UNREACHABLE rather than merely wrong, taking its block, its
+     * away message and its pet name with it. Idempotent and silent on a clean database.
+     */
+    foldContactPubkeyCase(this.#db, this.#logger);
+
     // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices — one per (agent, session, reason). Written every
     // time an inbound message is refused; read by cello_receive and by the cello_inbox pull. Modelled
     // on contact_rename_notices above and keyed the same way, on agent_id (the stable key) — the map
@@ -3617,7 +3633,7 @@ export class SessionNodeManager {
   /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
   isContact(agentName: string, pubkey: string): boolean {
     if (!this.#db) return false;
-    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_id = ? AND pubkey = ?").get(this.#requireAgentId(agentName), pubkey);
+    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_id = ? AND pubkey = ?").get(this.#requireAgentId(agentName), normalizeContactPubkey(pubkey));
     return row !== undefined;
   }
 
@@ -3634,7 +3650,7 @@ export class SessionNodeManager {
     if (!this.#db) throw new Error(`getTier('${agentName}'): database not initialized`);
     const row = this.#db
       .prepare("SELECT tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
-      .get(this.#requireAgentId(agentName), pubkey) as { tier: number | null } | undefined;
+      .get(this.#requireAgentId(agentName), normalizeContactPubkey(pubkey)) as { tier: number | null } | undefined;
     if (row && row.tier !== null && !isKnownTierValue(row.tier)) {
       // A stored tier outside 0..4 is corruption — surface it. normalizeTier still maps it to the
       // tighter UNKNOWN so the caller is safe, but a silent map would hide a broken row.
@@ -3697,6 +3713,9 @@ export class SessionNodeManager {
    *  at first add, exactly as `added_at`/`moniker` already do; re-adding never downgrades a contact
    *  the operator has since promoted. Raising the tier later is `cello_contact_set_tier`'s job. */
   addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null, tier: number = TIER.UNKNOWN): void {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!pubkey) return;
     // Review F1: a missing DB handle must FAIL the write loudly — returning silently here let
     // the handler log contact.added and report ok:true for a row that never landed.
@@ -3726,6 +3745,9 @@ export class SessionNodeManager {
    *  when no such contact — fail-loud at the caller, never a silent no-op success. Same
    *  validate-throw backstop as addContact. */
   setContactMoniker(agentName: string, pubkey: string, moniker: string | null): boolean {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     // Review F2: false means exactly "no such contact" — a null DB handle throws instead, so the
     // operator is never sent chasing a nonexistent missing-contact problem.
     if (!this.#db) throw new Error(`setContactMoniker('${agentName}'): database not initialized`);
@@ -3754,6 +3776,9 @@ export class SessionNodeManager {
    * contact in order to withhold something from them.
    */
   setContactSignalPref(agentName: string, pubkey: string, signalHash: string, present: boolean | null): void {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) throw new Error(`setContactSignalPref('${agentName}'): database not initialized`);
     const agentId = this.#requireAgentId(agentName);
     if (present === null) {
@@ -3786,6 +3811,9 @@ export class SessionNodeManager {
    * the operator's standing default, never to disclosing something consent has not cleared.
    */
   getContactSignalPrefs(agentName: string, pubkey: string): Map<string, boolean> {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) return new Map();
     const rows = this.#db
       .prepare("SELECT signal_hash, present FROM contact_signal_prefs WHERE agent_id = ? AND contact_pubkey = ?")
@@ -3796,6 +3824,9 @@ export class SessionNodeManager {
   /** DOD-AWAY-TIER-1: set (or clear, with null) a contact's per-contact away message. Returns false
    *  when no such contact — fail-loud at the caller (same contract as setContactMoniker/setContactTier). */
   setContactAwayMessage(agentName: string, pubkey: string, message: string | null): boolean {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) throw new Error(`setContactAwayMessage('${agentName}'): database not initialized`);
     const res = this.#db
       .prepare("UPDATE contacts SET away_message = ? WHERE agent_id = ? AND pubkey = ?")
@@ -3809,6 +3840,9 @@ export class SessionNodeManager {
    *  four-level resolution TOTAL. A pure read; the resolved text is screened on the outbound path by
    *  the caller like any content (SI — it does not bypass the gateway). */
   resolveAwayMessage(agentName: string, pubkey: string): string | null {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) return null;
     const agentId = this.#requireAgentId(agentName);
     const row = this.#db
@@ -3837,6 +3871,9 @@ export class SessionNodeManager {
    *  setContactMoniker). The caller validates the tier is a known constant BEFORE calling; this
    *  stores whatever it is handed (the handler is the validation boundary). */
   setContactTier(agentName: string, pubkey: string, tier: number): boolean {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) throw new Error(`setContactTier('${agentName}'): database not initialized`);
     const res = this.#db
       .prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?")
@@ -3854,6 +3891,9 @@ export class SessionNodeManager {
    *  (AC5). Limitation: last_offered_moniker updates only on the RECEIVING side of an offer, so rename
    *  detection works only for peers who INITIATE to you — a property, not a bug. */
   recordOfferedMoniker(agentName: string, pubkey: string, offered: string): void {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     // Fail CLOSED like getTier/setContactTier: a silent skip here would drop a rename baseline update
     // (and any notice) while the daemon reports healthy — the inbound path always has an open DB.
     if (!this.#db) throw new Error(`recordOfferedMoniker('${agentName}'): database not initialized`);
@@ -3895,6 +3935,9 @@ export class SessionNodeManager {
   /** DOD-RENAME-1: clear a pending rename notice — the operator acted (adopted a name or removed the
    *  contact). Idempotent (no notice → no-op). Fail-closed on a missing DB, like the writes above. */
   clearRenameNotice(agentName: string, pubkey: string): void {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) throw new Error(`clearRenameNotice('${agentName}'): database not initialized`);
     this.#db
       .prepare("DELETE FROM contact_rename_notices WHERE agent_id = ? AND pubkey = ?")
@@ -3903,6 +3946,9 @@ export class SessionNodeManager {
 
   /** M8C-CONTACT-1: known stays known until explicitly removed. */
   removeContact(agentName: string, pubkey: string): boolean {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) return false;
     const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
     // DOD-RENAME-1: a removed contact has no pending rename to resolve.
@@ -3961,6 +4007,9 @@ export class SessionNodeManager {
   /** MONIKER-4: the operator's pet name for a pubkey (whoLabel's top tier), or null. Read-only
    *  and tolerant of a not-yet-open DB (a missing label degrades the doorbell, never blocks it). */
   getContactMoniker(agentName: string, pubkey: string): string | null {
+    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
+    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
+    pubkey = normalizeContactPubkey(pubkey);
     if (!this.#db) {
       // Review F2: the last fully-silent branch in the resolution chain — the label degrades to
       // fingerprint, which is correct, but say so rather than returning null wordlessly.
@@ -9360,9 +9409,11 @@ export class SessionNodeManager {
    * *"An UNKNOWN-tier contact (a mere row) is NOT known."* The tier is read from the row already
    * being fetched, so the case-insensitivity below survives (`getTier` compares case-sensitively).
    *
-   * ⚠️ **HEX CASE IS NOT A DIFFERENCE IN IDENTITY.** `contacts.pubkey` is stored verbatim from the
-   * IPC parameter and is never normalized, so an exact-match lookup would report a contact the
-   * operator can see in `cello_contacts` as an unknown stranger — and quietly downgrade the notice.
+   * ⚠️ **HEX CASE IS NOT A DIFFERENCE IN IDENTITY.** This unit originally worked around that with its
+   * own `lower(pubkey)` lookup, because `contacts.pubkey` was stored verbatim from the IPC parameter
+   * and an exact match would report a contact the operator can SEE in `cello_contacts` as an unknown
+   * stranger. The workaround is gone: `contact-pubkey-case.ts` now normalizes every contacts
+   * accessor and folds the rows already on disk, so there is one spelling and one rule.
    */
   #orphanEvidence(
     agentName: string,
@@ -9404,8 +9455,8 @@ export class SessionNodeManager {
       if (!this.#db) throw new Error("database is not open");
       const agentId = this.#requireAgentId(agentName);
       const contact = this.#db
-        .prepare("SELECT moniker, tier FROM contacts WHERE agent_id = ? AND lower(pubkey) = ?")
-        .get(agentId, signerPubkeyHex.toLowerCase()) as { moniker: string | null; tier: number | null } | undefined;
+        .prepare("SELECT moniker, tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
+        .get(agentId, normalizeContactPubkey(signerPubkeyHex)) as { moniker: string | null; tier: number | null } | undefined;
       /**
        * ⚠️ **QUARANTINED ROWS ARE NOT A LOCAL TRACE, AND WITHOUT THIS CLAUSE THE PROBE WRITES ITS
        * OWN EVIDENCE.** Found where `023-REFUSEDEVIDENCE` met `024-ORPHANTRIAGE`.
