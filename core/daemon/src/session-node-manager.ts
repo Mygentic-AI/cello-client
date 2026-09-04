@@ -10051,6 +10051,29 @@ export class SessionNodeManager {
         ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
         correlationId,
       });
+      /**
+       * ⚠️ **DROP THE WITNESS — A BLOCKED MESSAGE MADE THE SESSION PERMANENTLY UNSEALABLE.**
+       *
+       * THE THIRD INSTANCE of the shape already fixed for document frames at `:10593`, found by the
+       * first journey that ever sealed a session after a screener block.
+       *
+       * `sealReadiness` derives `missingLeaves` from `#witnessedSeq.size` — every position the
+       * ordering authority committed that this tree has not appended. The entry is dropped where the
+       * leaf is credited, and that drop lives inside `#appendVerifiedContent`. A terminal block does
+       * not go through it: the branch above takes `appendSessionLeaf` directly, so the leaf WAS
+       * committed and the witness was never retired.
+       *
+       * **From the operator's chair:** their screener catches one hostile message, and from that
+       * moment `cello_close_session` answers `session_incomplete` forever — *"waiting on an earlier
+       * message from the counterparty that has not arrived"* — about a message that arrived, was
+       * judged, and is sitting in the chain. The only exit is a force-abandon, which forfeits the
+       * notarized receipt. Measured live: `treeSize 3, highWaterSeq 2, missingLeaves 1`.
+       *
+       * Not introduced by `DOD-M15-REFUSEDEVIDENCE-1` — it is older than this unit and simply had no
+       * test that both blocked a message and then sealed. It is fixed here because this unit's own
+       * DoD requires that session to seal.
+       */
+      this.#witnessedSeq.get(key)?.delete(contentHashHex);
     }
 
     // DOD-COATTEND-1 (review F2): the plaintext failed to reach the transcript, and since Tier 1 the
@@ -11402,6 +11425,11 @@ export class SessionNodeManager {
         }
       } else if (entry.screenedOut) {
         this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
+        // The SAME witness leak as the immediate-append terminal-block branch (see the block comment
+        // at the `if (terminalBlock)` append in `ingestReceivedContent`), on the held path. This
+        // branch also bypasses `#appendVerifiedContent`, where the drop lives — so a blocked message
+        // that arrived out of order left `missingLeaves` stuck at 1 and the session unsealable.
+        this.#witnessedSeq.get(key)?.delete(entry.contentHashHex);
       } else {
         this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);
       }

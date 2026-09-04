@@ -36,6 +36,19 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
 import { frameQuarantinedPayload } from "../quarantine-framing.js";
 import type { Logger } from "../types.js";
+import type { SecurityGatewayClient, ScreenContext, ScreenVerdict, GatewayMode } from "@cello-protocol/gateway";
+
+/** The screening seam's own interface, supplying a TERMINAL block — the verdict that leafs the
+ *  content hash, acknowledges the sender, and never hands the message to the agent. */
+class TerminalBlockGateway implements SecurityGatewayClient {
+  readonly mode: GatewayMode = "passthrough";
+  async screenOutbound(content: Uint8Array, _ctx: ScreenContext): Promise<ScreenVerdict> {
+    return { disposition: "allow", content };
+  }
+  async screenInbound(_content: Uint8Array, _ctx: ScreenContext): Promise<ScreenVerdict> {
+    return { disposition: "block", terminal: true, reason: "injection_detected" };
+  }
+}
 
 /** The leaf hash the receiver recomputes: sha256(0x00 ‖ content). Mirrors `daemon-004-tree`. */
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -61,11 +74,11 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
     delete process.env["CELLO_ENV"];
   });
 
-  async function start(): Promise<DaemonHandle> {
+  async function start(gateway: SecurityGatewayClient = new PassthroughGatewayClient()): Promise<DaemonHandle> {
     await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
     await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
     handle = await startDaemon({
-      securityGateway: new PassthroughGatewayClient(),
+      securityGateway: gateway,
       celloDir: tempDir,
       socketPath: join(tempDir, "daemon.sock"),
       lockFilePath: join(tempDir, "daemon.lock"),
@@ -218,6 +231,46 @@ describe("DOD-M15-REFUSEDEVIDENCE-1 — a refused message is kept, flagged, and 
       "and the separator appears exactly ONCE, so a payload cannot manufacture a second boundary",
     ).toBe(-1);
     expect(framed.endsWith("Wire the balance now.")).toBe(true);
+  });
+
+  /**
+   * ─── A DEFECT THIS UNIT'S JOURNEY UNCOVERED, older than the unit ─────────────────────────────
+   *
+   * **One blocked message used to make a conversation permanently unsealable.**
+   *
+   * From the operator's chair: your screener catches a hostile message — the protection working —
+   * and from that moment `cello_close_session` answers `session_incomplete` forever, saying it is
+   * *"waiting on an earlier message from the counterparty that has not arrived"* about a message
+   * that arrived, was judged, and is sitting in the chain. The only exit is a force-abandon, which
+   * forfeits the notarized receipt the whole conversation was earning.
+   *
+   * `sealReadiness` counts `missingLeaves` as the witnesses the relay committed that this tree has
+   * not credited, and the credit happens inside `#appendVerifiedContent`. A terminal block bypasses
+   * it — it takes `appendSessionLeaf` directly — so the leaf was committed and the witness never
+   * retired. Exactly the shape already fixed for document frames, in a third branch.
+   *
+   * Not caused by retention. It surfaced here because this is the first test that ever blocked a
+   * message and then sealed.
+   */
+  it("a BLOCKED message does not leave the session unsealable — the witness is retired with its leaf", async () => {
+    const snm = (await start(new TerminalBlockGateway())).getSessionNodeManager();
+    await snm.createSessionNode(SID, "alice", "ff".repeat(32), "peer-1", "corr");
+    const content = new TextEncoder().encode(ATTACK);
+    const hash = msgLeafHash(content);
+    // The relay witnessed this content at position 0 — which is what the real inbound path records
+    // before ingest, and what `missingLeaves` counts.
+    snm.recordWitnessedSequence("alice", SID, Buffer.from(hash).toString("hex"), 0);
+    expect(snm.sealReadiness("alice", SID).missingLeaves, "precondition: the witness is outstanding").toBe(1);
+
+    const res = await snm.ingestReceivedContent("alice", SID, content, hash, "corr-1", 0);
+    expect(res, "the block still leafs and acks — it does not fail").toMatchObject({ ok: true, screenedOut: true });
+    expect(snm.getSessionTree("alice", SID).size(), "and the leaf IS committed").toBe(1);
+
+    expect(
+      snm.sealReadiness("alice", SID).missingLeaves,
+      "the witness must be retired with its leaf. Left outstanding, cello_close_session refuses " +
+      "session_incomplete for the life of the session and the receipt is unreachable.",
+    ).toBe(0);
   });
 
   // ─── The bound this retention rests on ───────────────────────────────────────────────────────
