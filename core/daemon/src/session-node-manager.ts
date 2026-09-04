@@ -793,6 +793,17 @@ export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set(["session_c
 export const TERMINAL_REFUSAL_READ_RETRY_MS = 60_000;
 
 /**
+ * DOD-M15-REFUSALTERMINAL-1 review F7 — how many terminally-refused content hashes are remembered
+ * per session.
+ *
+ * The counterparty chooses how many rows this table gets: one per distinct message aimed at a
+ * closed conversation, written even after the byte cap has stopped retaining evidence. 512 matches
+ * `MAX_REFUSED_PARKED_ENTRIES`, is far above any honest volume for a conversation that has ENDED,
+ * and bounds the table at (sessions × 512) small rows.
+ */
+export const MAX_TERMINAL_REFUSALS_PER_SESSION = 512;
+
+/**
  * DOD-M15-REFUSALTERMINAL-1 — ONE refusal, TWO counts, and the NAMES are the fix.
  *
  * The inbox reported `times: 58` for a refusal that had fired tens of thousands of times, and the
@@ -6323,6 +6334,18 @@ export class SessionNodeManager {
     // session ends, most sharply for `session_committed` — a refusal that exists only because the
     // session was already sealed. Dropping them at seal would delete exactly the ones a sealed
     // session produces. Growth is one row per (session, reason), i.e. proportional to `sessions`.
+    /**
+     * DOD-M15-REFUSALTERMINAL-1 review F7 — named because this list is the documented teardown set.
+     *
+     * `#terminallyRefused` and `#terminalRefusalsLoaded` are a READ CACHE over
+     * `terminal_content_refusals` and are dropped here with everything else in-memory; the durable
+     * rows stay, for the same reason the notices do — the question they answer outlives the
+     * session, and a fresh check reloads them on demand. `#terminalRefusalsReadFailedAt` goes too,
+     * so a torn-down session's back-off does not delay the first read after it is revived.
+     */
+    this.#terminallyRefused.delete(key);
+    this.#terminalRefusalsLoaded.delete(key);
+    this.#terminalRefusalsReadFailedAt.delete(key);
     this.#unreadableAlgSeen.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
@@ -10851,13 +10874,47 @@ export class SessionNodeManager {
     const alreadyKnown = this.#isTerminallyRefused(agentName, sessionId, contentHashHex);
     try {
       if (!this.#db) throw new Error("database is not open");
+      const agentId = this.#requireAgentId(agentName);
       this.#db
         .prepare(
           `INSERT OR IGNORE INTO terminal_content_refusals
              (agent_id, session_id, content_hash, reason, marked_at)
            VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(this.#requireAgentId(agentName), sessionId, contentHashHex, reason, Date.now());
+        .run(agentId, sessionId, contentHashHex, reason, Date.now());
+      /**
+       * ⚠️ **BOUNDED, because the counterparty chooses how many rows exist — review F7.**
+       *
+       * One row per distinct content hash aimed at a closed conversation, and the funnel that calls
+       * this runs even when the byte cap has already stopped RETENTION. So a peer who has exhausted
+       * the session's storage budget can still write rows here, indefinitely, on a table nothing
+       * else deletes. Every sibling store in this file is bounded (`MAX_UNREADABLE_ALG_FRAMES`, the
+       * tier byte cap, `MAX_REFUSAL_READERS`); this one was not.
+       *
+       * Oldest-dropped, so the newest refusals keep their stop and the loop stays closed for what
+       * is arriving now. A dropped row costs at most one extra fetch for content nobody is sending
+       * any more — the pre-fix behaviour for that one hash, and nothing worse.
+       */
+      const dropped = this.#db
+        .prepare(
+          `DELETE FROM terminal_content_refusals
+            WHERE agent_id = ? AND session_id = ? AND content_hash NOT IN (
+              SELECT content_hash FROM terminal_content_refusals
+               WHERE agent_id = ? AND session_id = ?
+               ORDER BY marked_at DESC LIMIT ${MAX_TERMINAL_REFUSALS_PER_SESSION}
+            )`,
+        )
+        .run(agentId, sessionId, agentId, sessionId);
+      if (Number(dropped.changes) > 0) {
+        // Loud, because it means a counterparty has aimed more than the cap's worth of distinct
+        // messages at one closed conversation — which is abuse, not ordinary traffic.
+        this.#logger.warn("session.content.terminal_refusal.evicted", {
+          agentName, sessionId, dropped: Number(dropped.changes),
+          cap: MAX_TERMINAL_REFUSALS_PER_SESSION,
+          impact:
+            "more distinct messages have been refused on this closed conversation than the cap keeps a record of, so the oldest stops were dropped. If one of those arrives again it costs one wasted fetch; nothing is delivered and nothing is lost.",
+        });
+      }
     } catch (err: unknown) {
       this.#logger.error("session.content.terminal_refusal.persist.failed", {
         agentName, sessionId, reason,

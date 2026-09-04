@@ -35,7 +35,7 @@ import { createHash } from "node:crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import type { GatewayMode, ScreenContext, ScreenVerdict, SecurityGatewayClient } from "@cello-protocol/gateway";
 import { startDaemon, type DaemonHandle } from "../daemon.js";
-import { TERMINAL_REFUSAL_REASONS } from "../session-node-manager.js";
+import { MAX_TERMINAL_REFUSALS_PER_SESSION, TERMINAL_REFUSAL_REASONS } from "../session-node-manager.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
 import { FileKeyProvider } from "@cello-protocol/crypto";
 import type { Logger, DaemonConfig } from "../types.js";
@@ -416,6 +416,45 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
       await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
     }
     expect(logged.filter((l) => l.event === "session.content.terminal_refusal")).toHaveLength(1);
+  });
+
+  it("the terminal table is BOUNDED — the counterparty chooses how many rows it gets", async () => {
+    /**
+     * Review F7. One row per distinct content hash aimed at a closed conversation, written by a
+     * funnel that runs even after the byte cap has stopped retention — so a peer with an exhausted
+     * storage budget can still grow a durable table nothing else deletes. Oldest-dropped, newest
+     * kept, so the stop holds for what is arriving now.
+     */
+    await boot();
+    insertSessionRow("s-closed", "sealed");
+    const mgr = handle!.getSessionNodeManager();
+    const db = mgr.getDb()!;
+    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+
+    // Fill to the cap directly — driving 513 real ingests would take minutes and prove the same
+    // thing about a different code path. The eviction runs on the NEXT real refusal below.
+    const insert = db.prepare(
+      "INSERT OR IGNORE INTO terminal_content_refusals (agent_id, session_id, content_hash, reason, marked_at) VALUES (?, ?, ?, 'session_committed', ?)",
+    );
+    for (let i = 0; i < MAX_TERMINAL_REFUSALS_PER_SESSION; i++) {
+      insert.run(agentId, "s-closed", i.toString(16).padStart(64, "0"), 1000 + i);
+    }
+    const content = new TextEncoder().encode("one over the cap");
+    await mgr.ingestReceivedContent("alice", "s-closed", content, msgLeafHash(content));
+
+    const rows = db
+      .prepare("SELECT COUNT(*) AS n FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ?")
+      .get(agentId, "s-closed") as { n: number };
+    expect(rows.n).toBe(MAX_TERMINAL_REFUSALS_PER_SESSION);
+    // The NEWEST is what survives — a stop that drops the message currently arriving would be the
+    // wrong end of the list to cut.
+    const kept = db
+      .prepare("SELECT 1 AS present FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ? AND content_hash = ?")
+      .get(agentId, "s-closed", Buffer.from(msgLeafHash(content)).toString("hex")) as { present: number } | undefined;
+    expect(kept, "the newest stop must survive the eviction").toBeDefined();
+    // And it is announced: more than the cap's worth of distinct messages at one closed
+    // conversation is abuse, not ordinary traffic.
+    expect(logged.some((l) => l.event === "session.content.terminal_refusal.evicted")).toBe(true);
   });
 
   it("nothing interpolates the refused content — not into a log line, an error or a notice", async () => {
