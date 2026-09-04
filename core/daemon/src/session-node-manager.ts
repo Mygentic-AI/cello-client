@@ -2852,11 +2852,16 @@ export class SessionNodeManager {
         -- ⚠️ self_authored COVERS TWO PROVENANCES, and sender_sig IS NOT NULL is the discriminator.
         -- Named here because it is the same shape this column exists to prevent, one level up: a
         -- provable sent row and an unprovable one share a label, so a reader keying on attribution
-        -- alone cannot tell them apart. An unprovable sent row is legitimate — an UNWITNESSED send
-        -- never put a Structure 1 on the wire, so there is nothing signed to store — but the reader
-        -- has to be told where the distinction lives, or it will be rediscovered as a bug.
+        -- alone cannot tell them apart.
         --   self_authored + sender_sig NOT NULL -> we wrote it and can prove we did
-        --   self_authored + sender_sig NULL     -> we wrote it; the relay never witnessed it
+        --   self_authored + sender_sig NULL     -> we wrote it; no proof was stored for this row
+        --
+        -- ⚠️ THE NULL CASE USED TO READ "the relay never witnessed it", and DOD-M15-AUTHORSHIP-ABSENT-1
+        -- made that false. Every content frame now carries this side's signature over its own
+        -- Structure 1 whether or not a relay witnessed the leaf, so an unwitnessed send is provable
+        -- too. Rewritten rather than deleted: the old sentence is why a NULL here was read as
+        -- ordinary. It is not ordinary now — it means this machine could not sign at all, or the row
+        -- came by a path that carries no proof, and both are worth a second look.
         --
         -- attribution is NOT NULL ON PURPOSE, and it is the load-bearing column. There is a soft
         -- path — session.content.ordering.decode_failed falls back to hash-dedup — that ingests a
