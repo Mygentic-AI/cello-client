@@ -3088,6 +3088,35 @@ export class SessionNodeManager {
         FROM content_refusal_notices
     `);
     /**
+     * ⚠️ **THE INVARIANT: a lifetime total can never be SMALLER than a since-dismissal count.**
+     * Caught on the live daemon, not by review — the inbox read
+     * `times_since_dismissed: 78, times_total: 12`.
+     *
+     * `INSERT OR IGNORE` above only fills rows that are ABSENT. A row that already exists but began
+     * counting AFTER the notice did — the totals table shipped one commit before `seeded`, so its
+     * rows default to 0 and claim to be exact — is left alone, and then presents a partial tally as
+     * a lifetime figure. Smaller than the number beside it, which is the tell.
+     *
+     * `count` resets on dismissal and `total` does not, so in healthy operation `total >= count`
+     * always. `count > total` therefore means one thing only: this row's total did not start at the
+     * beginning. Repaired to the best floor available and marked `seeded`, because that is what it
+     * is. Runs at every boot — it is also the repair for a totals write that failed while the
+     * notice's succeeded.
+     */
+    this.#db.exec(`
+      UPDATE content_refusal_totals
+         SET total = (SELECT n.count FROM content_refusal_notices n
+                       WHERE n.agent_id = content_refusal_totals.agent_id
+                         AND n.session_id = content_refusal_totals.session_id
+                         AND n.reason = content_refusal_totals.reason),
+             seeded = 1
+       WHERE EXISTS (SELECT 1 FROM content_refusal_notices n
+                      WHERE n.agent_id = content_refusal_totals.agent_id
+                        AND n.session_id = content_refusal_totals.session_id
+                        AND n.reason = content_refusal_totals.reason
+                        AND n.count > content_refusal_totals.total)
+    `);
+    /**
      * DOD-M15-REFUSALTERMINAL-1 — content this agent will never accept, so the daemon stops going
      * to fetch it.
      *

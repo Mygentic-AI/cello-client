@@ -376,6 +376,46 @@ describe("DOD-M15-REFUSALTERMINAL-1", () => {
     expect(after.times_total_at_least).toBe(58);
   });
 
+  it("UPGRADE: a total SMALLER than its own since-dismissed count is repaired to a floor", async () => {
+    /**
+     * **Found on the live daemon, not by review.** After the first patched build ran, the inbox read
+     * `times_since_dismissed: 78, times_total: 12` — an "exact" lifetime figure smaller than the
+     * number beside it. The totals table shipped one commit before `seeded`, so its rows default to
+     * 0 and claim to be exact, and `INSERT OR IGNORE` only fills rows that are ABSENT, so the
+     * backfill never touched them.
+     *
+     * `count` resets on dismissal and `total` does not, so `total >= count` holds in healthy
+     * operation. `count > total` means this row did not start at the beginning — a floor, not a
+     * figure. This is also the repair for a totals write that failed while the notice's succeeded.
+     */
+    await boot();
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const agentId = (db.prepare("SELECT agent_id FROM agents WHERE agent_name = ?").get("alice") as { agent_id: string }).agent_id;
+    const now = Date.now();
+    db.prepare(
+      `INSERT OR REPLACE INTO content_refusal_notices
+         (agent_id, session_id, reason, kind, impact, guidance, count, first_at, last_at)
+       VALUES (?, ?, 'session_committed', 'refused', 'i', 'g', 78, ?, ?)`,
+    ).run(agentId, "s-late", now, now);
+    // A totals row that started counting LATE and, crucially, claims to be exact.
+    db.prepare(
+      `INSERT OR REPLACE INTO content_refusal_totals
+         (agent_id, session_id, reason, total, first_at, last_at, seeded)
+       VALUES (?, ?, 'session_committed', 12, ?, ?, 0)`,
+    ).run(agentId, "s-late", now, now);
+
+    await handle!.stop("test_repair");
+    handle = null;
+    await boot();
+
+    const client = await connect();
+    const r = ((await inbox(client))["refusals"] as Refusal[]).find((x) => x.session_id === "s-late")!;
+    expect(r.times_since_dismissed).toBe(78);
+    // THE DEFECT IN ONE ASSERTION: 12 was reported as an exact lifetime total beside 78.
+    expect(r.times_total, "a partial tally must not be presented as a figure").toBeUndefined();
+    expect(r.times_total_at_least).toBe(78);
+  });
+
   it("a counted row reports an exact total, never a floor", async () => {
     // The other half of F1c: the two fields are mutually exclusive, so a row counted from its first
     // refusal must not arrive wearing the hedge.
