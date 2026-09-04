@@ -25,7 +25,8 @@ import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
-import { ContentParkClient, ContentParkRefusedError } from "./content-park-client.js";
+import { ContentParkClient, ContentParkRefusedError, ContentParkUnreachableError } from "./content-park-client.js";
+import type { ParkDialFailure } from "./content-park-client.js";
 import { extractErrorMessage } from "./error-message.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
@@ -59,10 +60,113 @@ export function createContentPark(deps: ContentParkDeps) {
   // proven (J-CONTENT increment 1) before the send/receive-path integration. The relay
   // multiaddr (with /p2p/<peerId>) comes from the session assignment's relay endpoint;
   // dials run from the standing receiver (open-gater) node.
+  /**
+   * ⚠️ THE `/p2p/` SEGMENT IS SHAPE-CHECKED — review HIGH-1.
+   *
+   * This used to accept whatever followed `/p2p/`, so a truncated or mistyped multiaddr became a
+   * "peer id" that only `newStream` rejected, four layers down, as `invalid_peer_id` — and the
+   * deposit then reported it as a relay that could not be REACHED. A payload fault wearing a
+   * network fault's name is the substitution this milestone is named for.
+   *
+   * This proves the segment is a plausible base58btc peer id, NOT that the peer exists — the
+   * multibase/multihash decode still happens in the transport, and `invalid_peer_id` is still
+   * mapped honestly below for anything this misses. It is defence in depth on the cheapest fault,
+   * not a replacement for the mapping.
+   */
+  const PEER_ID_SHAPE = /^(1[1-9A-HJ-NP-Za-km-z]{47,52}|Qm[1-9A-HJ-NP-Za-km-z]{44}|12D3Koo[1-9A-HJ-NP-Za-km-z]{45,50})$/;
   const parseRelayPeer = (multiaddr: string | undefined): { peerId: string; addr: string } | null => {
     if (!multiaddr) return null;
-    const peerId = multiaddr.split("/p2p/")[1];
-    return peerId ? { peerId, addr: multiaddr } : null;
+    // Up to the next `/`, so a CIRCUIT address (`…/p2p/<relay>/p2p-circuit/p2p/<target>`) yields the
+    // relay rather than `<relay>/p2p-circuit` — which the old form produced and only `newStream`
+    // ever rejected, four layers down, as an invalid peer id.
+    const peerId = multiaddr.split("/p2p/")[1]?.split("/")[0];
+    return peerId && PEER_ID_SHAPE.test(peerId) ? { peerId, addr: multiaddr } : null;
+  };
+
+  /**
+   * DOD-M15-PARKCONN-1 review HIGH-1 — **ONE STREAM FAILURE IS SIX FAULTS, AND ONLY TWO ARE ABOUT
+   * REACHING THE RELAY.**
+   *
+   * `#open` wraps every `newStream` rejection, because the dial evidence it collects is worth having
+   * on all of them. Labelling them all `relay_unreachable` is a different question, and getting it
+   * wrong reproduces the exact defect this unit exists to remove: `invalid_peer_id` is a MALFORMED
+   * ARGUMENT, `node_stopped` is THIS daemon's own transport, and `protocol_not_supported` means the
+   * connection worked and the relay does not speak content-park. Telling any of those three
+   * "the relay could not be reached — retry once it is up" sends the operator to the network for a
+   * fault that is not there, and the guidance is the half an operator actually reads.
+   *
+   * Reasons come from `core/transport/src/node.ts` (`newStream` + `mapStreamError`). An unknown one
+   * gets a neutral label rather than a reachability claim, because the default is where this class
+   * of defect hides.
+   */
+  const parkTransportFault = (
+    reason: string,
+    relayPeerId: string,
+  ): { reason: string; guidance: string } => {
+    switch (reason) {
+      case "no_connection":
+      case "connection_lost":
+        return {
+          reason: `relay_unreachable:${reason}`,
+          guidance:
+            `Relay ${relayPeerId} could not be reached from this daemon (${reason}), so nothing was deposited and no content was lost. ` +
+            `Retry once the relay is up. A conversation cannot be moved to a different relay from here — the park relay comes from the ` +
+            `session assignment — so if this relay stays down, broker a new session with cello_initiate_session.`,
+        };
+      case "invalid_peer_id":
+        return {
+          reason: "relay_address_invalid",
+          guidance:
+            `The /p2p/ segment of the relayMultiaddr is not a usable peer id, so no relay was ever contacted. The relay is not at fault ` +
+            `and retrying will not help. Pass the relay endpoint from the session assignment verbatim — a truncated paste is the usual cause.`,
+        };
+      case "node_stopped":
+        return {
+          reason: "daemon_transport_stopped",
+          guidance:
+            `This daemon's own transport is stopped, so the relay was never asked. Nothing was deposited. This is local: restart the ` +
+            `daemon, or start the agent with cello_start_agent if it was stopped deliberately.`,
+        };
+      case "protocol_not_supported":
+        return {
+          reason: "relay_protocol_unsupported",
+          guidance:
+            `Relay ${relayPeerId} is CONNECTED and does not speak the content-park protocol — a version skew, not an outage. Retrying ` +
+            `will not change it. Use a relay running a build that carries content-park, or update this one.`,
+        };
+      case "limited_connection_refused":
+        return {
+          reason: "relay_limited_connection",
+          guidance:
+            `Relay ${relayPeerId} allowed only a limited (relayed) connection and refused a content-park stream on it. CELLO's own paths ` +
+            `always permit limited connections, so this points at a defect on this side rather than at the relay; report it with the daemon log.`,
+        };
+      default:
+        return {
+          reason: `park_stream_failed:${reason}`,
+          guidance:
+            `The content-park stream to relay ${relayPeerId} could not be opened (${reason}), and nothing was deposited. This daemon has no ` +
+            `specific remedy for that reason — the dial detail below is the evidence to report.`,
+        };
+    }
+  };
+
+  /** The IPC refusal for a content-park stream that could not be opened, with the dial evidence. */
+  const parkTransportRefusal = (
+    err: ContentParkUnreachableError,
+  ): { ok: false; reason: string; guidance: string; dialFailures: readonly ParkDialFailure[] } => {
+    const fault = parkTransportFault(err.reason, err.relayPeerId);
+    const dials =
+      err.dialFailures.length > 0
+        ? ` Dials tried: ${err.dialFailures.map((f) => `${f.addr} → ${f.error}`).join("; ")}.`
+        : ` No dial was refused, so the connection existed a moment ago or was never attempted.`;
+    return {
+      ok: false,
+      reason: fault.reason,
+      guidance: fault.guidance + dials,
+      // DoD 1: recoverable from the RESPONSE as well as the log — this caller has no daemon log.
+      dialFailures: err.dialFailures,
+    };
   };
 
 
@@ -82,7 +186,9 @@ export function createContentPark(deps: ContentParkDeps) {
     relayAddrs: string[],
   ): Promise<
     | { ok: true; recovered: number; pulled: number; refused: number; refusals: Array<{ contentHash: string; sessionId: string; reason: string }> }
-    | { ok: false; reason: string }
+    // `guidance` is set only where this function knows more than the caller's reason table can —
+    // the transport faults, whose remedy depends on WHICH fault it was (review MEDIUM-2).
+    | { ok: false; reason: string; guidance?: string }
   > {
     const kp = getKeyProvider(recipientAgent.name);
     if (!kp) return { ok: false, reason: "signing_key_unavailable" };
@@ -108,6 +214,16 @@ export function createContentPark(deps: ContentParkDeps) {
       if (err instanceof ContentParkRefusedError) {
         logger.warn("content.recover.refused", { agentName: recipientAgent.name, relayPeerId, reason: err.reason });
         return { ok: false, reason: `relay_refused_pull:${err.reason}` };
+      }
+      /**
+       * Review MEDIUM-2 — the transport wrap reaches here too, and rethrowing it made
+       * `content_park_recover` answer `internal_error` / "An unexpected error occurred" for a relay
+       * that is simply down. `content_park_recover` is one of the three failures this order was
+       * written from, so this is the live path, not a hypothetical.
+       */
+      if (err instanceof ContentParkUnreachableError) {
+        const refusal = parkTransportRefusal(err);
+        return { ok: false, reason: refusal.reason, guidance: refusal.guidance };
       }
       throw err;
     }
@@ -566,7 +682,7 @@ export function createContentPark(deps: ContentParkDeps) {
      * `ciphertext` (the raw path) is kept for the one caller that wants byte fidelity through the
      * relay rather than envelope semantics.
      */
-    handlers.set("content_park_deposit", async (params, _connectionId) => {
+    const runDeposit: IpcHandler = async (params, _connectionId) => {
       /**
        * `Buffer.from(x, "hex")` TRUNCATES at the first invalid pair instead of throwing — the trap
        * `park-envelope.ts` already documents. Unvalidated, a typo'd `content` is signed and sealed at
@@ -624,7 +740,54 @@ export function createContentPark(deps: ContentParkDeps) {
       }
 
       const node = sessionNodeManager.getStandingReceiverNode();
-      if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
+      if (!node) {
+        /**
+         * DOD-M15-PARKCONN-1 — **NAME THE CAUSE, NOT THE EXIT POINT** (Invariant 3).
+         *
+         * `standing_receiver_unavailable` is the label that already misnamed this incident 102
+         * times, which is why `standingReceiverAbsenceReason()` exists — and `recoverParkedFromRelay`
+         * has used it since M12-P12 while this handler kept returning the bare label. The four causes
+         * demand opposite responses: `standing_receiver_creating` clears in seconds and a retry
+         * works; `agent_offline` never clears until the agent is started; `daemon_shutting_down`
+         * means stop.
+         *
+         * The wire reason is unchanged — a caller matching on it keeps working — and the cause rides
+         * alongside, which is the same shape the send path settled on.
+         */
+        /**
+         * ⚠️ THE GUESS USES THE SIGNABLE LIST, review MEDIUM-4 — the same filter the signing branch
+         * below applies, and for the same reason it documents: a `load_failed` agent holds no key
+         * provider, so counting it makes a daemon with ONE healthy agent say it cannot tell which.
+         *
+         * And a name that matches no agent is not an offline agent, review LOW-6:
+         * `standingReceiverAbsenceReason("typo")` returns `agent_offline` because the name is simply
+         * absent from the wanting-a-receiver set, so the operator was told to start an agent that
+         * does not exist — a real verb pointed at nothing.
+         */
+        const signableAgents = agents.filter((a) => a.state !== "load_failed");
+        const namedAgent = senderAgentName
+          ? (signableAgents.some((a) => a.name === senderAgentName) ? senderAgentName : undefined)
+          : (signableAgents.length === 1 ? signableAgents[0]!.name : undefined);
+        const cause = namedAgent
+          ? sessionNodeManager.standingReceiverAbsenceReason(namedAgent)
+          : senderAgentName
+            ? "sender_agent_not_found"
+            // Review LOW-5: zero is not "more than one". An agentless daemon was being told it had
+            // several and could not say which.
+            : signableAgents.length === 0
+              ? "no_loadable_agent"
+              : "unknown_agent";
+        const guidanceByCause: Record<string, string> = {
+          standing_receiver_creating: "The standing receiver is still being built; retry this deposit in a few seconds.",
+          agent_offline: `Agent '${namedAgent}' is not online, so this daemon has no node to deposit from. Start it with cello_start_agent.`,
+          no_standing_receiver: "No agent on this daemon has a standing receiver; start an agent with cello_start_agent first.",
+          daemon_shutting_down: "The daemon is shutting down — nothing was deposited, and retrying will not help until it is back up.",
+          unknown_agent: `This daemon has no standing receiver and ${agents.filter((a) => a.state !== "load_failed").length} signable agents, so it cannot say which one is missing it; pass senderAgentName, or start an agent with cello_start_agent.`,
+          sender_agent_not_found: `This daemon has no loadable agent named '${senderAgentName}', so there is nothing to check a standing receiver for. Check the name — cello_agents lists what this daemon holds.`,
+          no_loadable_agent: "This daemon has no loadable agent at all, so it can never have a standing receiver. Create and register one, then start it with cello_start_agent.",
+        };
+        return { ok: false, reason: "standing_receiver_unavailable", cause, guidance: guidanceByCause[cause] ?? "The daemon's standing receiver is not ready yet; retry after startup." };
+      }
 
       let payload: Uint8Array;
       if (hasContent) {
@@ -692,13 +855,70 @@ export function createContentPark(deps: ContentParkDeps) {
         payload = Buffer.from(ciphertext, "hex");
       }
 
-      const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
-      return await client.deposit(node, {
-        recipientPubkey: Buffer.from(recipientPubkey, "hex"),
-        contentHash: Buffer.from(contentHash, "hex"),
-        sessionId: Buffer.from(sessionId, "hex"),
-        ciphertext: payload,
-      });
+      /**
+       * DOD-M15-PARKCONN-1 — **THE ODD HANDLER OUT NOW REFUSES LIKE ITS SIBLINGS, AND SAYS SO ONCE.**
+       *
+       * Every other exit above returns `{ ok: false, reason, guidance }`; this one ended in a bare
+       * `return await client.deposit(...)` with no catch and no log. An unreachable relay — the
+       * ordinary condition park exists for — therefore left the daemon as a THROW, which IPC shapes
+       * into `internal_error` + "An unexpected error occurred. Check daemon logs for details." The
+       * daemon logs held nothing either: this handler logged NOTHING AT ALL, which is why
+       * `019-PARKERROR` went looking for a deposit line and found none.
+       *
+       * Only `ContentParkUnreachableError` is converted. Anything else still throws, because a
+       * blanket catch here would turn a genuine defect into a tidy refusal — the failure this
+       * milestone is named for.
+       */
+      const client = newParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+      try {
+        return await client.deposit(node, {
+          recipientPubkey: Buffer.from(recipientPubkey, "hex"),
+          contentHash: Buffer.from(contentHash, "hex"),
+          sessionId: Buffer.from(sessionId, "hex"),
+          ciphertext: payload,
+        });
+      } catch (err: unknown) {
+        // Only the transport wrap is converted. A blanket catch here would turn a genuine defect
+        // into a tidy refusal — the failure this milestone is named for.
+        if (!(err instanceof ContentParkUnreachableError)) throw err;
+        return parkTransportRefusal(err);
+      }
+    };
+
+    /**
+     * ⚠️ **THE RESULT LOG WRAPS THE WHOLE HANDLER, review MEDIUM-3.**
+     *
+     * It used to sit beside the two exits that reach the relay, so eleven refusals — every bad
+     * argument, `agent_not_found`, `session_not_found`, `session_recipient_mismatch` — still
+     * returned in total silence. That is the same hole `019-PARKERROR` fell into in this very
+     * handler, for a different reason: an operator greps for a deposit line and finds nothing.
+     *
+     * Wrapping rather than sprinkling is deliberate. A call per exit drifts the moment someone adds
+     * a fourteenth; a wrapper cannot miss one.
+     */
+    handlers.set("content_park_deposit", async (params, connectionId) => {
+      const res = (await runDeposit(params, connectionId)) as {
+        ok?: boolean; reason?: string; cause?: string; retryAfterMs?: number;
+      };
+      const line = {
+        // Read off the CALLER's params: a refusal can fire before either is parsed, and a log line
+        // that omits which deposit it is about cannot be correlated with anything.
+        relayMultiaddr: typeof params?.["relayMultiaddr"] === "string" ? params["relayMultiaddr"] : undefined,
+        sessionId: typeof params?.["sessionId"] === "string" ? params["sessionId"] : undefined,
+        contentHash: typeof params?.["contentHash"] === "string" ? params["contentHash"] : undefined,
+        ok: res.ok === true,
+        ...(res.reason !== undefined ? { reason: res.reason } : {}),
+        ...(res.cause !== undefined ? { cause: res.cause } : {}),
+        // Review LOW-8: the relay's own "when" already rides on the response; dropping it from the
+        // log leaves an aggregated log unable to say when a throttled deposit clears.
+        ...(res.retryAfterMs !== undefined ? { retryAfterMs: res.retryAfterMs } : {}),
+      };
+      // NOT `content.park.deposit.result` — the ContentParkClient already emits that name one layer
+      // down, and two events from different layers under one name make an aggregated log unreadable
+      // (the same review finding as `content.park.pull.refused_by_relay`).
+      if (line.ok) logger.info("content.park.deposit.ipc.result", line);
+      else logger.warn("content.park.deposit.ipc.result", line);
+      return res;
     });
 
     handlers.set("content_park_pull", async (params, _connectionId) => {
@@ -714,11 +934,20 @@ export function createContentPark(deps: ContentParkDeps) {
       if (!kp) return { ok: false, reason: "signing_key_unavailable", guidance: `Signing key for '${recipientAgent.name}' is not loaded.` };
       const node = sessionNodeManager.getStandingReceiverNode();
       if (!node) return { ok: false, reason: "standing_receiver_unavailable", guidance: "The daemon's standing receiver is not ready yet; retry after startup." };
-      const client = new ContentParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
+      // Review LOW-9: the seam, like every other client in this file. This handler was still
+      // constructing directly, which is why its `#open` failure path had no unit coverage.
+      const client = newParkClient({ relayPeerId: relay.peerId, relayAddrs: [relay.addr], logger });
       let entries;
       try {
         entries = await client.pull(node, Buffer.from(recipientPubkey, "hex"), kp);
       } catch (err: unknown) {
+        /**
+         * Review MEDIUM-2 — `#open` is shared, so this handler now receives the same transport wrap
+         * the deposit handler does. Rethrowing it turned an unreachable relay into
+         * `internal_error` + "An unexpected error occurred" — the exact response this unit exists to
+         * abolish, one handler over, on a path the order's own evidence names.
+         */
+        if (err instanceof ContentParkUnreachableError) return parkTransportRefusal(err);
         // DOD-M15-RELAYAUTH-1 review HIGH-3: a refusal must not be reported as an empty list.
         if (err instanceof ContentParkRefusedError) {
           return {
@@ -763,7 +992,17 @@ export function createContentPark(deps: ContentParkDeps) {
         // where it helps the operator without breaking a consumer that branches on the reason.
         const noReceiver = new Set(["standing_receiver_creating", "agent_offline", "no_standing_receiver", "daemon_shutting_down"]);
         const wireReason = noReceiver.has(res.reason) ? "standing_receiver_unavailable" : res.reason;
-        return { ok: false, reason: wireReason, guidance: guidanceByReason[res.reason] ?? "Recover failed." };
+        /**
+         * Review MEDIUM-2 — a guidance the drain already computed WINS, and the bare "Recover
+         * failed." is the last resort rather than the answer for everything the table misses. That
+         * default is not an affordance: it names no next step, which is what Invariant 4 forbids on
+         * exactly this kind of response.
+         */
+        return {
+          ok: false,
+          reason: wireReason,
+          guidance: res.guidance ?? guidanceByReason[res.reason] ?? `Recover failed (${res.reason}) and this daemon has no specific remedy for that reason. The daemon log holds the detail — report it with the reason above.`,
+        };
       }
       /**
        * `refusals` REACHES THE CALLER — review B2a pass-2 F3, "no consumer, no ship".
