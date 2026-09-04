@@ -13,8 +13,14 @@
  *
  * "TERMINAL" means the daemon records a leaf + acknowledges (the sender stops) but never delivers
  * the content — distinct from the fail-closed TRANSIENT block a down gateway returns, which stays
- * un-acked for redelivery. Language and injection run on the SANITIZED text (what the agent would
- * see), so confusable lookalikes normalized to Latin are judged as Latin, not held.
+ * un-acked for redelivery.
+ *
+ * The two screens read DIFFERENT texts, and the split is the point. Injection screening runs on the
+ * SANITIZED text (what the agent would see), so a homoglyph attack — English with Cyrillic lookalikes
+ * swapped in to dodge a keyword filter — is judged on its normalized form. The LANGUAGE screen runs
+ * on the text as WRITTEN, because normalization erases the script composition it exists to measure:
+ * an all-Cyrillic jailbreak Latinizes to a 0.255 Cyrillic share, under the bar, and was delivered
+ * (measured live 2026-09-04). One message, two independent questions, two inputs.
  */
 import { operatorCanRun, noOperatorOverride } from "./affordance.js";
 import { sanitizeInbound } from "../detect/sanitize.js";
@@ -94,12 +100,18 @@ export class InboundScreener {
     }));
 
     // The text the agent would actually see — sanitized (confusables normalized, invisibles stripped).
-    // Language and injection judge THIS, not the raw bytes: a confusable-Latin word is Latin here.
+    // The injection scanner judges THIS, not the raw bytes: a confusable-Latin word is Latin here.
     const deliveredText = r.text;
 
     // IN-003: language allowlist. A message confidently in a non-allowlisted script (default: only
     // Latin/English) is held — a TERMINAL block (the same bytes are the same language on redelivery).
-    const lang = screenInboundLanguage(deliveredText, this.#language ?? {});
+    //
+    // It reads `scriptScanText` — the text as WRITTEN — and NOT `deliveredText`. Handing it the
+    // normalized text disarms it completely: confusables rewrites every Cyrillic letter with a Latin
+    // lookalike, so the live 2026-09-04 jailbreak arrived 165/165 Cyrillic, reached this line as 123
+    // Latin / 42 Cyrillic, and cleared the 0.5 bar it should have failed at. Both texts are correct
+    // answers to different questions, and this screen asks the one only the original can answer.
+    const lang = screenInboundLanguage(r.scriptScanText, this.#language ?? {});
     if (!lang.allowed) {
       return {
         disposition: "block",

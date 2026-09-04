@@ -10,6 +10,11 @@
  * RE2 engine (no native RegExp — ReDoS). The RE2 binding is a pending decision, so that step is
  * not wired here yet; this module exposes the sanitized text + notes that the pattern matcher and
  * the M9-IN-002 scanner will consume.
+ *
+ * THREE texts come out, and which one a caller takes is a security decision. `text` is the delivered
+ * form (everything applied). `decodedForScan` is that plus encodings decoded, for detection only.
+ * `scriptScanText` is the text as WRITTEN with only invisibles removed — the language screen's
+ * input, because confusables normalization destroys the very evidence that screen reads.
  */
 import { AFFORDANCE_PREFIX } from "../screen/affordance.js";
 
@@ -25,6 +30,24 @@ export interface SanitizationNote {
 export interface SanitizeResult {
   /** The DELIVERED text: invisible-strip + confusables + special-token strip. Empty on `blocked`. */
   text: string;
+  /**
+   * The text as it was WRITTEN, with only invisibles stripped — for the LANGUAGE screen, which asks
+   * a question `text` can no longer answer. Empty on `blocked`.
+   *
+   * `normalizeConfusables` rewrites every Cyrillic/Greek letter that has a Latin lookalike, so by
+   * the time `text` exists the script composition of the original is gone: a jailbreak measured live
+   * on 2026-09-04 arrived 165/165 Cyrillic and reached the screen as 123 Latin / 42 Cyrillic — a
+   * 0.255 share, under the 0.5 bar — and was delivered. Normalization is doing its job; the defect
+   * was feeding its output to a check that needed its input.
+   *
+   * Invisibles ARE stripped first, and that ordering is load-bearing: `scriptOf` buckets variation
+   * selectors and Tag characters as letters, so scanning the raw decode lets a sender pad the counts
+   * with codepoints nobody can see and duck the share threshold.
+   *
+   * Nothing else consumes this. The pattern scanner, the special-token strip, the semantic
+   * classifier and the delivered form all read the confusables-normalized `text`.
+   */
+  scriptScanText: string;
   /**
    * The delivered text with encodings additionally decoded — for DETECTION ONLY (the pattern
    * matcher / entropy). Never delivered to the agent: decoding %XX / &#..; / \x.. in a legitimate
@@ -222,6 +245,7 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   if (content.length > maxBytes) {
     return {
       text: "",
+      scriptScanText: "",
       decodedForScan: "",
       notes: [],
       entropySuspicion: 0,
@@ -238,6 +262,11 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   const inv = stripInvisible(text);
   if (inv.removed > 0) notes.push({ step: "invisible_strip", detail: "stripped invisible/smuggled-Unicode codepoints", count: inv.removed });
   text = inv.text;
+
+  // Captured HERE, between the two steps, because this is the only point where both properties the
+  // language screen needs hold at once: no invisible codepoint survives to pad the letter counts,
+  // and no lookalike has been rewritten yet. See `scriptScanText` on SanitizeResult.
+  const scriptScanText = text;
 
   const conf = normalizeConfusables(text);
   if (conf.changed) notes.push({ step: "confusables", detail: "normalized lookalike characters to their base form", count: conf.count });
@@ -257,5 +286,5 @@ export function sanitizeInbound(content: Uint8Array, opts: SanitizeOptions = {})
   const entropySuspicion = scoreEntropy(decodedForScan);
   if (entropySuspicion > 0) notes.push({ step: "entropy", detail: "high-entropy encoded-blob segment(s) detected", count: entropySuspicion });
 
-  return { text, decodedForScan, notes, entropySuspicion };
+  return { text, scriptScanText, decodedForScan, notes, entropySuspicion };
 }
