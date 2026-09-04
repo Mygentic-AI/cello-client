@@ -51,6 +51,29 @@ export type RefusalKind = (typeof REFUSAL_KINDS)[keyof typeof REFUSAL_KINDS];
  * read then said "call again and keep waiting" — the notice was already gone. Every door returns the
  * two together for that reason.
  */
+/**
+ * DOD-M15-REFUSALTERMINAL-1 — what the counts on a refusal notice mean, for EVERY door that shows
+ * one.
+ *
+ * ⚠️ **ONE constant because there are TWO doors.** `cello_inbox` and `cello_receive` both surface
+ * refusals, and review F4 caught the receive door shipping the new field names with no sentence
+ * explaining them — the misreading this line exists to end, moved rather than fixed. A second copy
+ * is a second thing to keep true.
+ *
+ * The defect being described: on 2026-09-04 an operator read `times: 58` for a refusal that had
+ * fired tens of thousands of times over two and a half days, and concluded it was minor. The
+ * counter was accurate; the word `times` was the lie.
+ */
+export const REFUSAL_COUNT_GUIDANCE =
+  "THE TWO COUNTS MEAN DIFFERENT THINGS. `times_since_dismissed` counts only the refusals since " +
+  "the operator last ran cello_dismiss on that conversation — dismissing clears the notice, never " +
+  "the cause — so it can be small while the real figure is enormous. Judge severity by the " +
+  "lifetime one instead, which arrives as ONE of these two: `times_total` is an exact count from " +
+  "the first refusal; `times_total_at_least` is a FLOOR, for a conversation whose tally began when " +
+  "this daemon was upgraded, and the true figure may be far higher. If NEITHER is present, this " +
+  "notice could not be written to disk (see session.refusal.persist.failed) and its scale is " +
+  "unknown — in that case do not read the smaller number as the total.";
+
 export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
   /**
    * VERBATIM, and deliberately so: this is the sentence the previous unit wrote for exactly this

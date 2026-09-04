@@ -460,6 +460,29 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the refusal reaches cello_receive
     })) as Record<string, unknown>;
   }
 
+  it("DOD-M15-REFUSALTERMINAL-1 F4: the receive door names the counts the SAME way the inbox does", async () => {
+    /**
+     * The second door. Review F4 caught this one shipping the drain's internal camelCase straight
+     * into an MCP response — `timesSinceDismissed` in a payload that is snake_case everywhere else —
+     * with no sentence saying the small number is not the lifetime one. That is the misreading this
+     * unit exists to remove, moved to the other door rather than fixed.
+     */
+    handle = await startDaemon(await setup("alice"));
+    handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-counts", "session_committed", {
+      kind: REFUSAL_KINDS.REFUSED, impact: "closed", guidance: "start a new one",
+    });
+
+    const res = await quietReceive("s-ipc-counts");
+    const refusals = res["refusals"] as Array<Record<string, unknown>>;
+    expect(refusals[0]!["times_since_dismissed"]).toBe(1);
+    expect(refusals[0]!["times_total"]).toBe(1);
+    expect(refusals[0]!, "the drain's internal camelCase must not reach an MCP response")
+      .not.toHaveProperty("timesSinceDismissed");
+    // And the sentence, from the one shared constant — a second copy is a second thing to keep true.
+    expect(String(res["refusal_guidance"])).toContain("times_total_at_least");
+    expect(String(res["refusal_guidance"])).toContain("cello_dismiss");
+  });
+
   it("a quiet receive carries the refusal — the conversation did not go silent for no reason", async () => {
     handle = await startDaemon(await setup("alice"));
     handle.getSessionNodeManager().noteContentRefusal("alice", "s-ipc-1", "content_hash_alg_unknown", { kind: REFUSAL_KINDS.REFUSED,

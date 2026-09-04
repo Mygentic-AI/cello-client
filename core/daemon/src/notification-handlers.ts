@@ -10,7 +10,7 @@
  * it exists to backstop would be no reconciler at all.
  */
 import type { IpcHandler } from "./ipc-server.js";
-import { REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
+import { REFUSAL_COUNT_GUIDANCE, REFUSAL_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { ConnState } from "./contact-handlers.js";
@@ -245,18 +245,10 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
       ...(truncated ? { refusals_incomplete: true } : {}),
       refusals_guidance:
         header +
-        "\n\nThese are grouped by session_id, and they carry TWO counts. `times_since_dismissed` " +
-        "counts only the refusals since the operator last ran cello_dismiss on that conversation — " +
-        "dismissing clears the notice, never the cause — so it can be small while the real figure " +
-        "is enormous. Judge severity by the lifetime one instead, which arrives as ONE of these " +
-        "two: `times_total` is an exact count from the first refusal; `times_total_at_least` is a " +
-        "FLOOR, for a conversation whose tally began when this daemon was upgraded, and the true " +
-        "figure may be far higher. If NEITHER is present this notice could not be written to disk " +
-        "(see session.refusal.persist.failed) and its scale is unknown — in that case do not read " +
-        "the smaller number as the total. `repeat: true` means you have been told about this one " +
-        "before and `times_since_dismissed` has grown by an order of magnitude since. " +
-        "TELL THE OPERATOR. A refusal that reaches an agent and stops there is the same silence it " +
-        "was written to end." +
+        "\n\nThese are grouped by session_id. " + REFUSAL_COUNT_GUIDANCE +
+        " `repeat: true` means you have been told about this one before and " +
+        "`times_since_dismissed` has grown by an order of magnitude since. TELL THE OPERATOR. A " +
+        "refusal that reaches an agent and stops there is the same silence it was written to end." +
         (truncated
           ? " refusals_incomplete: true means this list hit its cap and there are older ones not shown."
           : ""),
