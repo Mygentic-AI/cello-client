@@ -19,7 +19,9 @@ import {
   decodeStructure1,
   STRUCTURE1_VERSION,
   STRUCTURE1_VERSION_V2,
+  STRUCTURE1_VERSION_V3,
   LAST_SEEN_HASH_BYTES,
+  PREV_OWN_HASH_BYTES,
   STRUCTURE1_DECODE_REASONS,
 } from "../structure1.js";
 import { computeGenesisPrevRoot } from "../session.js";
@@ -34,6 +36,7 @@ const SENDER_PUBKEY = new Uint8Array(32).fill(0xdd);
 const COUNTERPARTY_PUBKEY = new Uint8Array(32).fill(0xbb);
 const SESSION_ID = new Uint8Array(16).fill(0xee);
 const LAST_SEEN_HASH = new Uint8Array(32).fill(0xa7);
+const PREV_OWN_HASH = new Uint8Array(32).fill(0xb4);
 const TIMESTAMP = 1_700_000_000_000;
 
 const V1_FIELDS = {
@@ -316,5 +319,174 @@ describe("020-ACKHASH: decodeStructure1 refuses an unnamed shape by name", () =>
     expect(notArray.ok).toBe(false);
     if (notArray.ok) return;
     expect(notArray.reason).toBe(STRUCTURE1_DECODE_REASONS.NOT_ARRAY);
+  });
+});
+
+// ─── 035-SELFCHAIN: v3 — the sender's link to their OWN previous message ──────
+
+describe("035-SELFCHAIN: prev_own_hash is what makes a conversation a chain", () => {
+  const V2_FIELDS = { ...V1_FIELDS, lastSeenHash: LAST_SEEN_HASH };
+  const V3_FIELDS = { ...V2_FIELDS, prevOwnHash: PREV_OWN_HASH };
+
+  it("with a prevOwnHash ⇒ eight fields, version 3, matching the pinned v3 vector", () => {
+    const fixture = JSON.parse(
+      readFileSync(join(__dirname, "../../test/vectors/structure1-v3-canonical.json"), "utf8"),
+    ) as { inputs: { last_seen_hash_hex: string; prev_own_hash_hex: string }; expected_cbor_hex: string };
+
+    const bytes = encodeStructure1({
+      contentHash: fromHex("cc".repeat(32)),
+      senderPubkey: fromHex("dd".repeat(32)),
+      sessionId: fromHex("ee".repeat(16)),
+      lastSeenSeq: 3,
+      timestamp: 1_700_000_000_000,
+      lastSeenHash: fromHex(fixture.inputs.last_seen_hash_hex),
+      prevOwnHash: fromHex(fixture.inputs.prev_own_hash_hex),
+    });
+    expect(toHex(bytes)).toBe(fixture.expected_cbor_hex);
+  });
+
+  it("v3 APPENDS — the v2 bytes are a prefix once the version header is accounted for", () => {
+    /**
+     * The whole reason the field went to index 7. Asserted on the BYTES here rather than only on
+     * decoded values, because "append" is a claim about the encoding: strip each array's 2-byte
+     * header and v2's remainder must be a prefix of v3's.
+     */
+    const v2 = toHex(encodeStructure1(V2_FIELDS));
+    const v3 = toHex(encodeStructure1(V3_FIELDS));
+    expect(v2.startsWith("8702")).toBe(true);
+    expect(v3.startsWith("8803")).toBe(true);
+    expect(v3.slice(4).startsWith(v2.slice(4))).toBe(true);
+    // …and the only thing after that prefix is the 32-byte hash, in a CBOR byte-string header.
+    expect(v3.slice(4 + v2.slice(4).length)).toBe("5820" + "b4".repeat(32));
+  });
+
+  it("every field a v1 or v2 reader already reads keeps its index and its value", () => {
+    const v1 = decodeStructure1(encodeStructure1(V1_FIELDS));
+    const v2 = decodeStructure1(encodeStructure1(V2_FIELDS));
+    const v3 = decodeStructure1(encodeStructure1(V3_FIELDS));
+    expect(v1.ok && v2.ok && v3.ok).toBe(true);
+    if (!v1.ok || !v2.ok || !v3.ok) return;
+    expect(toHex(v3.fields.contentHash)).toBe(toHex(v1.fields.contentHash));
+    expect(toHex(v3.fields.senderPubkey)).toBe(toHex(v1.fields.senderPubkey));
+    expect(toHex(v3.fields.sessionId)).toBe(toHex(v1.fields.sessionId));
+    expect(v3.fields.lastSeenSeq).toBe(v1.fields.lastSeenSeq);
+    expect(v3.fields.timestamp).toBe(v1.fields.timestamp);
+    expect(toHex(v3.fields.lastSeenHash!)).toBe(toHex(v2.fields.lastSeenHash!));
+  });
+
+  it("an explicit `undefined` prevOwnHash is the SAME as omitting it — no eight-field array with a hole", () => {
+    // Same trap the v2 test pins: branching on `"prevOwnHash" in fields` would emit an 8-array whose
+    // index 7 is CBOR `undefined` — a v3 claim carrying no self link, which is the fail-open this
+    // layout exists to close.
+    const omitted = encodeStructure1(V2_FIELDS);
+    const explicit = encodeStructure1({ ...V2_FIELDS, prevOwnHash: undefined });
+    expect(toHex(explicit)).toBe(toHex(omitted));
+    expect(decodeStructure1(omitted)).toEqual(decodeStructure1(explicit));
+  });
+
+  it("prevOwnHash without lastSeenHash still emits v2 — the self link never travels alone", () => {
+    /**
+     * ⚠️ NAMED BECAUSE IT LOOKS LIKE A BUG AND IS NOT. There is no layout carrying a self link and
+     * no acknowledgement: v3 is defined as v2 plus one field. A caller in that state has nothing to
+     * acknowledge, which means it is the first message of the session — and its self link would be
+     * the session genesis, which asserts nothing either. The honest encoding is the one that makes
+     * no claim it cannot support.
+     */
+    const bytes = encodeStructure1({ ...V1_FIELDS, prevOwnHash: PREV_OWN_HASH });
+    expect(toHex(bytes)).toBe(toHex(encodeStructure1(V1_FIELDS)));
+  });
+
+  it("a WRONG-WIDTH prevOwnHash throws at encode — never silently downgraded to v2", () => {
+    /**
+     * A silent downgrade is the worse failure and it is why this throws. An unacceptable ack hash
+     * shows up immediately — the counterparty refuses the message. A missing SELF link is invisible
+     * in any single message: everything verifies, and the only symptom appears later, as a
+     * conversation whose order cannot be proven. Catch it before the bytes are signed.
+     */
+    expect(() => encodeStructure1({ ...V2_FIELDS, prevOwnHash: new Uint8Array(31) }))
+      .toThrow(/prev_own_hash must be 32 bytes/);
+    expect(() => encodeStructure1({ ...V2_FIELDS, prevOwnHash: new Uint8Array(0) }))
+      .toThrow(/prev_own_hash must be 32 bytes/);
+  });
+
+  it("the session GENESIS is a legal prevOwnHash — a first message is a value, not an absence", () => {
+    const genesis = computeGenesisPrevRoot(SENDER_PUBKEY, COUNTERPARTY_PUBKEY, SESSION_ID, TIMESTAMP);
+    expect(genesis.length).toBe(PREV_OWN_HASH_BYTES);
+    const decoded = decodeStructure1(encodeStructure1({ ...V2_FIELDS, prevOwnHash: genesis }));
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(toHex(decoded.fields.prevOwnHash!)).toBe(toHex(genesis));
+    // And it is SESSION-SPECIFIC, which is the reason it is not 32 zero bytes: a constant shared by
+    // every session is one an attacker can present for any of them.
+    const other = computeGenesisPrevRoot(SENDER_PUBKEY, COUNTERPARTY_PUBKEY, new Uint8Array(16).fill(0x11), TIMESTAMP);
+    expect(toHex(other)).not.toBe(toHex(genesis));
+  });
+
+  // ─── refusals: the load-bearing half ───
+
+  it("a v3 that OMITS prev_own_hash is refused — seven fields cannot claim to be a v3", () => {
+    const raw = rawArray(STRUCTURE1_VERSION_V3, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, LAST_SEEN_HASH);
+    const r = decodeStructure1(raw);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe(STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT);
+  });
+
+  it("a v3 whose prev_own_hash is the wrong width is refused BY NAME, never dropped to null", () => {
+    for (const bad of [new Uint8Array(31), new Uint8Array(33), new Uint8Array(0)]) {
+      const raw = rawArray(STRUCTURE1_VERSION_V3, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, LAST_SEEN_HASH, bad);
+      const r = decodeStructure1(raw);
+      expect(r.ok).toBe(false);
+      if (r.ok) continue;
+      expect(r.reason).toBe(STRUCTURE1_DECODE_REASONS.PREV_OWN_HASH_MALFORMED);
+    }
+  });
+
+  it("a v3 whose prev_own_hash is not bytes at all is refused BY NAME", () => {
+    const raw = rawArray(STRUCTURE1_VERSION_V3, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, LAST_SEEN_HASH, 7);
+    const r = decodeStructure1(raw);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe(STRUCTURE1_DECODE_REASONS.PREV_OWN_HASH_MALFORMED);
+  });
+
+  it("an EIGHT-field array that is not version 3 is refused — the version decides, never the length", () => {
+    for (const v of [STRUCTURE1_VERSION, STRUCTURE1_VERSION_V2, 4]) {
+      const raw = rawArray(v, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, LAST_SEEN_HASH, PREV_OWN_HASH);
+      const r = decodeStructure1(raw);
+      expect(r.ok).toBe(false);
+      if (r.ok) continue;
+      expect(r.reason).toBe(STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT);
+    }
+  });
+
+  it("a v3 whose LAST_SEEN_HASH is malformed is refused for THAT reason, not the self link's", () => {
+    // Two 32-byte fields sit side by side, and a reader that checked them in one place would name
+    // the wrong one. Each names itself.
+    const raw = rawArray(STRUCTURE1_VERSION_V3, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, new Uint8Array(31), PREV_OWN_HASH);
+    const r = decodeStructure1(raw);
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe(STRUCTURE1_DECODE_REASONS.LAST_SEEN_HASH_MALFORMED);
+  });
+
+  it("v1 and v2 still decode with prevOwnHash null — null means the layout has none, never a missing one", () => {
+    const v1 = decodeStructure1(encodeStructure1(V1_FIELDS));
+    const v2 = decodeStructure1(encodeStructure1(V2_FIELDS));
+    expect(v1.ok && v2.ok).toBe(true);
+    if (!v1.ok || !v2.ok) return;
+    expect(v1.fields.prevOwnHash).toBeNull();
+    expect(v2.fields.prevOwnHash).toBeNull();
+  });
+
+  it("a v1 SEVEN-array is still the submission-id layout — the new field did not widen it", () => {
+    // The regression 020-ACKHASH pinned, re-pinned one layout later: the relay's submission-id
+    // tolerance must survive every future append.
+    const raw = rawArray(STRUCTURE1_VERSION, CONTENT_HASH, SENDER_PUBKEY, SESSION_ID, 3, TIMESTAMP, new Uint8Array(16).fill(0x5b));
+    const r = decodeStructure1(raw);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.fields.lastSeenHash).toBeNull();
+    expect(r.fields.prevOwnHash).toBeNull();
   });
 });

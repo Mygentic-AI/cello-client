@@ -46,7 +46,9 @@ export {
   decodeStructure1,
   STRUCTURE1_VERSION,
   STRUCTURE1_VERSION_V2,
+  STRUCTURE1_VERSION_V3,
   LAST_SEEN_HASH_BYTES,
+  PREV_OWN_HASH_BYTES,
   STRUCTURE1_DECODE_REASONS,
 } from "./structure1.js";
 export type {

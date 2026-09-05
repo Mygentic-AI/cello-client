@@ -25,8 +25,33 @@ export const STRUCTURE1_VERSION = 1;
  */
 export const STRUCTURE1_VERSION_V2 = 2;
 
+/**
+ * v3 — `prev_own_hash` APPENDED at index 7 (`DOD-M15-SELFCHAIN-1`).
+ *
+ * ⚠️ THIS IS THE OTHER HALF OF THE CHAIN, AND WITHOUT IT THERE IS NO CHAIN.
+ *
+ * `last_seen_hash` links a sender to the counterparty: *"the last thing I got from you."* That
+ * chains ACROSS the two parties and it does not chain a sender to themselves — so when one party
+ * sends twice in a row, BOTH of their messages carry the same `last_seen_hash`, because nothing
+ * arrived in between. Nothing in the signed bytes distinguishes them, and nothing links the second
+ * to the first.
+ *
+ * Position cannot fill that gap: the relay assigns position AFTER the sender has signed, so a
+ * sender can never sign their own position. The relay's receipt pins it, but the receipt goes to
+ * the SENDER — so whoever hands a conversation to a new relay holds no receipt for the
+ * counterparty's messages and can reorder any run of them. Measured in `031-RELAYREPLAY`.
+ *
+ * `prev_own_hash` is the `content_hash` of this sender's OWN previous message in this session. With
+ * both links every position is committed: move a message inside your own run and your self-link
+ * breaks; move one across the interleaving and the counterparty link breaks.
+ */
+export const STRUCTURE1_VERSION_V3 = 3;
+
 /** `last_seen_hash` is a SHA-256 root — always exactly 32 bytes, never a prefix and never empty. */
 export const LAST_SEEN_HASH_BYTES = 32;
+
+/** `prev_own_hash` is a content hash — always exactly 32 bytes, same rule, same reason. */
+export const PREV_OWN_HASH_BYTES = 32;
 
 /**
  * ⚠️ INDEX 6 IS ALREADY SPOKEN FOR, WHICH IS WHY THE VERSION DECIDES AND NOT THE LENGTH.
@@ -37,6 +62,7 @@ export const LAST_SEEN_HASH_BYTES = 32;
  *
  *   length 7 && version 1  ⇒  the pre-existing submission-id layout (index 6 is NOT an ack hash)
  *   length 7 && version 2  ⇒  the ack-hash layout
+ *   length 8 && version 3  ⇒  the ack-hash layout PLUS `prev_own_hash` at index 7
  *   anything else          ⇒  refused BY NAME, never coerced
  *
  * A reader that silently admits an unrecognised length is not tolerant, it is fail-open: it would
@@ -53,6 +79,8 @@ export const STRUCTURE1_DECODE_REASONS = {
   FIELD_MALFORMED: "structure1_field_malformed",
   /** A v2 carried `last_seen_hash`, and it was not 32 bytes. Present-but-wrong, never dropped. */
   LAST_SEEN_HASH_MALFORMED: "structure1_last_seen_hash_malformed",
+  /** A v3 carried `prev_own_hash`, and it was not 32 bytes. Present-but-wrong, never dropped. */
+  PREV_OWN_HASH_MALFORMED: "structure1_prev_own_hash_malformed",
 } as const;
 
 export type Structure1DecodeReason =
@@ -75,6 +103,12 @@ export interface Structure1Fields {
    * a v2 that omits the field is refused as UNKNOWN_LAYOUT and never reaches here.
    */
   lastSeenHash: Uint8Array | null;
+  /**
+   * The 32 bytes on a v3 claim; `null` on v1 and v2. `null` means "this layout carries no self
+   * link", never "the link was missing" — a v3 that omits it is refused as UNKNOWN_LAYOUT and never
+   * reaches here.
+   */
+  prevOwnHash: Uint8Array | null;
 }
 
 export type Structure1DecodeResult =
@@ -87,9 +121,16 @@ export type Structure1DecodeResult =
  *   v1: [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp]
  *   v2: [2, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp,
  *        last_seen_hash(32)]
+ *   v3: [3, …the same six…, last_seen_hash(32), prev_own_hash(32)]
  *
  * `lastSeenHash` ABSENT ⇒ v1, six fields, byte-identical to the pinned v1 vector. PRESENT ⇒ v2.
- * The version tag is what disambiguates, so the two can never be confused by a reader.
+ * `prevOwnHash` PRESENT as well ⇒ v3. The version tag is what disambiguates, so no two layouts can
+ * be confused by a reader, and the v1 and v2 vectors are unchanged by the addition.
+ *
+ * ⚠️ `prev_own_hash` IS A VALUE, NEVER AN ABSENCE — the same rule as `last_seen_hash` and the same
+ * reason. A sender's first message in a session has no predecessor, and that case is
+ * `computeGenesisPrevRoot` for the session: not 32 zero bytes, which would be presentable for any
+ * session, and not a shorter array, which is refused.
  *
  * ⚠️ `last_seen_hash` IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing,
  * and that case is a defined 32-byte value: `computeGenesisPrevRoot` for the session — the agreed
@@ -109,6 +150,14 @@ export function encodeStructure1(fields: {
   lastSeenSeq: number;
   timestamp: number;
   lastSeenHash?: Uint8Array;
+  /**
+   * The sender's OWN previous message in this session — `DOD-M15-SELFCHAIN-1`. Supplying it selects
+   * v3 and is what makes the conversation a chain rather than a set of cross-acknowledgements.
+   *
+   * A sender's FIRST message in a session has no predecessor, and that case is a defined 32 bytes:
+   * `computeGenesisPrevRoot` for the session. Never omitted to mean "first" — see the header.
+   */
+  prevOwnHash?: Uint8Array;
 }): Uint8Array {
   const ts = fields.timestamp > 0xffffffff ? BigInt(fields.timestamp) : fields.timestamp;
   const head = [
@@ -133,7 +182,20 @@ export function encodeStructure1(fields: {
       `structure1: last_seen_hash must be ${LAST_SEEN_HASH_BYTES} bytes, got ${fields.lastSeenHash.length}`,
     );
   }
-  return encodeCbor([STRUCTURE1_VERSION_V2, ...head, fields.lastSeenHash]);
+  if (fields.prevOwnHash === undefined) {
+    return encodeCbor([STRUCTURE1_VERSION_V2, ...head, fields.lastSeenHash]);
+  }
+  if (fields.prevOwnHash.length !== PREV_OWN_HASH_BYTES) {
+    // Thrown for the same reason the ack hash is: a caller that meant to chain to its own previous
+    // message and cannot must find out HERE, at the last point before these bytes are signed.
+    // Silently emitting v2 instead would be the downgrade this layout exists to close — and unlike
+    // the ack hash, a missing self-link is invisible in a single message and only shows up later,
+    // as a conversation whose order cannot be proven.
+    throw new Error(
+      `structure1: prev_own_hash must be ${PREV_OWN_HASH_BYTES} bytes, got ${fields.prevOwnHash.length}`,
+    );
+  }
+  return encodeCbor([STRUCTURE1_VERSION_V3, ...head, fields.lastSeenHash, fields.prevOwnHash]);
 }
 
 /** Bytes at `i` of exactly `len`, tolerating a Buffer from a decoder that produced one. */
@@ -165,7 +227,8 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
   const version = arr[0];
   const isV1 = version === STRUCTURE1_VERSION && (arr.length === 6 || arr.length === 7);
   const isV2 = version === STRUCTURE1_VERSION_V2 && arr.length === 7;
-  if (!isV1 && !isV2) return { ok: false, reason: STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT };
+  const isV3 = version === STRUCTURE1_VERSION_V3 && arr.length === 8;
+  if (!isV1 && !isV2 && !isV3) return { ok: false, reason: STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT };
 
   const contentHash = bytesAt(arr, 1, 32);
   const senderPubkey = bytesAt(arr, 2, 32);
@@ -207,15 +270,28 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
   // A v1 seven-array's index 6 is a SUBMISSION ID and is not read here — it is the relay's concern,
   // and reading it as an ack hash is exactly the confusion the version tag prevents.
   let lastSeenHash: Uint8Array | null = null;
-  if (isV2) {
+  if (isV2 || isV3) {
     lastSeenHash = bytesAt(arr, 6, LAST_SEEN_HASH_BYTES);
     if (lastSeenHash === null) {
       return { ok: false, reason: STRUCTURE1_DECODE_REASONS.LAST_SEEN_HASH_MALFORMED };
     }
   }
 
+  // `DOD-M15-SELFCHAIN-1`. Present-but-wrong is refused, never dropped to null: a v3 whose self link
+  // is unreadable is a chain nobody can check, and admitting it without the field would make a
+  // corrupt link indistinguishable from an honest v2 that never claimed one.
+  let prevOwnHash: Uint8Array | null = null;
+  if (isV3) {
+    prevOwnHash = bytesAt(arr, 7, PREV_OWN_HASH_BYTES);
+    if (prevOwnHash === null) {
+      return { ok: false, reason: STRUCTURE1_DECODE_REASONS.PREV_OWN_HASH_MALFORMED };
+    }
+  }
+
   return {
     ok: true,
-    fields: { version, contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp, lastSeenHash },
+    fields: {
+      version, contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp, lastSeenHash, prevOwnHash,
+    },
   };
 }

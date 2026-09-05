@@ -1,0 +1,16 @@
+{
+  "description": "035-SELFCHAIN: Structure 1 v3 canonical CBOR fixture — prev_own_hash appended at index 7. RFC 8949 §4.2.1.",
+  "_note": "Canonical CBOR of the 8-element positional TBS array for protocol_version=3. Inputs 1-6 are byte-for-byte the ones in structure1-v2-canonical.json, so the three files together prove the field is APPENDED and no existing index moved: strip the leading '8803' and the trailing 32-byte hash from this hex, and the remainder is the v2 hex after its leading '8702'.",
+  "_why": "prev_own_hash is the content hash of the SENDER'S OWN previous message in this session. last_seen_hash chains a sender to the counterparty; this chains them to themselves. Without it, two messages sent back to back are indistinguishable in the signed bytes — both acknowledge the same message from the other side — so whoever hands the conversation to a new relay can swap them. A sender's first message in a session carries computeGenesisPrevRoot for that session, never zeros.",
+  "inputs": {
+    "protocol_version": 3,
+    "content_hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sender_pubkey_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "session_id_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "last_seen_seq": 3,
+    "timestamp": 1700000000000,
+    "last_seen_hash_hex": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+    "prev_own_hash_hex": "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
+  },
+  "expected_cbor_hex": "88035820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd50eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee031b0000018bcfe568005820a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a75820b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
+}
