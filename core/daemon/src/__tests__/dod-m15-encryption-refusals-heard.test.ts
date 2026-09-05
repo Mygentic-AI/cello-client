@@ -156,6 +156,8 @@ describe("the encryption gate's refusals are HEARD, not just logged", () => {
         seen.push(n!.reason);
         expect(n!.guidance, `${prefix}: the operator is left waiting for a message that may have arrived`)
           .toMatch(/MAY STILL REACH YOU BY THE OTHER ROUTE/);
+        expect(n!.guidance, `${prefix}: and it must not promise a route it cannot describe`)
+          .toMatch(/if they are not running CELLO, there is no such copy/);
       } finally {
         await f.cleanup();
       }
@@ -163,6 +165,65 @@ describe("the encryption gate's refusals are HEARD, not just logged", () => {
     // The three are DISTINCT causes, not one sentence wearing three names.
     expect(new Set(seen).size, "three causes, three reasons").toBe(3);
   }, 120_000);
+});
+
+describe("the OTHER ROUTE is promised only when this machine can actually take it", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  it("★★★ an agent that cannot open a mailbox copy is told SO, not told to wait", async () => {
+    /**
+     * ⚠️ **THE PROMISE WAS FALSE EXACTLY WHERE THE REFUSAL NAMED ITS OWN CAUSE** — review F2, and
+     * the assertion that catches it is not "is the sentence there" but "is the sentence true".
+     *
+     * Opening a mailbox copy needs `KeyProvider.openContentSeal`, which is documented OPTIONAL: a
+     * threshold or signing-only provider does not implement it, and an agent loaded without a
+     * provider has none at all. `content-park.ts` refuses both. That is the SAME condition
+     * `no_local_identity` reports — so on the one refusal that names a missing local identity, the
+     * operator was told to wait for a delivery that could never run, permanently, for every message
+     * on every session of that agent.
+     *
+     * Driven the way production reaches it: a manager with NO key provider resolver, which is what
+     * an agent loaded without its identity key looks like from here.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-encref-noroute-" });
+    // The daemon wires a resolver at startup; strip it, which is the state an agent with no loadable
+    // identity key leaves behind.
+    fx.snm.setKeyProviderResolver(() => undefined);
+    await fx.snm.createSessionNode(SID, "alice", "bb".repeat(32), PEER, "corr");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, frame({}), PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice!.reason).toBe("no_session_key");
+    expect(
+      notice!.guidance,
+      "this machine cannot open a mailbox copy either — promising one is a delivery that can never happen",
+    ).not.toMatch(/MAY STILL REACH YOU BY THE OTHER ROUTE/);
+    expect(
+      notice!.guidance,
+      "and it says so, rather than going quiet about it — one cause shuts both routes",
+    ).toMatch(/WILL NOT REACH YOU BY THE OTHER ROUTE EITHER/);
+    expect(notice!.guidance, "with the operator's actual next step: load the identity key").toMatch(/identity key/i);
+  }, 60_000);
+
+  it("★ the same refusal on an agent that CAN open one keeps the reassurance", async () => {
+    /**
+     * The positive control. Without it, deleting the sentence everywhere would pass the test above
+     * — the check has to distinguish two machines, not merely dislike one string.
+     */
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-encref-route-" });
+    await fx.snm.createSessionNode(SID, "alice", "bb".repeat(32), PEER, "corr");
+
+    await fx.snm.handleContentFrameForTest("alice", SID, frame({}), PEER);
+
+    const [notice] = fx.snm.takeContentRefusals("alice", SID, "op");
+    expect(notice!.reason).toBe("no_session_key");
+    expect(
+      notice!.guidance,
+      "a file-backed identity key CAN open a mailbox copy, so the reassurance is true here",
+    ).toMatch(/MAY STILL REACH YOU BY THE OTHER ROUTE/);
+  }, 60_000);
 });
 
 describe("the encryption gate still refuses — the notice is an addition, not a substitution", () => {

@@ -437,7 +437,7 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
     const recovered = await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr");
 
     expect(recovered.ok, "the mailbox copy is accepted on the envelope's signature — unchanged, and correct").toBe(true);
-    const reconciled = fx.eventsNamed("content.recover.authorship_refusal_reconciled").at(-1);
+    const reconciled = fx.eventsNamed("content.recover.refusal_reconciled").at(-1);
     expect(
       reconciled,
       "without this line the operator reads REFUSED, watches the message arrive, and has nothing connecting the two",
@@ -470,7 +470,7 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
     expect((await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr")).ok).toBe(true);
 
     expect(
-      fx.eventsNamed("content.recover.authorship_refusal_reconciled"),
+      fx.eventsNamed("content.recover.refusal_reconciled"),
       "an ordinary parked message must not carry an alarm about a refusal that never happened",
     ).toHaveLength(0);
   }, 60_000);

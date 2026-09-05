@@ -34,6 +34,7 @@ import {
 import {
   CONTENT_ENCRYPTION_REASONS,
   CONTENT_ENCRYPTION_GUIDANCE,
+  CONTENT_ENCRYPTION_INBOUND_GUIDANCE,
   SESSION_CONTENT_ENCRYPTION_V1,
   type ContentEncryptionReason,
 } from "./content-encryption-status.js";
@@ -440,7 +441,13 @@ export interface AbandonNoticeResult {
  * A LOST one must be, and `cello_send` has already said so. `unknown` means do not claim either.
  */
 export interface SessionImpairment {
-  cause: "direct_send" | "delivery_ack";
+  /**
+   * `content_key` added by `029c` review F7: a send that failed because this machine had no content
+   * encryption key — never agreed, or gone between the preflight and the seal — is a LOCAL key
+   * fault, not a transport one. Reported as `direct_send` it sent the operator to inspect a
+   * connection that was working.
+   */
+  cause: "direct_send" | "delivery_ack" | "content_key";
   retained: "parked" | "durable" | "lost" | "unknown";
 }
 
@@ -923,22 +930,48 @@ const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
 
 /**
- * ⚠️ **EVERY INBOUND REFUSAL SAYS THIS, BECAUSE THE REFUSAL DOES NOT HOLD.**
+ * ⚠️ **THE REFUSALS THAT SAY THIS ARE THE ONES WHERE THE REFUSAL DOES NOT HOLD — NOT ALL OF THEM.**
  *
- * Refusing an inbound frame sends back no delivery acknowledgement, so the sender's TTF backstop
- * parks a copy in the relay mailbox — sealed to this agent's LONG-TERM IDENTITY key, not the
- * session key — and recovery opens that one whatever went wrong with the direct copy. The message
- * therefore tends to arrive seconds later by the other route.
+ * It said "EVERY INBOUND REFUSAL SAYS THIS", and review F5 measured that: fifteen call sites file a
+ * refusal notice in this file and four carry this sentence — the three encryption causes and the
+ * authorship one. The rest MUST NOT. A screened-out message is deliberately never delivered by any
+ * route, and a transcript write failure lost content that was already accepted; promising either
+ * operator a second chance would be a lie in the opposite direction. Rewritten rather than deleted,
+ * because "EVERY" read as a rule and the next person to add a refusal would have applied it blindly.
  *
- * Saying so is not a hedge, it is the difference between an operator who waits and one who knows
- * what they are looking at. Every wording that claimed "nothing was stored" full stop was describing
- * one copy and reading as a verdict on the message.
+ * Where it DOES apply: refusing an inbound frame sends back no delivery acknowledgement, so a CELLO
+ * sender's TTF backstop parks a copy in the relay mailbox — sealed to this agent's LONG-TERM
+ * IDENTITY key, not the session key — and recovery opens that one whatever went wrong with the
+ * direct copy.
+ *
+ * ⚠️ AND ONLY WHEN THIS MACHINE CAN OPEN ONE. See `REFUSAL_NO_OTHER_ROUTE`; the choice is made by
+ * `#mailboxRouteAvailable`, never by a caller writing the sentence into a literal.
  */
 const REFUSAL_MAY_STILL_ARRIVE =
-  "IT MAY STILL REACH YOU BY THE OTHER ROUTE: a refusal sends back no acknowledgement, so their " +
-  "agent parks a copy in the relay mailbox and this side opens that one with your long-term key " +
-  "instead of this session's. If it arrives, it arrives without whatever this check was unable to " +
-  "confirm.";
+  "IT MAY STILL REACH YOU BY THE OTHER ROUTE: a refusal sends back no acknowledgement, so a CELLO " +
+  "counterparty's agent parks a copy in the relay mailbox and this side opens that one with your " +
+  "long-term key instead of this session's. If it arrives, it arrives without whatever this check " +
+  "was unable to confirm — and if they are not running CELLO, there is no such copy and it will " +
+  "not arrive.";
+
+/**
+ * ⚠️ **THE OTHER ROUTE DOES NOT EXIST ON THIS MACHINE, AND SAYING SO IS THE POINT** — review F2.
+ *
+ * Opening a mailbox copy needs `KeyProvider.openContentSeal`, which is OPTIONAL: a threshold or
+ * signing-only provider does not implement it, and an agent loaded without a provider has none at
+ * all. `content-park.ts` refuses both — `signing_key_unavailable`, `cannot_unseal`.
+ *
+ * That is the SAME condition `CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY` reports. So on the one
+ * refusal that names a missing local identity, the reassurance above was false: both routes are shut
+ * by one cause, permanently, for every message on every session of that agent — and the operator was
+ * told to wait for a delivery that cannot happen. That is the H1 defect exactly: a refusal
+ * announcing a better outcome than it delivers.
+ */
+const REFUSAL_NO_OTHER_ROUTE =
+  "AND IT WILL NOT REACH YOU BY THE OTHER ROUTE EITHER: the relay mailbox copy is opened with this " +
+  "agent's long-term identity key, which is the very thing this machine is missing. One cause shuts " +
+  "both routes, and it will keep shutting them until the agent is loaded with its identity key. Do " +
+  "not wait for this message to turn up.";
 
 /**
  * Constant-shape byte equality for the two binding checks. Lifted rather than hand-rolled a second
@@ -1969,9 +2002,12 @@ export class SessionNodeManager {
    */
   #unreadableAlgSeen = new Map<string, Map<string, string>>();
   /**
-   * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1 — the content hashes this side refused for having no
-   * usable proof of authorship, so the park path can say so when the same message arrives the
-   * other way.
+   * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1, widened by `029c` review F4 — the content hashes this
+   * side refused ON THE DIRECT PATH, for any reason, so the park path can say so when the same
+   * message arrives the other way.
+   *
+   * One map rather than one per refusal: what the park path needs to know is "did we turn this
+   * content away and tell somebody so", and the reason is already on the notice.
    *
    * **The silence this closes.** A direct-path refusal sends no delivery ACK, so the sender's TTF
    * backstop parks the message and it arrives through the relay mailbox seconds later — where the
@@ -1984,7 +2020,7 @@ export class SessionNodeManager {
    * entry costs one reconciliation line and an unbounded map would be a leak with a peer's hand on
    * the tap.
    */
-  #unprovenAuthorshipSeen = new Map<string, Set<string>>();
+  #refusedOnDirectPath = new Map<string, Set<string>>();
   // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
   // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
   // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
@@ -5974,7 +6010,7 @@ export class SessionNodeManager {
   #markSessionImpaired(
     agentName: string,
     sessionId: string,
-    opts: { cause: "direct_send" | "delivery_ack"; error: string; correlationId?: string },
+    opts: { cause: "direct_send" | "delivery_ack" | "content_key"; error: string; correlationId?: string },
   ): void {
     const key = this.#k(agentName, sessionId);
     const prior = this.#sessionLiveness.get(key);
@@ -6499,7 +6535,7 @@ export class SessionNodeManager {
     this.#terminalRefusalsLoaded.delete(key);
     this.#terminalRefusalsReadFailedAt.delete(key);
     this.#unreadableAlgSeen.delete(key);
-    this.#unprovenAuthorshipSeen.delete(key);
+    this.#refusedOnDirectPath.delete(key);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
@@ -8818,6 +8854,11 @@ export class SessionNodeManager {
        * A window cannot be closed by reasoning about who wins it, only by removing it: nothing may
        * run between the read and the seal. The preflight above stays because failing before a stream
        * is opened is worth one extra read.
+       *
+       * ⚠️ THIS CLOSES THE LOCAL WINDOW AND NOT THE CLASS (review F8). The sender still seals at T
+       * and the receiver still decrypts at T+flight, so a re-key landing in THAT interval produces
+       * the same false tamper report. What is removed is the part this side controls; the rest is a
+       * property of there being two machines.
        */
       const sealState = this.#contentEncryptionState(agentName, sessionId);
       if (sealState.key === null) {
@@ -8878,7 +8919,17 @@ export class SessionNodeManager {
       this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
       return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
-      this.#markSessionImpaired(agentName, sessionId, { cause: "direct_send", error: err instanceof Error ? err.message : String(err), correlationId });
+      /**
+       * Review F7: a content-key fault is NOT a transport fault, and labelling it `direct_send`
+       * points the operator at the connection when the connection is fine. `content_not_encryptable`
+       * is thrown twice above — once before the stream is opened, once at the seal — and both are
+       * about this machine's key state.
+       */
+      const failure = err instanceof Error ? err.message : String(err);
+      this.#markSessionImpaired(agentName, sessionId, {
+        cause: failure.startsWith("content_not_encryptable") ? "content_key" : "direct_send",
+        error: failure, correlationId,
+      });
       if (sendStream !== undefined) {
         try { sendStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -9459,10 +9510,10 @@ export class SessionNodeManager {
    * Bounded for the same reason and by the same cap as `#noteUnreadableAlgFrame`: a peer sending
    * unprovable frames feeds this map, so it drops the oldest rather than growing.
    */
-  #noteUnprovenAuthorshipFrame(agentName: string, sessionId: string, contentHash: Uint8Array): void {
+  #noteRefusedOnDirectPath(agentName: string, sessionId: string, contentHash: Uint8Array): void {
     const key = this.#k(agentName, sessionId);
-    let hashes = this.#unprovenAuthorshipSeen.get(key);
-    if (!hashes) { hashes = new Set(); this.#unprovenAuthorshipSeen.set(key, hashes); }
+    let hashes = this.#refusedOnDirectPath.get(key);
+    if (!hashes) { hashes = new Set(); this.#refusedOnDirectPath.set(key, hashes); }
     if (hashes.size >= MAX_UNREADABLE_ALG_FRAMES) {
       const oldest = hashes.values().next();
       if (!oldest.done) hashes.delete(oldest.value);
@@ -13027,7 +13078,7 @@ export class SessionNodeManager {
      * content on the direct path, and the ingest below is what decides whether the other route
      * succeeded. Reading it after would race the clear.
      */
-    const refusedForAuthorship = this.#unprovenAuthorshipSeen.get(memoKey)?.has(contentHashHex) === true;
+    const refusedForAuthorship = this.#refusedOnDirectPath.get(memoKey)?.has(contentHashHex) === true;
     const result = await this.ingestReceivedContent(
       agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
       // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
@@ -13091,14 +13142,23 @@ export class SessionNodeManager {
      * "delivered".
      */
     if (refusedForAuthorship && result.ok && result.held !== true && result.screenedOut !== true) {
-      const hashes = this.#unprovenAuthorshipSeen.get(memoKey);
+      const hashes = this.#refusedOnDirectPath.get(memoKey);
       hashes?.delete(contentHashHex);
-      if (hashes && hashes.size === 0) this.#unprovenAuthorshipSeen.delete(memoKey);
-      this.#logger.warn("content.recover.authorship_refusal_reconciled", {
+      if (hashes && hashes.size === 0) this.#refusedOnDirectPath.delete(memoKey);
+      /**
+       * ⚠️ RENAMED FROM `…authorship_refusal_reconciled` by `029c` review F4, because the memo it
+       * reads now covers EVERY direct-path refusal and not only the authorship one. Keeping the old
+       * name would have put "no usable proof of who wrote it" on a message that was actually
+       * refused for not decrypting — a wrong cause is worse than a general one.
+       *
+       * The specific reason is already on the operator's notice; what this event adds is that the
+       * refusal did not hold.
+       */
+      this.#logger.warn("content.recover.refusal_reconciled", {
         agentName, sessionId, correlationId,
         contentHash: contentHashHex,
-        impact: "THIS EXACT MESSAGE was refused on the direct path for carrying no usable proof of who wrote it, and the same content has now been accepted from the relay mailbox, where the sealed envelope proves the sender. The refusal did not hold: the message WAS delivered by the other route. What is missing is narrower than the refusal implied — this message has no signature of its own in the record, so the receipt can show it arrived and cannot prove which of them wrote that individual line.",
-        guidance: "Nothing to do about this message. The upgrade you were told to ask for is still the fix: once they are on a build that signs each message, the direct path stops refusing and the receipt regains its per-message proof.",
+        impact: "THIS EXACT MESSAGE was refused on the direct path and the same content has now been accepted from the relay mailbox, where the sealed envelope proves the sender. The refusal did not hold: the message WAS delivered by the other route. What the direct path could not confirm is still unconfirmed — the mailbox proves WHO sent it and nothing about the check that refused it — so the receipt can show this message arrived without showing everything a directly-delivered one would.",
+        guidance: "Nothing to do about this message. The fix named on the original refusal still stands: until the cause clears, every message on this session takes the slower route and lands with less attached to it.",
       });
     }
     return result;
@@ -15570,7 +15630,7 @@ export class SessionNodeManager {
      * through the relay mailbox seconds later, where the ENVELOPE's signature authenticates it and
      * recovery accepts it — correctly, and with no per-message proof. So the message may well be
      * delivered, moments after the operator was told it was not. The reconciliation is logged
-     * (`content.recover.authorship_refusal_reconciled`) and the sentence below now says what is
+     * (`content.recover.refusal_reconciled`) and the sentence below now says what is
      * actually true of this path: nothing was shown YET, and this refusal does not stop the copy
      * coming the other way.
      */
@@ -15597,7 +15657,10 @@ export class SessionNodeManager {
        * below pins what it OPENS with, which a truncation cannot survive.
        */
       : "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. " +
-      REFUSAL_MAY_STILL_ARRIVE +
+      // Review F2: chosen from what THIS machine can do, not asserted. An agent with no identity
+      // key cannot open a mailbox copy either, and telling them to wait for one would be the same
+      // false promise on a different refusal.
+      (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
       " Almost always their CELLO build is older than this one: a build from before message signing " +
       "does not attach a signature at all. Ask which version they are running, and tell them to " +
       "upgrade — this will keep happening until they do, and only they can fix it. If they are on " +
@@ -15608,7 +15671,7 @@ export class SessionNodeManager {
     });
     this.noteContentRefusal(agentName, sessionId, reason, { kind: REFUSAL_KINDS.REFUSED, impact, guidance });
     // Armed AFTER the refusal is filed, so the memo can never claim a refusal that did not happen.
-    this.#noteUnprovenAuthorshipFrame(agentName, sessionId, contentHash);
+    this.#noteRefusedOnDirectPath(agentName, sessionId, contentHash);
   }
 
   /**
@@ -15623,17 +15686,44 @@ export class SessionNodeManager {
    * Both surfaces, always: the ERROR is the durable forensic record an investigation reads days
    * later, and the notice is the control — the thing that actually reaches the person.
    */
+  /**
+   * Can a refused message still reach this operator through the relay mailbox? — review F2.
+   *
+   * Feature-detected, not assumed: `openContentSeal` is documented OPTIONAL on `KeyProvider`, and
+   * `content-park.ts` refuses recovery without it. Asking the same resolver `content-park.ts` asks
+   * is what keeps the sentence on the operator's screen tied to what their machine can actually do.
+   */
+  #mailboxRouteAvailable(agentName: string): boolean {
+    const kp = this.#keyProviderResolver?.(agentName);
+    return kp !== undefined && typeof kp.openContentSeal === "function";
+  }
+
   #refuseInboundContent(
     agentName: string,
     sessionId: string,
     reason: string,
+    contentHash: Uint8Array,
     detail: { impact: string; guidance: string } & Record<string, unknown>,
     correlationId?: string,
   ): void {
-    this.#logger.error("session.content.refused", { agentName, sessionId, correlationId, reason, ...detail });
+    // The sentence about the other route is chosen HERE, from what this machine can actually do —
+    // never written into a caller's literal, where it would be a promise nobody re-checked.
+    const guidance = `${detail.guidance} ${this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE}`;
+    this.#logger.error("session.content.refused", { agentName, sessionId, correlationId, reason, ...detail, guidance });
     this.noteContentRefusal(agentName, sessionId, reason, {
-      kind: REFUSAL_KINDS.REFUSED, impact: detail.impact, guidance: detail.guidance,
+      kind: REFUSAL_KINDS.REFUSED, impact: detail.impact, guidance,
     });
+    /**
+     * Review F4 — A PROMISE MADE HERE IS CLOSED IN `recoverParkedEntry`, not left standing.
+     *
+     * The guidance above tells the operator the message may arrive by the mailbox. Both sibling
+     * refusals on this path already arm a memo so the recovery can say the refusal did not hold;
+     * this one armed nothing, so a delivered message would have left a permanent alarm sitting in
+     * `cello_check_notifications` saying it had been turned away.
+     *
+     * Armed AFTER the notice is filed, so the memo can never claim a refusal that did not happen.
+     */
+    this.#noteRefusedOnDirectPath(agentName, sessionId, contentHash);
   }
 
   #recordFrameOrdering(
@@ -16007,22 +16097,25 @@ export class SessionNodeManager {
       const encState = this.#contentEncryptionState(agentName, sessionId);
       let plaintextBody: Uint8Array;
       if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
-        this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", {
+        this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", contentHash, {
           declared: typeof declaredEncryption === "string" ? declaredEncryption : "(absent)",
           impact: "the frame did not say it was encrypted under this session's key, so it was refused unread — nothing was shown and this copy was not kept.",
           guidance:
             "STOPPED ON PURPOSE. A message arrived that was not encrypted under this session's key. " +
             "This build never sends one, so either something between you rewrote the frame, or your " +
             "counterparty is running something that is not CELLO. Confirm with them OUT OF BAND " +
-            "before opening another session. " + REFUSAL_MAY_STILL_ARRIVE,
+            "before opening another session.",
         }, correlationId);
         return;
       }
       if (encState.key === null) {
-        this.#refuseInboundContent(agentName, sessionId, "no_session_key", {
+        this.#refuseInboundContent(agentName, sessionId, "no_session_key", contentHash, {
           detail: encState.reason,
           impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
-          guidance: `${CONTENT_ENCRYPTION_GUIDANCE[encState.reason]} ${REFUSAL_MAY_STILL_ARRIVE}`,
+          // Review F6: the RECEIVE-side wording. The send-side table explains what became of a
+          // message this operator sent, which is the wrong direction entirely for a message they
+          // cannot open.
+          guidance: CONTENT_ENCRYPTION_INBOUND_GUIDANCE[encState.reason],
         }, correlationId);
         return;
       }
@@ -16030,13 +16123,12 @@ export class SessionNodeManager {
       if (opened === null) {
         // GCM's tag is the only thing separating "not for us" from "modified in flight", and this
         // side must not branch on which — that would be branching on attacker-controlled input.
-        this.#refuseInboundContent(agentName, sessionId, "decrypt_failed", {
+        this.#refuseInboundContent(agentName, sessionId, "decrypt_failed", contentHash, {
           impact: "the message did not decrypt under this session's agreed key — it was modified in flight, or it was encrypted under a different key. Refused unread.",
           guidance:
             "STOPPED ON PURPOSE. Nothing was shown and this copy was not kept. A message that fails " +
             "this check has either been altered on its way to you or was not encrypted for this " +
-            "session. Confirm with your counterparty OUT OF BAND, then start a new session. " +
-            REFUSAL_MAY_STILL_ARRIVE,
+            "session. Confirm with your counterparty OUT OF BAND, then start a new session.",
         }, correlationId);
         return;
       }

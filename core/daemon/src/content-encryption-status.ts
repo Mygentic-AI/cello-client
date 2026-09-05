@@ -117,6 +117,48 @@ export const CONTENT_ENCRYPTION_GUIDANCE: Record<ContentEncryptionReason, string
 };
 
 /**
+ * ⚠️ **THE SAME REASONS, TOLD TO THE OTHER DIRECTION** — `029c` review F6.
+ *
+ * `CONTENT_ENCRYPTION_GUIDANCE` above is written for the SEND path: it explains what became of a
+ * message THIS operator tried to send. The inbound refusal (`no_session_key`) was reusing it
+ * verbatim, so an operator who could not open an INCOMING message read advice about their own
+ * outbound mail — *"A message sent before it completes … goes to your counterparty's relay
+ * mailbox"* — two directions and two mailboxes in one paragraph.
+ *
+ * The CAUSE is identical, so the reason set is shared; only the consequence differs, so only the
+ * prose is. Total over the union for the same reason the other map is: a new reason cannot be added
+ * without deciding what it means to the receiving side.
+ */
+export const CONTENT_ENCRYPTION_INBOUND_GUIDANCE: Record<ContentEncryptionReason, string> = {
+  [CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED]:
+    "This conversation had not finished agreeing its encryption key when their message arrived, " +
+    "which normally completes within a second of you both being connected. Nothing is wrong with " +
+    "their message or their build. If it keeps happening, one of you is not staying connected long " +
+    "enough for the exchange to finish.",
+  [CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY]:
+    "THIS machine has no identity key available for this agent, so it cannot take part in the " +
+    "encryption exchange at all — and every conversation it opens has the same problem. Your " +
+    "counterparty did nothing and does not need to change anything. Check that this agent was " +
+    "loaded with its identity key, then start a new conversation.",
+  [CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED]:
+    "THIS side never sent its half of the encryption key, so your counterparty could not finish the " +
+    "exchange and you cannot open what they sent. The fault is local — do not raise it with them. " +
+    "Look for session.key.announce.failed for the connection error; it re-announces on the next " +
+    "connect, so a new conversation usually clears it.",
+  [CONTENT_ENCRYPTION_REASONS.KEY_REFUSED]:
+    "STOPPED ON PURPOSE. The encryption key your counterparty sent could not be tied to them, so " +
+    "this conversation was stopped rather than carried on in the open — which is why their message " +
+    "cannot be opened now. The ordinary cause is a build mismatch. The one that matters is " +
+    "something between you substituting its own key so it can read what you exchange. Confirm with " +
+    "them OUT OF BAND, not over CELLO, before opening another conversation.",
+  [CONTENT_ENCRYPTION_REASONS.PEER_SILENT]:
+    "Your counterparty never sent their half of the encryption key, so there is nothing here to " +
+    "open their message with. They are running the same protocol, so this is not a version " +
+    "difference — either the frame was dropped between you, or their daemon is not answering. " +
+    "Check they are online, then start a new conversation.",
+};
+
+/**
  * Render a reason for an agent.
  *
  * ⚠️ NO UNKNOWN-REASON FALLBACK, deliberately. The value is produced and consumed in one process
