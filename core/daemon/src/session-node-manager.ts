@@ -82,7 +82,7 @@ import { triageOrphanedContent, type OrphanEvidence } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, LEAF_KIND_MSG, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /**
@@ -14097,6 +14097,90 @@ export class SessionNodeManager {
   }
 
   /**
+   * Hand the relay a leaf this agent RECEIVED whose author never submitted it — 034-CARRYLEAF.
+   *
+   * **The attack this closes:** somebody sends you something, declines to have it witnessed, and
+   * seals one message short. The relay's account really does end before their last message, so your
+   * receipt does too — every leaf validly signed, nothing false, the last thing said simply absent.
+   *
+   * **Why this is admissible and not a forgery:** the bytes are theirs, the signature over them is
+   * theirs, and `#verifyAuthorshipClaim` verified it against this session's counterparty before a
+   * word of it was ingested. The relay verifies it again against the directory-signed assignment.
+   * Nothing here is asserted by us except that we received it.
+   *
+   * ⚠️ BEST-EFFORT, AND ITS FAILURE IS NOT SILENT. If the relay cannot be reached, the message is
+   * still delivered and read — refusing it would make the relay a precondition for reading mail,
+   * which is the thing every unit on this path has been careful not to do. What is lost is only the
+   * guarantee that it can enter a receipt, and that surfaces where the operator can act on it: the
+   * seal's own pre-flight refuses a gapped chain by name (`seal_carry_noncontiguous`) with guidance,
+   * so the consequence reaches them at the moment it matters rather than as a log line here.
+   */
+  #witnessReceivedLeaf(
+    agentName: string,
+    sessionId: string,
+    contentHash: Uint8Array,
+    structure1Cbor: Uint8Array,
+    senderSignature: Uint8Array,
+    correlationId?: string,
+  ): void {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) {
+      this.#logger.warn("session.content.witness_received.unavailable", {
+        agentName, sessionId, correlationId,
+        impact:
+          "a message arrived that its sender never had witnessed, and this side has no relay client " +
+          "for the session, so it could not be witnessed here either. It is delivered and readable; " +
+          "it cannot enter a notarized receipt until some party witnesses it.",
+      });
+      return;
+    }
+    void entry.relayClient
+      .witnessReceivedLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_MSG, {
+        structure1Cbor,
+        senderSignature,
+      })
+      .then((res) => {
+        if (res.ok) {
+          this.#logger.info("session.content.witness_received", {
+            agentName, sessionId, correlationId, relaySequence: res.sequence_number,
+            impact:
+              "this side witnessed a message its SENDER did not. The leaf now holds a canonical " +
+              "position, so it can appear in a receipt whatever the sender does next.",
+          });
+          // It has a position now, so it can be acknowledged like any other received message.
+          this.#noteAcknowledgeable(agentName, sessionId, res.sequence_number - 1, contentHash);
+          return;
+        }
+        /**
+         * `counter_submit_duplicate` is NOT a failure and must not be logged as one: it means this
+         * relay already holds the leaf, which is the outcome we wanted. It fires on the ordinary
+         * race where the sender's own submit lands while ours is in flight.
+         */
+        if (res.reason === "counter_submit_duplicate") {
+          this.#logger.info("session.content.witness_received.already_held", {
+            agentName, sessionId, correlationId,
+            impact: "the relay already held this leaf — its sender witnessed it after all, or in parallel with us.",
+          });
+          return;
+        }
+        this.#logger.error("session.content.witness_received.failed", {
+          agentName, sessionId, correlationId, reason: res.reason,
+          ...(res.detail === undefined ? {} : { detail: res.detail }),
+          impact:
+            "a message arrived that its sender never had witnessed, and this side could not witness " +
+            "it either. It is delivered and readable. What is at risk is the RECEIPT: if this " +
+            "message is still unwitnessed when the conversation is sealed, the seal will refuse a " +
+            "gapped chain by name rather than quietly leaving it out.",
+        });
+      })
+      .catch((err: unknown) => {
+        this.#logger.error("session.content.witness_received.threw", {
+          agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        });
+      });
+  }
+
+  /**
    * Record that a message ARRIVED and was accepted at a known canonical position — 033-ACKEMIT
    * review F1.
    *
@@ -16929,7 +17013,23 @@ export class SessionNodeManager {
          * whatever we hold of the content. That limit is structural to a (position, content) pair
          * and it is what the carried-leaf follow-on closes.
          */
-        if (framedSeq !== null) this.#noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
+        if (framedSeq !== null) {
+          this.#noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
+        } else {
+          /**
+           * ─── WITNESS WHAT THEY DID NOT — 034-CARRYLEAF, and this is the line that closes
+           * `DOD-M15-WITHHOLD-SEAL-1` ────────────────────────────────────────────────────────────
+           *
+           * No ordering record means the sender never asked the relay to witness this message. Two
+           * things look identical from here: their relay was briefly unreachable, or they are
+           * withholding it on purpose so it cannot appear in the receipt. **We do not need to tell
+           * those apart, and that is the point** — the same action repairs both, and it costs the
+           * honest case nothing.
+           *
+           * We hold their signature over their own bytes. So we hand it to the relay ourselves.
+           */
+          void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, correlationId);
+        }
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {

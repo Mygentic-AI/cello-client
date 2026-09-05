@@ -325,6 +325,129 @@ describe("033-ACKEMIT — the OTHER production emitter: an unwitnessed send", ()
   }, 60_000);
 });
 
+describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by the receiver", () => {
+  it("★★ the carried claim goes on the wire VERBATIM — the author's bytes and the author's signature", async () => {
+    /**
+     * ⚠️ **THE HALF THAT MUST BE ASSERTED AT THE WIRE, because both ways of getting it wrong are
+     * invisible from anywhere else.**
+     *
+     * Re-encoding the author's Structure 1 changes the signed bytes, and the relay then refuses a
+     * leaf that is perfectly valid — measured on this exact structure before, where a daemon-local
+     * encoder emitted a timestamp as float64 where the published one promotes to uint64. Re-signing
+     * it is worse: it turns their statement into ours, in a record whose whole value is that each
+     * party's words are their own.
+     *
+     * So the assertion is byte equality on both fields, read back off the frame the client wrote.
+     */
+    const author = generateKeypair();
+    const authorPub = await author.getPublicKey();
+    const contentHash = wireContentHash(BODY);
+    const theirClaim = encodeStructure1({
+      contentHash,
+      senderPubkey: authorPub,
+      sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
+      lastSeenSeq: 3,
+      timestamp: 1_750_000_000_000,
+      lastSeenHash: new Uint8Array(32).fill(0x5a),
+    });
+    const theirSig = await author.sign(theirClaim);
+
+    // OUR client — a different identity entirely. It is witnessing, not authoring.
+    const us = generateKeypair();
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: us,
+      senderPubkey: await us.getPublicKey(),
+      logger: noopLogger,
+    });
+    const relay = makeFakeRelay();
+    const sid = Uint8Array.from(Buffer.from(SID, "hex"));
+    client.registerSession(SID, relay.node, undefined, undefined, GENESIS);
+
+    const submit = client.witnessReceivedLeaf(relay.node, sid, contentHash, LEAF_KIND_MSG, {
+      structure1Cbor: theirClaim,
+      senderSignature: theirSig,
+    });
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "hash_submit_ack", sequence_number: 4 });
+    const res = await submit;
+    client.close();
+
+    expect(res.ok, `the witness submit must go through: ${JSON.stringify(res)}`).toBe(true);
+    const frame = relay.sentFrames.find((f) => f["type"] === "hash_submit");
+    expect(frame, "a hash_submit must reach the wire for this to prove anything").toBeDefined();
+    expect(
+      Buffer.from(frame!["structure1_cbor"] as Uint8Array).toString("hex"),
+      "the AUTHOR's bytes, untouched — a re-encode makes the relay refuse a valid leaf",
+    ).toBe(Buffer.from(theirClaim).toString("hex"));
+    expect(
+      Buffer.from(frame!["sender_signature"] as Uint8Array).toString("hex"),
+      "and the AUTHOR's signature — signing it ourselves would turn their statement into ours",
+    ).toBe(Buffer.from(theirSig).toString("hex"));
+
+    /**
+     * AND OUR OWN ACKNOWLEDGEMENT STATE IS NOT RESTATED INTO IT. `last_seen_seq` and
+     * `last_seen_hash` inside those bytes are the AUTHOR's account of what THEY had seen. This
+     * client's own seed is the genesis; if the carried path had rebuilt the claim, index 4 would
+     * read 0 and index 6 would be the genesis instead of theirs.
+     */
+    const arr = decode(frame!["structure1_cbor"] as Uint8Array) as unknown[];
+    expect(arr[4], "their last_seen_seq, not ours").toBe(3);
+    expect(Buffer.from(ackHash(arr)).toString("hex")).toBe(Buffer.from(new Uint8Array(32).fill(0x5a)).toString("hex"));
+  });
+
+  it("★ a message with NO ordering record triggers the witness attempt; one WITH a record does not", async () => {
+    /**
+     * The trigger, at the level that decides it. A sender who witnessed their own leaf needs no
+     * help, and submitting it again would spend a position on a duplicate — the replay the relay
+     * refuses by name.
+     *
+     * The fixture has no reachable relay, so the attempt cannot SUCCEED here; what it can do is
+     * prove the attempt was made, and that it is made for exactly one of the two shapes. The
+     * success path is asserted at the wire above and end to end by the relay's own suite.
+     */
+    const author = generateKeypair();
+    const authorPub = await author.getPublicKey();
+    const contentHash = wireContentHash(BODY);
+    const s1 = encodeStructure1({
+      contentHash, senderPubkey: authorPub,
+      sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
+      lastSeenSeq: 0, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x9c),
+    });
+    const sig = await author.sign(s1);
+    const s2 = encodeCbor([1, authorPub, contentHash, sig]) as Uint8Array;
+
+    const attempts = async (withOrderingRecord: boolean): Promise<number> => {
+      const f = await startTwoConnectionFixture({ dirPrefix: "cello-carryleaf-trigger-" });
+      try {
+        await f.createSession(SID, "alice", Buffer.from(authorPub).toString("hex"), PEER);
+        await f.snm.handleContentFrameForTest(
+          "alice", SID,
+          inboundFrame({ structure1_cbor: s1, sender_signature: sig, ...(withOrderingRecord ? { structure2_cbor: s2 } : {}) }),
+          PEER,
+        );
+        await new Promise((r) => setTimeout(r, 250));
+        expect(
+          f.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received"),
+          "PRECONDITION: the message must be ingested either way — refusing it would make the relay a precondition for reading mail",
+        ).toHaveLength(1);
+        // The session has no relay client, so the attempt announces itself by name here.
+        return f.eventsNamed("session.content.witness_received.unavailable").length;
+      } finally {
+        await f.cleanup();
+      }
+    };
+
+    expect(await attempts(false), "a withheld message MUST be witnessed by its receiver").toBe(1);
+    expect(await attempts(true), "one its sender already witnessed must NOT be re-submitted").toBe(0);
+  }, 120_000);
+});
+
 describe("033-ACKEMIT — what the operator is told when the RELAY refuses", () => {
   /**
    * ⚠️ **THIS SURFACE HAD NO TEST AT ALL, and the guard's own comment invoked the "a refusal nobody
