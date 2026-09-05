@@ -2218,15 +2218,15 @@ async function startDaemonHoldingLock(
     // message as sha256, and the recipient refuses it and re-pulls it forever. The commit that added
     // the column said the producer "passes it"; the producer was passing a value nothing supplied,
     // because these two hooks were never widened.
-    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg) => {
-      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg);
+    onTtf: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind) => {
+      retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind);
     },
     // M12-P12: same durable destination, different cause — a park deposit the relay refused. The
     // TTF timer is already cancelled on this path, so this is the only thing holding the content.
     // M12-P13 (review HIGH-1): the enqueue's own answer is returned, never a bare `true`. A dropped
     // copy that reports success now buys a committed hash-chain leaf for content that is gone.
-    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg) => {
-      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg);
+    onParkFailed: (agentName, sessionId, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind) => {
+      return retryQueue.enqueueAwaitingContent(sessionNodeManager.resolveAgentId(agentName), sessionId, Buffer.from(contentHashHex, "hex"), content, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind);
     },
   });
 
@@ -2516,6 +2516,10 @@ async function startDaemonHoldingLock(
       contentHashAlg: entry.contentHashAlg,
       structure1Cbor: entry.structure1Cbor,
       structure2Cbor: entry.structure2Cbor,
+      // 034-CARRYLEAF: a re-parked message must reach its recipient in a shape they can WITNESS on
+      // the sender's behalf, or a crash re-opens the withholding hole on the mailbox route.
+      structure1Signature: entry.structure1Signature,
+      leafKind: entry.leafKind,
     });
     const client = new ContentParkClient({ relayPeerId: ep.relayPeerId, relayAddrs: [...ep.relayAddrs], logger });
     const res = await client.deposit(node, {

@@ -46,6 +46,17 @@ export interface AwaitingContentEntry {
   sessionId: string;
   contentHashHex: string;
   contentBlob: Uint8Array;
+  /**
+   * 034-CARRYLEAF — the AUTHOR's signature over `structure1Cbor`, and the leaf DOMAIN.
+   *
+   * A message re-parked after a restart must reach its recipient in a shape they can WITNESS on the
+   * sender's behalf, or a crash re-opens the withholding hole on the mailbox route: the recipient
+   * gets the content, cannot prove the ordering claim to the relay, and the message can never enter
+   * a receipt. Both are persisted for the same reason the ordering record is — the in-memory copy
+   * is gone by the time this row is read.
+   */
+  structure1Signature?: Uint8Array;
+  leafKind?: number;
   /** M12-P12 (review F2): the relay's signed ordering record, carried so a RE-park is self-ordering
    *  exactly like the live park. Without it `recoverParkedFromRelay` falls back to the in-memory
    *  #witnessedSeq map, which is empty after a receiver restart — the content then appends at its
@@ -138,6 +149,11 @@ export class RetryQueue {
         content_hash_hex TEXT,
         structure1_cbor BLOB,
         structure2_cbor BLOB,
+        -- 034-CARRYLEAF: the AUTHOR's signature over structure1_cbor, and the leaf DOMAIN. Without
+        -- both, a message re-parked after a restart cannot be witnessed by its recipient, and the
+        -- withholding attack stays open on exactly the path a crash creates.
+        structure1_sig BLOB,
+        leaf_kind INTEGER,
         content_hash_alg TEXT
       )
     `);
@@ -156,6 +172,8 @@ export class RetryQueue {
     for (const col of [
       { name: "structure1_cbor", type: "BLOB" },
       { name: "structure2_cbor", type: "BLOB" },
+      { name: "structure1_sig", type: "BLOB" },
+      { name: "leaf_kind", type: "INTEGER" },
       // DOD-M15-SEALWIRE-1 part B2b: which content-hash algorithm this queued message was hashed
       // under. The crash-backstop park producer has no other source for it — the frame is gone by
       // the time it runs — and re-parking under the wrong one gets the message refused.
@@ -196,7 +214,7 @@ export class RetryQueue {
    */
   loadFromDb(): void {
     const rows = this.#db
-      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, content_hash_alg FROM retry_queue ORDER BY session_id, position ASC")
+      .prepare("SELECT session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, structure1_sig, leaf_kind, content_hash_alg FROM retry_queue ORDER BY session_id, position ASC")
       .all() as unknown as Array<{
         session_id: string;
         agent_id: string | null;
@@ -210,6 +228,8 @@ export class RetryQueue {
         content_hash_alg: string | null;
         structure1_cbor: Buffer | null;
         structure2_cbor: Buffer | null;
+        structure1_sig: Buffer | null;
+        leaf_kind: number | null;
       }>;
 
     this.#queues.clear();
@@ -240,6 +260,8 @@ export class RetryQueue {
           contentHashAlg: row.content_hash_alg ?? undefined,
           structure1Cbor: row.structure1_cbor ? Uint8Array.from(row.structure1_cbor) : undefined,
           structure2Cbor: row.structure2_cbor ? Uint8Array.from(row.structure2_cbor) : undefined,
+          structure1Signature: row.structure1_sig ? Uint8Array.from(row.structure1_sig) : undefined,
+          leafKind: row.leaf_kind ?? undefined,
           queuedAt: row.queued_at,
           position: row.position,
         };
@@ -629,7 +651,7 @@ export class RetryQueue {
    * what `resolveContentHashAlg` reads as "predates the field", and that distinction is the one B1
    * and B2a each had to restore after it was collapsed.
    */
-  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): boolean {
+  enqueueAwaitingContent(agentId: string, sessionId: string, contentHash: Uint8Array, contentBlob: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, leafKind?: number): boolean {
     if (!agentId) throw new Error("enqueueAwaitingContent: an owning agentId is required");
     const contentHashHex = Buffer.from(contentHash).toString("hex");
     const ak = this.#ak(agentId, sessionId);
@@ -660,12 +682,14 @@ export class RetryQueue {
     try {
       this.#db
         .prepare(
-          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, content_hash_alg)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+          `INSERT INTO retry_queue (session_id, agent_id, nonce_hex, content_blob, queued_at, attempts, position, awaiting_ack, content_hash_hex, structure1_cbor, structure2_cbor, structure1_sig, leaf_kind, content_hash_alg)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`,
         )
         .run(sessionId, agentId, contentHashHex, Buffer.from(this.#sealBlob(contentBlob)), queuedAt, 1, position, contentHashHex,
              structure1Cbor ? Buffer.from(structure1Cbor) : null,
              structure2Cbor ? Buffer.from(structure2Cbor) : null,
+             structure1Signature ? Buffer.from(structure1Signature) : null,
+             leafKind ?? null,
              contentHashAlg ?? null);
     } catch (err: unknown) {
       const reason = err instanceof Error ? err.message : String(err);

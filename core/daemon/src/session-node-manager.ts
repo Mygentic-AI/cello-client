@@ -2230,7 +2230,7 @@ export class SessionNodeManager {
   // `persisted` delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels the
   // timer (content.delivery.acked); TTF expiry hands the content to the park backstop.
   // Keyed sessionId → contentHashHex → entry.
-  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }>>();
+  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string; structure1Signature?: Uint8Array; leafKind?: number }>>();
   // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
   // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
   #contentTtfMs = 20_000;
@@ -2243,7 +2243,7 @@ export class SessionNodeManager {
   // Injected after construction because RetryQueue is built later in daemon.ts.
   #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
   // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
   // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
@@ -2317,7 +2317,7 @@ export class SessionNodeManager {
   // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
   // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
   // claim durability — nor commit the leaf that claim now authorises.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean) | null = null;
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -2425,8 +2425,8 @@ export class SessionNodeManager {
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -9103,7 +9103,9 @@ export class SessionNodeManager {
        *
        * So the session key encrypts the copy that goes ON THE WIRE, below, and nothing else.
        */
-      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2, contentHashAlg);
+      // 034-CARRYLEAF: the SIGNED claim and its domain ride the awaiting entry, so a message that
+      // ends up re-parked after a restart still reaches its recipient in a shape they can witness.
+      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, frameS1 ?? orderingS1, orderingS2, contentHashAlg, frameSig, leafKind);
       /**
        * THE WIRE COPY. `content_hash` above was computed over the PLAINTEXT and stays that way: the
        * transcript, the seal and the salted hash all depend on it meaning what it means today, and
@@ -12961,7 +12963,7 @@ export class SessionNodeManager {
    * route reads this map, and a v2 envelope omits the field entirely whenever the value is `sha256`,
    * which is every value in play today. That re-opened the exact finding the fix closed.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, leafKind?: number): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#k(agentName, sessionId);
     let bySession = this.#awaitingAck.get(ackKey);
@@ -12978,7 +12980,7 @@ export class SessionNodeManager {
     // B2b-1 review F2: the algorithm rides WITH the entry. The TTF-expiry park route reads this map
     // minutes later, in-process, and without it that copy names nothing (= sha256) while the direct
     // frame named something else — the same message, two claims about what it is, no restart needed.
-    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor, contentHashAlg });
+    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind });
   }
 
   /**
@@ -13031,7 +13033,7 @@ export class SessionNodeManager {
       // M12-P12 (review pass 2): the ordering record travels on THIS path too. It is in hand — the
       // very next statement hands it to #parkContent — and a TTF row written without it re-parks in
       // arrival order, which is the divergent-leaf-index failure the durable columns exist to stop.
-      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg, entry.structure1Signature, entry.leafKind);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
@@ -13375,6 +13377,28 @@ export class SessionNodeManager {
      * Same reasoning as `priorDeclaredAlg` directly above: the memo says what THIS side did to this
      * content on the direct path, and the ingest below is what decides whether the other route
      * succeeded. Reading it after would race the clear.
+     */
+    /**
+     * ⚠️ **REFUSING AN UNNOTARIZABLE MAILBOX MESSAGE WAS TRIED HERE AND REVERTED — recorded so the
+     * next attempt starts from what actually blocks it, not from the compatibility argument that
+     * does not.**
+     *
+     * The mailbox is the remaining route for the withholding attack: a counterparty who parks a
+     * message with no ordering record AND no signature over its ordering claim delivers something
+     * readable that can never enter a receipt. The obvious fix is to refuse it here.
+     *
+     * **It cannot ship yet, and the reason is our OWN path, not an older peer's.** `SEC-1` AC5 is
+     * explicit: the crash-backstop shape — signed by the sender, no ordering record — is legal and
+     * must be accepted. That envelope is produced when content is queued before anything witnessed
+     * it, and from the recipient's side it is INDISTINGUISHABLE from an attacker's stripped one. So
+     * this refusal rejects our own crash recovery along with the attack.
+     *
+     * **What closes it:** make the crash backstop sign an ordering claim at enqueue time, the way
+     * the live park path now does (`#signOwnContentClaim` already produces exactly this artifact).
+     * Then "no ordering record and no signed claim" is a shape only a modified client emits, and
+     * refusing it costs nothing real. The retry queue already carries the two columns for it —
+     * `structure1_sig` and `leaf_kind` — which were added for this and are populated on the live
+     * path today.
      */
     const refusedForAuthorship = this.#refusedOnDirectPath.get(memoKey)?.has(contentHashHex) === true;
     const result = await this.ingestReceivedContent(
@@ -17106,28 +17130,31 @@ export class SessionNodeManager {
            * We hold their signature over their own bytes. So we hand it to the relay ourselves.
            */
           /**
-           * ⚠️ **THE KIND COMES OFF THE FRAME, AND WITHOUT IT WE DECLINE TO WITNESS — review F5.**
+           * ─── THE KIND COMES OFF THE FRAME, AND A FRAME WITHOUT ONE IS REFUSED ─────────────────
            *
-           * A leaf kind selects a HASH DOMAIN, and documents and rejection envelopes ride this same
-           * frame. Hardcoding `msg` meant a document witnessed on its author's behalf entered the
-           * relay's canonical log described as something it is not. A peer too old to send the field
-           * is left alone rather than guessed at: witnessing their leaf under the wrong domain would
-           * be a worse outcome than not witnessing it, because it puts a wrong statement in the
-           * record instead of leaving a gap the seal can name.
+           * A leaf kind selects a HASH DOMAIN — documents and rejection envelopes ride this same
+           * frame — so witnessing under a guessed domain would put a wrong statement in the
+           * canonical record.
+           *
+           * ⚠️ **THIS USED TO DECLINE TO WITNESS AND DELIVER THE MESSAGE ANYWAY, "because a peer
+           * too old to send the field should be left alone". THAT SENTENCE WAS INHERITED, NOT
+           * DERIVED, AND IT LEFT THE WHOLE ATTACK OPEN.** CELLO is alpha with no users; there is no
+           * older peer to protect. What the leniency actually bought was an opt-out: emit the shape
+           * a 2026-09-04 build emitted, and your message is delivered AND cannot be witnessed —
+           * which is precisely the withholding this line exists to stop, reachable by anyone
+           * willing to modify their client.
+           *
+           * So it is refused. Missing, malformed and mismatched take one path (§5), and a peer that
+           * cannot say which domain its own leaf belongs to has supplied an unusable proof.
            */
           const framedKind = frame["leaf_kind"];
-          if (typeof framedKind === "number") {
-            void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
-          } else {
-            this.#logger.info("session.content.witness_received.kind_unknown", {
-              agentName, sessionId, correlationId,
-              impact:
-                "a message arrived that its sender never had witnessed, and the frame did not say " +
-                "which leaf domain it belongs to — their build predates the field. It was NOT " +
-                "witnessed on their behalf, because witnessing it under a guessed domain would put " +
-                "a wrong statement in the record rather than leave a gap the seal can name.",
-            });
+          if (typeof framedKind !== "number") {
+            this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
+              detail: "leaf_kind_absent",
+            }, correlationId);
+            return;
           }
+          void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
         }
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
