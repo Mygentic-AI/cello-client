@@ -2324,7 +2324,7 @@ async function startDaemonHoldingLock(
     parkRetryTimers.add(timer);
   }
 
-  sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor, contentHashAlg }) => {
+  sessionNodeManager.setContentParkHook(async ({ agentName, sessionId, recipientPubkeyHex, relayPeerId, relayAddrs, contentHashHex, content, structure1Cbor, structure2Cbor, structure1Signature, leafKind, contentHashAlg }) => {
     const node = sessionNodeManager.getStandingReceiverNode();
     if (!node) {
       const reason = "standing_receiver_unavailable";
@@ -2382,6 +2382,10 @@ async function startDaemonHoldingLock(
       contentHashAlg,
       structure1Cbor,
       structure2Cbor,
+      // 034-CARRYLEAF: promotes the envelope to v4 when present, which is what lets the recipient
+      // witness this leaf if its author never does.
+      structure1Signature,
+      leafKind,
     });
     const client = new ContentParkClient({ relayPeerId, relayAddrs: [...relayAddrs], logger });
     const res = await client.deposit(node, {

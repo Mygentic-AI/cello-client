@@ -2330,7 +2330,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
     | null = null;
 
   constructor(opts: {
@@ -2454,7 +2454,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -2539,7 +2539,7 @@ export class SessionNodeManager {
    * when its value is `undefined` — forces each of the three callers to state what this message was
    * hashed under, so a new fourth caller cannot omit it by accident.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): Promise<ParkAttempt> {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, parkLeafKind?: number): Promise<ParkAttempt> {
     // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
     // the live hook refuses (before any deposit), with the same event and the same `cause`.
     if (this.#parkFaultRemaining > 0) {
@@ -2574,6 +2574,11 @@ export class SessionNodeManager {
         // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
         structure1Cbor,
         structure2Cbor,
+        // 034-CARRYLEAF: the author's signature over `structure1Cbor`, so the RECIPIENT can witness
+        // this leaf if its author never does. Without it the mailbox route stays truncatable.
+        structure1Signature,
+        // 034-CARRYLEAF: the leaf DOMAIN, so a recovered leaf is never witnessed under a guess.
+        leafKind: parkLeafKind,
         // B2b: the park route must name the same algorithm the direct frame did, or the recipient
         // verifies the same message two different ways depending on which route it took.
         contentHashAlg,
@@ -8980,6 +8985,16 @@ export class SessionNodeManager {
     // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
     // connection). See the note on #handleContentStream's finally.
     let sendStream: Stream | undefined;
+    /**
+     * 034-CARRYLEAF — HOISTED OUT OF THE TRY so the PARK path in the catch can carry them.
+     *
+     * The park copy is built when the direct send fails, which is inside the catch below; declaring
+     * these in the try left the parked envelope with only the relay-WITNESSED claim, so a message
+     * its author deliberately did not witness was parked with no ordering claim at all and could
+     * never be witnessed by its recipient.
+     */
+    let frameS1: Uint8Array | undefined;
+    let frameSig: Uint8Array | undefined;
     try {
       /**
        * ─── EVERY FRAME CARRIES ITS OWN PROOF — `DOD-M15-AUTHORSHIP-ABSENT-1` ────────────────────
@@ -9003,8 +9018,8 @@ export class SessionNodeManager {
        * widened that window enough to break the live two-node round trip. Measured, not reasoned
        * about: seam-3 went red and both daemons logged `session.key.agreed` before the refusal.
        */
-      let frameS1 = orderingS1;
-      let frameSig = orderingSig;
+      frameS1 = orderingS1;
+      frameSig = orderingSig;
       let frameS2 = orderingS2;
       if (frameS1 === undefined || frameSig === undefined) {
         const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
@@ -9144,6 +9159,21 @@ export class SessionNodeManager {
         // unknown CBOR key, so emitting it is safe for every build in existence; a newer one reads
         // it and verifies under the named algorithm instead of assuming.
         content_hash_alg: contentHashAlg,
+        /**
+         * 034-CARRYLEAF review F5 — WHICH LEAF DOMAIN this content belongs to.
+         *
+         * Documents and rejection envelopes ride this same frame, and the receiver had no way to
+         * recover their kind: it appended them locally as "doc" from its own inspection of the
+         * body, while anything it witnessed on the sender's behalf went to the relay as a MESSAGE
+         * leaf. The certified root is over content hashes, so no root diverges — but the relay's
+         * canonical log and the carried `leaf_kind` would describe the leaf as something it is not,
+         * and a leaf kind selects a HASH DOMAIN everywhere else in this protocol.
+         *
+         * Same argument as `content_hash_alg` beside it: an older peer ignores an unknown CBOR key,
+         * so emitting it is safe for every build in existence, and a receiver that does not see it
+         * declines to witness rather than guessing (see `#witnessReceivedLeaf`).
+         */
+        leaf_kind: leafKind,
       }) as Uint8Array;
       // Injected dial failure — thrown from inside the try so it lands in exactly the catch the
       // real connection_lost lands in, and the whole downstream path (untrack → park → durable
@@ -9218,7 +9248,21 @@ export class SessionNodeManager {
         ...this.#streamCensus(entry.node, entry.counterpartySessionPeerId),
         correlationId,
       });
-      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
+      /**
+       * ⚠️ **THE PARKED COPY CARRIES THE SIGNED CLAIM, NOT ONLY THE WITNESSED ONE — 034-CARRYLEAF
+       * review F1, and this is what closes the withholding attack on the MAILBOX route.**
+       *
+       * It passed `orderingS1`, which exists only when the relay witnessed this leaf — so a message
+       * the sender deliberately did not witness was parked with no ordering claim at all, and the
+       * recipient recovered it holding nothing the relay would accept as proof of authorship. They
+       * could read it and could never put it in a receipt.
+       *
+       * `frameS1`/`frameSig` are the pair the DIRECT frame carries for this same message: the
+       * relay's witnessed claim when there is one, and otherwise a claim this agent signed itself.
+       * Either way it is the author's signature over the author's own ordering claim, which is the
+       * only form the relay accepts when the recipient witnesses on their behalf.
+       */
+      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
@@ -13357,6 +13401,34 @@ export class SessionNodeManager {
      * wired, this line is the difference between an all-clear and a permanent silent discard — and
      * finding that then costs more than the clause costs now.
      */
+    /**
+     * ─── WITNESS A RECOVERED MESSAGE ITS SENDER NEVER WITNESSED — 034-CARRYLEAF review F1 ────────
+     *
+     * The mailbox route's half of the withholding fix. `recoveredSeq` absent means no relay ordering
+     * record came with it, which is the same shape the direct path treats as "their submit never
+     * happened" — and it is reached the same two ways: their relay was briefly unreachable, or they
+     * are withholding on purpose.
+     *
+     * ⚠️ THE SIGNATURE COMES FROM THE ENVELOPE, AND ONLY A v4 ENVELOPE HAS ONE. `parkSig`
+     * authenticates the DEPOSIT — it signs `(session_id, recipient_pubkey, content_hash)` — and the
+     * relay will not accept it, because a counter-submit is admissible only against the author's own
+     * signature over their own ordering claim. A v2 or v3 envelope therefore cannot be witnessed on
+     * its author's behalf, and is left alone rather than guessed at.
+     *
+     * **So this route is closed against a peer running a stock client, and open to one that
+     * deliberately emits an older envelope.** Requiring v4 is the step that closes it completely,
+     * and it waits on nothing in the field emitting v2 or v3 — the same tolerate-then-enforce
+     * sequence every bilateral wire change in this milestone follows.
+     */
+    if (
+      result.ok && result.held !== true && result.screenedOut !== true &&
+      recoveredSeq === null && env.structure1Cbor && env.structure1Signature
+    ) {
+      const kind = env.leafKind;
+      if (typeof kind === "number") {
+        this.#witnessReceivedLeaf(agentName, sessionId, contentHash, env.structure1Cbor, env.structure1Signature, kind, correlationId);
+      }
+    }
     if (priorDeclaredAlg !== undefined && result.ok && result.held !== true && result.screenedOut !== true) {
       // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
       // refusal even when the recovery fails, so the next genuine reconciliation says nothing.
@@ -14094,6 +14166,92 @@ export class SessionNodeManager {
   setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void {
     this.#sessionContentKeys.set(this.#k(agentName, sessionId), Uint8Array.from(key));
     this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
+   * Hand the relay a leaf this agent RECEIVED whose author never submitted it — 034-CARRYLEAF.
+   *
+   * **The attack this closes:** somebody sends you something, declines to have it witnessed, and
+   * seals one message short. The relay's account really does end before their last message, so your
+   * receipt does too — every leaf validly signed, nothing false, the last thing said simply absent.
+   *
+   * **Why this is admissible and not a forgery:** the bytes are theirs, the signature over them is
+   * theirs, and `#verifyAuthorshipClaim` verified it against this session's counterparty before a
+   * word of it was ingested. The relay verifies it again against the directory-signed assignment.
+   * Nothing here is asserted by us except that we received it.
+   *
+   * ⚠️ BEST-EFFORT, AND ITS FAILURE IS NOT SILENT. If the relay cannot be reached, the message is
+   * still delivered and read — refusing it would make the relay a precondition for reading mail,
+   * which is the thing every unit on this path has been careful not to do. What is lost is only the
+   * guarantee that it can enter a receipt, and that surfaces where the operator can act on it: the
+   * seal's own pre-flight refuses a gapped chain by name (`seal_carry_noncontiguous`) with guidance,
+   * so the consequence reaches them at the moment it matters rather than as a log line here.
+   */
+  #witnessReceivedLeaf(
+    agentName: string,
+    sessionId: string,
+    contentHash: Uint8Array,
+    structure1Cbor: Uint8Array,
+    senderSignature: Uint8Array,
+    /** The domain the AUTHOR assigned this leaf, read off their frame — never guessed (review F5). */
+    leafKind: number,
+    correlationId?: string,
+  ): void {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    if (!entry?.relayClient || !entry.relaySessionIdBytes) {
+      this.#logger.warn("session.content.witness_received.unavailable", {
+        agentName, sessionId, correlationId,
+        impact:
+          "a message arrived that its sender never had witnessed, and this side has no relay client " +
+          "for the session, so it could not be witnessed here either. It is delivered and readable; " +
+          "it cannot enter a notarized receipt until some party witnesses it.",
+      });
+      return;
+    }
+    void entry.relayClient
+      .witnessReceivedLeaf(entry.node, entry.relaySessionIdBytes, contentHash, leafKind, {
+        structure1Cbor,
+        senderSignature,
+      })
+      .then((res) => {
+        if (res.ok) {
+          this.#logger.info("session.content.witness_received", {
+            agentName, sessionId, correlationId, relaySequence: res.sequence_number,
+            impact:
+              "this side witnessed a message its SENDER did not. The leaf now holds a canonical " +
+              "position, so it can appear in a receipt whatever the sender does next.",
+          });
+          // It has a position now, so it can be acknowledged like any other received message.
+          this.#noteAcknowledgeable(agentName, sessionId, res.sequence_number - 1, contentHash);
+          return;
+        }
+        /**
+         * `counter_submit_duplicate` is NOT a failure and must not be logged as one: it means this
+         * relay already holds the leaf, which is the outcome we wanted. It fires on the ordinary
+         * race where the sender's own submit lands while ours is in flight.
+         */
+        if (res.reason === "counter_submit_duplicate") {
+          this.#logger.info("session.content.witness_received.already_held", {
+            agentName, sessionId, correlationId,
+            impact: "the relay already held this leaf — its sender witnessed it after all, or in parallel with us.",
+          });
+          return;
+        }
+        this.#logger.error("session.content.witness_received.failed", {
+          agentName, sessionId, correlationId, reason: res.reason,
+          ...(res.detail === undefined ? {} : { detail: res.detail }),
+          impact:
+            "a message arrived that its sender never had witnessed, and this side could not witness " +
+            "it either. It is delivered and readable. What is at risk is the RECEIPT: if this " +
+            "message is still unwitnessed when the conversation is sealed, the seal will refuse a " +
+            "gapped chain by name rather than quietly leaving it out.",
+        });
+      })
+      .catch((err: unknown) => {
+        this.#logger.error("session.content.witness_received.threw", {
+          agentName, sessionId, correlationId, error: extractErrorMessage(err),
+        });
+      });
   }
 
   /**
@@ -16929,7 +17087,45 @@ export class SessionNodeManager {
          * whatever we hold of the content. That limit is structural to a (position, content) pair
          * and it is what the carried-leaf follow-on closes.
          */
-        if (framedSeq !== null) this.#noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
+        if (framedSeq !== null) {
+          this.#noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
+        } else {
+          /**
+           * ─── WITNESS WHAT THEY DID NOT — 034-CARRYLEAF, and this is the line that closes
+           * `DOD-M15-WITHHOLD-SEAL-1` ────────────────────────────────────────────────────────────
+           *
+           * No ordering record means the sender never asked the relay to witness this message. Two
+           * things look identical from here: their relay was briefly unreachable, or they are
+           * withholding it on purpose so it cannot appear in the receipt. **We do not need to tell
+           * those apart, and that is the point** — the same action repairs both, and it costs the
+           * honest case nothing.
+           *
+           * We hold their signature over their own bytes. So we hand it to the relay ourselves.
+           */
+          /**
+           * ⚠️ **THE KIND COMES OFF THE FRAME, AND WITHOUT IT WE DECLINE TO WITNESS — review F5.**
+           *
+           * A leaf kind selects a HASH DOMAIN, and documents and rejection envelopes ride this same
+           * frame. Hardcoding `msg` meant a document witnessed on its author's behalf entered the
+           * relay's canonical log described as something it is not. A peer too old to send the field
+           * is left alone rather than guessed at: witnessing their leaf under the wrong domain would
+           * be a worse outcome than not witnessing it, because it puts a wrong statement in the
+           * record instead of leaving a gap the seal can name.
+           */
+          const framedKind = frame["leaf_kind"];
+          if (typeof framedKind === "number") {
+            void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
+          } else {
+            this.#logger.info("session.content.witness_received.kind_unknown", {
+              agentName, sessionId, correlationId,
+              impact:
+                "a message arrived that its sender never had witnessed, and the frame did not say " +
+                "which leaf domain it belongs to — their build predates the field. It was NOT " +
+                "witnessed on their behalf, because witnessing it under a guessed domain would put " +
+                "a wrong statement in the record rather than leave a gap the seal can name.",
+            });
+          }
+        }
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {

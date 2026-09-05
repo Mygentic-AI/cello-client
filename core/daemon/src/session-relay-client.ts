@@ -394,6 +394,20 @@ function buildWitnessAlertTbs(
  * per-node relayDirSig) against any consortium directory pubkey. Field order/presence MUST match the
  * directory producer (directory-node.ts) and the relay verifier (relay-node.ts recordAssignment).
  */
+/**
+ * 034-CARRYLEAF — a leaf this agent RECEIVED, carried to the relay on its author's behalf.
+ *
+ * The author's own signed bytes and their signature over them, verbatim as they arrived on the
+ * content frame. **Never re-encoded**: the signature is over the ENCODED BYTES, so a decode-and-
+ * re-encode on this path would produce a claim the relay refuses and blame the wrong party for it.
+ */
+export interface CarriedLeafClaim {
+  /** The AUTHOR's `structure1_cbor`, exactly as received. */
+  structure1Cbor: Uint8Array;
+  /** The AUTHOR's signature over those bytes, exactly as received. */
+  senderSignature: Uint8Array;
+}
+
 export interface RelayAssignmentCarry {
   participantA: Uint8Array;            // 32-byte initiator pubkey
   participantB: Uint8Array;            // 32-byte counterparty pubkey
@@ -894,15 +908,44 @@ export class AgentRelayClient {
           // submit's paired in-flight values. Best-effort + separate from the receipt write.
           const structure2Cbor = frame["structure2_cbor"] instanceof Uint8Array ? (frame["structure2_cbor"] as Uint8Array) : undefined;
           if (this.#sealLeafStore && structure2Cbor && structure1Cbor && this.#pendingLeafKind !== null) {
+            /**
+             * ⚠️ **THE AUTHOR COMES FROM THE SIGNED BYTES, AND THE RECEIPT ONLY ATTACHES TO OUR OWN
+             * LEAF — 034-CARRYLEAF review F3.**
+             *
+             * This wrote `senderPubkeyHex: this.senderPubkeyHex` unconditionally, which was true for
+             * as long as the only thing a client could submit was its own leaf. `witnessReceivedLeaf`
+             * ended that: on a counter-submit `structure1Cbor` holds the COUNTERPARTY's bytes, so
+             * this row labelled their leaf as ours — and attached a relay receipt to it, which is the
+             * one thing that must never happen to a leaf we did not author, because a receipt is what
+             * pins OUR leaves to a sequence we could otherwise renumber.
+             *
+             * It was inert on the wire by luck: `sender_pubkey_hex` is not transmitted and the
+             * directory re-derives the author from `structure2_cbor`. It was never inert locally —
+             * the store is `INSERT OR IGNORE` on `(agent, session, sequence)`, and the ack arrives
+             * BEFORE the `leaf_deliver` echo, so this row won and the correct one was silently
+             * dropped.
+             *
+             * Same rule as everywhere else on this path: the identity comes from inside the bytes
+             * the author signed, never from an ambient value that happens to be right today.
+             */
+            const authored = decodeStructure1(structure1Cbor);
+            const authorHex = authored.ok
+              ? Buffer.from(authored.fields.senderPubkey).toString("hex")
+              : this.senderPubkeyHex;
+            const ourOwnLeaf = authorHex === this.senderPubkeyHex;
             this.#sealLeafStore.store(this.senderPubkeyHex, ev.receipt.sessionIdHex, {
               sequenceNumber: seq,
               leafKind: this.#pendingLeafKind,
-              senderPubkeyHex: this.senderPubkeyHex,
+              senderPubkeyHex: authorHex,
               structure2Cbor,
               structure1Cbor,
-              relayId: ev.receipt.relayId,
-              relayTimestamp: ev.receipt.timestamp,
-              relaySignatureHex: ev.receipt.signatureHex,
+              ...(ourOwnLeaf
+                ? {
+                    relayId: ev.receipt.relayId,
+                    relayTimestamp: ev.receipt.timestamp,
+                    relaySignatureHex: ev.receipt.signatureHex,
+                  }
+                : {}),
             }, Date.now());
           }
         } catch (err) {
@@ -1030,6 +1073,56 @@ export class AgentRelayClient {
       // receipt — the relay does not ack-sign a delivery to the recipient). It is pinned at seal by the
       // absent party's sender_signature (unforgeable) + sequence contiguity against our receipt-pinned own
       // leaves. Our OWN echoed leaf is skipped here (it is recorded WITH its receipt on the ack path).
+      /**
+       * ─── OUR OWN LEAF, WITNESSED BY SOMEBODY ELSE — 034-CARRYLEAF review F2 ──────────────────
+       *
+       * ⚠️ **WITHOUT THIS, MAKING THE COUNTERPARTY ABLE TO WITNESS OUR LEAF COST US THE RECEIPT.**
+       *
+       * When the counterparty counter-submits a leaf WE authored, the relay assigns it a position
+       * and delivers it to us — and `authoredByUs` is true, so the capture below skipped it. We
+       * never submitted it ourselves, so no ack ever arrived and the ack path never wrote a row
+       * either. The result was a permanent hole at that position in our own carry: the unilateral
+       * seal refused it as `seal_carry_noncontiguous`, and the bilateral one refused to co-sign a
+       * root it could not judge. **An honest sender whose relay hiccuped once lost the receipt for
+       * the entire conversation** — for a message sitting in their own transcript.
+       *
+       * So the leaf is stored, **with NO relay receipt**, because we hold none: nobody acked it to
+       * us. That asymmetry is exactly the one the seal design already relies on. A bilateral seal
+       * needs a contiguous chain and gets one. A UNILATERAL seal additionally requires every one of
+       * our OWN leaves to carry a receipt — so a party who never witnesses their own messages still
+       * cannot seal alone on them (`unilateral_own_leaf_unwitnessed`), which is precisely what
+       * `DOD-M15-WITHHOLD-SEAL-1` intends.
+       *
+       * `INSERT OR IGNORE` keeps whichever row lands first, and a real receipt-bearing row for the
+       * same position can only come from our own ack — which cannot exist here, or we would have
+       * submitted it ourselves.
+       */
+      if (this.#sealLeafStore && seq >= 0 && authoredByUs && deliveredS1.ok) {
+        const s2Own = frame["structure2_cbor"];
+        if (s2Own instanceof Uint8Array && s1.length > 0) {
+          try {
+            const wrote = this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
+              sequenceNumber: seq,
+              leafKind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
+              senderPubkeyHex: this.senderPubkeyHex,
+              structure2Cbor: s2Own,
+              structure1Cbor: s1,
+            }, Date.now());
+            if (wrote) {
+              this.#logger.info("relay.seal_leaf.own.witnessed_by_counterparty", {
+                seq,
+                session: sidHex,
+                impact:
+                  "a message THIS agent wrote was witnessed by the counterparty rather than by us — " +
+                  "our own submit did not land. The leaf is kept so this conversation can still be " +
+                  "sealed together; sealing it alone would still need a receipt we do not hold.",
+              });
+            }
+          } catch (err) {
+            this.#logger.error("relay.seal_leaf.own.store_failed", { seq, session: sidHex, error: extractErrorMessage(err) });
+          }
+        }
+      }
       if (this.#sealLeafStore && seq >= 0 && !authoredByUs) {
         const s2 = frame["structure2_cbor"];
         const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
@@ -1537,6 +1630,35 @@ export class AgentRelayClient {
   }
 
   /**
+   * ─── WITNESS A LEAF THIS AGENT RECEIVED BUT DID NOT AUTHOR — 034-CARRYLEAF ────────────────────
+   *
+   * **This is what closes `DOD-M15-WITHHOLD-SEAL-1`.** Until it existed, `submitMessageHash` had
+   * one production caller on the SEND path, so nothing ever witnessed a message that was RECEIVED.
+   * A counterparty who delivered a message directly and never submitted its hash left the relay's
+   * account of the conversation one message short — permanently — and a unilateral seal then agreed
+   * with the witness. Every leaf validly signed, nothing false, the last thing said simply absent.
+   *
+   * **The teeth are the author's own signature.** It arrived on the content frame beside the bytes
+   * it signs, this daemon verified it before ingesting anything, and it cannot be forged here. The
+   * relay verifies it again against the session's assignment before sequencing — so what this hands
+   * over is a claim the author made and cannot disown.
+   *
+   * ⚠️ **THE BYTES ARE PASSED THROUGH, NEVER REBUILT.** A signature is over the encoded bytes, and
+   * the one measured cost of forgetting that on this exact structure was a daemon-local encoder
+   * emitting a timestamp as float64 where the published one promotes to uint64 — same value,
+   * different signed bytes, refused by everyone.
+   */
+  async witnessReceivedLeaf(
+    node: CelloNode,
+    sessionId: Uint8Array,
+    contentHash: Uint8Array,
+    leafKind: number,
+    carried: CarriedLeafClaim,
+  ): Promise<SubmitResult> {
+    return this.submitLeaf(node, sessionId, contentHash, leafKind, null, carried);
+  }
+
+  /**
    * Submit a leaf hash of a given kind (0x00 message / 0x02 control) to the relay. The SEAL
    * ctrl leaf rides this path: two distinct-sender ctrl leaves in the relay's
    * log trigger the directory's FROST notarization (relay `#maybeProcessSeal`).
@@ -1585,6 +1707,14 @@ export class AgentRelayClient {
     contentHash: Uint8Array,
     leafKind: number,
     contentBytes: Uint8Array | null,
+    /**
+     * 034-CARRYLEAF — a leaf THIS AGENT DID NOT AUTHOR, carried on its author's behalf.
+     *
+     * Absent for every ordinary send, where this client builds and signs its own claim. Present
+     * only when witnessing something received whose author never submitted it — see
+     * `witnessReceivedLeaf`.
+     */
+    carried?: CarriedLeafClaim,
   ): Promise<SubmitResult> {
     if (contentBytes !== null && leafKind !== LEAF_KIND_CTRL) {
       // Logged at ERROR and returned: a caller reaching this line is trying to hand the relay
@@ -1655,7 +1785,7 @@ export class AgentRelayClient {
     }
     // Chain on the prior submit so only one is outstanding at a time (FIFO). The ack
     // carries no session_id, so concurrent submits on one stream would be ambiguous.
-    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind, contentBytes));
+    const run = this.#submitChain.then(() => this.#doSubmit(node, sessionId, contentHash, leafKind, contentBytes, carried));
     // Keep the chain alive regardless of this submit's outcome.
     this.#submitChain = run.then(() => undefined, () => undefined);
     return run;
@@ -1705,7 +1835,7 @@ export class AgentRelayClient {
    */
   static readonly #RATE_LIMITED_MAX_WAIT_MS = 65_000;
 
-  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null): Promise<SubmitResult> {
+  async #doSubmit(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null, carried?: CarriedLeafClaim): Promise<SubmitResult> {
     const sessionIdHex = Buffer.from(sessionId).toString("hex");
     // Snapshotted BEFORE the first attempt, and it is the whole safety of this loop.
     //
@@ -1724,7 +1854,7 @@ export class AgentRelayClient {
     // this must be discriminated on OUR state, not on the relay's reason string.
     const recordedBefore = this.#sessions.get(sessionIdHex)?.recorded === true;
 
-    let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
+    let result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes, carried);
     for (
       let attempt = 1;
       attempt < AgentRelayClient.#SESSION_NOT_FOUND_ATTEMPTS
@@ -1746,7 +1876,7 @@ export class AgentRelayClient {
         attempt,
         reason: result.reason,
       });
-      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
+      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes, carried);
     }
 
     /**
@@ -1788,7 +1918,7 @@ export class AgentRelayClient {
       });
       await new Promise((r) => setTimeout(r, waitMs));
       if (this.#closed) break;
-      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes);
+      result = await this.#doSubmitOnce(node, sessionId, contentHash, leafKind, contentBytes, carried);
     }
     if (!result.ok && result.reason === "rate_limited") {
       // Option 2, the fallback: it did not clear within our budget, so the caller must hear it
@@ -1815,7 +1945,7 @@ export class AgentRelayClient {
     return result;
   }
 
-  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null): Promise<SubmitResult> {
+  async #doSubmitOnce(node: CelloNode, sessionId: Uint8Array, contentHash: Uint8Array, leafKind: number, contentBytes: Uint8Array | null, carried?: CarriedLeafClaim): Promise<SubmitResult> {
     if (this.#closed) return { ok: false, reason: "relay_client_closed" };
     if (!(await this.#ensureConnected(node))) return { ok: false, reason: "relay_unavailable" };
 
@@ -1868,7 +1998,13 @@ export class AgentRelayClient {
      * signing. A claim that NAMES a position with no hash is the defect, and the receiving daemon
      * refuses exactly that.
      */
-    if (!lastSeen) {
+    /**
+     * ⚠️ NOT FOR A CARRIED LEAF — 034-CARRYLEAF review F8. This branch describes THIS agent having
+     * nothing to acknowledge, and on a counter-submit the acknowledgement inside the bytes is the
+     * AUTHOR's, already made. Logging "this submit acknowledges nothing" about it would be false,
+     * and this daemon's own seed is irrelevant to a claim it did not write.
+     */
+    if (!lastSeen && !carried) {
       /**
        * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE.** Same rule as the content
        * claim's, and the receiving half is `#verifyAcknowledgedContent` — a v1 claim is refused the
@@ -1900,7 +2036,20 @@ export class AgentRelayClient {
     //
     // `lastSeenHash` is passed on EVERY send, so every claim this daemon signs is v2 and binds to
     // content. Nothing here ever passes `undefined` — see the refusal above.
-    const structure1 = encodeStructure1({
+    /**
+     * ⚠️ **A CARRIED LEAF IS SENT VERBATIM AND SIGNED BY NOBODY HERE — 034-CARRYLEAF.**
+     *
+     * When this agent is witnessing something it RECEIVED, the claim already exists: its author
+     * built it, signed it, and put it on the content frame. Re-encoding it would change the signed
+     * bytes and the relay would refuse a leaf that is perfectly valid. Signing it ourselves would be
+     * worse — it would turn their statement into ours, which is the one thing that must never happen
+     * to a record whose whole value is that each party's words are their own.
+     *
+     * So this branch takes the bytes as they arrived, and this agent's own acknowledgement state is
+     * deliberately NOT consulted: `last_seen_seq` and `last_seen_hash` inside those bytes are the
+     * AUTHOR's account of what THEY had seen, and they are not ours to restate.
+     */
+    const structure1 = carried ? carried.structure1Cbor : encodeStructure1({
       contentHash,
       senderPubkey: this.#senderPubkey,
       sessionId,
@@ -1908,7 +2057,7 @@ export class AgentRelayClient {
       timestamp: Date.now(),
       ...(lastSeen ? { lastSeenHash: lastSeen.hash } : {}),
     });
-    const signature = await this.#keyProvider.sign(structure1);
+    const signature = carried ? carried.senderSignature : await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
       type: "hash_submit",
       session_id: sessionId,
