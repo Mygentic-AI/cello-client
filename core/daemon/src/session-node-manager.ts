@@ -8769,13 +8769,14 @@ export class SessionNodeManager {
        * frame and a system that "carries on, degraded" gives up the body while the operator reads a
        * warning they have learned to scroll past. That is why this is a throw and not a warning.
        */
-      const encState = this.#contentEncryptionState(agentName, sessionId);
-      if (encState.key === null) {
+      // FAIL FAST, before a stream is opened for a message that cannot go out. The key this reads is
+      // NOT the one that seals the body — see the read beside `sealSessionContent` below.
+      const preflight = this.#contentEncryptionState(agentName, sessionId);
+      if (preflight.key === null) {
         throw new Error(
-          `content_not_encryptable: ${encState.reason} — ${CONTENT_ENCRYPTION_GUIDANCE[encState.reason]}`,
+          `content_not_encryptable: ${preflight.reason} — ${CONTENT_ENCRYPTION_GUIDANCE[preflight.reason]}`,
         );
       }
-      const sessionKey = encState.key;
       const stream = await this.#openContentStream(agentName, sessionId, entry, correlationId);
       sendStream = stream;
       // AC-001/AC-003: arm the TTF tracking BEFORE the frame goes on the wire. The
@@ -8802,8 +8803,33 @@ export class SessionNodeManager {
        * THE WIRE COPY. `content_hash` above was computed over the PLAINTEXT and stays that way: the
        * transcript, the seal and the salted hash all depend on it meaning what it means today, and
        * the receiver decrypts before it verifies.
+       *
+       * ⚠️ **THE KEY IS READ HERE, ADJACENT TO THE SEAL, AND IT USED TO BE READ FAR ABOVE.**
+       *
+       * The read sat before `#openContentStream`, so the captured key crossed an `await` — several,
+       * once this unit added signing — before it sealed anything. A session key agreed with the
+       * counterparty inside that window left this side sealing under the key it captured while the
+       * far side had already moved on, and **every message was then refused as `decrypt_failed`**:
+       * a false tamper report on honest content, on both sides, for the life of the session.
+       *
+       * Not theoretical. It is what reddened four live-libp2p fixtures when identity keys were first
+       * wired into them — both daemons logged `session.key.agreed`, and the refusal followed.
+       *
+       * A window cannot be closed by reasoning about who wins it, only by removing it: nothing may
+       * run between the read and the seal. The preflight above stays because failing before a stream
+       * is opened is worth one extra read.
        */
-      const wireBody = sealSessionContent(sessionKey, content);
+      const sealState = this.#contentEncryptionState(agentName, sessionId);
+      if (sealState.key === null) {
+        // Reachable only if the key vanished between the preflight and here — a re-key or a
+        // teardown mid-send. Named as its own cause rather than reusing the preflight's, so a log
+        // reader can tell "never had one" from "had one and lost it while sending".
+        throw new Error(
+          `content_not_encryptable: ${sealState.reason} — the key was present when this send began ` +
+          `and gone by the time it sealed. ${CONTENT_ENCRYPTION_GUIDANCE[sealState.reason]}`,
+        );
+      }
+      const wireBody = sealSessionContent(sealState.key, content);
       const frame = encodeCbor({
         type: "content_frame",
         session_id: sessionId,

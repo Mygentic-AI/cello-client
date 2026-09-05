@@ -27,7 +27,11 @@ import { describe, it, expect, afterEach } from "vitest";
 import { encodeCbor } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
 import * as lp from "it-length-prefixed";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { openSessionContent } from "@cello-protocol/crypto";
+import { decode } from "cbor-x";
+import type { CelloNode } from "@cello-protocol/transport";
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 import { wireContentHash } from "../wire-content-hash.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 
@@ -185,5 +189,64 @@ describe("the encryption gate still refuses — the notice is an addition, not a
       fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received"),
       "and a body nobody could open never becomes a delivered message",
     ).toHaveLength(0);
+  }, 60_000);
+});
+
+describe("the session key is read ADJACENT to the seal — the window that made honest mail read as tampering", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  /** Every frame the daemon actually wrote to the wire, decoded. */
+  function sentFrames(node: CelloNode | null): Array<Record<string, unknown>> {
+    const raw = (node as unknown as { sent?: Uint8Array[] } | null)?.sent ?? [];
+    return raw.flatMap((framed) => {
+      for (let off = 0; off < Math.min(4, framed.length); off++) {
+        try { return [decode(framed.subarray(off)) as Record<string, unknown>]; } catch { /* varint prefix */ }
+      }
+      return [];
+    });
+  }
+
+  it("★★★ a key agreed DURING the send seals the body — not the key the send started with", async () => {
+    /**
+     * ⚠️ **THE WINDOW, DRIVEN.** The send used to read the content key, then `await` the content
+     * stream — and, after `DOD-M15-AUTHORSHIP-ABSENT-1`, sign a claim as well — before sealing the
+     * body with the value it had captured. A session key agreed with the counterparty inside that
+     * window left this side sealing under a key the far side had already replaced, and **every
+     * message was then refused as `decrypt_failed`**: a false tamper report on honest content.
+     *
+     * It is not theoretical. It is what reddened four live-libp2p fixtures the moment identity keys
+     * were wired into them, with both daemons logging `session.key.agreed` before the refusal.
+     *
+     * The re-key is injected inside `newStream`, which is precisely where the `await` sits — the
+     * only place a test can stand to see this. The assertion is the OUTCOME a counterparty
+     * experiences: the body on the wire opens under the key that was current when it was sealed.
+     */
+    const REKEYED = new Uint8Array(32).fill(0x33);
+    let node: CelloNode | null = null;
+    fx = await startTwoConnectionFixture({
+      dirPrefix: "cello-keywindow-",
+      node: node = new FakeNode({
+        // The counterparty's half of a key agreement landing mid-send.
+        onNewStream: () => { fx!.snm.setSessionContentKeyForTest("alice", SID, REKEYED); },
+      }) as unknown as CelloNode,
+    });
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, BODY);
+    const res = await fx.snm.sendContent("alice", SID, BODY, hash, "corr", LEAF_KIND_MSG, alg);
+    expect(res.ok, "the send must reach the wire for this to prove anything").toBe(true);
+
+    const frame = sentFrames(node).find((f) => f["type"] === "content_frame");
+    expect(frame).toBeDefined();
+    const onWire = frame!["content_bytes"] as Uint8Array;
+    expect(
+      openSessionContent(REKEYED, onWire),
+      "the counterparty holds the key agreed during the send — the body must open under THAT one",
+    ).not.toBeNull();
+    expect(
+      openSessionContent(AGREED, onWire),
+      "and not under the one the send captured before the stream opened, which is nobody's key now",
+    ).toBeNull();
   }, 60_000);
 });
