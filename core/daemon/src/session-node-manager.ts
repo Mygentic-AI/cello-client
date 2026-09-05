@@ -930,14 +930,14 @@ const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
 
 /**
- * ─── 033-ACKEMIT: the four things that can be wrong with an ACKNOWLEDGEMENT ──────────────────────
+ * ─── 033-ACKEMIT: the three things that can be wrong with an ACKNOWLEDGEMENT ─────────────────────
  *
- * All four are `unusable` — the message is refused and the session lives. None of them is an
+ * All three are `unusable` — the message is refused and the session lives. None of them is an
  * identity fault: by the time any is returned the signature has verified, the signer IS this
  * session's counterparty, and the claim is about this content in this conversation. What is wrong is
  * what the claim says the sender had SEEN.
  *
- * They are four names and not one because the operator's next move differs for each, and because an
+ * They are three names and not one because the operator's next move differs for each, and because an
  * investigator who cannot tell "your counterparty is on an older build" from "your counterparty
  * acknowledged something you never sent" is looking at the wrong half of the problem.
  *
@@ -956,8 +956,6 @@ const AUTHORSHIP_ACK_HASH_MISMATCH = "ack_hash_mismatch";
 /** The claim acknowledges a position beyond anything this side has recorded. */
 const AUTHORSHIP_ACK_HASH_AHEAD = "ack_hash_ahead_of_record";
 
-/** The first message of a session, on a session this side holds no starting point for. */
-const AUTHORSHIP_ACK_HASH_UNCHECKABLE = "ack_hash_uncheckable";
 
 /**
  * The set that routes an `unusable` reason to the acknowledgement wording rather than the generic
@@ -968,7 +966,6 @@ const ACK_HASH_REASONS: ReadonlySet<string> = new Set<string>([
   AUTHORSHIP_ACK_HASH_ABSENT,
   AUTHORSHIP_ACK_HASH_MISMATCH,
   AUTHORSHIP_ACK_HASH_AHEAD,
-  AUTHORSHIP_ACK_HASH_UNCHECKABLE,
 ]);
 
 /**
@@ -2678,6 +2675,24 @@ export class SessionNodeManager {
       // sealed record so it survives a daemon restart and is readable on the cert-read surface
       // (cello_get_sealed_receipt). JSON string with hex-encoded pubkeys; NULL until sealed.
       // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
+      /**
+       * 033-ACKEMIT — THE SESSION'S GENESIS PREV_ROOT, and it is persisted for ONE reason: a
+       * restart.
+       *
+       * It is a pure function of the two participant keys, the session id and the SESSION
+       * TIMESTAMP — and the timestamp arrives on the directory-signed relay assignment and lives
+       * nowhere else. A session restored from this table after a daemon restart re-registers with
+       * no assignment in hand, so without this column the daemon could not say what the first
+       * message of that session acknowledges, and every send on it would be refused rather than
+       * signed. Deriving is still preferred where the assignment IS in memory; this is what makes
+       * the derivation survive the process.
+       *
+       * NULL for every session opened before this column existed. That is not read as "no
+       * acknowledgement needed" — those sessions refuse to submit until they have received
+       * something, and say so with a next step. A silent v1 downgrade is the one thing it must
+       * never mean.
+       */
+      "ALTER TABLE sessions ADD COLUMN genesis_prev_root BLOB",
       "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
       "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
       // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)
@@ -5627,7 +5642,7 @@ export class SessionNodeManager {
         this.#relayClients.set(clientKey, client);
       }
       const sessionIdHexForRelay = Buffer.from(relay.sessionIdBytes).toString("hex");
-      client.registerSession(sessionIdHexForRelay, node, this.#relayLeafHandler(agentName, sessionId, correlationId), relay.assignment);
+      client.registerSession(sessionIdHexForRelay, node, this.#relayLeafHandler(agentName, sessionId, correlationId), relay.assignment, this.#sessionGenesisPrevRoot(agentName, sessionId));
 
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {
@@ -5639,6 +5654,10 @@ export class SessionNodeManager {
         entry.relayAddrs = relay.relayAddrs;
         // Review H1: the dial path needs the credential in hand, not just the endpoint.
         entry.relayAssignment = relay.assignment;
+        // 033-ACKEMIT: the ONE choke point where a session learns its assignment, and therefore the
+        // one place its genesis can be derived and written down before a restart takes the
+        // assignment away with it.
+        if (relay.assignment) this.#persistGenesisPrevRoot(agentName, sessionId, relay.assignment);
         // MSG-2 startup-flush: also PERSIST it, so a restart's crash-backstop flush (which runs
         // before the in-memory entry exists) can deposit un-acked content to the same relay.
         try {
@@ -5754,6 +5773,10 @@ export class SessionNodeManager {
       }
       // registerSession presents the assignment eagerly (see its own comment). No leaf handler: this
       // relay is not witnessing the session, it only needs the binding that authorizes the dial.
+      // 033-ACKEMIT: no genesis is passed and none is needed. This client is not witnessing the
+      // session — it never submits — and `registerSession` derives a seed from the assignment
+      // anyway. Reaching into the session record for one here would also be reaching with the RELAY
+      // session id, which is not the key that record is stored under.
       client.registerSession(sessionIdHex, node, undefined, relay.assignment);
       this.#logger.info("session.relay.assignment.presented_to_reservation_relay", {
         agentName,
@@ -8161,13 +8184,66 @@ export class SessionNodeManager {
    */
   #sessionGenesisPrevRoot(agentName: string, sessionId: string): Uint8Array | undefined {
     const assignment = this.#activeNodes.get(this.#k(agentName, sessionId))?.relayAssignment;
-    if (!assignment) return undefined;
-    return computeGenesisPrevRoot(
-      assignment.participantA,
-      assignment.participantB,
-      Uint8Array.from(Buffer.from(sessionId, "hex")),
-      assignment.sessionTimestamp,
-    );
+    if (assignment) {
+      return computeGenesisPrevRoot(
+        assignment.participantA,
+        assignment.participantB,
+        Uint8Array.from(Buffer.from(sessionId, "hex")),
+        assignment.sessionTimestamp,
+      );
+    }
+    /**
+     * THE RESTART CASE. A session restored from the database re-registers with no assignment, so
+     * the derivation above has nothing to work from and the stored copy is the only answer. Read
+     * second, never first: the live assignment is authoritative, and a stored value that ever
+     * disagreed with it would be the more dangerous of the two to prefer.
+     */
+    const row = this.#db
+      ?.prepare("SELECT genesis_prev_root FROM sessions WHERE agent_id = ? AND session_id = ?")
+      .get(this.#requireAgentId(agentName), sessionId) as { genesis_prev_root?: unknown } | undefined;
+    const stored = row?.genesis_prev_root;
+    const bytes = stored instanceof Uint8Array ? stored : Buffer.isBuffer(stored) ? new Uint8Array(stored) : null;
+    // A stored value of the wrong width is not a genesis. Refusing it here sends the caller down its
+    // own named refusal, which is a better outcome than signing an acknowledgement of 17 bytes.
+    return bytes && bytes.length === 32 ? bytes : undefined;
+  }
+
+  /**
+   * Persist the session's genesis prev_root, once, at the moment the assignment arrives.
+   *
+   * `WHERE genesis_prev_root IS NULL` rather than a plain update: the value cannot legitimately
+   * change for the life of a session, so the second writer is either redundant or wrong, and the
+   * first write is the one derived closest to the assignment that opened the session.
+   */
+  #persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
+    if (!this.#db) return;
+    try {
+      const genesis = computeGenesisPrevRoot(
+        assignment.participantA,
+        assignment.participantB,
+        Uint8Array.from(Buffer.from(sessionId, "hex")),
+        assignment.sessionTimestamp,
+      );
+      this.#db
+        .prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
+        .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
+    } catch (err: unknown) {
+      /**
+       * LOUD, AND IT DOES NOT BLOCK. Losing this row costs the session its acknowledgements after a
+       * restart — sends are then refused by name until the counterparty speaks — and that is a far
+       * smaller harm than failing the session open that is in progress. Reported at ERROR because
+       * the failure is invisible until a restart that may be days away.
+       */
+      this.#logger.error("session.genesis.persist.failed", {
+        agentName, sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact:
+          "this session's starting point was not written to the database. Everything works until " +
+          "this daemon restarts; after that, a send on this session is refused until the " +
+          "counterparty has sent something, because the daemon cannot say what its first message " +
+          "acknowledges.",
+      });
+    }
   }
 
   getSessionTree(agentName: string, sessionId: string): SessionTree {
@@ -8381,7 +8457,7 @@ export class SessionNodeManager {
           entry.extraRelayClientKeys = [...(entry.extraRelayClientKeys ?? []), clientKey];
         }
         // No leaf handler: this relay is not witnessing the session, it only needs the binding.
-        client.registerSession(sessionIdHex, entry.node, undefined, assignment);
+        client.registerSession(sessionIdHex, entry.node, undefined, assignment, this.#sessionGenesisPrevRoot(agentName, sessionId));
         const recorded = await client.recordAssignmentAndWait(entry.node, sessionIdHex);
         if (recorded) {
           this.#logger.info("session.transport.dial_authorized", {
@@ -15740,15 +15816,39 @@ export class SessionNodeManager {
      * identical across every session is one an attacker can present for any session, so the one
      * position most exposed to a forged acknowledgement would be the only one nobody could check.
      */
-    const assignment = this.#activeNodes.get(this.#k(agentName, sessionId))?.relayAssignment;
     if (fields.lastSeenSeq <= 0) {
-      if (!assignment) return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_UNCHECKABLE };
-      const genesis = computeGenesisPrevRoot(
-        assignment.participantA,
-        assignment.participantB,
-        Uint8Array.from(Buffer.from(sessionId, "hex")),
-        assignment.sessionTimestamp,
-      );
+      const genesis = this.#sessionGenesisPrevRoot(agentName, sessionId);
+      /**
+       * ⚠️ **SOFT HERE, AND THIS IS THE ONE BRANCH WHERE THAT IS NOT A FAIL-OPEN — the reasoning is
+       * the load-bearing part, so it is written down rather than assumed.**
+       *
+       * `last_seen_seq` 0 means "I have received nothing from you", and the hash that goes with it
+       * is the session's agreed starting point. It is a genuine value and this daemon always emits
+       * it — but as a CHECK it is close to redundant, because the thing it establishes (that this
+       * claim was made for THIS session) has already been established three lines above by the
+       * session-id binding, against a value derived from the same session id.
+       *
+       * **What an attacker gains by reaching this branch: nothing.** They cannot skip the real
+       * comparison by claiming 0, because claiming 0 is claiming to have acknowledged NOTHING of
+       * ours — it removes their own ratification of our history rather than falsifying it, and the
+       * positional check below is what a claim about our messages has to survive. And they cannot
+       * cause the absence either: whether we hold a genesis depends on our own assignment and our
+       * own database, never on anything they send.
+       *
+       * The alternative was refusing, and it would have been the wrong kind of strict: a session
+       * restored from a row written before this column existed holds no genesis, and every first
+       * message on it would be refused for something the counterparty did not do.
+       */
+      if (!genesis) {
+        this.#logger.info("session.content.ack_hash.genesis_unavailable", {
+          agentName, sessionId,
+          impact:
+            "this message acknowledges nothing yet, and this side holds no recorded starting point " +
+            "for the session, so the acknowledgement was not compared. The message is accepted: it " +
+            "is already bound to this conversation by the session id inside the signed bytes.",
+        });
+        return undefined;
+      }
       return bytesEqual(fields.lastSeenHash, genesis)
         ? undefined
         : { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_MISMATCH };
