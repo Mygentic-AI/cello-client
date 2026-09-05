@@ -112,7 +112,8 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         -- survive a restart, because the session timestamp it is derived from arrives on the relay
         -- assignment and is gone from memory once the process ends. Dropping it on the one boot a
         -- legacy database upgrades is therefore indistinguishable from never having written it —
-        -- and every send on that session is then refused, by name, until the counterparty speaks.
+        -- and that session then acknowledges nothing until the counterparty speaks, so its own
+        -- messages carry no content binding for as long as it stays one-sided.
         genesis_prev_root BLOB,
         -- DOD-M15-FREEZE-STATUS-1, carried for CELLO_Support's lane. Dropping these on upgrade would
         -- un-freeze a session frozen because a party signed with a key that was not the

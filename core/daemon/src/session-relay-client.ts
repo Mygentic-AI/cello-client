@@ -605,9 +605,9 @@ export class AgentRelayClient {
      * Supplied by the caller because `session-node-manager` is where the session record lives. When
      * it is absent an ASSIGNMENT can still produce it (both participant keys and the session
      * timestamp are on the carry), and that covers re-registration of a session whose row predates
-     * the column. When NEITHER is available the session simply has no seed, the first submit finds
-     * no acknowledgement to make, and it is REFUSED by name rather than downgraded to a v1 claim
-     * that asserts nothing.
+     * the column. When NEITHER is available the session has no seed, and its first submit claims
+     * position 0 with no hash — which asserts nothing about content and is therefore honest, rather
+     * than a claim about a position it cannot back.
      */
     genesisPrevRoot?: Uint8Array,
   ): void {
@@ -1857,15 +1857,16 @@ export class AgentRelayClient {
      */
     const lastSeen = this.#lastSeen.get(sessionIdHex);
     /**
-     * ⚠️ REFUSED, NOT DOWNGRADED. A v1 emission from this point is a regression, not a fallback.
+     * ⚠️ **THIS COMMENT USED TO SAY "REFUSED, NOT DOWNGRADED", AND THE CODE UNDER IT DID REFUSE.**
+     * It is rewritten rather than deleted because a comment asserting a refusal that no longer
+     * happens is how the next reader comes to believe a guard exists where there is a fallback.
      *
      * There is no seed only when this session was registered with neither a genesis nor an
-     * assignment to derive one from — which means this daemon cannot say what its first message
-     * acknowledges. Emitting v1 anyway would put a claim on the wire that binds to a POSITION and
-     * not to CONTENT, which is precisely the unbacked number this unit exists to stop signing; and
-     * it would do it silently, on the path an adversary would most like to take. So the send fails
-     * loudly with a cause the operator can act on, and the caller's park/retry backstop keeps the
-     * message itself from being lost.
+     * assignment to derive one from, AND nothing has been received on it. The claim that goes out
+     * then is `last_seen_seq: 0` with no hash — "I have seen nothing of yours" — which is true and
+     * asserts nothing about content, so it is not the unbacked number this unit exists to stop
+     * signing. A claim that NAMES a position with no hash is the defect, and the receiving daemon
+     * refuses exactly that.
      */
     if (!lastSeen) {
       /**
@@ -1976,19 +1977,18 @@ export class AgentRelayClient {
   }
 
   /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
-  lastSeenSeq(sessionIdHex: string): number {
-    return this.#lastSeen.get(sessionIdHex)?.seq ?? 0;
-  }
-
   /**
    * The POSITION and the CONTENT AT IT together — 033-ACKEMIT.
    *
-   * ⚠️ EXISTS SO THE OTHER EMITTER CANNOT TAKE ONE WITHOUT THE OTHER. `session-node-manager`'s
-   * unwitnessed content claim reads `lastSeenSeq()` above; reading the hash through a second
-   * accessor would let a future edit advance one and not the other, and a `last_seen_seq` paired
-   * with a `last_seen_hash` for a different message is worse than no acknowledgement at all —
-   * it looks checkable and fails. `undefined` means this session has no acknowledgement to make,
-   * which the caller must handle rather than fill in.
+   * ⚠️ **IT REPLACED `lastSeenSeq()`, WHICH IS DELETED RATHER THAN LEFT WIRED.** That accessor
+   * returned the position alone, and `session-node-manager`'s unwitnessed content claim was its
+   * only caller. Leaving it in place after this one took over would leave a second way to read half
+   * of a pair that must be read whole: a `last_seen_seq` paired with a `last_seen_hash` for a
+   * different message is worse than no acknowledgement at all, because it looks checkable and
+   * fails.
+   *
+   * `undefined` means this session has no acknowledgement to make, which the caller must handle
+   * rather than fill in.
    */
   lastSeenAck(sessionIdHex: string): { seq: number; hash: Uint8Array } | undefined {
     return this.#lastSeen.get(sessionIdHex);

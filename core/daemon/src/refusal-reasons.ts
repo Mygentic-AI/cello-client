@@ -214,3 +214,34 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "start a new one. If it repeats for the SAME counterparty, do not accept anything from them " +
     "until you have confirmed out of band that they still control the identity you know them by.",
 };
+
+/**
+ * 033-ACKEMIT — what the operator is told when the RELAY refuses to witness a message because the
+ * acknowledgement this daemon signed contradicts the relay's own record.
+ *
+ * ⚠️ **A PURE FUNCTION, AND THAT IS THE POINT.** The two sentences it returns lived inline at the
+ * one call site, which sits behind a real relay answering a real `hash_submit_error` — so nothing in
+ * the suite could reach them, and the guard's own comment invoked the "a refusal nobody hears"
+ * pattern while being, itself, untestable. Review F6 then found the `relay_fault` remedy naming a
+ * move that does not exist ("sending again usually picks a healthy one" — a session keeps the relay
+ * its assignment names, and there is no handover anywhere). Pulling the text out is what lets a test
+ * hold it.
+ *
+ * `relayFault` is `ack_hash_unverifiable`: the relay's counter reached a position its own leaf log
+ * did not, which is a fault on the relay and NOT something either participant did. It is separate
+ * from a mismatch for that reason — sending an operator to ask their counterparty about a problem
+ * the witness caused spends their attention on the wrong party.
+ */
+export function relayAckHashRefusalNotice(relayFault: boolean, mailboxRouteAvailable: boolean): {
+  impact: string;
+  guidance: string;
+} {
+  const impact = relayFault
+    ? "the relay could not check what this agent said it had received, so it did not witness this message. The message was still sent; it has no place in the notarized record."
+    : "the relay REFUSED to witness this message: what this agent signed as the last thing it received from your counterparty does not match what the relay recorded at that position. The message was still sent, and it has no place in the notarized record. Your copy of this conversation and the witness's copy have stopped agreeing.";
+  const guidance = relayFault
+    ? "Nothing to change on your machine — the fault is on the relay this session is bound to, and it cannot be moved: a session keeps the relay its assignment names. Your messages still reach your counterparty; what stops is the notarized record growing. Close the session (cello_close_session) while its record is still worth notarizing, and open a new one, which will be assigned a relay afresh."
+    : "Do NOT rely on a receipt for this conversation until this stops. Send one more message: if it is witnessed, this was a one-off. If it repeats, the two records genuinely disagree — confirm what your counterparty actually sent you OUT OF BAND, then close this session and open a new one." +
+      (mailboxRouteAvailable ? "" : "");
+  return { impact, guidance };
+}

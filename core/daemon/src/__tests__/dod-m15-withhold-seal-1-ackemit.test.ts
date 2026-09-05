@@ -30,6 +30,7 @@ import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { wireContentHash } from "../wire-content-hash.js";
+import { relayAckHashRefusalNotice } from "../refusal-reasons.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 
 const SID = "3c".repeat(32);
@@ -324,6 +325,50 @@ describe("033-ACKEMIT — the OTHER production emitter: an unwitnessed send", ()
   }, 60_000);
 });
 
+describe("033-ACKEMIT — what the operator is told when the RELAY refuses", () => {
+  /**
+   * ⚠️ **THIS SURFACE HAD NO TEST AT ALL, and the guard's own comment invoked the "a refusal nobody
+   * hears" pattern while being itself unreachable from any test.** Deleting the whole
+   * `noteContentRefusal` block left the suite green — the exact shape the block was written to
+   * prevent, one level up.
+   *
+   * The fixture cannot produce a relay refusal (it has no relay answering `hash_submit_error`), and
+   * a test that can only ever produce one value is the hollow shape this milestone keeps finding.
+   * So the SENTENCES moved into a pure function and are held here; that the call site uses them is
+   * held by the typechecker, since there is no second copy of the text to drift.
+   */
+  it("★ the two causes get different sentences, and neither sends the reader to the wrong party", () => {
+    const fault = relayAckHashRefusalNotice(true, true);
+    const mismatch = relayAckHashRefusalNotice(false, true);
+
+    expect(fault.impact).not.toBe(mismatch.impact);
+    expect(fault.guidance).not.toBe(mismatch.guidance);
+
+    // A RELAY fault must not send the operator to their counterparty.
+    expect(fault.guidance, "the fault is on the relay — nothing on this machine to change").toMatch(/fault is on the relay/i);
+    expect(fault.guidance, "and it must not ask them to go and check with the other person").not.toMatch(/counterparty actually sent|out of band/i);
+
+    // A MISMATCH is the one where confirming with the counterparty is the real move.
+    expect(mismatch.guidance).toMatch(/out of band/i);
+  });
+
+  it("★★ the relay-fault remedy does NOT promise a retry onto a different relay — there is no such thing", () => {
+    /**
+     * Review F6. It said "sending again usually picks a healthy one." A session's relay is fixed by
+     * the directory-signed assignment; nothing reassigns one, and relay handover is out of scope.
+     * A resend goes to the SAME relay and produces the SAME refusal — so that sentence spent the
+     * reader's trust as well as their time, which is worse than offering no remedy at all.
+     *
+     * The assertion names the retired promise rather than the replacement, because the replacement
+     * can be reworded and the promise must never come back.
+     */
+    const { guidance } = relayAckHashRefusalNotice(true, true);
+    expect(guidance, "no 'try again and you might get a better relay'").not.toMatch(/picks a healthy|another relay|different relay|try a different/i);
+    expect(guidance, "it says the relay is FIXED for this session").toMatch(/keeps the relay its assignment names/i);
+    expect(guidance, "and it names a move that actually exists").toMatch(/cello_close_session/);
+  });
+});
+
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** An inbound content frame, built the way a real sender builds one. `fields` is spread LAST. */
@@ -351,7 +396,14 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
    * holds with no relay involved at all" means — and it is why withholding a submit no longer
    * dissolves the acknowledgement.
    */
-  async function deliverClaim(opts: { lastSeenSeq: number; lastSeenHash?: Uint8Array }): Promise<{
+  async function deliverClaim(opts: {
+    lastSeenSeq: number;
+    lastSeenHash?: Uint8Array;
+    /** Mark the session diverged before the claim arrives — the state an unwitnessed append leaves. */
+    diverged?: boolean;
+    /** Leave our own leaf HELD rather than placed, which is what an ahead-of-tail position produces. */
+    holdOwnLeafInsteadOfPlacing?: boolean;
+  }): Promise<{
     notice: { reason: string; impact: string; guidance: string } | undefined;
     received: number;
   }> {
@@ -369,9 +421,23 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
 
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-ackemit-" });
     await fx.createSession(SID, "alice", Buffer.from(senderPubkey).toString("hex"), PEER);
-    // OUR OWN leaf at relay position 1 — the message the counterparty is acknowledging. Placed
-    // through the tree the same way a real send places it, so `hashAt(0)` answers what we sent.
-    fx.snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(new Uint8Array(32).fill(0xd1)).toString("hex"), undefined);
+    /**
+     * OUR OWN leaf at relay position 1 — the message the counterparty is acknowledging.
+     *
+     * `holdOwnLeafInsteadOfPlacing` produces the other real state: the relay assigned this leaf a
+     * position ahead of our tail, so `placeOwnLeaf` HELD it and it is not in the tree. The
+     * counterparty already has it and acknowledges it; this side has it and has not placed it.
+     */
+    if (opts.holdOwnLeafInsteadOfPlacing) {
+      fx.snm.holdOwnLeafForTest("alice", SID, 8, Buffer.from(new Uint8Array(32).fill(0xd1)).toString("hex"));
+    } else {
+      fx.snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(new Uint8Array(32).fill(0xd1)).toString("hex"), undefined);
+      // A SECOND leaf, so a genuine positional MISMATCH is expressible: a hash we really do hold,
+      // named at a position where we hold a different one. Without it the only wrong hash available
+      // is one we have never held, which is a different refusal entirely.
+      fx.snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(new Uint8Array(32).fill(0xd2)).toString("hex"), undefined);
+    }
+    if (opts.diverged) fx.snm.markSessionDiverged("alice", SID);
 
     await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({ structure1_cbor: structure1, sender_signature: signature }), PEER);
 
@@ -392,12 +458,21 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      * some other check refused it, so the REASON is named — and the transcript is asserted empty,
      * because the fact that matters to the operator is that nothing was recorded.
      */
-    const { notice, received } = await deliverClaim({ lastSeenSeq: 1, lastSeenHash: new Uint8Array(32).fill(0xee) });
+    const { notice, received } = await deliverClaim({ lastSeenSeq: 1, lastSeenHash: new Uint8Array(32).fill(0xd2) });
     expect(notice, "a refusal nobody hears is indistinguishable from the message never arriving").toBeDefined();
-    expect(notice!.reason).toBe("authorship_unacknowledged");
+    /**
+     * ⚠️ **NAMES THE SPECIFIC CAUSE, NOT THE CLASS** — review F5, and this assertion is what makes
+     * the collapse it found visible. Three different causes previously surfaced under ONE reason
+     * with ONE sentence, and a test asserting the shared name passed for all three: it proved a
+     * refusal was filed, not that the right one was.
+     */
+    expect(notice!.reason).toBe("ack_hash_mismatch");
     expect(received, "a claim we cannot reconcile must not be recorded as delivered").toBe(0);
     // Names what was OBSERVED — never a conclusion about the counterparty the code did not reach.
-    expect(notice!.impact, "the operator is told the two records disagree, not that anyone is lying").toMatch(/does not match your own record/);
+    expect(
+      notice!.impact,
+      "the operator is told WHICH disagreement this is — a different message of theirs in the position they name — not a generic 'records disagree'",
+    ).toMatch(/names a DIFFERENT message of yours in the position/);
     expect(notice!.impact).not.toMatch(/malicious|attack|lying/i);
     expect(notice!.guidance.startsWith("STOPPED ON PURPOSE"), `the notice must OPEN with its framing: ${JSON.stringify(notice!.guidance.slice(0, 60))}`).toBe(true);
     expect(notice!.guidance, "and it must name a next step the reader can perform").toMatch(/out of band/i);
@@ -413,18 +488,17 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
     expect(received, "and the message is delivered").toBe(1);
   }, 60_000);
 
-  it("★ a position BEYOND our record is refused — the branch an attacker reaches for", async () => {
+  it("★ content this side has NEVER held is refused — however the position is chosen", async () => {
     /**
      * WHO CONTROLS THE ABSENCE. `last_seen_seq` is entirely the sender's to choose, so a check that
      * merely SKIPS a position it cannot find would be a free switch for turning the comparison off:
-     * name position 999 and nothing is ever compared.
-     *
-     * It is also not something an honest peer does — they acknowledge a leaf WE authored, which we
-     * placed ourselves, so it is in our tree by the time they can have seen it.
+     * name position 999 and nothing is ever compared. The question asked is therefore about CONTENT
+     * rather than about an index — the hash must be something this side actually holds — and a
+     * chosen-at-will position cannot make that question go away.
      */
-    const { notice, received } = await deliverClaim({ lastSeenSeq: 999, lastSeenHash: new Uint8Array(32).fill(0xd1) });
-    expect(notice, "an unfindable position must REFUSE, never wave through").toBeDefined();
-    expect(notice!.reason).toBe("authorship_unacknowledged");
+    const { notice, received } = await deliverClaim({ lastSeenSeq: 999, lastSeenHash: new Uint8Array(32).fill(0xee) });
+    expect(notice, "content we have never held must REFUSE, never wave through").toBeDefined();
+    expect(notice!.reason).toBe("ack_hash_unknown_content");
     expect(received).toBe(0);
   }, 60_000);
 
@@ -439,9 +513,116 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      */
     const { notice, received } = await deliverClaim({ lastSeenSeq: 1 });
     expect(notice, "an absent acknowledgement of a real position is not a lenient case").toBeDefined();
-    expect(notice!.reason).toBe("authorship_unacknowledged");
+    expect(notice!.reason).toBe("ack_hash_absent");
     expect(received).toBe(0);
-    expect(notice!.guidance, "the likely cause is their build, and only they can fix it").toMatch(/upgrade/i);
+    expect(notice!.guidance, "the likely cause IS their build here, and only they can fix it").toMatch(/upgrade/i);
+    /**
+     * AND THE OTHER TWO MUST NOT SAY THIS. A peer that sends an acknowledgement at all is on a build
+     * NEWER than v1 by construction, so "ask them to upgrade" is impossible as a cause there — which
+     * is exactly what the shared sentence used to tell them.
+     */
+  }, 60_000);
+
+  it("★★ the RECEIVE-side genesis comparison actually compares — clause 3's other half", async () => {
+    /**
+     * ⚠️ **THIS BRANCH HAD NO TEST, and mutating its comparison to `true` reddened nothing.**
+     *
+     * The emitter's genesis bytes were pinned; the RECEIVER's comparison of them was not, so the
+     * suite proved this daemon sends the right starting point and nothing proved it checks the one
+     * it is sent. A peer could have named any 32 bytes as the session's starting point.
+     *
+     * The fixture agrees `0x9c` repeated as the genesis, so a claim naming anything else at position
+     * zero is a claim about a starting point this session does not have.
+     */
+    const wrong = await deliverClaim({ lastSeenSeq: 0, lastSeenHash: new Uint8Array(32).fill(0x11) });
+    expect(wrong.notice, "a wrong starting point at position zero must be refused").toBeDefined();
+    expect(wrong.notice!.reason).toBe("ack_hash_mismatch");
+    expect(wrong.received).toBe(0);
+
+    if (fx) { await fx.cleanup(); fx = null; }
+
+    const right = await deliverClaim({ lastSeenSeq: 0, lastSeenHash: new Uint8Array(32).fill(0x9c) });
+    expect(right.notice, `and the session's real starting point is accepted: ${right.notice?.reason}`).toBeUndefined();
+    expect(right.received, "which is what proves the test above measures a comparison").toBe(1);
+  }, 120_000);
+
+  it("★★ the three causes do NOT share one sentence — each names its own cause and its own remedy", async () => {
+    /**
+     * ⚠️ **THE TEST THAT WOULD HAVE CAUGHT THE COLLAPSE, and it is here because it did not exist.**
+     *
+     * All three causes surfaced under one reason carrying one impact and one guidance — a sentence
+     * written for a fourth situation. For an ABSENT acknowledgement the impact was flatly false
+     * ("the part that says which of your messages they had received does not match" — there is no
+     * such part), and for the other two the guidance told the reader to ask their counterparty to
+     * upgrade, which cannot be the cause: a peer who sends an acknowledgement at all is on a NEWER
+     * build than one that does not.
+     *
+     * The previous tests asserted the SHARED name and passed in all three cases, which is what made
+     * it invisible. This one asserts they DIFFER.
+     */
+    const absent = await deliverClaim({ lastSeenSeq: 1 });
+    if (fx) { await fx.cleanup(); fx = null; }
+    const mismatch = await deliverClaim({ lastSeenSeq: 1, lastSeenHash: new Uint8Array(32).fill(0xee) });
+
+    expect(absent.notice!.reason).not.toBe(mismatch.notice!.reason);
+    expect(absent.notice!.impact).not.toBe(mismatch.notice!.impact);
+    expect(absent.notice!.guidance).not.toBe(mismatch.notice!.guidance);
+
+    // The version remedy belongs to the ABSENT cause and to nothing else.
+    expect(absent.notice!.guidance, "an older build IS the cause here").toMatch(/upgrade/i);
+    expect(
+      mismatch.notice!.guidance,
+      "a peer that sent an acknowledgement is NOT on an older build — sending the operator to ask about a version spends their trust on the wrong question",
+    ).not.toMatch(/upgrade/i);
+    // And neither one accuses anybody.
+    for (const n of [absent.notice!, mismatch.notice!]) {
+      expect(n.impact + n.guidance, "name what was observed, never a conclusion about the peer").not.toMatch(/malicious|lying|attack/i);
+    }
+  }, 120_000);
+
+  it("★★ DIVERGENCE does not switch the check off — the hole the attacker could open themselves", async () => {
+    /**
+     * ⚠️ **THE MOST SECURITY-RELEVANT TEST IN THIS UNIT, and the branch it covers previously had a
+     * WAIVER on it defended by a false sentence.**
+     *
+     * The waiver read: *"Who controls this absence? Not the peer: divergence is caused by OUR submit
+     * failing, and nothing the counterparty sends can produce it."* A counterparty who sends direct
+     * and never submits makes us append unwitnessed, which puts our tree ahead of the relay's
+     * counter, which makes our very next send land behind our own frontier and mark the session
+     * DIVERGED. One withheld message plus one reply from us, and every later acknowledgement was
+     * accepted unchecked — using the exact behaviour the check exists to catch.
+     *
+     * So a diverged session still refuses a hash we have never held. It loses only the POSITIONAL
+     * strengthening, which really is meaningless once indices stop meaning relay positions.
+     */
+    const { notice, received } = await deliverClaim({
+      lastSeenSeq: 1,
+      lastSeenHash: new Uint8Array(32).fill(0xee),
+      diverged: true,
+    });
+    expect(notice, "a diverged session must still refuse content it never held").toBeDefined();
+    expect(notice!.reason).toBe("ack_hash_unknown_content");
+    expect(received).toBe(0);
+  }, 60_000);
+
+  it("★ a HELD own leaf is acknowledged without being refused — a gap on OUR machine is not their fault", async () => {
+    /**
+     * The counterparty acknowledges a leaf of ours that the relay has already delivered to them and
+     * that WE have not placed yet — `placeOwnLeaf` holds it whenever the assigned position runs
+     * ahead of our tail. An index-only check answered "that position does not exist" and refused
+     * their reply outright, then told the operator to abandon the conversation over a transient
+     * hold on their own machine.
+     *
+     * The membership test is what makes this right: the content IS ours, held pending the gap, so
+     * the claim is true and it is accepted.
+     */
+    const { notice, received } = await deliverClaim({
+      lastSeenSeq: 9,
+      lastSeenHash: new Uint8Array(32).fill(0xd1),
+      holdOwnLeafInsteadOfPlacing: true,
+    });
+    expect(notice, `a held leaf is content we hold — refusing it blames the peer for our own gap: ${notice?.reason}`).toBeUndefined();
+    expect(received).toBe(1);
   }, 60_000);
 
   it("★ a v1 claim naming NO position is ACCEPTED — and the difference between the two is the rule", async () => {
