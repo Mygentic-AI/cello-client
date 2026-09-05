@@ -67,7 +67,7 @@ async function connectedClient(opts: {
     ...(opts.onWitnessAlert ? { onWitnessAlert: opts.onWitnessAlert } : {}),
     ...(opts.onWitnessUnreadable ? { onWitnessUnreadable: opts.onWitnessUnreadable } : {}),
   });
-  client.registerSession(SESSION_HEX, relay.node);
+  client.registerSession(SESSION_HEX, relay.node, undefined, undefined, new Uint8Array(32).fill(0x9c));
   // Drive the handshake so the reader loop is live and dispatching inbound frames.
   const submit = client.submitMessageHash(relay.node, SESSION_ID, new Uint8Array(32).fill(3));
   await tick();

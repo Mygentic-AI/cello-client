@@ -30,7 +30,7 @@
 import { createHash } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1 } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeSealPayload, encodeStructure1, decodeStructure1, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { CelloNode } from "@cello-protocol/transport";
 import { verify, type KeyProvider } from "@cello-protocol/crypto";
@@ -403,6 +403,30 @@ export interface RelayAssignmentCarry {
   assignmentSignature: Uint8Array;     // 64-byte per-node directory sig over the relay TBS (relay_directory_signature)
 }
 
+/**
+ * The genesis prev_root derivable from a relay assignment — 033-ACKEMIT.
+ *
+ * The carry holds both participant keys and the session timestamp, which with the session id are
+ * exactly `computeGenesisPrevRoot`'s inputs. Returns `undefined` when there is no assignment, and
+ * the caller then has no seed: absence is reported at the submit, never papered over.
+ *
+ * ⚠️ NOT 32 ZERO BYTES, and not any other constant. A value identical across every session is one
+ * an attacker can present for any session, which would make the first message's acknowledgement
+ * unfalsifiable exactly where it is most exposed.
+ */
+function genesisFromAssignment(
+  sessionIdHex: string,
+  assignment: RelayAssignmentCarry | undefined,
+): Uint8Array | undefined {
+  if (!assignment) return undefined;
+  return computeGenesisPrevRoot(
+    assignment.participantA,
+    assignment.participantB,
+    Uint8Array.from(Buffer.from(sessionIdHex, "hex")),
+    assignment.sessionTimestamp,
+  );
+}
+
 function toU8(v: unknown): Uint8Array {
   if (v instanceof Uint8Array) return v;
   if (Buffer.isBuffer(v)) return new Uint8Array(v as Buffer);
@@ -477,12 +501,27 @@ export class AgentRelayClient {
   #connecting: Promise<boolean> | null = null;
   #closed = false;
   /**
-   * PER-SESSION highest relay-assigned sequence (session_id hex → seq). The relay's
-   * `seq_counter` is per session, and it rejects `last_seen_seq > seq_counter`, so each
-   * session's submit MUST carry that session's own high-water mark — NOT an agent-global
-   * one (which would make a newer session's first submit look ahead and get rejected).
+   * PER-SESSION acknowledgement state (session_id hex → the position AND the content at it).
+   *
+   * `seq` is the highest relay-assigned sequence. The relay's `seq_counter` is per session, and it
+   * rejects `last_seen_seq > seq_counter`, so each session's submit MUST carry that session's own
+   * high-water mark — NOT an agent-global one (which would make a newer session's first submit look
+   * ahead and get rejected).
+   *
+   * ⚠️ `hash` IS THE SAME FACT AS `seq`, WHICH IS WHY THEY LIVE IN ONE ENTRY — 033-ACKEMIT.
+   *
+   * `last_seen_seq` is a NUMBER: "I saw position 7" attests to a POSITION and never to CONTENT, so
+   * a signed acknowledgement was an unbacked number that only the relay's separate receipt gave any
+   * meaning to. `hash` is the content hash of the message AT that position, and the two are written
+   * together in `#bumpLastSeen` from ONE decode of ONE leaf. They cannot be assigned apart, so they
+   * cannot come to mean different messages — which is the defect this unit exists to remove, not a
+   * disagreement to reconcile later.
+   *
+   * Seeded at `registerSession` with `{ seq: 0, hash: genesisPrevRoot }`: the first message of a
+   * session has seen nothing, and that case is a DEFINED 32-byte value — the agreed starting point
+   * of this two-party chain — never a missing field and never a fallback to v1.
    */
-  readonly #lastSeen = new Map<string, number>();
+  readonly #lastSeen = new Map<string, { seq: number; hash: Uint8Array }>();
   /** The one outstanding submit's resolver (global FIFO — ack carries no session_id). */
   #pendingAck: AckResolver | null = null;
   // The sender-signed structure1_cbor of the in-flight submit, paired with its ack so the
@@ -559,17 +598,42 @@ export class AgentRelayClient {
     node: CelloNode,
     onLeafDeliver?: (frame: LeafDeliverFrame) => void,
     assignment?: RelayAssignmentCarry,
+    /**
+     * 033-ACKEMIT — the session's genesis prev_root: what the FIRST message of this session
+     * acknowledges, before anything has been received.
+     *
+     * Supplied by the caller because `session-node-manager` is where the session record lives. When
+     * it is absent an ASSIGNMENT can still produce it (both participant keys and the session
+     * timestamp are on the carry), and that covers re-registration of a session whose row predates
+     * the column. When NEITHER is available the session has no seed, and its first submit claims
+     * position 0 with no hash — which asserts nothing about content and is therefore honest, rather
+     * than a claim about a position it cannot back.
+     */
+    genesisPrevRoot?: Uint8Array,
   ): void {
     const existing = this.#sessions.get(sessionIdHex);
+    const carriedAssignment = assignment ?? existing?.assignment;
     this.#sessions.set(sessionIdHex, {
       node,
       onLeafDeliver: onLeafDeliver ?? (() => {}),
       // Carry the assignment forward across re-registration; never lose a recorded flag on re-register.
-      assignment: assignment ?? existing?.assignment,
+      assignment: carriedAssignment,
       recorded: existing?.recorded ?? false,
       recordRejected: existing?.recordRejected ?? false,
       recordTimedOut: existing?.recordTimedOut ?? false,
     });
+    /**
+     * SEED THE ACKNOWLEDGEMENT, and only when there is nothing to lose.
+     *
+     * A session that has already received a leaf holds a REAL `{ seq, hash }`; overwriting it with
+     * the genesis on a re-registration would walk the acknowledgement backwards to "I have seen
+     * nothing" for a conversation that is well underway — and the relay would then answer the next
+     * submit from a position we had already passed.
+     */
+    if (!this.#lastSeen.has(sessionIdHex)) {
+      const seed = genesisPrevRoot ?? genesisFromAssignment(sessionIdHex, carriedAssignment);
+      if (seed) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: seed });
+    }
     // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
     // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay
     // rejects frames for a session it has not recorded. Best-effort + serialized on the submit chain
@@ -728,10 +792,23 @@ export class AgentRelayClient {
     }
   }
 
-  #bumpLastSeen(sessionIdHex: string, seq: number): void {
+  /**
+   * Advance this session's acknowledgement to a counterparty leaf: the POSITION and the CONTENT
+   * AT IT, written together (033-ACKEMIT).
+   *
+   * `contentHash` comes from the same `decodeStructure1` of the same leaf that produced `seq`, so
+   * the pair describes one message by construction. There is no path that advances one without the
+   * other, and that is deliberate: a `last_seen_seq` and a `last_seen_hash` that could drift apart
+   * would let this daemon sign an acknowledgement of a message it never saw.
+   *
+   * Monotonic on `seq` — a re-delivery of an earlier leaf must not walk the acknowledgement
+   * backwards, and it must not swap the hash under an unchanged position either.
+   */
+  #bumpLastSeen(sessionIdHex: string, seq: number, contentHash: Uint8Array): void {
     if (seq < 0) return;
-    const prev = this.#lastSeen.get(sessionIdHex) ?? 0;
-    if (seq > prev) this.#lastSeen.set(sessionIdHex, seq);
+    const prev = this.#lastSeen.get(sessionIdHex);
+    if (prev && seq <= prev.seq) return;
+    this.#lastSeen.set(sessionIdHex, { seq, hash: contentHash });
   }
 
   /** True if this Structure-1 leaf was authored by US (sender_pubkey === our K_local). */
@@ -909,10 +986,46 @@ export class AgentRelayClient {
       const seq = typeof frame["sequence_number"] === "number" ? frame["sequence_number"] : -1;
       const sidHex = Buffer.from(toU8(frame["session_id"])).toString("hex");
       const s1 = toU8(frame["structure1_cbor"]);
-      // Advance last_seen_seq ONLY for a COUNTERPARTY leaf. The relay also echoes our OWN
+      /**
+       * ONE DECODE, TWO CONSUMERS — 033-ACKEMIT. The acknowledgement bump and the seal-leaf capture
+       * below both need the sender's own signed fields, and they must agree about which leaf they
+       * are looking at. Decoding twice would let a future edit change one read and not the other.
+       */
+      const deliveredS1 = decodeStructure1(s1);
+      // Advance last_seen ONLY for a COUNTERPARTY leaf. The relay also echoes our OWN
       // leaf back as a leaf_deliver — that must NOT advance it (same reason as the ack above).
       const authoredByUs = this.#isOwnLeaf(s1);
-      if (seq >= 0 && !authoredByUs) this.#bumpLastSeen(sidHex, seq);
+      /**
+       * The POSITION and the CONTENT AT IT, from the counterparty's own signed bytes.
+       *
+       * ⚠️ THE HASH COMES FROM INSIDE `structure1_cbor`, NEVER FROM AN ENVELOPE FIELD. The frame
+       * also carries `structure2_cbor`, which the RELAY built — taking the hash from there would key
+       * our acknowledgement on a value the witness supplies, and a tampering relay could then make
+       * us sign an acknowledgement of content the counterparty never sent. Index 1 of Structure 1 is
+       * inside the bytes the counterparty signed, so it is the one copy neither we nor the relay can
+       * move.
+       *
+       * A leaf whose layout this build cannot name advances NOTHING — position included. The
+       * previous code advanced `seq` from the envelope regardless, so an unreadable leaf could move
+       * the acknowledgement forward while leaving the hash behind it; refusing to advance keeps the
+       * pair describing one real message, and the relay's own decoder already gates what reaches
+       * here.
+       */
+      if (seq >= 0 && !authoredByUs) {
+        if (deliveredS1.ok) {
+          this.#bumpLastSeen(sidHex, seq, deliveredS1.fields.contentHash);
+        } else {
+          this.#logger.warn("relay.leaf_deliver.unreadable", {
+            seq,
+            session: sidHex,
+            structure1Reason: deliveredS1.reason,
+            impact:
+              "this delivered leaf could not be read, so this session's acknowledgement was NOT " +
+              "advanced to it. The next message this agent sends will acknowledge the last leaf it " +
+              "could read, which is honest — it never claims to have seen something it could not.",
+          });
+        }
+      }
       // Record the COUNTERPARTY's delivered leaf in the seal-leaf log (no relay
       // receipt — the relay does not ack-sign a delivery to the recipient). It is pinned at seal by the
       // absent party's sender_signature (unforgeable) + sequence contiguity against our receipt-pinned own
@@ -926,9 +1039,8 @@ export class AgentRelayClient {
         // #isOwnLeaf and #captureReceipt and was simply missed by the order's reader list, which is
         // exactly the "next layout change has to find them again" problem the shared decoder exists
         // to end. Behaviour for every relay-accepted leaf is unchanged; the fail-open closes.
-        const s1Decoded = decodeStructure1(s1);
-        const senderHex = s1Decoded.ok
-          ? Buffer.from(s1Decoded.fields.senderPubkey).toString("hex")
+        const senderHex = deliveredS1.ok
+          ? Buffer.from(deliveredS1.fields.senderPubkey).toString("hex")
           : undefined;
         if (structure2Cbor && s1.length > 0 && senderHex) {
           try {
@@ -1736,20 +1848,65 @@ export class AgentRelayClient {
     const stream = this.#stream;
     if (!stream) return { ok: false, reason: "relay_unavailable" };
 
-    // This session's OWN high-water mark (NOT an agent-global one) — the relay's seq_counter
-    // is per session and rejects last_seen_seq > seq_counter.
-    const lastSeenForSession = this.#lastSeen.get(sessionIdHex) ?? 0;
+    /**
+     * ─── WHAT THIS SEND ACKNOWLEDGES — 033-ACKEMIT ───────────────────────────────────────────────
+     *
+     * This session's OWN high-water mark (NOT an agent-global one) — the relay's seq_counter is per
+     * session and rejects `last_seen_seq > seq_counter` — AND the content hash at that position,
+     * read from the one entry that holds both.
+     */
+    const lastSeen = this.#lastSeen.get(sessionIdHex);
+    /**
+     * ⚠️ **THIS COMMENT USED TO SAY "REFUSED, NOT DOWNGRADED", AND THE CODE UNDER IT DID REFUSE.**
+     * It is rewritten rather than deleted because a comment asserting a refusal that no longer
+     * happens is how the next reader comes to believe a guard exists where there is a fallback.
+     *
+     * There is no seed only when this session was registered with neither a genesis nor an
+     * assignment to derive one from, AND nothing has been received on it. The claim that goes out
+     * then is `last_seen_seq: 0` with no hash — "I have seen nothing of yours" — which is true and
+     * asserts nothing about content, so it is not the unbacked number this unit exists to stop
+     * signing. A claim that NAMES a position with no hash is the defect, and the receiving daemon
+     * refuses exactly that.
+     */
+    if (!lastSeen) {
+      /**
+       * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE.** Same rule as the content
+       * claim's, and the receiving half is `#verifyAcknowledgedContent` — a v1 claim is refused the
+       * moment it names position 1 or beyond, and accepted when it names none.
+       *
+       * Reaching here means the session was registered with no genesis and no assignment to derive
+       * one from, and no counterparty leaf has been delivered. `last_seen_seq: 0` with no hash says
+       * "I have seen nothing of yours", which is true, and asserts nothing about content — so it is
+       * not the unbacked number this unit exists to stop signing.
+       *
+       * It does not refuse the submit, and an earlier version did. Sessions brokered without a
+       * relay assignment are real, and refusing there left them unable to be witnessed at all.
+       */
+      this.#logger.info("session.relay.submit.unacknowledged", {
+        relayPeerId: this.#relayPeerId,
+        session: sessionIdHex,
+        impact:
+          "this submit acknowledges nothing: the session has no recorded starting point and no " +
+          "counterparty leaf has arrived on it. The leaf is witnessed as normal; the claim simply " +
+          "makes no assertion about what this agent has received.",
+      });
+    }
     // The published encoder from protocol-types — the ONE definition of the field order, pinned by
-    // `structure1-canonical.json`. A second local copy lived here until 020-ACKHASH; it drifted, and
-    // the drift was invisible because both copies "worked": it encoded a timestamp above 2^32-1 as a
-    // CBOR float64 while the published encoder (and every other TBS builder in this package) promotes
-    // it to a uint64. Same value, different signed bytes, and only the vector said which was canonical.
+    // `structure1-canonical.json` (v1) and `structure1-v2-canonical.json` (v2). A second local copy
+    // lived here until 020-ACKHASH; it drifted, and the drift was invisible because both copies
+    // "worked": it encoded a timestamp above 2^32-1 as a CBOR float64 while the published encoder
+    // (and every other TBS builder in this package) promotes it to a uint64. Same value, different
+    // signed bytes, and only the vector said which was canonical.
+    //
+    // `lastSeenHash` is passed on EVERY send, so every claim this daemon signs is v2 and binds to
+    // content. Nothing here ever passes `undefined` — see the refusal above.
     const structure1 = encodeStructure1({
       contentHash,
       senderPubkey: this.#senderPubkey,
       sessionId,
-      lastSeenSeq: lastSeenForSession,
+      lastSeenSeq: lastSeen?.seq ?? 0,
       timestamp: Date.now(),
+      ...(lastSeen ? { lastSeenHash: lastSeen.hash } : {}),
     });
     const signature = await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
@@ -1820,8 +1977,45 @@ export class AgentRelayClient {
   }
 
   /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
-  lastSeenSeq(sessionIdHex: string): number {
-    return this.#lastSeen.get(sessionIdHex) ?? 0;
+  /**
+   * Advance this session's acknowledgement from a message that ARRIVED — 033-ACKEMIT review F1.
+   *
+   * ⚠️ **`#bumpLastSeen` used to have exactly one caller, inside the `leaf_deliver` handler, so the
+   * acknowledgement tracked what the RELAY DELIVERED rather than what was RECEIVED.** On a direct
+   * session that is a real difference: the content arrives peer-to-peer and the relay's copy of the
+   * leaf follows separately, so until it did, this daemon signed an acknowledgement one message
+   * behind what it had actually read — and on a session where delivery never came back at all, the
+   * acknowledgement never moved.
+   *
+   * The order's own words are "the content hash of the last message this sender ACTUALLY RECEIVED".
+   * This is the caller that makes that true: the receive path calls it as soon as a message has been
+   * verified and ingested at a known canonical position.
+   *
+   * **THE POSITION IS STILL REQUIRED, and that is a real limit rather than an oversight.** The pair
+   * is (position, content-at-position), and the relay refuses a `last_seen_seq` that runs ahead of
+   * its counter — so a message that arrived with NO ordering record cannot be acknowledged by
+   * position at all, whatever we hold of it. That case is the withheld-submit attack itself, and it
+   * is closed by carrying the sender's signed leaf into the seal, not from here.
+   */
+  noteReceivedLeaf(sessionIdHex: string, relaySeq: number, contentHash: Uint8Array): void {
+    this.#bumpLastSeen(sessionIdHex, relaySeq, contentHash);
+  }
+
+  /**
+   * The POSITION and the CONTENT AT IT together — 033-ACKEMIT.
+   *
+   * ⚠️ **IT REPLACED `lastSeenSeq()`, WHICH IS DELETED RATHER THAN LEFT WIRED.** That accessor
+   * returned the position alone, and `session-node-manager`'s unwitnessed content claim was its
+   * only caller. Leaving it in place after this one took over would leave a second way to read half
+   * of a pair that must be read whole: a `last_seen_seq` paired with a `last_seen_hash` for a
+   * different message is worse than no acknowledgement at all, because it looks checkable and
+   * fails.
+   *
+   * `undefined` means this session has no acknowledgement to make, which the caller must handle
+   * rather than fill in.
+   */
+  lastSeenAck(sessionIdHex: string): { seq: number; hash: Uint8Array } | undefined {
+    return this.#lastSeen.get(sessionIdHex);
   }
 
   close(): void {

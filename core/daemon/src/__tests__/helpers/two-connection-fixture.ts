@@ -241,9 +241,22 @@ export async function startTwoConnectionFixture(
        */
       const agreeKey = () =>
         snm.setSessionContentKeyForTest(agent, sessionId, new Uint8Array(32).fill(0x7e));
+      /**
+       * 033-ACKEMIT: put the session's GENESIS where a completed session open leaves it — same
+       * short-circuit, same reason as the key above.
+       *
+       * Production derives it from the directory-signed relay assignment and writes it to the
+       * session row; a fixture that builds a session node directly never sees an assignment. Without
+       * it every send on this fixture is refused for having no starting point to acknowledge, and
+       * every inbound frame it builds is a v1 claim the receiver refuses — so the tests would be
+       * exercising two refusal paths instead of the behaviour they were written for.
+       */
+      const agreeGenesis = () =>
+        snm.setSessionGenesisForTest(agent, sessionId, new Uint8Array(32).fill(0x9c));
       if (!sessionOpts?.relay) {
         await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
         agreeKey();
+        agreeGenesis();
         return;
       }
       // A REAL keypair, not a stub: the park path signs the entry, and `sealParkEnvelope` is the
@@ -259,6 +272,7 @@ export async function startTwoConnectionFixture(
         sessionIdBytes: Buffer.from(sessionId, "hex"),
       });
       agreeKey();
+      agreeGenesis();
     },
     seedSent(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();

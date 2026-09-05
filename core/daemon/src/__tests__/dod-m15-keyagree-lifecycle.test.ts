@@ -139,7 +139,23 @@ describe("006-CRYPTO: the throwaway key is minted once, held in memory, and dest
      * not). Without the exemption this test goes red about the throwaway key the moment anything
      * agrees a salt in this fixture, for a reason that has nothing to do with it.
      */
-    const PERSISTED_ON_PURPOSE = new Set(["content_salt"]);
+    const PERSISTED_ON_PURPOSE = new Set(["content_salt", "genesis_prev_root"]);
+    /**
+     * ⚠️ **EVERY NAME ADDED HERE WEAKENS THE LENGTH TRIPWIRE, so each one pays for itself with a
+     * POSITIVE assertion rather than just an exemption.**
+     *
+     * `genesis_prev_root` (033-ACKEMIT) is 32 bytes and belongs on disk for the same shape of reason
+     * `content_salt` does — opposite lifetime to the throwaway secret, which must not survive the
+     * session while this must. But it is also a PUBLIC derived value, so unlike the salt it can be
+     * checked directly: asserting it equals the value the fixture agreed proves it is not key
+     * material, which is what the length heuristic was only ever approximating.
+     */
+    const genesis = row["genesis_prev_root"];
+    expect(genesis, "PRECONDITION: the fixture agreed a genesis, or this assertion proves nothing").toBeTruthy();
+    expect(
+      Buffer.from(genesis as Uint8Array).equals(Buffer.alloc(32, 0x9c)),
+      "the genesis column holds the session's agreed starting point — a public value — and not key material",
+    ).toBe(true);
     for (const [column, value] of Object.entries(row)) {
       if (PERSISTED_ON_PURPOSE.has(column)) continue;
       expect(

@@ -68,7 +68,7 @@ async function connectedClient(): Promise<{
   });
   const relay = makeFakeRelay();
   const sid = new Uint8Array(16).fill(0x11);
-  client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
+  client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, new Uint8Array(32).fill(0x9c));
   return { client, relay, sid };
 }
 

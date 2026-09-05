@@ -32,6 +32,21 @@ import { makeFakeRelay, tick, noopLogger, fakeNode } from "./relay-client-fake.j
  */
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
+/**
+ * 033-ACKEMIT — the acknowledgement seed every registered session now carries.
+ *
+ * Production derives this from the session's directory-signed assignment (or reads it back from the
+ * session row after a restart) and `registerSession` seeds `#lastSeen` with it, so the FIRST submit
+ * of a session has a defined 32-byte value to acknowledge instead of an absence. A session
+ * registered without one cannot say what its first message acknowledges and its submits are
+ * REFUSED — never downgraded to a v1 claim — which is why these fixtures supply one: they are
+ * asserting the submit path, not the refusal.
+ *
+ * A recognisable fill rather than zeros, so a test that accidentally asserts the wrong constant
+ * says so instead of matching an all-zero default.
+ */
+const TEST_GENESIS = new Uint8Array(32).fill(0x9c);
+
 
 describe("session-relay-client: relay auth payload", () => {
   it("builds SHA-256(domain || nonce || pubkey) — the exact bytes the relay verifies", async () => {
@@ -168,8 +183,8 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     const relay = makeFakeRelay();
     const sidA = new Uint8Array(16).fill(0x0a);
     const sidB = new Uint8Array(16).fill(0x0b);
-    client.registerSession(Buffer.from(sidA).toString("hex"), relay.node);
-    client.registerSession(Buffer.from(sidB).toString("hex"), relay.node);
+    client.registerSession(Buffer.from(sidA).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
+    client.registerSession(Buffer.from(sidB).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
 
     // Drive the relay's challenge → auth_ok so the client authenticates on first submit.
     const submit1 = client.submitMessageHash(relay.node, sidA, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
@@ -210,7 +225,7 @@ describe("AgentRelayClient: per-agent multi-session bookkeeping (H1)", () => {
     });
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0x0c);
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(9, LEAF_KIND_MSG));
     await tick();
@@ -364,7 +379,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0x7a);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(1, LEAF_KIND_MSG));
@@ -396,7 +411,7 @@ describe("AgentRelayClient: session_not_found is transient, not terminal (DOD-FI
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0x7b);
 
-    client.registerSession(Buffer.from(sid).toString("hex"), relay.node);
+    client.registerSession(Buffer.from(sid).toString("hex"), relay.node, undefined, undefined, TEST_GENESIS);
     await tick();
 
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
@@ -548,7 +563,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0xf1);
     const sidHex = Buffer.from(sid).toString("hex");
-    client.registerSession(sidHex, relay.node);
+    client.registerSession(sidHex, relay.node, undefined, undefined, TEST_GENESIS);
 
     // The content hash that will be inside Structure1 (the submit produces it from this).
     const contentHash = new Uint8Array(32).fill(1);
@@ -606,7 +621,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const sid = new Uint8Array(16).fill(0xf2);
     const sidHex = Buffer.from(sid).toString("hex");
     let leafDelivered = false;
-    client.registerSession(sidHex, relay.node, (_frame) => { leafDelivered = true; });
+    client.registerSession(sidHex, relay.node, (_frame) => { leafDelivered = true; }, undefined, TEST_GENESIS);
 
     // Authenticate the stream (leaf_deliver requires an active stream).
     const submit = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(2, LEAF_KIND_MSG));
@@ -666,7 +681,7 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
     const relay = makeFakeRelay();
     const sid = new Uint8Array(16).fill(0xf3);
     const sidHex = Buffer.from(sid).toString("hex");
-    client.registerSession(sidHex, relay.node);
+    client.registerSession(sidHex, relay.node, undefined, undefined, TEST_GENESIS);
 
     // Submit own leaf → ack captures it WITH receipt.
     const contentHash = new Uint8Array(32).fill(3);
