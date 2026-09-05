@@ -676,10 +676,17 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       // REACHABLE, not merely un-rebuilt. The circuit through the surviving relay is what a NAT'd
       // caller actually dials, so that is what gets asserted — the absence of a rebuild log line
       // would be true of a receiver that had quietly died.
-      const i = manager.getStandingReceiverInfo("alice")!;
-      expect(i.peerId, "same node, same peer id — nothing was rebuilt").toBe(peerBefore);
+      // ⚠️ READ IT DEFENSIVELY, and that is not defensive coding for its own sake. A receiver being
+      // rebuilt is ABSENT from the map for the duration, so `getStandingReceiverInfo(...)!.peerId`
+      // throws a TypeError instead of failing the assertion — the mutation that reverts this very
+      // rule reddens on "Cannot read properties of null", which tells a reader nothing about the
+      // property. Name the state instead, so the failure says what broke.
+      const identity = (): string => manager.getStandingReceiverInfo("alice")?.peerId
+        ?? "(no receiver — it is being rebuilt)";
+      expect(identity(), "same node, same peer id — nothing was rebuilt").toBe(peerBefore);
       expect(
-        i.addrs.some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`)),
+        manager.getStandingReceiverInfo("alice")?.addrs
+          .some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`)) ?? false,
         "the agent is still dialable through the relay that lived",
       ).toBe(true);
       expect(manager.getStandingReceiverReachability("alice")).toBe("reserved");
@@ -687,7 +694,7 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       // And it stays that way — a rebuild on the NEXT watchdog tick would be the same defect,
       // arriving 250ms later.
       await wait(1_000);
-      expect(manager.getStandingReceiverInfo("alice")!.peerId).toBe(peerBefore);
+      expect(identity(), "still the same node a second later — no rebuild on a later tick").toBe(peerBefore);
     } finally {
       await manager.gracefulShutdown();
       await survivor.node.stop();
