@@ -27,7 +27,8 @@ import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSIO
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
 import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
-import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import type { CelloNode } from "@cello-protocol/transport";
 import { wireContentHash } from "../wire-content-hash.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 
@@ -47,6 +48,28 @@ const GENESIS = new Uint8Array(32).fill(0x9c);
  * `TypeError: The first argument must be of type string ... Received undefined` — a message that
  * sends the next reader to audit Buffer rather than to the field that went missing.
  */
+/**
+ * Every frame the daemon actually wrote to the wire, decoded.
+ *
+ * ⚠️ UN-FRAMED WITH `lp.decode`, NOT BY PROBING OFFSETS. The neighbouring suites strip the
+ * length prefix by trying `subarray(0..3)` and taking the first offset that decodes — and a CBOR
+ * decoder handed a wrong offset does not reliably throw: measured here, it returned an object with
+ * NO KEYS, so `find(f => f.type === "content_frame")` reported "the send never reached the wire"
+ * about a frame that was sitting right there. Reading the varint properly is the difference between
+ * a test that measures the frame and one that measures the guess.
+ */
+async function sentFrames(node: CelloNode | null): Promise<Array<Record<string, unknown>>> {
+  const raw = (node as unknown as { sent?: Uint8Array[] } | null)?.sent ?? [];
+  const out: Array<Record<string, unknown>> = [];
+  for (const framed of raw) {
+    for await (const chunk of lp.decode([framed] as unknown as AsyncIterable<Uint8Array>)) {
+      const u8 = chunk instanceof Uint8Array ? chunk : (chunk as { subarray(): Uint8Array }).subarray();
+      out.push(decode(u8) as Record<string, unknown>);
+    }
+  }
+  return out;
+}
+
 function ackHash(arr: unknown[]): Uint8Array {
   expect(arr.length, "v2 is SEVEN fields — six means the emitter was reverted").toBe(7);
   expect(arr[6], "index 6 must be the 32-byte ack hash").toBeInstanceOf(Uint8Array);
@@ -255,6 +278,50 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
     expect([v1.length, v1[0]]).toEqual([6, 1]);
     expect([v2.length, v2[0]]).toEqual([7, 2]);
   });
+});
+
+
+describe("033-ACKEMIT — the OTHER production emitter: an unwitnessed send", () => {
+  let fx: TwoConnectionFixture | null = null;
+  afterEach(async () => { if (fx) await fx.cleanup(); fx = null; });
+
+  it("★ a send with NO relay signs a v2 claim too — the second emitter, which had no coverage at all", async () => {
+    /**
+     * ⚠️ **THIS TEST EXISTS BECAUSE A MUTATION SURVIVED, and that is the whole argument for it.**
+     *
+     * There are TWO production Structure 1 builders. `session-relay-client` builds the one that
+     * rides a `hash_submit`; `#signOwnContentClaim` builds the one for the path where no submit
+     * happens — a relay-degraded or relay-less send — and it is the emitter whose comment said "v1
+     * DELIBERATELY" until this unit. With the whole suite green, deleting `lastSeenHash` from THAT
+     * call site changed nothing: every emitter assertion was aimed at the other writer.
+     *
+     * A red on one writer proves only that AT LEAST ONE of them works. This aims at the other one.
+     */
+    let node: CelloNode | null = null;
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-ackemit-unwitnessed-", node: node = new FakeNode() as unknown as CelloNode });
+    // NO `relay: true` — this session has no relay client at all, so nothing is witnessed and
+    // `#signOwnContentClaim` is the only thing that can produce a claim for the frame.
+    await fx.createSession(SID, "alice", "bb".repeat(32), PEER);
+
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, BODY);
+    const res = await fx.snm.sendContent("alice", SID, BODY, hash, "corr", LEAF_KIND_MSG, alg);
+    expect(res.ok, "the send itself must work — this path is the relay-degraded one, not a failure").toBe(true);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const frame = (await sentFrames(node)).find((f) => f["type"] === "content_frame");
+    expect(frame, "the send must reach the wire for this to prove anything").toBeDefined();
+    const arr = decode(frame!["structure1_cbor"] as Uint8Array) as unknown[];
+
+    expect(arr.length, "SEVEN fields — six means this emitter was reverted while the other stayed").toBe(7);
+    expect(arr[0]).toBe(STRUCTURE1_VERSION_V2);
+    /**
+     * THE VALUE, NOT THE SHAPE. The fixture seeds the session's genesis as 0x9c repeated — the
+     * value a completed session open leaves — so this names what the claim acknowledges rather than
+     * checking that 32 bytes of something are present.
+     */
+    expect(Buffer.from(ackHash(arr)).toString("hex")).toBe(Buffer.from(new Uint8Array(32).fill(0x9c)).toString("hex"));
+    expect(arr[4], "nothing has been received on this session, so it acknowledges position zero").toBe(0);
+  }, 60_000);
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
