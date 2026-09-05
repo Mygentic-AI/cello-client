@@ -24,11 +24,12 @@ import { describe, it, expect, afterEach } from "vitest";
 import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSION_V2 } from "@cello-protocol/protocol-types";
-import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
+import { generateKeypair, sealSessionContent, buildRelayAckTbs } from "@cello-protocol/crypto";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
 import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
 import { DatabaseSync } from "node:sqlite";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
+import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { wireContentHash } from "../wire-content-hash.js";
@@ -409,16 +410,16 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
      * file is a step on the way to it.**
      *
      * The seal carry is the leaf chain a unilateral seal hands the directory — it IS the receipt's
-     * raw material, and `getSealCarry` is what `submitAndEscalate` reads. Before this unit, both of
-     * its writers sat inside the relay client and both needed the relay to have spoken first, so a
-     * message whose author never submitted it could never get in. The victim held the message, held
-     * the author's signature over it, and still could not put it in their receipt.
+     * raw material. Before this unit both of its writers needed the relay to have spoken first, so
+     * a message whose author never submitted it could never get in: the victim held the message,
+     * held the author's signature over it, and still could not put it in their receipt.
      *
-     * The run below is the full production path on the receiving side: a leaf arrives with a valid
-     * author signature and NO ordering record → this daemon witnesses it on the author's behalf →
-     * the relay sequences it and echoes it back → and because its AUTHOR is the counterparty, it is
-     * filed as a counterparty leaf in the carry, with no relay receipt, which is exactly the shape
-     * the directory's verifier already accepts for the absent party.
+     * ⚠️ **THE FIXTURE IS THE PRODUCTION ONE — a SIGNED ack and a real `RelayReceiptStore`.** The
+     * first version of this test wired neither, so `#captureReceipt` short-circuited and the
+     * ack-path carry write never ran. In production it runs FIRST, and the store is
+     * `INSERT OR IGNORE`, so the row this test inspects is the row that row WINS. Asserting against
+     * the other one made a real defect — the ack path labelling the author as the submitter and
+     * attaching a relay receipt to a leaf we did not write — invisible.
      */
     const author = generateKeypair();
     const authorPub = await author.getPublicKey();
@@ -433,17 +434,20 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     });
     const authorSig = await author.sign(withheld);
 
-    // OUR relay client, on the fake relay, registered for this session.
+    const relayKp = generateKeypair();
+    const relayIdHex = Buffer.from(await relayKp.getPublicKey()).toString("hex");
     const us = generateKeypair();
     const usPub = await us.getPublicKey();
     const db = new DatabaseSync(":memory:") as unknown as ConstructorParameters<typeof SessionSealLeafStore>[0];
     const sealLeafStore = new SessionSealLeafStore(db, noopLogger);
+    const receiptStore = new RelayReceiptStore(db, noopLogger);
     const client = new AgentRelayClient({
       relayPeerId: "12D3KooWRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
       keyProvider: us,
       senderPubkey: usPub,
       logger: noopLogger,
+      receiptStore,
       sealLeafStore,
     });
     const relay = makeFakeRelay();
@@ -459,37 +463,42 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     await tick();
     relay.push({ type: "relay_auth_ok" });
     await tick();
-    relay.push({ type: "hash_submit_ack", sequence_number: 7 });
-    expect((await submit).ok, "the witness submit must be acked").toBe(true);
-
-    // The relay sequences it and ECHOES it back to the submitter — the real relay does this on the
-    // same stream (`leaf_echo`). Its AUTHOR is the counterparty, so this side files it as theirs.
+    const seq = 7;
+    const ts = 12345;
+    const s2 = encodeCbor([seq, authorPub, contentHash, authorSig]) as Uint8Array;
     relay.push({
-      type: "leaf_deliver",
-      session_id: sid,
-      sequence_number: 7,
-      leaf_kind: LEAF_KIND_MSG,
-      structure1_cbor: withheld,
-      structure2_cbor: encodeCbor([7, authorPub, contentHash, authorSig]) as Uint8Array,
+      type: "hash_submit_ack",
+      sequence_number: seq,
+      structure2_cbor: s2,
+      relay_id: relayIdHex,
+      timestamp: ts,
+      relay_signature: await relayKp.sign(buildRelayAckTbs(contentHash, seq, ts)),
     });
+    expect((await submit).ok, "the witness submit must be acked").toBe(true);
     await tick();
     client.close();
 
     const carry = sealLeafStore.getCarry(Buffer.from(usPub).toString("hex"), SID);
-    const theirs = carry.find((l) => l.senderPubkeyHex === Buffer.from(authorPub).toString("hex"));
+    const row = carry.find((l) => l.sequenceNumber === seq);
     expect(
-      theirs,
+      row,
       `the withheld leaf must be in the carry — this is the receipt's raw material:\n${JSON.stringify(carry.map((c) => ({ seq: c.sequenceNumber, sender: c.senderPubkeyHex.slice(0, 12) })))}`,
     ).toBeDefined();
-    expect(theirs!.sequenceNumber, "at the canonical position the relay assigned it").toBe(7);
     expect(
-      Buffer.from(theirs!.structure1Cbor).toString("hex"),
+      row!.senderPubkeyHex,
+      "attributed to its AUTHOR, taken from inside the bytes they signed — not to whoever handed it over",
+    ).toBe(Buffer.from(authorPub).toString("hex"));
+    expect(
+      Buffer.from(row!.structure1Cbor).toString("hex"),
       "carrying the AUTHOR's own signed bytes — that is what makes it undeniable by them",
     ).toBe(Buffer.from(withheld).toString("hex"));
-    expect(
-      theirs!.relaySignatureHex,
-      "and with NO relay receipt, which is exactly the shape the verifier accepts for the absent party",
-    ).toBeUndefined();
+    /**
+     * ⚠️ NO RELAY RECEIPT ON A LEAF WE DID NOT WRITE. A receipt is what pins OUR OWN leaves to a
+     * sequence we could otherwise renumber; attaching one to somebody else's leaf would assert a
+     * property about their message that our ack does not establish.
+     */
+    expect(row!.relaySignatureHex, "no receipt is attached to a leaf this agent did not author").toBeUndefined();
+    expect(row!.relayId).toBeUndefined();
   });
 
   it("★ a message with NO ordering record triggers the witness attempt; one WITH a record does not", async () => {

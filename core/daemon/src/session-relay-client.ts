@@ -908,15 +908,44 @@ export class AgentRelayClient {
           // submit's paired in-flight values. Best-effort + separate from the receipt write.
           const structure2Cbor = frame["structure2_cbor"] instanceof Uint8Array ? (frame["structure2_cbor"] as Uint8Array) : undefined;
           if (this.#sealLeafStore && structure2Cbor && structure1Cbor && this.#pendingLeafKind !== null) {
+            /**
+             * ⚠️ **THE AUTHOR COMES FROM THE SIGNED BYTES, AND THE RECEIPT ONLY ATTACHES TO OUR OWN
+             * LEAF — 034-CARRYLEAF review F3.**
+             *
+             * This wrote `senderPubkeyHex: this.senderPubkeyHex` unconditionally, which was true for
+             * as long as the only thing a client could submit was its own leaf. `witnessReceivedLeaf`
+             * ended that: on a counter-submit `structure1Cbor` holds the COUNTERPARTY's bytes, so
+             * this row labelled their leaf as ours — and attached a relay receipt to it, which is the
+             * one thing that must never happen to a leaf we did not author, because a receipt is what
+             * pins OUR leaves to a sequence we could otherwise renumber.
+             *
+             * It was inert on the wire by luck: `sender_pubkey_hex` is not transmitted and the
+             * directory re-derives the author from `structure2_cbor`. It was never inert locally —
+             * the store is `INSERT OR IGNORE` on `(agent, session, sequence)`, and the ack arrives
+             * BEFORE the `leaf_deliver` echo, so this row won and the correct one was silently
+             * dropped.
+             *
+             * Same rule as everywhere else on this path: the identity comes from inside the bytes
+             * the author signed, never from an ambient value that happens to be right today.
+             */
+            const authored = decodeStructure1(structure1Cbor);
+            const authorHex = authored.ok
+              ? Buffer.from(authored.fields.senderPubkey).toString("hex")
+              : this.senderPubkeyHex;
+            const ourOwnLeaf = authorHex === this.senderPubkeyHex;
             this.#sealLeafStore.store(this.senderPubkeyHex, ev.receipt.sessionIdHex, {
               sequenceNumber: seq,
               leafKind: this.#pendingLeafKind,
-              senderPubkeyHex: this.senderPubkeyHex,
+              senderPubkeyHex: authorHex,
               structure2Cbor,
               structure1Cbor,
-              relayId: ev.receipt.relayId,
-              relayTimestamp: ev.receipt.timestamp,
-              relaySignatureHex: ev.receipt.signatureHex,
+              ...(ourOwnLeaf
+                ? {
+                    relayId: ev.receipt.relayId,
+                    relayTimestamp: ev.receipt.timestamp,
+                    relaySignatureHex: ev.receipt.signatureHex,
+                  }
+                : {}),
             }, Date.now());
           }
         } catch (err) {
@@ -1044,6 +1073,56 @@ export class AgentRelayClient {
       // receipt — the relay does not ack-sign a delivery to the recipient). It is pinned at seal by the
       // absent party's sender_signature (unforgeable) + sequence contiguity against our receipt-pinned own
       // leaves. Our OWN echoed leaf is skipped here (it is recorded WITH its receipt on the ack path).
+      /**
+       * ─── OUR OWN LEAF, WITNESSED BY SOMEBODY ELSE — 034-CARRYLEAF review F2 ──────────────────
+       *
+       * ⚠️ **WITHOUT THIS, MAKING THE COUNTERPARTY ABLE TO WITNESS OUR LEAF COST US THE RECEIPT.**
+       *
+       * When the counterparty counter-submits a leaf WE authored, the relay assigns it a position
+       * and delivers it to us — and `authoredByUs` is true, so the capture below skipped it. We
+       * never submitted it ourselves, so no ack ever arrived and the ack path never wrote a row
+       * either. The result was a permanent hole at that position in our own carry: the unilateral
+       * seal refused it as `seal_carry_noncontiguous`, and the bilateral one refused to co-sign a
+       * root it could not judge. **An honest sender whose relay hiccuped once lost the receipt for
+       * the entire conversation** — for a message sitting in their own transcript.
+       *
+       * So the leaf is stored, **with NO relay receipt**, because we hold none: nobody acked it to
+       * us. That asymmetry is exactly the one the seal design already relies on. A bilateral seal
+       * needs a contiguous chain and gets one. A UNILATERAL seal additionally requires every one of
+       * our OWN leaves to carry a receipt — so a party who never witnesses their own messages still
+       * cannot seal alone on them (`unilateral_own_leaf_unwitnessed`), which is precisely what
+       * `DOD-M15-WITHHOLD-SEAL-1` intends.
+       *
+       * `INSERT OR IGNORE` keeps whichever row lands first, and a real receipt-bearing row for the
+       * same position can only come from our own ack — which cannot exist here, or we would have
+       * submitted it ourselves.
+       */
+      if (this.#sealLeafStore && seq >= 0 && authoredByUs && deliveredS1.ok) {
+        const s2Own = frame["structure2_cbor"];
+        if (s2Own instanceof Uint8Array && s1.length > 0) {
+          try {
+            const wrote = this.#sealLeafStore.store(this.senderPubkeyHex, sidHex, {
+              sequenceNumber: seq,
+              leafKind: typeof frame["leaf_kind"] === "number" ? frame["leaf_kind"] : LEAF_KIND_MSG,
+              senderPubkeyHex: this.senderPubkeyHex,
+              structure2Cbor: s2Own,
+              structure1Cbor: s1,
+            }, Date.now());
+            if (wrote) {
+              this.#logger.info("relay.seal_leaf.own.witnessed_by_counterparty", {
+                seq,
+                session: sidHex,
+                impact:
+                  "a message THIS agent wrote was witnessed by the counterparty rather than by us — " +
+                  "our own submit did not land. The leaf is kept so this conversation can still be " +
+                  "sealed together; sealing it alone would still need a receipt we do not hold.",
+              });
+            }
+          } catch (err) {
+            this.#logger.error("relay.seal_leaf.own.store_failed", { seq, session: sidHex, error: extractErrorMessage(err) });
+          }
+        }
+      }
       if (this.#sealLeafStore && seq >= 0 && !authoredByUs) {
         const s2 = frame["structure2_cbor"];
         const structure2Cbor = s2 instanceof Uint8Array ? s2 : undefined;
