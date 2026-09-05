@@ -620,54 +620,118 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
     return { manager, events };
   }
 
-  it("W1: the relay dies → the circuit address vanishes → the watchdog re-picks a live relay and the agent is reachable again", async () => {
+  it("W1: TWO relays grant, one dies — the receiver is NOT rebuilt and the agent stays dialable", async () => {
+    // THE PROPERTY THIS WHOLE UNIT EXISTS FOR (032-RELAYSPREAD).
+    //
+    // Before the spread the receiver reserved with the FIRST relay that granted and stopped. Losing
+    // that one left the agent unreachable by every NAT'd peer while still reporting itself online —
+    // measured in production at 3.6-4.8s median and 322-371s at the 90th percentile, and unbounded
+    // when the relay went mute rather than dying. The old version of this test asserted the
+    // recovery from that state: a NEW node, new peer id, built on the 30-second grid.
+    //
+    // Now there is no state to recover from. The agent holds a reservation with both relays, so the
+    // death of one costs it nothing an operator or a caller can feel, and rebuilding the receiver
+    // would THROW AWAY a healthy reservation to replace a lost one.
     const dying = await startHopRelay();
     const survivor = await startHopRelay();
     const { manager, events } = makeManager("w1.db");
     await manager.initialize();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
-      // The dying relay is FIRST, so it is the one selected.
       manager.setDirectoryRelayEndpoints("alice", [
         { relayPeerId: dying.peerId, relayAddrs: [dying.addr] },
         { relayPeerId: survivor.peerId, relayAddrs: [survivor.addr] },
       ]);
       await manager.ensureStandingReceiverForAgent("alice");
+
+      // BOTH, not the first one that answered. This is the assertion that would still pass if the
+      // walk had simply run — so it names the count that GRANTED, which cannot.
       expect(
         await waitUntil(() => {
           const i = manager.getStandingReceiverInfo("alice");
-          return i !== null && i.addrs.some((a) => a.includes("/p2p-circuit"));
-        }, 10_000),
+          return i !== null
+            && i.addrs.some((a) => a.includes(`/p2p/${dying.peerId}/p2p-circuit`))
+            && i.addrs.some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`));
+        }, 15_000),
+        "the receiver must announce a circuit through BOTH relays, not just the first to grant",
       ).toBe(true);
+      const reach = events.filter((e) => e.event === "session.standing_receiver.reachability").at(-1);
+      expect(reach!.context.relaysOffered).toBe(2);
+      expect(reach!.context.reservationsHeld).toBe(2);
 
       const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
 
-      // The relay dies. NOTE: libp2p does NOT drop the /p2p-circuit address here — it
-      // keeps it until the reservation's own refresh, hours away. So "still advertising
-      // a circuit address" proves nothing, and a test that only checked for one would
-      // pass while the agent was unreachable. The watchdog must DETECT the loss.
+      // The relay dies. NOTE: libp2p does NOT drop the /p2p-circuit address here — it keeps it
+      // until the reservation's own refresh, hours away. So "still advertising a circuit address"
+      // proves nothing, and a test that only checked for one would pass while the relay was gone.
       await dying.node.stop();
 
-      const detected = await waitUntil(
-        () => events.some((e) => e.event === "session.standing_receiver.reservation.lost" && e.level === "warn"),
+      const lost = await waitUntil(
+        () => events.some((e) => e.event === "session.standing_receiver.reservation.lost"
+          && e.context.relayPeerId === dying.peerId),
         20_000,
       );
-      expect(detected).toBe(true);
+      expect(lost, "the loss must still be DETECTED and named — spreading is not the same as not looking").toBe(true);
 
-      // …and having detected it, re-probe (the dead relay now fails), pick the
-      // survivor, and rebuild — WITHOUT anyone asking. A NEW node, holding a real
-      // reservation with the relay that is still alive.
-      const recovered = await waitUntil(() => {
-        const i = manager.getStandingReceiverInfo("alice");
-        return i !== null && i.peerId !== peerBefore && i.addrs.some((a) => a.includes("/p2p-circuit"));
-      }, 20_000);
-      expect(recovered).toBe(true);
+      // REACHABLE, not merely un-rebuilt. The circuit through the surviving relay is what a NAT'd
+      // caller actually dials, so that is what gets asserted — the absence of a rebuild log line
+      // would be true of a receiver that had quietly died.
+      const i = manager.getStandingReceiverInfo("alice")!;
+      expect(i.peerId, "same node, same peer id — nothing was rebuilt").toBe(peerBefore);
+      expect(
+        i.addrs.some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`)),
+        "the agent is still dialable through the relay that lived",
+      ).toBe(true);
+      expect(manager.getStandingReceiverReachability("alice")).toBe("reserved");
+
+      // And it stays that way — a rebuild on the NEXT watchdog tick would be the same defect,
+      // arriving 250ms later.
+      await wait(1_000);
+      expect(manager.getStandingReceiverInfo("alice")!.peerId).toBe(peerBefore);
     } finally {
       await manager.gracefulShutdown();
       await survivor.node.stop();
       try { await dying.node.stop(); } catch { /* already stopped */ }
     }
-  }, 40_000);
+  }, 60_000);
+
+  it("W1b: the LAST reservation dies → zero held → the receiver IS rebuilt", async () => {
+    // The other half of the count, and the half W1 no longer covers. Holding none is not a
+    // degradation an agent can absorb: nobody behind a home router can reach it at all, so the
+    // structural answer — a new node, because a circuit listener is fixed at node creation — is
+    // still the right one.
+    const only = await startHopRelay();
+    const { manager, events } = makeManager("w1b.db");
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: only.peerId, relayAddrs: [only.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      expect(
+        await waitUntil(() => {
+          const i = manager.getStandingReceiverInfo("alice");
+          return i !== null && i.addrs.some((a) => a.includes("/p2p-circuit"));
+        }, 15_000),
+      ).toBe(true);
+      const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
+
+      await only.node.stop();
+
+      const lost = await waitUntil(
+        () => events.some((e) => e.event === "session.standing_receiver.reservation.lost"
+          && e.context.reservationsHeld === 0),
+        20_000,
+      );
+      expect(lost, "losing the last one reports ZERO held, which is the loud case").toBe(true);
+      expect(
+        await waitUntil(() => manager.getStandingReceiverInfo("alice")?.peerId !== peerBefore, 20_000),
+        "with nothing held there is nothing to conserve — the receiver is rebuilt",
+      ).toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      try { await only.node.stop(); } catch { /* already stopped */ }
+    }
+  }, 60_000);
 
   it("W2: a receiver that NEVER had a reservation is not rebuilt on a timer — no thrash against relays we know refuse", async () => {
     const { manager, events } = makeManager("w2.db");

@@ -12,7 +12,8 @@
  * nobody — every counterparty falls back to the relay's store-and-forward, which is the parked-message
  * behaviour this milestone has been chasing from the other end.
  *
- * AND THE WATCHDOG SKIPS IT, deliberately:
+ * AND THE WATCHDOG SKIPPED IT, deliberately — the code as it stood when this was written (the two
+ * fields quoted here became one `relayPeerIds` count in 032-RELAYSPREAD; the branch is still there):
  *
  *   `if (!sr.hasReservation || sr.relayPeerId === undefined) continue; // never had one — not a LOSS`
  *
@@ -193,12 +194,30 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
   let cleanup: (() => Promise<void>) | null = null;
   afterEach(async () => { if (cleanup) await cleanup(); cleanup = null; });
 
-  it("a circuit address WITHOUT the relay id still records the relay — the candidate is the floor", async () => {
-    // The held address is libp2p's string, not ours. If a transport ever reports it without
-    // `/p2p/<relayId>/p2p-circuit`, reading only it yields undefined — and an undefined relayPeerId
-    // makes the watchdog treat a healthy reservation as ABSENT and rebuild it, which would be a
-    // regression on the single-relay case that works today. The candidate string is ours and always
-    // carries the id.
+  it("a circuit address WITHOUT the relay id counts as NO reservation — the candidate is no longer the floor", async () => {
+    /**
+     * ⚠️ THIS ASSERTION IS THE REVERSE OF WHAT IT WAS, and the reversal is 032-RELAYSPREAD.
+     *
+     * The old floor read the relay id off `reservations.addrs[0]` — the FIRST CANDIDATE — when the
+     * held address could not be parsed, on the grounds that an unknown relay id makes the watchdog
+     * treat a healthy reservation as absent and rebuild it. That reasoning holds only while the
+     * pool is size one, which is what its own comment in `session-node-manager.ts` said: "dormant
+     * while the pool is size 1; the pool is designed to be larger."
+     *
+     * The pool is now larger. A receiver reserves with every relay that grants, so candidate 0 is
+     * routinely NOT the relay in question — and recording it names a relay we are not connected to.
+     * The watchdog then finds that peer absent on every tick forever and rebuilds on the 30-second
+     * grid: the floor stops being a floor and becomes the churn.
+     *
+     * So the rule is now "a held address that does not name its relay is not a held reservation",
+     * and the cost is a rebuild. That is the SAFE direction — the alternative is an agent reading
+     * as healthy against a relay nobody is connected to, which is the silent unreachability this
+     * whole file exists to kill.
+     *
+     * And the shape being guarded against is not one libp2p produces: `circuit-relay-v2`'s listener
+     * builds the announced address by encapsulating the RELAY'S OWN multiaddrs with `/p2p-circuit`,
+     * and those carry `/p2p/<relayId>`.
+     */
     class IdlessCircuitNode extends ReservationNode {
       override listenAddresses(): string[] { return ["/ip4/127.0.0.1/tcp/4001/p2p-circuit"]; }
       override getConnections(): Array<{
@@ -228,8 +247,10 @@ describe("DOD-M12B-RESERVATION-RETRY-1: the backoff and the budget", () => {
 
     expect(
       snm.getStandingReceiverReachability("alice"),
-      "it HAS a circuit address — an unparseable one must not read as no reservation at all",
-    ).toBe("reserved");
+      "a circuit address that does not name its relay cannot be watched, proved to, or admitted " +
+        "inbound — so it is not a reservation this daemon can keep, and reporting it as one is how " +
+        "an unreachable agent looks healthy",
+    ).toBe("retrying");
   }, 30_000);
 
   it("the wait GROWS between attempts — a fixed interval is what churns a scarce relay", async () => {

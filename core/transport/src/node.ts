@@ -1086,6 +1086,33 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
   // else start() throws loudly — NO_FATAL must not mask a real EADDRINUSE.
   const hasCircuitListen = opts.listenAddresses.some((a) => a.includes("/p2p-circuit"));
 
+  /**
+   * 032-RELAYSPREAD — **ONE CONFIGURED RELAY LISTENER RESERVES; THE REST ARE SILENTLY DROPPED**,
+   * unless the reservation queue can run them all at once. Read out of
+   * `@libp2p/circuit-relay-v2@4.2.5`, not inferred:
+   *
+   *   #checkReservationCount() {
+   *     if (this.pendingReservations.length === 0) {
+   *       this.log.trace('have discovered enough relays');
+   *       this.reserveQueue.clear();          // ← every QUEUED reservation job, gone
+   *
+   * `pendingReservations` is filled only by `reserveRelay()`, which fires only for the DISCOVERY
+   * listen address (a bare `/p2p-circuit`). We listen on EXPLICIT relay addresses, so it is always
+   * empty — and `#checkReservationCount()` runs at the end of every successful reservation. With
+   * the default `reservationConcurrency` of 1, relay 2..N sit queued while relay 1 reserves, and
+   * relay 1's success wipes them. Their `listen()` never settles, so `libp2p.start()` never
+   * resolves either: the node comes up holding exactly one circuit no matter how many it was given.
+   *
+   * That is the unexplained 2026-08-18 measurement recorded in `#buildRevivedNode` — "handed 2
+   * relay addrs at once, no deadline: start() never completes (10,002ms and counting)". It was
+   * never a slow relay.
+   *
+   * `Queue.clear()` splices only the ARRAY; a job already executing keeps running and its promise
+   * still settles. So the fix is to leave nothing queued: give the queue room for every circuit
+   * address this node was handed.
+   */
+  const circuitListenCount = opts.listenAddresses.filter((a) => a.includes("/p2p-circuit")).length;
+
   // Resolved ONCE and shared: what libp2p is configured with is what the node reports, by
   // construction rather than by two call sites agreeing.
   const connectionMonitorPolicy = resolveConnectionMonitorConfig(opts);
@@ -1117,7 +1144,7 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     transports: [
       tcp(),
       webSockets(),
-      circuitRelayTransport(),
+      circuitRelayTransport(hasCircuitListen ? { reservationConcurrency: circuitListenCount } : {}),
     ],
     connectionEncrypters: [
       // Noise ONLY — no plaintext. SI-001.
