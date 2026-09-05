@@ -17376,7 +17376,7 @@ export class SessionNodeManager {
     // DOD-M15-ASSIGN-1 review N3: the ONE relay this receiver actually reserved with earns the
     // inbound AutoNAT carve-out — nothing else does. Set only when a reservation genuinely
     // completed, so a directory that merely NAMES a relay cannot dial in behind it.
-    gater.setReservedRelayPeer(circuitAddrs > 0 && reservedRelayPeerId !== undefined ? reservedRelayPeerId : null);
+    gater.setReservedRelayPeers(circuitAddrs > 0 && reservedRelayPeerId !== undefined ? [reservedRelayPeerId] : []);
     this.#standingReceivers.set(agentName, {
       node,
       gater,

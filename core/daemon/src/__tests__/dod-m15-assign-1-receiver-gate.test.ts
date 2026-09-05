@@ -128,7 +128,7 @@ describe("DOD-M15-ASSIGN-1 (b) — an unclaimed standing receiver admits nobody"
     const gater = new SessionConnectionGater({ sessionId: "sr-autonat", allowedPeerId: null, logger });
     const relay = peer("ReservationRelay");
     gater.setAllowedOutboundPeer(relay.toString());
-    gater.setReservedRelayPeer(relay.toString());
+    gater.setReservedRelayPeers([relay.toString()]);
 
     expect(gater.denyInboundEncryptedConnection(relay, FAKE_CONN)).toBe(false);
     expect(
@@ -148,7 +148,7 @@ describe("DOD-M15-ASSIGN-1 (b) — an unclaimed standing receiver admits nobody"
 
     // On the outbound allowlist — the directory named it — but no reservation ever completed.
     gater.setAllowedOutboundPeer(namedButUnreserved.toString());
-    gater.setReservedRelayPeer(null);
+    gater.setReservedRelayPeers([]);
 
     expect(
       gater.denyInboundEncryptedConnection(namedButUnreserved, FAKE_CONN),
@@ -156,6 +156,53 @@ describe("DOD-M15-ASSIGN-1 (b) — an unclaimed standing receiver admits nobody"
     ).toBe(true);
     // Outbound is unaffected — we may still dial it.
     expect(gater.denyOutboundEncryptedConnection(namedButUnreserved, FAKE_CONN)).toBe(false);
+  });
+
+  it("032-RELAYSPREAD: the carve-out is a SET — every GRANTING relay is admitted, a merely NAMED one is not", () => {
+    // The receiver now holds a reservation with every relay that will grant one, so the carve-out
+    // has to admit more than one peer. The BOUND does not move with it: the set is what actually
+    // GRANTED, never what the directory offered. Widening it to the candidate list would let a
+    // compromised directory name a relay and dial in behind the gate — the single-relay version's
+    // own failure, multiplied by the size of the pool.
+    const { logger } = makeLogger();
+    const gater = new SessionConnectionGater({ sessionId: "sr-spread", allowedPeerId: null, logger });
+    const grantedA = peer("GrantingRelayA");
+    const grantedB = peer("GrantingRelayB");
+    const namedOnly = peer("OfferedButNeverGranted");
+
+    // All three are on the OUTBOUND allowlist — the directory named all three, and we may dial all
+    // three. Only two of them ever granted.
+    for (const p of [grantedA, grantedB, namedOnly]) gater.setAllowedOutboundPeer(p.toString());
+    gater.setReservedRelayPeers([grantedA.toString(), grantedB.toString()]);
+
+    expect(gater.denyInboundEncryptedConnection(grantedA, FAKE_CONN)).toBe(false);
+    expect(gater.denyInboundEncryptedConnection(grantedB, FAKE_CONN)).toBe(false);
+    expect(
+      gater.denyInboundEncryptedConnection(namedOnly, FAKE_CONN),
+      "offered is not granted: a relay that never completed a reservation buys no inbound foothold, " +
+        "however many of its neighbours did",
+    ).toBe(true);
+    expect(gater.denyOutboundEncryptedConnection(namedOnly, FAKE_CONN)).toBe(false);
+  });
+
+  it("032-RELAYSPREAD: losing ONE reservation revokes ONLY that relay's carve-out", () => {
+    // The removal half. A relay whose reservation is gone must lose the foothold in the same breath
+    // — otherwise a relay that granted once keeps inbound rights for the life of the receiver, and
+    // the bound quietly becomes "ever granted" instead of "holds one now".
+    const { logger } = makeLogger();
+    const gater = new SessionConnectionGater({ sessionId: "sr-lost-one", allowedPeerId: null, logger });
+    const kept = peer("StillHolding");
+    const lost = peer("ReservationLost");
+    for (const p of [kept, lost]) gater.setAllowedOutboundPeer(p.toString());
+
+    gater.setReservedRelayPeers([kept.toString(), lost.toString()]);
+    expect(gater.denyInboundEncryptedConnection(lost, FAKE_CONN)).toBe(false);
+
+    // The watchdog notices one reservation is gone and hands over what is still held.
+    gater.setReservedRelayPeers([kept.toString()]);
+
+    expect(gater.denyInboundEncryptedConnection(kept, FAKE_CONN), "the surviving reservation is untouched").toBe(false);
+    expect(gater.denyInboundEncryptedConnection(lost, FAKE_CONN), "the lost one is refused again").toBe(true);
   });
 
   it("a PROMOTED node denies its relay inbound — INV-5 holds where every real session ends up (review N4)", () => {
@@ -167,7 +214,7 @@ describe("DOD-M15-ASSIGN-1 (b) — an unclaimed standing receiver admits nobody"
     const gater = new SessionConnectionGater({ sessionId: "promoted", allowedPeerId: null, logger });
     const relay = peer("ReservationRelay");
     gater.setAllowedOutboundPeer(relay.toString());
-    gater.setReservedRelayPeer(relay.toString());
+    gater.setReservedRelayPeers([relay.toString()]);
 
     gater.setAllowedPeer(peer("Counterparty").toString());
 

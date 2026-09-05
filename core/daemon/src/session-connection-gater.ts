@@ -93,7 +93,7 @@ export class SessionConnectionGater implements ConnectionGater {
   #standingReceiverOutbound: boolean;
 
   /**
-   * The ONE relay this receiver currently holds a live circuit reservation with, or null.
+   * The relays this receiver currently holds a live circuit reservation with. Empty by default.
    *
    * Review N3. The inbound AutoNAT carve-out below first keyed on `#allowedOutboundPeerIds`, and
    * that set is populated from the relay peer ids **the directory hands out at signaling-auth
@@ -101,11 +101,18 @@ export class SessionConnectionGater implements ConnectionGater {
    * entire threat model is "one compromised directory", that handed the adversary back a narrow
    * inbound foothold: name a relay, never complete a reservation, and dial in anyway.
    *
-   * A single slot, set only when a reservation actually succeeds, is the honest version of the
+   * Entries added ONLY when a reservation actually succeeded is the honest version of the
    * justification the carve-out's comment makes — "a peer this node already dials and holds a
    * reservation with" — rather than a set that merely tends to contain those.
+   *
+   * 032-RELAYSPREAD widened this from ONE peer to a set, because the receiver now holds a
+   * reservation with every relay that will grant one. **The BOUND did not widen with it, and that
+   * is the security-sensitive part**: membership is still "this relay's own reservation is
+   * confirmed held", never "this relay is in the pool". Widening it to the candidate list would
+   * let a directory that merely NAMES a relay dial in behind the gate — the exact failure the
+   * single-relay version was written to prevent, multiplied by the size of the pool.
    */
-  #reservedRelayPeerId: string | null = null;
+  readonly #reservedRelayPeerIds = new Set<string>();
 
   constructor(opts: {
     sessionId: string;
@@ -155,11 +162,16 @@ export class SessionConnectionGater implements ConnectionGater {
   }
 
   /**
-   * Record that this receiver now holds a LIVE circuit reservation with `peerId`, which is what
-   * earns that relay the inbound AutoNAT carve-out. Pass null when the reservation is lost.
+   * Record the relays this receiver holds LIVE circuit reservations with — the only peers that earn
+   * the inbound AutoNAT carve-out.
+   *
+   * REPLACES the set rather than adding to it. A relay absent from `peerIds` loses its carve-out in
+   * the same call that notices the reservation is gone, so the bound stays "holds one now" and
+   * cannot drift into "granted one once". Pass `[]` when nothing is held.
    */
-  setReservedRelayPeer(peerId: string | null): void {
-    this.#reservedRelayPeerId = peerId;
+  setReservedRelayPeers(peerIds: readonly string[]): void {
+    this.#reservedRelayPeerIds.clear();
+    for (const peerId of peerIds) this.#reservedRelayPeerIds.add(peerId);
   }
 
   /**
@@ -268,14 +280,16 @@ export class SessionConnectionGater implements ConnectionGater {
      * breaks INV-5 — a SESSION node admits exactly one counterparty, and the existing tests say so
      * in those words. A promoted node has no AutoNAT probe to answer, so it needs nothing here.
      *
-     * To the ONE RELAY HOLDING A LIVE RESERVATION (`#reservedRelayPeerId`), not the outbound
+     * To THE RELAYS HOLDING A LIVE RESERVATION (`#reservedRelayPeerIds`), not the outbound
      * allowlist. That allowlist is built from relay peer ids the DIRECTORY supplies, cumulatively,
      * including ones whose reservation never completed — so keying on it let a compromised
      * directory name a relay and dial in without ever holding a reservation. In a unit whose threat
-     * model is exactly that adversary, the set was the wrong thing to trust.
+     * model is exactly that adversary, the outbound allowlist was the wrong thing to trust, and it
+     * still is: this set holds only relays whose own reservation was confirmed, however many relays
+     * the pool names.
      */
-    if (direction === "inbound" && this.#standingReceiverOutbound && peerId.toString() === this.#reservedRelayPeerId) {
-      return false; // allow — the relay we hold a live reservation with, answering a probe we started
+    if (direction === "inbound" && this.#standingReceiverOutbound && this.#reservedRelayPeerIds.has(peerId.toString())) {
+      return false; // allow — a relay we hold a live reservation with, answering a probe we started
     }
     if (this.#allowedPeerId === null) {
       if (direction === "outbound") return false; // allow — we chose this dial; INV-5 is inbound-only
