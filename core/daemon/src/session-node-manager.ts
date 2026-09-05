@@ -14027,6 +14027,26 @@ export class SessionNodeManager {
   }
 
   /**
+   * Test seam: put the session's genesis prev_root where a completed session open leaves it —
+   * 033-ACKEMIT.
+   *
+   * ⚠️ THE STATE IS THE PRODUCTION ONE; ONLY HOW IT GOT THERE IS SHORT-CIRCUITED, exactly as
+   * `setSessionContentKeyForTest` short-circuits the key exchange next door.
+   *
+   * In production this value is derived from the directory-signed relay assignment and written to
+   * the session row the moment the session learns it, so every real session has one. A fixture that
+   * builds a session node directly never sees an assignment — so without this seam every content
+   * test built on the fixture would be exercising the "no starting point" REFUSAL path instead of
+   * the thing it was written for, and would report that as a pass or a mysterious failure depending
+   * on which side of the send it sat on.
+   */
+  setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void {
+    this.#db
+      ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ?")
+      .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
+  }
+
+  /**
    * Test seam: drop the agreed key while leaving the session up — the state before an exchange
    * completes, and after a teardown evicts one. Its mirror above is what a completed exchange
    * leaves; both are needed, or a status field stuck in one position passes either test alone.
@@ -15611,18 +15631,70 @@ export class SessionNodeManager {
     // second meaning: for every session created without an assignment the two are the same value
     // (`relaySessionIdBytes` is set from `sessionId` on exactly those paths).
     const sessionIdBytes = entry.relaySessionIdBytes ?? Uint8Array.from(Buffer.from(sessionId, "hex"));
+    /**
+     * ⚠️ **THIS COMMENT USED TO READ "v1 DELIBERATELY" AND IT WAS RIGHT UNTIL NOW — 033-ACKEMIT.**
+     *
+     * It said `last_seen_hash` was `WITHHOLD-SEAL-1`'s emitter and "not owed here", and that a v1
+     * claim makes no content acknowledgement at all, "which is honest, where an invented one would
+     * not be." Accurate for `020-ACKHASH`, which shipped the reader only. It is rewritten rather
+     * than deleted because it is the sentence that would otherwise explain away the LAST production
+     * path still emitting v1 — and this unit's own Definition of Done is that a grep finds none.
+     *
+     * The reasoning it rested on has been answered: nothing is invented here. The acknowledgement
+     * is read from the same `#lastSeen` entry the submit reads, so a frame built on this path and
+     * one built by a submit make the same claim about the same message.
+     */
+    const sessionIdHexForAck = Buffer.from(sessionIdBytes).toString("hex");
+    /**
+     * The pair, from ONE accessor. Falling back to the session's genesis when there is no relay
+     * client at all is not an invention either: nothing has been witnessed on this session, so the
+     * honest acknowledgement is position 0 and the agreed starting point of the chain.
+     */
+    const ack = entry.relayClient?.lastSeenAck(sessionIdHexForAck)
+      ?? (() => { const g = this.#sessionGenesisPrevRoot(agentName, sessionId); return g ? { seq: 0, hash: g } : undefined; })();
+    if (!ack) {
+      /**
+       * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE — see `#verifyAcknowledgedContent`
+       * for the receiving half of the same rule, which is what makes this safe rather than a
+       * downgrade.**
+       *
+       * Reaching here means this session has no recorded starting point AND has received nothing.
+       * The claim it produces is `last_seen_seq: 0` with no hash: "I have seen nothing of yours, and
+       * I assert nothing about your content." That is honest, and it is not the fail-open the unit
+       * closes — the hole is a claim that names a POSITION with no content behind it, and this names
+       * no position. A receiver refuses a v1 claim the moment it acknowledges position 1 or beyond.
+       *
+       * It does not throw, and an earlier version did. Sessions brokered without a relay assignment
+       * are real — the directory does not always return one — and throwing there stopped those
+       * sessions sending at all, which trades a hole this claim does not have for a failure of the
+       * thing the product is for.
+       */
+      this.#logger.info("session.content.claim.unacknowledged", {
+        agentName, sessionId,
+        impact:
+          "this message is signed with no acknowledgement of anything received, because this " +
+          "session has no recorded starting point and nothing has arrived on it yet. It binds the " +
+          "sender and the content as always; it makes no claim about the counterparty's messages.",
+      });
+      const bare = encodeStructure1({
+        contentHash,
+        senderPubkey: await signer.getPublicKey(),
+        sessionId: sessionIdBytes,
+        lastSeenSeq: 0,
+        timestamp: Date.now(),
+      });
+      return { structure1: bare, signature: await signer.sign(bare) };
+    }
     const structure1 = encodeStructure1({
       contentHash,
       senderPubkey: await signer.getPublicKey(),
       sessionId: sessionIdBytes,
       // The highest counterparty position this session has seen, from the same source the submit
-      // reads. Zero when there is no relay client at all, which is honest: nothing has been
-      // witnessed on this session, so there is no position to acknowledge.
-      lastSeenSeq: entry.relayClient?.lastSeenSeq(Buffer.from(sessionIdBytes).toString("hex")) ?? 0,
+      // reads — and now the content hash at it, taken from the same entry so the two cannot
+      // describe different messages.
+      lastSeenSeq: ack.seq,
       timestamp: Date.now(),
-      // v1 DELIBERATELY. `last_seen_hash` (v2) is `WITHHOLD-SEAL-1`'s emitter and is not owed here;
-      // a v1 claim makes no content acknowledgement at all, which is honest, where an invented one
-      // would not be.
+      lastSeenHash: ack.hash,
     });
     return { structure1, signature: await signer.sign(structure1) };
   }
@@ -15806,8 +15878,31 @@ export class SessionNodeManager {
     sessionId: string,
     fields: { lastSeenSeq: number; lastSeenHash: Uint8Array | null },
   ): { verdict: "unusable"; reason: string } | undefined {
+    /**
+     * ⚠️ **A v1 CLAIM IS REFUSED THE MOMENT IT NAMES A POSITION — and accepted when it names none.
+     * The split is the whole rule, so it is stated rather than left to the reader.**
+     *
+     * `last_seen_seq >= 1` with no hash IS the defect: "I saw position 7" attests to a position and
+     * never to content, which is the unbacked number this unit exists to stop accepting. Treating
+     * that as "fine, skip the check" would recreate `DOD-M15-AUTHORSHIP-ABSENT-1` one layer down —
+     * an attacker evading a mismatch check simply never supplies a checkable proof.
+     *
+     * `last_seen_seq === 0` with no hash claims nothing about our messages, so there is no check to
+     * skip and nothing to bind. A sender genuinely in that state — a session brokered without a
+     * relay assignment, which the directory does not always return — has nothing to acknowledge,
+     * and refusing them would stop the product's own advertised journey to close a hole they are
+     * not in.
+     *
+     * **THE BOUND, SAID PLAINLY:** a peer can decline to bind by never acknowledging anything.
+     * That costs them their own ratification of our history rather than falsifying it, and it is
+     * the same under-claiming the relay has always allowed (it refuses a `last_seen_seq` that runs
+     * AHEAD of its counter, never one that lags). This unit does not change that either way, and
+     * the follow-on that does is the receiver submitting a hash for what it received.
+     */
     if (fields.lastSeenHash === null) {
-      return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_ABSENT };
+      return fields.lastSeenSeq >= 1
+        ? { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_ABSENT }
+        : undefined;
     }
     /**
      * THE GENESIS IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing, and

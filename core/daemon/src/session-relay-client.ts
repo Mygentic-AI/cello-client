@@ -1868,20 +1868,27 @@ export class AgentRelayClient {
      * message itself from being lost.
      */
     if (!lastSeen) {
-      this.#logger.error("session.relay.submit.ack_hash_unavailable", {
+      /**
+       * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE.** Same rule as the content
+       * claim's, and the receiving half is `#verifyAcknowledgedContent` — a v1 claim is refused the
+       * moment it names position 1 or beyond, and accepted when it names none.
+       *
+       * Reaching here means the session was registered with no genesis and no assignment to derive
+       * one from, and no counterparty leaf has been delivered. `last_seen_seq: 0` with no hash says
+       * "I have seen nothing of yours", which is true, and asserts nothing about content — so it is
+       * not the unbacked number this unit exists to stop signing.
+       *
+       * It does not refuse the submit, and an earlier version did. Sessions brokered without a
+       * relay assignment are real, and refusing there left them unable to be witnessed at all.
+       */
+      this.#logger.info("session.relay.submit.unacknowledged", {
         relayPeerId: this.#relayPeerId,
         session: sessionIdHex,
         impact:
-          "this message was NOT witnessed: the session has no recorded starting point, so this " +
-          "agent cannot say what its acknowledgement refers to, and it will not sign one that " +
-          "refers to nothing. The message itself is not lost — the send path parks it and retries.",
-        guidance:
-          "This is an internal invariant break on THIS machine, not a peer or network problem: the " +
-          "session was registered without a genesis value. Restart the agent (cello_start_agent) to " +
-          "re-establish the session; if it persists, the session predates this build and a new one " +
-          "will carry the value.",
+          "this submit acknowledges nothing: the session has no recorded starting point and no " +
+          "counterparty leaf has arrived on it. The leaf is witnessed as normal; the claim simply " +
+          "makes no assertion about what this agent has received.",
       });
-      return { ok: false, reason: "submit_ack_hash_unavailable" };
     }
     // The published encoder from protocol-types — the ONE definition of the field order, pinned by
     // `structure1-canonical.json` (v1) and `structure1-v2-canonical.json` (v2). A second local copy
@@ -1896,9 +1903,9 @@ export class AgentRelayClient {
       contentHash,
       senderPubkey: this.#senderPubkey,
       sessionId,
-      lastSeenSeq: lastSeen.seq,
+      lastSeenSeq: lastSeen?.seq ?? 0,
       timestamp: Date.now(),
-      lastSeenHash: lastSeen.hash,
+      ...(lastSeen ? { lastSeenHash: lastSeen.hash } : {}),
     });
     const signature = await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
@@ -1971,6 +1978,20 @@ export class AgentRelayClient {
   /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
   lastSeenSeq(sessionIdHex: string): number {
     return this.#lastSeen.get(sessionIdHex)?.seq ?? 0;
+  }
+
+  /**
+   * The POSITION and the CONTENT AT IT together — 033-ACKEMIT.
+   *
+   * ⚠️ EXISTS SO THE OTHER EMITTER CANNOT TAKE ONE WITHOUT THE OTHER. `session-node-manager`'s
+   * unwitnessed content claim reads `lastSeenSeq()` above; reading the hash through a second
+   * accessor would let a future edit advance one and not the other, and a `last_seen_seq` paired
+   * with a `last_seen_hash` for a different message is worse than no acknowledgement at all —
+   * it looks checkable and fails. `undefined` means this session has no acknowledgement to make,
+   * which the caller must handle rather than fill in.
+   */
+  lastSeenAck(sessionIdHex: string): { seq: number; hash: Uint8Array } | undefined {
+    return this.#lastSeen.get(sessionIdHex);
   }
 
   close(): void {

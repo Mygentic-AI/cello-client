@@ -25,7 +25,6 @@ import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSION_V2 } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
-import type { CelloNode } from "@cello-protocol/transport";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
 import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
@@ -203,18 +202,28 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
     ).not.toBe(Buffer.from(GENESIS).toString("hex"));
   });
 
-  it("★ NO seed ⇒ the submit is REFUSED BY NAME. It is never downgraded to a v1 claim", async () => {
+  it("★ NO seed ⇒ v1 claiming POSITION ZERO — the one honest emission, and it asserts nothing", async () => {
     /**
-     * The fail-open this unit exists to close, tested from the emitting side.
+     * ⚠️ **THE BOUND ON THIS UNIT, PINNED AS A TEST RATHER THAN LEFT IN A COMMENT.**
      *
-     * A v1 emission binds to a POSITION and not to CONTENT — the unbacked number again — and doing
-     * it silently, on the one path an adversary would most like to take, is worse than any refusal.
-     * So the assertion is on BOTH halves: it refused, AND nothing reached the wire.
+     * A session registered with no genesis and no assignment to derive one from has nothing to
+     * acknowledge, and the honest claim is `last_seen_seq: 0` with no hash: "I have seen nothing of
+     * yours, and I assert nothing about your content."
+     *
+     * That is NOT the fail-open this unit closes. The hole is a claim naming a POSITION with no
+     * content behind it — `last_seen_seq >= 1` and no hash — and the receiving daemon refuses
+     * exactly that, which the receive-side test below pins. This names no position.
+     *
+     * An earlier version REFUSED the submit here, and it was wrong for a measurable reason:
+     * sessions brokered without a relay assignment are real (the directory does not always return
+     * one), and refusing left them unable to be witnessed at all — trading a hole this claim does
+     * not have for a failure of the thing the product is for.
      */
     const { arr, result } = await submittedStructure1({ genesis: undefined });
-    expect(result.ok).toBe(false);
-    expect(result.reason, "named at its cause, not at its exit point").toBe("submit_ack_hash_unavailable");
-    expect(arr.length, "and no claim was signed at all — a silent v1 would be six fields here").toBe(0);
+    expect(result.ok, "the leaf is still witnessed — an unacknowledging claim is not a broken one").toBe(true);
+    expect(arr.length, "SIX fields: there is no hash, and an invented one would be worse than none").toBe(6);
+    expect(arr[0]).toBe(1);
+    expect(arr[4], "and it names NO position, which is what makes the absent hash honest").toBe(0);
   });
 
   it("★ INDEX 6 IS EXCLUSIVE: a v2 claim carrying a submission id is REFUSED, not coerced", () => {
@@ -352,19 +361,38 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
     expect(received).toBe(0);
   }, 60_000);
 
-  it("★ a v1 claim — no hash at all — is REFUSED. Missing, malformed and mismatched take ONE path", async () => {
+  it("★ a v1 claim that NAMES A POSITION is REFUSED — that is the unbacked number", async () => {
     /**
      * The fail-open this unit is closing, tested from the receiving side.
      *
      * An attacker who wants to evade a mismatch check simply never supplies a checkable proof, so
-     * treating an absent `last_seen_hash` as "fine, skip the check" would recreate
-     * `DOD-M15-AUTHORSHIP-ABSENT-1` one layer down — a bad proof refused and a missing one waved
-     * through.
+     * treating an absent `last_seen_hash` on a claim about OUR message as "fine, skip the check"
+     * would recreate `DOD-M15-AUTHORSHIP-ABSENT-1` one layer down — a bad proof refused and a
+     * missing one waved through.
      */
     const { notice, received } = await deliverClaim({ lastSeenSeq: 1 });
-    expect(notice, "an absent acknowledgement is not a lenient case").toBeDefined();
+    expect(notice, "an absent acknowledgement of a real position is not a lenient case").toBeDefined();
     expect(notice!.reason).toBe("authorship_unacknowledged");
     expect(received).toBe(0);
     expect(notice!.guidance, "the likely cause is their build, and only they can fix it").toMatch(/upgrade/i);
+  }, 60_000);
+
+  it("★ a v1 claim naming NO position is ACCEPTED — and the difference between the two is the rule", async () => {
+    /**
+     * ⚠️ **THE COMPANION TO THE TEST ABOVE, AND IT IS THE ONE THAT MAKES THE RULE FALSIFIABLE.**
+     *
+     * Without it, "refuse every v1 claim" and "refuse a v1 claim that names a position" both pass
+     * the test above, and the difference between them is whether every peer on an older build stops
+     * being able to talk to this one.
+     *
+     * `last_seen_seq: 0` with no hash asserts nothing about our messages, so there is no check being
+     * skipped. **The bound, stated:** a peer CAN decline to bind by never acknowledging anything —
+     * which costs them their own ratification of our history rather than falsifying it, and is the
+     * same under-claiming the relay has always allowed, since it refuses a `last_seen_seq` that runs
+     * ahead of its counter and never one that lags.
+     */
+    const { notice, received } = await deliverClaim({ lastSeenSeq: 0 });
+    expect(notice, `a claim that acknowledges nothing asserts nothing to refuse: ${notice?.reason}`).toBeUndefined();
+    expect(received, "and the message is delivered").toBe(1);
   }, 60_000);
 });
