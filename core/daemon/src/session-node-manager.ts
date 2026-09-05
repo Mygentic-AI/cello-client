@@ -923,6 +923,24 @@ const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
 
 /**
+ * ⚠️ **EVERY INBOUND REFUSAL SAYS THIS, BECAUSE THE REFUSAL DOES NOT HOLD.**
+ *
+ * Refusing an inbound frame sends back no delivery acknowledgement, so the sender's TTF backstop
+ * parks a copy in the relay mailbox — sealed to this agent's LONG-TERM IDENTITY key, not the
+ * session key — and recovery opens that one whatever went wrong with the direct copy. The message
+ * therefore tends to arrive seconds later by the other route.
+ *
+ * Saying so is not a hedge, it is the difference between an operator who waits and one who knows
+ * what they are looking at. Every wording that claimed "nothing was stored" full stop was describing
+ * one copy and reading as a verdict on the message.
+ */
+const REFUSAL_MAY_STILL_ARRIVE =
+  "IT MAY STILL REACH YOU BY THE OTHER ROUTE: a refusal sends back no acknowledgement, so their " +
+  "agent parks a copy in the relay mailbox and this side opens that one with your long-term key " +
+  "instead of this session's. If it arrives, it arrives without whatever this check was unable to " +
+  "confirm.";
+
+/**
  * Constant-shape byte equality for the two binding checks. Lifted rather than hand-rolled a second
  * time — `seal-frontier-verify` has the same helper for the same comparison, and two copies of
  * "are these the same bytes" is two things to keep true.
@@ -15554,6 +15572,31 @@ export class SessionNodeManager {
     this.#noteUnprovenAuthorshipFrame(agentName, sessionId, contentHash);
   }
 
+  /**
+   * An inbound content frame refused before it could be read — the ENCRYPTION gate's three causes.
+   *
+   * ⚠️ **THESE LOGGED AND FILED NOTHING, AND THAT IS WHY THIS EXISTS.** All three carried a good
+   * `impact` and `guidance` at ERROR and none of them called `noteContentRefusal`, so the sentences
+   * an operator needed were in a file they have no reason to open. From their chair a message never
+   * arrived and the conversation went quiet — the exact defect `DOD-M15-NO-SILENT-REFUSAL-1` was
+   * built to end, on the same path, three checks above the one that respected it.
+   *
+   * Both surfaces, always: the ERROR is the durable forensic record an investigation reads days
+   * later, and the notice is the control — the thing that actually reaches the person.
+   */
+  #refuseInboundContent(
+    agentName: string,
+    sessionId: string,
+    reason: string,
+    detail: { impact: string; guidance: string } & Record<string, unknown>,
+    correlationId?: string,
+  ): void {
+    this.#logger.error("session.content.refused", { agentName, sessionId, correlationId, reason, ...detail });
+    this.noteContentRefusal(agentName, sessionId, reason, {
+      kind: REFUSAL_KINDS.REFUSED, impact: detail.impact, guidance: detail.guidance,
+    });
+  }
+
   #recordFrameOrdering(
     agentName: string,
     sessionId: string,
@@ -15925,42 +15968,37 @@ export class SessionNodeManager {
       const encState = this.#contentEncryptionState(agentName, sessionId);
       let plaintextBody: Uint8Array;
       if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
-        this.#logger.error("session.content.refused", {
-          agentName, sessionId, correlationId,
-          reason: "content_encryption_absent_or_unknown",
+        this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", {
           declared: typeof declaredEncryption === "string" ? declaredEncryption : "(absent)",
-          impact: "the frame did not say it was encrypted under this session's key, so it was refused unread. Nothing was shown and nothing was stored.",
+          impact: "the frame did not say it was encrypted under this session's key, so it was refused unread — nothing was shown and this copy was not kept.",
           guidance:
             "STOPPED ON PURPOSE. A message arrived that was not encrypted under this session's key. " +
             "This build never sends one, so either something between you rewrote the frame, or your " +
             "counterparty is running something that is not CELLO. Confirm with them OUT OF BAND " +
-            "before opening another session.",
-        });
+            "before opening another session. " + REFUSAL_MAY_STILL_ARRIVE,
+        }, correlationId);
         return;
       }
       if (encState.key === null) {
-        this.#logger.error("session.content.refused", {
-          agentName, sessionId, correlationId,
-          reason: "no_session_key",
+        this.#refuseInboundContent(agentName, sessionId, "no_session_key", {
           detail: encState.reason,
           impact: "an encrypted message arrived and this side has no agreed key to open it, so it was refused unread rather than shown as garbage.",
-          guidance: CONTENT_ENCRYPTION_GUIDANCE[encState.reason],
-        });
+          guidance: `${CONTENT_ENCRYPTION_GUIDANCE[encState.reason]} ${REFUSAL_MAY_STILL_ARRIVE}`,
+        }, correlationId);
         return;
       }
       const opened = openSessionContent(encState.key, contentBytes);
       if (opened === null) {
         // GCM's tag is the only thing separating "not for us" from "modified in flight", and this
         // side must not branch on which — that would be branching on attacker-controlled input.
-        this.#logger.error("session.content.refused", {
-          agentName, sessionId, correlationId,
-          reason: "decrypt_failed",
+        this.#refuseInboundContent(agentName, sessionId, "decrypt_failed", {
           impact: "the message did not decrypt under this session's agreed key — it was modified in flight, or it was encrypted under a different key. Refused unread.",
           guidance:
-            "STOPPED ON PURPOSE. Nothing was shown and nothing was stored. A message that fails this " +
-            "check has either been altered on its way to you or was not encrypted for this session. " +
-            "Confirm with your counterparty OUT OF BAND, then start a new session.",
-        });
+            "STOPPED ON PURPOSE. Nothing was shown and this copy was not kept. A message that fails " +
+            "this check has either been altered on its way to you or was not encrypted for this " +
+            "session. Confirm with your counterparty OUT OF BAND, then start a new session. " +
+            REFUSAL_MAY_STILL_ARRIVE,
+        }, correlationId);
         return;
       }
       plaintextBody = opened;
