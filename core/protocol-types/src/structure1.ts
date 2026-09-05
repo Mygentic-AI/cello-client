@@ -1,85 +1,87 @@
 /**
- * Structure 1 — the sender's signed ordering claim, canonical CBOR.
+ * Structure 1 — the sender's signed claim, canonical CBOR. **ONE LAYOUT. EVERY FIELD REQUIRED.**
  *
- * THE ONE BUILDER AND THE ONE READER. The daemon kept a second, positional `encodeStructure1` in
- * `session-relay-client.ts` until 020-ACKHASH; the two were maintained separately and only a
- * convention kept them equal. It had already broken — the copy emitted a timestamp above 2^32-1 as
- * a CBOR float64 where this one promotes to uint64 — so the vector below was pinning bytes
- * production never emitted. Import this; never write a third.
+ * ```
+ * [3, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp,
+ *     last_seen_hash(32), prev_own_hash(32)]
+ * ```
  *
  * Field order is LOAD-BEARING: it is signed over. Reorder a field and signatures produced by any
- * other implementation stop verifying against ours. `structure1-canonical.json` and
- * `structure1-v2-canonical.json` pin the resulting bytes for each version.
+ * other implementation stop verifying against ours. `structure1-canonical.json` pins the bytes.
+ *
+ * ─── THE TWO HASHES ARE THE WHOLE POINT ────────────────────────────────────────────────────────
+ *
+ * A conversation is a cryptographic chain, and moving any message in it breaks a signature. Two
+ * links do that, and both are known to the sender at signing time:
+ *
+ *   - `last_seen_hash` — the last message I received from YOU. Chains me to you.
+ *   - `prev_own_hash`  — MY own previous message. Chains me to myself.
+ *
+ * Neither alone is enough, and `DOD-M15-SELFCHAIN-1` exists because only the first one existed.
+ * When one party sends twice in a row, both of their messages acknowledge the SAME message from the
+ * other side — nothing arrived in between — so their acknowledgements are identical and nothing in
+ * the signed bytes says which came first. Whoever later hands the conversation to a new relay could
+ * swap them.
+ *
+ * The relay-assigned position cannot fill that gap, and this is the fact everything here follows
+ * from: **the relay assigns position AFTER the sender has signed, so a sender can never sign their
+ * own position.** The relay's receipt does pin it — but the receipt goes to the SENDER, so the party
+ * handing over a conversation holds no receipt for the counterparty's messages.
+ *
+ * ─── WHAT IS STILL DISPUTABLE, AND WHY IT IS NOT A GAP ─────────────────────────────────────────
+ *
+ * The chain works because the act of sending proves what you received. It follows that **the last
+ * message each side sent has been ratified by nobody** — there is no reply to chain it to yet, and
+ * there is nothing that could be. Every message with a reply after it is immutable; the
+ * unacknowledged tail is covered by the relay's ACK receipt and by `DOD-M15-WITHHOLD-SEAL-1`, not
+ * by this. Do not try to "fix" the tail by chaining it to something: the ratification IS the reply.
+ *
+ * ─── ONE LAYOUT, AND WHAT WAS DELETED TO GET THERE ─────────────────────────────────────────────
+ *
+ * CELLO is alpha with no users, so **backward compatibility is an anti-requirement** (Andre,
+ * 2026-09-05). Three tolerances are gone rather than carried:
+ *
+ *   - the six-field layout with no acknowledgement at all;
+ *   - the seven-field layout carrying `last_seen_hash`;
+ *   - the seven-field layout whose index 6 was a sender-minted SUBMISSION ID
+ *     (`DOD-M15-SUBMIT-ID-1`). That shipped as relay tolerance and no client ever emitted one —
+ *     measured, not assumed: nothing in `core/*` builds it. It was dead code waiting for a caller.
+ *
+ * With one layout, the ambiguity those versions existed to resolve is gone too: index 6 had two
+ * possible meanings and only the version tag could separate them. Now it has one.
+ *
+ * The version tag STAYS at index 0. It is domain separation, not compatibility — every to-be-signed
+ * structure in this protocol carries one, and dropping it would let these bytes be confused with
+ * another structure of the same shape.
+ *
+ * A timestamp above 2^32-1 is encoded as a CBOR bigint — a plain number encodes as a float64, and
+ * two implementations that disagree about which they emit produce different signed bytes for the
+ * same value. Same promotion as `buildSessionEstablishmentTbs`.
  */
 import { encodeCbor, decodeCbor } from "./cbor.js";
 
-/** The Structure 1 version tag. Bound as the FIRST field, so a v1 claim can never read as a v2 one. */
-export const STRUCTURE1_VERSION = 1;
+/** The Structure 1 domain tag, bound as the FIRST signed field. One layout; nothing else is read. */
+export const STRUCTURE1_VERSION = 3;
 
-/**
- * v2 — `last_seen_hash` APPENDED at index 6 (`DOD-M15-WITHHOLD-SEAL-1`).
- *
- * `last_seen_seq` is a NUMBER, so "I saw position 7" attests to a POSITION and never to CONTENT.
- * `last_seen_hash` binds the acknowledgement to what was actually received. It ADDS: `last_seen_seq`
- * stays and keeps doing ordering and dedup work.
- */
-export const STRUCTURE1_VERSION_V2 = 2;
+/** The number of fields in the one layout. A different arity is a different structure. */
+export const STRUCTURE1_FIELD_COUNT = 8;
 
-/**
- * v3 — `prev_own_hash` APPENDED at index 7 (`DOD-M15-SELFCHAIN-1`).
- *
- * ⚠️ THIS IS THE OTHER HALF OF THE CHAIN, AND WITHOUT IT THERE IS NO CHAIN.
- *
- * `last_seen_hash` links a sender to the counterparty: *"the last thing I got from you."* That
- * chains ACROSS the two parties and it does not chain a sender to themselves — so when one party
- * sends twice in a row, BOTH of their messages carry the same `last_seen_hash`, because nothing
- * arrived in between. Nothing in the signed bytes distinguishes them, and nothing links the second
- * to the first.
- *
- * Position cannot fill that gap: the relay assigns position AFTER the sender has signed, so a
- * sender can never sign their own position. The relay's receipt pins it, but the receipt goes to
- * the SENDER — so whoever hands a conversation to a new relay holds no receipt for the
- * counterparty's messages and can reorder any run of them. Measured in `031-RELAYREPLAY`.
- *
- * `prev_own_hash` is the `content_hash` of this sender's OWN previous message in this session. With
- * both links every position is committed: move a message inside your own run and your self-link
- * breaks; move one across the interleaving and the counterparty link breaks.
- */
-export const STRUCTURE1_VERSION_V3 = 3;
-
-/** `last_seen_hash` is a SHA-256 root — always exactly 32 bytes, never a prefix and never empty. */
+/** Both chain links are SHA-256 outputs — always exactly 32 bytes, never a prefix and never empty. */
 export const LAST_SEEN_HASH_BYTES = 32;
-
-/** `prev_own_hash` is a content hash — always exactly 32 bytes, same rule, same reason. */
 export const PREV_OWN_HASH_BYTES = 32;
 
-/**
- * ⚠️ INDEX 6 IS ALREADY SPOKEN FOR, WHICH IS WHY THE VERSION DECIDES AND NOT THE LENGTH.
- *
- * `DOD-M15-SUBMIT-ID-1` widened the relay to accept a SIX OR SEVEN field Structure 1, reserving
- * index 6 for a sender-minted submission id, and shipped that tolerance ahead of any emitter. So a
- * seven-field array has two possible meanings and `arr.length` cannot tell them apart:
- *
- *   length 7 && version 1  ⇒  the pre-existing submission-id layout (index 6 is NOT an ack hash)
- *   length 7 && version 2  ⇒  the ack-hash layout
- *   length 8 && version 3  ⇒  the ack-hash layout PLUS `prev_own_hash` at index 7
- *   anything else          ⇒  refused BY NAME, never coerced
- *
- * A reader that silently admits an unrecognised length is not tolerant, it is fail-open: it would
- * verify a signature over bytes whose meaning is not agreed.
- */
 export const STRUCTURE1_DECODE_REASONS = {
   /** The bytes are not CBOR at all. */
   NOT_CBOR: "structure1_not_cbor",
   /** Valid CBOR, but not the positional array every Structure 1 is. */
   NOT_ARRAY: "structure1_not_array",
-  /** A (version, length) pair this build cannot name — including a v2 that omits `last_seen_hash`. */
+  /** Not the one layout — wrong domain tag, wrong arity, or both. Refused, never coerced. */
   UNKNOWN_LAYOUT: "structure1_unknown_layout",
-  /** A field at one of the unchanged indices 1–5 is the wrong type or the wrong width. */
+  /** A field at indices 1–5 is the wrong type or the wrong width. */
   FIELD_MALFORMED: "structure1_field_malformed",
-  /** A v2 carried `last_seen_hash`, and it was not 32 bytes. Present-but-wrong, never dropped. */
+  /** `last_seen_hash` was not 32 bytes. Present-but-wrong, never dropped. */
   LAST_SEEN_HASH_MALFORMED: "structure1_last_seen_hash_malformed",
-  /** A v3 carried `prev_own_hash`, and it was not 32 bytes. Present-but-wrong, never dropped. */
+  /** `prev_own_hash` was not 32 bytes. Present-but-wrong, never dropped. */
   PREV_OWN_HASH_MALFORMED: "structure1_prev_own_hash_malformed",
 } as const;
 
@@ -98,17 +100,20 @@ export interface Structure1Fields {
    */
   timestamp: number | bigint;
   /**
-   * The 32 bytes on a v2 claim; `null` on any v1 claim, INCLUDING a v1 seven-array whose index 6 is
-   * a submission id. `null` means "this layout carries no ack hash", never "the hash was missing" —
-   * a v2 that omits the field is refused as UNKNOWN_LAYOUT and never reaches here.
+   * The last message this sender RECEIVED. Never null: a claim that carries no acknowledgement is
+   * not a layout this build accepts.
+   *
+   * The first message of a session has received nothing, and that case is a defined 32-byte value —
+   * `computeGenesisPrevRoot` for the session, the agreed starting point of this two-party chain.
+   * Not 32 zero bytes, which would be a constant identical across every session and therefore
+   * presentable for any of them.
    */
-  lastSeenHash: Uint8Array | null;
+  lastSeenHash: Uint8Array;
   /**
-   * The 32 bytes on a v3 claim; `null` on v1 and v2. `null` means "this layout carries no self
-   * link", never "the link was missing" — a v3 that omits it is refused as UNKNOWN_LAYOUT and never
-   * reaches here.
+   * This sender's OWN previous message. Never null, same rule, same genesis for a sender who has
+   * not spoken in this session yet.
    */
-  prevOwnHash: Uint8Array | null;
+  prevOwnHash: Uint8Array;
 }
 
 export type Structure1DecodeResult =
@@ -116,32 +121,12 @@ export type Structure1DecodeResult =
   | { ok: false; reason: Structure1DecodeReason };
 
 /**
- * Canonical Structure 1 bytes.
+ * Canonical Structure 1 bytes. Both chain links are REQUIRED — there is no shape that omits one.
  *
- *   v1: [1, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp]
- *   v2: [2, content_hash(32), sender_pubkey(32), session_id(16), last_seen_seq, timestamp,
- *        last_seen_hash(32)]
- *   v3: [3, …the same six…, last_seen_hash(32), prev_own_hash(32)]
- *
- * `lastSeenHash` ABSENT ⇒ v1, six fields, byte-identical to the pinned v1 vector. PRESENT ⇒ v2.
- * `prevOwnHash` PRESENT as well ⇒ v3. The version tag is what disambiguates, so no two layouts can
- * be confused by a reader, and the v1 and v2 vectors are unchanged by the addition.
- *
- * ⚠️ `prev_own_hash` IS A VALUE, NEVER AN ABSENCE — the same rule as `last_seen_hash` and the same
- * reason. A sender's first message in a session has no predecessor, and that case is
- * `computeGenesisPrevRoot` for the session: not 32 zero bytes, which would be presentable for any
- * session, and not a shorter array, which is refused.
- *
- * ⚠️ `last_seen_hash` IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing,
- * and that case is a defined 32-byte value: `computeGenesisPrevRoot` for the session — the agreed
- * starting point of this two-party chain. Not 32 zero bytes, which would be a constant identical
- * across every session and therefore presentable for any of them; and not a shorter array, which is
- * refused. A caller that has no hash to send sends v1, and a v1 claim makes no content assertion at
- * all — which is honest — rather than an empty one that reads as satisfied.
- *
- * A timestamp above 2^32-1 is encoded as a CBOR bigint — a plain number encodes as a float64, and
- * two implementations that disagree about which one they emit produce different signed bytes for
- * the same value. Same promotion as `buildSessionEstablishmentTbs`.
+ * Throws on a wrong-width hash rather than emitting something shorter, at the last point before
+ * these bytes are signed. A caller that meant to chain and cannot must find out here: a signature
+ * over a claim nobody accepts is worse than a refusal, and a silently unlinked message is invisible
+ * until the conversation's order is disputed, long after anyone could act on it.
  */
 export function encodeStructure1(fields: {
   contentHash: Uint8Array;
@@ -149,53 +134,30 @@ export function encodeStructure1(fields: {
   sessionId: Uint8Array;
   lastSeenSeq: number;
   timestamp: number;
-  lastSeenHash?: Uint8Array;
-  /**
-   * The sender's OWN previous message in this session — `DOD-M15-SELFCHAIN-1`. Supplying it selects
-   * v3 and is what makes the conversation a chain rather than a set of cross-acknowledgements.
-   *
-   * A sender's FIRST message in a session has no predecessor, and that case is a defined 32 bytes:
-   * `computeGenesisPrevRoot` for the session. Never omitted to mean "first" — see the header.
-   */
-  prevOwnHash?: Uint8Array;
+  lastSeenHash: Uint8Array;
+  prevOwnHash: Uint8Array;
 }): Uint8Array {
+  if (fields.lastSeenHash.length !== LAST_SEEN_HASH_BYTES) {
+    throw new Error(
+      `structure1: last_seen_hash must be ${LAST_SEEN_HASH_BYTES} bytes, got ${fields.lastSeenHash.length}`,
+    );
+  }
+  if (fields.prevOwnHash.length !== PREV_OWN_HASH_BYTES) {
+    throw new Error(
+      `structure1: prev_own_hash must be ${PREV_OWN_HASH_BYTES} bytes, got ${fields.prevOwnHash.length}`,
+    );
+  }
   const ts = fields.timestamp > 0xffffffff ? BigInt(fields.timestamp) : fields.timestamp;
-  const head = [
+  return encodeCbor([
+    STRUCTURE1_VERSION,
     fields.contentHash,
     fields.senderPubkey,
     fields.sessionId,
     fields.lastSeenSeq,
     ts,
-  ];
-
-  // Branch on the VALUE, not on `"lastSeenHash" in fields`: an explicit `undefined` must encode as
-  // v1, not as a seven-field array whose index 6 is CBOR undefined — a v2 claim with no hash in it.
-  if (fields.lastSeenHash === undefined) {
-    return encodeCbor([STRUCTURE1_VERSION, ...head]);
-  }
-  if (fields.lastSeenHash.length !== LAST_SEEN_HASH_BYTES) {
-    // Thrown, not silently downgraded to v1. A caller that meant to acknowledge content and cannot
-    // must find out here, at the last point before these bytes are signed — a signature over a v2
-    // nobody accepts is worse than a refusal, and a silent drop to v1 is the downgrade this layout
-    // exists to close.
-    throw new Error(
-      `structure1: last_seen_hash must be ${LAST_SEEN_HASH_BYTES} bytes, got ${fields.lastSeenHash.length}`,
-    );
-  }
-  if (fields.prevOwnHash === undefined) {
-    return encodeCbor([STRUCTURE1_VERSION_V2, ...head, fields.lastSeenHash]);
-  }
-  if (fields.prevOwnHash.length !== PREV_OWN_HASH_BYTES) {
-    // Thrown for the same reason the ack hash is: a caller that meant to chain to its own previous
-    // message and cannot must find out HERE, at the last point before these bytes are signed.
-    // Silently emitting v2 instead would be the downgrade this layout exists to close — and unlike
-    // the ack hash, a missing self-link is invisible in a single message and only shows up later,
-    // as a conversation whose order cannot be proven.
-    throw new Error(
-      `structure1: prev_own_hash must be ${PREV_OWN_HASH_BYTES} bytes, got ${fields.prevOwnHash.length}`,
-    );
-  }
-  return encodeCbor([STRUCTURE1_VERSION_V3, ...head, fields.lastSeenHash, fields.prevOwnHash]);
+    fields.lastSeenHash,
+    fields.prevOwnHash,
+  ]);
 }
 
 /** Bytes at `i` of exactly `len`, tolerating a Buffer from a decoder that produced one. */
@@ -206,8 +168,8 @@ function bytesAt(arr: unknown[], i: number, len: number): Uint8Array | null {
 }
 
 /**
- * Read a Structure 1 claim, branching on the VERSION at index 0 — never on the array length (see
- * `STRUCTURE1_DECODE_REASONS` for why the two are not interchangeable).
+ * Read a Structure 1 claim. One layout: the domain tag AND the arity must both match, and every
+ * field must be present and the right width.
  *
  * Exported because the readers across both repos each hand-rolled their own positional
  * destructuring, and the next layout change should not have to find them again.
@@ -225,10 +187,9 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
   if (!Array.isArray(arr)) return { ok: false, reason: STRUCTURE1_DECODE_REASONS.NOT_ARRAY };
 
   const version = arr[0];
-  const isV1 = version === STRUCTURE1_VERSION && (arr.length === 6 || arr.length === 7);
-  const isV2 = version === STRUCTURE1_VERSION_V2 && arr.length === 7;
-  const isV3 = version === STRUCTURE1_VERSION_V3 && arr.length === 8;
-  if (!isV1 && !isV2 && !isV3) return { ok: false, reason: STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT };
+  if (version !== STRUCTURE1_VERSION || arr.length !== STRUCTURE1_FIELD_COUNT) {
+    return { ok: false, reason: STRUCTURE1_DECODE_REASONS.UNKNOWN_LAYOUT };
+  }
 
   const contentHash = bytesAt(arr, 1, 32);
   const senderPubkey = bytesAt(arr, 2, 32);
@@ -241,16 +202,11 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
    * before: no client-side reader ever checked this width, and requiring it here would turn a
    * layout reader into a second, quieter place that can reject a session.
    *
-   * Each consumer is safe for one of two reasons, and it is worth naming both rather than claiming
-   * the stronger one for all of them. `seal-frontier-verify` COMPARES the value against an expected
-   * session id, so a wrong width fails exactly as a wrong value does. `#captureReceipt`
+   * Each consumer is safe for one of two reasons. `seal-frontier-verify` COMPARES the value against
+   * an expected session id, so a wrong width fails exactly as a wrong value does. `#captureReceipt`
    * (`session-relay-client.ts`) does NOT compare it — it hexes the value straight into the
    * `relay_ack_receipts` primary key — and is safe instead because those bytes are
    * `#pendingStructure1`, which this daemon produced and signed moments earlier.
-   *
-   * An earlier version of this comment said every consumer compares it. That was false for
-   * `#captureReceipt`, and a comment asserting a safety property the code does not have is how
-   * defects survive review in this repo — so it is corrected here rather than deleted.
    */
   const sessionId = arr[3] instanceof Uint8Array
     ? arr[3]
@@ -267,25 +223,15 @@ export function decodeStructure1(cbor: Uint8Array): Structure1DecodeResult {
     return { ok: false, reason: STRUCTURE1_DECODE_REASONS.FIELD_MALFORMED };
   }
 
-  // A v1 seven-array's index 6 is a SUBMISSION ID and is not read here — it is the relay's concern,
-  // and reading it as an ack hash is exactly the confusion the version tag prevents.
-  let lastSeenHash: Uint8Array | null = null;
-  if (isV2 || isV3) {
-    lastSeenHash = bytesAt(arr, 6, LAST_SEEN_HASH_BYTES);
-    if (lastSeenHash === null) {
-      return { ok: false, reason: STRUCTURE1_DECODE_REASONS.LAST_SEEN_HASH_MALFORMED };
-    }
+  // Each link names ITSELF when it is wrong. Two 32-byte fields sit side by side, and a reader that
+  // checked them in one place would send an investigation to the wrong one.
+  const lastSeenHash = bytesAt(arr, 6, LAST_SEEN_HASH_BYTES);
+  if (lastSeenHash === null) {
+    return { ok: false, reason: STRUCTURE1_DECODE_REASONS.LAST_SEEN_HASH_MALFORMED };
   }
-
-  // `DOD-M15-SELFCHAIN-1`. Present-but-wrong is refused, never dropped to null: a v3 whose self link
-  // is unreadable is a chain nobody can check, and admitting it without the field would make a
-  // corrupt link indistinguishable from an honest v2 that never claimed one.
-  let prevOwnHash: Uint8Array | null = null;
-  if (isV3) {
-    prevOwnHash = bytesAt(arr, 7, PREV_OWN_HASH_BYTES);
-    if (prevOwnHash === null) {
-      return { ok: false, reason: STRUCTURE1_DECODE_REASONS.PREV_OWN_HASH_MALFORMED };
-    }
+  const prevOwnHash = bytesAt(arr, 7, PREV_OWN_HASH_BYTES);
+  if (prevOwnHash === null) {
+    return { ok: false, reason: STRUCTURE1_DECODE_REASONS.PREV_OWN_HASH_MALFORMED };
   }
 
   return {

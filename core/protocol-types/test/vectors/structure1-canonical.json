@@ -1,13 +1,16 @@
 {
-  "description": "CELLO-MERKLE-002 AC-001: Structure 1 canonical CBOR fixture. RFC 8949 §4.2.1.",
-  "_note": "Canonical CBOR of the 6-element positional TBS array for protocol_version=1.",
+  "description": "Structure 1 canonical CBOR fixture — the ONE layout. RFC 8949 §4.2.1.",
+  "_note": "Canonical CBOR of the 8-element positional TBS array. There is one layout and every field is required; the earlier six- and seven-field fixtures were deleted with the tolerances they pinned (CELLO is alpha with no users, so backward compatibility is an anti-requirement).",
+  "_why": "The two hashes are the point. last_seen_hash chains a sender to their counterparty; prev_own_hash chains them to themselves. Without the second, two messages one party sends back to back carry identical acknowledgements — nothing arrived in between — so nothing in the signed bytes says which came first. The relay-assigned position cannot help: it is assigned after the sender signs.",
   "inputs": {
-    "protocol_version": 1,
+    "protocol_version": 3,
     "content_hash_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     "sender_pubkey_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
     "session_id_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
     "last_seen_seq": 3,
-    "timestamp": 1700000000000
+    "timestamp": 1700000000000,
+    "last_seen_hash_hex": "a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+    "prev_own_hash_hex": "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
   },
-  "expected_cbor_hex": "86015820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd50eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee031b0000018bcfe56800"
+  "expected_cbor_hex": "88035820cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc5820dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd50eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee031b0000018bcfe568005820a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a75820b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
 }

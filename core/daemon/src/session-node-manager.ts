@@ -15932,36 +15932,23 @@ export class SessionNodeManager {
       ?? (() => { const g = this.#sessionGenesisPrevRoot(agentName, sessionId); return g ? { seq: 0, hash: g } : undefined; })();
     if (!ack) {
       /**
-       * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE — see `#verifyAcknowledgedContent`
-       * for the receiving half of the same rule, which is what makes this safe rather than a
-       * downgrade.**
+       * ⚠️ NO STARTING POINT MEANS NO SEND — `DOD-M15-SELFCHAIN-1`.
        *
-       * Reaching here means this session has no recorded starting point AND has received nothing.
-       * The claim it produces is `last_seen_seq: 0` with no hash: "I have seen nothing of yours, and
-       * I assert nothing about your content." That is honest, and it is not the fail-open the unit
-       * closes — the hole is a claim that names a POSITION with no content behind it, and this names
-       * no position. A receiver refuses a v1 claim the moment it acknowledges position 1 or beyond.
+       * This used to emit a shorter claim: `last_seen_seq: 0` with no hashes, on the argument that
+       * "I have seen nothing of yours" is honest and asserts nothing false. It IS honest, and it is
+       * no longer a shape this protocol has. Both chain links are required, and a session with no
+       * recorded starting point has nothing for them to anchor to.
        *
-       * It does not throw, and an earlier version did. Sessions brokered without a relay assignment
-       * are real — the directory does not always return one — and throwing there stopped those
-       * sessions sending at all, which trades a hole this claim does not have for a failure of the
-       * thing the product is for.
+       * Refusing costs a message on a session that was brokered without an assignment. Sending one
+       * costs the ability to prove the order of the whole conversation later, and the cost is
+       * invisible until someone disputes it — which is exactly the failure this unit exists to end.
+       * Refuse loudly, and say what to do about it.
        */
-      this.#logger.info("session.content.claim.unacknowledged", {
-        agentName, sessionId,
-        impact:
-          "this message is signed with no acknowledgement of anything received, because this " +
-          "session has no recorded starting point and nothing has arrived on it yet. It binds the " +
-          "sender and the content as always; it makes no claim about the counterparty's messages.",
-      });
-      const bare = encodeStructure1({
-        contentHash,
-        senderPubkey: await signer.getPublicKey(),
-        sessionId: sessionIdBytes,
-        lastSeenSeq: 0,
-        timestamp: Date.now(),
-      });
-      return { structure1: bare, signature: await signer.sign(bare) };
+      throw new Error(
+        "session_unchainable: this session has no recorded starting point on this machine, so a " +
+        "message sent on it could not link to anything and its place in the conversation could " +
+        "never be proven. Restart the session so it is registered with its genesis.",
+      );
     }
     const structure1 = encodeStructure1({
       contentHash,
@@ -15973,8 +15960,29 @@ export class SessionNodeManager {
       lastSeenSeq: ack.seq,
       timestamp: Date.now(),
       lastSeenHash: ack.hash,
+      /**
+       * ─── THE SELF LINK ON THE UNWITNESSED PATH — `DOD-M15-SELFCHAIN-1` ────────────────────────
+       *
+       * This is the path that matters most for it. A conversation that ran while the relay was down
+       * is precisely the one whose order gets disputed later, so the chain cannot depend on a relay
+       * having been there to witness it.
+       *
+       * `ack.hash` is the session genesis when this agent has not spoken here yet — the same value
+       * the acknowledgement falls back to, and a value rather than an absence.
+       */
+      prevOwnHash: this.#ownChainStore?.lastOwnHash(Buffer.from(await signer.getPublicKey()).toString("hex"), sessionId)
+        ?? ack.hash,
     });
-    return { structure1, signature: await signer.sign(structure1) };
+    const signed = { structure1, signature: await signer.sign(structure1) };
+    /**
+     * Advance the chain only once the claim is signed and about to go out, and never before — the
+     * same rule the witnessed path follows. A chain advanced over a message that was never sent
+     * makes every later message look tampered with.
+     */
+    this.#ownChainStore?.record(
+      Buffer.from(await signer.getPublicKey()).toString("hex"), sessionId, contentHash, Date.now(),
+    );
+    return signed;
   }
 
   /**

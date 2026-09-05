@@ -2059,45 +2059,73 @@ export class AgentRelayClient {
      * AUTHOR's account of what THEY had seen, and they are not ours to restate.
      */
     /**
-     * ─── THE SELF LINK — `DOD-M15-SELFCHAIN-1` ───────────────────────────────────────────────────
+     * ─── BOTH CHAIN LINKS, UNCONDITIONALLY — `DOD-M15-SELFCHAIN-1` ───────────────────────────────
      *
-     * `lastSeenHash` above chains this sender to their COUNTERPARTY. It does not chain them to
-     * themselves, so two messages sent back to back carry identical acknowledgements and nothing in
-     * the signed bytes tells them apart. `prevOwnHash` is the other half: the content hash of this
-     * agent's own previous message in this session.
+     * `lastSeenHash` chains this sender to their COUNTERPARTY. `prevOwnHash` chains them to
+     * THEMSELVES. Neither is optional: a claim carrying one link is not a shape this protocol has,
+     * and `encodeStructure1` has no branch that emits one.
      *
-     * ⚠️ THE FIRST MESSAGE CARRIES THE SESSION GENESIS, NOT AN ABSENCE. "I have not spoken here" is
-     * a real state with a defined value, derived per session — the same rule and the same constant
-     * `lastSeenHash` uses, for the same reason: a shared constant would be presentable for any
-     * conversation.
+     * ⚠️ THE CONDITIONAL SPREAD THAT USED TO BE HERE DEFEATED THE TYPE. Writing
+     * `...(x ? { lastSeenHash: x } : {})` satisfies a REQUIRED field as far as the compiler is
+     * concerned, so the one guard that should have made an unlinked claim impossible to write was
+     * silently inert. Pass both by value; let `tsc` do its job.
      *
-     * ⚠️ AND WITHOUT A SEED THERE IS NO LINK TO MAKE, so the claim stays v2 rather than carrying a
-     * link this daemon cannot support. That is the same honest degradation as the `lastSeen` branch
-     * above: a session registered with neither a genesis nor an assignment has no agreed starting
-     * point, and inventing one would sign a chain anchored to nothing.
+     * ⚠️ NO SEED MEANS NO SEND. The seed is this session's genesis — the agreed starting point both
+     * links fall back to before anything has been said. A session registered with neither a genesis
+     * nor an assignment to derive one from has no such point, and the honest outcome is to refuse
+     * rather than sign a chain anchored to nothing. There is no degraded shape to fall back to and
+     * deliberately so: an unlinked message is invisible until the conversation's order is disputed,
+     * which is far too late for anyone to act on it.
      */
-    const selfSeed = lastSeen?.hash;
-    const prevOwn = this.#ownChainStore && selfSeed
-      ? (this.#ownChainStore.lastOwnHash(this.senderPubkeyHex, sessionIdHex) ?? selfSeed)
-      : undefined;
-    if (!carried && !prevOwn) {
-      this.#logger.warn("session.relay.submit.unchained", {
+    const seed = lastSeen?.hash;
+    if (!carried && !seed) {
+      this.#logger.error("session.relay.submit.unchainable", {
         relayPeerId: this.#relayPeerId,
         session: sessionIdHex,
         impact:
-          "this message does not link to this agent's previous message in the conversation, so the " +
-          "order of its own messages cannot be proven later. The message is witnessed as normal. " +
-          "This happens when the session has no recorded starting point on this machine.",
+          "this session has no recorded starting point on this machine, so a message sent on it " +
+          "could not link to anything and its place in the conversation could never be proven. " +
+          "The message was NOT sent. Restart the session so it is registered with its genesis.",
       });
+      return { ok: false, reason: "session_unchainable" };
     }
+    if (!carried && !this.#ownChainStore) {
+      this.#logger.error("session.relay.submit.unchainable", {
+        relayPeerId: this.#relayPeerId,
+        session: sessionIdHex,
+        impact:
+          "this daemon has no record of what it previously said in this conversation, so it cannot " +
+          "link this message to its own last one. The message was NOT sent.",
+      });
+      return { ok: false, reason: "session_unchainable" };
+    }
+    /**
+     * This agent's own previous message, or the session genesis when it has not spoken here yet.
+     * "I have not spoken" is a VALUE — derived per session, so it cannot be presented for a
+     * different conversation — never an absent field.
+     */
+    const prevOwn = carried ? undefined : (this.#ownChainStore!.lastOwnHash(this.senderPubkeyHex, sessionIdHex) ?? seed!);
+    /**
+     * ⚠️ **A CARRIED LEAF IS SENT VERBATIM AND SIGNED BY NOBODY HERE — 034-CARRYLEAF.**
+     *
+     * When this agent is witnessing something it RECEIVED, the claim already exists: its author
+     * built it, signed it, and put it on the content frame. Re-encoding it would change the signed
+     * bytes and the relay would refuse a leaf that is perfectly valid. Signing it ourselves would be
+     * worse — it would turn their statement into ours, which is the one thing that must never happen
+     * to a record whose whole value is that each party's words are their own.
+     *
+     * So this branch takes the bytes as they arrived, and this agent's own chain state is
+     * deliberately NOT consulted: both links inside those bytes are the AUTHOR's account, and they
+     * are not ours to restate.
+     */
     const structure1 = carried ? carried.structure1Cbor : encodeStructure1({
       contentHash,
       senderPubkey: this.#senderPubkey,
       sessionId,
-      lastSeenSeq: lastSeen?.seq ?? 0,
+      lastSeenSeq: lastSeen!.seq,
       timestamp: Date.now(),
-      ...(lastSeen ? { lastSeenHash: lastSeen.hash } : {}),
-      ...(prevOwn ? { prevOwnHash: prevOwn } : {}),
+      lastSeenHash: seed!,
+      prevOwnHash: prevOwn!,
     });
     const signature = carried ? carried.senderSignature : await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
