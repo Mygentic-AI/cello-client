@@ -92,6 +92,33 @@ export const PARK_ENVELOPE_VERSION = 2;
 export const PARK_ENVELOPE_VERSION_ALG = 3;
 
 /**
+ * v4 — a v3 envelope plus THE SENDER'S SIGNATURE OVER `structure1Cbor` (034-CARRYLEAF review F1).
+ *
+ * ⚠️ **WITHOUT IT, A WITHHELD MESSAGE THAT ARRIVES BY MAILBOX CANNOT BE WITNESSED, and the
+ * withholding attack stays open on that route.**
+ *
+ * The direct path closed it: a message arriving with no relay ordering record is witnessed by its
+ * RECIPIENT, using the author's own signature carried beside the bytes it signs. The mailbox route
+ * had no such field — this envelope carried `structure1Cbor` and no signature over it, because
+ * `parkSig` covers `(session_id, recipient_pubkey, content_hash)`, a different statement. So the
+ * recipient held the author's words and nothing the relay would accept as proof of them, and a
+ * counterparty who parked instead of hand-delivering still truncated the record.
+ *
+ * The algorithm rides at index 6 exactly as on v3 and is ALWAYS present here, so the shape is a
+ * clean superset rather than a second optional tail nobody can parse positionally.
+ *
+ * **This is the emit half only.** A v2 or v3 envelope is still accepted — refusing one would destroy
+ * store-and-forward mail already sitting in every relay mailbox, which is the failure
+ * `SIGNED_ENVELOPE_VERSIONS` exists to prevent. Requiring v4 is a later step, once nothing in the
+ * field emits the older shapes; until then this route is closed against a stock client and open to
+ * one that deliberately strips the field.
+ */
+export const PARK_ENVELOPE_VERSION_S1SIG = 4;
+
+/** The message leaf domain — the default a v4 envelope names when its caller does not. */
+const LEAF_KIND_MSG_DOMAIN = 0x00;
+
+/**
  * The versions that carry a sender signature and may therefore be authenticated.
  *
  * A SET, not a single constant, and the difference is mail loss. `authenticateParkedEntry` refused
@@ -99,7 +126,11 @@ export const PARK_ENVELOPE_VERSION_ALG = 3;
  * 3 would have turned every v2 envelope sitting in every relay mailbox into `unsigned_envelope`:
  * store-and-forward mail destroyed, and reported as an attack.
  */
-const SIGNED_ENVELOPE_VERSIONS = new Set<number>([PARK_ENVELOPE_VERSION, PARK_ENVELOPE_VERSION_ALG]);
+const SIGNED_ENVELOPE_VERSIONS = new Set<number>([
+  PARK_ENVELOPE_VERSION,
+  PARK_ENVELOPE_VERSION_ALG,
+  PARK_ENVELOPE_VERSION_S1SIG,
+]);
 
 export interface ParkEnvelope {
   /** 1 = legacy/unsigned (bare content or the pre-SEC-1 shape). 2 = signed. */
@@ -110,8 +141,16 @@ export interface ParkEnvelope {
   structure2Cbor?: Uint8Array;
   /** SEC-1 — the sender's identity key. Present only on v2. */
   senderPubkey?: Uint8Array;
-  /** SEC-1 — Ed25519 over buildParkContentTbs(...). Present on v2 and v3. */
+  /** SEC-1 — Ed25519 over buildParkContentTbs(...). Present on v2, v3 and v4. */
   parkSig?: Uint8Array;
+  /**
+   * 034-CARRYLEAF — the sender's Ed25519 signature over `structure1Cbor`. Present only on v4.
+   *
+   * DISTINCT FROM `parkSig`, which signs `(session_id, recipient_pubkey, content_hash)`. This one
+   * signs the ordering claim itself, which is the only form the relay will accept when the recipient
+   * witnesses a leaf on its author's behalf.
+   */
+  structure1Signature?: Uint8Array;
   /**
    * The algorithm the sender used for `content_hash`. Present only on v3.
    *
@@ -121,6 +160,15 @@ export interface ParkEnvelope {
    * said nothing" — the same collapse B1's empty-string case exists to prevent.
    */
   contentHashAlg?: string;
+  /**
+   * 034-CARRYLEAF — the leaf DOMAIN this content belongs to (0x00 msg, 0x04 doc, …). Present only
+   * on v4.
+   *
+   * A leaf kind selects a hash domain, and documents ride this same envelope. Witnessing a recovered
+   * leaf under a guessed domain would put a wrong statement in the canonical record, so a recipient
+   * that does not see this does not witness at all.
+   */
+  leafKind?: number;
 }
 
 export type ParkAuthFailure =
@@ -194,6 +242,16 @@ export function encodeParkEnvelope(args: {
   structure2Cbor?: Uint8Array;
   /** Omit, or pass the default, to emit a v2 envelope every current peer can read. */
   contentHashAlg?: string;
+  /**
+   * 034-CARRYLEAF — the sender's signature over `structure1Cbor`, which promotes the envelope to v4.
+   *
+   * It is what lets the RECIPIENT witness this leaf when the sender did not: the relay accepts a
+   * counter-submit only against the author's own signature over their own ordering claim, and
+   * `parkSig` signs a different statement.
+   */
+  structure1Signature?: Uint8Array;
+  /** The leaf domain, carried on v4 so a recovered leaf is never witnessed under a guessed one. */
+  leafKind?: number;
 }): Uint8Array {
   const base = [
     args.content,
@@ -214,6 +272,25 @@ export function encodeParkEnvelope(args: {
    * tamper on a message nobody touched.
    */
   const alg = args.contentHashAlg;
+  /**
+   * v4 WHEN THE ORDERING CLAIM IS SIGNED — 034-CARRYLEAF. Checked before the algorithm branches,
+   * because v4 always carries the algorithm slot and a v2/v3 decision would drop the signature.
+   * Both fields must be present: a signature with no claim to check it against is not evidence.
+   */
+  if (args.structure1Signature && args.structure1Cbor) {
+    const named = alg === undefined || alg === null ? CONTENT_HASH_ALGS.SHA256 : alg;
+    if (!isKnownContentHashAlg(named)) {
+      throw new ParkEnvelopeError(
+        PARK_ENVELOPE_REASONS.ALG_UNREADABLE,
+        named,
+        `PARK ENVELOPE: refusing to seal an entry naming content-hash algorithm "${named}", which ` +
+        "this build cannot itself reproduce.",
+      );
+    }
+    return encodeCbor([
+      PARK_ENVELOPE_VERSION_S1SIG, ...base, named, args.structure1Signature, args.leafKind ?? LEAF_KIND_MSG_DOMAIN,
+    ]) as Uint8Array;
+  }
   if (alg === undefined || alg === null || alg === CONTENT_HASH_ALGS.SHA256) {
     return encodeCbor([PARK_ENVELOPE_VERSION, ...base]) as Uint8Array;
   }
@@ -257,6 +334,13 @@ export async function sealParkEnvelope(args: {
   content: Uint8Array;
   structure1Cbor?: Uint8Array;
   structure2Cbor?: Uint8Array;
+  /**
+   * 034-CARRYLEAF — the sender's signature over `structure1Cbor`. Passing it promotes the envelope
+   * to v4 and is what lets the RECIPIENT witness this leaf if the sender never does.
+   */
+  structure1Signature?: Uint8Array;
+  /** The leaf domain, carried on v4 so a recovered leaf is never witnessed under a guessed one. */
+  leafKind?: number;
   /** The algorithm behind `contentHash`. Omit for the default; see `PARK_ENVELOPE_VERSION_ALG`. */
   contentHashAlg?: string;
 }): Promise<Uint8Array> {
@@ -268,6 +352,8 @@ export async function sealParkEnvelope(args: {
     content: args.content,
     structure1Cbor: args.structure1Cbor,
     structure2Cbor: args.structure2Cbor,
+    structure1Signature: args.structure1Signature,
+    leafKind: args.leafKind,
     senderPubkey,
     parkSig,
     contentHashAlg: args.contentHashAlg,
@@ -286,6 +372,20 @@ export function decodeParkEnvelope(plaintext: Uint8Array): ParkEnvelope {
   try {
     const arr = cborDecode(plaintext) as unknown[];
     // v3 first: a v2 envelope plus the content-hash algorithm as a 7th element.
+    // v4 FIRST — longest shape first, so a v4 array can never be read as a shorter one.
+    if (Array.isArray(arr) && arr.length === 9 && arr[0] === PARK_ENVELOPE_VERSION_S1SIG && arr[1] instanceof Uint8Array) {
+      return {
+        version: PARK_ENVELOPE_VERSION_S1SIG,
+        content: arr[1],
+        structure1Cbor: arr[2] instanceof Uint8Array ? arr[2] : undefined,
+        structure2Cbor: arr[3] instanceof Uint8Array ? arr[3] : undefined,
+        senderPubkey: arr[4] instanceof Uint8Array ? arr[4] : undefined,
+        parkSig: arr[5] instanceof Uint8Array ? arr[5] : undefined,
+        contentHashAlg: typeof arr[6] === "string" ? arr[6] : undefined,
+        structure1Signature: arr[7] instanceof Uint8Array ? arr[7] : undefined,
+        leafKind: typeof arr[8] === "number" ? arr[8] : undefined,
+      };
+    }
     if (Array.isArray(arr) && arr.length === 7 && arr[0] === PARK_ENVELOPE_VERSION_ALG && arr[1] instanceof Uint8Array) {
       return {
         version: PARK_ENVELOPE_VERSION_ALG,

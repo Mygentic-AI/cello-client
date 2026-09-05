@@ -30,6 +30,7 @@ import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
 import { DatabaseSync } from "node:sqlite";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { RelayReceiptStore } from "../relay-receipt-store.js";
+import { encodeParkEnvelope, decodeParkEnvelope, PARK_ENVELOPE_VERSION_S1SIG } from "../park-envelope.js";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { wireContentHash } from "../wire-content-hash.js";
@@ -644,6 +645,66 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       "a frame that does not say which domain its leaf belongs to is NOT witnessed on a guess",
     ).toBe(0);
   }, 120_000);
+});
+
+describe("034-CARRYLEAF — the MAILBOX route carries what the recipient needs to witness", () => {
+  /**
+   * ⚠️ **THE SECOND ROUTE, and without it the withholding attack stayed open on it — review F1.**
+   *
+   * The direct path is closed: a message arriving with no relay ordering record is witnessed by its
+   * recipient using the author's signature carried beside the bytes it signs. The relay MAILBOX had
+   * no such field — the envelope carried `structure1Cbor` and no signature over it, because
+   * `parkSig` signs `(session_id, recipient_pubkey, content_hash)`, a different statement that the
+   * relay will not accept for a counter-submit. So a counterparty who parked instead of
+   * hand-delivering still truncated the record.
+   */
+  it("★★ a v4 envelope round-trips the author's ordering claim, its SIGNATURE, and its leaf domain", () => {
+    const content = new TextEncoder().encode("the message they would rather you could not witness");
+    const claim = new Uint8Array([0xa1, 0xa2, 0xa3]);
+    const claimSig = new Uint8Array(64).fill(0x77);
+    const parkSig = new Uint8Array(64).fill(0x11);
+    const senderPubkey = new Uint8Array(32).fill(0x22);
+
+    const bytes = encodeParkEnvelope({
+      content, senderPubkey, parkSig,
+      structure1Cbor: claim,
+      structure1Signature: claimSig,
+      leafKind: 0x04,
+    });
+    const env = decodeParkEnvelope(bytes);
+
+    expect(env.version, "a signed ordering claim promotes the envelope to v4").toBe(PARK_ENVELOPE_VERSION_S1SIG);
+    expect(Buffer.from(env.structure1Cbor!).toString("hex")).toBe(Buffer.from(claim).toString("hex"));
+    expect(
+      Buffer.from(env.structure1Signature!).toString("hex"),
+      "the AUTHOR's signature over their own claim — the only form the relay accepts from a third party",
+    ).toBe(Buffer.from(claimSig).toString("hex"));
+    expect(env.leafKind, "and the domain, so a recovered leaf is never witnessed under a guess").toBe(0x04);
+    /**
+     * `parkSig` SURVIVES ALONGSIDE IT AND IS NOT THE SAME THING. It authenticates the DEPOSIT and
+     * signs a different statement; conflating them is what would let a recipient hand the relay a
+     * proof it refuses, and blame the wrong party for the refusal.
+     */
+    expect(Buffer.from(env.parkSig!).toString("hex")).toBe(Buffer.from(parkSig).toString("hex"));
+  });
+
+  it("★ an envelope with NO signature over the claim stays v2 — older peers keep reading their mail", () => {
+    /**
+     * The compatibility half, and it is not decoration: `SIGNED_ENVELOPE_VERSIONS` exists because
+     * bumping a version constant once turned every envelope sitting in every relay mailbox into
+     * `unsigned_envelope` — store-and-forward mail destroyed and reported as an attack.
+     *
+     * So a sender with nothing to sign emits exactly what it emitted before.
+     */
+    const env = decodeParkEnvelope(encodeParkEnvelope({
+      content: new TextEncoder().encode("ordinary mail"),
+      senderPubkey: new Uint8Array(32).fill(0x22),
+      parkSig: new Uint8Array(64).fill(0x11),
+      structure1Cbor: new Uint8Array([0xa1]),
+    }));
+    expect(env.version).toBe(2);
+    expect(env.structure1Signature, "and it carries no signature to be confused for one").toBeUndefined();
+  });
 });
 
 describe("033-ACKEMIT — what the operator is told when the RELAY refuses", () => {

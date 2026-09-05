@@ -2330,7 +2330,7 @@ export class SessionNodeManager {
   readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
   #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
+    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
     | null = null;
 
   constructor(opts: {
@@ -2454,7 +2454,7 @@ export class SessionNodeManager {
    * caller only enqueues on an honest {ok:false}).
    */
   setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
+    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
   ): void {
     this.#contentParkHook = fn;
   }
@@ -2539,7 +2539,7 @@ export class SessionNodeManager {
    * when its value is `undefined` — forces each of the three callers to state what this message was
    * hashed under, so a new fourth caller cannot omit it by accident.
    */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): Promise<ParkAttempt> {
+  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, parkLeafKind?: number): Promise<ParkAttempt> {
     // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
     // the live hook refuses (before any deposit), with the same event and the same `cause`.
     if (this.#parkFaultRemaining > 0) {
@@ -2574,6 +2574,11 @@ export class SessionNodeManager {
         // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
         structure1Cbor,
         structure2Cbor,
+        // 034-CARRYLEAF: the author's signature over `structure1Cbor`, so the RECIPIENT can witness
+        // this leaf if its author never does. Without it the mailbox route stays truncatable.
+        structure1Signature,
+        // 034-CARRYLEAF: the leaf DOMAIN, so a recovered leaf is never witnessed under a guess.
+        leafKind: parkLeafKind,
         // B2b: the park route must name the same algorithm the direct frame did, or the recipient
         // verifies the same message two different ways depending on which route it took.
         contentHashAlg,
@@ -8980,6 +8985,16 @@ export class SessionNodeManager {
     // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
     // connection). See the note on #handleContentStream's finally.
     let sendStream: Stream | undefined;
+    /**
+     * 034-CARRYLEAF — HOISTED OUT OF THE TRY so the PARK path in the catch can carry them.
+     *
+     * The park copy is built when the direct send fails, which is inside the catch below; declaring
+     * these in the try left the parked envelope with only the relay-WITNESSED claim, so a message
+     * its author deliberately did not witness was parked with no ordering claim at all and could
+     * never be witnessed by its recipient.
+     */
+    let frameS1: Uint8Array | undefined;
+    let frameSig: Uint8Array | undefined;
     try {
       /**
        * ─── EVERY FRAME CARRIES ITS OWN PROOF — `DOD-M15-AUTHORSHIP-ABSENT-1` ────────────────────
@@ -9003,8 +9018,8 @@ export class SessionNodeManager {
        * widened that window enough to break the live two-node round trip. Measured, not reasoned
        * about: seam-3 went red and both daemons logged `session.key.agreed` before the refusal.
        */
-      let frameS1 = orderingS1;
-      let frameSig = orderingSig;
+      frameS1 = orderingS1;
+      frameSig = orderingSig;
       let frameS2 = orderingS2;
       if (frameS1 === undefined || frameSig === undefined) {
         const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
@@ -9233,7 +9248,21 @@ export class SessionNodeManager {
         ...this.#streamCensus(entry.node, entry.counterpartySessionPeerId),
         correlationId,
       });
-      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, orderingS1, orderingS2, contentHashAlg);
+      /**
+       * ⚠️ **THE PARKED COPY CARRIES THE SIGNED CLAIM, NOT ONLY THE WITNESSED ONE — 034-CARRYLEAF
+       * review F1, and this is what closes the withholding attack on the MAILBOX route.**
+       *
+       * It passed `orderingS1`, which exists only when the relay witnessed this leaf — so a message
+       * the sender deliberately did not witness was parked with no ordering claim at all, and the
+       * recipient recovered it holding nothing the relay would accept as proof of authorship. They
+       * could read it and could never put it in a receipt.
+       *
+       * `frameS1`/`frameSig` are the pair the DIRECT frame carries for this same message: the
+       * relay's witnessed claim when there is one, and otherwise a claim this agent signed itself.
+       * Either way it is the author's signature over the author's own ordering claim, which is the
+       * only form the relay accepts when the recipient witnesses on their behalf.
+       */
+      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
       if (attempt.outcome === "parked") {
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
@@ -13372,6 +13401,34 @@ export class SessionNodeManager {
      * wired, this line is the difference between an all-clear and a permanent silent discard — and
      * finding that then costs more than the clause costs now.
      */
+    /**
+     * ─── WITNESS A RECOVERED MESSAGE ITS SENDER NEVER WITNESSED — 034-CARRYLEAF review F1 ────────
+     *
+     * The mailbox route's half of the withholding fix. `recoveredSeq` absent means no relay ordering
+     * record came with it, which is the same shape the direct path treats as "their submit never
+     * happened" — and it is reached the same two ways: their relay was briefly unreachable, or they
+     * are withholding on purpose.
+     *
+     * ⚠️ THE SIGNATURE COMES FROM THE ENVELOPE, AND ONLY A v4 ENVELOPE HAS ONE. `parkSig`
+     * authenticates the DEPOSIT — it signs `(session_id, recipient_pubkey, content_hash)` — and the
+     * relay will not accept it, because a counter-submit is admissible only against the author's own
+     * signature over their own ordering claim. A v2 or v3 envelope therefore cannot be witnessed on
+     * its author's behalf, and is left alone rather than guessed at.
+     *
+     * **So this route is closed against a peer running a stock client, and open to one that
+     * deliberately emits an older envelope.** Requiring v4 is the step that closes it completely,
+     * and it waits on nothing in the field emitting v2 or v3 — the same tolerate-then-enforce
+     * sequence every bilateral wire change in this milestone follows.
+     */
+    if (
+      result.ok && result.held !== true && result.screenedOut !== true &&
+      recoveredSeq === null && env.structure1Cbor && env.structure1Signature
+    ) {
+      const kind = env.leafKind;
+      if (typeof kind === "number") {
+        this.#witnessReceivedLeaf(agentName, sessionId, contentHash, env.structure1Cbor, env.structure1Signature, kind, correlationId);
+      }
+    }
     if (priorDeclaredAlg !== undefined && result.ok && result.held !== true && result.screenedOut !== true) {
       // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
       // refusal even when the recovery fails, so the next genuine reconciliation says nothing.
