@@ -150,12 +150,24 @@ describe("DOD-M12B-SESSION-SEED-1: the revival reservation race", () => {
      * SECOND ATTEMPT with a message blaming a second relay. The property this test is named for is
      * about relays, so ask about relays.
      */
-    const asksDuring = factory.asks.slice(builtBefore);
+    /**
+     * ⚠️ FILTER BY nodeType, WHICH IS WHY THE FIELD IS RECORDED. The comment on `asks` already says
+     * it — "the standing receiver rebuilds inside the same window as a revival and asks for circuit
+     * addresses too, so a raw count folds the two together" — and this assertion then folded them
+     * anyway. It passed only because the receiver happened to ask the same relay the revival did.
+     *
+     * 032-RELAYSPREAD is what surfaced it: a standing receiver now asks EVERY relay, so the fold
+     * showed up as this test reddening with a message blaming the REVIVAL for walking to a second
+     * relay it never asked. The revival's own asks are the `session` ones, and they are still one.
+     */
+    const asksDuring = factory.asks.slice(builtBefore).filter((a) => a.nodeType === "session");
     const relaysAsked = new Set(asksDuring.flatMap((a) => a.circuits));
     expect([...relaysAsked], "a granting first candidate must end the loop — asking a second " +
       "relay burns a scarce reservation the first already gave us").toEqual([CIRCUIT_A]);
-    const granted = duringRevival.filter((n) => n.listenAddresses().some((a) => a.includes("/p2p-circuit")));
-    expect(granted.length, "exactly one node ends up holding the reservation").toBe(1);
+    const grantedSessionNodes = duringRevival.filter((n, i) =>
+      factory.asks[builtBefore + i]?.nodeType === "session"
+      && n.listenAddresses().some((a) => a.includes("/p2p-circuit")));
+    expect(grantedSessionNodes.length, "exactly one node ends up holding the reservation").toBe(1);
   }, 30_000);
 
   it("a relay that NEVER answers does not hang the revival — it moves on and the session comes back", async () => {

@@ -177,10 +177,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
     ).toBe(true);
 
     const asks = factory.asks.filter((a) => a.circuits.length > 0);
-    expect(asks.length, "exactly two asks: refused, then granted").toBe(2);
+    /**
+     * THE DANCE IS PER RELAY, and that is what this test is for. The FIRST TWO asks are both
+     * relay A: refused because this transport identity has proved nothing, then granted after the
+     * proof lands. Asserting the first two by position, rather than asserting the total, is what
+     * keeps the property pinned independently of how many relays the walk goes on to visit.
+     *
+     * 032-RELAYSPREAD: the walk no longer STOPS at the first grant — an agent that holds one
+     * reservation is unreachable by every NAT'd peer the moment that relay goes away — so relay B
+     * is asked too, and the receiver is then built on every address that granted. The old
+     * `toBe(2)` was pinning "we stop at the first relay", which was never this test's subject.
+     */
+    expect(asks.length, "at least the two-attempt dance with relay A").toBeGreaterThanOrEqual(2);
     expect(
-      asks.map((a) => a.circuits[0]),
-      "both asks go to the SAME relay — the second is a retry, not a walk to the next candidate",
+      asks.slice(0, 2).map((a) => a.circuits[0]),
+      "the first two asks go to the SAME relay — the second is a retry, not a walk to the next candidate",
     ).toEqual([CIRCUIT_A, CIRCUIT_A]);
     expect(
       asks[0]?.peerId,
@@ -188,6 +199,21 @@ describe("DOD-M15-RELAYSLOTS-1: the receiver proves itself and gets its slot", (
         "so a retry on a fresh identity would be refused exactly like the first ask — the seed is " +
         "reused for precisely this reason.",
     ).toBe(asks[1]?.peerId);
+    // …and the walk went on to relay B rather than stopping, then built the receiver on the
+    // addresses that granted. Both halves, because "it asked B" without "it listens on B" is the
+    // slot-nobody-can-dial failure this file's own header describes.
+    expect(
+      asks.some((a) => a.circuits[0] === CIRCUIT_B),
+      "the walk must CONTINUE past the first grant — one reservation is one relay away from unreachable",
+    ).toBe(true);
+    expect(
+      asks.at(-1)?.circuits,
+      "the installed receiver listens on EVERY granted circuit, not on the first one that answered",
+    ).toEqual([CIRCUIT_A, CIRCUIT_B]);
+    expect(
+      new Set(asks.map((a) => a.peerId)).size,
+      "ONE identity across every relay: an agent is dialable at ONE peer id through any of its circuits",
+    ).toBe(1);
     expect(relay.gateProofs()).toHaveLength(1);
     expect(relay.gateProofs()[0]?.peerId).toBe(asks[0]?.peerId);
   }, 30_000);
