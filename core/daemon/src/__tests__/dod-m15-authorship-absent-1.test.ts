@@ -126,6 +126,15 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
       `a refusal nobody hears is indistinguishable from the message never arriving.\n${JSON.stringify(fx.eventsNamed("session.content.refused"))}`,
     ).toBeDefined();
     expect(notice!.reason).toBe("authorship_proof_absent");
+    /**
+     * ⚠️ **PIN THE OPENING, NOT A SUBSTRING** — review F1. This assertion was `/upgrade/i` alone,
+     * and it stayed green while the guidance shipped beginning `NaNcopy in the relay mailbox…`: a
+     * dropped literal turned the `+` before the next string into a unary plus, and "tell them to
+     * upgrade" survives at the tail of the wreckage. A substring match cannot see a sentence that
+     * lost its head.
+     */
+    expect(notice!.guidance.startsWith("STOPPED ON PURPOSE."), `the notice must OPEN with its framing, not mid-word: ${JSON.stringify(notice!.guidance.slice(0, 80))}`).toBe(true);
+    expect(notice!.guidance, "no value ever reaches an operator's screen as NaN").not.toMatch(/NaN/);
     expect(notice!.guidance, "the reader must be given a next step they can actually perform").toMatch(/upgrade/i);
 
     // NOT INGESTED. The transcript is the record this unit exists to keep provable.
@@ -428,7 +437,7 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
     const recovered = await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr");
 
     expect(recovered.ok, "the mailbox copy is accepted on the envelope's signature — unchanged, and correct").toBe(true);
-    const reconciled = fx.eventsNamed("content.recover.authorship_refusal_reconciled").at(-1);
+    const reconciled = fx.eventsNamed("content.recover.refusal_reconciled").at(-1);
     expect(
       reconciled,
       "without this line the operator reads REFUSED, watches the message arrive, and has nothing connecting the two",
@@ -461,7 +470,7 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — the refusal does NOT hold, and the ope
     expect((await fx.snm.recoverParkedEntry("alice", SID, recipientPub, plaintext!, contentHash, "corr")).ok).toBe(true);
 
     expect(
-      fx.eventsNamed("content.recover.authorship_refusal_reconciled"),
+      fx.eventsNamed("content.recover.refusal_reconciled"),
       "an ordinary parked message must not carry an alarm about a refusal that never happened",
     ).toHaveLength(0);
   }, 60_000);

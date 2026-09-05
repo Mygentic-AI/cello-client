@@ -39,7 +39,13 @@ export class FakeNode implements Partial<CelloNode> {
    * the route a message takes when the counterparty is not there to receive it directly. Optional
    * and defaulted off, so every existing caller keeps a node whose streams succeed.
    */
-  constructor(private readonly opts: { newStreamFails?: boolean } = {}) {}
+  /**
+   * `onNewStream` fires INSIDE `newStream`, i.e. between a caller reading session state and using
+   * it. That is the only way to drive a window that exists purely because an `await` sits in the
+   * middle of one — a test that mutates state before or after the send cannot reach it.
+   * Optional and defaulted off, so every existing caller is unchanged (fixture rule).
+   */
+  constructor(private readonly opts: { newStreamFails?: boolean; onNewStream?: () => void } = {}) {}
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
   getPeerId(): string { return this.#peerId; }
@@ -78,6 +84,7 @@ export class FakeNode implements Partial<CelloNode> {
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
+    this.opts.onNewStream?.();
     if (this.opts.newStreamFails) throw new Error("connection_lost: counterparty stream dead");
     const sink = this.sent;
     return { send(d: Uint8Array) { sink.push(d); }, async close() {}, abort() {}, status: "open" } as unknown as Stream;

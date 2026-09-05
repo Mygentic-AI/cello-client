@@ -1544,6 +1544,11 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
           // sent nothing at all and has no last message to reason about.
           const what = impairment?.cause === "delivery_ack"
             ? "Our acknowledgement to the counterparty could not be sent (liveness: impaired) — this is about a receipt we owe them, not about anything you sent."
+            // `029c` review F7: a content-key fault is LOCAL and the connection is fine. Saying "did
+            // not reach the counterparty on the direct path" sends the operator to inspect a network
+            // that is working, and to blame a peer who is not involved.
+            : impairment?.cause === "content_key"
+            ? "Your own last send could not be encrypted for this conversation, so it was never put on the wire (liveness: impaired). THIS IS A FAULT ON THIS MACHINE — the connection is fine and your counterparty is not involved."
             : "Your own last send did not reach the counterparty on the direct path (liveness: impaired).";
           const whatNext =
             impairment?.retained === "parked" ? " That message went to the relay to hand over instead — do NOT resend it: it is not lost, and a resend takes a second position in the record."
