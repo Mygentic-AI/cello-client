@@ -501,6 +501,86 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     expect(row!.relayId).toBeUndefined();
   });
 
+  it("★★ AND THE AUTHOR KEEPS THEIR RECEIPT: our own leaf, witnessed by the counterparty, still enters our carry", async () => {
+    /**
+     * ⚠️ **THE REGRESSION THIS UNIT INTRODUCED AND ALMOST SHIPPED — review F2.**
+     *
+     * Once the counterparty can witness OUR leaf, the relay delivers it back to us and
+     * `authoredByUs` is true, so the counterparty-leaf capture skipped it. We never submitted it,
+     * so no ack arrived and the ack path wrote nothing either. **A permanent hole at that position
+     * in our own carry** — the unilateral seal refuses a gapped chain, the bilateral one refuses to
+     * co-sign a root it cannot judge, and the guidance for both sends the operator to `cello_receive`
+     * and then to force-abandon. An honest sender whose relay hiccuped once lost the receipt for the
+     * entire conversation, over a message sitting in their own transcript.
+     *
+     * **And the asymmetry is the security property, so it is asserted too.** The leaf is kept with
+     * NO relay receipt, because we hold none. A bilateral seal needs a contiguous chain and now gets
+     * one; a UNILATERAL seal additionally requires every one of OUR leaves to carry a receipt, so a
+     * party who never witnesses their own messages still cannot seal alone on them. Keeping the leaf
+     * must not quietly hand them that.
+     */
+    const us = generateKeypair();
+    const usPub = await us.getPublicKey();
+    const ourHash = wireContentHash(BODY);
+    const ourClaim = encodeStructure1({
+      contentHash: ourHash,
+      senderPubkey: usPub,
+      sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
+      lastSeenSeq: 0,
+      timestamp: 1_750_000_000_000,
+      lastSeenHash: GENESIS,
+    });
+    const ourSig = await us.sign(ourClaim);
+
+    const db = new DatabaseSync(":memory:") as unknown as ConstructorParameters<typeof SessionSealLeafStore>[0];
+    const sealLeafStore = new SessionSealLeafStore(db, noopLogger);
+    const client = new AgentRelayClient({
+      relayPeerId: "12D3KooWRelay",
+      relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWRelay"],
+      keyProvider: us,
+      senderPubkey: usPub,
+      logger: noopLogger,
+      sealLeafStore,
+    });
+    const relay = makeFakeRelay();
+    const sid = Uint8Array.from(Buffer.from(SID, "hex"));
+    client.registerSession(SID, relay.node, undefined, undefined, GENESIS);
+
+    // Get the client connected, then deliver OUR OWN leaf — witnessed by somebody else, so we
+    // never saw an ack for it. This is exactly what a counter-submit by the counterparty produces.
+    const warm = client.submitMessageHash(relay.node, sid, new Uint8Array(32).fill(0x01), LEAF_KIND_MSG);
+    await tick();
+    relay.push({ type: "relay_auth_challenge", nonce: new Uint8Array(32).fill(7) });
+    await tick();
+    relay.push({ type: "relay_auth_ok" });
+    await tick();
+    relay.push({ type: "hash_submit_ack", sequence_number: 1 });
+    await warm;
+
+    relay.push({
+      type: "leaf_deliver",
+      session_id: sid,
+      sequence_number: 2,
+      leaf_kind: LEAF_KIND_MSG,
+      structure1_cbor: ourClaim,
+      structure2_cbor: encodeCbor([2, usPub, ourHash, ourSig]) as Uint8Array,
+    });
+    await tick();
+    client.close();
+
+    const carry = sealLeafStore.getCarry(Buffer.from(usPub).toString("hex"), SID);
+    const ours = carry.find((l) => l.sequenceNumber === 2);
+    expect(
+      ours,
+      `our own leaf must not leave a hole just because somebody else witnessed it:\n${JSON.stringify(carry.map((c) => c.sequenceNumber))}`,
+    ).toBeDefined();
+    expect(ours!.senderPubkeyHex).toBe(Buffer.from(usPub).toString("hex"));
+    expect(
+      ours!.relaySignatureHex,
+      "and with NO receipt — we hold none, and a unilateral seal must still refuse to stand on it",
+    ).toBeUndefined();
+  });
+
   it("★ a message with NO ordering record triggers the witness attempt; one WITH a record does not", async () => {
     /**
      * The trigger, at the level that decides it. A sender who witnessed their own leaf needs no
