@@ -38,6 +38,7 @@ import type { Logger } from "./types.js";
 import { extractErrorMessage } from "./error-message.js";
 import { evaluateRelayAck, type RelayReceiptStore } from "./relay-receipt-store.js";
 import type { SessionSealLeafStore } from "./session-seal-leaf-store.js";
+import type { SessionOwnChainStore } from "./session-own-chain-store.js";
 
 
 export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
@@ -306,6 +307,12 @@ export interface AgentRelayClientOpts {
    */
   sealLeafStore?: SessionSealLeafStore;
   /**
+   * `DOD-M15-SELFCHAIN-1` — what this agent last said in each session, so the next message links to
+   * it. Optional on the type because test harnesses construct a client without one; when it is
+   * absent this daemon cannot chain to itself and says so rather than signing an unlinked claim.
+   */
+  ownChainStore?: SessionOwnChainStore;
+  /**
    * DOD-M15-RELAYSLOTS-1: the current directory-issued online token for this agent, or `undefined`
    * when the directory has not issued one (not connected yet, or this key is not a registered
    * agent). A relay refuses an auth without it, and refuses to let the peer hold a reservation slot.
@@ -493,6 +500,7 @@ export class AgentRelayClient {
   readonly #logger: Logger;
   readonly #receiptStore: RelayReceiptStore | undefined;
   readonly #sealLeafStore: SessionSealLeafStore | undefined;
+  readonly #ownChainStore: SessionOwnChainStore | undefined;
   /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
   /** DOD-M15-CORROBORATE-1 — where a relay's witness alert goes. See the opt of the same name. */
@@ -592,6 +600,7 @@ export class AgentRelayClient {
     this.#logger = opts.logger;
     this.#receiptStore = opts.receiptStore;
     this.#sealLeafStore = opts.sealLeafStore;
+    this.#ownChainStore = opts.ownChainStore;
     this.#onlineToken = opts.onlineToken;
     this.#onWitnessAlert = opts.onWitnessAlert;
     this.#onWitnessUnreadable = opts.onWitnessUnreadable;
@@ -2049,6 +2058,38 @@ export class AgentRelayClient {
      * deliberately NOT consulted: `last_seen_seq` and `last_seen_hash` inside those bytes are the
      * AUTHOR's account of what THEY had seen, and they are not ours to restate.
      */
+    /**
+     * ─── THE SELF LINK — `DOD-M15-SELFCHAIN-1` ───────────────────────────────────────────────────
+     *
+     * `lastSeenHash` above chains this sender to their COUNTERPARTY. It does not chain them to
+     * themselves, so two messages sent back to back carry identical acknowledgements and nothing in
+     * the signed bytes tells them apart. `prevOwnHash` is the other half: the content hash of this
+     * agent's own previous message in this session.
+     *
+     * ⚠️ THE FIRST MESSAGE CARRIES THE SESSION GENESIS, NOT AN ABSENCE. "I have not spoken here" is
+     * a real state with a defined value, derived per session — the same rule and the same constant
+     * `lastSeenHash` uses, for the same reason: a shared constant would be presentable for any
+     * conversation.
+     *
+     * ⚠️ AND WITHOUT A SEED THERE IS NO LINK TO MAKE, so the claim stays v2 rather than carrying a
+     * link this daemon cannot support. That is the same honest degradation as the `lastSeen` branch
+     * above: a session registered with neither a genesis nor an assignment has no agreed starting
+     * point, and inventing one would sign a chain anchored to nothing.
+     */
+    const selfSeed = lastSeen?.hash;
+    const prevOwn = this.#ownChainStore && selfSeed
+      ? (this.#ownChainStore.lastOwnHash(this.senderPubkeyHex, sessionIdHex) ?? selfSeed)
+      : undefined;
+    if (!carried && !prevOwn) {
+      this.#logger.warn("session.relay.submit.unchained", {
+        relayPeerId: this.#relayPeerId,
+        session: sessionIdHex,
+        impact:
+          "this message does not link to this agent's previous message in the conversation, so the " +
+          "order of its own messages cannot be proven later. The message is witnessed as normal. " +
+          "This happens when the session has no recorded starting point on this machine.",
+      });
+    }
     const structure1 = carried ? carried.structure1Cbor : encodeStructure1({
       contentHash,
       senderPubkey: this.#senderPubkey,
@@ -2056,6 +2097,7 @@ export class AgentRelayClient {
       lastSeenSeq: lastSeen?.seq ?? 0,
       timestamp: Date.now(),
       ...(lastSeen ? { lastSeenHash: lastSeen.hash } : {}),
+      ...(prevOwn ? { prevOwnHash: prevOwn } : {}),
     });
     const signature = carried ? carried.senderSignature : await this.#keyProvider.sign(structure1);
     const frame = encodeCbor({
@@ -2118,6 +2160,34 @@ export class AgentRelayClient {
       const result = await Promise.race([ackPromise, timeout]);
       // On timeout, reset the stream so a late ack can't settle a LATER submit (FIFO desync).
       if (!result.ok && result.reason === "relay_submit_timeout") this.#resetStream();
+      /**
+       * ─── ADVANCE THE SELF CHAIN, AND ONLY ON SUCCESS — `DOD-M15-SELFCHAIN-1` ──────────────────
+       *
+       * Recorded AFTER the relay acknowledged, never before. Advancing first and then failing to
+       * send would leave the chain pointing at a message that never existed, and every later message
+       * would be refused by the counterparty with a reason that names tampering — an outage
+       * reported as an attack.
+       *
+       * A retry therefore re-reads the same predecessor, which is exactly right: a retransmission is
+       * the same message, not the next one.
+       *
+       * NOT for a carried leaf. Those bytes are the AUTHOR's and this agent did not write them, so
+       * they are no part of this agent's own chain.
+       */
+      if (result.ok && !carried && this.#ownChainStore) {
+        try {
+          this.#ownChainStore.record(this.senderPubkeyHex, sessionIdHex, contentHash, Date.now());
+        } catch (err: unknown) {
+          this.#logger.error("session.selfchain.record.failed", {
+            session: sessionIdHex,
+            error: err instanceof Error ? err.message : String(err),
+            impact:
+              "this message was witnessed, but this agent could not record it as the link for its " +
+              "next message — so the next one will chain to the wrong predecessor and the " +
+              "counterparty will refuse it. Restart the session to re-anchor the chain.",
+          });
+        }
+      }
       return result;
     } finally {
       clearTimeout(timer);

@@ -109,6 +109,7 @@ import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 
 
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
+import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
@@ -1127,6 +1128,8 @@ export class SessionNodeManager {
   #relayReceiptStore: RelayReceiptStore | null = null;
   /** FED-OPTIONB-SEAL-001: the per-session leaf log (both parties) carried at a unilateral seal. */
   #sealLeafStore: SessionSealLeafStore | null = null;
+  /** `DOD-M15-SELFCHAIN-1` — this agent's own last message per session, so the next one links to it. */
+  #ownChainStore: SessionOwnChainStore | null = null;
   // M9-CORE-001: the inbound screening seam. Every byte that reaches the agent passes
   // through #appendVerifiedContent's buffer write; screenInbound gates it there, on every
   // arrival path (direct, held-release, recovered-park). Defaults to always-allow when no
@@ -1152,8 +1155,8 @@ export class SessionNodeManager {
    * reachable by nobody. Making it required means a call site that forgets to pass it is a type
    * error rather than an agent that quietly stops being dialable.
    */
-  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined) | null = null;
-  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined): void {
+  #detachedRelayClientBuilder: ((agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; ownChainStore?: SessionOwnChainStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined) | null = null;
+  setDetachedRelayClientBuilder(fn: (agentName: string, relayPeerId: string, relayAddrs: string[], stores: { receiptStore?: RelayReceiptStore; sealLeafStore?: SessionSealLeafStore; ownChainStore?: SessionOwnChainStore; onlineToken: () => Uint8Array | undefined }) => AgentRelayClient | undefined): void {
     this.#detachedRelayClientBuilder = fn;
   }
 
@@ -1202,9 +1205,11 @@ export class SessionNodeManager {
       // sign. The fix would have broken the fix.
       if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
       if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
+      if (!this.#ownChainStore && this.#db) this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
       client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        ownChainStore: this.#ownChainStore ?? undefined,
         // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
         onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });
@@ -1319,9 +1324,11 @@ export class SessionNodeManager {
        * that first version failed this file's own test because the client could not dial.
        */
       const baseRelayAddr = heldCircuitAddr.split("/p2p-circuit")[0] ?? heldCircuitAddr;
+      if (!this.#ownChainStore && this.#db) this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
       client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
+        ownChainStore: this.#ownChainStore ?? undefined,
         // DOD-M15-RELAYSLOTS-1: read at each auth, never snapshotted — the token expires hourly.
         onlineToken: () => this.getDirectoryOnlineToken(agentName),
       });

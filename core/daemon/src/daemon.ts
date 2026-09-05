@@ -2167,6 +2167,9 @@ async function startDaemonHoldingLock(
       // seal depends on — silently, while reporting success.
       receiptStore: stores.receiptStore,
       sealLeafStore: stores.sealLeafStore,
+      // `DOD-M15-SELFCHAIN-1` — without this the client cannot chain a message to this agent's own
+      // previous one, and says so rather than signing an unlinked claim.
+      ownChainStore: stores.ownChainStore,
       // DOD-M15-RELAYSLOTS-1: the manager owns the current token and hands the accessor down, so
       // this client reads a fresh one at every auth instead of a snapshot taken here at build time.
       onlineToken: stores.onlineToken,
