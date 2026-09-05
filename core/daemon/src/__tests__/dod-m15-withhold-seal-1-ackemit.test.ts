@@ -42,6 +42,19 @@ const CONTENT_KEY = new Uint8Array(32).fill(0x7e);
 const GENESIS = new Uint8Array(32).fill(0x9c);
 
 /**
+ * Index 6 as bytes, or a failure that NAMES what was there instead of crashing inside Buffer.
+ *
+ * Measured while making these tests fail on purpose: with the emitter reverted, two of them died on
+ * `TypeError: The first argument must be of type string ... Received undefined` — a message that
+ * sends the next reader to audit Buffer rather than to the field that went missing.
+ */
+function ackHash(arr: unknown[]): Uint8Array {
+  expect(arr.length, "v2 is SEVEN fields — six means the emitter was reverted").toBe(7);
+  expect(arr[6], "index 6 must be the 32-byte ack hash").toBeInstanceOf(Uint8Array);
+  return arr[6] as Uint8Array;
+}
+
+/**
  * Drive a client to authenticated, then read back the ONE `hash_submit` it wrote.
  *
  * Returns the decoded Structure 1 ARRAY — not the daemon's own re-decode of it. The signature is
@@ -157,10 +170,10 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
 
     const { arr, result } = await submittedStructure1({ genesis: realGenesis });
     expect(result.ok).toBe(true);
-    expect(Buffer.from(arr[6] as Uint8Array).toString("hex")).toBe(Buffer.from(realGenesis).toString("hex"));
+    expect(Buffer.from(ackHash(arr)).toString("hex")).toBe(Buffer.from(realGenesis).toString("hex"));
     expect(arr[4], "and it acknowledges POSITION ZERO — it has seen nothing yet").toBe(0);
     expect(
-      Buffer.from(arr[6] as Uint8Array).equals(Buffer.alloc(32)),
+      Buffer.from(ackHash(arr)).equals(Buffer.alloc(32)),
       "32 zero bytes is the one value this may never be",
     ).toBe(false);
   });
@@ -183,9 +196,9 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
     });
     expect(result.ok).toBe(true);
     expect(arr[4], "the position advanced to the delivered leaf").toBe(4);
-    expect(Buffer.from(arr[6] as Uint8Array).toString("hex")).toBe(Buffer.from(theirHash).toString("hex"));
+    expect(Buffer.from(ackHash(arr)).toString("hex")).toBe(Buffer.from(theirHash).toString("hex"));
     expect(
-      Buffer.from(arr[6] as Uint8Array).toString("hex"),
+      Buffer.from(ackHash(arr)).toString("hex"),
       "and it is no longer the seed — a build that ignored the leaf would still be emitting that",
     ).not.toBe(Buffer.from(GENESIS).toString("hex"));
   });
