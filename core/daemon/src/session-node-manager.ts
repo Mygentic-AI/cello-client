@@ -1687,6 +1687,8 @@ export class SessionNodeManager {
   /** The reason the last reservation attempt was refused, per agent — captured at the rejection so
    *  the retry and give-up can name a CAUSE instead of only their own exit point. */
   readonly #srLastRejectionReason = new Map<string, string>();
+  /** 032-RELAYSPREAD: when this agent's receiver was last re-spread, so it never rides the 30s grid. */
+  readonly #srLastRespreadAt = new Map<string, number>();
   readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
   /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
@@ -7047,6 +7049,7 @@ export class SessionNodeManager {
     this.#standingReceivers.clear();
     this.#srReservationRetry.clear();
     this.#srLastRejectionReason.clear();
+    this.#srLastRespreadAt.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.
@@ -17849,8 +17852,63 @@ export class SessionNodeManager {
        * is that it never STOPS BEING REACHABLE while that is true — the surviving relays carry it,
        * the loss is named in the log with its cause, and the lost relay's inbound carve-out is
        * revoked above. That is availability, not restoration in place.
+       *
+       * WHICH LEAVES A RATCHET, and `#respreadIfDecayed` below is what stops it: relays are only
+       * ever lost between rebuilds, never regained, so an agent nobody talks to walks itself back
+       * down to one relay — the exact state this unit exists to get it out of.
        */
     }
+    for (const agentName of this.#standingReceivers.keys()) {
+      if (this.#agentsWantingReceiver.has(agentName)) this.#respreadIfDecayed(agentName);
+    }
+  }
+
+  /**
+   * 032-RELAYSPREAD — **AN IDLE AGENT MUST NOT RATCHET ITSELF BACK DOWN TO ONE RELAY.**
+   *
+   * Spreading happens when a receiver is BUILT, and between builds the count only falls: a lost
+   * circuit cannot be retaken by a running node (a circuit listener is fixed at node creation), and
+   * a relay the directory announces later is skipped while any circuit is held. An agent in
+   * conversation re-spreads constantly — the receiver is handed into each session and a fresh one
+   * is built behind it — so this is about the agent nobody has talked to for a day. It loses relays
+   * one at a time, nothing pulls it back up, and it ends up exactly where this unit found it:
+   * reachable through one relay, one relay away from being reachable through none.
+   *
+   * **THE COST OF FIXING IT IS A NEW PEER ID**, which is why it is fenced three ways rather than
+   * simply rebuilding on sight:
+   *   - **ONLY WHEN IDLE.** A rebuild replaces the receiver's transport identity, and a counterparty
+   *     may be holding the old one from a `session_offer_accept`. With a live session for this agent
+   *     we leave it alone — a degraded spread costs redundancy, a changed peer id mid-conversation
+   *     costs the conversation.
+   *   - **ONLY WHEN THERE IS SOMETHING TO GAIN.** Holding every relay that was offered is not decay.
+   *   - **ON ITS OWN SLOW CLOCK**, never the watchdog's 30-second grid. A reservation is scarce —
+   *     the relay holds it for its full TTL even after we disconnect — so this reuses the
+   *     reservation retry interval rather than inventing a faster one.
+   */
+  #respreadIfDecayed(agentName: string): void {
+    if (this.#shuttingDown) return;
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr || sr.relayPeerIds.length === 0) return;                    // zero held is the loud path
+    for (const entry of this.#activeNodes.values()) {
+      if (entry.agentName === agentName) return;                        // in conversation — hands off
+    }
+    const offered = this.#reservationCircuitAddrs(agentName).addrs.length;
+    if (sr.relayPeerIds.length >= offered) return;                      // nothing to gain
+    const now = Date.now();
+    const last = this.#srLastRespreadAt.get(agentName) ?? 0;
+    if (now - last < this.#srReservationRetryMs) return;
+    this.#srLastRespreadAt.set(agentName, now);
+    this.#logger.info("session.standing_receiver.respread", {
+      agentName,
+      reservationsHeld: sr.relayPeerIds.length,
+      relaysOffered: offered,
+      impact: "this agent is idle and holds fewer relay reservations than it was offered, so its " +
+        "receiver is being rebuilt to take the rest. Without this it can only lose relays between " +
+        "rebuilds, and an agent nobody talks to drifts back down to a single relay — one relay " +
+        "away from being unreachable behind NAT, which is the state this whole mechanism exists " +
+        "to keep it out of.",
+    });
+    void this.#rebuildStandingReceiver(agentName);
   }
 
   /**
@@ -18473,6 +18531,11 @@ export class SessionNodeManager {
     // reservations that genuinely completed, so a directory that merely NAMES a relay cannot dial
     // in behind it, however many relays it names.
     gater.setReservedRelayPeers(heldRelayPeerIds);
+    // The re-spread clock starts HERE, at the build, not at the epoch. Otherwise the first decay
+    // re-spreads instantly — undoing the "a lost relay does not rebuild the receiver" rule seconds
+    // after it fires, and changing the peer id of an agent that just lost one relay of three. The
+    // ratchet this guards against runs over hours; nothing about it needs answering in a second.
+    this.#srLastRespreadAt.set(agentName, Date.now());
     this.#standingReceivers.set(agentName, {
       node,
       gater,
