@@ -677,7 +677,11 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
           return i !== null
             && i.addrs.some((a) => a.includes(`/p2p/${dying.peerId}/p2p-circuit`))
             && i.addrs.some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`));
-        }, 15_000),
+          // 45s, not 15s: this waits on TWO real libp2p reservations over two real hop relays, and
+          // the budget has to hold on a machine running the whole suite. It failed here once at 15s
+          // under full-suite load while passing alone — a budget that only holds on an idle machine
+          // is a test that reports the machine, not the code.
+        }, 45_000),
         "the receiver must announce a circuit through BOTH relays, not just the first to grant",
       ).toBe(true);
       const reach = events.filter((e) => e.event === "session.standing_receiver.reachability").at(-1);
@@ -768,7 +772,7 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       await survivor.node.stop();
       try { await dying.node.stop(); } catch { /* already stopped */ }
     }
-  }, 60_000);
+  }, 120_000);
 
   it("W1b: the LAST reservation dies → zero held → the receiver IS rebuilt", async () => {
     // The other half of the count, and the half W1 no longer covers. Holding none is not a
