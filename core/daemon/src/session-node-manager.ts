@@ -15581,15 +15581,28 @@ export class SessionNodeManager {
         "one of your machines re-sending an old message into the wrong session, or someone in " +
         "between doing it deliberately. ONE thing to do: ask your counterparty OUT OF BAND (a " +
         "channel that is not this one) whether they meant to send this, before you continue here."
-      : +
-      "REACH YOU BY THE OTHER ROUTE: refusing sends back no acknowledgement, so their agent parks a " +
-      "copy in the relay mailbox and this side accepts that one on the strength of the mailbox " +
-      "envelope — delivered, but with no proof of who wrote that individual message. Almost always " +
-      "their CELLO build is older than this one: a build from before message signing does not attach " +
-      "a signature at all. Ask which version they are running, and tell them to upgrade — this will " +
-      "keep happening until they do, and only they can fix it. If they are on the SAME version as " +
-      "you, that explanation does not hold: confirm with them OUT OF BAND before opening another " +
-      "session.";
+      /**
+       * ⚠️ **THIS BRANCH SHIPPED AS `NaNcopy in the relay mailbox…` AND NOTHING NOTICED** — review
+       * F1, and it is worth more than the one-line fix.
+       *
+       * Splitting the guidance in two dropped the opening literal and left behind the `+` that had
+       * joined it, which is not a concatenation with nothing on its left — it is a UNARY PLUS on the
+       * next string. `+"REACH YOU BY…"` is `NaN`, and `NaN + "copy in the relay mailbox…"` is a
+       * perfectly good string. So the flagship refusal of this whole milestone reached the operator
+       * beginning mid-word with `NaN`, with its "STOPPED ON PURPOSE" framing and its reason gone.
+       *
+       * **The test was green because it asked the wrong question.** The only assertion on this
+       * string was `.toMatch(/upgrade/i)`, and "tell them to upgrade" survives at the tail. A
+       * substring match on a sentence cannot see that the sentence lost its head — so the assertion
+       * below pins what it OPENS with, which a truncation cannot survive.
+       */
+      : "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. " +
+      REFUSAL_MAY_STILL_ARRIVE +
+      " Almost always their CELLO build is older than this one: a build from before message signing " +
+      "does not attach a signature at all. Ask which version they are running, and tell them to " +
+      "upgrade — this will keep happening until they do, and only they can fix it. If they are on " +
+      "the SAME version as you, that explanation does not hold: confirm with them OUT OF BAND " +
+      "before opening another session.";
     this.#logger.error("session.content.refused", {
       agentName, sessionId, correlationId, reason, ...detail, impact, guidance,
     });

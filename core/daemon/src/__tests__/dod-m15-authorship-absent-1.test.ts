@@ -126,6 +126,15 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
       `a refusal nobody hears is indistinguishable from the message never arriving.\n${JSON.stringify(fx.eventsNamed("session.content.refused"))}`,
     ).toBeDefined();
     expect(notice!.reason).toBe("authorship_proof_absent");
+    /**
+     * ⚠️ **PIN THE OPENING, NOT A SUBSTRING** — review F1. This assertion was `/upgrade/i` alone,
+     * and it stayed green while the guidance shipped beginning `NaNcopy in the relay mailbox…`: a
+     * dropped literal turned the `+` before the next string into a unary plus, and "tell them to
+     * upgrade" survives at the tail of the wreckage. A substring match cannot see a sentence that
+     * lost its head.
+     */
+    expect(notice!.guidance.startsWith("STOPPED ON PURPOSE."), `the notice must OPEN with its framing, not mid-word: ${JSON.stringify(notice!.guidance.slice(0, 80))}`).toBe(true);
+    expect(notice!.guidance, "no value ever reaches an operator's screen as NaN").not.toMatch(/NaN/);
     expect(notice!.guidance, "the reader must be given a next step they can actually perform").toMatch(/upgrade/i);
 
     // NOT INGESTED. The transcript is the record this unit exists to keep provable.
