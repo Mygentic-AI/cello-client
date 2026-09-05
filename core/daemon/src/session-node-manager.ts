@@ -57,7 +57,7 @@ import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeStructure1, encodeStructure1 } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeStructure1, encodeStructure1, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
@@ -930,6 +930,48 @@ const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
 const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
 
 /**
+ * ─── 033-ACKEMIT: the four things that can be wrong with an ACKNOWLEDGEMENT ──────────────────────
+ *
+ * All four are `unusable` — the message is refused and the session lives. None of them is an
+ * identity fault: by the time any is returned the signature has verified, the signer IS this
+ * session's counterparty, and the claim is about this content in this conversation. What is wrong is
+ * what the claim says the sender had SEEN.
+ *
+ * They are four names and not one because the operator's next move differs for each, and because an
+ * investigator who cannot tell "your counterparty is on an older build" from "your counterparty
+ * acknowledged something you never sent" is looking at the wrong half of the problem.
+ *
+ * ⚠️ **NAME WHAT WAS OBSERVED, NEVER AN INFERRED CONCLUSION** (`DOD-M15-ERRSTRING-1`). Not one of
+ * these says "peer is malicious" — a mismatch is equally what a genuine software fault on the other
+ * side looks like, and an error that names a party the code did not check is this milestone's
+ * founding defect.
+ */
+
+/** A v1 claim: it carries no `last_seen_hash`, so it asserts a POSITION and no content at all. */
+const AUTHORSHIP_ACK_HASH_ABSENT = "ack_hash_absent";
+
+/** The hash names content this side does not hold at the position the claim names. */
+const AUTHORSHIP_ACK_HASH_MISMATCH = "ack_hash_mismatch";
+
+/** The claim acknowledges a position beyond anything this side has recorded. */
+const AUTHORSHIP_ACK_HASH_AHEAD = "ack_hash_ahead_of_record";
+
+/** The first message of a session, on a session this side holds no starting point for. */
+const AUTHORSHIP_ACK_HASH_UNCHECKABLE = "ack_hash_uncheckable";
+
+/**
+ * The set that routes an `unusable` reason to the acknowledgement wording rather than the generic
+ * one. A SET, not a string prefix test: a name-shaped check would silently adopt any future reason
+ * someone happens to call `ack_*`, and give it a sentence written for these four.
+ */
+const ACK_HASH_REASONS: ReadonlySet<string> = new Set<string>([
+  AUTHORSHIP_ACK_HASH_ABSENT,
+  AUTHORSHIP_ACK_HASH_MISMATCH,
+  AUTHORSHIP_ACK_HASH_AHEAD,
+  AUTHORSHIP_ACK_HASH_UNCHECKABLE,
+]);
+
+/**
  * ⚠️ **THE REFUSALS THAT SAY THIS ARE THE ONES WHERE THE REFUSAL DOES NOT HOLD — NOT ALL OF THEM.**
  *
  * It said "EVERY INBOUND REFUSAL SAYS THIS", and review F5 measured that: fifteen call sites file a
@@ -1181,7 +1223,10 @@ export class SessionNodeManager {
      */
     const claimedRegistration = !client.hasSession(sessionId);
     if (claimedRegistration) {
-      client.registerSession(sessionId, node);
+      // 033-ACKEMIT: the seal transport submits a ctrl leaf like any other, so it needs the same
+      // acknowledgement seed. It carries no assignment of its own, so the genesis is supplied here
+      // from the session's own active entry rather than derived inside the client.
+      client.registerSession(sessionId, node, undefined, undefined, this.#sessionGenesisPrevRoot(agentName, sessionId));
     } else {
       /**
        * Review MEDIUM-1 — **A PATH THAT DECLINES TO FIX A LEAK MUST SAY SO.**
@@ -8101,6 +8146,30 @@ export class SessionNodeManager {
    * on first access (so it survives a restart — AC-007). Never returns null;
    * an unknown session yields an empty tree.
    */
+  /**
+   * The session's genesis prev_root — what its FIRST message acknowledges, before anything has been
+   * received (033-ACKEMIT).
+   *
+   * Derived, never stored: both participant keys and the session timestamp ride on the assignment
+   * this session's active node already holds, and the session id is the third input. Deriving beats
+   * a column here because the value is a pure function of things that cannot change for the life of
+   * a session — a stored copy could only ever disagree with the derivation, and the day it did, the
+   * two sides would sign acknowledgements of different starting points.
+   *
+   * `undefined` for a session with no assignment on record. The callers do not paper over that: the
+   * emitter refuses the submit by name, and the receive check refuses the claim by name.
+   */
+  #sessionGenesisPrevRoot(agentName: string, sessionId: string): Uint8Array | undefined {
+    const assignment = this.#activeNodes.get(this.#k(agentName, sessionId))?.relayAssignment;
+    if (!assignment) return undefined;
+    return computeGenesisPrevRoot(
+      assignment.participantA,
+      assignment.participantB,
+      Uint8Array.from(Buffer.from(sessionId, "hex")),
+      assignment.sessionTimestamp,
+    );
+  }
+
   getSessionTree(agentName: string, sessionId: string): SessionTree {
     const key = this.#k(agentName, sessionId);
     const cached = this.#trees.get(key);
@@ -8709,6 +8778,42 @@ export class SessionNodeManager {
             ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }),
             correlationId,
           });
+          /**
+           * ─── 033-ACKEMIT: THIS ONE REACHES THE OPERATOR, NOT JUST THE LOG ─────────────────────
+           *
+           * Every other refusal on this branch is an availability answer — the relay is busy, the
+           * session is not recorded, the stream died — and the send degrades to unwitnessed, which
+           * is the documented path. These two are not availability. The WITNESS is telling us that
+           * the acknowledgement this daemon signed disagrees with the record, and that is a
+           * statement about the integrity of the conversation.
+           *
+           * `logger.warn` followed by a bare assignment is the exact shape Invariant 2's recurring
+           * box names — a guard that fires correctly into a file nobody opens. The named surface is
+           * `noteContentRefusal`, the same one every inbound refusal in this file uses, so it lands
+           * where the operator already looks for "something was rejected and here is why".
+           *
+           * It does NOT stop the send. The relay refused to witness this leaf, so the message
+           * degrades to unwitnessed exactly as any other refusal does and the operator keeps their
+           * conversation; what changes is that they are told the record has stopped agreeing with
+           * itself, at the moment it happens, instead of discovering it at the seal.
+           */
+          if (witnessed.reason === "ack_hash_mismatch" || witnessed.reason === "ack_hash_unverifiable") {
+            const relayFault = witnessed.reason === "ack_hash_unverifiable";
+            const impact = relayFault
+              ? "the relay could not check what this agent said it had received, so it did not witness this message. The message was still sent; it has no place in the notarized record."
+              : "the relay REFUSED to witness this message: what this agent signed as the last thing it received from your counterparty does not match what the relay recorded at that position. The message was still sent, and it has no place in the notarized record. Your copy of this conversation and the witness's copy have stopped agreeing.";
+            const guidance = relayFault
+              ? "Nothing to change on your machine — the fault is on the relay. Sending again usually picks a healthy one. If every send says this, close the session (cello_close_session) while the record is still short enough to be worth notarizing."
+              : "Do NOT rely on a receipt for this conversation until this stops. Send one more message: if it is witnessed, this was a one-off. If it repeats, the two records genuinely disagree — confirm what your counterparty actually sent you OUT OF BAND, then close this session and open a new one.";
+            this.#logger.error("session.relay.ack_hash.refused", {
+              agentName, sessionId, correlationId, reason: witnessed.reason,
+              ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }),
+              impact, guidance,
+            });
+            this.noteContentRefusal(agentName, sessionId, witnessed.reason, {
+              kind: REFUSAL_KINDS.REFUSED, impact, guidance,
+            });
+          }
           relayRefusal = witnessed.reason;
         }
       } catch (relayErr: unknown) {
@@ -15579,7 +15684,119 @@ export class SessionNodeManager {
     if (!bytesEqual(s1.fields.sessionId, expectedSessionId)) {
       return { verdict: "unusable", reason: AUTHORSHIP_SESSION_MISMATCH };
     }
+    /**
+     * ─── AND IT MUST ACKNOWLEDGE SOMETHING THAT WAS ACTUALLY SAID — 033-ACKEMIT ──────────────────
+     *
+     * **THIS IS THE HALF THAT NEEDS NO RELAY, and it is the reason the unit exists.** Everything the
+     * check consumes is on this machine: the counterparty's own signed bytes, and our own tree. We
+     * do not ask the relay what position 7 held — we already know, because we placed the leaf there.
+     *
+     * Until now a signed acknowledgement was a NUMBER. "I saw position 7" attests to a position and
+     * never to content, so the only thing binding the acknowledgement to a message was the relay's
+     * separate receipt over `content_hash ‖ seq ‖ timestamp`. Withhold the relay's half and the
+     * signed claim is an unbacked number — which is how a counterparty seals one message short.
+     * With the hash signed, the claim stands on its own and the relay is no longer load-bearing for
+     * it.
+     *
+     * It runs LAST for the reason the two checks above run last: everything from here down answers
+     * `unusable`, which refuses the message and leaves the session alive, while a `refuted` FREEZES
+     * it. A check that could answer before the signature and the signer were established would hand
+     * a peer a switch for choosing the softer outcome. By this line the claim provably came from
+     * this session's counterparty, about this content, in this conversation — the only question
+     * left is whether what they say they saw is what we sent.
+     */
+    const ackVerdict = this.#verifyAcknowledgedContent(agentName, sessionId, s1.fields);
+    if (ackVerdict) return ackVerdict;
     return { verdict: "verified", senderPubkey: s1Pubkey, senderSig: senderSignature };
+  }
+
+  /**
+   * Does this claim's `last_seen_hash` name content this side actually put at that position?
+   *
+   * Returns `undefined` when the acknowledgement holds, or the `unusable` verdict to refuse with.
+   * Split out of `#verifyAuthorshipClaim` so the three refusal causes can be named separately —
+   * a claim that carries NO hash, one that names a position we never reached, and one that names
+   * the wrong content — rather than collapsing into a single "the proof was bad".
+   *
+   * ⚠️ MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH (§5). A v1 claim carries no content
+   * assertion at all, and treating that as "fine, skip the check" would recreate the fail-open this
+   * unit is closing one layer down: an attacker who wants to evade a mismatch check simply never
+   * supplies a checkable proof. `decodeStructure1` has already refused a v2 whose hash is the wrong
+   * width, so `lastSeenHash === null` here means exactly one thing — a v1 layout — and it is
+   * refused by its own name.
+   */
+  #verifyAcknowledgedContent(
+    agentName: string,
+    sessionId: string,
+    fields: { lastSeenSeq: number; lastSeenHash: Uint8Array | null },
+  ): { verdict: "unusable"; reason: string } | undefined {
+    if (fields.lastSeenHash === null) {
+      return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_ABSENT };
+    }
+    /**
+     * THE GENESIS IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing, and
+     * that case is a defined 32 bytes — the agreed starting point of this two-party chain, derived
+     * from both keys, the session id and the session timestamp. Not 32 zero bytes: a constant
+     * identical across every session is one an attacker can present for any session, so the one
+     * position most exposed to a forged acknowledgement would be the only one nobody could check.
+     */
+    const assignment = this.#activeNodes.get(this.#k(agentName, sessionId))?.relayAssignment;
+    if (fields.lastSeenSeq <= 0) {
+      if (!assignment) return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_UNCHECKABLE };
+      const genesis = computeGenesisPrevRoot(
+        assignment.participantA,
+        assignment.participantB,
+        Uint8Array.from(Buffer.from(sessionId, "hex")),
+        assignment.sessionTimestamp,
+      );
+      return bytesEqual(fields.lastSeenHash, genesis)
+        ? undefined
+        : { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_MISMATCH };
+    }
+    /**
+     * ⚠️ A DIVERGED SESSION CANNOT ANSWER THIS, AND SAYING SO IS NOT THE SAME AS WAIVING IT.
+     *
+     * Tree index and relay position are the same number only while every one of our own leaves was
+     * witnessed. An unwitnessed append (the documented relay-degraded path) puts this side ahead of
+     * the relay's counter for good — `placeOwnLeaf` logs it, marks the session diverged and says the
+     * seal is already lost there. From then on our index N is not the relay's position N, and
+     * comparing them would refuse every remaining message for something the COUNTERPARTY did not do.
+     *
+     * **Who controls this absence?** Not the peer: divergence is caused by OUR submit failing, and
+     * nothing the counterparty sends can produce it. That is what makes it safe to be soft here and
+     * would not be if they could reach it. The session is already unsealable, so this waives a check
+     * on a record that has already lost the thing it protects — and it is logged, not silent.
+     */
+    if (this.isSessionDiverged(agentName, sessionId)) {
+      this.#logger.warn("session.content.ack_hash.unverifiable_diverged", {
+        agentName, sessionId, lastSeenSeq: fields.lastSeenSeq,
+        impact:
+          "this message's acknowledgement was NOT checked against the record: this session already " +
+          "diverged from the relay's ordering, so a local position no longer means a relay position. " +
+          "The message is accepted; the session was already unsealable before this arrived.",
+      });
+      return undefined;
+    }
+    /**
+     * THE POSITION MUST EXIST IN OUR RECORD, and a claim beyond it is REFUSED rather than skipped.
+     *
+     * This is the branch an attacker reaches for: a check that cannot run is a check that does not
+     * refuse, and `last_seen_seq` is entirely theirs to choose. Naming a position past our frontier
+     * would be a free way to switch the whole comparison off. It is also not something an honest
+     * peer does — they acknowledge a leaf WE authored, which we placed ourselves, so it is in our
+     * tree by the time they can have seen it.
+     *
+     * Relay sequences are 1-based and tree indices are 0-based; every receive path in this file
+     * normalises with -1 and says so.
+     */
+    const tree = this.getSessionTree(agentName, sessionId);
+    const atPosition = tree.hashAt(fields.lastSeenSeq - 1);
+    if (atPosition === null) {
+      return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_AHEAD };
+    }
+    return Buffer.from(fields.lastSeenHash).toString("hex") === atPosition
+      ? undefined
+      : { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_MISMATCH };
   }
 
   /**
@@ -15593,7 +15810,7 @@ export class SessionNodeManager {
   #refuseUnprovenAuthorship(
     agentName: string,
     sessionId: string,
-    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation",
+    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation" | "authorship_unacknowledged",
     contentHash: Uint8Array,
     detail: Record<string, unknown>,
     correlationId?: string,
@@ -15614,7 +15831,15 @@ export class SessionNodeManager {
         ? "a message arrived carrying no proof of who wrote it, so it was NOT ingested, NOT shown and NOT attributed to anyone. Every message in this conversation has to be provable to whoever reads its receipt later, and this one could not be."
         : reason === "authorship_wrong_conversation"
           ? "a message arrived carrying a VALID signature by this conversation's counterparty — made for a DIFFERENT conversation. The same message, or an old one of theirs, was presented here. It was NOT ingested, NOT shown and NOT added to this conversation's record."
-          : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
+          /**
+           * 033-ACKEMIT. Says what was OBSERVED — the two records disagree about what was said —
+           * and stops there. It does NOT say the counterparty is lying: the same signal is what a
+           * genuine fault on their side looks like, and naming a conclusion the code did not reach
+           * is the error-fidelity defect this milestone was opened for.
+           */
+          : reason === "authorship_unacknowledged"
+            ? "a message arrived that is genuinely from your counterparty and genuinely about this conversation — and the part of it that says WHICH of your messages they had received does not match your own record. It was NOT ingested and NOT shown. This is the check that stops someone quietly leaving your last message out of the receipt, so a message that fails it is refused rather than recorded."
+            : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
     /**
      * ⚠️ THE VERB IS THE COUNTERPARTY'S, AND THE GUIDANCE SAYS SO. The reader is the RECEIVING
      * operator, and there is nothing on their machine to change — the missing signature is produced
@@ -15656,6 +15881,21 @@ export class SessionNodeManager {
        * substring match on a sentence cannot see that the sentence lost its head — so the assertion
        * below pins what it OPENS with, which a truncation cannot survive.
        */
+      /**
+       * 033-ACKEMIT — TWO PATHS, AND THE FIRST IS THE ONE THAT ACTUALLY HAPPENS.
+       *
+       * Capped at two (Invariant 4): an affordance list that enumerates everything is a menu. The
+       * verb is the counterparty's in both cases — there is nothing to change on this machine — so
+       * it names the one move that fixes the likely cause and the one that settles the other.
+       */
+      : reason === "authorship_unacknowledged"
+      ? "STOPPED ON PURPOSE, and this is NOT about their signature — it verified. " +
+        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
+        " Far the likeliest cause is that their CELLO build predates this check and does not say " +
+        "what it has received: ask which version they are running and tell them to upgrade, because " +
+        "only they can fix it. If they are on the SAME version as you, the two records genuinely " +
+        "disagree about what was said — do not carry on in this conversation. Confirm what they " +
+        "sent you OUT OF BAND, then open a new session."
       : "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. " +
       // Review F2: chosen from what THIS machine can do, not asserted. An agent with no identity
       // key cannot open a mailbox copy either, and telling them to wait for one would be the same
@@ -16219,9 +16459,21 @@ export class SessionNodeManager {
         // A replayed claim gets its own name on BOTH surfaces, not just in the log context: it is
         // the one `unusable` cause that may be adversarial, and it is the one the operator can act
         // on. The others are a peer whose build or bytes we could not read.
+        /**
+         * 033-ACKEMIT — AND THE FOUR ACKNOWLEDGEMENT CAUSES GET THEIR OWN SURFACE REASON, for the
+         * same argument that gave the replay one: `authorship_proof_unusable` tells the operator the
+         * proof was "unreadable, or signed over different content", and for these it is neither.
+         * The proof is perfect; what it CLAIMS TO HAVE SEEN is wrong. Filing them under the generic
+         * name would send someone to audit a decoder, and would spend the operator's attention
+         * asking their counterparty about a version number that is not the question.
+         */
         this.#refuseUnprovenAuthorship(
           agentName, sessionId,
-          authorship.reason === AUTHORSHIP_SESSION_MISMATCH ? "authorship_wrong_conversation" : "authorship_proof_unusable",
+          authorship.reason === AUTHORSHIP_SESSION_MISMATCH
+            ? "authorship_wrong_conversation"
+            : ACK_HASH_REASONS.has(authorship.reason)
+              ? "authorship_unacknowledged"
+              : "authorship_proof_unusable",
           contentHash, { detail: authorship.reason }, correlationId,
         );
         return;
@@ -17740,7 +17992,9 @@ export class SessionNodeManager {
         this.#relayClients.set(clientKey, client);
       }
 
-      client.registerSession(sessionId, node, this.#relayLeafHandler(agentName, sessionId, correlationId));
+      // 033-ACKEMIT: a revived session re-registers with no assignment in hand, so the genesis comes
+      // from the entry that was just restored above.
+      client.registerSession(sessionId, node, this.#relayLeafHandler(agentName, sessionId, correlationId), undefined, this.#sessionGenesisPrevRoot(agentName, sessionId));
 
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {
