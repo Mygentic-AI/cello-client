@@ -2087,6 +2087,18 @@ export class SessionNodeManager {
    * permanently less provable than the identical message that did not, for a reason with nothing to
    * do with authorship.
    */
+  /**
+   * 033-ACKEMIT review F1 — what this side has ACTUALLY RECEIVED, per session: the canonical
+   * position and the content hash at it.
+   *
+   * ⚠️ **IT MIRRORS THE RELAY CLIENT'S `#lastSeen` RATHER THAN REPLACING IT, and the duplication is
+   * deliberate.** The submit path needs the value on the client, because that is where the claim is
+   * built; the unwitnessed content path needs it here, because a session with no relay client has no
+   * client to read it from. Both are written from ONE place — `#noteAcknowledgeable` below — so they
+   * cannot come to disagree, and the client is preferred on read because it also sees leaves the
+   * relay delivered that never came through this path.
+   */
+  #lastAck = new Map<string, { seq: number; hash: Uint8Array }>();
   #heldContent = new Map<string, Map<number, { content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string; screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind; authorship?: SentAuthorship; restoredAcrossRestart?: boolean }>>();
   // DOD-MSG-4: the relay's high-water canonical sequence for this session — the largest sequence the
   // relay has witnessed (max over leaf_deliver). Keyed #k(agent,session). EXPOSED for the next
@@ -14044,6 +14056,32 @@ export class SessionNodeManager {
   }
 
   /**
+   * Record that a message ARRIVED and was accepted at a known canonical position — 033-ACKEMIT
+   * review F1.
+   *
+   * The one writer for both copies of the acknowledgement, so the claim this daemon signs says what
+   * it actually received rather than what the relay got round to delivering back to it.
+   *
+   * Monotonic, and it must be: a re-delivery or a recovered park of an EARLIER message must not walk
+   * the acknowledgement backwards, and must not swap the hash under an unchanged position.
+   */
+  #noteAcknowledgeable(agentName: string, sessionId: string, canonicalSeq: number, contentHash: Uint8Array): void {
+    // Relay sequences are 1-based; a canonical leaf index is 0-based. The claim carries the relay's
+    // number, because the relay is what checks it.
+    const relaySeq = canonicalSeq + 1;
+    if (relaySeq < 1) return;
+    const key = this.#k(agentName, sessionId);
+    const prev = this.#lastAck.get(key);
+    if (prev && relaySeq <= prev.seq) return;
+    this.#lastAck.set(key, { seq: relaySeq, hash: Uint8Array.from(contentHash) });
+    const entry = this.#activeNodes.get(key);
+    const sessionIdHex = entry?.relaySessionIdBytes
+      ? Buffer.from(entry.relaySessionIdBytes).toString("hex")
+      : sessionId;
+    entry?.relayClient?.noteReceivedLeaf(sessionIdHex, relaySeq, contentHash);
+  }
+
+  /**
    * Test seam: put an own leaf in the HELD state instead of the tree — 033-ACKEMIT.
    *
    * The state `placeOwnLeaf` produces when the relay assigns a position ahead of our tail: the leaf
@@ -15684,6 +15722,7 @@ export class SessionNodeManager {
      * honest acknowledgement is position 0 and the agreed starting point of the chain.
      */
     const ack = entry.relayClient?.lastSeenAck(sessionIdHexForAck)
+      ?? this.#lastAck.get(this.#k(agentName, sessionId))
       ?? (() => { const g = this.#sessionGenesisPrevRoot(agentName, sessionId); return g ? { seq: 0, hash: g } : undefined; })();
     if (!ack) {
       /**
@@ -16835,6 +16874,21 @@ export class SessionNodeManager {
       // acknowledged `persisted` — the sender's TTF→park backstop then guarantees the
       // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
       if (ingest.ok && !ingest.held) {
+        /**
+         * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
+         * delivering its copy back to us.
+         *
+         * Placed after a successful, non-held ingest deliberately: a HELD frame is not yet a durable
+         * leaf and is not acknowledged `persisted` either, so claiming to have seen it would put a
+         * position in our signed claim that our own record does not yet hold.
+         *
+         * `framedSeq` is the relay's canonical position taken from the sender's own signed ordering
+         * record and verified before it got here. When it is absent the message arrived with no
+         * ordering record — the withheld-submit case — and there is no position to acknowledge,
+         * whatever we hold of the content. That limit is structural to a (position, content) pair
+         * and it is what the carried-leaf follow-on closes.
+         */
+        if (framedSeq !== null) this.#noteAcknowledgeable(agentName, sessionId, framedSeq, contentHash);
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
     } catch (err: unknown) {

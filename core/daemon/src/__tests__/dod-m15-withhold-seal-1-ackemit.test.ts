@@ -523,6 +523,60 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      */
   }, 60_000);
 
+  it("★★ a RECEIVED message advances the acknowledgement — not the relay delivering its copy back", async () => {
+    /**
+     * ⚠️ **REVIEW F1: `#bumpLastSeen` had exactly ONE caller, inside the relay's `leaf_deliver`
+     * handler — so the acknowledgement tracked what the RELAY DELIVERED, not what was RECEIVED.**
+     *
+     * On a direct session those are different events: the content arrives peer-to-peer and the
+     * relay's copy of the leaf follows separately, so until it did, this daemon signed an
+     * acknowledgement one message behind what it had actually read. The order's own words are "the
+     * content hash of the last message this sender ACTUALLY RECEIVED", and the implementation had
+     * stopped at "from the same store that already supplies `last_seen_seq`".
+     *
+     * **THERE IS NO RELAY IN THIS TEST.** A message arrives on the direct path carrying the sender's
+     * signed ordering record; we ingest it; and the very next thing we send acknowledges THAT
+     * message — by content, at the position the record named.
+     */
+    let node: CelloNode | null = null;
+    fx = await startTwoConnectionFixture({ dirPrefix: "cello-ackemit-received-", node: node = new FakeNode() as unknown as CelloNode });
+    const kp = generateKeypair();
+    const senderPubkey = await kp.getPublicKey();
+    await fx.createSession(SID, "alice", Buffer.from(senderPubkey).toString("hex"), PEER);
+
+    // Their message, at canonical position 1, with the relay's ordering record on the frame.
+    const theirHash = wireContentHash(BODY);
+    const s1 = encodeStructure1({
+      contentHash: theirHash, senderPubkey,
+      sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
+      lastSeenSeq: 0, timestamp: 1_750_000_000_000,
+      lastSeenHash: new Uint8Array(32).fill(0x9c),
+    });
+    const sig = await kp.sign(s1);
+    const s2 = encodeCbor([1, senderPubkey, theirHash, sig]) as Uint8Array;
+    await fx.snm.handleContentFrameForTest("alice", SID, inboundFrame({ structure1_cbor: s1, sender_signature: sig, structure2_cbor: s2 }), PEER);
+
+    expect(
+      fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received"),
+      "PRECONDITION: their message must have been ingested, or this measures nothing",
+    ).toHaveLength(1);
+    console.log("DEBUG held=", JSON.stringify(fx.eventsNamed("session.content.held").map(e=>e.ctx)));
+    console.log("DEBUG claim.unack=", fx.eventsNamed("session.content.claim.unacknowledged").length);
+
+    // Now WE send. The claim must acknowledge their message — by content, at their position.
+    const { hash, alg } = await fx.snm.contentHashForSession("alice", SID, new TextEncoder().encode("our reply"));
+    await fx.snm.sendContent("alice", SID, new TextEncoder().encode("our reply"), hash, "corr", LEAF_KIND_MSG, alg);
+    await new Promise((r) => setTimeout(r, 200));
+
+    const sent = (await sentFrames(node)).filter((f) => f["type"] === "content_frame");
+    const ours = decode(sent[sent.length - 1]!["structure1_cbor"] as Uint8Array) as unknown[];
+    expect(ours[4], "position 1 — the message we just read, not 0").toBe(1);
+    expect(
+      Buffer.from(ackHash(ours)).toString("hex"),
+      "and the CONTENT of it — a build that only advanced on leaf_deliver is still emitting the genesis here",
+    ).toBe(Buffer.from(theirHash).toString("hex"));
+  }, 60_000);
+
   it("★★ the RECEIVE-side genesis comparison actually compares — clause 3's other half", async () => {
     /**
      * ⚠️ **THIS BRANCH HAD NO TEST, and mutating its comparison to `true` reddened nothing.**

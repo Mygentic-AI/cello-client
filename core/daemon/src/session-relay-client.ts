@@ -1978,6 +1978,30 @@ export class AgentRelayClient {
 
   /** The highest relay-assigned sequence observed for a given session (ack or deliver). */
   /**
+   * Advance this session's acknowledgement from a message that ARRIVED — 033-ACKEMIT review F1.
+   *
+   * ⚠️ **`#bumpLastSeen` used to have exactly one caller, inside the `leaf_deliver` handler, so the
+   * acknowledgement tracked what the RELAY DELIVERED rather than what was RECEIVED.** On a direct
+   * session that is a real difference: the content arrives peer-to-peer and the relay's copy of the
+   * leaf follows separately, so until it did, this daemon signed an acknowledgement one message
+   * behind what it had actually read — and on a session where delivery never came back at all, the
+   * acknowledgement never moved.
+   *
+   * The order's own words are "the content hash of the last message this sender ACTUALLY RECEIVED".
+   * This is the caller that makes that true: the receive path calls it as soon as a message has been
+   * verified and ingested at a known canonical position.
+   *
+   * **THE POSITION IS STILL REQUIRED, and that is a real limit rather than an oversight.** The pair
+   * is (position, content-at-position), and the relay refuses a `last_seen_seq` that runs ahead of
+   * its counter — so a message that arrived with NO ordering record cannot be acknowledged by
+   * position at all, whatever we hold of it. That case is the withheld-submit attack itself, and it
+   * is closed by carrying the sender's signed leaf into the seal, not from here.
+   */
+  noteReceivedLeaf(sessionIdHex: string, relaySeq: number, contentHash: Uint8Array): void {
+    this.#bumpLastSeen(sessionIdHex, relaySeq, contentHash);
+  }
+
+  /**
    * The POSITION and the CONTENT AT IT together — 033-ACKEMIT.
    *
    * ⚠️ **IT REPLACED `lastSeenSeq()`, WHICH IS DELETED RATHER THAN LEFT WIRED.** That accessor
