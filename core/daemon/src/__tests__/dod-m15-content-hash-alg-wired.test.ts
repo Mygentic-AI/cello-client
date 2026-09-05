@@ -62,6 +62,8 @@ async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array
     sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
+    lastSeenHash: new Uint8Array(32).fill(0xa7),
+    prevOwnHash: new Uint8Array(32).fill(0xb4),
   });
   return lp.encode.single(encodeCbor({
     type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1,

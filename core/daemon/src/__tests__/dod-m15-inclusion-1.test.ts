@@ -90,6 +90,8 @@ function signedLeavesFor(hashesHex: readonly string[]): SealFrontierLeaf[] {
       sessionId: SESSION_ID_BYTES,
       lastSeenSeq: i,
       timestamp: 1_700_000_000_000 + i,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     }),
     sender_pubkey: new Uint8Array(32),
     sender_signature: new Uint8Array(64),

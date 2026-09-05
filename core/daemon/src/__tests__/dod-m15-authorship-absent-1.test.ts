@@ -93,6 +93,8 @@ async function signedClaim(
     sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
+    lastSeenHash: new Uint8Array(32).fill(0xa7),
+    prevOwnHash: new Uint8Array(32).fill(0xb4),
   });
   return {
     structure1,
@@ -282,6 +284,8 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
       sessionId: Buffer.from(OTHER_SESSION, "hex"),
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     fx = await startTwoConnectionFixture({ dirPrefix: "cello-authorship-othersession-" });
     await fx.createSession(SID, "alice", Buffer.from(senderPubkey).toString("hex"), PEER);
@@ -339,6 +343,8 @@ describe("DOD-M15-AUTHORSHIP-ABSENT-1 — a message with no passport does not ge
         sessionId: Buffer.from(OTHER, "hex"),
         lastSeenSeq: 0,
         timestamp: 1_750_000_000_000,
+        lastSeenHash: new Uint8Array(32).fill(0xa7),
+        prevOwnHash: new Uint8Array(32).fill(0xb4),
       });
       return { structure1, signature: await kp.sign(structure1) };
     };

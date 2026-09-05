@@ -62,7 +62,6 @@ export {
   buildStructure2,
   encodeStructure2,
   encodeScanResultSentinel,
-  verifyStructure2Signature,
 } from "./structure2.js";
 
 export { computeGenesisPrevRoot, encodeSealPayload, decodeSealPayload, buildSessionEstablishmentTbs, buildSealTbs, SEAL_RECEIPT_DISCLAIMER } from "./session.js";

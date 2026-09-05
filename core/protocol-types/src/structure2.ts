@@ -12,7 +12,8 @@
  *
  * Structure 1 TBS (for signature verification):
  *   [1, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]
- * This is what the sender signs; verifyStructure2Signature reconstructs it from Structure 2 fields
+ * This is what the sender signs. It is verified over the `structure1_cbor` bytes AS RECEIVED —
+ * never rebuilt from Structure 2 fields, which is what the deleted verifier below did wrong
  * plus the session_id, last_seen_seq, and timestamp carried through the relay path.
  */
 
@@ -155,32 +156,17 @@ export function encodeStructure2(s2: Structure2): Uint8Array {
 // ─── Verify ───────────────────────────────────────────────────────────────────
 
 /**
- * Reconstructs canonical CBOR of Structure 1 from Structure 2 fields plus the
- * session_id, last_seen_seq, and timestamp carried through the relay path,
- * then verifies the sender's Ed25519 signature.
+ * ⚠️ `verifyStructure2Signature` WAS DELETED HERE — `DOD-M15-SELFCHAIN-1`.
  *
- * Structure 1 TBS: [1, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]
- * Per RFC 8032 (Ed25519) and RFC 8949 §4.2.1 (canonical CBOR).
+ * It rebuilt Structure 1 inline, as a six-field array, instead of calling `encodeStructure1`. A
+ * second builder for a signed structure is the defect this package's own header warns about, and it
+ * had already drifted: the one layout carries eight fields, so the function could not verify a real
+ * signature any more and its own tests were the only thing that noticed.
  *
- * @param timestamp - Unix milliseconds. May be number or bigint. cbor-x decodes uint64
- *   timestamps as bigint; relay callers that deserialize Structure 1 CBOR must pass the
- *   decoded value directly here rather than converting to number (which is lossy above
- *   Number.MAX_SAFE_INTEGER).
+ * It had NO production caller in either repo — only the barrel export and its tests. So it went,
+ * rather than being taught the new layout: a verifier nothing calls is a claim nobody checks, and
+ * keeping it would have left a second definition of the signed bytes for the next reader to trust.
+ *
+ * Callers verify a Structure 1 signature the way every production path already does: over the
+ * `structure1_cbor` bytes AS RECEIVED, never over a re-encoding.
  */
-export function verifyStructure2Signature(
-  s2: Structure2,
-  session_id: Uint8Array,
-  last_seen_seq: number,
-  timestamp: number | bigint
-): boolean {
-  const tsEncoded = typeof timestamp === "bigint" ? timestamp : timestamp > 0xffffffff ? BigInt(timestamp) : timestamp;
-  const tbs = encodeCbor([
-    1,
-    s2.content_hash,
-    s2.sender_pubkey,
-    session_id,
-    last_seen_seq,
-    tsEncoded,
-  ]) as Uint8Array;
-  return verify(s2.sender_pubkey, tbs, s2.sender_signature);
-}

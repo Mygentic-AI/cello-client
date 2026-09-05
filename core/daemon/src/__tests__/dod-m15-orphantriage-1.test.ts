@@ -429,6 +429,8 @@ describe("DOD-M15-ORPHANTRIAGE-1 — the verified signer survives the session lo
       sessionId: Buffer.from(SID, "hex"),
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     }, RETAINED);
     // The signature the receiver verifies — over the EXACT bytes, by the key inside them.
     const sig = await kp.sign(s1);

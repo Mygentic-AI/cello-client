@@ -546,6 +546,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
         sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
         lastSeenSeq: 0,
         timestamp: 1_700_000_000_000,
+        lastSeenHash: new Uint8Array(32).fill(0xa7),
+        prevOwnHash: new Uint8Array(32).fill(0xb4),
       });
       let sig = await kp.sign(structure1Cbor);
       if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }

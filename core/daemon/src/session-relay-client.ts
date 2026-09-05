@@ -501,6 +501,20 @@ export class AgentRelayClient {
   readonly #receiptStore: RelayReceiptStore | undefined;
   readonly #sealLeafStore: SessionSealLeafStore | undefined;
   readonly #ownChainStore: SessionOwnChainStore | undefined;
+  /**
+   * `DOD-M15-SELFCHAIN-1` — this agent's own last message per session, in memory.
+   *
+   * ⚠️ THE MAP IS THE CHAIN; THE STORE IS ITS DURABILITY. Separating them is deliberate. Within a
+   * running process the map is authoritative and always available, so a send never depends on a
+   * database being wired. Across a RESTART only the store can answer, and without it this daemon
+   * would silently start a new chain mid-conversation — the counterparty refusing every message
+   * after it, with no way to tell that from tampering.
+   *
+   * So a missing store is a durability gap, reported once, and never a reason to refuse a send: it
+   * is caused by our own wiring, never by anything a peer does, and refusing there would break the
+   * product to close a hole the peer cannot reach.
+   */
+  readonly #ownChain = new Map<string, Uint8Array>();
   /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
   /** DOD-M15-CORROBORATE-1 — where a relay's witness alert goes. See the opt of the same name. */
@@ -2089,22 +2103,20 @@ export class AgentRelayClient {
       });
       return { ok: false, reason: "session_unchainable" };
     }
-    if (!carried && !this.#ownChainStore) {
-      this.#logger.error("session.relay.submit.unchainable", {
-        relayPeerId: this.#relayPeerId,
-        session: sessionIdHex,
-        impact:
-          "this daemon has no record of what it previously said in this conversation, so it cannot " +
-          "link this message to its own last one. The message was NOT sent.",
-      });
-      return { ok: false, reason: "session_unchainable" };
-    }
     /**
      * This agent's own previous message, or the session genesis when it has not spoken here yet.
      * "I have not spoken" is a VALUE — derived per session, so it cannot be presented for a
      * different conversation — never an absent field.
+     *
+     * The in-memory map first, then the durable store for the restart case, then the genesis. See
+     * `#ownChain` for why a missing store degrades durability rather than blocking the send.
      */
-    const prevOwn = carried ? undefined : (this.#ownChainStore!.lastOwnHash(this.senderPubkeyHex, sessionIdHex) ?? seed!);
+    let prevOwn: Uint8Array | undefined;
+    if (!carried) {
+      prevOwn = this.#ownChain.get(sessionIdHex)
+        ?? this.#ownChainStore?.lastOwnHash(this.senderPubkeyHex, sessionIdHex)
+        ?? seed!;
+    }
     /**
      * ⚠️ **A CARRIED LEAF IS SENT VERBATIM AND SIGNED BY NOBODY HERE — 034-CARRYLEAF.**
      *
@@ -2202,9 +2214,11 @@ export class AgentRelayClient {
        * NOT for a carried leaf. Those bytes are the AUTHOR's and this agent did not write them, so
        * they are no part of this agent's own chain.
        */
-      if (result.ok && !carried && this.#ownChainStore) {
+      if (result.ok && !carried) {
+        // The map is the chain — always advanced. The store is its durability, advanced when wired.
+        this.#ownChain.set(sessionIdHex, contentHash);
         try {
-          this.#ownChainStore.record(this.senderPubkeyHex, sessionIdHex, contentHash, Date.now());
+          this.#ownChainStore?.record(this.senderPubkeyHex, sessionIdHex, contentHash, Date.now());
         } catch (err: unknown) {
           this.#logger.error("session.selfchain.record.failed", {
             session: sessionIdHex,

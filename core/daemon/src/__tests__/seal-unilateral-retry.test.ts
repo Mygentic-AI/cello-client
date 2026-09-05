@@ -396,6 +396,8 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
       sessionId: SID_BYTES,
       lastSeenSeq: 0,
       timestamp: TS,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     relay.push({
       type: "leaf_deliver",
@@ -480,6 +482,8 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
       sessionId: SID_BYTES,
       lastSeenSeq: 0,
       timestamp: TS,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     relay.push({
       type: "leaf_deliver", sequence_number: 1, leaf_kind: 2, session_id: SID_BYTES,

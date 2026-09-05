@@ -31,6 +31,8 @@ async function signedLeaf(
     sessionId: opts.sessionId ?? SID,
     lastSeenSeq,
     timestamp: 1_700_000_000_000,
+    lastSeenHash: new Uint8Array(32).fill(0xa7),
+    prevOwnHash: new Uint8Array(32).fill(0xb4),
   });
   let sig = await kp.sign(s1);
   if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }

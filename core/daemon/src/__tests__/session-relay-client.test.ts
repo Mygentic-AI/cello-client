@@ -79,7 +79,10 @@ describe("session-relay-client: Structure 1", () => {
     const lastSeenSeq = 0;
     const timestamp = 1_750_000_000_000;
 
-    const s1 = encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp });
+    const s1 = encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp
+,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4), });
 
     // Mirror the relay's decodeStructure1: a 6-element array with the exact field shapes.
     const arr = decode(s1) as unknown[];
@@ -114,6 +117,8 @@ describe("session-relay-client: Structure 1", () => {
       sessionId: new Uint8Array(16).fill(0x09),
       lastSeenSeq: 3,
       timestamp: 1_750_000_000_001,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
 
     const sig = await kp.sign(s1);

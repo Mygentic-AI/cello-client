@@ -141,6 +141,7 @@ async function submittedStructure1(opts: { genesis?: Uint8Array; deliverFirst?: 
         lastSeenSeq: 0,
         timestamp: 1_750_000_000_000,
         lastSeenHash: GENESIS,
+        prevOwnHash: new Uint8Array(32).fill(0xb4),
       }),
       structure2_cbor: encodeCbor([opts.deliverFirst.seq]) as Uint8Array,
     });
@@ -274,12 +275,18 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
       encodeStructure1({
         contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000,
         lastSeenHash: new Uint8Array(16).fill(0x5b),
+        prevOwnHash: new Uint8Array(32).fill(0xb4),
       }),
     ).toThrow(/32 bytes/);
 
     // And the shapes stay distinguishable: v1 six fields, v2 seven with the version saying so.
-    const v1 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000 })) as unknown[];
-    const v2 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x44) })) as unknown[];
+    const v1 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000
+,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4), })) as unknown[];
+    const v2 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x44)
+,
+      prevOwnHash: new Uint8Array(32).fill(0xb4), })) as unknown[];
     expect([v1.length, v1[0]]).toEqual([6, 1]);
     expect([v2.length, v2[0]]).toEqual([7, 2]);
   });
@@ -353,6 +360,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       lastSeenSeq: 3,
       timestamp: 1_750_000_000_000,
       lastSeenHash: new Uint8Array(32).fill(0x5a),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const theirSig = await author.sign(theirClaim);
 
@@ -432,6 +440,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
       lastSeenHash: new Uint8Array(32).fill(0x9c),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const authorSig = await author.sign(withheld);
 
@@ -530,6 +539,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
       lastSeenHash: GENESIS,
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const ourSig = await us.sign(ourClaim);
 
@@ -599,6 +609,7 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       contentHash, senderPubkey: authorPub,
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
       lastSeenSeq: 0, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x9c),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const sig = await author.sign(s1);
     const s2 = encodeCbor([1, authorPub, contentHash, sig]) as Uint8Array;
@@ -798,6 +809,7 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
       lastSeenSeq: opts.lastSeenSeq,
       timestamp: 1_750_000_000_000,
       ...(opts.lastSeenHash ? { lastSeenHash: opts.lastSeenHash } : {}),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const signature = await kp.sign(structure1);
 
@@ -933,6 +945,7 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
       lastSeenSeq: 0, timestamp: 1_750_000_000_000,
       lastSeenHash: new Uint8Array(32).fill(0x9c),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     const sig = await kp.sign(s1);
     const s2 = encodeCbor([1, senderPubkey, theirHash, sig]) as Uint8Array;

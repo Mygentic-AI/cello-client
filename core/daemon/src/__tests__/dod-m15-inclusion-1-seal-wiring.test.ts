@@ -140,6 +140,8 @@ describe("DOD-M15-INCLUSION-1: a real session_sealed frame fills the certified l
           sessionId: SESSION_ID_BYTES,
           lastSeenSeq: i,
           timestamp: 1_700_000_000_000 + i,
+          lastSeenHash: new Uint8Array(32).fill(0xa7),
+          prevOwnHash: new Uint8Array(32).fill(0xb4),
         });
         return { structure1_cbor: s1, sender_pubkey: senderPubkey, sender_signature: await signer.sign(s1) };
       }),

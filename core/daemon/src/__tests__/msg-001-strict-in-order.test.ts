@@ -322,6 +322,8 @@ describe("DOD-MSG-4: ordering-record verification is adversarially exercised", (
       sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
       lastSeenSeq: 0,
       timestamp: 1_700_000_000_000,
+      lastSeenHash: new Uint8Array(32).fill(0xa7),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
     });
     let sig = await kp.sign(structure1Cbor); // 64-byte Ed25519 over the exact structure1 bytes
     if (opts.corruptSig) { sig = new Uint8Array(sig); sig[0] ^= 0xff; }

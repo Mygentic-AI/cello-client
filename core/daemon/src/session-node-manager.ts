@@ -970,6 +970,21 @@ const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
  * founding defect.
  */
 
+/**
+ * `DOD-M15-SELFCHAIN-1` — the sender's link to their OWN previous message names content this side
+ * did not receive from them as their last one.
+ *
+ * ⚠️ THIS IS THE ONE THAT MEANS THE ORDER OF THE CONVERSATION IS IN DISPUTE, and it is why it is
+ * named apart from the acknowledgement reasons above rather than folded in with them. Those say the
+ * sender is wrong about what WE said; this says they are wrong about what THEY said, which is the
+ * only thing they cannot be honestly mistaken about for long.
+ *
+ * ⚠️ AND IT STILL NAMES WHAT WAS OBSERVED, NEVER A CONCLUSION. The same signal is produced by a
+ * peer reordering a conversation and by a peer whose own chain record went out of step after a
+ * restart, and this side cannot tell them apart.
+ */
+const AUTHORSHIP_SELF_CHAIN_MISMATCH = "self_chain_mismatch";
+
 /** A v1 claim: it carries no `last_seen_hash`, so it asserts a POSITION and no content at all. */
 const AUTHORSHIP_ACK_HASH_ABSENT = "ack_hash_absent";
 
@@ -16141,6 +16156,19 @@ export class SessionNodeManager {
      */
     const ackVerdict = this.#verifyAcknowledgedContent(agentName, sessionId, s1.fields);
     if (ackVerdict) return ackVerdict;
+    /**
+     * ─── AND IT MUST LINK TO THEIR OWN PREVIOUS MESSAGE — `DOD-M15-SELFCHAIN-1` ──────────────────
+     *
+     * The check above asks whether they are right about what WE said. This one asks whether they
+     * are right about what THEY said, and it is the check that makes the ORDER of the conversation
+     * provable rather than merely its contents.
+     *
+     * **THIS IS THE HALF THAT NEEDS NO RELAY**, in the strongest sense: the expected value is the
+     * last message we received from them, which is a fact about our own inbox. A relay that is
+     * absent, slow, colluding or lying cannot change it, and cannot wave a broken chain past us.
+     */
+    const chainVerdict = this.#verifySenderSelfChain(agentName, sessionId, s1.fields);
+    if (chainVerdict) return chainVerdict;
     return { verdict: "verified", senderPubkey: s1Pubkey, senderSig: senderSignature };
   }
 
@@ -16159,10 +16187,58 @@ export class SessionNodeManager {
    * width, so `lastSeenHash === null` here means exactly one thing — a v1 layout — and it is
    * refused by its own name.
    */
+  /**
+   * Does this claim link to the last message we actually received from this sender?
+   *
+   * ─── Why the expected value is our INBOX and not our tree ──────────────────────────────────────
+   *
+   * The tree holds every leaf in canonical order and records no authorship, so it cannot say which
+   * of them this sender wrote. What can is the acknowledgement state this daemon already keeps: the
+   * last content hash received from the counterparty, updated on every message as it is ingested.
+   * That IS their previous message, by definition.
+   *
+   * It is seeded at session registration with the session GENESIS, so a sender's first message has
+   * a real expected value rather than a special case — "they have not spoken here yet" is a value,
+   * derived per session, and not an absence.
+   *
+   * ⚠️ RUNS BEFORE THIS MESSAGE IS INGESTED, which is what makes the comparison meaningful: the
+   * state still holds their PREVIOUS message. Moving this after ingest would compare a message to
+   * itself and pass every time.
+   */
+  #verifySenderSelfChain(
+    agentName: string,
+    sessionId: string,
+    fields: { prevOwnHash: Uint8Array },
+  ): { verdict: "unusable"; reason: string } | undefined {
+    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
+    const expected = entry?.relayClient?.lastSeenAck(sessionId)?.hash
+      ?? this.#sessionGenesisPrevRoot(agentName, sessionId);
+    /**
+     * ⚠️ NO EXPECTED VALUE MEANS NO COMPARISON, AND THIS IS THE ONE PLACE THAT IS NOT A FAIL-OPEN —
+     * because of WHO CONTROLS THE ABSENCE. Whether this side holds a starting point for the session
+     * depends on our own assignment and our own database. Nothing the sender puts on the wire can
+     * cause it, so it is not a switch they can reach for. A session restored from a row written
+     * before this existed is the real case, and refusing there would refuse every message on it for
+     * something the counterparty did not do.
+     */
+    if (!expected) {
+      this.#logger.info("session.content.self_chain.unverifiable", {
+        agentName, sessionId,
+        impact:
+          "this side holds no record of this sender's previous message in this session, so the " +
+          "link inside their signed bytes was not compared. The message is accepted; it is already " +
+          "bound to this conversation and to its author by the checks above.",
+      });
+      return undefined;
+    }
+    if (bytesEqual(fields.prevOwnHash, expected)) return undefined;
+    return { verdict: "unusable", reason: AUTHORSHIP_SELF_CHAIN_MISMATCH };
+  }
+
   #verifyAcknowledgedContent(
     agentName: string,
     sessionId: string,
-    fields: { lastSeenSeq: number; lastSeenHash: Uint8Array | null },
+    fields: { lastSeenSeq: number; lastSeenHash: Uint8Array },
   ): { verdict: "unusable"; reason: string } | undefined {
     /**
      * ⚠️ **A v1 CLAIM IS REFUSED THE MOMENT IT NAMES A POSITION — and accepted when it names none.
@@ -16185,11 +16261,15 @@ export class SessionNodeManager {
      * AHEAD of its counter, never one that lags). This unit does not change that either way, and
      * the follow-on that does is the receiver submitting a hash for what it received.
      */
-    if (fields.lastSeenHash === null) {
-      return fields.lastSeenSeq >= 1
-        ? { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_ABSENT }
-        : undefined;
-    }
+    /**
+     * ⚠️ THE "NO ACKNOWLEDGEMENT AT ALL" BRANCH IS GONE, and its absence is the point.
+     *
+     * It used to accept a claim carrying no `last_seen_hash` as long as it also named no position —
+     * honest, and a shape a peer could choose. `DOD-M15-SELFCHAIN-1` deleted every layout that can
+     * express it: there is one Structure 1 and both chain links are required, so a claim without one
+     * does not decode at all and never reaches this method. `AUTHORSHIP_ACK_HASH_ABSENT` is kept as
+     * a reason because the wording that routes off it is still reachable from other callers.
+     */
     /**
      * THE GENESIS IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing, and
      * that case is a defined 32 bytes — the agreed starting point of this two-party chain, derived

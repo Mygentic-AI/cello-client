@@ -168,6 +168,8 @@ describe("SEC-1: relay-park content authentication (fail-closed)", () => {
         sessionId: Uint8Array.from(Buffer.from(sid, "hex")),
         lastSeenSeq: 0,
         timestamp: 1_700_000_000_000,
+        lastSeenHash: new Uint8Array(32).fill(0xa7),
+        prevOwnHash: new Uint8Array(32).fill(0xb4),
       });
       const sig = await counterparty.sign(structure1Cbor);
       const built = buildStructure2(seq, pubkey, hash, sig, new Uint8Array(32));

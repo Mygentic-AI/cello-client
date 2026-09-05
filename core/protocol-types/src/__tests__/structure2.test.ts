@@ -30,7 +30,6 @@ import {
   buildStructure2,
   encodeStructure2,
   encodeScanResultSentinel,
-  verifyStructure2Signature,
   SCAN_RESULT_SENTINEL,
 } from "../structure2.js";
 
@@ -81,12 +80,17 @@ async function makeStructure2(seq = 1, lastSeenSeq = 0) {
   // buildStructure2, never the envelope.
   const senderPubkey = await kp.getPublicKey();
   const contentHash = new Uint8Array(await crypto.subtle.digest("SHA-256", content));
+  // Both chain links are required (`DOD-M15-SELFCHAIN-1`). Their VALUES are irrelevant to this
+  // file — the subject is `buildStructure2`, which binds the sender signature and never reads them
+  // — so a fixed pair keeps the fixture stable and says plainly that they are not under test here.
   const structure1 = encodeStructure1({
     contentHash,
     senderPubkey,
     sessionId,
     lastSeenSeq,
     timestamp: ts,
+    lastSeenHash: new Uint8Array(32).fill(0xa7),
+    prevOwnHash: new Uint8Array(32).fill(0xb4),
   });
   const senderSignature = await kp.sign(structure1);
 
@@ -132,6 +136,8 @@ describe("AC-001: Structure 1 canonical CBOR fixture (regression guard from MSG-
         session_id_hex: string;
         last_seen_seq: number;
         timestamp: number;
+        last_seen_hash_hex: string;
+        prev_own_hash_hex: string;
       };
       expected_cbor_hex: string;
     };
@@ -142,6 +148,8 @@ describe("AC-001: Structure 1 canonical CBOR fixture (regression guard from MSG-
       sessionId: fromHex(fixture.inputs.session_id_hex),
       lastSeenSeq: fixture.inputs.last_seen_seq,
       timestamp: fixture.inputs.timestamp,
+      lastSeenHash: fromHex(fixture.inputs.last_seen_hash_hex),
+      prevOwnHash: fromHex(fixture.inputs.prev_own_hash_hex),
     });
     expect(toHex(bytes)).toBe(fixture.expected_cbor_hex);
   });
@@ -166,30 +174,6 @@ describe("AC-002: Structure 2 canonical CBOR fixture", () => {
 
     const cbor = encodeStructure2(s2Result.structure2);
     expect(toHex(cbor)).toBe(fixture.expected_cbor_hex);
-  });
-});
-
-// ─── AC-003: verifyStructure2Signature — honest relay round-trip ──────────────
-
-describe("AC-003: verifyStructure2Signature — honest relay round-trip", () => {
-  it("AC-003: Structure 2 built from real Structure 1 signature verifies", async () => {
-    const { structure2, envelope, sessionId, lastSeenSeq } = await makeStructure2();
-    const ok = verifyStructure2Signature(structure2, sessionId, lastSeenSeq, envelope.timestamp);
-    expect(ok).toBe(true);
-  });
-});
-
-// ─── AC-004: forged sender_signature → verification fails ────────────────────
-
-describe("AC-004: forged sender_signature → verification fails", () => {
-  it("AC-004: Structure 2 with random 64-byte sender_signature → verifyStructure2Signature returns false", async () => {
-    const { structure2, sessionId, lastSeenSeq, envelope } = await makeStructure2();
-    const forgedStructure2 = {
-      ...structure2,
-      sender_signature: new Uint8Array(64).fill(0xff),
-    };
-    const ok = verifyStructure2Signature(forgedStructure2, sessionId, lastSeenSeq, envelope.timestamp);
-    expect(ok).toBe(false);
   });
 });
 
@@ -243,35 +227,3 @@ describe("AC-008: buildStructure2 field length validation", () => {
   });
 });
 
-// ─── SI-001: forged Structure 2 around a tampered inner signature ─────────────
-
-describe("SI-001: forged Structure 2 — tampered sender_signature never verifies", () => {
-  it("SI-001: well-formed Structure 2 with one-bit-flipped signature → false", async () => {
-    const { structure2, sessionId, lastSeenSeq, envelope } = await makeStructure2();
-
-    const tamperedSig = Uint8Array.from(structure2.sender_signature);
-    tamperedSig[0] ^= 0x01;
-    const tampered = { ...structure2, sender_signature: tamperedSig };
-    expect(verifyStructure2Signature(tampered, sessionId, lastSeenSeq, envelope.timestamp)).toBe(false);
-  });
-
-  it("SI-001: tampered sender_pubkey in Structure 2 → false", async () => {
-    const { structure2, sessionId, lastSeenSeq, envelope } = await makeStructure2();
-    const altPub = new Uint8Array(32).fill(0x99);
-    const tampered = { ...structure2, sender_pubkey: altPub };
-    expect(verifyStructure2Signature(tampered, sessionId, lastSeenSeq, envelope.timestamp)).toBe(false);
-  });
-
-  it("SI-001: all 256 one-bit flips on sender_signature → false", async () => {
-    const { structure2, sessionId, lastSeenSeq, envelope } = await makeStructure2();
-    for (let bit = 0; bit < 256; bit++) {
-      const byteIdx = Math.floor(bit / 8);
-      const mask = 1 << (bit % 8);
-      const flipped = Uint8Array.from(structure2.sender_signature);
-      flipped[byteIdx] ^= mask;
-      expect(
-        verifyStructure2Signature({ ...structure2, sender_signature: flipped }, sessionId, lastSeenSeq, envelope.timestamp)
-      ).toBe(false);
-    }
-  });
-});
