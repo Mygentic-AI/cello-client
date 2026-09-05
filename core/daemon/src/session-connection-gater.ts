@@ -169,6 +169,21 @@ export class SessionConnectionGater implements ConnectionGater {
    * the same call that notices the reservation is gone, so the bound stays "holds one now" and
    * cannot drift into "granted one once". Pass `[]` when nothing is held.
    */
+  /**
+   * Does this relay hold the inbound carve-out — i.e. would this gater ADMIT an inbound dial from
+   * it on the strength of a live reservation?
+   *
+   * **This IS the carve-out branch**, not a description of it: `denyInboundEncryptedConnection`
+   * calls this method rather than re-testing the set. One definition, so nothing observing the gate
+   * can be told something different from what the gate does — which matters because the review
+   * found that substituting the CANDIDATE list for the held list at the manager's
+   * `setReservedRelayPeers` call left every test in this unit green while opening exactly the hole
+   * the bound exists to close. Read-only and silent: an observation must not log a refusal.
+   */
+  holdsInboundCarveOut(peerId: string): boolean {
+    return this.#standingReceiverOutbound && this.#reservedRelayPeerIds.has(peerId);
+  }
+
   setReservedRelayPeers(peerIds: readonly string[]): void {
     this.#reservedRelayPeerIds.clear();
     for (const peerId of peerIds) this.#reservedRelayPeerIds.add(peerId);
@@ -288,7 +303,7 @@ export class SessionConnectionGater implements ConnectionGater {
      * still is: this set holds only relays whose own reservation was confirmed, however many relays
      * the pool names.
      */
-    if (direction === "inbound" && this.#standingReceiverOutbound && this.#reservedRelayPeerIds.has(peerId.toString())) {
+    if (direction === "inbound" && this.holdsInboundCarveOut(peerId.toString())) {
       return false; // allow — a relay we hold a live reservation with, answering a probe we started
     }
     if (this.#allowedPeerId === null) {

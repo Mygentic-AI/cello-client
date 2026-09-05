@@ -271,6 +271,31 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
       expect(reach).toBeDefined();
       expect(reach!.context.relaysOffered).toBe(2);
       expect(reach!.context.reservationsHeld).toBe(1);
+
+      /**
+       * ⚠️ THE WIRING, WHICH IS THE SECURITY-SENSITIVE HALF AND WAS THE HOLLOW ONE.
+       *
+       * Two tests in `dod-m15-assign-1-receiver-gate.test.ts` prove the gater's SET SEMANTICS by
+       * handing a gater a list directly — and nothing was going to get those wrong. They say
+       * nothing about the one line that matters, which is what the MANAGER hands it. Swap that
+       * argument for `reservations.relayPeerIds` — the DIRECTORY-supplied candidate list — and every
+       * one of those tests still passes while the receiver ships the exact hole the bound exists to
+       * close: a compromised directory names a relay, never grants a reservation, and dials in
+       * behind the gate.
+       *
+       * This fixture is the one that can tell them apart, because one relay granted and the other
+       * only ever appeared in the candidate list.
+       */
+      expect(
+        manager.isRelayCarvedOutInbound("alice", relay.peerId),
+        "the relay that GRANTED is admitted inbound — it answers the AutoNAT probes we start",
+      ).toBe(true);
+      expect(
+        manager.isRelayCarvedOutInbound("alice", DEAD_RELAY_PEER_ID),
+        "the relay that was OFFERED and never granted is refused inbound: being named by the " +
+          "directory must not buy a foothold, which is precisely what handing the gater the " +
+          "candidate list instead of the held list would do",
+      ).toBe(false);
     } finally {
       await manager.gracefulShutdown();
       await relay.node.stop();
@@ -673,6 +698,27 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       );
       expect(lost, "the loss must still be DETECTED and named — spreading is not the same as not looking").toBe(true);
 
+      /**
+       * THE REVOCATION HALF, and without it this test passes against an implementation that logs
+       * `reservation.lost` and then does NOTHING — no pruning, no carve-out revoked. Every other
+       * assertion below would still hold: the peer id is unchanged because nothing was rebuilt, the
+       * survivor's address is still announced (libp2p keeps a circuit address until the reservation's
+       * own refresh, hours away — this test's own note says so), and the reachability enum reads off
+       * a list nobody pruned.
+       */
+      const lostEvent = events.find((e) => e.event === "session.standing_receiver.reservation.lost"
+        && e.context.relayPeerId === dying.peerId);
+      expect(lostEvent!.context.reservationsHeld, "the count SHRANK — one of two is gone").toBe(1);
+      expect(
+        manager.isRelayCarvedOutInbound("alice", dying.peerId),
+        "the dead relay lost its inbound carve-out in the same breath as the loss was noticed — " +
+          "otherwise the gater's bound quietly becomes 'granted one once'",
+      ).toBe(false);
+      expect(
+        manager.isRelayCarvedOutInbound("alice", survivor.peerId),
+        "and the surviving relay keeps its own",
+      ).toBe(true);
+
       // REACHABLE, not merely un-rebuilt. The circuit through the surviving relay is what a NAT'd
       // caller actually dials, so that is what gets asserted — the absence of a rebuild log line
       // would be true of a receiver that had quietly died.
@@ -691,6 +737,28 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       ).toBe(true);
       expect(manager.getStandingReceiverReachability("alice")).toBe("reserved");
 
+      /**
+       * ⚠️ AND A REAL DIAL, because clause 3 says "assert the agent is still reachable, not merely
+       * that no rebuild was logged" — and an announced address plus an internal enum is neither.
+       * libp2p keeps a circuit address for hours after its relay dies, so the string proves nothing
+       * on its own; a stranger dialling THROUGH THE SURVIVING RELAY is the thing a NAT'd caller
+       * actually does.
+       */
+      const caller = await createNode({ keyProvider: generateKeypair(), listenAddresses: ["/ip4/127.0.0.1/tcp/0"] });
+      await caller.start();
+      try {
+        const circuit = manager.getStandingReceiverInfo("alice")!.addrs
+          .find((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`))!;
+        const reached = await caller.dial(circuit);
+        expect(
+          reached.peerId,
+          "a stranger dialled this agent THROUGH THE SURVIVING RELAY and got there — that is what " +
+            "'still reachable' means, and it is the thing an announced address cannot prove",
+        ).toBe(peerBefore);
+      } finally {
+        await caller.stop();
+      }
+
       // And it stays that way — a rebuild on the NEXT watchdog tick would be the same defect,
       // arriving 250ms later.
       await wait(1_000);
@@ -707,12 +775,17 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
     // degradation an agent can absorb: nobody behind a home router can reach it at all, so the
     // structural answer — a new node, because a circuit listener is fixed at node creation — is
     // still the right one.
-    const only = await startHopRelay();
+    // TWO relays, and the second is introduced only AFTER the first dies — so zero really is held
+    // when the watchdog looks, and the rebuild has somewhere to go. That second half is coverage the
+    // old W1 carried and this test would otherwise drop: "a rebuild happened" is not "the rebuild
+    // recovered reachability", and only the latter is worth anything to the agent.
+    const dying = await startHopRelay();
+    const survivor = await startHopRelay();
     const { manager, events } = makeManager("w1b.db");
     await manager.initialize();
     try {
       await seedAgents(manager.getDb(), ["alice"]);
-      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: only.peerId, relayAddrs: [only.addr] }]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: dying.peerId, relayAddrs: [dying.addr] }]);
       await manager.ensureStandingReceiverForAgent("alice");
       expect(
         await waitUntil(() => {
@@ -722,7 +795,9 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       ).toBe(true);
       const peerBefore = manager.getStandingReceiverInfo("alice")!.peerId;
 
-      await only.node.stop();
+      await dying.node.stop();
+      // The pool the rebuild will walk. Announced now, so the receiver still lost everything it had.
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: survivor.peerId, relayAddrs: [survivor.addr] }]);
 
       const lost = await waitUntil(
         () => events.some((e) => e.event === "session.standing_receiver.reservation.lost"
@@ -730,15 +805,28 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
         20_000,
       );
       expect(lost, "losing the last one reports ZERO held, which is the loud case").toBe(true);
+      // …and the rebuild RECOVERS REACHABILITY, not merely identity: a new node holding a real
+      // reservation with the relay that is still alive.
       expect(
-        await waitUntil(() => manager.getStandingReceiverInfo("alice")?.peerId !== peerBefore, 20_000),
-        "with nothing held there is nothing to conserve — the receiver is rebuilt",
+        await waitUntil(() => {
+          const i = manager.getStandingReceiverInfo("alice");
+          return i !== null && i.peerId !== peerBefore
+            && i.addrs.some((a) => a.includes(`/p2p/${survivor.peerId}/p2p-circuit`));
+        }, 25_000),
+        "with nothing held there is nothing to conserve — the receiver is rebuilt, against a relay " +
+          "that is actually alive",
       ).toBe(true);
+      expect(manager.isRelayCarvedOutInbound("alice", survivor.peerId)).toBe(true);
+      expect(
+        manager.isRelayCarvedOutInbound("alice", dying.peerId),
+        "the relay that died does not keep a carve-out across the rebuild",
+      ).toBe(false);
     } finally {
       await manager.gracefulShutdown();
-      try { await only.node.stop(); } catch { /* already stopped */ }
+      await survivor.node.stop();
+      try { await dying.node.stop(); } catch { /* already stopped */ }
     }
-  }, 60_000);
+  }, 90_000);
 
   it("W2: a receiver that NEVER had a reservation is not rebuilt on a timer — no thrash against relays we know refuse", async () => {
     const { manager, events } = makeManager("w2.db");

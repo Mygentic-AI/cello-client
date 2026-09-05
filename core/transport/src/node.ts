@@ -1110,6 +1110,12 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
    * `Queue.clear()` splices only the ARRAY; a job already executing keeps running and its promise
    * still settles. So the fix is to leave nothing queued: give the queue room for every circuit
    * address this node was handed.
+   *
+   * ⚠️ AND THE LOAD-BEARING PRECONDITION, without which none of the above reproduces:
+   * `libp2p@3.3.2` `transport-manager.js` creates ONE LISTENER PER ADDRESS and pushes every
+   * `listener.listen(addr)` into a single `tasks` array awaited together. That parallelism is what
+   * puts relay 2 in the queue while relay 1 is running; listen them serially and there would be
+   * nothing queued to wipe.
    */
   const circuitListenCount = opts.listenAddresses.filter((a) => a.includes("/p2p-circuit")).length;
 
@@ -1144,7 +1150,11 @@ export async function createNode(opts: CreateNodeOptions): Promise<CelloNode> {
     transports: [
       tcp(),
       webSockets(),
-      circuitRelayTransport(hasCircuitListen ? { reservationConcurrency: circuitListenCount } : {}),
+      // `Math.max(1, …)`, review F9: the ternary version was correct only because the flag and the
+      // count came off the same filter. Let those drift and `{ reservationConcurrency: 0 }` gives a
+      // queue that starts nothing and a `start()` that hangs forever — this exact bug, silently
+      // reintroduced. A floor of 1 is libp2p's own default, so it cannot make anything worse.
+      circuitRelayTransport({ reservationConcurrency: Math.max(1, circuitListenCount) }),
     ],
     connectionEncrypters: [
       // Noise ONLY — no plaintext. SI-001.

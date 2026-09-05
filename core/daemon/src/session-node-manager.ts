@@ -4963,6 +4963,22 @@ export class SessionNodeManager {
    * counterparty_session_* fields. Read-only — does NOT consume the standing receiver
    * (unlike acceptSession, which hands it off).
    */
+  /**
+   * 032-RELAYSPREAD — would this receiver ADMIT an inbound dial from this relay?
+   *
+   * The gater's inbound carve-out is the security-sensitive half of the spread: only relays whose
+   * own reservation is confirmed held earn it, so a directory that merely NAMES a relay cannot dial
+   * in behind the gate. Nothing could observe that from outside the manager, and the review found
+   * the consequence: substituting the CANDIDATE list for the held list at the `setReservedRelayPeers`
+   * call kept every test in the unit green while shipping exactly that hole. A guard whose wiring
+   * cannot be observed is a guard nothing can test.
+   *
+   * Reads the live gater rather than a copy, so it cannot drift from what the gate actually does.
+   */
+  isRelayCarvedOutInbound(agentName: string, relayPeerId: string): boolean {
+    return this.#standingReceivers.get(agentName)?.gater.holdsInboundCarveOut(relayPeerId) ?? false;
+  }
+
   getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null {
     // DOD-LOOP-1: the initiator advertises ITS OWN agent's standing receiver, which it then reuses
     // as the session node — so the advertised endpoint matches the node the counterparty dials.
@@ -16607,17 +16623,27 @@ export class SessionNodeManager {
         /**
          * DOD-M12B-SESSION-SEED-1 (review F8): drop it zeroed, like every other seed.
          *
-         * (review F7, DECIDED AGAINST — deliberately NOT reusing this seed for the replacement.)
+         * (review F7, STILL DECIDED AGAINST — deliberately NOT reusing this seed for the
+         * replacement — but its stated blocker is GONE and the reason has changed. Restated rather
+         * than reworded, because a decision whose premise has been reversed is a decision nobody
+         * has actually made.)
+         *
          * Reuse is attractive: this receiver's peer id may already be inside a `session_offer_accept`
          * the counterparty is acting on, and a rebuild in that window is the documented "we record
-         * an identity that no longer exists… every send in this direction parks forever" defect. But
-         * a preserved identity would have to be handed to the candidate loop in
-         * `#startReceiverNode`, whose rejected candidates are stopped WITHOUT awaiting `start()` —
-         * so two nodes could be briefly live on one advertised peer id, which is review F1, a HIGH,
-         * and the reason each candidate now mints its own. Fixing F7 properly means bounding and
-         * awaiting the loser's teardown first, and an unawaited stop is precisely what the current
-         * code chose to avoid a stuck libp2p teardown blocking receiver creation. Filed as
-         * follow-on work rather than trading a MEDIUM fix for a HIGH regression.
+         * an identity that no longer exists… every send in this direction parks forever" defect.
+         *
+         * The old blocker was that a preserved identity would reach the candidate loop, whose
+         * rejected candidates were stopped WITHOUT awaiting `start()`, putting two live nodes on one
+         * advertised peer id. **032-RELAYSPREAD already crossed that line**: the walk now runs one
+         * shared seed through every candidate, with a settlement-chained teardown, and it is safe
+         * there because the receiver's gater admits nobody inbound.
+         *
+         * What still stops reuse HERE is different and is about the OLD node, not the new one. This
+         * rebuild path awaits `sr.node.stop()`, but a stop can hang on a stuck libp2p teardown, and
+         * handing the replacement the same identity before the previous receiver is provably dead
+         * would put two nodes on a peer id a COUNTERPARTY has been told to dial — which is not the
+         * candidate case at all: that node has a content handler and can be promoted. Doing it
+         * safely needs a bounded, verified teardown first. Still follow-on work.
          */
         sr.seed.fill(0);
         try {
@@ -16830,6 +16856,11 @@ export class SessionNodeManager {
           // quarantine), and this reads the directory pool alone. Two populations must not share
           // one field name, so this one is named for what it measures.
           hadRelayToAsk: (this.#directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
+          // …and HOW MANY the walk actually asks, so this event stands on its own instead of
+          // needing the last reachability line to be read beside it. Same population and same
+          // meaning as `relaysOffered` everywhere else: the merged, quarantine-filtered candidate
+          // list.
+          relaysOffered: this.#reservationCircuitAddrs(agentName).addrs.length,
           impact:
             "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
         });
@@ -16877,8 +16908,23 @@ export class SessionNodeManager {
       // full TTL even after the client disconnects, and churning attempts across a fleet is how a
       // relay is exhausted (`#startReceiverNode` records that hazard).
       if (sr.relayPeerIds.length === 0) {
-        this.#retryReservationIfDue(agentName);
-        continue;
+        // …unless one has arrived since. Review F4, same class as the recompute below: the
+        // slow-start path installs a receiver before every circuit has bound, so "held nothing at
+        // install" is not the same fact as "holds nothing now". Adopting it here is what stops the
+        // retry ladder rebuilding a receiver that is already reachable.
+        const arrived = heldRelayIdsOf(sr.node)
+          .filter((id) => sr.node.getConnections().some((c) => c.peerId === id && c.status === "open"));
+        if (arrived.length === 0) {
+          this.#retryReservationIfDue(agentName);
+          continue;
+        }
+        sr.relayPeerIds = arrived;
+        sr.gater.setReservedRelayPeers(arrived);
+        this.#logger.info("session.standing_receiver.reservation.gained", {
+          agentName,
+          relayPeerIds: arrived,
+          reservationsHeld: arrived.length,
+        });
       }
       // It has at least one — any earlier retry budget, and the reason the last attempt failed, are
       // stale.
@@ -16907,13 +16953,38 @@ export class SessionNodeManager {
       // the churn engine — every relay is another watchdog subject, and a full rebuild per loss
       // multiplies the 30-second grid by the size of the pool while throwing away reservations that
       // are perfectly healthy.
-      const advertising = new Set(heldRelayIdsOf(sr.node));
+      /**
+       * RECOMPUTED FROM THE NODE, never filtered down from the stored list. Review F4: filtering
+       * `sr.relayPeerIds` makes it SHRINK-ONLY, and a list that can only shrink cannot see a
+       * circuit arrive. Three things went wrong with that, and the first one happens routinely:
+       *   - the slow-start path installs the receiver before every circuit has bound, so a relay
+       *     that binds four seconds later was invisible to this watchdog and absent from the
+       *     gater's carve-out set FOREVER — its AutoNAT probe reply refused by our own gate;
+       *   - shrinking to zero then rebuilt a receiver that was announcing live circuits, which is
+       *     the exact defect this unit is against;
+       *   - anything that ever restores a circuit could not be counted.
+       * Reading the node's own addresses costs the same and has none of that.
+       */
       const open = sr.node.getConnections().filter((c) => c.status === "open").map((c) => c.peerId);
-      const stillHeld = sr.relayPeerIds.filter((id) => advertising.has(id) && open.includes(id));
-      if (stillHeld.length === sr.relayPeerIds.length) continue;
-
+      const stillHeld = heldRelayIdsOf(sr.node).filter((id) => open.includes(id));
       const lost = sr.relayPeerIds.filter((id) => !stillHeld.includes(id));
+      const gained = stillHeld.filter((id) => !sr.relayPeerIds.includes(id));
       sr.relayPeerIds = stillHeld;
+      if (gained.length > 0) {
+        // A circuit this receiver did not have at install. Said out loud because it is the visible
+        // half of the slow-start case, and because it is the moment that relay earns its inbound
+        // carve-out — a silent widening of the gate is not something to do without a line.
+        this.#logger.info("session.standing_receiver.reservation.gained", {
+          agentName,
+          relayPeerIds: gained,
+          reservationsHeld: stillHeld.length,
+        });
+      }
+      if (lost.length === 0) {
+        // Nothing lost. The gater still gets the current set, because `gained` may have widened it.
+        if (gained.length > 0) sr.gater.setReservedRelayPeers(stillHeld);
+        continue;
+      }
       // REVOKE FIRST. A relay whose reservation is gone must lose its inbound carve-out in the same
       // breath as the loss is noticed, or the gater's bound quietly becomes "granted one once".
       sr.gater.setReservedRelayPeers(stillHeld);
@@ -16948,35 +17019,32 @@ export class SessionNodeManager {
         continue;
       }
       /**
-       * STILL REACHABLE, SO THE RECEIVER STANDS. This is the property the whole unit exists for:
-       * the agent keeps its peer id, keeps its surviving circuits, and nobody's dial fails while a
-       * replacement is built.
+       * STILL REACHABLE, SO THE RECEIVER STANDS, AND NOTHING ELSE HAPPENS HERE. That second half is
+       * the part worth reading, because the obvious next line is wrong twice over.
        *
-       * What is done about the lost one is bounded, and the bound is stated rather than implied.
-       * A circuit listener is fixed at node creation, so the ONLY way to obtain a genuinely new
-       * reservation is a new node — which is exactly the rebuild this branch refuses. What we can
-       * do is remove the relay-side REASON for the revocation: the relay times out the reservation
-       * of a peer that has not proven key possession to it, so we prove again, and the listener
-       * this node still holds for that relay is then free to re-reserve.
+       * **A LOST CONFIGURED CIRCUIT CANNOT BE RETAKEN BY THIS NODE.** Read out of
+       * `@libp2p/circuit-relay-v2@4.2.5`, not assumed: for an explicit relay address
+       * `transport/listener.js#listen()` is a ONE-SHOT — it reserves once and nothing calls it
+       * again; `reservation-store.js#removeReservation()` clears the refresh timeout and deletes
+       * the entry; and the listener's `_onAddRelayPeer` returns early for `type === 'configured'`,
+       * so even a later reservation would not be announced. A circuit listener is fixed at node
+       * creation, and the only thing that takes a new one is a NEW NODE — which is exactly the
+       * rebuild this branch exists to refuse.
        *
-       * So: a reservation lost to an expired proof comes back here. One lost because the relay
-       * itself is gone does not, and stays gone until the receiver is next rebuilt for another
-       * reason. In both cases the agent remains reachable through the relays it still holds, which
-       * is the thing being bought — not a guarantee that every circuit is restored in place.
+       * **AND RE-PROVING TO THE LOST RELAY WOULD REBUILD THE RECEIVER ANYWAY.** Review F3: an
+       * earlier version called `#authenticateStandingReceiver` here to "remove the relay-side
+       * reason for the revocation". That function ends with `if (refusal?.tryAnotherRelay) { …
+       * void this.#rebuildStandingReceiver(agentName); }` — and a dead or misconfigured relay is
+       * precisely the one that answers that way. So the common case was: lose relay A while
+       * holding B, decline to rebuild, prove to A, A refuses, rebuild the whole receiver and throw
+       * B's healthy reservation away. The churn engine, re-entered through the back door.
+       *
+       * **THE BOUND, STATED PLAINLY BECAUSE IT IS A REAL SHORTFALL AGAINST THE DoD:** a lost
+       * circuit is gone until the receiver is next rebuilt for another reason. What the agent buys
+       * is that it never STOPS BEING REACHABLE while that is true — the surviving relays carry it,
+       * the loss is named in the log with its cause, and the lost relay's inbound carve-out is
+       * revoked above. That is availability, not restoration in place.
        */
-      for (const relayPeerId of lost) {
-        const addr = this.#reservationCircuitAddrs(agentName).addrs
-          .find((a) => a.includes(`/p2p/${relayPeerId}/p2p-circuit`));
-        if (addr === undefined) continue;
-        void this.#authenticateStandingReceiver(agentName, sr.node, relayPeerId, addr, randomUUID())
-          .catch((err: unknown) => {
-            this.#logger.warn("session.standing_receiver.relay_auth.failed", {
-              agentName,
-              relayPeerId,
-              error: extractErrorMessage(err),
-            });
-          });
-      }
     }
   }
 
@@ -17194,18 +17262,27 @@ export class SessionNodeManager {
      * not. Its hazard is real and survives: a rejected candidate is torn down while its `start()`
      * may still be in flight, so two nodes can briefly be live on this peer id. Two things bound it
      * now, and neither existed when that rule was written:
+     *   - **THE ONE THAT CARRIES THE WEIGHT: DOD-M15-ASSIGN-1** made a standing receiver's gater
+     *     admit NOBODY inbound until a session offer names the dialer. The old rule's stated danger
+     *     — "sharing this gater, so it admits dials … an open endpoint under our advertised id" —
+     *     is not true of this gater any more. `#startReceiverNode` has exactly one caller and it
+     *     constructs that gater with `allowedPeerId: null` and an empty reserved set, so an
+     *     overlapping candidate is an endpoint that refuses everyone.
      *   - the teardown is chained onto the candidate's OWN start promise (the `#buildRevivedNode`
      *     pattern, verified against libp2p 3.3.2: `stop()` returns immediately unless the status is
      *     `started`, and through the whole timeout window it is `starting`, so the old unawaited
-     *     `stop()` stopped nothing). A brief overlap is possible; that the node DIES is guaranteed.
-     *   - DOD-M15-ASSIGN-1 made a standing receiver's gater admit NOBODY inbound until a session
-     *     offer names the dialer. The old rule's stated danger — "sharing this gater, so it admits
-     *     dials … an open endpoint under our advertised id" — is not true of this gater any more.
+     *     `stop()` stopped nothing). ⚠️ This bounds the LEAK, not the OVERLAP — a timed-out
+     *     candidate is not awaited and the walk moves straight to the next one on the same seed, so
+     *     overlap is the normal shape of that case, not a remote possibility. It guarantees the
+     *     loser dies, and nothing more.
      * `#buildRevivedNode` already runs a fixed identity through this same walk for the same reason.
      */
     const receiverSeed = randomBytes(32);
     /** Circuit addresses whose relay ACTUALLY GRANTED this identity a reservation. */
     const grantedAddrs: string[] = [];
+    // For `spread.grant_not_bound` below: the walk's own duration is measured against the relay's
+    // two-minute proof memory, so it has to be a number rather than an inference.
+    const walkStartedAt = Date.now();
 
     for (const circuitAddr of candidateCircuitAddrs) {
       const candidateSeed = receiverSeed;
@@ -17400,21 +17477,71 @@ export class SessionNodeManager {
       await node.start();
       return { node, seed: receiverSeed };
     }
+    /**
+     * ⚠️ SLOW AND FAILED ARE DIFFERENT ANSWERS AND MUST NOT SHARE A BRANCH. Review F1: a single
+     * `.catch(() => false)` around this race collapsed every `start()` REJECTION into the deadline
+     * branch — and `CelloNodeImpl.start()` rejects by design, stopping the node and throwing
+     * `listen_failed` when no direct (non-circuit) listener materialised. That is the guard the
+     * transport keeps precisely so `FaultTolerance.NO_FATAL` cannot mask a real `EADDRINUSE`.
+     *
+     * Swallowed, it installed a STOPPED node as the agent's front door: no addresses to advertise,
+     * `#tryCreateStandingReceiver` never saw a failure so the M8B F14 retry never fired, and the
+     * operator was told the receiver "did not finish binding every circuit inside the deadline" and
+     * "is reachable through those" — sending them to the relay fleet for a port held by an orphan
+     * daemon on their own machine. The rejection is rethrown so it reaches
+     * `session.node.create.failed` with its own cause, exactly as it does on the no-relay path.
+     */
     let deadline: ReturnType<typeof setTimeout> | undefined;
-    const startedInTime = await Promise.race([
-      node.start().then(() => true as const),
-      new Promise<false>((resolve) => {
+    let startError: unknown;
+    const started = node.start().then(
+      () => "ok" as const,
+      (err: unknown) => { startError = err; return "failed" as const; },
+    );
+    const outcome = await Promise.race([
+      started,
+      new Promise<"slow">((resolve) => {
         // Per granted relay: each circuit listener is its own dial and its own reservation, so a
         // pool of three must not be judged on a budget sized for one.
-        deadline = setTimeout(() => resolve(false), this.#srReservationTimeoutMs * grantedAddrs.length);
+        deadline = setTimeout(() => resolve("slow"), this.#srReservationTimeoutMs * grantedAddrs.length);
       }),
-    ]).catch(() => false as const);
+    ]);
     if (deadline !== undefined) clearTimeout(deadline);
-    if (!startedInTime) {
-      // NOT a teardown: the node is installed with whatever circuits did materialise, because some
-      // reachability beats none and the reservation watchdog is what settles the rest. Said out
-      // loud because a receiver that came up slowly and a receiver that came up crippled look
-      // identical from outside, and only this line separates them.
+    if (outcome === "failed") throw startError;
+    /**
+     * GRANTED IN THE WALK, REFUSED AT INSTALL — a distinct fact and, until this line, an invisible
+     * one. The receiver would simply report `reservationsHeld: 2` where 3 relays granted, with
+     * nothing naming which relay went missing or why.
+     *
+     * ⚠️ IT HAS A KNOWN CAUSE AND A CROSS-REPO CLOCK. The walk stops the granted candidate and the
+     * node below RE-ASKS, which works because the relay remembers the proof — for
+     * `PROVEN_PEER_MEMORY_MS = 2 minutes` (`relay-connection-gater.ts`, trustless-cello). The walk
+     * costs up to `#srReservationTimeoutMs` × 2 attempts per relay, so a pool of three at the
+     * 15s default can spend 90 seconds before the final node asks relay 1 again. The earliest
+     * proof can expire before it is used, and that is what this event catches.
+     */
+    const boundRelays = new Set(heldRelayIdsOf(node));
+    const grantedButUnbound = grantedAddrs
+      .map((a) => CIRCUIT_RELAY_ID.exec(a)?.[1])
+      .filter((id): id is string => id !== undefined && !boundRelays.has(id));
+    if (grantedButUnbound.length > 0) {
+      this.#logger.warn("session.standing_receiver.spread.grant_not_bound", {
+        agentName,
+        relayPeerIds: grantedButUnbound,
+        relaysGranted: grantedAddrs.length,
+        reservationsHeld: boundRelays.size,
+        walkMs: Date.now() - walkStartedAt,
+        correlationId,
+        impact: "these relays granted this agent a reservation during the walk and then bound no " +
+          "circuit on the receiver itself, so the agent is reachable through fewer relays than it " +
+          "earned. The relay remembers a proof for two minutes; if walkMs is near or past that, " +
+          "the proof expired before the receiver asked and the walk is what needs shortening — " +
+          "not the relay fleet.",
+      });
+    }
+    if (outcome === "slow") {
+      // NOT a teardown, and now this line means only what it says: the node is starting and has not
+      // finished. It is installed with whatever circuits did materialise, because some reachability
+      // beats none and the reservation watchdog is what settles the rest.
       this.#logger.warn("session.standing_receiver.spread.slow_start", {
         agentName,
         relaysGranted: grantedAddrs.length,
@@ -17455,11 +17582,15 @@ export class SessionNodeManager {
 
     let node: CelloNode;
     /**
-     * DOD-M12B-SESSION-SEED-1 — the transport identity of the receiver that actually survived.
+     * DOD-M12B-SESSION-SEED-1 — the transport identity of this receiver.
      *
-     * Minted per CANDIDATE inside `#startReceiverNode` and returned with the winner, not minted
-     * here: a rejected candidate is stopped without awaiting its `start()`, so two candidates can
-     * be briefly live, and one shared seed would put both on the same advertised peer id.
+     * Minted ONCE inside `#startReceiverNode` and returned with the node, not minted here. It is
+     * one seed for the whole walk (032-RELAYSPREAD): the receiver reserves with every relay that
+     * grants, and an agent must be dialable at ONE peer id through any of its circuits, so every
+     * reservation has to belong to the same key. What makes that safe is DOD-M15-ASSIGN-1 — the
+     * gater above admits NOBODY inbound — not the teardown, which bounds how long a rejected
+     * candidate lives rather than preventing it from overlapping. See the seed note in
+     * `#startReceiverNode` for the full argument.
      *
      * FRESH EVERY TIME, which is the privacy property rather than an implementation detail. A
      * receiver serves at most one session (it is promoted into the session at handoff and replaced),
