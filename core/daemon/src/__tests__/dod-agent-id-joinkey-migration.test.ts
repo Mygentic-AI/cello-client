@@ -288,6 +288,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC2 — a MIGRATED database matches a FRESH one
       "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
       "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
       "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
+      "ALTER TABLE sessions ADD COLUMN genesis_prev_root BLOB",
       "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
       "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
       "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",

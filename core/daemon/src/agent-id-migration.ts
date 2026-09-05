@@ -107,6 +107,13 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         -- under it becomes unverifiable, and the "does this session already have one?" lookup then
         -- mints a fresh salt and splits the transcript silently. Same trap as diverged_at above.
         content_salt BLOB,
+        -- 033-ACKEMIT — the session's genesis prev_root: what its FIRST message acknowledges.
+        -- Same trap as the two above, and the consequence is specific: this column exists ONLY to
+        -- survive a restart, because the session timestamp it is derived from arrives on the relay
+        -- assignment and is gone from memory once the process ends. Dropping it on the one boot a
+        -- legacy database upgrades is therefore indistinguishable from never having written it —
+        -- and every send on that session is then refused, by name, until the counterparty speaks.
+        genesis_prev_root BLOB,
         -- DOD-M15-FREEZE-STATUS-1, carried for CELLO_Support's lane. Dropping these on upgrade would
         -- un-freeze a session frozen because a party signed with a key that was not the
         -- counterparty's — the failure that column exists to survive, reintroduced by the migration
