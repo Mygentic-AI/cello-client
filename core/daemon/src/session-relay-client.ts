@@ -343,7 +343,16 @@ export interface AgentRelayClientOpts {
  */
 export interface RelayWitnessAlert {
   sessionIdHex: string;
-  reason: "leaf_signed_by_neither_participant";
+  /**
+   * 034-CARRYLEAF — a second reason, and the two are NOT interchangeable to a reader.
+   *
+   * `leaf_signed_by_neither_participant` is a stranger's leaf reaching the relay.
+   * `leaf_witnessed_by_counterparty` is a participant putting a message in the record that its own
+   * author did not — which is the observable trace of the withholding attack, and also of an
+   * ordinary relay hiccup. Which of those it is depends on how often it happens, so the operator is
+   * told rather than the daemon deciding.
+   */
+  reason: "leaf_signed_by_neither_participant" | "leaf_witnessed_by_counterparty";
   /** Which witness. Null when the relay runs without a signing identity and could not name itself. */
   relayId: string | null;
   observedAt: number;
@@ -1179,7 +1188,8 @@ export class AgentRelayClient {
       const sidBytes = sid instanceof Uint8Array || Buffer.isBuffer(sid) ? toU8(sid) : new Uint8Array();
       const wellFormed =
         sidBytes.length === 16
-        && frame["reason"] === "leaf_signed_by_neither_participant"
+        && (frame["reason"] === "leaf_signed_by_neither_participant"
+          || frame["reason"] === "leaf_witnessed_by_counterparty")
         && typeof observedAt === "number" && Number.isFinite(observedAt)
         && typeof submitterIsCounterparty === "boolean"
         && (rawRelayId === undefined || typeof rawRelayId === "string");
@@ -1245,13 +1255,16 @@ export class AgentRelayClient {
        * every `hash_submit_ack`, so the same check that verifies a receipt verifies this. Missing,
        * malformed and mismatched take ONE path: omitting the proof is the cheapest way to dodge it.
        */
+      const alertReason = frame["reason"] as RelayWitnessAlert["reason"];
       const rawSig = frame["witness_signature"];
       const sigBytes = rawSig instanceof Uint8Array || Buffer.isBuffer(rawSig) ? toU8(rawSig) : null;
       let verifiable = false;
       if (typeof rawRelayId === "string") {
         if (!/^[0-9a-fA-F]{64}$/.test(rawRelayId)) { unreadable("relay_id_not_a_pubkey"); return; }
         if (!sigBytes || sigBytes.length !== 64) { unreadable("declared_relay_id_without_signature"); return; }
-        const tbs = buildWitnessAlertTbs(sidBytes, "leaf_signed_by_neither_participant", observedAt, submitterIsCounterparty);
+        // THE REASON THE RELAY SENT, not a literal: the reason is inside the signed bytes, so
+        // verifying a different one than arrived would refuse every alert of the new kind.
+        const tbs = buildWitnessAlertTbs(sidBytes, alertReason, observedAt, submitterIsCounterparty);
         if (!verify(new Uint8Array(Buffer.from(rawRelayId, "hex")), tbs, sigBytes)) {
           unreadable("witness_signature_invalid"); return;
         }
@@ -1259,7 +1272,7 @@ export class AgentRelayClient {
       }
       const alert: RelayWitnessAlert = {
         sessionIdHex,
-        reason: "leaf_signed_by_neither_participant",
+        reason: alertReason,
         relayId: typeof rawRelayId === "string" ? rawRelayId : null,
         observedAt,
         submitterIsCounterparty,

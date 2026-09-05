@@ -97,6 +97,12 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
     if (notices.length > 0) {
       out["relay_witness_alerts"] = notices.map((n) => ({
         session_id: n.alert.sessionIdHex,
+        /**
+         * 034-CARRYLEAF — WHICH observation this is. Two reasons reach this list now and they mean
+         * opposite things about the counterparty, so a row that does not carry its reason is a row
+         * the reader will apply the wrong guidance to.
+         */
+        reason: n.alert.reason,
         first_observed_at: n.firstObservedAt,
         last_observed_at: n.lastObservedAt,
         times_observed: n.occurrences,
@@ -110,7 +116,34 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // The list is bounded; say so on the list itself, not only in a log nobody opens.
         out["relay_witness_alerts_incomplete"] = true;
       }
-      out["relay_witness_alerts_guidance"] =
+      /**
+       * ⚠️ **ONE GUIDANCE STRING PER REASON, AND ONLY FOR THE REASONS ACTUALLY PRESENT.**
+       *
+       * There was one string, written entirely for `leaf_signed_by_neither_participant`, and adding
+       * a second reason to the same list without splitting it would put a sentence about a refused
+       * stranger's submission under an observation about a participant's own behaviour. That is the
+       * error-substitution defect this milestone exists for, and it was found in this exact shape
+       * one unit ago.
+       */
+      const reasons = new Set(notices.map((n) => n.alert.reason));
+      if (reasons.has("leaf_witnessed_by_counterparty")) {
+        out["relay_witness_counterparty_witnessed_guidance"] =
+          "A message in one of your conversations was put into the permanent record by the OTHER " +
+          "party, because the person who wrote it never asked the relay to record it. Read the row's " +
+          "submitter_was_your_counterparty to see which side you are on. FALSE means you wrote the " +
+          "message and your counterparty recorded it for you — that usually means your own path to " +
+          "the relay failed, and it is worth knowing because it is your side that is degraded. TRUE " +
+          "means your counterparty wrote the message and YOUR agent recorded it for them. ONCE IS " +
+          "NOT EVIDENCE OF ANYTHING: a relay is unreachable for a moment quite often, and this is " +
+          "exactly what that looks like. REPEATEDLY, from the same counterparty, is the shape of " +
+          "someone keeping their own words out of the receipt — which is the thing this check exists " +
+          "to make impossible, and it did not work for them: the message IS in the record, signed by " +
+          "them, because your agent put it there. Nothing needs to be done and nothing is at risk; " +
+          "if the pattern worries the operator, the way to end a conversation is cello_close_session " +
+          "and confirming anything with the counterparty happens outside CELLO.";
+      }
+      if (reasons.has("leaf_signed_by_neither_participant")) {
+        out["relay_witness_alerts_guidance"] =
         "A relay carrying one of your conversations refused a submission because its signature " +
         "verified against neither your key nor your counterparty's. Nothing was added to the " +
         "conversation record and the session is still open. THIS IS ONE RELAY'S OBSERVATION, NOT A " +
@@ -124,6 +157,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         "terms, and let them decide; if it worries them, the way to end a conversation is " +
         "cello_close_session, and confirming anything with the counterparty happens outside CELLO. " +
         "relay_witness_alerts_incomplete: true means this list hit its cap and there were more.";
+      }
     }
     if (unreadable.length > 0) {
       out["relay_witness_unreadable"] = unreadable.map((u) => ({
