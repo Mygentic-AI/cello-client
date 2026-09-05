@@ -82,7 +82,7 @@ import { triageOrphanedContent, type OrphanEvidence } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, LEAF_KIND_MSG, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
 
 /**
@@ -9144,6 +9144,21 @@ export class SessionNodeManager {
         // unknown CBOR key, so emitting it is safe for every build in existence; a newer one reads
         // it and verifies under the named algorithm instead of assuming.
         content_hash_alg: contentHashAlg,
+        /**
+         * 034-CARRYLEAF review F5 — WHICH LEAF DOMAIN this content belongs to.
+         *
+         * Documents and rejection envelopes ride this same frame, and the receiver had no way to
+         * recover their kind: it appended them locally as "doc" from its own inspection of the
+         * body, while anything it witnessed on the sender's behalf went to the relay as a MESSAGE
+         * leaf. The certified root is over content hashes, so no root diverges — but the relay's
+         * canonical log and the carried `leaf_kind` would describe the leaf as something it is not,
+         * and a leaf kind selects a HASH DOMAIN everywhere else in this protocol.
+         *
+         * Same argument as `content_hash_alg` beside it: an older peer ignores an unknown CBOR key,
+         * so emitting it is safe for every build in existence, and a receiver that does not see it
+         * declines to witness rather than guessing (see `#witnessReceivedLeaf`).
+         */
+        leaf_kind: leafKind,
       }) as Uint8Array;
       // Injected dial failure — thrown from inside the try so it lands in exactly the catch the
       // real connection_lost lands in, and the whole downstream path (untrack → park → durable
@@ -14121,6 +14136,8 @@ export class SessionNodeManager {
     contentHash: Uint8Array,
     structure1Cbor: Uint8Array,
     senderSignature: Uint8Array,
+    /** The domain the AUTHOR assigned this leaf, read off their frame — never guessed (review F5). */
+    leafKind: number,
     correlationId?: string,
   ): void {
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
@@ -14135,7 +14152,7 @@ export class SessionNodeManager {
       return;
     }
     void entry.relayClient
-      .witnessReceivedLeaf(entry.node, entry.relaySessionIdBytes, contentHash, LEAF_KIND_MSG, {
+      .witnessReceivedLeaf(entry.node, entry.relaySessionIdBytes, contentHash, leafKind, {
         structure1Cbor,
         senderSignature,
       })
@@ -17028,7 +17045,29 @@ export class SessionNodeManager {
            *
            * We hold their signature over their own bytes. So we hand it to the relay ourselves.
            */
-          void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, correlationId);
+          /**
+           * ⚠️ **THE KIND COMES OFF THE FRAME, AND WITHOUT IT WE DECLINE TO WITNESS — review F5.**
+           *
+           * A leaf kind selects a HASH DOMAIN, and documents and rejection envelopes ride this same
+           * frame. Hardcoding `msg` meant a document witnessed on its author's behalf entered the
+           * relay's canonical log described as something it is not. A peer too old to send the field
+           * is left alone rather than guessed at: witnessing their leaf under the wrong domain would
+           * be a worse outcome than not witnessing it, because it puts a wrong statement in the
+           * record instead of leaving a gap the seal can name.
+           */
+          const framedKind = frame["leaf_kind"];
+          if (typeof framedKind === "number") {
+            void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
+          } else {
+            this.#logger.info("session.content.witness_received.kind_unknown", {
+              agentName, sessionId, correlationId,
+              impact:
+                "a message arrived that its sender never had witnessed, and the frame did not say " +
+                "which leaf domain it belongs to — their build predates the field. It was NOT " +
+                "witnessed on their behalf, because witnessing it under a guessed domain would put " +
+                "a wrong statement in the record rather than leave a gap the seal can name.",
+            });
+          }
         }
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }

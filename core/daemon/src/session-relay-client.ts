@@ -1998,7 +1998,13 @@ export class AgentRelayClient {
      * signing. A claim that NAMES a position with no hash is the defect, and the receiving daemon
      * refuses exactly that.
      */
-    if (!lastSeen) {
+    /**
+     * ⚠️ NOT FOR A CARRIED LEAF — 034-CARRYLEAF review F8. This branch describes THIS agent having
+     * nothing to acknowledge, and on a counter-submit the acknowledgement inside the bytes is the
+     * AUTHOR's, already made. Logging "this submit acknowledges nothing" about it would be false,
+     * and this daemon's own seed is irrelevant to a claim it did not write.
+     */
+    if (!lastSeen && !carried) {
       /**
        * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE.** Same rule as the content
        * claim's, and the receiving half is `#verifyAcknowledgedContent` — a v1 claim is refused the

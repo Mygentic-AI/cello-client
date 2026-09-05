@@ -602,13 +602,18 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     const sig = await author.sign(s1);
     const s2 = encodeCbor([1, authorPub, contentHash, sig]) as Uint8Array;
 
-    const attempts = async (withOrderingRecord: boolean): Promise<number> => {
+    const attempts = async (withOrderingRecord: boolean, withLeafKind = true): Promise<number> => {
       const f = await startTwoConnectionFixture({ dirPrefix: "cello-carryleaf-trigger-" });
       try {
         await f.createSession(SID, "alice", Buffer.from(authorPub).toString("hex"), PEER);
         await f.snm.handleContentFrameForTest(
           "alice", SID,
-          inboundFrame({ structure1_cbor: s1, sender_signature: sig, ...(withOrderingRecord ? { structure2_cbor: s2 } : {}) }),
+          inboundFrame({
+            structure1_cbor: s1,
+            sender_signature: sig,
+            ...(withLeafKind ? { leaf_kind: LEAF_KIND_MSG } : {}),
+            ...(withOrderingRecord ? { structure2_cbor: s2 } : {}),
+          }),
           PEER,
         );
         await new Promise((r) => setTimeout(r, 250));
@@ -625,6 +630,19 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
 
     expect(await attempts(false), "a withheld message MUST be witnessed by its receiver").toBe(1);
     expect(await attempts(true), "one its sender already witnessed must NOT be re-submitted").toBe(0);
+    /**
+     * ⚠️ **AND A PEER TOO OLD TO NAME THE LEAF DOMAIN IS LEFT ALONE — review F5, and it is a real
+     * bound on when this attack is closed.**
+     *
+     * A leaf kind selects a HASH DOMAIN. Witnessing their leaf under a guessed one would put a
+     * wrong statement in the canonical record, which is worse than leaving a gap the seal can name.
+     * The consequence, stated rather than buried: **withholding is only closed between two peers
+     * that both carry this build.**
+     */
+    expect(
+      await attempts(false, false),
+      "a frame that does not say which domain its leaf belongs to is NOT witnessed on a guess",
+    ).toBe(0);
   }, 120_000);
 });
 
