@@ -16797,7 +16797,14 @@ export class SessionNodeManager {
           // "No relay would grant" and "there was no relay to ask" are different facts and lead to
           // different places — the first at relay capacity, the second at this agent's directory
           // connection. Without this they are the same sentence.
-          reservationsRequested: (this.#directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
+          //
+          // 032-RELAYSPREAD: this was also called `reservationsRequested` — the same mis-naming as
+          // the reachability events, in its worst form, because here the value is a BOOLEAN under a
+          // name that reads as a count. It is NOT `relaysOffered`: that field counts the merged
+          // candidate list the walk actually asks (directory pool + persisted endpoints, minus
+          // quarantine), and this reads the directory pool alone. Two populations must not share
+          // one field name, so this one is named for what it measures.
+          hadRelayToAsk: (this.#directoryRelayEndpoints.get(agentName)?.length ?? 0) > 0,
           impact:
             "no relay would grant this agent a circuit reservation, so anyone behind NAT cannot reach or dial it — inbound sessions will only arrive from peers that can connect directly, and everything else falls back to the relay's store-and-forward",
         });
@@ -17403,20 +17410,36 @@ export class SessionNodeManager {
         });
     }
 
-    // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come
-    // up? circuitAddrs === 0 with reservations requested means every relay
-    // refused/was unreachable — the agent is deaf to NAT'd initiators (public
-    // ones can still connect directly). That must be LOUD, not a quiet shrug.
+    // DOD-NAT-REACHABILITY-1 observability: how reachable did this receiver come up? Zero held
+    // while relays were offered means every relay refused or was unreachable — the agent is deaf
+    // to NAT'd initiators (public ones can still connect directly). That must be LOUD, not a quiet
+    // shrug.
+    //
+    // 032-RELAYSPREAD — TWO NUMBERS, SO TWO NAMES. Both events used to carry one field,
+    // `reservationsRequested`, holding `reservations.addrs.length` — the size of the CANDIDATE
+    // list, under a name that reads as a count of asks. That is why "the client already requests a
+    // reservation with every relay it knows" read as true in an audit: the outcome was one and the
+    // request was one too, and a single field could report neither.
+    //   relaysOffered    — how many relays were in the candidate list (deduped by relay peer id in
+    //                      `#reservationCircuitAddrs`, so it counts relays, not addresses).
+    //   reservationsHeld — how many reservations this node actually holds, counted the only way
+    //                      that proves a grant: ANNOUNCED /p2p-circuit listen addresses. `start()`
+    //                      resolving is not enough — a relay out of reservation slots completes the
+    //                      handshake, grants nothing, and leaves a node that looks started and is
+    //                      dialable by nobody.
     this.#logger.info("session.standing_receiver.reachability", {
       agentName,
-      circuitAddrs,
-      reservationsRequested: reservations.addrs.length,
+      relaysOffered: reservations.addrs.length,
+      reservationsHeld: circuitAddrs,
       correlationId,
     });
     if (reservations.addrs.length > 0 && circuitAddrs === 0) {
       this.#logger.warn("session.standing_receiver.reservation.none", {
         agentName,
-        reservationsRequested: reservations.addrs.length,
+        relaysOffered: reservations.addrs.length,
+        // Zero by this branch's own condition, and stated rather than implied: the event reads
+        // "offered 3, held 0" on its own, without the reader having to find the gate above it.
+        reservationsHeld: circuitAddrs,
         relayPeerIds: reservations.relayPeerIds,
         correlationId,
       });

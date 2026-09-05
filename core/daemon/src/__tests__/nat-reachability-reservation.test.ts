@@ -209,7 +209,15 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
         return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
       }, 10_000);
       expect(ok).toBe(true);
-      expect(events.some((e) => e.event === "session.standing_receiver.reachability")).toBe(true);
+      // 032-RELAYSPREAD part 1 — the reachability event names the two facts separately.
+      // `reservationsRequested` was `reservations.addrs.length`: the size of the CANDIDATE list,
+      // logged under a name that reads as a count of asks. That one field is why "the client
+      // already requests a reservation with every relay it knows" survived an audit.
+      const reach = events.find((e) => e.event === "session.standing_receiver.reachability");
+      expect(reach).toBeDefined();
+      expect(reach!.context).not.toHaveProperty("reservationsRequested");
+      expect(reach!.context.relaysOffered).toBe(1);
+      expect(reach!.context.reservationsHeld).toBe(1);
       // The reservation settles INSIDE node.start() (the circuit listener awaits
       // openConnection + reserve), so the healthy path must never fire the
       // degradation warn — pins the timing against future libp2p upgrades.
@@ -229,11 +237,45 @@ describe("R4+R5+R6: SessionNodeManager reservation wiring", () => {
       expect(info).not.toBeNull();
       expect(info!.addrs.length).toBeGreaterThan(0);
       expect(info!.addrs.every((a) => !a.includes("/p2p-circuit"))).toBe(true);
-      expect(events.some((e) => e.event === "session.standing_receiver.reservation.none" && e.level === "warn")).toBe(true);
+      const none = events.find((e) => e.event === "session.standing_receiver.reservation.none");
+      expect(none).toBeDefined();
+      expect(none!.level).toBe("warn");
+      // Offered one, held none. The two numbers DIVERGE here, which is the whole point of splitting
+      // the field: under the old name this event said "1" and a reader could not tell whether that
+      // meant one relay asked or one reservation obtained.
+      expect(none!.context).not.toHaveProperty("reservationsRequested");
+      expect(none!.context.relaysOffered).toBe(1);
+      expect(none!.context.reservationsHeld).toBe(0);
     } finally {
       await manager.gracefulShutdown();
     }
   }, 20_000);
+
+  it("R5b: offered TWO relays with one dead — relaysOffered is 2 and reservationsHeld is 1", async () => {
+    // THE DISCRIMINATING CASE, and the reason R4 alone is not enough: R4 offers one relay and holds
+    // one, so `reservationsHeld: reservations.addrs.length` — the exact bug being renamed away —
+    // passes it. Here the two numbers cannot both be right, so only a count of what actually
+    // GRANTED survives. Order-independent: whichever candidate is tried first, one relay grants.
+    const relay = await startHopRelay();
+    const { manager, events } = await makeManager();
+    try {
+      await seedRelayEndpoint(manager, "alice", relay.peerId, relay.addr);
+      await seedRelayEndpoint(manager, "alice", DEAD_RELAY_PEER_ID, "/ip4/127.0.0.1/tcp/59987");
+      await manager.ensureStandingReceiverForAgent("alice");
+      const ok = await waitUntil(() => {
+        const info = manager.getStandingReceiverInfo("alice");
+        return info !== null && info.addrs.some((a) => a.includes("/p2p-circuit"));
+      }, 15_000);
+      expect(ok).toBe(true);
+      const reach = events.find((e) => e.event === "session.standing_receiver.reachability");
+      expect(reach).toBeDefined();
+      expect(reach!.context.relaysOffered).toBe(2);
+      expect(reach!.context.reservationsHeld).toBe(1);
+    } finally {
+      await manager.gracefulShutdown();
+      await relay.node.stop();
+    }
+  }, 30_000);
 
   it("R6: the initiator dials a /p2p-circuit counterparty address — the embedded relay is admitted outbound", async () => {
     const relay = await startHopRelay();
