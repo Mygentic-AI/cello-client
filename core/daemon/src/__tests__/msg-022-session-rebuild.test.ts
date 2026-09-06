@@ -342,12 +342,23 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
         // establishment step — a false positive that makes this guard noisy and then ignored.
         //
-        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 13 session
+        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 15 session
         // collaborators are here. `#securityGateway` and `#factory` are deliberately NOT — neither
         // is reached from establishment today. If a screening or node-building step ever routes
         // through one, ADD IT HERE FIRST: the guard will not report a step it cannot see, which is
         // the exact failure this widening was written to prevent.
-        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+        //
+        // ⚠️ AND IT HAPPENED, EXACTLY AS WARNED. `#contentIn` / `#contentOut` were added when the
+        // content path moved out of the manager, and the list was not. Establishment's call went
+        // from `this.#registerContentHandler(` to `this.#contentIn.registerContentHandler(`, which
+        // this pattern cannot match AT ALL — after `this.` it needs a name followed immediately by
+        // `(`. So the step vanished from the scan and the test stayed green with the content
+        // handler no longer required of revival. The step is still there today; what was lost was
+        // the requirement. The next edit that dropped it would have left this green, and a revived
+        // session would come back reporting itself healthy with nothing reading its inbound stream
+        // — the counterparty's messages landing on a dead socket until the five-minute mailbox poll
+        // rescued them. That is the precise defect this file exists to catch.
+        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
