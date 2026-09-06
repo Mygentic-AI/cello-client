@@ -1127,6 +1127,15 @@ function carryContentHashInputs(carry: readonly SealCarryLeaf[]): LeafInput[] | 
   return inputs;
 }
 
+/**
+ * How many of the counterparty's content hashes a session remembers for the self-link check.
+ *
+ * Bounded because a peer feeds it. 256 covers any realistic gap in our own copy of a conversation —
+ * a held message, one the inbound screen refused, one lost in flight — while keeping the memory a
+ * single session can cost fixed. Past the cap the check gets STRICTER, never looser.
+ */
+const SELF_CHAIN_MEMORY = 256;
+
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
   readonly #logger: Logger;
@@ -1220,7 +1229,6 @@ export class SessionNodeManager {
       // sign. The fix would have broken the fix.
       if (!this.#relayReceiptStore && this.#db) this.#relayReceiptStore = new RelayReceiptStore(this.#db, this.#logger);
       if (!this.#sealLeafStore && this.#db) this.#sealLeafStore = new SessionSealLeafStore(this.#db, this.#logger);
-      if (!this.#ownChainStore && this.#db) this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
       client = this.#detachedRelayClientBuilder?.(agentName, ep.relayPeerId, [...ep.relayAddrs], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
@@ -1339,7 +1347,6 @@ export class SessionNodeManager {
        * that first version failed this file's own test because the client could not dial.
        */
       const baseRelayAddr = heldCircuitAddr.split("/p2p-circuit")[0] ?? heldCircuitAddr;
-      if (!this.#ownChainStore && this.#db) this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
       client = this.#detachedRelayClientBuilder?.(agentName, relayPeerId, [baseRelayAddr], {
         receiptStore: this.#relayReceiptStore ?? undefined,
         sealLeafStore: this.#sealLeafStore ?? undefined,
@@ -2667,6 +2674,20 @@ export class SessionNodeManager {
     this.#logger.info("persist.db.opened", { encrypted: true, migrated: migration.migrated });
     // PERSIST-002: the identity store (agents + manifest_state) lives in the same encrypted DB.
     ensureIdentitySchema(this.#db);
+    /**
+     * ⚠️ THE OWN-CHAIN STORE IS BUILT HERE, NOT LAZILY INSIDE THE RELAY-CLIENT BUILDERS —
+     * `DOD-M15-SELFCHAIN-1`, review F2.
+     *
+     * It was constructed only when a relay client was attached, so a session that never attached one
+     * left it null: nothing was ever recorded, and every message that side sent carried the same
+     * self link. That is the exact defect this unit exists to close, on the path its own comments
+     * call the one that matters most — a conversation that ran while the relay was down is precisely
+     * the one whose order gets disputed later.
+     *
+     * The chain belongs to the AGENT and the SESSION. The relay is how the conversation travels; it
+     * is not what makes the conversation provable.
+     */
+    this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         session_id TEXT NOT NULL,
@@ -9096,6 +9117,10 @@ export class SessionNodeManager {
     // `finally` retires — same defect, other end, other cap (64 outbound per protocol per
     // connection). See the note on #handleContentStream's finally.
     let sendStream: Stream | undefined;
+    // 🔗 `DOD-M15-SELFCHAIN-1`: true when THIS side built the claim, so this side owns advancing its
+    // chain once the message has gone. Declared out here because the PARK path — which is also a
+    // delivery — runs in the catch below.
+    let ownClaimAwaitingSend = false;
     /**
      * 034-CARRYLEAF — HOISTED OUT OF THE TRY so the PARK path in the catch can carry them.
      *
@@ -9132,8 +9157,10 @@ export class SessionNodeManager {
       frameS1 = orderingS1;
       frameSig = orderingSig;
       let frameS2 = orderingS2;
+      // A relay-witnessed claim advanced the chain on its ack; this flag covers the other case.
       if (frameS1 === undefined || frameSig === undefined) {
         const own = await this.#signOwnContentClaim(agentName, sessionId, entry, contentHash);
+        ownClaimAwaitingSend = true;
         frameS1 = own.structure1;
         frameSig = own.signature;
         frameS2 = undefined;
@@ -9308,6 +9335,15 @@ export class SessionNodeManager {
       // A close that failed for a benign reason costs a redundant park, which the receiver dedups
       // on the content hash. A false delivered costs the message.
       await stream.close();
+      /**
+       * 🔗 THE MESSAGE HAS GONE, SO THE CHAIN ADVANCES — `DOD-M15-SELFCHAIN-1`, review F7.
+       *
+       * Below `stream.close()` deliberately: close waits for the write buffer to drain, so a reset
+       * mid-flush throws above this line and the bytes never left. Advancing before it would point
+       * the chain at a message the counterparty never saw, and every later message would then be
+       * refused by them for a reason that names tampering.
+       */
+      if (ownClaimAwaitingSend) this.#advanceOwnChain(agentName, sessionId, entry, contentHash);
       this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
       return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
@@ -9375,6 +9411,16 @@ export class SessionNodeManager {
        */
       const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
       if (attempt.outcome === "parked") {
+        /**
+         * 🔗 A PARK IS A DELIVERY, so the chain advances here too — `DOD-M15-SELFCHAIN-1`.
+         *
+         * The mailbox copy is sealed to the counterparty's long-term key and they WILL open it, so
+         * the message is part of the conversation. Leaving the chain behind here would make this
+         * side's next message link to something the counterparty has already moved past, and they
+         * would refuse it as a broken chain — a false tamper report caused by our own relay being
+         * briefly unreachable.
+         */
+        if (ownClaimAwaitingSend) this.#advanceOwnChain(agentName, sessionId, entry, contentHash);
         this.#noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
@@ -16110,22 +16156,79 @@ export class SessionNodeManager {
        * is precisely the one whose order gets disputed later, so the chain cannot depend on a relay
        * having been there to witness it.
        *
-       * `ack.hash` is the session genesis when this agent has not spoken here yet — the same value
-       * the acknowledgement falls back to, and a value rather than an absence.
+       * ⚠️ ONE CHAIN, READ THROUGH THE RELAY CLIENT FIRST. This used to read only the durable
+       * store, while the witnessed path reads an in-memory map first — so a session that mixed the
+       * two, which is every session where the relay comes and goes, walked two different chains and
+       * the lagging one produced a link the counterparty refuses.
+       *
+       * ⚠️ AND THE LAST FALLBACK IS THE SESSION GENESIS, NOT `ack.hash`. `ack.hash` is what the
+       * COUNTERPARTY last said; it is only the genesis until they have said anything. Falling back
+       * to it meant this agent's own first message linked to the other party's message — refused by
+       * every checker, and reported as tampering against a party that had done nothing.
        */
-      prevOwnHash: this.#ownChainStore?.lastOwnHash(Buffer.from(await signer.getPublicKey()).toString("hex"), sessionId)
+      prevOwnHash: this.#ownChainOf(agentName, sessionId, entry, await signer.getPublicKey())
+        ?? this.#sessionGenesisPrevRoot(agentName, sessionId)
         ?? ack.hash,
     });
-    const signed = { structure1, signature: await signer.sign(structure1) };
     /**
-     * Advance the chain only once the claim is signed and about to go out, and never before — the
-     * same rule the witnessed path follows. A chain advanced over a message that was never sent
-     * makes every later message look tampered with.
+     * ⚠️ THE CHAIN IS NOT ADVANCED HERE, AND IT USED TO BE — review F7.
+     *
+     * `SessionOwnChainStore.record` says in capitals that it is called AFTER the send succeeds. This
+     * ran at signing time, before a stream was even opened. Any failure between here and delivery
+     * left the chain pointing at a message the counterparty never saw, and every later message was
+     * then refused by them for a reason that names tampering. A retransmission must re-use the same
+     * predecessor, because a retransmission is the same message.
+     *
+     * `#advanceOwnChain` is called by the send path at each point where the message has actually
+     * gone — the direct send, and the relay park that is the fallback for it.
      */
-    this.#ownChainStore?.record(
-      Buffer.from(await signer.getPublicKey()).toString("hex"), sessionId, contentHash, Date.now(),
-    );
-    return signed;
+    return { structure1, signature: await signer.sign(structure1) };
+  }
+
+  /**
+   * This agent's own last message on a session, from the ONE chain both send paths share.
+   *
+   * `undefined` means it has not spoken here yet, which is the session genesis and not an absence.
+   * The caller supplies that; this does not guess.
+   */
+  #ownChainOf(
+    agentName: string,
+    sessionId: string,
+    entry: { relayClient?: AgentRelayClient; relaySessionIdBytes?: Uint8Array } | undefined,
+    ownPubkey: Uint8Array,
+  ): Uint8Array | undefined {
+    const relayHex = entry?.relaySessionIdBytes
+      ? Buffer.from(entry.relaySessionIdBytes).toString("hex")
+      : sessionId;
+    return entry?.relayClient?.lastOwnHash(relayHex)
+      ?? this.#ownChainStore?.lastOwnHash(Buffer.from(ownPubkey).toString("hex"), sessionId)
+      ?? undefined;
+  }
+
+  /**
+   * Record what this agent just sent — called ONLY once the message has actually gone.
+   *
+   * Writes through the relay client when there is one, so the in-memory chain the witnessed path
+   * reads and the durable row stay one chain rather than two. Falls back to the store directly for
+   * a session with no relay client at all, which is exactly the unwitnessed case this unit exists
+   * to cover.
+   */
+  #advanceOwnChain(
+    agentName: string,
+    sessionId: string,
+    entry: { relayClient?: AgentRelayClient; relaySessionIdBytes?: Uint8Array } | undefined,
+    contentHash: Uint8Array,
+  ): void {
+    const relayHex = entry?.relaySessionIdBytes
+      ? Buffer.from(entry.relaySessionIdBytes).toString("hex")
+      : sessionId;
+    if (entry?.relayClient) {
+      entry.relayClient.noteOwnLeaf(relayHex, contentHash);
+      return;
+    }
+    const ownPubkeyHex = this.#ownPubkeyHex(agentName);
+    if (!ownPubkeyHex) return;
+    this.#ownChainStore?.record(ownPubkeyHex, sessionId, contentHash, Date.now());
   }
 
   /**
@@ -16338,9 +16441,22 @@ export class SessionNodeManager {
     sessionId: string,
     fields: { prevOwnHash: Uint8Array },
   ): { verdict: "unusable"; reason: string } | undefined {
-    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    const expected = entry?.relayClient?.lastSeenAck(sessionId)?.hash
-      ?? this.#sessionGenesisPrevRoot(agentName, sessionId);
+    const key = this.#k(agentName, sessionId);
+    const genesis = this.#sessionGenesisPrevRoot(agentName, sessionId);
+    /**
+     * ⚠️ THE EXPECTED VALUE IS OUR INBOX — `#lastAck` — AND NOT THE SESSION GENESIS.
+     *
+     * `#lastFromCounterparty` is the last content hash we accepted FROM THIS COUNTERPARTY, written
+     * on every successful ingest. That IS their previous message, by definition. The genesis is only
+     * the answer before they have said anything.
+     *
+     * It used to read the relay client's acknowledgement with the genesis as a fallback, which is
+     * the same conflation the emitter had: on a session with no relay client the fallback never
+     * moved, so the counterparty's SECOND message was refused as a broken chain for the rest of the
+     * conversation. Four live-transport fixtures caught it the moment the emitter started producing
+     * a real chain.
+     */
+    const expected = this.#lastFromCounterparty.get(key) ?? genesis;
     /**
      * ⚠️ NO EXPECTED VALUE MEANS NO COMPARISON, AND THIS IS THE ONE PLACE THAT IS NOT A FAIL-OPEN —
      * because of WHO CONTROLS THE ABSENCE. Whether this side holds a starting point for the session
@@ -16360,7 +16476,64 @@ export class SessionNodeManager {
       return undefined;
     }
     if (bytesEqual(fields.prevOwnHash, expected)) return undefined;
+    /**
+     * ─── OUR OWN GAP IS NOT THEIR TAMPERING, AND THE DIFFERENCE IS DECIDABLE ─────────────────────
+     *
+     * `expected` is the last message from them we ACCEPTED. Our record can legitimately be behind
+     * theirs: a message of theirs can arrive out of order and be HELD, be refused by the inbound
+     * screen, or be lost in flight. In every one of those cases their next message links to
+     * something real that we simply do not have at the front of our record — and refusing it would
+     * be a fabricated tamper report caused by our own gap, against a party that did nothing.
+     *
+     * So a link naming ANY message we have accepted from them is accepted, and the gap is reported
+     * as OUR problem. A link naming something we have never held from them is the actual accusation:
+     * it is either invented or it belongs to a conversation this is not.
+     *
+     * ⚠️ THIS IS DELIBERATELY WEAKER THAN THE RELAY'S CHECK, AND SAYING SO IS THE POINT. The relay
+     * holds the whole ordered log and refuses anything but the immediate predecessor; the directory
+     * does the same at seal time. This side holds only what reached it, so the strongest honest
+     * question it can ask is "did you name something you actually said to me?". Two strict checkers
+     * plus one honest one beats three checkers where the weakest one fabricates accusations.
+     */
+    const seen = this.#receivedFromCounterparty.get(key);
+    if (seen?.has(Buffer.from(fields.prevOwnHash).toString("hex"))) {
+      this.#logger.info("session.content.self_chain.behind", {
+        agentName, sessionId,
+        impact:
+          "this message links to an earlier message from your counterparty than the last one this " +
+          "side accepted, so this side's copy of the conversation has a gap in it. The message is " +
+          "accepted — the link names something they really did send you. The gap is on this side.",
+      });
+      return undefined;
+    }
     return { verdict: "unusable", reason: AUTHORSHIP_SELF_CHAIN_MISMATCH };
+  }
+
+  /**
+   * Every content hash accepted from the counterparty on a session, so a link to one of THEIR
+   * earlier messages can be told apart from a link to something they never sent.
+   *
+   * ⚠️ BOUNDED, because it is fed by a peer. A conversation must not cost unbounded memory because
+   * the other side kept talking: the oldest entries are dropped past the cap, and a link older than
+   * that is refused. That is the right way round — the cap makes the check STRICTER as it bites,
+   * never looser.
+   */
+  readonly #receivedFromCounterparty = new Map<string, Set<string>>();
+  /** The MOST RECENT of those, which is what an honest next message links to. */
+  readonly #lastFromCounterparty = new Map<string, Uint8Array>();
+
+  #noteReceivedFromCounterparty(agentName: string, sessionId: string, contentHash: Uint8Array): void {
+    const key = this.#k(agentName, sessionId);
+    this.#lastFromCounterparty.set(key, Uint8Array.from(contentHash));
+    let seen = this.#receivedFromCounterparty.get(key);
+    if (!seen) { seen = new Set<string>(); this.#receivedFromCounterparty.set(key, seen); }
+    seen.add(Buffer.from(contentHash).toString("hex"));
+    while (seen.size > SELF_CHAIN_MEMORY) {
+      // Sets iterate in insertion order, so the first entry is the oldest.
+      const oldest = seen.values().next().value as string | undefined;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
   }
 
   #verifyAcknowledgedContent(
@@ -17318,6 +17491,20 @@ export class SessionNodeManager {
       // acknowledged `persisted` — the sender's TTF→park backstop then guarantees the
       // missing-earlier message is fetchable, and dedup absorbs the redundant copy.
       if (ingest.ok && !ingest.held) {
+        /**
+         * ─── THE SELF CHAIN IS PURELY CONTENT, SO IT ADVANCES HERE — `DOD-M15-SELFCHAIN-1` ───────
+         *
+         * ⚠️ NOT INSIDE `#noteAcknowledgeable`, and that placement was the bug. The acknowledgement
+         * is a (POSITION, content) pair and needs the relay's number, so on a session the relay
+         * never witnessed it is never written at all. The self link needs no position — it is one
+         * party's hash chain over their own messages — so tying it to the acknowledgement meant the
+         * receiver's record never moved on an unwitnessed session, and the counterparty's SECOND
+         * message was refused as a broken chain for the rest of the conversation.
+         *
+         * That is the path this unit exists for: a conversation that ran while the relay was down is
+         * precisely the one whose order gets disputed later.
+         */
+        this.#noteReceivedFromCounterparty(agentName, sessionId, contentHash);
         /**
          * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
          * delivering its copy back to us.

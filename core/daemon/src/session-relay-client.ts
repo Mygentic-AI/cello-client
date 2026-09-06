@@ -510,11 +510,25 @@ export class AgentRelayClient {
    * would silently start a new chain mid-conversation — the counterparty refusing every message
    * after it, with no way to tell that from tampering.
    *
-   * So a missing store is a durability gap, reported once, and never a reason to refuse a send: it
-   * is caused by our own wiring, never by anything a peer does, and refusing there would break the
-   * product to close a hole the peer cannot reach.
+   * So a missing store is a durability gap, and never a reason to refuse a send: it is caused by our
+   * own wiring, never by anything a peer does, and refusing there would break the product to close a
+   * hole the peer cannot reach. It IS reported — once per client, at construction, by the error
+   * below. An earlier version of this comment promised that report and nothing emitted it, which is
+   * the shape that lets a wiring gap sit invisible until a restart days later.
    */
   readonly #ownChain = new Map<string, Uint8Array>();
+  /**
+   * `DOD-M15-SELFCHAIN-1` — each session's GENESIS, kept apart from `#lastSeen`, and keeping them
+   * apart is the entire point of this field.
+   *
+   * `#lastSeen` is seeded with the genesis at registration and then ADVANCES as the counterparty
+   * speaks. So after the counterparty's first message it holds THEIR last content hash, not the
+   * starting point. Reading it as the self link's fallback handed a sender the other party's hash
+   * for their own first message, which the relay then refused — and, worse, told the innocent
+   * counterparty their chain was broken. This map never advances, so it is always the right answer
+   * to "what does a party who has not spoken here yet link to?".
+   */
+  readonly #genesis = new Map<string, Uint8Array>();
   /** DOD-M15-RELAYSLOTS-1 — read fresh at every auth. See `AgentRelayClientOpts.onlineToken`. */
   readonly #onlineToken: (() => Uint8Array | undefined) | undefined;
   /** DOD-M15-CORROBORATE-1 — where a relay's witness alert goes. See the opt of the same name. */
@@ -615,6 +629,22 @@ export class AgentRelayClient {
     this.#receiptStore = opts.receiptStore;
     this.#sealLeafStore = opts.sealLeafStore;
     this.#ownChainStore = opts.ownChainStore;
+    if (!this.#ownChainStore) {
+      /**
+       * ONCE PER CLIENT, AT CONSTRUCTION, and at ERROR because the consequence is invisible until a
+       * restart that may be days away — at which point this daemon silently starts a new chain
+       * mid-conversation and the counterparty refuses everything after it, for a reason that names
+       * tampering.
+       */
+      this.#logger.error("session.relay.own_chain.store_absent", {
+        relayPeerId: opts.relayPeerId,
+        impact:
+          "this relay client was wired without a durable record of what this agent has said. " +
+          "Conversations work until the daemon restarts; after a restart, mid-conversation, this " +
+          "side starts a new chain and the counterparty refuses every message after it as though " +
+          "the record had been altered.",
+      });
+    }
     this.#onlineToken = opts.onlineToken;
     this.#onWitnessAlert = opts.onWitnessAlert;
     this.#onWitnessUnreadable = opts.onWitnessUnreadable;
@@ -671,9 +701,10 @@ export class AgentRelayClient {
      * nothing" for a conversation that is well underway — and the relay would then answer the next
      * submit from a position we had already passed.
      */
+    const genesis = genesisPrevRoot ?? genesisFromAssignment(sessionIdHex, carriedAssignment);
+    if (genesis) this.#genesis.set(sessionIdHex, genesis);
     if (!this.#lastSeen.has(sessionIdHex)) {
-      const seed = genesisPrevRoot ?? genesisFromAssignment(sessionIdHex, carriedAssignment);
-      if (seed) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: seed });
+      if (genesis) this.#lastSeen.set(sessionIdHex, { seq: 0, hash: genesis });
     }
     // Eagerly present the assignment so the relay records the session (binds peer IDs, creates the
     // session entry) BEFORE the first hash_submit or the counterparty's leaves arrive — the relay
@@ -788,6 +819,7 @@ export class AgentRelayClient {
   unregisterSession(sessionIdHex: string): void {
     this.#sessions.delete(sessionIdHex);
     this.#lastSeen.delete(sessionIdHex);
+    this.#genesis.delete(sessionIdHex);
   }
 
   hasSessions(): boolean {
@@ -2082,6 +2114,7 @@ export class AgentRelayClient {
      * which is far too late for anyone to act on it.
      */
     const seed = lastSeen?.hash;
+    const genesis = this.#genesis.get(sessionIdHex);
     if (!carried && !seed) {
       this.#logger.error("session.relay.submit.unchainable", {
         relayPeerId: this.#relayPeerId,
@@ -2103,9 +2136,35 @@ export class AgentRelayClient {
      */
     let prevOwn: Uint8Array | undefined;
     if (!carried) {
+      /**
+       * ⚠️ THE LAST FALLBACK IS THE GENESIS, NOT `seed` — and `seed` is what it used to be.
+       *
+       * `seed` is `#lastSeen`, which ADVANCES as the counterparty speaks. So the moment the
+       * counterparty had said anything, a party sending their FIRST message linked to the
+       * counterparty's message instead of to the session's starting point. The relay expects the
+       * genesis for a sender's first leaf, so it refused — and then told the counterparty, who had
+       * done nothing, that this side's chain was broken. Every two-party conversation died on its
+       * second message and blamed the wrong party for it.
+       */
       prevOwn = this.#ownChain.get(sessionIdHex)
         ?? this.#ownChainStore?.lastOwnHash(this.senderPubkeyHex, sessionIdHex)
-        ?? seed!;
+        ?? genesis;
+      if (!prevOwn) {
+        /**
+         * Unreachable while a seed exists — both come from the same registration — but stated as a
+         * refusal rather than a non-null assertion. The one thing that must never happen here is
+         * signing a self link chosen because it was the nearest value to hand.
+         */
+        this.#logger.error("session.relay.submit.unchainable", {
+          relayPeerId: this.#relayPeerId,
+          session: sessionIdHex,
+          impact:
+            "this session has an acknowledgement but no recorded starting point, so this agent's " +
+            "own first message has nothing to link to. The message was NOT sent. Restart the " +
+            "session so it is registered with its genesis.",
+        });
+        return { ok: false, reason: "session_unchainable" };
+      }
     }
     /**
      * ⚠️ **A CARRIED LEAF IS SENT VERBATIM AND SIGNED BY NOBODY HERE — 034-CARRYLEAF.**
@@ -2267,6 +2326,36 @@ export class AgentRelayClient {
    */
   lastSeenAck(sessionIdHex: string): { seq: number; hash: Uint8Array } | undefined {
     return this.#lastSeen.get(sessionIdHex);
+  }
+
+  /**
+   * This agent's OWN last message on a session — what its next message's self link must name.
+   *
+   * ⚠️ EXPOSED BECAUSE THERE MUST BE ONE CHAIN, NOT TWO. The unwitnessed send path lives in
+   * `session-node-manager` and was reading only the durable store, while the witnessed path reads
+   * this in-memory map first. A session that mixed the two — which is every session where the relay
+   * comes and goes — was walking two different chains, and the one that lagged produced a link the
+   * counterparty refuses.
+   *
+   * `undefined` means this agent has not spoken on this session yet, which is the session GENESIS
+   * and not an absence. The caller supplies it; this class does not guess.
+   */
+  lastOwnHash(sessionIdHex: string): Uint8Array | undefined {
+    return this.#ownChain.get(sessionIdHex)
+      ?? this.#ownChainStore?.lastOwnHash(this.senderPubkeyHex, sessionIdHex)
+      ?? undefined;
+  }
+
+  /**
+   * Record what this agent just sent on a path this client did not carry — the UNWITNESSED send.
+   *
+   * The two paths share one chain (see `lastOwnHash`), so a direct send has to advance it here too.
+   * Without this, a conversation that ran while the relay was down advanced nothing, and the first
+   * witnessed message after it linked to something long superseded.
+   */
+  noteOwnLeaf(sessionIdHex: string, contentHash: Uint8Array): void {
+    this.#ownChain.set(sessionIdHex, contentHash);
+    this.#ownChainStore?.record(this.senderPubkeyHex, sessionIdHex, contentHash, Date.now());
   }
 
   close(): void {

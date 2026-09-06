@@ -53,7 +53,17 @@ const COUNTERPARTY = generateKeypair();
 const counterpartyHex = async (): Promise<string> =>
   Buffer.from(await COUNTERPARTY.getPublicKey()).toString("hex");
 
-async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array> {
+async function contentFrame(
+  fields: Record<string, unknown>,
+  /**
+   * The sender's link to their OWN previous message on this session — `DOD-M15-SELFCHAIN-1`.
+   *
+   * Defaults to the session's starting point, which is right for a FIRST message and wrong for any
+   * later one. A test that drives two frames must state it, or the second is refused for a broken
+   * chain before it can reach whatever that test is about.
+   */
+  prevOwnHash: Uint8Array = TEST_SESSION_GENESIS,
+): Promise<Uint8Array> {
   const contentHash = fields["content_hash"] as Uint8Array;
   const structure1 = encodeStructure1({
     contentHash,
@@ -72,7 +82,7 @@ async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array
      * invisible to a test that only looks for the presence of one.
      */
     lastSeenHash: TEST_SESSION_GENESIS,
-    prevOwnHash: TEST_SESSION_GENESIS,
+    prevOwnHash,
   });
   return lp.encode.single(encodeCbor({
     type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
@@ -675,8 +685,14 @@ describe("DOD-M15-SEALWIRE-1 part B1: the receiver can verify a SALTED frame onc
     ).toBe(0);
 
     // A number — not a name at all. Refused, and the log must say it was the wrong SHAPE.
+    //
+    // ⚠️ SECOND FRAME ON THIS SESSION, so it links to the FIRST. Left at the default it would be
+    // refused for a broken chain before the algorithm was ever looked at, and this test would pass
+    // on a refusal that has nothing to do with its subject.
     await fx.snm.handleContentFrameForTest(
-      "alice", SID, await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }), PEER,
+      "alice", SID,
+      await contentFrame({ content_hash: wireContentHash(CONTENT), content_hash_alg: 42 }, wireContentHash(CONTENT)),
+      PEER,
     );
     await wait(300);
     const failure = fx.eventsNamed("session.content.cross_check.failed").at(-1);
