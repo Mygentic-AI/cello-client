@@ -68,6 +68,13 @@ export interface FixtureIdentity {
  */
 const FIXTURE_KEYS = new Map<string, KeyProvider>();
 
+/**
+ * The FROST group key this fixture has participant_b vouch for. Exported so a test can assert the
+ * exact value an initiator PINS, rather than restating the constant — an assertion against a copy
+ * passes when the producer and the copy drift together, which is the failure it is meant to catch.
+ */
+export const FIXTURE_RESPONDER_PRIMARY = new Uint8Array(32).fill(0x5b);
+
 export function fixtureIdentity(): FixtureIdentity {
   const kp = generateKeypair();
   const pubkeyHex = kp.toJSON()["publicKey"]!;
@@ -185,7 +192,7 @@ export async function makeSignedAssignmentFrame(
    * for a frame nothing reads.
    */
   const responderKp = FIXTURE_KEYS.get(Buffer.from(opts.responderPubkey).toString("hex").toLowerCase());
-  const responderPrimary = new Uint8Array(32).fill(0x5b);
+  const responderPrimary = FIXTURE_RESPONDER_PRIMARY;
   const counterpartyBinding = responderKp
     ? await (opts.forgeCounterpartyBinding ? generateKeypair() : responderKp).sign(
         buildKeyBindingTbs(opts.responderPubkey, responderPrimary),

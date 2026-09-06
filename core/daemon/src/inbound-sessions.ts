@@ -1302,11 +1302,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * authority over who may dial this agent's receiver.
      *
      * ⚠️ WHAT THIS DOES **NOT** BUY, stated first because the first draft of this comment claimed it
-     * did. It is a CONSISTENCY check between two frames, not an authentication of either. The
-     * assignment's signature is verified further down (`verifyInboundAssignment`), but that happens
-     * AFTER this, and on first contact it can only prove internal consistency — so a single
-     * compromised directory still controls both frames here and simply names the same peer id in
-     * each.
+     * did. It is a CONSISTENCY check between two frames, not an authentication of either. Two
+     * frames from one hostile directory agree with each other trivially — it names the same peer id
+     * in both.
+     *
+     * ⚠️ AND THE ORIGINAL TEXT HERE IS NOW OUT OF DATE, kept as the record of what was true. It
+     * added: *"the assignment's signature is verified further down (`verifyInboundAssignment`), but
+     * that happens AFTER this, and on first contact it can only prove internal consistency — so a
+     * single compromised directory still controls both frames here."* 038-KEYBIND closed the second
+     * half. First contact now verifies the assignment's threshold signature under a group key the
+     * CALLER's own identity key signed for, so a directory can no longer name a key of its choosing
+     * and cannot produce a valid assignment for a caller whose K_local it does not hold. What is
+     * still true is the first half: this check runs BEFORE that one, so at the moment it fires it is
+     * comparing two unverified frames, and that is why its own value is stated small below.
      *
      * WHAT IT DOES BUY, which is real but smaller: the two frames must agree, so an attacker who can
      * influence ONE of them and not the other is caught — a stale or replayed offer, a second

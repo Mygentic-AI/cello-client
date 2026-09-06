@@ -32,6 +32,12 @@ export interface RegistrationStateRecord {
   /**
    * 038-KEYBIND. Hex 64-byte Ed25519 signature by this agent's K_local over
    * (k_local_pubkey, primaryPubkey). Null for an agent whose row predates the column.
+   *
+   * ⚠️ **WRITTEN, AND READ BY NOTHING YET** — said plainly rather than implied, because the careful
+   * null-handling around it otherwise reads as a decision some caller acts on, and no caller
+   * exists. The live copy is the one on the DIRECTORY's profile, which is what rides on every
+   * session assignment; this is the agent's own record of what it signed, kept so a future
+   * re-upload does not have to re-derive it from a value a directory supplied.
    */
   keyBinding: string | null;
 }

@@ -164,9 +164,17 @@ export async function verifyAssignmentSignature(
      *
      * `participant_b_primary_pubkey` alone would not fix that — it would move the same circularity
      * to the other side, where a directory names a group key and we write it down. The BINDING is
-     * what makes it a fact: a signature under `participant_b`'s K_local, which is the value the
-     * operator typed and which this function's caller has already compared against `target_pubkey`.
-     * No directory holds that key, so no directory can put a group key of its choosing here.
+     * what makes it a fact: a signature under `participant_b`'s K_local. No directory holds that
+     * key, so no directory can put a group key of its choosing here.
+     *
+     * ⚠️ THE ANCHOR IS `participant_b.pubkey`, AND THIS FUNCTION DOES NOT CHECK IT. An earlier draft
+     * of this note said the caller "has already compared" it against the operator's `target_pubkey`;
+     * it has not — `outbound-sessions.ts` runs that comparison ~50 lines AFTER this call, and
+     * getting the order backwards in a comment is how someone later moves the pinning above it.
+     *
+     * What makes the returned key safe to pin is that the caller RETURNS on a target mismatch, so
+     * nothing reaches `recordCounterpartyPrimary` unless `participant_b` is the counterparty the
+     * operator asked for. The ordering is load-bearing and lives at the call site, not here.
      */
     const counterpartyBinding = assignment.participant_b_key_binding;
     const counterpartyPrimary = assignment.participant_b_primary_pubkey;

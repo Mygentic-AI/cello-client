@@ -170,8 +170,11 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
     if (!cols.some((c) => c.name === "reg_key_binding")) {
       // 038-KEYBIND. Nullable, because an operator's existing row cannot grow a signature by a
       // migration — the value is minted by the daemon holding the seed, on the next registration.
-      // A null here is not tolerated at the protocol boundary: the directory refuses to serve an
-      // assignment without a binding, so an agent with a null column re-registers to get one.
+      //
+      // A null here has no local consequence and nothing detects it: this column is written and
+      // read by nothing yet (see `RegistrationStateRecord.keyBinding`). What makes a pre-038 agent
+      // unusable is the DIRECTORY-side profile having no binding, which both clients refuse an
+      // assignment over — and the remedy for that is the same re-registration that fills this in.
       db.exec("ALTER TABLE agents ADD COLUMN reg_key_binding TEXT");
     }
   }

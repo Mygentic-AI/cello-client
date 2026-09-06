@@ -29,7 +29,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createOutboundSessions, type OutboundSessionDeps } from "../outbound-sessions.js";
 import { registerInitiateSessionHandler, type InitiateSessionDeps } from "../initiate-session-handler.js";
-import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity, FIXTURE_RESPONDER_PRIMARY } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -78,6 +78,8 @@ interface Harness {
 async function makeHarness(opts: {
   participantA: Uint8Array;
   participantB: Uint8Array;
+  /** 038-KEYBIND F5: a group key this daemon recorded for the counterparty in an earlier session. */
+  pinnedCounterpartyPrimary?: string;
 }): Promise<Harness> {
   const { logger, events } = makeLogger();
   const ourQuorum = generateKeypair();
@@ -125,6 +127,8 @@ async function makeHarness(opts: {
     recordSessionGenesis: () => {},
     // 038-KEYBIND: the initiator records the responder's group key once the negotiation proved it.
     recordCounterpartyPrimary: (_agent: string, _sid: string, hex: string) => { counterpartyPrimaries.push(hex); },
+    // 038-KEYBIND review F5: the pin the outbound path now compares against before dialling.
+    getPinnedCounterpartyPrimary: () => opts.pinnedCounterpartyPrimary ?? null,
     createSessionNode: async (sessionId: string) => {
       sessionNodesCreated.push(sessionId);
       return { ok: true as const };
@@ -248,6 +252,57 @@ describe("DOD-M15-ASSIGN-TARGET-1: the assignment must name who the operator ask
 
     expect(res["ok"], `expected the correct assignment to establish, got ${JSON.stringify(res)}`).toBe(true);
     expect(h.dials).toEqual([hex(ASKED_FOR)]);
+    /**
+     * 038-KEYBIND review F3 — the value that gets PINNED, not "it did not refuse".
+     *
+     * `counterpartyPrimaries` was collected by the harness and asserted nowhere, so deleting
+     * `recordCounterpartyPrimary` from `initiate-session-handler.ts` left every test in both repos
+     * green while a responder-first seal went straight back to `signer_key_not_held` — the exact
+     * regression DoD clause 7 exists to prevent.
+     *
+     * Asserted against the fixture's own exported constant, so a producer that starts emitting a
+     * different key cannot pass by agreeing with a restated copy.
+     */
+    expect(
+      h.counterpartyPrimaries,
+      "the initiator must record the responder's group key — the seal anchor for a responder-first close",
+    ).toEqual([hex(FIXTURE_RESPONDER_PRIMARY)]);
+  });
+
+  it("038-KEYBIND F5: REFUSES — before any dial — a counterparty group key that differs from the pin", async () => {
+    /**
+     * The mirror of the responder's `inbound_assignment_signer_not_pinned`. The binding already
+     * stops a FORGED key; what it cannot stop on its own is a genuine but STALE binding for a group
+     * key the counterparty no longer holds shares for, replayed by a directory that kept a copy.
+     * Without this the initiator overwrote its own record with it, silently, and the damage surfaced
+     * much later as a seal nobody could verify.
+     */
+    const h = await makeHarness({
+      participantA: OWN_PUBKEY,
+      participantB: ASKED_FOR,
+      pinnedCounterpartyPrimary: "77".repeat(32),
+    });
+
+    const res = await h.openSessionAs(AGENT, { target_pubkey: hex(ASKED_FOR) });
+
+    expect(res["ok"]).toBe(false);
+    expect(res["reason"]).toBe("counterparty_primary_key_changed");
+    // NOTHING dialled — a refusal after the dial has already handed the peer our session peer id
+    // and, on a direct address, our IP.
+    expectNothingDialled(h);
+    // And the recorded key is NOT overwritten by the one that was refused.
+    expect(h.counterpartyPrimaries).toEqual([]);
+  });
+
+  it("records NOTHING when the assignment is refused — a rejected key must never become the anchor", async () => {
+    // The mirror of the assertion above, and the one that makes it mean something: a refusal path
+    // that still pinned would write an impostor's key as the counterparty's permanent identity.
+    const h = await makeHarness({ participantA: OWN_PUBKEY, participantB: IMPOSTOR });
+
+    const res = await h.openSessionAs(AGENT, { target_pubkey: hex(ASKED_FOR) });
+
+    expect(res["ok"]).toBe(false);
+    expect(h.counterpartyPrimaries).toEqual([]);
   });
 
   it("compares CASE-INSENSITIVELY — an uppercase target_pubkey is the same counterparty", async () => {

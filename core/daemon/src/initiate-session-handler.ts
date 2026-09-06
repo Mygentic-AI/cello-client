@@ -148,6 +148,58 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
       };
     }
 
+    /**
+     * ─── 038-KEYBIND review F5: THE PIN GUARDS BOTH DIRECTIONS, OR IT GUARDS ONE ────────────────
+     *
+     * Inbound, a counterparty whose group key differs from the one this daemon recorded is a loud
+     * refusal — `inbound_assignment_signer_not_pinned`, with "confirm OUT OF BAND, this is not
+     * transient". Outbound there was no comparison at all: the binding was verified, the key was
+     * returned, and it OVERWROTE whatever had been recorded for that counterparty, silently.
+     *
+     * The binding already stops a forged key — a directory cannot mint one for a key the
+     * counterparty never signed over. What it does not stop is a genuine but STALE binding for an
+     * old group key they no longer hold shares for, replayed by a directory that kept a copy. That
+     * surfaces much later as a seal nobody can verify, instead of here, where it can be named.
+     *
+     * ⚠️ BEFORE THE DIAL. A refusal after `transportSelector.dial` has already handed the peer our
+     * session peer id and, on a direct address, our IP — permanently. Same reason
+     * `DOD-M15-ASSIGN-TARGET-1` refuses before dialling.
+     *
+     * The pinned value is this daemon's own memory of an earlier session, which no directory can
+     * retroactively change; that is what makes the comparison worth anything.
+     */
+    const askedForHex =
+      typeof params?.target_pubkey === "string"
+        ? params.target_pubkey
+        : typeof params?.counterparty_pubkey === "string"
+          ? params.counterparty_pubkey
+          : "";
+    const pinnedCounterparty = askedForHex
+      ? sessionNodeManager.getPinnedCounterpartyPrimary(agentName, askedForHex.toLowerCase())
+      : null;
+    if (pinnedCounterparty !== null && pinnedCounterparty.toLowerCase() !== negotiation.counterpartyPrimaryHex.toLowerCase()) {
+      logger.error("session.initiate.counterparty_primary_changed", {
+        sessionId: Buffer.from(assignment.session_id).toString("hex"),
+        agentName,
+        correlationId,
+        pinnedPrefix: pinnedCounterparty.slice(0, 16),
+        offeredPrefix: negotiation.counterpartyPrimaryHex.slice(0, 16),
+        impact:
+          "the assignment named a different threshold group key for this counterparty than the one " +
+          "recorded in an earlier session with them; it was refused before any dial, so nothing was " +
+          "opened, nothing was sent, and the recorded key was not overwritten",
+      });
+      return {
+        ok: false,
+        reason: "counterparty_primary_key_changed",
+        // The SAME remedy the inbound path gives, because it is the same event seen from the other
+        // side — and it names the one action that must NOT be taken blindly, since clearing the
+        // contact is what destroys a correct pin.
+        guidance:
+          "The directory named a different threshold signing key for this counterparty than the one your agent recorded in an earlier session with them. Nothing was opened and nothing you wrote was sent. This is not transient: either they genuinely re-registered — confirm that with them OUT OF BAND, on a channel that is not this one, then run cello_contact_remove for them, which clears the recorded key so the next session re-records it — or a directory is naming a key they did not authorise. From here the two look identical and only they can tell you which.",
+      };
+    }
+
     const result = await transportSelector.dial(assignment, { correlationId });
     const sessionId = Buffer.from(assignment.session_id).toString("hex");
 
