@@ -384,9 +384,9 @@ export class SessionNodeManager {
   readonly #seal: SessionSeal;
 
   /**
-   * Talking to the blind witness: connecting a session to its relay, proving key possession to it,
-   * holding the circuit reservation that keeps this agent reachable behind a NAT, renewing that
-   * reservation as it decays, quarantining a relay that misbehaves, and detaching cleanly.
+   * Talking to the blind witness: connecting a session to its relay, proving key possession, holding
+   * and renewing the circuit reservation that keeps this agent reachable behind a NAT, quarantining
+   * a relay that misbehaves, and detaching cleanly.
    */
   readonly #relay: SessionRelay;
 
@@ -996,10 +996,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // always-allow path that nothing in the product reached TODAY and any future refactor could.
     // "Currently unreachable" is a property of today's call sites, not of the code.
     //
-    // ⚠️ CHECKED AND ASSIGNED FIRST, ahead of every collaborator, because the content pipeline
-    // built below is handed this client by value and a constructor cannot hand out a field it has
-    // not set yet. Moving it up also means a caller that forgot to screen is told so before the
-    // manager builds anything, rather than after.
+    // ⚠️ CHECKED AND ASSIGNED FIRST, ahead of every collaborator: the content pipeline below is
+    // handed this client by value, and a constructor cannot hand out a field it has not set. It also
+    // means a caller that forgot to screen is told before the manager builds anything.
     if (!opts.securityGateway) {
       throw new Error(
         "SessionNodeManager: securityGateway is required (INV-9). The inbound screen has no " +
@@ -2816,8 +2815,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
     // or already-'interrupted' session back to 'interrupted'. This mirrors the
     // stream-close guard in `#watchRelayStream` (`session-relay.ts`) — the two paths must agree.
-    // NOT "below" any more: the relay path moved out, and the invariant is now a claim about two
-    // FILES agreeing. That is harder to keep true, which is why it is named rather than gestured at.
+    // Not "below" any more: that invariant is now a claim about two FILES, so it is named.
     const existing = this.#queries.getSessionRecord(agentName, sessionId);
     if (!existing || existing.status !== "active") {
       this.#logger.warn("session.interrupt.ignored", {
