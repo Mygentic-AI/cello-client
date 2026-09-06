@@ -226,16 +226,24 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     targetHex: string,
     sr: { peerId: string; addrs: string[] },
     correlationId: string,
-    agentName: string,
     /**
-     * `DOD-M15-ASSIGN-TARGET-1`: this agent's OWN K_local pubkey, hex.
+     * WHO WE ARE — name and key together, as ONE object, and the shape is the point (review F2).
      *
-     * Passed in rather than looked up here because the caller has already resolved it and already
-     * refuses (`agent_not_found`) when it cannot. A second lookup would invent an absence case at
-     * the one place that must not have one — the check below has to compare against a real key or
-     * refuse, never against an empty string that happens to mismatch.
+     * `ownPubkeyHex` is this agent's own K_local pubkey, hex. It is passed in rather than looked up
+     * here because every caller has already resolved it and already refuses (`agent_not_found`)
+     * when it cannot; a second lookup would invent an absence case at the one place that must not
+     * have one — the target check below has to compare against a real key or refuse, never against
+     * an empty string that happens to mismatch.
+     *
+     * ⚠️ AN OBJECT RATHER THAN TWO POSITIONAL STRINGS, because as positional parameters they sat
+     * adjacent to `targetHex` and `correlationId` and a swap COMPILED. Only one of the three call
+     * sites is unit-reachable (the cross-node one needs a live visiting connection), so a slip at
+     * either of the other two would have made every cross-region session refuse with
+     * `assignment_names_different_self` — a security-flavoured refusal for a wiring bug, on the
+     * exact path sovereign-node redundancy depends on, with nothing red. Named properties make that
+     * swap a type error instead of a test we do not have.
      */
-    ownPubkeyHex: string,
+    identity: { agentName: string; ownPubkeyHex: string },
     signalFilter?: { include?: string[]; exclude?: string[] },
     /**
      * `DOD-M15-UNILATERAL-1`: opt this conversation in to the HIGH-STAKES seal tier.
@@ -247,6 +255,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
      */
     highStakes?: boolean,
   ): Promise<SessionNegotiationResult> {
+    const { agentName, ownPubkeyHex } = identity;
     let resolveFrame!: (f: Record<string, unknown>) => void;
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
     const unregister = signaling.registerInboundHandler((frame) => {
@@ -747,7 +756,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "visiting_connection_unreachable", correlationId });
         return { ok: false, reason: "visiting_connection_unreachable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
       }
-      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName, agentPubkeyHex, signalFilter, highStakes);
+      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, { agentName, ownPubkeyHex: agentPubkeyHex }, signalFilter, highStakes);
       if (result.ok) {
         releaseReason = "handoff-complete";
         // Fix #1: remember the broker for this session so cello_close_session can reconnect to complete the seal.
@@ -904,7 +913,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
-            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, agentRec.pubkey, signalFilter, highStakes);
+            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, { agentName: ctx.agentName, ownPubkeyHex: agentRec.pubkey }, signalFilter, highStakes);
           }
           // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
           // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.
@@ -958,7 +967,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             action.kind === "same_node"
               // SAME-NODE: the target is on the node we're already connected to. The existing path runs
               // unchanged — ZERO visiting connections, ZERO new frames beyond the one discovery_lookup.
-              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, agentRec.pubkey, signalFilter, highStakes)
+              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, { agentName: ctx.agentName, ownPubkeyHex: agentRec.pubkey }, signalFilter, highStakes)
               // CROSS-NODE: reach into the target's home over a transient visiting connection.
               : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId, signalFilter, highStakes);
 
