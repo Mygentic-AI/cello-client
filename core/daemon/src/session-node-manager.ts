@@ -2591,7 +2591,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       /**
        * ⚠️ THE GENESIS IS WRITTEN BEFORE THE REGISTRATION, NOT AFTER — review F10.
        *
-       * `#sessionGenesisPrevRoot` reads the entry's assignment first and the stored column second,
+       * `#leafRecords.sessionGenesisPrevRoot` reads the entry's assignment first and the column second,
        * and BOTH were still unset at this line: the entry's assignment is set below and the column
        * is written below that. So the argument was always `undefined` here on a first attach, and
        * the seed only survived because `registerSession` falls back to deriving one from the
@@ -4050,6 +4050,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
 
 
+  /** Loaded from SQLite on first access so it survives a restart (AC-007). NEVER null: an unknown session yields an EMPTY tree. */
   getSessionTree(agentName: string, sessionId: string): SessionTree {
     const key = this.#k(agentName, sessionId);
     const cached = this.#trees.get(key);

@@ -1,8 +1,14 @@
 /**
  * CELLO Daemon — THE TWO DURABLE FACTS ABOUT A SESSION'S LEAVES
  *
- * Split out of `session-node-manager.ts` by 037-SESSIONCORE. Both are read at seal time and both
- * outlive the process, which is why they are here together rather than with the in-memory tree:
+ * Split out of `session-node-manager.ts` by 037-SESSIONCORE. Both are DURABLE PER-SESSION LEAF
+ * FACTS that outlive the process, which is why they are here together rather than with the
+ * in-memory tree:
+ *
+ * ⚠️ NOT "both are read at seal time" — that was the first wording and it is false of both halves.
+ * The genesis is read at session OPEN and at SEND (`#signOwnContentClaim`), never at seal; the
+ * certified leaf set is written at seal and read at PROOF time. The distinction matters because
+ * this header is the rule the next extraction obeys when deciding what belongs here.
  *
  *   - the GENESIS prev-root — where this two-party chain starts. It is a defined 32 bytes derived
  *     from both keys, the session id and the session timestamp, NOT 32 zeros: a constant identical
@@ -23,7 +29,7 @@ import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import { extractErrorMessage } from "./error-message.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 
-/** What the leaf records need from the manager. */
+/** What the leaf records need from the manager — six things, none of them session state. */
 export interface SessionLeafRecordContext {
   readonly logger: Logger;
   readonly queries: SessionQueries;
@@ -53,13 +59,19 @@ export class SessionLeafRecords {
    * first needed. It is recorded before the session node is built, and the session ROW does not
    * exist until that build inserts it (`#insertSessionRow` writes the column from here). The row is
    * what survives a restart; this is what the session open itself reads.
+   *
+   * ⚠️ **DELIBERATELY NOT EVICTED, and this module ships no `evictSession` because of it.** Every
+   * other collaborator has one, so the absence reads as an oversight — it is not. Dropping this on
+   * teardown would lose the in-memory genesis for any session whose `UPDATE sessions SET
+   * genesis_prev_root` FAILED, which is exactly the case `persistGenesisPrevRoot`'s error log says
+   * survives until a restart. Adding an `evictSession` here for symmetry would delete the only copy.
+   *
+   * ⚠️ IT THEREFORE GROWS FOR THE LIFE OF THE PROCESS — pre-existing, and stated rather than fixed.
+   * "each live session's chain" above is what it is FOR, not what it holds: entries are set and read
+   * and never removed, so it is roughly 200 bytes per session ever opened. Bounding it is not
+   * obviously safe for the reason directly above, so it wants a decision rather than a tidy-up.
    */
   readonly #sessionGenesis = new Map<string, Uint8Array>();
-  /**
-   * Return the daemon-owned Merkle tree for a session, loading it from SQLite
-   * on first access (so it survives a restart — AC-007). Never returns null;
-   * an unknown session yields an empty tree.
-   */
   /**
    * The session's genesis prev_root — what its FIRST message acknowledges, before anything has been
    * received (033-ACKEMIT).

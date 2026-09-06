@@ -106,6 +106,12 @@ export default [
     // number that is never raised. Raising one of these is not a fix; it is the regrowth this rule
     // exists to catch, spelled with a config change.
     //
+    //   ⚠️ RAISED A SECOND TIME, BY ONE LINE, ON 2026-09-06 — 10,989 → 10,990. A review found a
+    //       docblock that had been carried into a collaborator with the code around it, where it sat
+    //       above a method whose contract is the OPPOSITE of what it says ("never returns null" over
+    //       a method returning `| undefined`). It documents `getSessionTree`, which stayed here, so
+    //       the fix is the comment coming home. NET ZERO across the two files; it costs a line only
+    //       because the ratchet measures this one. Compressed to a single line first.
     //   ⚠️ RAISED ONCE, BY THREE LINES, ON 2026-09-06 — 12,254 → 12,257, and the reason is recorded
     //       so it can be audited rather than assumed. 037-SESSIONCORE's review found a bug I had
     //       introduced: a teardown DELETED a pending salt agreement instead of settling it, so
@@ -129,7 +135,7 @@ export default [
     //       count of it true, so it is deliberately given as a magnitude rather than a figure that
     //       silently rots.)
     files: ["core/daemon/src/session-node-manager.ts"],
-    rules: { "max-lines": ["error", { max: 10989, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 10990, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon.ts"],
