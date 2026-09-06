@@ -161,7 +161,7 @@ export class SessionRelay {
   /**
    * DOD-M15-RELAYAUTH-1: authenticate a fresh standing receiver to its reservation relay over the
    * CELLO relay protocol — proof of K_local key possession, not a session. Reuses the SAME
-   * `#relayClients` cache `#connectSessionRelay`/`#resolveSealTransport` read from, keyed
+   * `#relayClients` cache `connectSessionRelay`/`#resolveSealTransport` read from, keyed
    * identically (`${agentName}::${relayPeerId}`), so a session created moments later on this same
    * relay finds an already-authenticated client instead of dialing and authenticating twice.
    *
@@ -375,7 +375,7 @@ export class SessionRelay {
    * ⚠️ THIS BLOCK SPENT TWO MILESTONES ABOVE THE WRONG METHOD. It sat stacked on top of
    * `relayLeafHandler`'s own docblock, so the file showed two descriptions in a row and the first
    * one described a method further down the page. The content split then carried it verbatim into
-   * `session-content-ingest.ts`, where `#connectSessionRelay` does not exist at all and the
+   * `session-content-ingest.ts`, where `connectSessionRelay` does not exist at all and the
    * misattribution could no longer be worked out from context. Returned to the method it describes.
    */
   async connectSessionRelay(
@@ -483,7 +483,7 @@ export class SessionRelay {
       // absent `await` that became a remote process kill. The method's own try/catch does not cover
       // its prologue, so the catch here is the only thing standing between a torn-down node and the
       // daemon dying.
-      void this.presentAssignmentToReservationRelay(agentName, node, relay, sessionIdHexForRelay, correlationId, entry)
+      void this.#presentAssignmentToReservationRelay(agentName, node, relay, sessionIdHexForRelay, correlationId, entry)
         .catch((err: unknown) => {
           this.#ctx.logger.warn("session.relay.assignment.reservation_relay_failed", {
             agentName,
@@ -524,7 +524,7 @@ export class SessionRelay {
    * signature the relay verifies against its consortium set), so presenting it more widely grants
    * nothing that forging it would not already require. No directory change, no new frame.
    */
-  async presentAssignmentToReservationRelay(
+  async #presentAssignmentToReservationRelay(
     agentName: string,
     node: CelloNode,
     relay: RelayConnectParams,
@@ -1253,7 +1253,7 @@ export class SessionRelay {
        * rebuild this branch exists to refuse.
        *
        * **AND RE-PROVING TO THE LOST RELAY WOULD REBUILD THE RECEIVER ANYWAY.** Review F3: an
-       * earlier version called `#authenticateStandingReceiver` here to "remove the relay-side
+       * earlier version called `authenticateStandingReceiver` here to "remove the relay-side
        * reason for the revocation". That function ends with `if (refusal?.tryAnotherRelay) { …
        * void this.#ctx.receivers.rebuildStandingReceiver(agentName); }` — and a dead or misconfigured relay is
        * precisely the one that answers that way. So the common case was: lose relay A while
@@ -1379,7 +1379,7 @@ export class SessionRelay {
    * ─── Why this returns a verdict instead of a boolean ──────────────────────────────────────────
    *
    * Review HIGH-1/HIGH-2. Putting the reservation behind a proof MOVED THE FIRST REFUSAL onto this
-   * path. `#authenticateStandingReceiver` does everything right with a refusal — records it where
+   * path. `authenticateStandingReceiver` does everything right with a refusal — records it where
    * `cello_status` can read it, and quarantines a relay whose fault is its own — but it runs only
    * on a receiver that ALREADY HAS a reservation, so under the new gate a total failure never
    * reaches it. This method was logging `proven: false` and returning.
@@ -1453,7 +1453,7 @@ export class SessionRelay {
       }
 
       /**
-       * The same two lines `#authenticateStandingReceiver` runs, for the same reason. The `else`
+       * The same two lines `authenticateStandingReceiver` runs, for the same reason. The `else`
        * matters as much as the `if`: `proveReservation` also fails for transport reasons, which
        * leave `getLastAuthRefusal()` null, and leaving a PREVIOUS refusal in the map would have
        * `cello_status` explaining a cause that is no longer what is wrong.
@@ -1579,7 +1579,7 @@ export class SessionRelay {
        * THE STEP THIS METHOD IS NAMED AFTER, and the first version did not take it (review HIGH-2).
        *
        * `registerSession` files a handler in a Map. It opens nothing — no dial, no auth, no reader
-       * loop. `#connectSessionRelay` ends with exactly this line and the reconnect ended without it,
+       * loop. `connectSessionRelay` ends with exactly this line and the reconnect ended without it,
        * so a revived session registered a handler on a client whose stream was `null` and then
        * logged that its live inbound path was back. It was not: the counterparty's leaves queued at
        * the relay, no doorbell fired, and delivery fell back to the five-minute mailbox poll — the

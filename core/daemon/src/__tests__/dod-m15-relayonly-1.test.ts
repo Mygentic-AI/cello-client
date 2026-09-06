@@ -56,7 +56,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
   RELAY_ONLY_KEY,
@@ -344,7 +344,7 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
    * It DID go red, including its own vacuity precondition, which is the design working.
    */
   const SNM_PATH = join(import.meta.dirname, "..", "standing-receivers.ts");
-  const MANAGER_PATH = join(import.meta.dirname, "..", "session-node-manager.ts");
+  const SRC_DIR = join(import.meta.dirname, "..");
 
   it("★★ the suppression is IN the choke point, not at its call sites", () => {
     /**
@@ -451,7 +451,9 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
       .toBeGreaterThan(0);
     const offenders = raw.filter((r) => !r.line.includes("...config, relayOnly"));
     expect(
-      offenders.map((r) => `session-node-manager.ts:${r.n}`),
+      // NAMED FOR THE FILE ACTUALLY SCANNED. This said `session-node-manager.ts` while reading
+      // `standing-receivers.ts`, so a failure sent the reader to a line number in the wrong file.
+      offenders.map((r) => `standing-receivers.ts:${r.n}`),
       "a node is built straight off the factory instead of through #createAgentNode, so it does not " +
         "carry this agent's relay-only posture — that node will hole-punch to a direct connection " +
         "and disclose the address the setting exists to hide",
@@ -469,21 +471,28 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
      * wrong, but it must be looked at by a human against this line, which is what failing here buys.
      */
     /**
-     * ⚠️ **THIS ONE SCANS BOTH FILES, and narrowing it to one was a coverage regression.**
+     * ⚠️ **EVERY DAEMON SOURCE FILE, AND NOT A LIST — the list is what failed.**
      *
      * The three checks above are about ONE METHOD, so pointing them at the file that method now
-     * lives in is exactly right. This check is different in kind: it is a scan for a DANGEROUS SHAPE
-     * anywhere — a non-predicate read of a standing receiver's raw addresses. 037-SESSIONCORE moved
-     * the choke point out, but `session-node-manager.ts` still holds 22 reads of `#standingReceivers`
-     * and the reservation watchdog's own `listenAddresses()` call. Scanning only the new file would
-     * have left the manager — the file the split explicitly says the watchdog and relay paths stayed
-     * in — invisible to the guard that exists to police it.
+     * lives in is exactly right. This check is different in kind: it is a scan for a DANGEROUS
+     * SHAPE anywhere — a non-predicate read of a standing receiver's raw addresses.
+     *
+     * It was `[standing-receivers.ts, session-node-manager.ts]`, hand-maintained, and it decayed
+     * exactly as a hand-maintained list does. The comment here used to argue for keeping the
+     * manager in scope because it "still holds 22 reads of `#standingReceivers` and the reservation
+     * watchdog's own `listenAddresses()` call". The watchdog moved to `session-relay.ts`; the
+     * manager now matches this pattern ZERO times, the count is 18, and the file that owns
+     * reservations, circuit addresses and the watchdog was not scanned at all. The guard stayed
+     * green while no longer looking at the code it exists to police — the same failure the revival
+     * parity scan hit three times over, and for the same reason: **a loop over a list someone has
+     * to remember to extend gets SHORTER when they forget, never red.**
+     *
+     * A glob cannot shrink. The next file to hold this code is scanned the day it is created.
      */
-    const scanned = [SNM_PATH, MANAGER_PATH];
-    const lines = scanned.flatMap((f) => {
-      const name = f.split("/").pop()!;
-      return readFileSync(f, "utf8").split("\n").map((line, i) => ({ line, where: `${name}:${i + 1}` }));
-    });
+    const lines = readdirSync(SRC_DIR)
+      .filter((f) => f.endsWith(".ts"))
+      .flatMap((f) =>
+        readFileSync(join(SRC_DIR, f), "utf8").split("\n").map((line, i) => ({ line, where: `${f}:${i + 1}` })));
     const src = readFileSync(SNM_PATH, "utf8");
     const chokeLines = src.split("\n");
     const chokeStart = chokeLines.findIndex((l) => l.includes("getStandingReceiverInfo(agentName: string)"));
@@ -523,5 +532,21 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
     const src = readFileSync(SNM_PATH, "utf8");
     expect(src.length, "the file must actually have been read").toBeGreaterThan(10_000);
     expect(src, "and the method under guard must exist under that exact name").toContain("getStandingReceiverInfo");
+
+    /**
+     * ⚠️ AND THE ADDRESS SCAN MUST STILL BE LOOKING AT SOMETHING. A scan whose pattern matches
+     * nothing anywhere passes forever and proves nothing — which is precisely what the manager half
+     * of it became once the reservation watchdog moved out. Counting across the whole directory
+     * rather than per file, because zero in any ONE file is legitimate: the code moves, and moving
+     * it is not the failure. The pattern vanishing entirely is.
+     */
+    const reads = readdirSync(SRC_DIR)
+      .filter((f) => f.endsWith(".ts"))
+      .flatMap((f) => readFileSync(join(SRC_DIR, f), "utf8").split("\n").filter((l) => l.includes(".node.listenAddresses()")));
+    expect(
+      reads.length,
+      "no file reads a standing receiver's raw addresses any more, so the bypass scan above is " +
+        "matching nothing and would pass however the addresses were published",
+    ).toBeGreaterThan(0);
   });
 });

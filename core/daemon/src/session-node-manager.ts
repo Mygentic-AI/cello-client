@@ -235,7 +235,7 @@ export class SessionNodeManager {
   // `relayPeerIds`: the relays this receiver holds an announced circuit through. The watchdog reads
   // it as a COUNT — zero tells "never had one" (already degraded, and already loud) apart from a
   // loss, and a drop that leaves it non-empty is a lost relay the agent can absorb without being
-  // rebuilt. See #reservationWatchdogTick.
+  // rebuilt. See `#reservationWatchdogTick` in `session-relay.ts`.
   /**
    * DOD-M12B-SESSION-SEED-1 — session id → the transport seed its node identity derives from.
    *
@@ -2815,7 +2815,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // H-3 SECURITY: only an 'active' session may transition to 'interrupted'.
     // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
     // or already-'interrupted' session back to 'interrupted'. This mirrors the
-    // stream-close guard in #watchRelayStream below — the two paths must agree.
+    // stream-close guard in `#watchRelayStream` (`session-relay.ts`) — the two paths must agree.
+    // NOT "below" any more: the relay path moved out, and the invariant is now a claim about two
+    // FILES agreeing. That is harder to keep true, which is why it is named rather than gestured at.
     const existing = this.#queries.getSessionRecord(agentName, sessionId);
     if (!existing || existing.status !== "active") {
       this.#logger.warn("session.interrupt.ignored", {
@@ -4098,7 +4100,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    */
   /**
    * DOD-M15-RELAYSLOTS-1: relays this agent should skip, and until when — see the failover note in
-   * `#reservationCircuitAddrs`. Keyed agent → relay peer id → expiry.
+   * `reservationCircuitAddrs` (`session-relay.ts`). Keyed agent → relay peer id → expiry.
    *
    * Time-boxed rather than permanent because the fault is somebody else's to fix and we will not
    * hear when they have: an operator sets the missing directory key and restarts, and this agent
@@ -4396,7 +4398,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     // ONE lookup, and ONE event for the absent case (review LOW-8). This used to read the endpoint
     // here and again inside the relay reconnect, and both logged `session.revive.relay.absent` with
     // different `impact` text — one event name standing for two meanings, fired twice for a single
-    // condition. `#reconnectRevivedSessionRelay` takes it as a parameter now.
+    // condition. `reconnectRevivedSessionRelay` (`session-relay.ts`) takes it as a parameter now.
     const persistedRelay = this.#queries.getPersistedRelayEndpoint(agentName, sessionId);
     // 006-CRYPTO: a REVIVED session mints a FRESH keypair and re-keys — Decisions Carried #5. That
     // holds because the interrupt path destroys the old secret when it drops the entry; until it
@@ -4466,10 +4468,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
        * DOD-M15-RELAYLEAK-1 (review MEDIUM-4) — **THIS TEARDOWN LEAKED THE EXACT THING THE LINE IS
        * ABOUT, THROUGH A DIFFERENT DOOR.**
        *
-       * `#reconnectRevivedSessionRelay` above has already called `registerSession` on the cached
+       * `reconnectRevivedSessionRelay` (`session-relay.ts`, not "above") has already called `registerSession` on the cached
        * relay client and hung it on this entry. Deleting the map key and stopping the node released
        * the daemon's own objects and left that registration standing with **no owner** — and
-       * `#detachSessionRelay` closes a client only when `!hasSessions()`, so the orphaned
+       * `detachSessionRelay` (`session-relay.ts`) closes a client only when `!hasSessions()`, so the orphaned
        * registration held that predicate false for the life of the process. The client, its
        * authenticated stream and its relay-side reservation were unreachable and immortal.
        *
