@@ -245,7 +245,7 @@ export class SessionNodeManager {
    *
    * Andre's 2026-08-18 tenet is the lifetime rule: *"it should be possible to revive that session on
    * those peer IDs. But after that, those peer IDs and that peer connection needs to be shut down."*
-   * So this map is cleared in the same step that writes a terminal status (`#updateSessionStatus`),
+   * So this map is cleared in the same step that writes a terminal status (`SessionLifecycle.updateSessionStatus`),
    * not on a later sweep — and the bytes are zeroed before the reference is dropped, because a seed
    * that stays readable in the heap is exactly the "left open" the tenet forbids.
    *
@@ -316,7 +316,7 @@ export class SessionNodeManager {
    * without knowing which subsystem it serves.
    *
    * ⚠️ THE `touches the database` CLAUSE IS LOAD-BEARING. A first pass grouped on "holds no state"
-   * alone and swept in `#evictPeersOutsideGate`, which operates on libp2p connections and is not
+   * alone and swept in `#evictPeersOutsideGate` (`session-lifecycle.ts`), which operates on libp2p connections and is not
    * SQL at all. A source-scanning parity test caught the mis-grouping; the filter now requires the
    * method to name `#db`.
    */
@@ -2129,7 +2129,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#receivedContent.clear();
     // DOD-M12B-SESSION-SEED-1 (review F5): transport identities are key material and belong in the
     // same sentence as the plaintext above. Shutdown marks every active row `interrupted` by direct
-    // SQL, so no `#updateSessionStatus` destroy fires for them — without this, every live session's
+    // SQL, so no `SessionLifecycle.updateSessionStatus` destroy fires for them — without this, every live session's
     // seed survives the shutdown in memory for as long as the process lingers.
     for (const identity of this.#sessionSeeds.values()) identity.seed.fill(0);
     this.#sessionSeeds.clear();
@@ -2277,7 +2277,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       }) as unknown as SessionRecord[];
   }
 
-  // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
 
   // ─── The session-lifecycle path's public surface, kept on the manager ──────────────────────
   //
@@ -2552,6 +2551,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     return this.#contentIn.handleContentFrameForTest(...args);
   }
 
+  // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
   /** Loaded from SQLite on first access so it survives a restart (AC-007). NEVER null: an unknown session yields an EMPTY tree. */
   getSessionTree(agentName: string, sessionId: string): SessionTree {
     const key = this.#k(agentName, sessionId);

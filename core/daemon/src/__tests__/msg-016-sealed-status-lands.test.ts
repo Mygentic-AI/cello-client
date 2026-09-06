@@ -164,11 +164,18 @@ describe("every seal-completion path flips the status itself", () => {
   // fifth seal site can be added in a file nobody remembers to add here, and the suite stays green.
   // Every daemon source file is checked; anything genuinely exempt goes in EXEMPT with a reason.
   const SRC_DIR = join(import.meta.dirname, "..");
-  const EXEMPT: Record<string, string> = {
-    // The teardown itself. It is the function whose early return causes the defect — it cannot
-    // call the wrapper that exists to work around it.
-    "session-node-manager.ts": "writes the status inline, below the #activeNodes guard this pins around",
-  };
+  /**
+   * ⚠️ EMPTY, AND THAT IS THE CORRECT STATE — an exemption that exempts nothing is worse than none.
+   *
+   * It used to hold `session-node-manager.ts`, on the grounds that the teardown itself "writes the
+   * status inline, below the `#activeNodes` guard this pins around". That was true when the
+   * teardown lived there. `destroySessionNode` moved to `session-lifecycle.ts` with the rest of the
+   * session-lifecycle path, and the manager now matches this scan's own filter ZERO times — so the
+   * entry excluded a file that was never going to be scanned, while reading as a considered
+   * decision about live code. The three files that DO match are all checked, and if the teardown
+   * ever needs exempting again the entry can come back with a reason that is true on the day.
+   */
+  const EXEMPT: Record<string, string> = {};
   /**
    * A CALL on ONE line, which is the same rule the per-site scan below uses.
    *

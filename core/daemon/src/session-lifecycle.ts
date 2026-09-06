@@ -9,20 +9,20 @@
  *
  * **Moved verbatim, comments included.**
  *
- * ⚠️ **REVIVAL IS THE HARD PART, AND IT IS HARD FOR A SPECIFIC REASON.** A rebuilt session must
- * come back on the SAME transport peer id the counterparty was handed at establishment, or they can
- * never dial back and the conversation is one-way without saying so. That is why the session seed
- * is durable, why a terminal session must never be revived (its seed is destroyed with it), and why
- * a revived session has to take every step establishment takes — a guard in
- * `msg-022-session-rebuild.test.ts` derives those steps from establishment and requires revival to
- * match, because a revived session that behaves differently from a fresh one is the defect.
+ * ⚠️ **REVIVAL IS THE HARD PART, FOR A SPECIFIC REASON.** A rebuilt session must come back on the
+ * SAME transport peer id the counterparty was handed at establishment, or they can never dial back
+ * and the conversation is one-way without saying so. Hence the durable session seed, the rule that
+ * a terminal session never revives (its seed is destroyed with it), and the requirement that a
+ * revival take every step establishment takes — `msg-022-session-rebuild.test.ts` derives those
+ * steps from establishment and requires revival to match, because a revived session that behaves
+ * differently from a fresh one is the defect.
  *
- * ⚠️ **WHAT DELIBERATELY STAYED ON THE MANAGER.** `gracefulShutdown` and `#evictSessionCaches` are
- * not session lifecycle — the first is PROCESS teardown (it closes the database and sets the
- * shutting-down flag), and the second clears the manager's own shared maps. Both would have had to
- * write manager state through the context to live here, and neither is about one session. The seam
- * is: this file owns what happens to A SESSION; the manager owns the process and the state every
- * collaborator shares.
+ * ⚠️ **WHAT DELIBERATELY STAYED ON THE MANAGER.** `gracefulShutdown` is PROCESS teardown and
+ * `#evictSessionCaches` clears the eleven containers every collaborator shares; both would have had
+ * to mutate manager state through this context, and neither is about one session. The seam: this
+ * file owns what happens to A SESSION, the manager owns the process and the shared state. **The
+ * freeze path is the one exception** — `#freezeSession` stayed there and the reader that refuses to
+ * revive a frozen session is here, so this file holds the consumer and not the producer.
  */
 import { randomUUID, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
@@ -86,9 +86,9 @@ export interface SessionLifecycleContext {
   readonly counterpartyAddrs: Map<string, string[]>;
   /**
    * ⚠️ THE DURABLE IDENTITY A REVIVAL COMES BACK ON. Without the seed a rebuilt node gets a fresh
-   * key, so it can dial the counterparty and the counterparty can never dial it — a session that
-   * reports itself healthy and is silently one-way. A terminal session's seed is destroyed with it,
-   * which is what makes "terminal is terminal" enforceable rather than merely intended.
+   * key: it can dial the counterparty and they can never dial back — a session reporting itself
+   * healthy while silently one-way. A terminal session's seed is destroyed with it, which is what
+   * makes "terminal is terminal" enforceable rather than merely intended.
    */
   readonly sessionSeeds: Map<string, SessionRevivalIdentity>;
   readonly frozenSessions: Map<string, { reason: string; guidance: string }>;
@@ -1261,7 +1261,7 @@ export class SessionLifecycle {
     if (frozen) {
       // The REASON and the GUIDANCE both come from the site that froze it. Hardcoding them here was
       // correct while an identity failure was the only way in, and became a false accusation the
-      // moment a second one existed — see the note on `#frozenSessions`.
+      // moment a second one existed — see the note on `#frozenSessions` in `session-node-manager.ts`.
       return {
         ok: false,
         reason: frozen.reason,
