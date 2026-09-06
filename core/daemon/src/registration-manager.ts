@@ -172,6 +172,59 @@ export class RegistrationManager {
   }
 
   /**
+   * 038-KEYBIND review F4 — mint a binding ONLY over a group key this machine can corroborate.
+   *
+   * ⚠️ THE `already_registered` PATHS RUN NO CEREMONY, so the group key arrives in a directory's
+   * reply and there is nothing in that frame to check it against. Signing over it regardless is the
+   * defect this order exists to remove, relocated from the verify site to the mint site: K_local
+   * would be making a non-repudiable statement about a key chosen by the one party the binding is
+   * designed to take out of the trust path.
+   *
+   * The anchor this machine DOES hold is its FROST share. `commitments[0]` is the group key the
+   * DKG produced — computed here, from every participant's commitment — and it cannot be edited by
+   * a directory. So the answered key is checked against it, and only then signed over.
+   *
+   * ⚠️ NO SHARE IS A REFUSAL, not a licence to sign. An agent with no share cannot co-sign anything
+   * anyway; minting a binding for it would produce a proof that its group key is one it has no way
+   * to use, and the absent share is the fault worth reporting.
+   *
+   * Returns the binding, or the error the caller returns verbatim.
+   */
+  async #mintCorroboratedKeyBinding(
+    kLocalPubkeyHex: string,
+    answeredPrimaryHex: string,
+  ): Promise<{ ok: true; keyBinding: string } | { ok: false; error: string; detail: string }> {
+    const share = await this.#ctx.persistence?.loadActiveFrostKeyShare();
+    if (!share) {
+      this.#ctx.logger.error("registration.key_binding.no_share", {
+        agentPubkey: kLocalPubkeyHex,
+        impact: "the directory reports this agent already registered, but this machine holds no FROST share for it — so the threshold key in the reply could not be checked against anything local and no key binding was signed; nothing was persisted",
+      });
+      return {
+        ok: false,
+        error: "registration_share_missing",
+        detail:
+          "The directory says this agent is already registered, but this machine holds no signing share for it — so it cannot take part in ceremonies and cannot vouch for its own threshold key. This usually means the agent was registered on a different device. Restore that device's backup, or remove this agent and register a new one.",
+      };
+    }
+    if (share.primaryPubkey.toLowerCase() !== answeredPrimaryHex.toLowerCase()) {
+      this.#ctx.logger.error("registration.primary_pubkey.mismatch", {
+        agentPubkey: kLocalPubkeyHex,
+        derivedPrefix: share.primaryPubkey.slice(0, 16),
+        answeredPrefix: answeredPrimaryHex.slice(0, 16),
+        impact: "the directory named a threshold group key other than the one this agent's own share belongs to; nothing was persisted and no key binding was signed, because signing one would have vouched for a key this agent cannot sign with",
+      });
+      return {
+        ok: false,
+        error: "registration_primary_pubkey_mismatch",
+        detail:
+          "The directory named a different threshold key for this agent than the one its signing share belongs to. Nothing was saved. Retry registration; if it repeats, the node that answered is serving a profile that does not match this agent and cello status will show which one it was.",
+      };
+    }
+    return { ok: true, keyBinding: await this.#mintKeyBinding(kLocalPubkeyHex, answeredPrimaryHex) };
+  }
+
+  /**
    * Register this agent with the directory.
    * REG-001: ML-DSA keygen → signaling stream → register_request → DKG → register_success.
    */
@@ -261,10 +314,11 @@ export class RegistrationManager {
         // state is persisted whenever persistence is present — NOT gated on the ml-dsa blob (so an
         // already_registered agent is never left durably-unregistered when the blob is absent).
         if (this.#ctx.persistence) {
-          // 038-KEYBIND: this agent is already registered, so no ceremony runs — but both keys are
-          // here (K_local locally, the group key in the frame), which is all the binding needs.
-          const keyBinding = await this.#mintKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding));
+          // 038-KEYBIND: no ceremony runs on this path, so the group key comes from the directory's
+          // reply — checked against this machine's own share before K_local signs over it (F4).
+          const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
+          if (!minted.ok) return { error: minted.error, detail: minted.detail };
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -478,10 +532,13 @@ export class RegistrationManager {
         };
         // SI-003: persist before caching the registered state (see the dkg_ready branch).
         if (this.#ctx.persistence) {
-          // 038-KEYBIND: the DKG ran but the directory already had a profile, so the group key it
-          // returns is the authoritative one — bind THAT, not the one this run derived.
-          const rebinding = await this.#mintKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, rebinding));
+          // 038-KEYBIND: the DKG ran, but the directory already held a profile and answered with
+          // ITS key. Checked against this machine's own share before signing over it (F4) — an
+          // answer that disagrees with the share is a directory contradicting the ceremony, not a
+          // more authoritative value.
+          const minted = await this.#mintCorroboratedKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
+          if (!minted.ok) return { error: minted.error, detail: minted.detail };
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, minted.keyBinding));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -495,6 +552,37 @@ export class RegistrationManager {
     const agentId = responseWithTimeout["agent_id"] as string;
     const primaryPubkey = responseWithTimeout["primary_pubkey"] as string;
 
+    /**
+     * ─── 038-KEYBIND review F4: A DIRECTORY THAT ANSWERS A DIFFERENT GROUP KEY IS REFUSED ───────
+     *
+     * ⚠️ THE EARLIER SHAPE HERE WAS THE DEFECT THIS ORDER EXISTS TO REMOVE, one level up. It
+     * re-minted the binding over `primaryPubkey` whenever it differed from what the DKG derived,
+     * and argued that "binding what was ANSWERED cannot drift". It cannot drift, and it is the
+     * wrong thing to bind: K_local would be signing a statement about a group key this agent never
+     * derived and holds no share for, on the say-so of the one party the binding exists to remove
+     * from the trust path. A directory would get to choose which key is yours, which is exactly
+     * what Part 4.2 of the order rules out.
+     *
+     * `dkgPrimaryPubkeyHex` is the sum of the commitments this daemon computed in the ceremony it
+     * ran. That is the value that is ours. A `register_success` naming anything else is a directory
+     * contradicting the ceremony, and there is no honest reading of it — so the registration fails
+     * and no binding is signed. Mirrors `session-ceremony.ts`, which already aborts a key refresh
+     * when the primary changes.
+     */
+    if (primaryPubkey !== dkgPrimaryPubkeyHex) {
+      this.#ctx.logger.error("registration.primary_pubkey.mismatch", {
+        agentPubkey: kLocalPubkeyHex,
+        derivedPrefix: dkgPrimaryPubkeyHex.slice(0, 16),
+        answeredPrefix: primaryPubkey.slice(0, 16),
+        impact: "the directory confirmed registration under a threshold group key other than the one this agent's own DKG produced; nothing was persisted and no key binding was signed, because signing one would have vouched for a key this agent does not hold a share for",
+      });
+      return {
+        error: "registration_primary_pubkey_mismatch",
+        detail:
+          "The directory confirmed your registration under a different threshold key than the ceremony on this machine produced. Nothing was saved. Retry registration; if it repeats, the node that answered is not completing ceremonies correctly and cello status will show which one it was.",
+      };
+    }
+
     const state: RegistrationState = {
       agent_id: agentId,
       primary_pubkey: primaryPubkey,
@@ -505,18 +593,8 @@ export class RegistrationManager {
     // SI-003: AWAIT the final identity persists before reporting success, and cache the registered
     // state only after they commit — a register-success guarantees a durable identity row.
     if (this.#ctx.persistence) {
-      /**
-       * 038-KEYBIND — RE-MINT AGAINST THE DIRECTORY'S ANSWER, do not reuse the value sent above.
-       *
-       * `register_success` carries the primary_pubkey the directory considers canonical. It is the
-       * same key on every healthy registration, and reusing `keyBinding` would be right in exactly
-       * that case — but if the two ever differ, the stored binding would name a group key this
-       * agent is not actually registered under, and it would verify perfectly while pointing at the
-       * wrong key. Binding what was ANSWERED costs one signature and cannot drift.
-       */
       const ok = await this.#persistAll(this.#identityPersistOps(
-        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob,
-        primaryPubkey === dkgPrimaryPubkeyHex ? keyBinding : await this.#mintKeyBinding(kLocalPubkeyHex, primaryPubkey),
+        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding,
       ));
       if (!ok) return { error: "identity_persist_failed" };
     }

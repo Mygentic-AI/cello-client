@@ -17,16 +17,23 @@ import { describe, it, expect, vi } from "vitest";
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
 import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
-import { generateKeypair } from "@cello-protocol/crypto";
+import { generateKeypair, verifyKeyBinding } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
 const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 // 038-KEYBIND: registration now SIGNS the key binding with K_local, so the stub must sign.
 const stubKeyProvider = generateKeypair();
+const stubKeyProviderPubkeyHex = stubKeyProvider.toJSON()["publicKey"]!;
 const stubNode = {} as unknown as CelloNode;
 
-function makeRecordingPersistence() {
+/**
+ * 038-KEYBIND review F4: `sharePrimaryHex` is the group key this machine's own FROST share belongs
+ * to. The `already_registered` paths run no ceremony, so it is the ONLY thing they can check a
+ * directory-supplied `primary_pubkey` against before K_local signs a statement about it. `null`
+ * models a machine holding no share, which is now a refusal rather than a licence to sign.
+ */
+function makeRecordingPersistence(sharePrimaryHex: string | null = "cc".repeat(32)) {
   const calls = { mlDsa: [] as unknown[], reg: [] as unknown[], frost: [] as unknown[] };
   const persistence: DaemonRegistrationPersistence = {
     async persistMlDsaKeypair(o) { calls.mlDsa.push(o); },
@@ -34,7 +41,13 @@ function makeRecordingPersistence() {
     async persistFrostKeyShare(o) { calls.frost.push(o); },
     async loadRegistrationState() { return null; },
     async loadMlDsaKeypair() { return null; },
-    async loadActiveFrostKeyShare() { return null; },
+    async loadActiveFrostKeyShare() {
+      return sharePrimaryHex === null
+        ? null
+        : ({ primaryPubkey: sharePrimaryHex } as unknown as Awaited<
+            ReturnType<DaemonRegistrationPersistence["loadActiveFrostKeyShare"]>
+          >);
+    },
   };
   return { persistence, calls };
 }
@@ -49,7 +62,12 @@ function makeFakeCtx(opts: Partial<{
 }> = {}) {
   let pendingDkg: ((f: Record<string, unknown>) => void) | null = null;
   let pendingReg: ((f: Record<string, unknown>) => void) | null = null;
-  let pubkeyHex: string | null = "ab".repeat(32);
+  /**
+   * 038-KEYBIND: the stub's REAL pubkey, not an invented "ab"…. `register()` reads this rather than
+   * calling `getPublicKey()`, so an invented value would have K_local sign a binding naming a key
+   * it does not own — the binding would fail its own verifier and no test could assert on it.
+   */
+  let pubkeyHex: string | null = stubKeyProviderPubkeyHex;
 
   const ctx: RegistrationContext = {
     keyProvider: stubKeyProvider,
@@ -159,7 +177,13 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
       async persistFrostKeyShare() { /* unreached */ },
       async loadRegistrationState() { return null; },
       async loadMlDsaKeypair() { return null; },
-      async loadActiveFrostKeyShare() { return null; },
+      // 038-KEYBIND: a share that agrees with the directory's answer, so this test still reaches
+      // the persist it is about rather than stopping at the binding corroboration.
+      async loadActiveFrostKeyShare() {
+        return { primaryPubkey: "cc".repeat(32) } as unknown as Awaited<
+          ReturnType<DaemonRegistrationPersistence["loadActiveFrostKeyShare"]>
+        >;
+      },
     };
     const h = makeFakeCtx({ persistence: rejectingPersistence });
     const mgr = new RegistrationManager(h.ctx);
@@ -241,5 +265,79 @@ describe("RegistrationManager (daemon port) — seam paths", () => {
     const outcome = (await promise) as { error: string; detail?: string };
     expect(outcome.error).toBe("dkg_failed");
     expect(outcome.detail, "the cause must travel with the code, not be discarded").toBeTruthy();
+  });
+});
+
+/**
+ * 038-KEYBIND — THE MINT HALF, which had no test at all until review found it (F4 / test teeth).
+ *
+ * Everything downstream verifies a binding; nothing verified the one this daemon PRODUCES. A
+ * `#mintKeyBinding` that signed over the group key alone, or under the wrong context, or returned
+ * 64 zero bytes, left every test in BOTH repos green — the directory fixtures re-implement the
+ * framing locally, so they cannot catch a producer that drifts from it either.
+ *
+ * The `already_registered` path is the one this harness can drive end to end, and it is also the
+ * path that matters most: no ceremony runs, so the group key arrives in a directory's reply with
+ * nothing in the frame to check it against.
+ */
+describe("038-KEYBIND: the binding this daemon MINTS", () => {
+  const GROUP = "cc".repeat(32);
+
+  async function registerAgainstAlreadyRegistered(
+    persistence: DaemonRegistrationPersistence,
+    answeredPrimary = GROUP,
+  ): Promise<unknown> {
+    const h = makeFakeCtx({ persistence });
+    const mgr = new RegistrationManager(h.ctx);
+    const promise = mgr.register("", "token");
+    await vi.waitFor(() => expect(h.getPendingDkg()).not.toBeNull());
+    h.deliverDkg({
+      type: "register_error",
+      reason: "already_registered",
+      agent_id: "agent-mint",
+      primary_pubkey: answeredPrimary,
+      ml_dsa_pubkey: "dd".repeat(32),
+    });
+    return promise;
+  }
+
+  it("★ signs a binding the PRODUCTION verifier accepts, over (K_local, the group key)", async () => {
+    const { persistence, calls } = makeRecordingPersistence(GROUP);
+    await registerAgainstAlreadyRegistered(persistence);
+
+    const persisted = calls.reg[0] as { keyBinding: string; primaryPubkey: string };
+    // The VALUE, run through `verifyKeyBinding` — not "a 128-char string was stored". A binding over
+    // the group key alone, or under a reused context, or over the wrong identity, fails here.
+    expect(
+      verifyKeyBinding(
+        new Uint8Array(Buffer.from(persisted.keyBinding, "hex")),
+        new Uint8Array(Buffer.from(stubKeyProviderPubkeyHex, "hex")),
+        new Uint8Array(Buffer.from(GROUP, "hex")),
+      ),
+      "the binding this daemon mints must verify under its own K_local, over its own group key",
+    ).toBe(true);
+    expect(persisted.primaryPubkey).toBe(GROUP);
+  });
+
+  it("REFUSES when the directory names a group key this machine's share does not belong to", async () => {
+    // The share says one key; the directory answers another. Signing over the answer would have
+    // K_local vouch for a key this agent cannot sign with — chosen by the party the binding exists
+    // to take out of the trust path.
+    const { persistence, calls } = makeRecordingPersistence("11".repeat(32));
+    const result = await registerAgainstAlreadyRegistered(persistence, GROUP);
+
+    expect(result).toMatchObject({ error: "registration_primary_pubkey_mismatch" });
+    expect(calls.reg, "nothing may be persisted when the key could not be corroborated").toHaveLength(0);
+  });
+
+  it("REFUSES when this machine holds NO share — absence is not a licence to sign", async () => {
+    const { persistence, calls } = makeRecordingPersistence(null);
+    const result = await registerAgainstAlreadyRegistered(persistence, GROUP);
+
+    // A DIFFERENT reason from the mismatch: one says the directory disagrees with this machine, the
+    // other says this machine has nothing to disagree with, and the remedies are not the same.
+    expect(result).toMatchObject({ error: "registration_share_missing" });
+    expect((result as { detail?: string }).detail, "a refusal carries its next step").toBeTruthy();
+    expect(calls.reg).toHaveLength(0);
   });
 });
