@@ -588,7 +588,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         };
       }
       logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
-      return { ok: true, assignment };
+      return { ok: true, assignment, counterpartyPrimaryHex: verified.counterpartyPrimaryHex };
     } finally {
       unregister();
     }

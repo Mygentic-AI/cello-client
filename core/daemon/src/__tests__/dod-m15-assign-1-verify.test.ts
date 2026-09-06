@@ -14,7 +14,7 @@
  * keypair rather than stubbing the primitive.
  */
 import { describe, it, expect } from "vitest";
-import { generateKeypair, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
+import { generateKeypair, buildKeyBindingTbs, CONTEXT_SESSION_ESTABLISHMENT } from "@cello-protocol/crypto";
 import { buildSessionEstablishmentTbs, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import { verifyAssignmentSignature } from "../assignment-verify.js";
@@ -47,12 +47,24 @@ function persistenceWith(primaryPubkey: string | null): DbRegistrationPersistenc
 
 const SESSION_ID = new Uint8Array(16).fill(7);
 const PUB_A = new Uint8Array(32).fill(0xaa);
-const PUB_B = new Uint8Array(32).fill(0xbb);
+/**
+ * 038-KEYBIND — participant_b is a REAL keypair now, and the group key it vouches for is separate.
+ *
+ * The initiator refuses an assignment unless the counterparty's own identity key has signed for the
+ * threshold key the frame names as theirs. A made-up `0xbb` pubkey has no private half, so it could
+ * never produce that signature — which is the property, not an inconvenience.
+ */
+const RESPONDER = generateKeypair();
+const PUB_B_GROUP = new Uint8Array(32).fill(0x5b);
 const TS = 1_700_000_000_000;
 
 /** Build an assignment and sign its TBS with `signWith`, announcing `announceKey` as the signer. */
 async function makeAssignment(opts: {
   signWith: ReturnType<typeof generateKeypair>;
+  /** 038-KEYBIND: send NO counterparty group key / binding. */
+  omitCounterpartyBinding?: boolean;
+  /** 038-KEYBIND: have someone OTHER than participant_b vouch for participant_b's group key. */
+  forgeCounterpartyBinding?: boolean;
   announceKey?: Uint8Array;
   counterpartyPeerId?: string;
   tamperAfterSigning?: boolean;
@@ -61,6 +73,7 @@ async function makeAssignment(opts: {
   priorRelayId?: string;
 }): Promise<SessionAssignment> {
   const signerPub = opts.announceKey ?? (await opts.signWith.getPublicKey());
+  const PUB_B = await RESPONDER.getPublicKey();
   const counterpartyPeerId = opts.counterpartyPeerId ?? "12D3KooWCounterparty";
   // 017-TBS: present ONLY when the caller asks, so every existing fixture keeps signing 10 fields.
   const twelve = opts.highStakes !== undefined && opts.priorRelayId !== undefined;
@@ -98,6 +111,15 @@ async function makeAssignment(opts: {
     signature_type: "frost",
     signer_pubkey: signerPub,
     directory_signature: sig,
+    // 038-KEYBIND: participant_b vouches for its own group key, so the initiator can record it.
+    ...(opts.omitCounterpartyBinding
+      ? {}
+      : {
+          participant_b_primary_pubkey: PUB_B_GROUP,
+          participant_b_key_binding: await (
+            opts.forgeCounterpartyBinding ? generateKeypair() : RESPONDER
+          ).sign(buildKeyBindingTbs(PUB_B, PUB_B_GROUP)),
+        }),
     // TAMPERED AFTER SIGNING: the address set the daemon would dial is changed, the signature is
     // not. This is the shape a compromised directory produces.
     ...(opts.tamperAfterSigning ? { counterparty_session_peer_id: "12D3KooWImpostor" } : {}),
@@ -232,6 +254,47 @@ describe("DOD-M15-ASSIGN-1: a session assignment is verified before anything dia
  * an impostor as the counterparty, sign, drop `signature_type`, and the daemon dialled the impostor
  * having "verified" the assignment.
  */
+describe("038-KEYBIND: the initiator learns the responder's group key, or refuses", () => {
+  it("RETURNS the counterparty's group key when their own identity key vouched for it", async () => {
+    const kp = generateKeypair();
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const asg = await makeAssignment({ signWith: kp });
+
+    const r = await verifyAssignmentSignature(asg, persistenceWith(hex), silent, "alice", "corr");
+    expect(r.ok).toBe(true);
+    // THE VALUE, not "it did not refuse". The whole point of the field is what gets PINNED as the
+    // seal trust anchor, so asserting only `ok` would stay green if the function returned nothing.
+    expect(r.ok && r.counterpartyPrimaryHex).toBe(Buffer.from(PUB_B_GROUP).toString("hex"));
+  });
+
+  it("REFUSES when the counterparty's key binding is ABSENT — a withheld proof costs what a wrong one costs", async () => {
+    const kp = generateKeypair();
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const { logger, seen } = events();
+    const asg = await makeAssignment({ signWith: kp, omitCounterpartyBinding: true });
+
+    const r = await verifyAssignmentSignature(asg, persistenceWith(hex), logger, "alice", "corr");
+    expect(r.ok).toBe(false);
+    expect(!r.ok && r.reason).toBe("assignment_counterparty_binding_absent");
+    expect(!r.ok && r.guidance.length).toBeGreaterThan(0);
+    expect(seen).toContain("session.assignment.counterparty_binding_absent");
+  });
+
+  it("REFUSES — with a DIFFERENT reason — when someone other than the counterparty vouched for their group key", async () => {
+    const kp = generateKeypair();
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    const { logger, seen } = events();
+    const asg = await makeAssignment({ signWith: kp, forgeCounterpartyBinding: true });
+
+    const r = await verifyAssignmentSignature(asg, persistenceWith(hex), logger, "alice", "corr");
+    expect(r.ok).toBe(false);
+    // Distinct from the absent case: one says the directory is behind, the other says a key was
+    // substituted. Collapsing them would send the operator to the wrong remedy.
+    expect(!r.ok && r.reason).toBe("assignment_counterparty_binding_invalid");
+    expect(seen).toContain("session.assignment.counterparty_binding_invalid");
+  });
+});
+
 describe("DOD-M15-ASSIGN-1: a weaker signature type cannot be claimed to skip the check", () => {
   it("REFUSES an assignment whose signature_type is not frost, even when its own signature verifies", async () => {
     const attacker = generateKeypair();

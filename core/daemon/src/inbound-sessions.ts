@@ -1302,11 +1302,19 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * authority over who may dial this agent's receiver.
      *
      * ⚠️ WHAT THIS DOES **NOT** BUY, stated first because the first draft of this comment claimed it
-     * did. It is a CONSISTENCY check between two frames, not an authentication of either. The
-     * assignment's signature is verified further down (`verifyInboundAssignment`), but that happens
-     * AFTER this, and on first contact it can only prove internal consistency — so a single
-     * compromised directory still controls both frames here and simply names the same peer id in
-     * each.
+     * did. It is a CONSISTENCY check between two frames, not an authentication of either. Two
+     * frames from one hostile directory agree with each other trivially — it names the same peer id
+     * in both.
+     *
+     * ⚠️ AND THE ORIGINAL TEXT HERE IS NOW OUT OF DATE, kept as the record of what was true. It
+     * added: *"the assignment's signature is verified further down (`verifyInboundAssignment`), but
+     * that happens AFTER this, and on first contact it can only prove internal consistency — so a
+     * single compromised directory still controls both frames here."* 038-KEYBIND closed the second
+     * half. First contact now verifies the assignment's threshold signature under a group key the
+     * CALLER's own identity key signed for, so a directory can no longer name a key of its choosing
+     * and cannot produce a valid assignment for a caller whose K_local it does not hold. What is
+     * still true is the first half: this check runs BEFORE that one, so at the moment it fires it is
+     * comparing two unverified frames, and that is why its own value is stated small below.
      *
      * WHAT IT DOES BUY, which is real but smaller: the two frames must agree, so an attacker who can
      * influence ONE of them and not the other is caught — a stale or replayed offer, a second
@@ -1457,8 +1465,25 @@ export function createInboundSessions(deps: InboundSessionDeps) {
        * and encoded ten; every repeat counterparty would have been given that advice.
        */
       const isIdentityChange = verdict.reason === "inbound_assignment_signer_not_pinned";
+      /**
+       * 038-KEYBIND — A THIRD CLASS, because it has a third remedy.
+       *
+       * A missing or failed key binding is neither an identity change nor a damaged frame. It means
+       * the caller's assignment carried no proof (or a bad one) that the threshold key on it belongs
+       * to their identity key. Collapsing it into `assignment.invalid` would tell them their frame
+       * was altered in transit and to start a new session — advice that cannot work, because a
+       * retry produces the same assignment with the same missing field. The action is on THEIR side
+       * and it is a re-registration.
+       */
+      const isBindingFault =
+        verdict.reason === "inbound_assignment_no_key_binding" ||
+        verdict.reason === "inbound_assignment_key_binding_invalid";
       logger.error(
-        isIdentityChange ? "session.inbound.counterparty_primary_changed" : "session.inbound.assignment.invalid",
+        isIdentityChange
+          ? "session.inbound.counterparty_primary_changed"
+          : isBindingFault
+            ? "session.inbound.assignment.key_binding_failed"
+            : "session.inbound.assignment.invalid",
         {
         sessionId: parsed.sessionIdHex,
         agentName: localAgent.name,
@@ -1468,7 +1493,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         correlationId,
         impact: isIdentityChange
           ? "the assignment for a counterparty this agent has completed sessions with did not verify under the key it recorded for them; the session was refused and no receiver was handed over, because accepting it would mean talking to whoever holds the new key under the old name"
-          : "the session assignment did not verify, so this agent refused it rather than opening its receiver to a peer named by a document it could not check; nothing was accepted and no receiver was handed over",
+          : isBindingFault
+            ? "the caller's threshold group key could not be placed against their identity — the assignment carried no signature by their own identity key naming it, or one that did not hold — so accepting would have meant recording a key a directory chose as this counterparty's identity forever; the session was refused and no receiver was handed over"
+            : "the session assignment did not verify, so this agent refused it rather than opening its receiver to a peer named by a document it could not check; nothing was accepted and no receiver was handed over",
         guidance: isIdentityChange
           ? "this is not transient. Either that counterparty genuinely re-registered — confirm OUT OF BAND (on a channel that is not this one), then run cello_contact_remove for them, which clears the pinned identity so the next session re-pins — or a directory is producing assignments for them that they did not authorise. From here the two look identical and only they can tell you which."
           // Two DIFFERENT causes, and which one it is depends on what the signature was checked
@@ -1478,9 +1505,11 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           // signed, which is what a half-rolled version upgrade looks like. Telling a pinned
           // operator "it was altered in transit" points them at the network for something no retry
           // can fix, and every node runs the same build so "try another node" is dead advice.
-          : pinnedSigner !== null
-            ? "the signature did not verify under the key this agent recorded for that counterparty. Two things produce this and they need different actions: the frame was altered in transit, OR the two of you are running different CELLO versions and disagree about what gets signed. Check `cello -v` on both sides and upgrade the older one before retrying — a retry alone will not fix a version gap, and every directory node runs the same build."
-            : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
+          : isBindingFault
+            ? "the caller's session record carries no valid proof that its threshold signing key is theirs. Nothing on your side produces this and nothing you can do here fixes it — the proof is minted on THEIR machine at registration. Tell them out of band to re-register their agent, or to retry so a different directory node serves the field. Do not clear their contact: the pin is not what failed."
+            : pinnedSigner !== null
+              ? "the signature did not verify under the key this agent recorded for that counterparty. Two things produce this and they need different actions: the frame was altered in transit, OR the two of you are running different CELLO versions and disagree about what gets signed. Check `cello -v` on both sides and upgrade the older one before retrying — a retry alone will not fix a version gap, and every directory node runs the same build."
+              : "the assignment is tampered or malformed — its signature does not match its own contents. Retry to reach a different directory node; if it repeats, that node is not producing valid assignments",
         },
       );
       refuseInboundSession({
@@ -1489,7 +1518,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         counterpartyPubkeyHex: parsed.participantAPubkeyHex,
         reason: isIdentityChange
           ? REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED
-          : REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID,
+          : isBindingFault
+            ? REFUSAL_REASONS.INBOUND_ASSIGNMENT_KEY_BINDING
+            : REFUSAL_REASONS.INBOUND_ASSIGNMENT_INVALID,
         offeredDialer: offered,
         counterpartyGuidance: isIdentityChange
           ? "They refused this session: the signing key on your assignment is not the one they " +
@@ -1498,7 +1529,13 @@ export function createInboundSessions(deps: InboundSessionDeps) {
             "them to run cello_contact_remove for you so the next session re-pins. If you did not " +
             "re-register, something is issuing assignments in your name and neither of you should " +
             "proceed until you know what."
-          : pinnedSigner !== null
+          : isBindingFault
+            ? "They refused this session: your session record did not carry the proof that its threshold " +
+              "signing key is yours — the signature your own identity key makes over that key when you " +
+              "register. Without it they would be taking a directory's word for which key is yours and " +
+              "writing it down as your identity permanently. Retrying alone will not mint it: re-register " +
+              "your agent, then start a new session."
+            : pinnedSigner !== null
             ? "They refused this session: the assignment you dialled on did not verify under the key " +
               "they recorded for you earlier. Either it was altered in transit, or the two of you are " +
               "on different CELLO versions and disagree about what gets signed. Compare `cello -v` " +
@@ -1524,7 +1561,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
      * daemon chooses a permanent trust anchor for a counterparty and has nothing to check it
      * against. Pinned stays at debug — that one is the boring, good case.
      */
-    const firstContact = verdict.mode === "internal";
+    const firstContact = verdict.mode === "bound";
     // Carried to the AGENT, not just the log — review F6. `internal` is the wire word for the mode;
     // `first_contact` is what it means to the person reading it.
     const verification: "pinned" | "first_contact" = firstContact ? "first_contact" : "pinned";
@@ -1535,13 +1572,15 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       ...(firstContact
         ? {
             impact:
-              "FIRST CONTACT. The signature is internally consistent, which proves the frame was not " +
-              "altered after signing — it does NOT prove which directory signed it, because there is " +
-              "no earlier key recorded for this counterparty to check against. The key in this frame " +
-              "is being pinned now and every later session with them is measured against it.",
+              "FIRST CONTACT. The threshold key on this assignment was signed for by the caller's own " +
+              "identity key, so no directory could have put a key of its choosing there, and the " +
+              "assignment's signature verifies under that bound key. What is NOT established is who " +
+              "the caller is: the identity key itself is the thing you were given out of band. It is " +
+              "being pinned now and every later session with them is measured against it.",
             guidance:
-              "If this counterparty matters, confirm their pubkey out of band before relying on the " +
-              "seal. Once pinned, a substitution IS caught.",
+              "If this counterparty matters, confirm their 64-hex pubkey with them out of band before " +
+              "relying on the seal — that is the one value nothing on this frame can vouch for. Once " +
+              "pinned, a substitution IS caught.",
           }
         : {}),
       correlationId,

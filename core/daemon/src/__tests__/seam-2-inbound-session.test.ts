@@ -39,7 +39,7 @@ import { computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -123,7 +123,10 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   async function start(opts: {
@@ -244,7 +247,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     // Per-agent standing receiver (DOD-LOOP-1): an inbound assignment for bob can only be accepted
     // once bob's agent is online and his SR exists — provision it as cello_start_agent would.
     await snm.ensureStandingReceiverForAgent("bob");
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
 
     injectRef.inject!(await signedAssignmentFrame({
       initiatorPubkeyHex: initiatorPubkey,
@@ -275,7 +278,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
      */
     const verified = events.find((e) => e.event === "session.inbound.assignment.verified");
     expect(verified, "the responder must record that it verified the assignment").toBeDefined();
-    expect(["pinned", "internal"]).toContain(verified?.context?.["mode"]);
+    expect(["pinned", "bound"]).toContain(verified?.context?.["mode"]);
     expect(
       events.find((e) => e.event === "session.inbound.assignment.unverified"),
       "the deferred-verification event must be GONE — it contradicted the verification above",
@@ -316,7 +319,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       const awaitP = client.send("cello_await_session", { timeout_ms: 2000 }) as Promise<Record<string, unknown>>;
       await wait(40); // ensure the waiter is registered
 
-      const initiatorPubkey = "ab".repeat(32);
+      const initiatorPubkey = fixtureIdentity().pubkeyHex;
       injectRef.inject!(await signedAssignmentFrame({
         initiatorPubkeyHex: initiatorPubkey,
         counterpartyPubkeyHex: bobPubkey,
@@ -341,7 +344,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
 
     // Per-agent SR (DOD-LOOP-1): bob must be online for his inbound assignment to be accepted.
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     const frame = await signedAssignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" });
     injectRef.inject!(frame);
     await wait(120);
@@ -379,8 +382,8 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
     const sidB = Uint8Array.from(Array.from({ length: 16 }, (_, i) => i + 100));
-    const initA = "11".repeat(32);
-    const initB = "22".repeat(32);
+    const initA = fixtureIdentity().pubkeyHex;
+    const initB = fixtureIdentity().pubkeyHex;
     // Both frames are built (and signed) BEFORE either is pushed, so the two pushes are still
     // back-to-back with nothing awaited between them — that burst is the whole point of M2.
     // Two distinct initiators means two distinct counterparties, so each may carry its own signer.
@@ -416,7 +419,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     const h = await start({ logger, node, signalingConnect: makeInjectableSignaling(captured, injectRef) });
     await wait(50);
 
-    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: "cd".repeat(32), counterpartyPubkeyHex: bobPubkey })); // no peer id
+    injectRef.inject!(assignmentFrame({ initiatorPubkeyHex: fixtureIdentity().pubkeyHex, counterpartyPubkeyHex: bobPubkey })); // no peer id
     await wait(80);
 
     expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
@@ -436,7 +439,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(50);
 
     injectRef.inject!(assignmentFrame({
-      initiatorPubkeyHex: "cd".repeat(32), counterpartyPubkeyHex: bobPubkey,
+      initiatorPubkeyHex: fixtureIdentity().pubkeyHex, counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-peer", signatureType: "single",
     }));
     await wait(80);
@@ -470,7 +473,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
       await snm.ensureStandingReceiverForAgent("bob");
 
       injectRef.inject!(assignmentFrame({
-        initiatorPubkeyHex: "cd".repeat(32),
+        initiatorPubkeyHex: fixtureIdentity().pubkeyHex,
         counterpartyPubkeyHex: bobPubkey,
         initiatorPeerId: "alice-session-peer-id",
         counterpartyPeerId,
@@ -544,7 +547,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(60); // onDisconnect evicts the dead waiter
 
     // Now the directory pushes the session. The dead waiter must NOT swallow it.
-    const initiatorPubkey = "ef".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     injectRef.inject!(await signedAssignmentFrame({ initiatorPubkeyHex: initiatorPubkey, counterpartyPubkeyHex: bobPubkey, initiatorPeerId: "alice-peer" }));
     await wait(120);
 
@@ -571,7 +574,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(50);
 
     injectRef.inject!(assignmentFrame({
-      initiatorPubkeyHex: "cd".repeat(32),
+      initiatorPubkeyHex: fixtureIdentity().pubkeyHex,
       counterpartyPubkeyHex: "ee".repeat(32), // not a local agent
       initiatorPeerId: "alice-session-peer-id",
     }));
@@ -649,7 +652,7 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
 
     const DIR_SIG = Uint8Array.from(Array.from({ length: 64 }, (_, i) => (i * 7 + 3) & 0xff));
     injectRef.inject!(await signedAssignmentFrame({
-      initiatorPubkeyHex: "cd".repeat(32),
+      initiatorPubkeyHex: fixtureIdentity().pubkeyHex,
       counterpartyPubkeyHex: bobPubkey,
       initiatorPeerId: "alice-session-peer-id",
       relayDirectorySignature: DIR_SIG,

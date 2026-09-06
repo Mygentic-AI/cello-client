@@ -53,6 +53,7 @@ import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
+import { registerFixtureSigner } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -205,7 +206,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   async function start(opts: {

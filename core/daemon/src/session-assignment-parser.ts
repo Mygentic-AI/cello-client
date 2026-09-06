@@ -216,7 +216,29 @@ export function parseSessionAssignment(
   if (sigType === "frost") {
     const signerPubkey = toU8Safe(raw["signer_pubkey"]);
     if (!signerPubkey || signerPubkey.length !== 32) return null;
-    return { ...common, signature_type: "frost" as const, signer_pubkey: signerPubkey };
+    /**
+     * 038-KEYBIND — the key bindings are SHAPE-CHECKED HERE AND JUDGED IN `assignment-verify.ts`.
+     *
+     * A wrong-length value yields `undefined`, which the verifiers treat exactly as absent: both
+     * take the REFUSE path, and refuse by name. That is the missing/malformed/mismatched collapse
+     * the milestone requires — there is no shape of these fields that reaches a session.
+     *
+     * They are NOT rejected here (a `return null`) on purpose. `null` from this parser means "the
+     * assignment was malformed", which tells an operator nothing about which protection stopped
+     * them. Carrying the absence one layer further is what lets the refusal say
+     * "this counterparty's directory did not supply the proof that its group key is theirs".
+     */
+    const bindA = toU8Safe(raw["participant_a_key_binding"]);
+    const bPrimary = toU8Safe(raw["participant_b_primary_pubkey"]);
+    const bindB = toU8Safe(raw["participant_b_key_binding"]);
+    return {
+      ...common,
+      signature_type: "frost" as const,
+      signer_pubkey: signerPubkey,
+      participant_a_key_binding: bindA && bindA.length === 64 ? bindA : undefined,
+      participant_b_primary_pubkey: bPrimary && bPrimary.length === 32 ? bPrimary : undefined,
+      participant_b_key_binding: bindB && bindB.length === 64 ? bindB : undefined,
+    };
   }
   return { ...common, signature_type: "single" as const };
 }

@@ -272,6 +272,11 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
       // `true` here means "readable", so `relayOnly: null` is a genuine OFF rather than an unknown —
       // which is what the off-path test below needs in order to be testing what it claims.
       hasDatabase: () => true,
+      // 038-KEYBIND: the initiator pins the responder group key the negotiation proved, and
+      // compares it against any key recorded for that counterparty before — no pin here, so the
+      // comparison passes and this suite stays about the DIAL.
+      recordCounterpartyPrimary: () => {},
+      getPinnedCounterpartyPrimary: () => null,
       createSessionNode: async () => ({ ok: true }),
       // The handler records the session's chain starting point right after the node is created.
       recordSessionGenesis: () => {},
@@ -289,7 +294,7 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
       resolveCurrentAgent: (_c, explicit) => explicit ?? null,
       NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
       resolvedSessionNegotiator: {
-        negotiate: async () => ({ ok: true as const, assignment }),
+        negotiate: async () => ({ ok: true as const, assignment, counterpartyPrimaryHex: "11".repeat(32) }),
       } as unknown as SessionNegotiator,
       transportSelector: { dial: async () => ({ ok: true, mode: "relay" }) } as never,
       autoNatService: { getDialability: () => ({ dialable: false }) } as unknown as IAutoNatService,

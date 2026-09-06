@@ -846,13 +846,18 @@ export async function verifyUnilateralCertificate(
  * primary value is OUT-OF-BAND (any holder of the signer's primary — e.g. an arbitrator — can verify
  * an exported cert's legibility).
  *
- * SYMMETRY STATUS: the counterparty-primary branch (below) IS built — the RESPONDER records the
- * session initiator's primary from the FROST-signed SessionAssignment at accept time
- * (recordCounterpartyPrimary, daemon.ts). The missing half is the INITIATOR-records-RESPONDER
- * direction: an initiator never learns the responder's primary, so when the responder closes first,
- * the initiator cannot verify locally and accepts with reason `signer_key_not_held`. Making the
- * directory hand EACH party the other's primary (so both closing orders verify) is F2-b — a
- * cross-repo protocol addition, not done here.
+ * SYMMETRY STATUS: SYMMETRIC as of 038-KEYBIND, and the old text is worth stating because it names
+ * what was broken. It read: *"The missing half is the INITIATOR-records-RESPONDER direction: an
+ * initiator never learns the responder's primary, so when the responder closes first, the initiator
+ * cannot verify locally and accepts with reason `signer_key_not_held`."* That was exactly right,
+ * and it is now closed: the session assignment carries `participant_b_primary_pubkey` alongside a
+ * binding signed by participant_b's own K_local, the initiator verifies that binding before it will
+ * accept the assignment at all, and `initiate-session-handler.ts` records the result. Both closing
+ * orders verify locally.
+ *
+ * `signer_key_not_held` therefore no longer describes an ordinary responder-first close. It remains
+ * reachable — a session row that predates the recording, or one whose assignment never reached this
+ * path — and it is still the honest answer in those cases, which is why the branch stays.
  *
  * `legibility` MUST be the AS-RECEIVED wire object (not a normalised copy) — the directory signed
  * over the canonical hash of exactly what it sent.

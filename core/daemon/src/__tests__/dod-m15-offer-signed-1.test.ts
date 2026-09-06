@@ -40,7 +40,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createInboundSessions, type InboundSessionDeps } from "../inbound-sessions.js";
 import { TIER } from "../contacts-tier-migration.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -58,7 +58,7 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
 
 const AGENT = "alice";
 const AGENT_PUBKEY = "bb".repeat(32);
-const COUNTERPARTY = "aa".repeat(32);
+const COUNTERPARTY = fixtureIdentity().pubkeyHex;
 const SESSION_ID = new Uint8Array(16).fill(9);
 const REAL_DIALER = "12D3KooWRealInitiator";
 

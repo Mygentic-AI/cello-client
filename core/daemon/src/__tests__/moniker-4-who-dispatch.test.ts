@@ -17,7 +17,7 @@ import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import { NotificationDispatcher } from "../notification-dispatcher.js";
 import type { Logger, DaemonConfig, IpcNotification } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
@@ -192,7 +192,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
 
   it("offered name (stranger): who = offered, whoKnown = false; pet name (contact): who = pet, whoKnown = true", async () => {
     const h = await startHarness();
-    const initiator = "cd".repeat(32);
+    const initiator = fixtureIdentity().pubkeyHex;
     // One quorum key across both offers — see assignmentFrame: the first session pins it.
     const quorum = generateKeypair();
 
@@ -233,7 +233,7 @@ describe("MONIKER-4 AC2 e2e — the created doorbell carries the resolved who", 
 
   it("no name anywhere → who is the fingerprint, whoKnown false", async () => {
     const h = await startHarness();
-    const initiator = "ce".repeat(32);
+    const initiator = fixtureIdentity().pubkeyHex;
 
     h.inject(await assignmentFrame(initiator, h.bobPubkey));
     await wait(150);
