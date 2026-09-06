@@ -3736,14 +3736,15 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   // ─── The content pipeline's public surface, kept on the manager ────────────────────────────
   //
-  // These seven live in `session-content-pipeline.ts`; their documentation is there, next to the
-  // code it describes. They stay reachable here because 451 call sites across the daemon and its
-  // tests name them on the manager, and moving those is a change to every caller for no gain.
+  // Two of these live in `session-content-send.ts` and five in `session-content-ingest.ts`; the
+  // return types below say which. Their documentation is there, next to the code it describes.
+  // They stay reachable here because 451 call sites across the daemon and its tests name them on
+  // the manager, and moving those is a change to every caller for no gain.
   //
   // ⚠️ The signatures are DERIVED, not copied. `sendContent` alone carries ~60 lines of parameter
   // documentation and a five-branch return type; a hand-copied duplicate of that is a second
   // declaration that drifts from the first, silently, the moment either is edited. Deriving them
-  // makes drift impossible — a change to the pipeline's signature is a change to this one.
+  // makes drift impossible — a change to the moved signature is a change to this one.
 
   ingestReceivedContent(
     ...args: Parameters<SessionContentIngest["ingestReceivedContent"]>
