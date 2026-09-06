@@ -123,11 +123,10 @@ describe("DOD-M15-SEALWIRE-1 part A: the announcement rides a real connection", 
     // The session must name the REAL dialer as its counterparty: the connect handler filters on
     // exactly that peer id, so a fixture's placeholder would be discarded as an unrelated peer —
     // and the test would pass for the wrong reason.
-    const created = await fx.snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
-// `createSessionNode` sits below the paths that record a session's starting point, so a
-// fixture using it directly builds a shape production cannot. Seed it the way production
-// derives it — see `setSessionAnchorForTest`.
+    const created = await fx.// The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+// session it cannot anchor, and a fixture builds one below the paths that record it.
 snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     fx.snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     expect(created.ok, "the session node must come up before anything can connect to it").toBe(true);
@@ -157,11 +156,10 @@ snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_
     peer = await startCounterparty(inbox);
     ({ fx } = await fixtureWithRealNode("cello-salt-ann-b-"));
 
-    const created = await fx.snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
-// `createSessionNode` sits below the paths that record a session's starting point, so a
-// fixture using it directly builds a shape production cannot. Seed it the way production
-// derives it — see `setSessionAnchorForTest`.
+    const created = await fx.// The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+// session it cannot anchor, and a fixture builds one below the paths that record it.
 snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     fx.snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const addr = dialableAddr(fx, created);
@@ -201,11 +199,10 @@ snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_
     peer = await startCounterparty(inbox);
     ({ fx } = await fixtureWithRealNode("cello-salt-ann-c-"));
 
-    const created = await fx.snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
-// `createSessionNode` sits below the paths that record a session's starting point, so a
-// fixture using it directly builds a shape production cannot. Seed it the way production
-// derives it — see `setSessionAnchorForTest`.
+    const created = await fx.// The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+// session it cannot anchor, and a fixture builds one below the paths that record it.
 snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+snm.createSessionNode(SID, "alice", "bobpubkeyhex", peer.getPeerId(), "salt-test");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     fx.snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const addr = dialableAddr(fx, created);

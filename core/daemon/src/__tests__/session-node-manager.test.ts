@@ -834,11 +834,10 @@ describe("SessionNodeManager — integration tests", () => {
     cleanupNodes.push(counterparty);
     try {
       const sid = "1b".repeat(16);
-      const created = await manager.createSessionNode(sid, "alice", "bpub", counterparty.getPeerId(), "corr");
- // `createSessionNode` sits below the paths that record a session's starting point, so a
- // fixture using it directly builds a shape production cannot. Seed it the way production
- // derives it — see `setSessionAnchorForTest`.
+      const created = // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+ // session it cannot anchor, and a fixture builds one below the paths that record it.
  manager.setSessionAnchorForTest("alice", sid, "bpub", "bpub", 1_700_000_000_000);
+ await manager.createSessionNode(sid, "alice", "bpub", counterparty.getPeerId(), "corr");
       expect(created.ok).toBe(true);
       if (!created.ok) return;
 
@@ -867,11 +866,10 @@ describe("SessionNodeManager — integration tests", () => {
     await seedAgents(manager.getDb(), ["alice"]);
     try {
       const sid = "1c".repeat(16);
-      await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
-      // `createSessionNode` sits below the paths that record a session's starting point, so a
-      // fixture using it directly builds a shape production cannot. Seed it the way production
-      // derives it — see `setSessionAnchorForTest`.
+      // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+      // session it cannot anchor, and a fixture builds one below the paths that record it.
       manager.setSessionAnchorForTest("alice", sid, "bpub", "bpub", 1_700_000_000_000);
+      await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
       const r = await manager.connectToCounterparty("alice", sid, []);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.reason).toBe("no_counterparty_addrs");

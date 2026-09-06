@@ -5450,49 +5450,19 @@ export class SessionNodeManager {
     }
 
     /**
-     * ─── A SESSION WITH NO DIRECTORY ASSIGNMENT IS REFUSED, AND THE OPERATOR IS TOLD ─────────────
+     * ⚠️ THE "NO ASSIGNMENT" REFUSAL IS NOT HERE, AND THE PLACE IT MOVED TO IS THE POINT.
      *
-     * `DOD-M15-SELFCHAIN-1`, ruled 2026-09-06: *"An attempt to create a session without an
-     * assignment is suspicious and should be treated like other oddities that indicate the
-     * counterparty may be a malicious agent. It should be refused"* — and surfaced.
+     * `DOD-M15-SELFCHAIN-1`, ruled 2026-09-06: a session offered with no directory assignment is
+     * suspicious and must be refused and surfaced. It was briefly enforced HERE, and that was the
+     * wrong door: `createSessionNode` also runs on this agent's OWN outbound path, where the
+     * counterparty has no say in whether an assignment exists. A refusal there fires on our own
+     * initiations and says nothing about anyone's conduct.
      *
-     * ⚠️ WHAT THE ASSIGNMENT CARRIES THAT MAKES THIS A SECURITY REFUSAL RATHER THAN A MISSING
-     * OPTIONAL. Every real session is brokered: the directory FROST-signs an establishment record
-     * and each side verifies that signature before the session begins. Field 4 of those signed
-     * bytes is the conversation's STARTING POINT, and every first message chains to it. A session
-     * without one is a conversation whose order could never be proven — by either party, ever.
-     *
-     * Nothing legitimate produces it. Both production paths that create a session hold a verified
-     * assignment: the inbound accept path refuses an assignment it cannot parse or verify, and the
-     * initiate path builds from one. So reaching here means either a peer opening a conversation
-     * that would leave no provable record, or software that cannot participate in one.
-     *
-     * ⚠️ REFUSED **AND** SURFACED. A detection that only logs is not a control (M15 invariant 2):
-     * the durable refusal is what reaches `cello_inbox`, carrying `REFUSAL_GUIDANCE`'s sentence,
-     * which tells the operator to confirm out of band before accepting anything from them.
-     *
-     * ⚠️ AND IT NAMES WHAT WAS OBSERVED, NEVER A VERDICT. The same signal is produced by a hostile
-     * peer and by a counterparty running a build that predates brokered sessions, and this side
-     * cannot tell them apart — so the wording says what is missing and what it costs, and never
-     * that anyone is malicious.
+     * A counterparty can only attempt it INBOUND, so that is where it is refused and recorded —
+     * see `inbound-sessions.ts`. What remains true here is the correctness backstop: a session with
+     * no anchor cannot sign a chained message, so the SEND path refuses (`session_unchainable`)
+     * rather than emitting a message whose place could never be proven.
      */
-    if (!relay?.assignment && !this.#sessionGenesisPrevRoot(agentName, sessionId)) {
-      this.#logger.error("session.node.refused.no_assignment", {
-        agentName,
-        sessionId,
-        counterpartyPubkey,
-        impact:
-          "a session was offered with no directory assignment, so it has no agreed starting point " +
-          "and no message on it could ever be placed in a provable order. It was REFUSED and " +
-          "recorded for the operator's inbox.",
-      });
-      this.recordRefusedSession(agentName, sessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
-      return {
-        ok: false,
-        reason: REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT,
-        guidance: REFUSAL_GUIDANCE[REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT],
-      };
-    }
 
     // The session node N_A: either a FRESH ephemeral node (default), or — for the initiator
     // path (reuseStandingReceiver) — the standing receiver handed off as the session node. The
@@ -8346,7 +8316,10 @@ export class SessionNodeManager {
     const bytes = stored instanceof Uint8Array ? stored : Buffer.isBuffer(stored) ? new Uint8Array(stored) : null;
     // A stored value of the wrong width is not a genesis. Refusing it here sends the caller down its
     // own named refusal, which is a better outcome than signing an acknowledgement of 17 bytes.
-    return bytes && bytes.length === 32 ? bytes : undefined;
+    if (bytes && bytes.length === 32) return bytes;
+    // LAST, and only ever populated by `setSessionAnchorForTest` — a fixture building a session
+    // below the paths that record one. Read after both real sources so it cannot shadow either.
+    return this.#testAnchors.get(this.#k(agentName, sessionId));
   }
 
   /**
@@ -14270,16 +14243,28 @@ export class SessionNodeManager {
     participantBPubkeyHex: string,
     sessionTimestamp: number,
   ): void {
+    /**
+     * ⚠️ SEEDED IN MEMORY AS WELL AS ON DISK, AND CALLED BEFORE `createSessionNode`.
+     *
+     * `createSessionNode` REFUSES a session it cannot anchor, so a fixture that writes the column
+     * afterwards is too late — the session never gets created. The in-memory copy is what the
+     * refusal consults, and it is read LAST in `#sessionGenesisPrevRoot`, after the live assignment
+     * and after the stored row, so it can never shadow a real value.
+     */
     const genesis = computeGenesisPrevRoot(
       new Uint8Array(Buffer.from(participantAPubkeyHex, "hex")),
       new Uint8Array(Buffer.from(participantBPubkeyHex, "hex")),
       new Uint8Array(Buffer.from(sessionId, "hex")),
       sessionTimestamp,
     );
+    this.#testAnchors.set(this.#k(agentName, sessionId), genesis);
     this.#db
       ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
       .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
   }
+
+  /** See `setSessionAnchorForTest`. Empty in production — nothing outside a fixture writes it. */
+  readonly #testAnchors = new Map<string, Uint8Array>();
 
   /**
    * Hand the relay a leaf this agent RECEIVED whose author never submitted it — 034-CARRYLEAF.

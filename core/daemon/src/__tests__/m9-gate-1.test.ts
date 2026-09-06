@@ -119,11 +119,10 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     await mgr.initialize();
     // DOD-AGENT-ID-JOINKEY-1: production always has an `agents` row before any session exists.
     await seedAgents(mgr.getDb(), ["alice"]);
-    await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-gate1");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
     mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-gate1");
     return { mgr, storeDb, storeKey };
   }
 

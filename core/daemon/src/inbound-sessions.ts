@@ -1115,15 +1115,70 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     }
   }
 
-  function handleInboundSessionAssignment(frame: Record<string, unknown>): void {
+  /**
+   * @param streamAgentName the agent whose OWN signaling stream carried this frame. Needed because
+   *   a frame with no parseable assignment cannot say which local agent it was addressed to — and
+   *   the refusal below still has to be filed under someone, or the operator never sees it.
+   */
+  function handleInboundSessionAssignment(frame: Record<string, unknown>, streamAgentName?: string): void {
     // M4: one correlationId minted per inbound flow, threaded through EVERY event below.
     const correlationId = randomUUID();
     const parsed = extractInboundSessionAssignment(frame);
     if (!parsed) {
-      logger.warn("session.inbound.assignment.malformed", {
-        reason: "missing_assignment_or_ids",
+      /**
+       * ─── A SESSION OFFERED WITH NO DIRECTORY ASSIGNMENT — `DOD-M15-SELFCHAIN-1` ────────────────
+       *
+       * Ruled 2026-09-06: this is suspicious, is refused, and the operator is TOLD. It used to be a
+       * `warn` and a bare `return` — the shape this milestone exists to remove. The refusal was
+       * correct and its only consumer was a log file nobody opens.
+       *
+       * ⚠️ WHY IT IS A SECURITY REFUSAL RATHER THAN A MALFORMED FRAME. Every real session is
+       * brokered: the directory FROST-signs an establishment record and each side verifies that
+       * signature before the session begins. Field 4 of those signed bytes is the conversation's
+       * STARTING POINT, and every first message chains to it. A session offered without one is a
+       * conversation whose order could never be proven — by either party, ever — so the thing being
+       * offered is a conversation that leaves no record, which is a reason to refuse rather than a
+       * shape to tidy up.
+       *
+       * ⚠️ THIS IS THE DOOR A COUNTERPARTY CAN ACTUALLY REACH, which is why the refusal lives here
+       * and not at session creation: `createSessionNode` also runs on this agent's own outbound
+       * path, where the counterparty has no say and a refusal would say nothing about conduct.
+       *
+       * ⚠️ AND IT NAMES WHAT WAS OBSERVED, NEVER A VERDICT. The same frame comes from a hostile peer
+       * and from a counterparty on a build that predates brokered sessions, and this side cannot
+       * tell them apart — so the notice says what is missing and what it costs, never that anyone
+       * is malicious.
+       *
+       * Best-effort identifiers: the frame did not parse, so the session id and sender are read
+       * defensively and fall back to empty. A refusal the operator can see with a partial id beats
+       * one they cannot see at all.
+       */
+      const looseSessionId = typeof frame["session_id"] === "string" ? frame["session_id"] : "";
+      const looseSender = typeof frame["sender_pubkey"] === "string" ? frame["sender_pubkey"] : "";
+      logger.error("session.inbound.assignment.no_assignment", {
+        sessionId: looseSessionId,
+        counterpartyPubkey: looseSender,
         correlationId,
+        impact:
+          "a session was offered with no directory assignment, so it carries no agreed starting " +
+          "point and no message on it could ever be placed in a provable order. REFUSED, and " +
+          "recorded for the operator's inbox.",
       });
+      /**
+       * Filed under the agent whose stream carried it. Without a parseable assignment there is no
+       * `participant_b` to look the agent up by, so the STREAM is the only thing that says who this
+       * was aimed at — and it is a sound answer, because each agent has its own signaling stream.
+       *
+       * When the frame arrived on the shared manager rather than a per-agent one, there is no such
+       * answer and the error log above is the whole record. Said plainly rather than filed under a
+       * guessed agent: a refusal shown to the wrong operator is worse than one shown to none.
+       */
+      if (streamAgentName) {
+        recordRefusal(streamAgentName, looseSessionId, looseSender, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
+        if (looseSessionId) {
+          sessionNodeManager.recordRefusedSession(streamAgentName, looseSessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
+        }
+      }
       return;
     }
 
@@ -1548,14 +1603,14 @@ export function createInboundSessions(deps: InboundSessionDeps) {
     }
   }
 
-  function wirePerAgentSessionInbound(mgr: SignalingManager): void {
+  function wirePerAgentSessionInbound(mgr: SignalingManager, streamAgentName?: string): void {
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "seal_interrupted_request") return;
       void handleInboundSealInterruptedRequest(frame as Record<string, unknown>);
     });
     mgr.registerInboundHandler((frame) => {
       if (frame["type"] !== "session_assignment") return;
-      handleInboundSessionAssignment(frame as Record<string, unknown>);
+      handleInboundSessionAssignment(frame as Record<string, unknown>, streamAgentName);
     });
   }
   // CONN-001: test path only — the shared manager's inbound session/seal responders. Production

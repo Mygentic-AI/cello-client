@@ -1270,7 +1270,7 @@ async function startDaemonHoldingLock(
     });
     // CELLO-M7-CONN-001 (DOD-CONN-2): inbound session_assignment + seal_interrupted_request
     // on THIS agent's own stream, so a non-primary agent receives inbound sessions (SPINE-5).
-    wirePerAgentSessionInbound(mgr);
+    wirePerAgentSessionInbound(mgr, agentName);
     return entry;
   }
 

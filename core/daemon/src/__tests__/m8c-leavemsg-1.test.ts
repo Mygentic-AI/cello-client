@@ -118,6 +118,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => { parkCalls++; return { ok: true }; });
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -125,10 +128,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("leave a message");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -151,6 +150,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: true }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -158,10 +160,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("why did this park?");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -182,11 +180,10 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
     snm.setContentParkHook(async () => ({ ok: true })); // would deposit, but no relay is wired for this session
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000); // no relay param
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay param
 
     const content = new TextEncoder().encode("hello");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -200,6 +197,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => { throw new Error("relay_deposit_failed: relay unreachable"); });
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -207,10 +207,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("hello");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -231,6 +227,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -238,10 +237,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("hello");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -267,6 +262,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -274,10 +272,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("must not vanish");
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
@@ -334,11 +328,10 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000); // no relay
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to park");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -374,6 +367,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => { hookCalls++; return { ok: true }; });
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -381,10 +377,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     expect(snm.injectParkFault(1)).toBe(1);
     const content = new TextEncoder().encode("injected refusal");
@@ -419,6 +411,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -426,10 +421,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("queued, not lost");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -454,11 +445,10 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await makeAgentDir("alice");
     const h = await start(new FakeNode({ newStreamFails: true }));
     const snm = h.getSessionNodeManager();
-    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000); // no relay
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to go");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -478,6 +468,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -485,10 +478,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const client = await connectAs("alice");
     const res = await client.send("cello_send", { session_id: SID, content: "queued but committed" }) as Record<string, unknown>;
@@ -520,6 +509,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -527,10 +519,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // A persist that throws is the production shape of "not durable" on a relay-configured session:
     // enqueueAwaitingContent fails loud on a real DB failure precisely because the content is lost.
     snm.setAwaitingAckHooks({ onParkFailed: () => { throw new Error("disk full"); } });
@@ -556,6 +544,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -563,10 +554,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const same = new TextEncoder().encode("ok");
     const first = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-1");
@@ -593,6 +580,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setAwaitingAckHooks({}); // as if the composition root never wired it
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -600,10 +590,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("no hook, no queue");
     const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
@@ -617,6 +603,9 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: true })); // deposit succeeds
 
     const kp = generateKeypair();
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -624,10 +613,6 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
       senderPubkey: await kp.getPublicKey(),
       sessionIdBytes: Buffer.from(SID, "hex"),
     });
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
 
     const client = await connectAs("alice");
     const res = await client.send("cello_send", { session_id: SID, content: "leave a message for bob" }) as Record<string, unknown>;

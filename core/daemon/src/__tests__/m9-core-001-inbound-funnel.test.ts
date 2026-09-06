@@ -108,11 +108,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     // DOD-AGENT-ID-JOINKEY-1: ingestReceivedContent/createSessionNode resolve the NAME against a
     // real `agents` row — production always has one by the time a session exists.
     await seedAgents(mgr.getDb(), ["alice"]);
-    await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-1");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
     mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     return mgr;
   }
 
@@ -292,11 +291,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
 
     it("regression: with a sessions row, ingest still delivers and attributes the sender from the record", async () => {
       const { mgr } = await setupCapturing();
-      await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
-      // `createSessionNode` sits below the paths that record a session's starting point, so a
-      // fixture using it directly builds a shape production cannot. Seed it the way production
-      // derives it — see `setSessionAnchorForTest`.
+      // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+      // session it cannot anchor, and a fixture builds one below the paths that record it.
       mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+      await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
       const content = enc("attributed message");
       const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
       expect(res.ok).toBe(true);
@@ -313,11 +311,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     it("F1: a session whose row write fails is refused at creation (session_persist_failed), not left live-but-orphaned", async () => {
       const { mgr } = await setupCapturing();
       mgr.getDb().exec("DROP TABLE sessions"); // force the row write to fail
-      const res = await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-f1");
- // `createSessionNode` sits below the paths that record a session's starting point, so a
- // fixture using it directly builds a shape production cannot. Seed it the way production
- // derives it — see `setSessionAnchorForTest`.
+      const res = // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+ // session it cannot anchor, and a fixture builds one below the paths that record it.
  mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+ await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-f1");
       expect(res.ok).toBe(false);
       expect((res as { reason: string }).reason).toBe("session_persist_failed");
       // No live node remains — a rowless session is a dead session by definition after D4a.

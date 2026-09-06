@@ -198,11 +198,10 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     managers.push(mgrA);
     await seedAgentKeys(mgrA.getDb(), ["alice"]);
     await wireAgentKeyProviders(mgrA, mgrA.getDb());
-    await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
-    // `createSessionNode` sits below the paths that record a session's starting point, so a
-    // fixture using it directly builds a shape production cannot. Seed it the way production
-    // derives it — see `setSessionAnchorForTest`.
+    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
+    // session it cannot anchor, and a fixture builds one below the paths that record it.
     mgrA.setSessionAnchorForTest("alice", SID, "bobpk", "bobpk", 1_700_000_000_000);
+    await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
