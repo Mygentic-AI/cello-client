@@ -121,7 +121,7 @@ describe("M9-GATE-1: the park-recovery producer is screened by a REAL gateway pr
     await seedAgents(mgr.getDb(), ["alice"]);
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    mgr.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-gate1");
     return { mgr, storeDb, storeKey };
   }

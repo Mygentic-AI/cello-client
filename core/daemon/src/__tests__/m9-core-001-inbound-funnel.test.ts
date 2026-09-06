@@ -110,7 +110,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     await seedAgents(mgr.getDb(), ["alice"]);
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    mgr.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-1");
     return mgr;
   }
@@ -293,7 +293,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       const { mgr } = await setupCapturing();
       // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
       // session it cannot anchor, and a fixture builds one below the paths that record it.
-      mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+      mgr.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
       await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
       const content = enc("attributed message");
       const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
@@ -313,7 +313,7 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       mgr.getDb().exec("DROP TABLE sessions"); // force the row write to fail
       const res = // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
  // session it cannot anchor, and a fixture builds one below the paths that record it.
- mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+ mgr.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
  await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-f1");
       expect(res.ok).toBe(false);
       expect((res as { reason: string }).reason).toBe("session_persist_failed");

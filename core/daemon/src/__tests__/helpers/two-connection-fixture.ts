@@ -253,10 +253,20 @@ export async function startTwoConnectionFixture(
        */
       const agreeGenesis = () =>
         snm.setSessionGenesisForTest(agent, sessionId, new Uint8Array(32).fill(0x9c));
+      /**
+       * ⚠️ THE GENESIS IS SEEDED BEFORE THE SESSION NODE, and the order is load-bearing —
+       * `DOD-M15-SELFCHAIN-1`.
+       *
+       * `createSessionNode` registers the session with the relay client, and the client seeds its
+       * acknowledgement state from the session's starting point AT THAT MOMENT. Seeding afterwards
+       * leaves that state empty, and every send on the fixture is then refused for having nothing
+       * to chain to — the fixture would exercise a refusal path instead of the behaviour it was
+       * written for, which is the failure this seam exists to prevent.
+       */
+      agreeGenesis();
       if (!sessionOpts?.relay) {
         await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
         agreeKey();
-        agreeGenesis();
         return;
       }
       // A REAL keypair, not a stub: the park path signs the entry, and `sealParkEnvelope` is the
@@ -272,7 +282,6 @@ export async function startTwoConnectionFixture(
         sessionIdBytes: Buffer.from(sessionId, "hex"),
       });
       agreeKey();
-      agreeGenesis();
     },
     seedSent(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();

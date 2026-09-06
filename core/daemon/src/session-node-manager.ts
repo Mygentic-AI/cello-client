@@ -8317,9 +8317,9 @@ export class SessionNodeManager {
     // A stored value of the wrong width is not a genesis. Refusing it here sends the caller down its
     // own named refusal, which is a better outcome than signing an acknowledgement of 17 bytes.
     if (bytes && bytes.length === 32) return bytes;
-    // LAST, and only ever populated by `setSessionAnchorForTest` — a fixture building a session
+    // LAST, and only ever populated by `setSessionGenesisForTest` — a fixture building a session
     // below the paths that record one. Read after both real sources so it cannot shadow either.
-    return this.#testAnchors.get(this.#k(agentName, sessionId));
+    return this.#testGenesis.get(this.#k(agentName, sessionId));
   }
 
   /**
@@ -8329,6 +8329,30 @@ export class SessionNodeManager {
    * change for the life of a session, so the second writer is either redundant or wrong, and the
    * first write is the one derived closest to the assignment that opened the session.
    */
+  /**
+   * Record the session's starting point from the ASSIGNMENT, for a session that has one and no
+   * relay params — `DOD-M15-SELFCHAIN-1`.
+   *
+   * ⚠️ THE ANCHOR BELONGS TO THE SESSION, NOT TO THE RELAY, and treating it as the relay's was a
+   * real gap. It was persisted only when `relay.assignment` was present, which is relay-mode only —
+   * so a DIRECT-mode session, which is brokered and FROST-signed exactly like any other, recorded
+   * no starting point at all. Every message on it then had nothing to chain to.
+   *
+   * Both transport modes get their assignment from the same ceremony and derive the same value from
+   * it. The relay is how the conversation travels; it is not what makes the conversation provable.
+   */
+  recordSessionGenesis(
+    agentName: string,
+    sessionId: string,
+    participantA: Uint8Array,
+    participantB: Uint8Array,
+    sessionTimestamp: number,
+  ): void {
+    this.#persistGenesisPrevRoot(agentName, sessionId, {
+      participantA, participantB, sessionTimestamp,
+    } as RelayAssignmentCarry);
+  }
+
   #persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
     if (!this.#db) return;
     try {
@@ -14208,63 +14232,6 @@ export class SessionNodeManager {
     this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
   }
 
-  /**
-   * Record a session's STARTING POINT, for a fixture that built the session below the paths that
-   * record it — `DOD-M15-SELFCHAIN-1`. Same seam idiom, same rules, as
-   * `setSessionContentKeyForTest` above.
-   *
-   * ─── What the starting point IS, because it is not an arbitrary seed ───────────────────────────
-   *
-   * Every message signs two chain links. The first message of a session has nothing before it, so
-   * both links carry this value — and it is not invented:
-   * `computeGenesisPrevRoot(pubA, pubB, sessionId, sessionTimestamp)` is **field 4 of the bytes the
-   * directory FROST-signs at session establishment**, which each side independently verifies before
-   * the session begins (`assignment-verify.ts`). The chain's first link is therefore anchored to the
-   * opening ceremony rather than to arithmetic the two sides happen to agree on.
-   *
-   * ⚠️ **A SESSION WITHOUT ONE CANNOT EXIST IN PRODUCTION** — ruled 2026-09-06. Both production
-   * paths that create a session hold a verified assignment and write this column from it
-   * (`inbound-sessions.ts` on accept; the initiate path on the other side). Unit fixtures call
-   * `createSessionNode` directly, BELOW those paths, and so produce a shape production cannot.
-   *
-   * ⚠️ IT SHORT-CIRCUITS HOW THE ANCHOR GOT THERE, NEVER WHAT THE ANCHOR IS. The state it produces
-   * is exactly the production state, which is what makes it legitimate — and it DERIVES rather than
-   * invents, so a fixture cannot accidentally anchor two sessions alike, and cannot anchor to a
-   * constant that would be presentable for any session. A second derivation would be a protocol
-   * change, not a test-seam change.
-   *
-   * Write-once, matching the production writer: the value cannot legitimately change for the life of
-   * a session, so a second writer is either redundant or wrong.
-   */
-  setSessionAnchorForTest(
-    agentName: string,
-    sessionId: string,
-    participantAPubkeyHex: string,
-    participantBPubkeyHex: string,
-    sessionTimestamp: number,
-  ): void {
-    /**
-     * ⚠️ SEEDED IN MEMORY AS WELL AS ON DISK, AND CALLED BEFORE `createSessionNode`.
-     *
-     * `createSessionNode` REFUSES a session it cannot anchor, so a fixture that writes the column
-     * afterwards is too late — the session never gets created. The in-memory copy is what the
-     * refusal consults, and it is read LAST in `#sessionGenesisPrevRoot`, after the live assignment
-     * and after the stored row, so it can never shadow a real value.
-     */
-    const genesis = computeGenesisPrevRoot(
-      new Uint8Array(Buffer.from(participantAPubkeyHex, "hex")),
-      new Uint8Array(Buffer.from(participantBPubkeyHex, "hex")),
-      new Uint8Array(Buffer.from(sessionId, "hex")),
-      sessionTimestamp,
-    );
-    this.#testAnchors.set(this.#k(agentName, sessionId), genesis);
-    this.#db
-      ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
-      .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
-  }
-
-  /** See `setSessionAnchorForTest`. Empty in production — nothing outside a fixture writes it. */
-  readonly #testAnchors = new Map<string, Uint8Array>();
 
   /**
    * Hand the relay a leaf this agent RECEIVED whose author never submitted it — 034-CARRYLEAF.
@@ -14409,10 +14376,33 @@ export class SessionNodeManager {
    * on which side of the send it sat on.
    */
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void {
-    this.#db
-      ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ?")
-      .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
+    /**
+     * ⚠️ HELD IN MEMORY AS WELL AS WRITTEN, and the in-memory half is what makes it usable BEFORE
+     * the session row exists — `DOD-M15-SELFCHAIN-1`.
+     *
+     * Fixtures call this after `createSessionNode`, and the relay client seeds its acknowledgement
+     * state DURING that call. Without the map the seed is missing, and every send on the fixture is
+     * refused for having no starting point — the fixture would exercise a refusal path instead of
+     * the behaviour it was written for, which is the exact failure this seam exists to prevent.
+     *
+     * Read LAST in `#sessionGenesisPrevRoot`, after the live assignment and the stored row, so it
+     * can never shadow a real value. Empty in production: nothing outside a fixture writes it.
+     */
+    this.#testGenesis.set(this.#k(agentName, sessionId), Uint8Array.from(genesis));
+    /**
+     * The durable half is BEST EFFORT. Some fixtures run against a database whose schema was never
+     * created, and a seam that threw there would turn "this fixture has no sessions table" into a
+     * failure of whatever it was actually testing.
+     */
+    try {
+      this.#db
+        ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ?")
+        .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
+    } catch { /* see above — the in-memory half is the load-bearing one */ }
   }
+
+  /** See `setSessionGenesisForTest`. Empty in production. */
+  readonly #testGenesis = new Map<string, Uint8Array>();
 
   /**
    * Test seam: drop the agreed key while leaving the session up — the state before an exchange

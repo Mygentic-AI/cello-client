@@ -120,7 +120,7 @@ describe("MSG-001: content size cap (send side, daemon)", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     const rootBefore = snm.getSessionTreeRootHex("alice", SID);
 

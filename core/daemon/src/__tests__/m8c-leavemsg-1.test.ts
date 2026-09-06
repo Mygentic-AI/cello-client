@@ -120,7 +120,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -152,7 +152,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -182,7 +182,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: true })); // would deposit, but no relay is wired for this session
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay param
 
     const content = new TextEncoder().encode("hello");
@@ -199,7 +199,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -229,7 +229,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -264,7 +264,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -330,7 +330,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     snm.setContentParkHook(async () => ({ ok: false, reason: "standing_receiver_unavailable" }));
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to park");
@@ -369,7 +369,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -413,7 +413,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -447,7 +447,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to go");
@@ -470,7 +470,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -511,7 +511,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -546,7 +546,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -582,7 +582,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],
@@ -605,7 +605,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     const kp = generateKeypair();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr", false, {
       relayPeerId: "12D3KooWFakeRelay",
       relayAddrs: ["/ip4/127.0.0.1/tcp/1/p2p/12D3KooWFakeRelay"],

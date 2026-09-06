@@ -145,7 +145,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "strangerpubkeyhex", "strangerpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "strangerpubkeyhex", "peer-1", "corr");
 
     // Seed prior received bytes just under the cap (same producer as the real inbound path:
@@ -167,7 +167,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const db = snm.getDb();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "friendpubkeyhex", "friendpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "friendpubkeyhex", "peer-1", "corr");
     snm.addContact("alice", "friendpubkeyhex");
     // 'exempt entirely' is gone (INV-TIER-BOUND: no tier unbounded). Set the contact to KNOWN (100 MB
@@ -620,7 +620,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "strangerpubkeyhex", "strangerpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "strangerpubkeyhex", "peer-1", "corr");
 
     const bigChunk = new Uint8Array(ABUSE_MAX_SESSION_RECEIVED_BYTES + 100); // over the cap alone

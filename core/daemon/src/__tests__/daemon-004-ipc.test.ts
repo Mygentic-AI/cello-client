@@ -238,7 +238,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -338,7 +338,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -383,7 +383,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -688,7 +688,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -719,7 +719,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -749,7 +749,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -796,7 +796,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -842,7 +842,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -880,7 +880,7 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const snm = h1.getSessionNodeManager();
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));

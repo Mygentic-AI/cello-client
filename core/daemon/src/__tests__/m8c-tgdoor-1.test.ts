@@ -179,7 +179,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const sid = "cc".repeat(16);
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", sid, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", sid, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(sid, "alice", "bobpubkeyhex", "peer-1", "corr");
     snm.addContact("alice", "bobpubkeyhex"); // known — no AWAY-1 auto-ack noise in this test
 
@@ -289,11 +289,11 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const sidB = "f2".repeat(16);
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", sidA, "cp-a-pubkeyhex", "cp-a-pubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", sidA, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(sidA, "alice", "cp-a-pubkeyhex", "peer-a", "corr-a");
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", sidB, "cp-b-pubkeyhex", "cp-b-pubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", sidB, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(sidB, "alice", "cp-b-pubkeyhex", "peer-b", "corr-b");
     snm.addContact("alice", "cp-a-pubkeyhex");
     snm.addContact("alice", "cp-b-pubkeyhex");

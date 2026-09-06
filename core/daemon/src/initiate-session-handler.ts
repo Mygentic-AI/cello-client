@@ -197,6 +197,24 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
+    /**
+     * ─── RECORD THE SESSION'S STARTING POINT — `DOD-M15-SELFCHAIN-1` ─────────────────────────────
+     *
+     * Derived from the FROST-signed assignment this handler already holds, and written for EVERY
+     * transport mode. It used to be persisted only alongside relay params, which is relay-mode
+     * only — so a direct-mode session, brokered and signed exactly like any other, recorded no
+     * starting point and every message on it had nothing to chain to.
+     *
+     * The anchor belongs to the session. The relay is how the conversation travels; it is not what
+     * makes the conversation provable.
+     */
+    sessionNodeManager.recordSessionGenesis(
+      agentName,
+      sessionId,
+      assignment.participant_a.pubkey,
+      assignment.participant_b.pubkey,
+      assignment.session_timestamp,
+    );
 
     // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
     // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are

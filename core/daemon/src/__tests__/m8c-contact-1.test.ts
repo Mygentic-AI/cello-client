@@ -381,13 +381,13 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const SID_KNOWN = "22".repeat(32);
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID_UNKNOWN, "strangerpubkeyhex", "strangerpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID_UNKNOWN, "alice", "strangerpubkeyhex", "peer-1", "corr-1");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x7e));
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionAnchorForTest("alice", SID_KNOWN, "knownpubkeyhex", "knownpubkeyhex", 1_700_000_000_000);
+    snm.setSessionGenesisForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x9c));
     await snm.createSessionNode(SID_KNOWN, "alice", "knownpubkeyhex", "peer-2", "corr-2");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x7e));

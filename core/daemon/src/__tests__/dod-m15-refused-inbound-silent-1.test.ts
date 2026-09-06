@@ -274,7 +274,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const sid = "s-producer";
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    mgr.setSessionGenesisForTest("alice", sid, new Uint8Array(32).fill(0x9c));
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-refused");
 
     const content = new TextEncoder().encode(SECRET);
@@ -321,7 +321,7 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const sid = "s-skew";
     // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
     // session it cannot anchor, and a fixture builds one below the paths that record it.
-    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
+    mgr.setSessionGenesisForTest("alice", sid, new Uint8Array(32).fill(0x9c));
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-skew");
 
     const content = new TextEncoder().encode("a message from a newer build");
