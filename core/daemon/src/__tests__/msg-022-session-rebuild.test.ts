@@ -271,7 +271,11 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
    */
   it("PARITY: every call establishment makes, revival makes too", async () => {
     const { readFileSync } = await import("node:fs");
-    const src = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8");
+    // POINTED AT THE LIFECYCLE FILE. `acceptSession` and `reviveSessionNode` moved there together
+    // when the session-lifecycle path left the manager, so both regions travelled as a pair and the
+    // comparison is unchanged — it is still establishment against revival, in one file. This went
+    // red on its own "region start not found" precondition, which is the design working.
+    const src = readFileSync(join(import.meta.dirname, "..", "session-lifecycle.ts"), "utf-8");
     const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
     const region = (from: string, to: string): string => {
@@ -370,7 +374,15 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // on one side, because parity still held and the scan stayed green while no longer checking
         // the single most important step it exists to check: that a revived session reconnects its
         // relay witness rather than merely filing a handler.
-        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal|relay)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+        //
+        // ⚠️ AND `#ctx.` IS OPTIONAL IN FRONT OF ALL OF THEM. Inside a collaborator a call on a
+        // sibling reads `this.#ctx.relay.connectSessionRelay(`, not `this.#relay.connectSessionRelay(`.
+        // Without this clause the pattern matched NOTHING in the lifecycle file — not a step lost,
+        // EVERY step lost, and a scan that derives an empty list from one region and compares it to
+        // an empty list from the other passes for the emptiest possible reason. That is the fourth
+        // time this pattern has gone blind; the first three each cost one step, and this one would
+        // have cost all of them.
+        /this\.(?:#ctx\.)?(?:#?(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal|relay)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
