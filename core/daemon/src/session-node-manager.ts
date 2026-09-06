@@ -46,7 +46,7 @@ import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
 import { decode } from "cbor-x";
-import { encodeCbor, decodeStructure1, encodeStructure1, computeGenesisPrevRoot } from "@cello-protocol/protocol-types";
+import { encodeCbor, decodeStructure1, encodeStructure1 } from "@cello-protocol/protocol-types";
 import type { SessionAbandonedNotice } from "@cello-protocol/protocol-types";
 import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
@@ -69,7 +69,7 @@ import { triageOrphanedContent } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
-import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
+import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
 import { AuthorshipVerifier } from "./authorship-verification.js";
 import { InboundRefusals } from "./inbound-refusals.js";
@@ -83,12 +83,12 @@ import { SessionEphemerals } from "./session-ephemerals.js";
 import { SessionLiveness } from "./session-liveness.js";
 import { WitnessAlerts } from "./witness-alerts.js";
 import { HeldContent } from "./held-content.js";
+import { SessionLeafRecords } from "./session-leaf-records.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
-import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { retentionSentence, type QuarantineFrameMeta } from "./quarantine-framing.js";
 import {
@@ -313,7 +313,7 @@ export class SessionNodeManager {
       // 033-ACKEMIT: the seal transport submits a ctrl leaf like any other, so it needs the same
       // acknowledgement seed. It carries no assignment of its own, so the genesis is supplied here
       // from the session's own active entry rather than derived inside the client.
-      client.registerSession(sessionId, node, undefined, undefined, this.#sessionGenesisPrevRoot(agentName, sessionId));
+      client.registerSession(sessionId, node, undefined, undefined, this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
     } else {
       /**
        * Review MEDIUM-1 — **A PATH THAT DECLINES TO FIX A LEAK MUST SAY SO.**
@@ -671,6 +671,20 @@ export class SessionNodeManager {
    */
   readonly #held: HeldContent;
 
+  /**
+   * 037-SESSIONCORE — the two durable facts about a session's leaves: where the chain starts
+   * (the genesis prev-root) and which leaves the directory attested.
+   */
+  readonly #leafRecords: SessionLeafRecords;
+
+  /** ─── DELEGATORS — the leaf-record API other files call ─────────────────────────────── */
+recordSessionGenesis(agentName: string, sessionId: string, participantA: Uint8Array, participantB: Uint8Array, sessionTimestamp: number): void { return this.#leafRecords.recordSessionGenesis(agentName, sessionId, participantA, participantB, sessionTimestamp); }
+  setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void { return this.#leafRecords.setSessionGenesisForTest(agentName, sessionId, genesis); }
+  recordCertifiedLeafSet(agentName: string, sessionId: string, signedLeaves: readonly SealFrontierLeaf[], sealedRootHex: string, correlationId?: string): boolean { return this.#leafRecords.recordCertifiedLeafSet(agentName, sessionId, signedLeaves, sealedRootHex, correlationId); }
+  noteCertifiedLeafSetUnavailable(agentName: string, sessionId: string, state: "not_carried_absent_party" | "not_carried_present_party", detail: string): void { return this.#leafRecords.noteCertifiedLeafSetUnavailable(agentName, sessionId, state, detail); }
+  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null { return this.#leafRecords.getCertifiedLeafSet(agentName, sessionId); }
+  getCertifiedLeafSetState(agentName: string, sessionId: string): { state: string; detail: string | null } | null { return this.#leafRecords.getCertifiedLeafSetState(agentName, sessionId); }
+
   /** ─── DELEGATORS — the held-content seams other files call ──────────────────────────── */
 holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, contentHashHex: string): void { return this.#held.holdOwnLeafForTest(agentName, sessionId, canonicalSeq, contentHashHex); }
 
@@ -720,11 +734,11 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   dismissSession(agentName: string, sessionId: string): { ok: true } | { ok: false; reason: string } { return this.#queries.dismissSession(agentName, sessionId); }
   agentNameForId(agentId: string): string | null { return this.#queries.agentNameForId(agentId); }
   getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }> { return this.#queries.getRenameNotices(agentName); }
-  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null { return this.#queries.getCertifiedLeafSet(agentName, sessionId); }
+
   sessionsConsumingCap(agentName: string, counterpartyPubkey: string, limit = 10): string[] { return this.#queries.sessionsConsumingCap(agentName, counterpartyPubkey, limit); }
   advanceLastDeliveredSeq(agentName: string, sessionId: string, seq: number): void { return this.#queries.advanceLastDeliveredSeq(agentName, sessionId, seq); }
   countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number { return this.#queries.countActiveSessionsForCounterparty(agentName, counterpartyPubkey); }
-  getCertifiedLeafSetState(agentName: string, sessionId: string): { state: string; detail: string | null } | null { return this.#queries.getCertifiedLeafSetState(agentName, sessionId); }
+
   getSessionRecord(agentName: string, sessionId: string): SessionRecord | null { return this.#queries.getSessionRecord(agentName, sessionId); }
   hasDatabase(): boolean { return this.#queries.hasDatabase(); }
   readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> { return this.#queries.readSealedAnnex(agentName, sessionId); }
@@ -1297,7 +1311,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       isSessionDiverged: (a, sid) => this.#records.isSessionDiverged(a, sid),
-      sessionGenesisPrevRoot: (a, sid) => this.#sessionGenesisPrevRoot(a, sid),
+      sessionGenesisPrevRoot: (a, sid) => this.#leafRecords.sessionGenesisPrevRoot(a, sid),
       relaySessionIdBytes: (a, sid) => this.#activeNodes.get(this.#k(a, sid))?.relaySessionIdBytes,
       heldContentFor: (a, sid) => this.#heldContent.get(this.#k(a, sid)),
     });
@@ -1405,6 +1419,15 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       appendSessionLeaf: (a, sid, kind, h, cid) => this.appendSessionLeaf(a, sid, kind, h, cid),
       appendVerifiedContent: (a, sid, c, h, pk, cid, orig, auth) => this.#appendVerifiedContent(a, sid, c, h, pk, cid, orig, auth),
+    });
+
+    this.#leafRecords = new SessionLeafRecords({
+      logger: this.#logger,
+      queries: this.#queries,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      activeEntry: (key) => this.#activeNodes.get(key),
     });
     this.#dbPath = opts.dbPath;
     if (typeof opts.contentTtfMs === "number" && opts.contentTtfMs > 0) {
@@ -2758,8 +2781,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
        */
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) entry.relayAssignment = relay.assignment;
-      if (relay.assignment) this.#persistGenesisPrevRoot(agentName, sessionId, relay.assignment);
-      client.registerSession(sessionIdHexForRelay, node, this.#relayLeafHandler(agentName, sessionId, correlationId), relay.assignment, this.#sessionGenesisPrevRoot(agentName, sessionId));
+      if (relay.assignment) this.#leafRecords.persistGenesisPrevRoot(agentName, sessionId, relay.assignment);
+      client.registerSession(sessionIdHexForRelay, node, this.#relayLeafHandler(agentName, sessionId, correlationId), relay.assignment, this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
 
       if (entry) {
         entry.relayClient = client;
@@ -3939,127 +3962,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
 
 
-  /**
-   * DOD-M15-INCLUSION-1: keep the leaf set the certificate is signed over, so one message can later
-   * be proved to sit under it.
-   *
-   * REFUSES unless the hashes reproduce `sealedRootHex` — `certifiedLeafSetFrom` does that check and
-   * this method never bypasses it. That is what separates "the leaves the directory sent" from "the
-   * leaves the consortium signed", and only the second is worth storing: a proof built on the first
-   * would inherit whatever the directory chose to say.
-   *
-   * Idempotent (INSERT OR REPLACE keyed on leaf_index) so a re-delivered seal frame, or a unilateral
-   * seal later upgraded to bilateral, rewrites the same rows instead of failing or doubling them.
-   *
-   * @returns whether the set was accepted and stored.
-   */
-  recordCertifiedLeafSet(
-    agentName: string,
-    sessionId: string,
-    signedLeaves: readonly SealFrontierLeaf[],
-    sealedRootHex: string,
-    correlationId?: string,
-  ): boolean {
-    if (!this.#db) return false;
-    const resolved = certifiedLeafSetFrom(signedLeaves, sealedRootHex);
-    if (!resolved.ok) {
-      // The CAUSE is written where the proof surface can read it — fallback-finder finding 1. Without
-      // this row, `sealed_leaves_root_disagrees` (a directory contradicting its own FROST signature)
-      // and "this side was simply absent" are the same `null` downstream, and the operator is told
-      // the second.
-      this.#queries.noteCertifiedLeafState(agentName, sessionId, resolved.reason, resolved.detail);
-      // LOUD, and it names which of the two it is. `sealed_leaves_root_disagrees` in particular is
-      // the directory shipping a leaf set that is not the one it signed — the receipt still stands
-      // (its own signature is checked elsewhere), but nothing in this session can be proved at
-      // message granularity until a set that reproduces the root arrives.
-      this.#logger.error("seal.certified_leaves.refused", {
-        agentName,
-        sessionId,
-        reason: resolved.reason,
-        detail: resolved.detail,
-        correlationId,
-        impact:
-          "the leaf set shipped with this seal is not the one the certificate is signed over, so no " +
-          "inclusion proof can be issued for this session; the sealed receipt itself is unaffected",
-        guidance:
-          "cello_get_inclusion_proof will refuse this session by name (certified_leaves_unavailable). " +
-          "Nothing local repairs it — the set has to arrive with a seal frame that reproduces the " +
-          "signed root.",
-      });
-      return false;
-    }
-    const now = Date.now();
-    try {
-      const agentId = this.#requireAgentId(agentName);
-      /**
-       * DELETE THEN INSERT, INSIDE A TRANSACTION — fallback-finder finding 5.
-       *
-       * `INSERT OR REPLACE` alone is idempotent only for a set of the SAME length: a shorter
-       * re-delivery overwrites 0..k-1 and leaves stale rows at k..n-1, and an un-transacted loop that
-       * throws halfway leaves a truncated set that `getCertifiedLeafSet` still returns (it tests
-       * `rows.length > 0`, not completeness). Both produce a set that no longer hashes to the
-       * certified root — caught on read, but reported to the operator as *"the local copy has
-       * changed since the seal"*, which points at tampering for a write that never finished.
-       */
-      // `BEGIN` / `COMMIT` / `ROLLBACK` via exec — this file's and `db-identity-store.ts`'s idiom.
-      // `DaemonDatabase` has no `transaction()` helper (node:sqlite's handle does not provide one),
-      // and reaching for better-sqlite3's would compile against the adapter and fail on the other.
-      this.#db.exec("BEGIN");
-      try {
-        this.#db.prepare("DELETE FROM session_certified_leaves WHERE agent_id = ? AND session_id = ?")
-          .run(agentId, sessionId);
-        const stmt = this.#db.prepare(
-          `INSERT INTO session_certified_leaves
-             (agent_id, session_id, leaf_index, content_hash_hex, recorded_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        );
-        for (let i = 0; i < resolved.leafHashes.length; i++) {
-          stmt.run(agentId, sessionId, i, resolved.leafHashes[i], now);
-        }
-        this.#db.exec("COMMIT");
-      } catch (err: unknown) {
-        try { this.#db.exec("ROLLBACK"); } catch { /* the failing statement may have aborted it already */ }
-        throw err;
-      }
-    } catch (err: unknown) {
-      this.#queries.noteCertifiedLeafState(agentName, sessionId, "persist_failed", extractErrorMessage(err));
-      this.#logger.error("seal.certified_leaves.persist.failed", {
-        agentName,
-        sessionId,
-        reason: extractErrorMessage(err),
-        correlationId,
-        impact:
-          "this session's certified leaf set was verified but not written, so cello_get_inclusion_proof " +
-          "will refuse it by name until a later seal frame re-delivers the set",
-      });
-      return false;
-    }
-    this.#queries.noteCertifiedLeafState(agentName, sessionId, "stored", null);
-    this.#logger.info("seal.certified_leaves.recorded", {
-      agentName,
-      sessionId,
-      leafCount: resolved.leafHashes.length,
-      sealedRoot: sealedRootHex,
-      correlationId,
-    });
-    return true;
-  }
 
-  /**
-   * Record WHY this session does or does not have a certified leaf set.
-   *
-   * Public for the one case the manager cannot see: a seal frame that carried no signed leaves at
-   * all never reaches `recordCertifiedLeafSet`, and that absence is a permanent fact about the
-   * session for the party that observed it.
-   */
-  noteCertifiedLeafSetUnavailable(
-    agentName: string,
-    sessionId: string,
-    state: "not_carried_absent_party" | "not_carried_present_party",
-    detail: string,
-  ): void {
-    this.#queries.noteCertifiedLeafState(agentName, sessionId, state, detail);
-  }
+
+
 
 
 
@@ -4318,165 +4223,13 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
 
-  /**
-   * Return the daemon-owned Merkle tree for a session, loading it from SQLite
-   * on first access (so it survives a restart — AC-007). Never returns null;
-   * an unknown session yields an empty tree.
-   */
-  /**
-   * The session's genesis prev_root — what its FIRST message acknowledges, before anything has been
-   * received (033-ACKEMIT).
-   *
-   * DERIVED FIRST, STORED SECOND — and this docblock used to say "derived, never stored", which
-   * stopped being true inside this same unit. Rewritten rather than deleted: a reader who believed
-   * the first sentence would delete the column read below as redundant, and take the restart case
-   * with it.
-   *
-   * The live assignment is authoritative, because it is the thing the value is defined by. The
-   * stored column covers the one case the derivation cannot: a session restored after a restart
-   * re-registers with no assignment, and the session TIMESTAMP the genesis needs lives nowhere
-   * else.
-   *
-   * `undefined` when neither is available. The callers do not paper over that — they say, in the
-   * log and in the claim itself, that this session acknowledges nothing yet.
-   */
-  #sessionGenesisPrevRoot(agentName: string, sessionId: string): Uint8Array | undefined {
-    const assignment = this.#activeNodes.get(this.#k(agentName, sessionId))?.relayAssignment;
-    if (assignment) {
-      return computeGenesisPrevRoot(
-        assignment.participantA,
-        assignment.participantB,
-        Uint8Array.from(Buffer.from(sessionId, "hex")),
-        assignment.sessionTimestamp,
-      );
-    }
-    /**
-     * ⚠️ THE IN-MEMORY RECORD, READ BEFORE THE DATABASE — and this ordering is the fix, not a
-     * cache.
-     *
-     * `recordSessionGenesis` is called BEFORE the session node exists, because registering the
-     * session is what seeds the relay client's acknowledgement state and the seed has to be
-     * available by then. At that moment there is no session ROW to write to — `createSessionNode`
-     * inserts it — so a database-only record would still be empty at the one moment it is read.
-     * The row is written from this map when the insert happens, and read back after a restart.
-     */
-    const recorded = this.#sessionGenesis.get(this.#k(agentName, sessionId));
-    if (recorded) return recorded;
-    /**
-     * THE RESTART CASE. A session restored from the database re-registers with no assignment, so
-     * the derivation above has nothing to work from and the stored copy is the only answer. Read
-     * second, never first: the live assignment is authoritative, and a stored value that ever
-     * disagreed with it would be the more dangerous of the two to prefer.
-     */
-    const row = this.#db
-      ?.prepare("SELECT genesis_prev_root FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { genesis_prev_root?: unknown } | undefined;
-    const stored = row?.genesis_prev_root;
-    const bytes = stored instanceof Uint8Array ? stored : Buffer.isBuffer(stored) ? new Uint8Array(stored) : null;
-    // A stored value of the wrong width is not a genesis. Refusing it here sends the caller down its
-    // own named refusal, which is a better outcome than signing an acknowledgement of 17 bytes.
-    if (bytes && bytes.length === 32) return bytes;
-    return undefined;
-  }
 
-  /**
-   * Persist the session's genesis prev_root, once, at the moment the assignment arrives.
-   *
-   * `WHERE genesis_prev_root IS NULL` rather than a plain update: the value cannot legitimately
-   * change for the life of a session, so the second writer is either redundant or wrong, and the
-   * first write is the one derived closest to the assignment that opened the session.
-   */
-  /**
-   * Record the session's starting point from the ASSIGNMENT — `DOD-M15-SELFCHAIN-1`.
-   *
-   * ⚠️ **CALL THIS BEFORE `createSessionNode` / `acceptSession`, NOT AFTER.** Registering the
-   * session is what seeds the relay client's acknowledgement state, so the value has to exist by
-   * then; recorded afterwards, the first message of the session has nothing to chain to and is
-   * refused. Both the initiator and the responder derive this from the same FROST-signed assignment
-   * before they build anything.
-   *
-   * ⚠️ THE ANCHOR BELONGS TO THE SESSION, NOT TO THE RELAY, and treating it as the relay's was a
-   * real gap. It was derived only when a relay assignment CARRY was present — and that carry is
-   * built only for a relay-mode assignment that also carries a per-node relay signature. So a
-   * direct-mode session, brokered and FROST-signed exactly like any other, recorded no starting
-   * point at all, and every message on it had nothing to chain to.
-   *
-   * Both transport modes get their assignment from the same ceremony and derive the same value from
-   * it. The relay is how the conversation travels; it is not what makes the conversation provable.
-   */
-  recordSessionGenesis(
-    agentName: string,
-    sessionId: string,
-    participantA: Uint8Array,
-    participantB: Uint8Array,
-    sessionTimestamp: number,
-  ): void {
-    this.#persistGenesisPrevRoot(agentName, sessionId, {
-      participantA, participantB, sessionTimestamp,
-    } as RelayAssignmentCarry);
-  }
 
-  /**
-   * The starting point of each live session's chain, in memory.
-   *
-   * ⚠️ NOT A CACHE OF THE DATABASE — it is the only copy that exists at the moment the value is
-   * first needed. It is recorded before the session node is built, and the session ROW does not
-   * exist until that build inserts it (`#insertSessionRow` writes the column from here). The row is
-   * what survives a restart; this is what the session open itself reads.
-   */
-  readonly #sessionGenesis = new Map<string, Uint8Array>();
 
-  #persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
-    let genesis: Uint8Array;
-    try {
-      genesis = computeGenesisPrevRoot(
-        assignment.participantA,
-        assignment.participantB,
-        Uint8Array.from(Buffer.from(sessionId, "hex")),
-        assignment.sessionTimestamp,
-      );
-    } catch (err: unknown) {
-      /**
-       * The DERIVATION failed, which is a different failure from the write below and must not be
-       * reported as one. It means the assignment's own fields are not what this function needs, and
-       * no amount of database health would help.
-       */
-      this.#logger.error("session.genesis.derive.failed", {
-        agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
-        impact:
-          "this session's starting point could not be computed from its assignment, so nothing " +
-          "sent on it can be chained and every send will be refused by name. The session open " +
-          "continues; the conversation cannot.",
-      });
-      return;
-    }
-    // The in-memory record FIRST, and unconditionally: it is what the session open reads, and it
-    // must not depend on a database write that may not have anywhere to land yet.
-    this.#sessionGenesis.set(this.#k(agentName, sessionId), genesis);
-    if (!this.#db) return;
-    try {
-      this.#db
-        .prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
-        .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
-    } catch (err: unknown) {
-      /**
-       * LOUD, AND IT DOES NOT BLOCK. Losing this row costs the session its acknowledgements after a
-       * restart — sends are then refused by name until the counterparty speaks — and that is a far
-       * smaller harm than failing the session open that is in progress. Reported at ERROR because
-       * the failure is invisible until a restart that may be days away.
-       */
-      this.#logger.error("session.genesis.persist.failed", {
-        agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
-        impact:
-          "this session's starting point was not written to the database. Everything works until " +
-          "this daemon restarts; after that, a send on this session is refused until the " +
-          "counterparty has sent something, because the daemon cannot say what its first message " +
-          "acknowledges.",
-      });
-    }
-  }
+
+
+
+
 
   getSessionTree(agentName: string, sessionId: string): SessionTree {
     const key = this.#k(agentName, sessionId);
@@ -4689,7 +4442,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
           entry.extraRelayClientKeys = [...(entry.extraRelayClientKeys ?? []), clientKey];
         }
         // No leaf handler: this relay is not witnessing the session, it only needs the binding.
-        client.registerSession(sessionIdHex, entry.node, undefined, assignment, this.#sessionGenesisPrevRoot(agentName, sessionId));
+        client.registerSession(sessionIdHex, entry.node, undefined, assignment, this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
         const recorded = await client.recordAssignmentAndWait(entry.node, sessionIdHex);
         if (recorded) {
           this.#logger.info("session.transport.dial_authorized", {
@@ -7853,7 +7606,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       entry.node,
       undefined,
       entry.relayAssignment,
-      this.#sessionGenesisPrevRoot(agentName, sessionId),
+      this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId),
     );
   }
 
@@ -8493,46 +8246,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
 
 
-  /**
-   * Test seam: put the session's genesis prev_root where a completed session open leaves it —
-   * 033-ACKEMIT.
-   *
-   * ⚠️ THE STATE IS THE PRODUCTION ONE; ONLY HOW IT GOT THERE IS SHORT-CIRCUITED, exactly as
-   * `setSessionContentKeyForTest` short-circuits the key exchange next door.
-   *
-   * In production this value is derived from the directory-signed relay assignment and written to
-   * the session row the moment the session learns it, so every real session has one. A fixture that
-   * builds a session node directly never sees an assignment — so without this seam every content
-   * test built on the fixture would be exercising the "no starting point" REFUSAL path instead of
-   * the thing it was written for, and would report that as a pass or a mysterious failure depending
-   * on which side of the send it sat on.
-   */
-  setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void {
-    /**
-     * ⚠️ WRITES THE SAME MAP PRODUCTION WRITES, deliberately — `DOD-M15-SELFCHAIN-1`.
-     *
-     * This seam exists because a fixture builds a session below the paths that derive a starting
-     * point from a directory assignment; it does NOT exist to install a second, quieter source of
-     * the value. Sharing the map means a fixture and a real session read through exactly the same
-     * lookup, so a change to that lookup cannot pass the tests while breaking production.
-     *
-     * ⚠️ CALL IT BEFORE `createSessionNode`, the same rule production follows: registering the
-     * session is what seeds the relay client's acknowledgement state, and a value recorded after
-     * that leaves the first send with nothing to chain to.
-     */
-    this.#sessionGenesis.set(this.#k(agentName, sessionId), Uint8Array.from(genesis));
-    /**
-     * The durable half is BEST EFFORT. Some fixtures run against a database whose schema was never
-     * created, and a seam that threw there would turn "this fixture has no sessions table" into a
-     * failure of whatever it was actually testing. Harmless when the row does not exist yet either:
-     * `#insertSessionRow` writes the column from the map above.
-     */
-    try {
-      this.#db
-        ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ?")
-        .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
-    } catch { /* see above — the in-memory half is the load-bearing one */ }
-  }
+
 
 
 
@@ -8902,7 +8616,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
      */
     const ack = entry.relayClient?.lastSeenAck(sessionIdHexForAck)
       ?? this.#lastAck.get(this.#k(agentName, sessionId))
-      ?? (() => { const g = this.#sessionGenesisPrevRoot(agentName, sessionId); return g ? { seq: 0, hash: g } : undefined; })();
+      ?? (() => { const g = this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId); return g ? { seq: 0, hash: g } : undefined; })();
     if (!ack) {
       /**
        * ⚠️ NO STARTING POINT MEANS NO SEND — `DOD-M15-SELFCHAIN-1`.
@@ -8951,7 +8665,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
        * every checker, and reported as tampering against a party that had done nothing.
        */
       prevOwnHash: this.#ownChainOf(agentName, sessionId, entry, await signer.getPublicKey())
-        ?? this.#sessionGenesisPrevRoot(agentName, sessionId)
+        ?? this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId)
         ?? ack.hash,
     });
     /**
@@ -11393,7 +11107,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
       // 033-ACKEMIT: a revived session re-registers with no assignment in hand, so the genesis comes
       // from the entry that was just restored above.
-      client.registerSession(sessionId, node, this.#relayLeafHandler(agentName, sessionId, correlationId), undefined, this.#sessionGenesisPrevRoot(agentName, sessionId));
+      client.registerSession(sessionId, node, this.#relayLeafHandler(agentName, sessionId, correlationId), undefined, this.#leafRecords.sessionGenesisPrevRoot(agentName, sessionId));
 
       const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
       if (entry) {
@@ -12027,7 +11741,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
        * and on disk is what lets the chain be resumed after a restart. `null` when nothing recorded
        * one, which is a session whose sends will be refused by name rather than silently unlinked.
        */
-      const genesis = this.#sessionGenesis.get(this.#k(agentName, sessionId));
+      const genesis = this.#leafRecords.genesisFor(agentName, sessionId);
       this.#db
         .prepare(
           `INSERT INTO sessions
