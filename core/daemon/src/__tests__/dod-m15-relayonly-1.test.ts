@@ -330,7 +330,21 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
 });
 
 describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS", () => {
-  const SNM_PATH = join(import.meta.dirname, "..", "session-node-manager.ts");
+  /**
+   * ⚠️ THE CHOKE POINT MOVED, AND THIS GUARD FOLLOWS THE CODE RATHER THAN THE FILENAME.
+   *
+   * 037-SESSIONCORE split the standing receiver out of `session-node-manager.ts` into
+   * `standing-receivers.ts`. `getStandingReceiverInfo` — the single method every publish path leaves
+   * through — went with it, along with `publishableEndpoint` and the factory call.
+   *
+   * Pointing this at the new file is the whole change. Leaving it on the manager would have scanned
+   * a one-line DELEGATOR: `publishableEndpoint` absent, the `!== null` sentinel absent, and the
+   * factory never called — so this guard would have gone red for the wrong reason, and a later
+   * reader "fixing" it by relaxing the assertions would have disarmed the leak protection entirely.
+   * It DID go red, including its own vacuity precondition, which is the design working.
+   */
+  const SNM_PATH = join(import.meta.dirname, "..", "standing-receivers.ts");
+  const MANAGER_PATH = join(import.meta.dirname, "..", "session-node-manager.ts");
 
   it("★★ the suppression is IN the choke point, not at its call sites", () => {
     /**
@@ -428,7 +442,11 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
     const src = readFileSync(SNM_PATH, "utf8");
     const raw = src.split("\n")
       .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter((r) => r.line.includes("#factory.createNode("));
+      // Matches `#factory.createNode(` and `#ctx.factory.createNode(` alike: 037-SESSIONCORE moved
+      // the wrapper into a collaborator that reaches the factory through its context, and a pattern
+      // pinned to the old spelling would have found zero calls — which this guard's own precondition
+      // correctly reports as vacuous rather than passing.
+      .filter((r) => /factory\.createNode\(/.test(r.line));
     expect(raw.length, "precondition: the factory must still be called somewhere, or this guard is vacuous")
       .toBeGreaterThan(0);
     const offenders = raw.filter((r) => !r.line.includes("...config, relayOnly"));
@@ -450,24 +468,41 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
      * There is exactly ONE such read today, inside the guarded method. A second is not necessarily
      * wrong, but it must be looked at by a human against this line, which is what failing here buys.
      */
+    /**
+     * ⚠️ **THIS ONE SCANS BOTH FILES, and narrowing it to one was a coverage regression.**
+     *
+     * The three checks above are about ONE METHOD, so pointing them at the file that method now
+     * lives in is exactly right. This check is different in kind: it is a scan for a DANGEROUS SHAPE
+     * anywhere — a non-predicate read of a standing receiver's raw addresses. 037-SESSIONCORE moved
+     * the choke point out, but `session-node-manager.ts` still holds 22 reads of `#standingReceivers`
+     * and the reservation watchdog's own `listenAddresses()` call. Scanning only the new file would
+     * have left the manager — the file the split explicitly says the watchdog and relay paths stayed
+     * in — invisible to the guard that exists to police it.
+     */
+    const scanned = [SNM_PATH, MANAGER_PATH];
+    const lines = scanned.flatMap((f) => {
+      const name = f.split("/").pop()!;
+      return readFileSync(f, "utf8").split("\n").map((line, i) => ({ line, where: `${name}:${i + 1}` }));
+    });
     const src = readFileSync(SNM_PATH, "utf8");
-    const lines = src.split("\n");
-    const chokeStart = lines.findIndex((l) => l.includes("getStandingReceiverInfo(agentName: string)"));
+    const chokeLines = src.split("\n");
+    const chokeStart = chokeLines.findIndex((l) => l.includes("getStandingReceiverInfo(agentName: string)"));
     expect(chokeStart, "precondition: the choke point must be locatable").toBeGreaterThan(0);
-    const chokeEnd = chokeStart + lines.slice(chokeStart).findIndex((l, i) => i > 0 && l === "  }");
+    const chokeEnd = chokeStart + chokeLines.slice(chokeStart).findIndex((l, i) => i > 0 && l === "  }");
+    const chokeText = new Set(chokeLines.slice(chokeStart, chokeEnd + 1));
 
     const leaks: string[] = [];
-    lines.forEach((line, i) => {
+    lines.forEach(({ line, where }) => {
       if (!line.includes(".node.listenAddresses()")) return;
       // Inside the choke point: this is the guarded read, and the only one that publishes.
-      if (i >= chokeStart && i <= chokeEnd) return;
+      if (chokeText.has(line)) return;
       // ⚠️ NOT a blanket exemption for "any other read". The two reads outside the choke point today
       // are PREDICATES — `.some((a) => a.includes("/p2p-circuit"))`, asking whether a relay
       // reservation exists. A predicate inspects addresses; it does not hand them to anyone. A read
       // that is NOT a predicate is one that could be building an endpoint, and that is the shape
       // that must be looked at against this line.
       if (line.includes(".some(")) return;
-      leaks.push(`session-node-manager.ts:${i + 1}`);
+      leaks.push(where);
     });
 
     expect(
