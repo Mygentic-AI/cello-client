@@ -47,12 +47,12 @@ import {
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
-import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
+import { TIER, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { normalizeContactPubkey, foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { REFUSAL_KINDS, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
-import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
+import { settableTierName, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
 import * as lp from "it-length-prefixed";
@@ -71,1070 +71,124 @@ import {
   generateSessionEphemeral, destroySessionEphemeral, deriveSessionSecrets, type SessionEphemeral,
   signSessionEphemeral, verifySessionEphemeral, sealSessionContent, openSessionContent,
 } from "@cello-protocol/crypto";
-import type { LeafInput } from "@cello-protocol/crypto";
-import { encodeSealPayload, MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
+import { encodeSealPayload } from "@cello-protocol/protocol-types";
 // `PARK_ENVELOPE_REASONS` is deliberately NOT imported here. The reason codes are compared inside
 // `park-envelope.ts` itself (`parkRefusalGuidance`) and asserted in its own test; this file only ever
 // receives the already-classified `ParkAuthFailure`, so importing the code table here would invite a
 // second, drifting copy of the classification logic.
-import { decodeParkEnvelope, authenticateParkedEntry, pubkeyMatchesHex, ParkEnvelopeError, parkRefusalGuidance, type ParkEnvelope, type ParkAuthFailure } from "./park-envelope.js";
-import { triageOrphanedContent, type OrphanEvidence } from "./orphan-triage.js";
+import { decodeParkEnvelope, parkRefusalGuidance, type ParkEnvelope } from "./park-envelope.js";
+import { triageOrphanedContent } from "./orphan-triage.js";
 import { isValidMultiaddr } from "@cello-protocol/transport";
 // `LEAF_KIND_MSG` is no longer imported here: `sendContent`'s `leafKind` stopped defaulting to it
 // (B2b-1 review F4), so this file no longer names a default — every caller states its own kind.
 import { AgentRelayClient, LEAF_KIND_CTRL, isTerminalRelayRefusal, type RelayAssignmentCarry, type RelayAuthRefusal, type RelayWitnessAlert } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
-
-/**
- * One row in an agent's witness-alert list — DOD-M15-CORROBORATE-1 review F1. Deduped on
- * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
- * another slot in a bounded list.
- */
-export interface WitnessAlertNotice {
-  /** `${relayId}::${sessionIdHex}` — the dedupe key, not shown to anyone. */
-  key: string;
-  alert: RelayWitnessAlert;
-  occurrences: number;
-  /**
-   * When this witness first said it. Held SEPARATELY from `alert.observedAt`, because a later
-   * repeat can replace `alert` (a provable one supersedes an unprovable one) and that must not
-   * silently move the first sighting forward — an operator reading "first observed" wants to know
-   * when this started, not when the strongest version of it arrived.
-   */
-  firstObservedAt: number;
-  lastObservedAt: number;
-}
+import { AuthorshipVerifier } from "./authorship-verification.js";
+import { InboundRefusals } from "./inbound-refusals.js";
+import { SessionRecords } from "./session-records.js";
+import { ParkRecovery } from "./park-recovery.js";
+import { REFUSED_SESSIONS_CAP } from "./session-node-types.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
-
-
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
 import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
 import { addColumnIfMissing } from "./column-birth.js";
-import { quarantineRedaction, retentionSentence, type QuarantineFrameMeta } from "./quarantine-framing.js";
+import { retentionSentence, type QuarantineFrameMeta } from "./quarantine-framing.js";
 import {
   GATEWAY_UNAVAILABLE,
   GOVERNANCE_TIMEOUT,
   type SecurityGatewayClient,
 } from "@cello-protocol/gateway";
 
-
-/** SEC-1 / review M4: cap on the refused-parked-entry memo (remote-fed → must be bounded). */
 /**
- * How long the auto-acknowledge path holds its broker visiting connection AFTER submitting the seal
- * leaf. The directory pushes `seal_verified` back ~60ms later (measured on GCP), so releasing on
- * submit closed the stream before the frame it was opened for. Generous against 60ms, and bounded so
- * a stalled seal cannot leak the connection.
+ * One row in an agent's witness-alert list — DOD-M15-CORROBORATE-1 review F1. Deduped on
+ * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
+ * another slot in a bounded list.
  */
-const AUTOACK_BROKER_GRACE_MS = 30_000;
-
-const MAX_REFUSED_PARKED_ENTRIES = 512;
-/**
- * Per-session cap on remembered unreadable-algorithm frames (`DOD-M15-SEALWIRE-1` part B1).
- *
- * Fed by a REMOTE party — a peer on a newer build refuses every frame it sends — so it needs a
- * bound for the same reason `MAX_REFUSED_PARKED_ENTRIES` does. Small on purpose: the entries exist
- * only to reconcile a refusal with its park-route redelivery, which happens within seconds, and
- * losing an old one costs a log line rather than correctness.
- */
-const MAX_UNREADABLE_ALG_FRAMES = 64;
-
-/**
- * How many consumers' read positions a single refusal notice remembers.
- *
- * A consumer id is an IPC connection id, so every reconnect mints a new one and the read state would
- * otherwise grow without bound in a durable table. Sixteen is far above the real number of windows
- * attending one agent; past that the OLDEST reader is evicted, which costs at worst one repeated
- * announcement to a window that has already gone.
- */
-const MAX_REFUSAL_READERS = 16;
-
-/**
- * How many refusal notices one read returns, newest first.
- *
- * Review F3. The store is never emptied for an agent — a refusal records something that happened —
- * and read state is per IPC connection, so a fresh window after a restart is entitled to every
- * notice ever recorded. Uncapped, the answer to "why did this conversation go quiet?" was at the
- * bottom of an archive. Capped and newest-first, the recent cause leads and the caller is TOLD the
- * list was cut (`refusals_incomplete`), rather than the tail vanishing silently.
- */
-const MAX_REFUSALS_PER_READ = 25;
-
-/**
- * How long the first send waits for an in-flight salt agreement before giving up on it —
- * `DOD-M15-SEALWIRE-1` B2b-2 constraint 2.
- *
- * The agreement is ONE round trip on a stream that is already open, so a healthy exchange finishes
- * in milliseconds; this bound is not sized for the normal case, it is sized for how long an operator
- * should wait before their message goes out unsalted instead of not going out.
- *
- * Five seconds because both errors cost real things. Too short and a merely slow counterparty makes
- * the session permanently unsalted for no reason — the decision is irreversible, so the bound should
- * be generous relative to the round trip. Too long and the first message of every conversation with
- * a peer on an older build visibly hangs, which is the failure a user actually notices and blames
- * the product for. This is only ever paid by a session that HAS an agreement outstanding: a
- * park-only session never starts one and never waits (constraint 5).
- */
-const SALT_AGREEMENT_WAIT_MS = 5_000;
-
-/**
- * How many times this side re-attempts its session-key announce, and the base delay between them.
- *
- * Bounded on purpose (review F5): the announce rides `onPeerConnect`, so a connection that stays up
- * after one failed attempt would never produce another — encryption off for the life of the session,
- * with guidance pointing at a reconnect that never comes.
- */
-const SESSION_KEY_ANNOUNCE_RETRIES = 4;
-const SESSION_KEY_ANNOUNCE_RETRY_MS = 250;
-
-/**
- * WHY a session is hashing unsalted — review Finding 1, and this exists because one sentence was
- * carrying five different situations.
- *
- * `#saltForHashing` returns null for five distinct upstream conditions, and the single guidance
- * string asserted one of them: *"expected when your counterparty runs a build that predates the salt
- * agreement… start a new session once they upgrade."* An operator whose counterparty was merely
- * OFFLINE when they sent their first message — the most common case by far, since a parked first
- * message unsalts the session by design — read that and went and told a fully up-to-date
- * counterparty to upgrade.
- *
- * That is the `directory_unreachable` shape this project keeps re-learning: the message names the
- * exit point and points at the wrong machine. A closed set of reasons with its own guidance per
- * reason is the fix, and a closed set is what stops a sixth condition quietly inheriting a fifth's
- * explanation.
- */
-const UNSALTED_REASONS = {
-  /** No agreement was ever started — the counterparty has not connected. The park-only case. */
-  NO_AGREEMENT_STARTED: "no_agreement_started",
-  /** We announced and they did not answer inside the bound. */
-  AGREEMENT_TIMED_OUT: "agreement_timed_out",
-  /**
-   * They answered, terminally: they have already hashed content and can never adopt.
-   *
-   * ⚠️ THIS IS ONE OF FOUR THINGS THE PEER CAN SAY, AND IT USED TO BE ALL OF THEM — 006-CRYPTO
-   * finding 2. The wire frame carries WHICH reason, and `SaltAgreementFrame.adoptionClosed` is a
-   * label rather than a boolean precisely so a caller cannot say `closed` without saying why. That
-   * distinction reached the log and was then dropped one call before the operator, who was told
-   * "they had already hashed messages" no matter which of the four it was.
-   */
-  PEER_CLOSED_ADOPTION: "peer_closed_adoption",
-  /**
-   * They answered terminally because their side could NOT READ its own frontier — local storage
-   * trouble on their machine, not a conversation that started early.
-   *
-   * Kept apart from `PEER_CLOSED_ADOPTION` because the remedies are opposites: a new session fixes
-   * the already-hashing case and does nothing at all for this one.
-   */
-  PEER_FRONTIER_UNREADABLE: "peer_frontier_unreadable",
-  /** They answered terminally because the two sides could not converge — 006-CRYPTO finding 1. */
-  PEER_EXCHANGE_STALLED: "peer_exchange_stalled",
-  /**
-   * They closed adoption naming a reason THIS build does not recognise.
-   *
-   * Deliberately non-asserting. The peer chooses this string, so the safe rendering states what we
-   * know — they declined, and the label is in the log line above — and asserts nothing about why.
-   * Guessing here is how an operator ends up asking a counterparty to change something that was
-   * never the problem.
-   */
-  PEER_CLOSED_UNSPECIFIED: "peer_closed_unspecified",
-  /** The session was torn down while the first send was still waiting. */
-  SESSION_TORN_DOWN: "session_torn_down",
-  /** This side already hashed, leafed, held or has in flight — adoption closed here. */
-  ADOPTION_CLOSED_LOCALLY: "adoption_closed_locally",
-  /** They answered in time and OUR OWN write failed. Nothing about their build is involved. */
-  OUR_PERSIST_FAILED: "our_persist_failed",
-  /**
-   * OUR announce never left this machine — review pass 2, F2. Reusing `AGREEMENT_TIMED_OUT` here
-   * told the operator *"your counterparty did not answer"* about a frame we never sent, which is the
-   * exact substitution this closed set was created to end, re-entering through the settle site the
-   * previous pass asked for.
-   */
-  ANNOUNCE_FAILED: "our_announce_failed",
-  /**
-   * They answered, we stored it, and reading it back FAILED — review pass 2, F4. Distinct from
-   * `OUR_PERSIST_FAILED` because the two point at different log lines, and the guidance names one.
-   */
-  OUR_READ_FAILED: "our_read_failed",
-} as const;
-
-type UnsaltedReason = (typeof UNSALTED_REASONS)[keyof typeof UNSALTED_REASONS];
-
-/**
- * What the operator should DO about each. TOTAL by construction — a `Record` over the union, so a
- * new reason cannot be added without something for the reader to act on. Same shape, and the same
- * reason, as `refusal-reasons.ts`: that file exists because a free-form `reason: string` let a new
- * code slip past every test in its own guard file.
- */
-const UNSALTED_GUIDANCE: Record<UnsaltedReason, string> = {
-  [UNSALTED_REASONS.NO_AGREEMENT_STARTED]:
-    "Your counterparty was not connected when you sent this, so there was nobody to agree a salt with — most often they are simply offline and this message is going to their relay mailbox. Nothing is wrong with either build. The agreement only runs at session open, so this session stays unsalted even after they come online; a session started while you are both connected will be salted.",
-  [UNSALTED_REASONS.AGREEMENT_TIMED_OUT]:
-    "Your counterparty was connected but did not answer the salt agreement in time. Almost always they are on a build that predates it, in which case this is expected and permanent for this session — start a new session once they upgrade. If you know they are on the same version, look for session.salt.persist.failed on this side and session.salt.announce.failed on either.",
-  [UNSALTED_REASONS.PEER_CLOSED_ADOPTION]:
-    "Your counterparty declined the salt because their side of this session had already hashed messages — their conversation started before yours could agree one. Both builds are fine and both sides know. Start a new session if you want the protection.",
-  [UNSALTED_REASONS.PEER_FRONTIER_UNREADABLE]:
-    "Your counterparty declined the salt because their machine could not read its own record of this conversation — their local storage is not answering. Nothing is wrong with your machine or with either build, and they did not do anything wrong. STARTING A NEW SESSION WILL NOT HELP: the next one will decline the same way until their storage is working. Ask them, out of band, to look for session.salt.adoption.refused on their side; it names the read that failed.",
-  [UNSALTED_REASONS.PEER_EXCHANGE_STALLED]:
-    "Your counterparty holds a salt for this session and this side never managed to store one, so the two of you could not converge and both agreed to stop rather than trade messages about it forever. Nobody is at fault and no message was lost. Look for session.salt.persist.failed on this side — if it is there, a write to local storage failed and that is the whole cause. Start a new session; it will agree a salt normally.",
-  [UNSALTED_REASONS.PEER_CLOSED_UNSPECIFIED]:
-    "Your counterparty declined the salt for a reason this build does not recognise — most likely they are on a newer build that names a case this one predates. Both sides agree there is no salt, so nothing is broken and no message was lost. The exact reason they gave is in the session.salt.adoption.closed line just above. Start a new session once you both know why.",
-  [UNSALTED_REASONS.SESSION_TORN_DOWN]:
-    "This session was closed or reset while the message was still being prepared. This line is about the salt only; look for the close or freeze event just before it for what actually happened to the session.",
-  [UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY]:
-    "This session had already hashed or sent messages before a salt could be agreed, so adopting one now would leave half the conversation verifiable by one rule and half by another. That is permanent for this session and both builds are fine. Start a new session if you want the protection.",
-  [UNSALTED_REASONS.OUR_PERSIST_FAILED]:
-    "Your counterparty answered in time and THIS side failed to store the agreed salt — the fault is local, not theirs. Do not ask them to upgrade. Look for session.salt.persist.failed immediately above this line; it names the write that failed.",
-  [UNSALTED_REASONS.ANNOUNCE_FAILED]:
-    "THIS side could not send the salt agreement to your counterparty — the frame never left this machine, so they were never asked and their build is not involved. Do not ask them to upgrade. Look for session.salt.announce.failed immediately above this line for the connection error; most often the direct link to them dropped between connecting and sending.",
-  [UNSALTED_REASONS.OUR_READ_FAILED]:
-    "A salt was agreed for this session and THIS side could not read it back — the fault is local storage, not your counterparty. Do not ask them to upgrade. Look for session.salt.read.failed immediately above this line; a wrong-width or unreadable row is named there.",
-};
-
-/**
- * DOD-M12B-ACK-1 — inbound `/cello/content/1.0.0` streams allowed per connection.
- *
- * libp2p's registrar default is 32, and it enforces the cap AFTER protocol negotiation has already
- * answered, so exceeding it resets a stream the sender believes it just opened and the sender's
- * next write fails with a message that names nothing. Content delivery is bursty by design (a
- * document sweep opened 99 events in one second on a live daemon), and a slot stays occupied for
- * the whole of ingest — which awaits SQLCipher and the security gateway. 32 is simply too close to
- * normal traffic to be a safety limit.
- *
- * This is headroom, NOT the fix. The fix is that #handleContentStream now closes what it opens; a
- * raised cap without that would only move the cliff. Kept finite on purpose: an unbounded cap would
- * let a peer pin memory by opening streams it never uses, and the ceiling is what makes a future
- * leak of this shape show up as a bounded failure instead of a heap.
- */
-const CONTENT_MAX_INBOUND_STREAMS = 512;
-
-/**
- * DOD-M12B-ACK-1 — how long an inbound content stream may stay open after we have closed our end.
- *
- * Closing our write end retires the stream only once the PEER has closed its end too, so a peer
- * that opens streams and never closes them still fills our inbound slots — a guard that runs only
- * on the party it constrains is not a guard. After this window we reset it ourselves, which the
- * muxer honours unilaterally.
- *
- * It cannot be zero: an immediate reset would land while a well-behaved sender is still inside its
- * own `await stream.close()`, rejecting that close and turning every ordinary send into a park.
- * The frame is already ingested long before this fires, so nothing waits on it.
- */
-const CONTENT_STREAM_LINGER_MS = 30_000;
-
-/**
- * DOD-M12B-SHUTDOWN-1 — how long one teardown step may block the daemon's exit.
- *
- * Chosen against the surface that complains: `cello logout` gives up and reports the daemon still
- * running after 5 s, so a step that can burn longer than that guarantees the message the operator
- * saw. Two steps at 2 s each stay inside it.
- */
-const SHUTDOWN_STEP_DEADLINE_MS = 2_000;
-
-/**
- * DOD-M12B-REDIAL-1 — the shortest gap between two re-dials of one session.
- *
- * Long enough that a burst of sends against a peer that is genuinely gone costs one dial rather
- * than one per message; short enough that a peer coming back is picked up on the next thing the
- * operator says. It is cleared on a successful dial, so it never delays a live counterparty.
- */
-const REDIAL_COOLDOWN_MS = 15_000;
-
-/**
- * DOD-CAP-SELF-HEAL-1 — how long an interrupted session keeps consuming a cap slot.
- *
- * ATTRIBUTION ALONE DID NOT FIX THIS, and the reason is worth keeping. Recording who ended a
- * session only works for sessions ended after the recording started: every row written before the
- * column existed is unlabelled, and an unlabelled row counts. So the operator's actual backlog —
- * five finished conversations that were blocking two of their own agents — was untouched by it.
- * Attribution can never clear history, and history is what fills a cap.
- *
- * Age can. An interrupted session nobody has touched for hours is debris, not a live obligation,
- * and that is true whether our restart or their disconnect produced it.
- *
- * D18 SURVIVES BECAUSE THE ATTACK IS A RATE. The disconnect-evasion peer has to drop and reopen
- * faster than this window to gain anything, so everything it churns is recent and everything it
- * churns still counts. What ages out is the thing that was never an attack: a conversation that
- * finished. An attacker who waits out the window to gain one slot per window is not evading the
- * bound, they are obeying a slower one — and the global anti-swarm cap still applies on top.
- *
- * Two hours: comfortably longer than any churn worth attacking with, comfortably shorter than
- * "yesterday's conversation still blocks me".
- */
-/**
- * DOD-M12B-RESERVATION-RETRY-1 — how many times to re-ask for a refused reservation before saying
- * the agent is undialable and stopping. Bounded because a reservation is scarce and a fleet that
- * retries forever is how a relay is exhausted. With the 5-minute base and doubling, five retries
- * span about 2.5 hours.
- */
-export const SR_RESERVATION_MAX_RETRIES = 5;
-
-/** The relay peer id inside a `/…/p2p/<relay>/p2p-circuit/…` address. */
-const CIRCUIT_RELAY_ID = /\/p2p\/([^/]+)\/p2p-circuit/;
-
-/**
- * 032-RELAYSPREAD — the relays a node ACTUALLY HOLDS a circuit with, read off the addresses it is
- * announcing. One entry per relay, deduped.
- *
- * This is the single definition of "a reservation is held", and it is deliberately the strictest
- * one available: an ANNOUNCED circuit address. `start()` resolving is not enough — a relay out of
- * reservation slots completes the handshake, grants nothing, and leaves a node that looks started
- * and is dialable by nobody. Nor is a candidate address enough: a candidate is a relay we asked.
- */
-function heldRelayIdsOf(node: CelloNode): string[] {
-  const ids = new Set<string>();
-  for (const addr of node.listenAddresses()) {
-    if (!addr.includes("/p2p-circuit")) continue;
-    const id = CIRCUIT_RELAY_ID.exec(addr)?.[1];
-    if (id !== undefined) ids.add(id);
-  }
-  return [...ids];
-}
-
-/**
- * DOD-M15-RELAYSLOTS-1 — how long an agent skips a relay that refused it for a relay-side fault.
- *
- * Ten minutes: long enough that the agent is not re-asking a relay that cannot serve it every time
- * its receiver rebuilds, short enough that when someone fixes that relay the agent finds it again
- * without needing its own restart. The fault is on somebody else's machine and nobody tells us when
- * it is fixed, so this has to expire on its own.
- */
-export const RELAY_QUARANTINE_MS = 10 * 60 * 1000;
-
-export const CAP_INTERRUPTED_TTL_MS = Number(process.env["CELLO_CAP_INTERRUPTED_TTL_MS"]) || 2 * 60 * 60 * 1000;
-
-/**
- * DOD-CAP-SELF-HEAL-1 — what counts against a per-sender acceptance bound.
- *
- * `active` always. `interrupted` ONLY when the counterparty caused it.
- *
- * D18 is why `interrupted` has to count at all: a peer can flip a session to `interrupted` for free
- * by dropping its stream, then open a fresh one, indefinitely. Those are theirs and still count.
- *
- * What broke was charging them for OURS. A daemon restart flips every live session to
- * `interrupted`, nothing resolves them, and the reaper correctly refuses to take any with received
- * content — so the bound became all-time instead of concurrent. Measured 2026-08-17: two of one
- * operator's own agents could not open a session, because one held five finished conversations with
- * the other against a stranger cap of three.
- *
- * NULL counts as the counterparty's. The column is new, so every pre-existing row is unlabelled,
- * and the safe default for an anti-abuse bound is to count rather than to excuse.
- */
-const CAP_COUNTS = (alias = ""): string => {
-  const p = alias ? `${alias}.` : "";
-  return `(${p}status = 'active'
-           OR (${p}status = 'interrupted'
-               AND COALESCE(${p}interrupted_by, 'counterparty') != 'local'
-               AND ${p}updated_at >= ?))`;
-};
-const CAP_COUNT_SQL = (where: string): string =>
-  `SELECT COUNT(*) AS n FROM sessions WHERE ${where} AND ${CAP_COUNTS()}`;
-
-/** The cutoff an interrupted session must be newer than to still count. */
-const capStaleBefore = (): number => Date.now() - CAP_INTERRUPTED_TTL_MS;
-
-/**
- * DOD-M12B-ABANDON-NOTIFY-1 — what happened when we tried to tell the counterparty we hung up.
- *
- * A REASON, not a boolean. The three causes are not interchangeable, and collapsing them made the
- * operator's guidance blame the network for a session this side had already torn down — which is
- * the most common case, since force-abandon is largely used on `interrupted` sessions and those
- * have no node left to send on.
- *
- * `told: true` means the bytes left this node. There is no acknowledgement, so it is not proof the
- * far side acted — a counterparty on an older client does not understand the frame and keeps
- * calling. The guidance says so rather than promising they will stop.
- */
-export interface AbandonNoticeResult {
-  told: boolean;
-  reason: "sent" | "no_local_node" | "send_failed";
-}
-
-/**
- * DOD-M12B-ACK-1 — why a session is impaired, and what became of the content that revealed it.
- *
- * `cause` separates "your own message did not reach them" (`direct_send`) from "our acknowledgement
- * to them did not go out" (`delivery_ack`) — on the second the operator sent nothing at all, so a
- * surface that talks about their last send is describing a message they never wrote.
- *
- * `retained` is what makes it safe to advise. A parked or durably-queued message must NOT be
- * resent — a resend takes a second canonical position, which is this milestone's founding defect.
- * A LOST one must be, and `cello_send` has already said so. `unknown` means do not claim either.
- */
-export interface SessionImpairment {
-  /**
-   * `content_key` added by `029c` review F7: a send that failed because this machine had no content
-   * encryption key — never agreed, or gone between the preflight and the seal — is a LOCAL key
-   * fault, not a transport one. Reported as `direct_send` it sent the operator to inspect a
-   * connection that was working.
-   */
-  cause: "direct_send" | "delivery_ack" | "content_key";
-  retained: "parked" | "durable" | "lost" | "unknown";
-}
-
-// Persistence bounds are TIER-GRADUATED via DEFAULT_TIER_BOUNDS (contacts-tier-migration). The two
-// consts below DERIVE from the grid's UNKNOWN row rather than restating it — the grid is the single
-// source (DOD-TIER-2 AC4), so these can never drift from it.
-/** Anti-drip-feed: cumulative RECEIVED bytes per session at the UNKNOWN tier (= the grid's UNKNOWN
- *  byte cap). Higher tiers get more (DEFAULT_TIER_BOUNDS); no tier is unbounded (INV-TIER-BOUND). */
-export const ABUSE_MAX_SESSION_RECEIVED_BYTES = DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxBytesPerSession; // 25 MB
-/** Anti-drip-feed via many sessions: active sessions an UNKNOWN counterparty may hold open at once
- *  (= the grid's UNKNOWN per-sender cap). */
-export const ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER = DEFAULT_TIER_BOUNDS[TIER.UNKNOWN].maxSessionsPerSender; // 3
-/** Anti-swarm: total active sessions from ALL UNKNOWN-tier counterparties combined, per agent. A
- *  scalar across the whole unknown pool — not per-tier — so it stays a standalone const. */
-export const ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL = 50;
-
-/**
- * M7 DOD-SPINE-6 / MSG-001-3b: the inputs a session node needs to connect to the relay
- * as the Structure-2 witness (relay endpoint from the FROST-signed assignment + the
- * agent's K_local identity + the 16-byte session id). Optional on node creation: when
- * absent (or connect fails), the session still works over the direct content path — the
- * relay just doesn't witness the leaf yet.
- */
-export interface RelayConnectParams {
-  relayPeerId: string;
-  relayAddrs: string[];
-  keyProvider: KeyProvider;
-  senderPubkey: Uint8Array;
-  sessionIdBytes: Uint8Array;
-  /**
-   * FED-OPTIONB-SETUP-001 (Option B): the directory-signed relay assignment the client presents to its
-   * chosen relay (replaces the directory→relay dial). Absent for direct-mode and on the restart/persisted
-   * reconnect path (the relay already recorded the session at first establishment) — the client then just
-   * reconnects without re-recording.
-   */
-  assignment?: RelayAssignmentCarry;
-}
-
-/**
- * DOD-PARK-DRAIN-1: why the parked-mailbox drain is being asked to run.
- *
- * `standing_receiver_ready` — a receiver was just installed, first time or rebuilt. The rebuild is
- * the case that matters: content parks precisely because the relay link died, and the watchdog
- * rebuild is that same event seen from the client side.
- * `periodic_backstop` — nothing happened; this is the slow sweep that keeps a missed trigger from
- * stranding content until someone restarts the daemon. Drains are deduped and delete-on-confirm,
- * so an extra one costs a pull.
- */
-export type ParkedDrainReason =
-  | "standing_receiver_ready"
-  | "periodic_backstop"
-  /**
-   * DOD-M12B-SESSION-SEED-1 (case B): a session that was interrupted has just been revived, so the
-   * content the counterparty parked while we had no node can finally be fetched. Reviving the node
-   * without draining leaves the operator looking at a healthy session with no new mail.
-   */
-  | "session_revived"
-  /**
-   * DOD-M12B-LEAF-TRIGGERS-FETCH-1: the relay told us a specific message exists — we hold its hash
-   * and its canonical sequence — and its plaintext never arrived on the direct path. Measured live
-   * 2026-08-18: the leaf landed in ONE second and the bytes took 102, because nothing connected the
-   * two facts.
-   */
-  | "witnessed_leaf_unresolved";
-
-// ─── Interfaces ───────────────────────────────────────────────────────────────
-
-/**
- * Adapter interface for session node creation. Allows test injection of a
- * failing factory (AC-007) without touching the real libp2p stack.
- * The adapter pattern is mandatory per outline.md constraints.
- */
-export interface ISessionNodeFactory {
-  createNode(config: SessionNodeConfig): Promise<CelloNode>;
-}
-
-export interface SessionNodeConfig {
-  sessionId: string;
-  connectionGater?: SessionConnectionGater;
-  /**
-   * DOD-M15-RELAYONLY-1: this agent has asked never to be directly reachable, so the factory must
-   * omit dcutr from the node's service set.
-   *
-   * ⚠️ NOT a duplicate of filtering the published addresses. Those two things stop DIFFERENT
-   * disclosures: the filter controls what the DIRECTORY is told, and dcutr talks to the peer
-   * directly. Its whole job is to upgrade a relayed connection into a direct one, and the inbound
-   * side starts the upgrade — which is exactly a standing receiver. Leaving it on means the agent
-   * routes over the relay precisely as asked and then hole-punches to a direct connection anyway,
-   * with every test still green because the leak happens inside libp2p after the assertions.
-   */
-  relayOnly?: boolean;
-  /**
-   * CELLO-M7-TRANSPORT-001: role of the node, forwarded to createNode to tune the
-   * libp2p service set (dcutr is included for 'session' dialers, omitted for the
-   * 'standing_receiver'). AutoNAT is present for both.
-   */
-  nodeType?: "session" | "standing_receiver";
-  /**
-   * M7-SESSION-003 (AC-005): keepalive ping interval for the session node so a
-   * counterparty that vanishes without a clean close is detected within a bounded
-   * window. Factories should forward this to createNode({ keepAliveIntervalMs }).
-   */
-  keepAliveIntervalMs?: number;
-  /**
-   * DOD-NAT-REACHABILITY-1: circuit-relay listen addresses
-   * (`<relay-multiaddr>/p2p/<relay-peer-id>/p2p-circuit`) the node should take
-   * reservations on. Each entry makes libp2p reserve a slot with that relay and
-   * advertise the relayed address via getMultiaddrs() — which is what makes a
-   * NAT'd standing receiver dialable at all. A dead relay in this list degrades
-   * (no reservation, WARN) — it never fails node creation.
-   */
-  circuitRelayListenAddrs?: string[];
-  /**
-   * DOD-M12B-SESSION-SEED-1: the 32-byte Ed25519 seed this node's transport identity is derived
-   * from, so a node that is torn down can be rebuilt at the SAME peer id.
-   *
-   * Without it libp2p generates the key internally and the id is unrecoverable — which is why a
-   * laptop-close session cannot come back today: a rebuilt node could dial the counterparty, but
-   * the counterparty holds an id that no longer exists.
-   *
-   * PER SESSION, NEVER PER AGENT. Each standing receiver mints its own; at handoff the seed becomes
-   * that session's and the replacement receiver mints a fresh one. That preserves the recorded
-   * 2026-04-11 rationale for ephemeral ids (a passive observer must not be able to correlate one
-   * agent's sessions across days) while making the id stable WITHIN the one session an observer can
-   * already correlate by watching the connection.
-   */
-  transportPrivateKey?: Uint8Array;
-  /**
-   * DOD-M12B-SESSION-SEED-1 (case B review HIGH-1): bind a ROUTABLE interface, not loopback.
-   *
-   * Ordinary session nodes dial OUT and need no inbound reachability, so the factory gives them
-   * `127.0.0.1`. But a session node that reached its role by PROMOTION inherited the standing
-   * receiver's `0.0.0.0` bind and its circuit-relay reservation — which is every session node in
-   * production. A REBUILT one does not inherit anything, so without this it comes back on loopback
-   * with no relay address: the peer id is preserved and the counterparty still cannot reach us,
-   * which is precisely the half of the promise revival exists to keep. Preserving the id only
-   * matters because the circuit address `/p2p/<relay>/p2p-circuit/p2p/<sessionPeerId>` embeds it —
-   * and that is the address that was not being taken.
-   */
-  inboundReachable?: boolean;
-}
-
-/**
- * DOD-M12B-SESSION-SEED-1 — everything needed to bring one session back, and nothing else.
- *
- * Deliberately minimal: a revival re-establishes the SAME session with the SAME two parties, so it
- * needs our identity and theirs and no more. Anything else added here would be state that has to be
- * destroyed on the same edge, and each addition is another way to leave something open.
- */
-interface SessionRevivalIdentity {
-  /** The 32-byte Ed25519 seed our session node's peer id derives from. Zeroed on destruction. */
-  seed: Uint8Array;
-  /** The counterparty's SESSION-layer peer id — the gater's allowed peer, and our dial target. */
-  counterpartyPeerId: string;
-  /** Their agent pubkey, for the rebuilt content handler's authentication check. */
-  counterpartyPubkey: string;
-  /**
-   * DOD-M12B-SESSION-SEED-1 — the counterparty's transport addresses, so a revived session can DIAL
-   * them. Measured live 2026-08-18: without this the rebuild succeeded in 1ms and the very next send
-   * failed and was LOST, because `#evictSessionCaches` clears `#counterpartyAddrs` on teardown and
-   * the re-dial then has nothing to dial. A revived node with no way to reach the other side is a
-   * session that is "active" and cannot speak.
-   */
-  counterpartyAddrs: string[];
-}
-
-// ─── Active session entry ─────────────────────────────────────────────────────
-
-interface ActiveSessionEntry {
-  node: CelloNode;
-  agentName: string;
-
-  /** DOD-LOOP-1: the bare session id (hex). The map key is composite (agentName, sessionId), so
-   *  iteration/logging reads the real session id from here, not from the map key. */
-  sessionId: string;
-  counterpartyPubkey: string;
-  gater: SessionConnectionGater;
-  correlationId: string;
-  /**
-   * DAEMON-004: the counterparty's SESSION-layer Peer ID — the dial target for
-   * the direct content stream (/cello/content/1.0.0). Set when the node is
-   * created (outbound: the gater-allowed peer) or accepted (inbound: initiator).
-   */
-  counterpartySessionPeerId: string;
-  /**
-   * CELLO-M7-TRANSPORT-001: the AutoNAT service wrapping this session node. Emits
-   * transport.autonat.result on each probe cycle; stopped when the node is torn
-   * down so its node subscription is released.
-   */
-  autoNat: NodeAutoNatService;
-  /**
-   * M7 DOD-SPINE-6 / MSG-001-3b: the agent's shared relay witness client (one stream per
-   * agent, multiplexing all that agent's sessions — the relay keys delivery by agent
-   * pubkey). The leaf submit path uses it on cello_send. Absent when the relay is
-   * unreachable — the direct content path still delivers.
-   */
-  relayClient?: AgentRelayClient;
-  /** The 16-byte session id, for relay leaf submission (the relay frame carries it). */
-  relaySessionIdBytes?: Uint8Array;
-  /** The `#relayClients` map key (agentName + relay peer id) — federation-safe teardown. */
-  relayClientKey?: string;
-  /**
-   * MSG-001-3b (2b): the session's relay endpoint (peer id + addrs) from the FROST assignment.
-   * Held so the content-park backstop can deposit to the SAME relay this session is witnessed by
-   * when direct delivery fails. In-memory only (not persisted — the startup-flush park is the
-   * separate schema concern; this live park has the endpoint in hand).
-   */
-  relayPeerId?: string;
-  relayAddrs?: string[];
-  /**
-   * DOD-M15-RELAYAUTH-1 review H1: the session's directory-signed assignment, held so the DIAL path
-   * can present it to whichever relay is about to be asked to allow the dial. Without it here, the
-   * dialer has no credential in hand at the moment it needs one and the gate refuses a legitimate
-   * dial. Self-authenticating, so holding it grants nothing that forging it would not already require.
-   */
-  relayAssignment?: RelayAssignmentCarry;
-  /**
-   * DOD-M15-RELAYAUTH-1 review M4: `#relayClients` keys for the ADDITIONAL relay clients this
-   * session opened beyond its witness relay — the relays that gate circuit dials. `relayClientKey`
-   * only ever names the witness one, so without this list these clients and their `#sessions`
-   * entries are never released and accumulate for the life of the daemon.
-   */
-  extraRelayClientKeys?: string[];
-}
-
-/** DAEMON-004: a piece of content received and verified, awaiting cello_receive. */
-interface ReceivedContentEntry {
-  contentHex: string;
-  senderPubkey: string;
-  sequenceNumber: number;
-}
-
-// ─── Result types ─────────────────────────────────────────────────────────────
-
-type CreateSessionResult =
-  | { ok: true; peerId: string; addrs: string[] }
-  | { ok: false; reason: string; guidance: string };
-
-// ─── SessionNodeManager ───────────────────────────────────────────────────────
-
-/**
- * DOD-COATTEND-1: how much of the arrival buffer is kept. Delivery reads the durable transcript
- * now, so this buffer is only a recency hint (`peekLatestReceivedContentHex` for M8C-AWAY-1's
- * [[WRAP]] check). Small, and stated: an unstated cap is a silent truncation, and no cap at all is
- * the leak the old destructive read was accidentally preventing.
- */
-const RECEIVED_BUFFER_CAP = 32;
-
-/**
- * M12-P12 (review F6): the outcome of one park-deposit attempt. A bare boolean conflated
- * "this session has no relay to park to" with "the relay refused the deposit" — only the latter is
- * worth queuing for a later retry, and queuing the former grows the durable queue with rows that
- * can never drain.
- */
-/**
- * M12-P13 (review MEDIUM-5): the outcome AND the cause. `standing_receiver_unavailable` is an
- * exit-point label; `cause` is the four-way answer from `standingReceiverAbsenceReason()` that says
- * WHICH state the receiver was in — the distinction M12-P12 added precisely because the label had
- * misnamed this incident. It used to be logged here and then discarded at the mapping site, so the
- * caller (and the operator reading `reason`) was sent to the transport when the blocker was the
- * standing receiver.
- */
-// M12-P18: how many refused session ids to retain per agent (drain-sweep matching, not security).
-/**
- * ⚠️ `retryAfterMs` — `DOD-M15-RELAYABUSE-1` review MEDIUM-6. The guidance told operators the
- * throttle clears *"in about a minute"*, which is a hardcoded guess about the RELAY's configurable
- * window: a relay run at ten minutes makes that sentence a wrong promise. The real number was in
- * hand two frames away and died here, which is the value-with-no-reader defect one layer further
- * out from where it was just fixed twice.
- */
-type ParkAttempt = { outcome: "parked" | "refused" | "unconfigured"; cause?: string; retryAfterMs?: number };
-
-/**
- * DOD-M12B-REVIVAL-BOUND-1 — how long an interrupted session stays revivable before it is closed.
- *
- * 24 hours. The bound exists because of Andre's 2026-08-18 tenet — *"leave nothing open that is no
- * longer needed"* — and its value is set by the case it must not break: a laptop closed for the
- * night. A window shorter than a night's sleep would abandon exactly the sessions case A/B exist to
- * rescue, which is why this is not zero and not an hour.
- *
- * It is deliberately a plain constant and not a setting. A per-operator knob here is a knob that
- * turns the guarantee off, and the guarantee is the security property, not a preference.
- */
-export const REVIVAL_WINDOW_MS = 24 * 60 * 60 * 1000;
-
-/**
- * DOD-M12B-REVIVAL-BOUND-1 — how often the revival bound is applied.
- *
- * Hourly. The window is 24 hours, so the worst-case overshoot is ~4% of the bound, and the pass is
- * one DB walk with no network in it. Boot-only was the first build and it is not a bound at all: a
- * daemon left up for a week never applies it, and a long-lived daemon is the normal case.
- */
-export const REVIVAL_BOUND_SWEEP_MS = 60 * 60 * 1000;
-
-/** DOD-M12B-SESSION-SEED-1: per-relay deadline when a revived node asks for a circuit reservation.
- *  Three seconds — a relay that has a slot answers well inside it, and one that does not never
- *  answers at all (measured: 10,002ms and still waiting). */
-export const REVIVE_RESERVATION_TIMEOUT_MS = 3_000;
-
-/** How many relays a revival will ask before settling for a plain node. Two: the worst case is then
- *  ~6s to a usable session, against a measured "never" for the unbounded form. */
-export const REVIVE_RESERVATION_CANDIDATES = 2;
-
-/**
- * DOD-M12B-LEAF-TRIGGERS-FETCH-1 — how long the DIRECT path gets before we go and fetch content the
- * relay has already told us about.
- *
- * Two seconds. The witness leaf and the plaintext are separate deliveries, and on a healthy session
- * the direct content normally lands within milliseconds of the leaf — so fetching the instant a leaf
- * arrives would put a relay round trip on the hot path of every message in every session, which is a
- * self-inflicted load problem. Waiting forever is what cost 102 seconds. Two seconds is far above
- * the healthy direct latency and far below anything a person would notice.
- */
-export const LEAF_FETCH_GRACE_MS = 2_000;
-
-/**
- * DOD-M15-REFUSALTERMINAL-1 — the refusal reasons no retry can ever get past.
- *
- * MEASURED LIVE 2026-09-04: one message aimed at a conversation the counterparty had already
- * closed, refused `session_committed` and re-fetched roughly twice a second for 62 hours across
- * several daemon restarts — 232,056 refusal events on that one session and a 484 MB `daemon.log`.
- *
- * **WHY `session_committed` QUALIFIES.** A committed session carries a signature over its contents.
- * Nothing can be appended to it by anyone — not the counterparty, not us — so there is no future
- * state in which this content is accepted. That is the bar, and it is the whole bar.
- *
- * **⚠️ DO NOT ADD A REASON WITHOUT MEETING IT.** A reason wrongly called terminal silently drops a
- * message that would have arrived on the next try, which is worse than the loop this set exists to
- * end. The tempting ones and why each fails:
- *
- *   - `content_hash_mismatch` — the fetch is BY CONTENT HASH, and a later fetch may retrieve a
- *     correct copy from a different relay. Retrying can succeed.
- *   - `sender_unresolved` — the sender may become resolvable when a profile arrives or a directory
- *     syncs. Retrying can succeed.
- *   - `session_orphaned` — `024-ORPHANTRIAGE` owns that path and decides its disposition.
- *   - `session_size_limit_exceeded` — the cap IS monotonic, but its bound is a setting, and an
- *     operator who raises it must be able to un-stick the conversation.
- *   - a transient screener block — transient is in its name.
- */
-/**
- * ⚠️ NOT the same concept as `session-terminal-refusal.ts` (`DOD-MP-SESSION-RETIRE-1`), which is the
- * RELAY terminally refusing one of OUR SENDS. This set is about INBOUND content this side will
- * never accept. Two "terminal refusal" ideas live in this daemon and they point in opposite
- * directions — review F9.
- */
-export const TERMINAL_REFUSAL_REASONS: ReadonlySet<string> = new Set(["session_committed"]);
-
-/**
- * DOD-M15-REFUSALTERMINAL-1 review F3 — how long a FAILED read of the terminal-refusal rows is
- * backed off for, per session.
- *
- * A minute: long enough that a database throwing on every witnessed leaf produces one ERROR rather
- * than one per message (the exact log growth this unit exists to end), short enough that a disk
- * which recovers is noticed within a message or two rather than at the next restart.
- */
-export const TERMINAL_REFUSAL_READ_RETRY_MS = 60_000;
-
-/**
- * DOD-M15-REFUSALTERMINAL-1 review F7 — how many terminally-refused content hashes are remembered
- * per session.
- *
- * The counterparty chooses how many rows this table gets: one per distinct message aimed at a
- * closed conversation, written even after the byte cap has stopped retaining evidence. 512 matches
- * `MAX_REFUSED_PARKED_ENTRIES`, is far above any honest volume for a conversation that has ENDED,
- * and bounds the table at (sessions × 512) small rows.
- */
-export const MAX_TERMINAL_REFUSALS_PER_SESSION = 512;
-
-/**
- * DOD-M15-REFUSALTERMINAL-1 — ONE refusal, TWO counts, and the NAMES are the fix.
- *
- * The inbox reported `times: 58` for a refusal that had fired tens of thousands of times, and the
- * code was not wrong — the sentence describing it was. One number is "since you last dismissed this
- * conversation" and the other is "ever". Neither may be called `times`, because that is the word an
- * operator, and an agent deciding whether to escalate, reads as a lifetime figure.
- */
-export interface RefusalNotice {
-  sessionId: string;
-  reason: string;
-  kind: RefusalKind;
-  impact: string;
-  guidance: string;
-  /** Refusals of this reason on this session since the last `cello_dismiss` — which DELETES the
-   *  notice row, restarting this counter at 1. Zero dismissals and it equals `timesTotal`. */
-  timesSinceDismissed: number;
-  /**
-   * Every refusal of this reason on this session, from the first one, untouched by dismissal.
-   *
-   * OMITTED, never guessed, when the notice is served from the in-memory fallback — that path
-   * exists precisely because the database write failed, so no durable total was ever written, and
-   * reporting the smaller number twice would put the original lie back with two names on it.
-   *
-   * MUTUALLY EXCLUSIVE with `timesTotalAtLeast`: a figure and a floor are different claims and
-   * must not share a name.
-   */
-  timesTotal?: number;
-  /**
-   * A LOWER BOUND on the lifetime count, for a row SEEDED at upgrade from a notice that already
-   * existed — review F1c.
-   *
-   * The seed is that notice's `count`, which is refusals since the last dismissal, so the true
-   * figure is at least this and may be far more: on the machine this unit was written for, the
-   * notice read 58 and the log held 232,056 refusal events. Reporting 58 as `timesTotal` would be
-   * the original defect with the new name on it. "At least 58" is true; "58" is not.
-   */
-  timesTotalAtLeast?: number;
-  repeat?: boolean;
-}
-
-
-/**
- * DOD-M15-SEALWIRE-1 bullet 5, SENT half — our own authorship proof for a message we sent.
- *
- * Deliberately the SAME shape as the received half's `verifiedAuthorship`, because the transcript
- * column pair is the same and a second shape would invite a second meaning. What differs is the
- * ATTRIBUTION the row records: a sent row is `self_authored` (we PRODUCED this signature), never
- * `verified_signature` (we CHECKED someone else's). Same bytes, different claim.
- */
-export interface SentAuthorship {
-  senderPubkey: Uint8Array;
-  senderSig: Uint8Array;
-}
-
-/**
- * `DOD-M15-AUTHORSHIP-ABSENT-1` — the answer to "did the sender prove they wrote this message?",
- * with the three NOT-YES cases kept apart because they are three different facts about the peer.
- *
- * The distinction that matters is between `refuted` and `unusable`, and getting it backwards is the
- * trap this unit was written against:
- *
- *   - `refuted`   — a proof was supplied and it FAILED. That is evidence about the counterparty's
- *                   key, and it freezes the session (`#freezeOnIdentityFailure`).
- *   - `unusable`  — there is nothing here that could be checked against this message. Almost always
- *                   a peer on an older build; possibly someone stripping the field. It refuses THE
- *                   MESSAGE and leaves the session alone, because freezing on it would turn every
- *                   version skew into an incident only a new session can clear.
- *
- * Absent is not a fourth case: a frame with no `sender_signature` never reaches the verifier, and
- * its caller refuses it on the same path an `unusable` verdict takes. Missing, malformed and
- * mismatched arrive at one outcome, which is the rule this whole class of defect comes from.
- */
-type AuthorshipVerdict =
-  /** Signature verified against the key inside the signed bytes, and that key IS this session's counterparty. */
-  | { verdict: "verified"; senderPubkey: Uint8Array; senderSig: Uint8Array }
-  /**
-   * 024-ORPHANTRIAGE: the signature VERIFIED and there was no session record to match it against.
-   *
-   * ⚠️ **DELIBERATELY A SEPARATE VERDICT, NOT A `verified` WITH A FLAG.** `verified` means *verified
-   * AND matched to this session's counterparty*; the transcript column it feeds is documented as
-   * exactly that ("verified, never claimed") and seal-time attribution rests on it. Returning an
-   * unmatched signer under that name would silently widen a proof the rest of the system reads as
-   * stronger. This one carries the weaker fact under its own name, and has exactly one consumer:
-   * the orphan branch, which needs to tell an operator whether anything at all is known about who
-   * sent a message for a conversation that does not exist here.
-   */
-  | { verdict: "verified_unmatched"; senderPubkey: Uint8Array }
-  /** A proof was supplied and it is WRONG. Identity failure — fatal for the session. */
-  | { verdict: "refuted"; reason: "bad_signature" | "signer_not_counterparty" }
-  /** Nothing checkable arrived. Refuses the message; says nothing about the counterparty's key. */
-  | { verdict: "unusable"; reason: string };
-
-/**
- * The `unusable` reason for a proof that is real and describes some OTHER message.
- *
- * ⚠️ NOT `"content_hash_mismatch"` — review §6. That string is already the refusal reason for the
- * RECEIVER's own recompute failing (`ingestReceivedContent`), which is a tamper signal about the
- * BODY. This one says the sender's signed claim is about different content. Two different failures
- * sharing one name is a collision an operator grepping the log walks straight into.
- */
-const AUTHORSHIP_CONTENT_HASH_MISMATCH = "authorship_hash_mismatch";
-
-/**
- * The `unusable` reason for a proof that is real, is by the right signer, describes this content —
- * and was signed for a DIFFERENT conversation. A replay, not a forgery.
- *
- * Every one of those properties has been ESTABLISHED by the time this is returned; see the ordering
- * note in `#verifyAuthorshipClaim`. An earlier version of this sentence was true of the intent and
- * not of the code, because the check ran before the signature was verified.
- */
-const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
-
-/**
- * ─── 033-ACKEMIT: the three things that can be wrong with an ACKNOWLEDGEMENT ─────────────────────
- *
- * All three are `unusable` — the message is refused and the session lives. None of them is an
- * identity fault: by the time any is returned the signature has verified, the signer IS this
- * session's counterparty, and the claim is about this content in this conversation. What is wrong is
- * what the claim says the sender had SEEN.
- *
- * They are three names and not one because the operator's next move differs for each, and because an
- * investigator who cannot tell "your counterparty is on an older build" from "your counterparty
- * acknowledged something you never sent" is looking at the wrong half of the problem.
- *
- * ⚠️ **NAME WHAT WAS OBSERVED, NEVER AN INFERRED CONCLUSION** (`DOD-M15-ERRSTRING-1`). Not one of
- * these says "peer is malicious" — a mismatch is equally what a genuine software fault on the other
- * side looks like, and an error that names a party the code did not check is this milestone's
- * founding defect.
- */
-
-/**
- * `DOD-M15-SELFCHAIN-1` — the sender's link to their OWN previous message names content this side
- * did not receive from them as their last one.
- *
- * ⚠️ THIS IS THE ONE THAT MEANS THE ORDER OF THE CONVERSATION IS IN DISPUTE, and it is why it is
- * named apart from the acknowledgement reasons above rather than folded in with them. Those say the
- * sender is wrong about what WE said; this says they are wrong about what THEY said, which is the
- * only thing they cannot be honestly mistaken about for long.
- *
- * ⚠️ AND IT STILL NAMES WHAT WAS OBSERVED, NEVER A CONCLUSION. The same signal is produced by a
- * peer reordering a conversation and by a peer whose own chain record went out of step after a
- * restart, and this side cannot tell them apart.
- */
-const AUTHORSHIP_SELF_CHAIN_MISMATCH = "self_chain_mismatch";
-
-/** A v1 claim: it carries no `last_seen_hash`, so it asserts a POSITION and no content at all. */
-const AUTHORSHIP_ACK_HASH_ABSENT = "ack_hash_absent";
-
-/** The hash names content this side does not hold at the position the claim names. */
-const AUTHORSHIP_ACK_HASH_MISMATCH = "ack_hash_mismatch";
-
-/** The hash names content this side has never held — not in the tree, and not held pending a gap. */
-const AUTHORSHIP_ACK_HASH_UNKNOWN = "ack_hash_unknown_content";
-
-
-/**
- * The set that routes an `unusable` reason to the acknowledgement wording rather than the generic
- * one. A SET, not a string prefix test: a name-shaped check would silently adopt any future reason
- * someone happens to call `ack_*`, and give it a sentence written for these four.
- */
-export type AckHashReason =
-  typeof AUTHORSHIP_ACK_HASH_ABSENT | typeof AUTHORSHIP_ACK_HASH_MISMATCH | typeof AUTHORSHIP_ACK_HASH_UNKNOWN;
-
-const ACK_HASH_REASONS: ReadonlySet<string> = new Set<string>([
-  AUTHORSHIP_ACK_HASH_ABSENT,
-  AUTHORSHIP_ACK_HASH_MISMATCH,
-  AUTHORSHIP_ACK_HASH_UNKNOWN,
-]);
-
-/**
- * ⚠️ **THE REFUSALS THAT SAY THIS ARE THE ONES WHERE THE REFUSAL DOES NOT HOLD — NOT ALL OF THEM.**
- *
- * It said "EVERY INBOUND REFUSAL SAYS THIS", and review F5 measured that: fifteen call sites file a
- * refusal notice in this file and four carry this sentence — the three encryption causes and the
- * authorship one. The rest MUST NOT. A screened-out message is deliberately never delivered by any
- * route, and a transcript write failure lost content that was already accepted; promising either
- * operator a second chance would be a lie in the opposite direction. Rewritten rather than deleted,
- * because "EVERY" read as a rule and the next person to add a refusal would have applied it blindly.
- *
- * Where it DOES apply: refusing an inbound frame sends back no delivery acknowledgement, so a CELLO
- * sender's TTF backstop parks a copy in the relay mailbox — sealed to this agent's LONG-TERM
- * IDENTITY key, not the session key — and recovery opens that one whatever went wrong with the
- * direct copy.
- *
- * ⚠️ AND ONLY WHEN THIS MACHINE CAN OPEN ONE. See `REFUSAL_NO_OTHER_ROUTE`; the choice is made by
- * `#mailboxRouteAvailable`, never by a caller writing the sentence into a literal.
- */
-const REFUSAL_MAY_STILL_ARRIVE =
-  "IT MAY STILL REACH YOU BY THE OTHER ROUTE: a refusal sends back no acknowledgement, so a CELLO " +
-  "counterparty's agent parks a copy in the relay mailbox and this side opens that one with your " +
-  "long-term key instead of this session's. If it arrives, it arrives without whatever this check " +
-  "was unable to confirm — and if they are not running CELLO, there is no such copy and it will " +
-  "not arrive.";
-
-/**
- * ⚠️ **THE OTHER ROUTE DOES NOT EXIST ON THIS MACHINE, AND SAYING SO IS THE POINT** — review F2.
- *
- * Opening a mailbox copy needs `KeyProvider.openContentSeal`, which is OPTIONAL: a threshold or
- * signing-only provider does not implement it, and an agent loaded without a provider has none at
- * all. `content-park.ts` refuses both — `signing_key_unavailable`, `cannot_unseal`.
- *
- * That is the SAME condition `CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY` reports. So on the one
- * refusal that names a missing local identity, the reassurance above was false: both routes are shut
- * by one cause, permanently, for every message on every session of that agent — and the operator was
- * told to wait for a delivery that cannot happen. That is the H1 defect exactly: a refusal
- * announcing a better outcome than it delivers.
- */
-const REFUSAL_NO_OTHER_ROUTE =
-  "AND IT WILL NOT REACH YOU BY THE OTHER ROUTE EITHER: the relay mailbox copy is opened with this " +
-  "agent's long-term identity key, which is the very thing this machine is missing. One cause shuts " +
-  "both routes, and it will keep shutting them until the agent is loaded with its identity key. Do " +
-  "not wait for this message to turn up.";
-
-/**
- * Constant-shape byte equality for the two binding checks. Lifted rather than hand-rolled a second
- * time — `seal-frontier-verify` has the same helper for the same comparison, and two copies of
- * "are these the same bytes" is two things to keep true.
- */
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-/**
- * One row of a session's durable transcript as a reader sees it.
- *
- * DOD-M15-REFUSEDEVIDENCE-1: `'quarantined'` is a message that was received and REFUSED. Its `text`
- * is the withholding statement, never the payload — the storage is complete and only the READ is
- * redacted. `withheld` is present exactly on those rows so a caller can style or skip them without
- * string-matching the statement.
- */
-export interface TranscriptEntry {
-  sequence: number;
-  direction: "sent" | "received" | "quarantined";
-  text: string;
-  createdAt: number;
-  refusalReason?: string;
-  withheld?: true;
-  /** Named to end in `guidance` on purpose: that suffix is what the vocabulary layer rewrites, so a
-   *  CLI reader is told `cello quarantined` and an MCP reader `cello_quarantined`. */
-  withheld_guidance?: string;
-}
-
-/** A retained refused message, read back whole. The payload is handed out FRAMED, never raw. */
-export interface QuarantinedRecord {
-  sequence: number;
-  reason: string;
-  content: Uint8Array;
-  senderPubkeyHex: string | null;
-  senderSig: Uint8Array | null;
-  attribution: string;
-  createdAt: number;
-}
-
-/**
- * The relay's peer id out of a circuit listen address, or `null` if the address does not name one.
- *
- * Returns null rather than throwing or guessing: an unreadable address means we cannot tell which
- * relay this candidate was for, and every caller has a real thing to do with that answer.
- */
-function relayPeerIdOf(circuitAddr: string): string | null {
-  return /\/p2p\/([^/]+)\/p2p-circuit/.exec(circuitAddr)?.[1] ?? null;
-}
-
-/**
- * The Merkle leaf inputs for a seal carry: each leaf's `content_hash`, read out of the bytes its
- * SENDER SIGNED (`structure1_cbor`), never out of an envelope field somebody else filled in.
- *
- * `null` when any leaf is unreadable — the caller must then answer "I cannot judge", never "we
- * disagree". A decode failure is this daemon's limitation, not evidence against anyone.
- *
- * Canonical Structure 1 is `[version, content_hash, sender_pubkey, session_id, last_seen_seq,
- * timestamp]`, plus `last_seen_hash` at index 6 on a v2 claim (020-ACKHASH). The content hash is at
- * index 1 in both and is used AS the leaf hash (RFC 6962 §2.1 "hash" leaves are taken as-is), which
- * is the domain the certified root lives in.
- */
-function carryContentHashInputs(carry: readonly SealCarryLeaf[]): LeafInput[] | null {
-  const inputs: LeafInput[] = [];
-  for (const leaf of carry) {
-    const s1 = decodeStructure1(leaf.structure1Cbor);
-    if (!s1.ok) return null;
-    inputs.push({ kind: "hash", data: s1.fields.contentHash });
-  }
-  return inputs;
-}
-
-/**
- * How many of the counterparty's content hashes a session remembers for the self-link check.
- *
- * Bounded because a peer feeds it. 256 covers any realistic gap in our own copy of a conversation —
- * a held message, one the inbound screen refused, one lost in flight — while keeping the memory a
- * single session can cost fixed. Past the cap the check gets STRICTER, never looser.
- */
-const SELF_CHAIN_MEMORY = 256;
+import {
+  ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL,
+  ACK_HASH_REASONS,
+  AUTHORSHIP_SELF_CHAIN_MISMATCH,
+  AUTHORSHIP_SESSION_MISMATCH,
+  AUTOACK_BROKER_GRACE_MS,
+  type AbandonNoticeResult,
+  type AckHashReason,
+  type ActiveSessionEntry,
+  CAP_COUNTS,
+  CAP_COUNT_SQL,
+  CIRCUIT_RELAY_ID,
+  CONTENT_MAX_INBOUND_STREAMS,
+  CONTENT_STREAM_LINGER_MS,
+  type CreateSessionResult,
+  type ISessionNodeFactory,
+  LEAF_FETCH_GRACE_MS,
+  MAX_REFUSALS_PER_READ,
+  MAX_REFUSAL_READERS,
+  type ParkedDrainReason,
+  type QuarantinedRecord,
+  RECEIVED_BUFFER_CAP,
+  REDIAL_COOLDOWN_MS,
+  REFUSAL_MAY_STILL_ARRIVE,
+  REFUSAL_NO_OTHER_ROUTE,
+  RELAY_QUARANTINE_MS,
+  REVIVE_RESERVATION_CANDIDATES,
+  REVIVE_RESERVATION_TIMEOUT_MS,
+  type ReceivedContentEntry,
+  type RefusalNotice,
+  type RelayConnectParams,
+  SALT_AGREEMENT_WAIT_MS,
+  SESSION_KEY_ANNOUNCE_RETRIES,
+  SESSION_KEY_ANNOUNCE_RETRY_MS,
+  SHUTDOWN_STEP_DEADLINE_MS,
+  SR_RESERVATION_MAX_RETRIES,
+  type SentAuthorship,
+  type SessionImpairment,
+  type SessionNodeConfig,
+  type SessionRevivalIdentity,
+  type TranscriptEntry,
+  UNSALTED_GUIDANCE,
+  UNSALTED_REASONS,
+  type UnsaltedReason,
+  type WitnessAlertNotice,
+  capStaleBefore,
+  carryContentHashInputs,
+  heldRelayIdsOf,
+  relayPeerIdOf,
+} from "./session-node-types.js";
+
+// Re-exported so this module's public surface is unchanged by the split: every existing
+// importer of session-node-manager.js keeps working, and no test moves an import path.
+export {
+  ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER,
+  ABUSE_MAX_SESSION_RECEIVED_BYTES,
+  ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL,
+  type AbandonNoticeResult,
+  type AckHashReason,
+  CAP_INTERRUPTED_TTL_MS,
+  type ISessionNodeFactory,
+  LEAF_FETCH_GRACE_MS,
+  MAX_TERMINAL_REFUSALS_PER_SESSION,
+  type ParkedDrainReason,
+  type QuarantinedRecord,
+  RELAY_QUARANTINE_MS,
+  REVIVAL_BOUND_SWEEP_MS,
+  REVIVAL_WINDOW_MS,
+  REVIVE_RESERVATION_CANDIDATES,
+  REVIVE_RESERVATION_TIMEOUT_MS,
+  type RefusalNotice,
+  type RelayConnectParams,
+  SR_RESERVATION_MAX_RETRIES,
+  type SentAuthorship,
+  type SessionImpairment,
+  type SessionNodeConfig,
+  TERMINAL_REFUSAL_READ_RETRY_MS,
+  TERMINAL_REFUSAL_REASONS,
+  type TranscriptEntry,
+  type WitnessAlertNotice,
+} from "./session-node-types.js";
 
 export class SessionNodeManager {
   readonly #factory: ISessionNodeFactory;
@@ -1539,29 +593,9 @@ export class SessionNodeManager {
     return this.#witnessTruncated.has(agentName);
   }
 
-  /**
-   * Review F7: a relay sent a witness alert this build could not read or could not verify.
-   *
-   * Recorded so a version skew that silently kills the witness layer is visible to the operator
-   * instead of living only in a log file. Carries no session and no party by construction.
-   */
-  recordRelayWitnessUnreadable(agentName: string, relayPeerId: string, why: string): void {
-    const byRelay = this.#witnessUnreadable.get(agentName) ?? new Map<string, { why: string; count: number }>();
-    const prior = byRelay.get(relayPeerId);
-    byRelay.set(relayPeerId, { why, count: (prior?.count ?? 0) + 1 });
-    this.#witnessUnreadable.set(agentName, byRelay);
-    this.#logger.error("session.witness.unreadable.recorded", {
-      agentName, relayPeerId, why,
-      impact: "this agent's witness layer is not working against that relay — no observation it " +
-        "sends can be read, and nothing has been concluded about any participant",
-    });
-  }
 
-  /** Relays whose witness alerts this build could not read, for the agent's inbox. */
-  getWitnessUnreadable(agentName: string): ReadonlyArray<{ relayPeerId: string; why: string; count: number }> {
-    return [...(this.#witnessUnreadable.get(agentName) ?? new Map()).entries()]
-      .map(([relayPeerId, v]) => ({ relayPeerId, why: v.why, count: v.count }));
-  }
+
+
 
   /**
    * DOD-M15-RELAYSLOTS-1: the last relay refusal per agent, with the advice that goes with it.
@@ -1647,6 +681,102 @@ export class SessionNodeManager {
   /** DOD-M12B-SESSION-SEED-1: see setRetryDrainHook — fired when a session is revived. */
   #retryDrainHook: ((agentName: string, sessionId: string) => void) | null = null;
 
+  /**
+   * 036-GODFILE Part 1 — WHO SENT THIS, AND DID THEY SEE WHAT THEY CLAIM.
+   *
+   * It owns the two maps it maintains (`#receivedFromCounterparty`, `#lastFromCounterparty`), which
+   * nothing else in the daemon reads. Everything else it needs is listed explicitly in the context
+   * object rather than handed over as `this` — the manager's private state stays private, and a
+   * reader can see the whole of what authorship verification is allowed to touch in one place.
+   *
+   * ⚠️ BUILT IN THE CONSTRUCTOR, not as a field initializer. Field initializers run in declaration
+   * order, and this one closes over `#logger`, so declaring it above `#logger` made it read an
+   * uninitialized field — caught by tsc, and silent at runtime if it had been assigned later.
+   */
+  readonly #authorship: AuthorshipVerifier;
+
+  /**
+   * 036-GODFILE Parts 3+4 — everything that happens to an inbound message we will NOT deliver.
+   *
+   * It owns the five remote-fed maps it bounds. The manager used to clear them by hand in cache
+   * eviction, which is why they are gone from here: a caller that had to know five field names
+   * in order to forget a session knew too much, and a sixth would have been missed in silence.
+   */
+  readonly #refusals: InboundRefusals;
+
+  /**
+   * 036-GODFILE — contacts and tiers, agent settings, the transcript, and session divergence.
+   *
+   * Everything the daemon REMEMBERS about a conversation, as opposed to what it does with a
+   * message in flight. Its context is five items, which is why it was a seam.
+   */
+  readonly #records: SessionRecords;
+
+  /**
+   * 036-GODFILE Part 6 — the relay store-and-forward mailbox: depositing content the counterparty
+   * could not take live, recovering it when they return, and the backstop sweep that drains it
+   * even when a trigger is missing.
+   */
+  readonly #park: ParkRecovery;
+
+  /**
+   * ─── DELEGATORS — the mailbox API other files call, unchanged by the split ───────────────────
+   *
+   * `content-park.ts` and `daemon.ts` still say `manager.recoverParkedEntry(...)` and
+   * `manager.setContentParkHook(...)`. Keeping the surface identical is what lets the full suite
+   * stand as evidence that this was a move: a caller that had to change would mean the contract
+   * moved with it.
+   */
+  injectParkFault(count: number, cause?: string): number { return this.#park.injectParkFault(count, cause); }
+  getParkFaultRemaining(): number { return this.#park.getParkFaultRemaining(); }
+  setContentParkHook(fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>): void { return this.#park.setContentParkHook(fn); }
+  setParkedDrainHook(fn: (agentName: string, reason: ParkedDrainReason) => void): void { return this.#park.setParkedDrainHook(fn); }
+  recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" { return this.#park.recoverOwnSealCtrlLeafForTest(agentName, sessionId); }
+  async recoverParkedEntry(agentName: string, sessionId: string, recipientPubkey: Uint8Array, unsealed: Uint8Array, contentHash: Uint8Array, correlationId?: string): Promise< | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string } > { return this.#park.recoverParkedEntry(agentName, sessionId, recipientPubkey, unsealed, contentHash, correlationId); }
+
+  /**
+   * ─── DELEGATORS — the class API is unchanged by the split, deliberately ──────────────────────
+   *
+   * Every method below moved into `session-records.ts` with its implementation and its comments.
+   * These one-liners exist so that no CALLER had to change: `contact-handlers.ts`, the IPC surface
+   * and the tests all still say `manager.getTier(...)`. That is what lets the full suite stand as
+   * the evidence that this was a move and not a rewrite — a test that had to change would have
+   * meant behaviour moved (Rule B).
+   *
+   * They are the price of the split and they are the cheap half: one line each, no logic, and the
+   * prose that explains each rule lives beside the code that enforces it.
+   */
+  isContact(agentName: string, pubkey: string): boolean { return this.#records.isContact(agentName, pubkey); }
+  getTier(agentName: string, pubkey: string): number { return this.#records.getTier(agentName, pubkey); }
+  resolveTierBound(agentName: string, tier: number, field: "max_sessions" | "max_bytes"): number { return this.#records.resolveTierBound(agentName, tier, field); }
+  addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null, tier: number = TIER.UNKNOWN): void { return this.#records.addContact(agentName, pubkey, moniker, provenance, tier); }
+  setContactMoniker(agentName: string, pubkey: string, moniker: string | null): boolean { return this.#records.setContactMoniker(agentName, pubkey, moniker); }
+  setContactSignalPref(agentName: string, pubkey: string, signalHash: string, present: boolean | null): void { return this.#records.setContactSignalPref(agentName, pubkey, signalHash, present); }
+  getContactSignalPrefs(agentName: string, pubkey: string): Map<string, boolean> { return this.#records.getContactSignalPrefs(agentName, pubkey); }
+  setContactAwayMessage(agentName: string, pubkey: string, message: string | null): boolean { return this.#records.setContactAwayMessage(agentName, pubkey, message); }
+  setContactTier(agentName: string, pubkey: string, tier: number): boolean { return this.#records.setContactTier(agentName, pubkey, tier); }
+  recordOfferedMoniker(agentName: string, pubkey: string, offered: string): void { return this.#records.recordOfferedMoniker(agentName, pubkey, offered); }
+  removeContact(agentName: string, pubkey: string): boolean { return this.#records.removeContact(agentName, pubkey); }
+  getContactMoniker(agentName: string, pubkey: string): string | null { return this.#records.getContactMoniker(agentName, pubkey); }
+  listContacts(agentName: string): Array<{ pubkey: string; added_at: number; moniker: string | null; tier: number | null; provenance: string | null; sealed_count: number; last_spoke: number | null; }> { return this.#records.listContacts(agentName); }
+  clearRenameNotice(agentName: string, pubkey: string): void { return this.#records.clearRenameNotice(agentName, pubkey); }
+  clearPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): number { return this.#records.clearPinnedCounterpartyPrimary(agentName, counterpartyPubkeyHex); }
+  getTelegramSettings(): { botToken: string; allowlistedChatId: string } | null { return this.#records.getTelegramSettings(); }
+  setTelegramSettings(botToken: string, allowlistedChatId: string): void { return this.#records.setTelegramSettings(botToken, allowlistedChatId); }
+  getSetting(agentName: string, key: string): string | null { return this.#records.getSetting(agentName, key); }
+  deleteSetting(agentName: string, key: string): boolean { return this.#records.deleteSetting(agentName, key); }
+  setSetting(agentName: string, key: string, value: string): void { return this.#records.setSetting(agentName, key, value); }
+  getAllSettings(agentName: string): Array<{ key: string; value: string }> { return this.#records.getAllSettings(agentName); }
+  recordRelayWitnessUnreadable(agentName: string, relayPeerId: string, why: string): void { return this.#records.recordRelayWitnessUnreadable(agentName, relayPeerId, why); }
+  getWitnessUnreadable(agentName: string): ReadonlyArray<{ relayPeerId: string; why: string; count: number }> { return this.#records.getWitnessUnreadable(agentName); }
+  recordTranscriptMessage(agentName: string, sessionId: string, sequence: number, direction: "sent" | "received" | "quarantined", plaintext: Uint8Array, correlationId?: string, authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array }, quarantineReason?: string, senderPubkeyHexOverride?: string | null): boolean { return this.#records.recordTranscriptMessage(agentName, sessionId, sequence, direction, plaintext, correlationId, authorship, quarantineReason, senderPubkeyHexOverride); }
+  readTranscript(agentName: string, sessionId: string): { messages: TranscriptEntry[]; undecryptable: number } { return this.#records.readTranscript(agentName, sessionId); }
+  getUnreadSummary(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> { return this.#records.getUnreadSummary(agentName); }
+  getEndedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> { return this.#records.getEndedUnread(agentName); }
+  getUnreadReceivedCount(agentName: string, sessionId: string): number { return this.#records.getUnreadReceivedCount(agentName, sessionId); }
+  markSessionDiverged(agentName: string, sessionId: string): void { return this.#records.markSessionDiverged(agentName, sessionId); }
+  isSessionDiverged(agentName: string, sessionId: string): boolean { return this.#records.isSessionDiverged(agentName, sessionId); }
+
   /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: content hashes this session has actually resolved — ingested,
    *  held, or authored by us. A witnessed leaf whose hash is in here needs no fetch. */
   #resolvedContent = new Map<string, Set<string>>();
@@ -1655,23 +785,11 @@ export class SessionNodeManager {
    *  fetch for the same content — a slow relay must not be turned into a storm against itself. */
   #leafFetchTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  /**
-   * DOD-M15-REFUSALTERMINAL-1: content hashes refused for a reason no retry can get past — a READ
-   * CACHE over `terminal_content_refusals`, never the record itself.
-   *
-   * ⚠️ **NOT the same fact as `#resolvedContent`, and collapsing them is the trap.** "Resolved"
-   * means we HAVE the content. Terminally refused means we have it and are never accepting it.
-   * Filing one under the other tells the next reader that refused content was delivered.
-   */
-  #terminallyRefused = new Map<string, Set<string>>();
+  
 
-  /** Sessions whose terminal-refusal rows have been read from the database into the map above.
-   *  Nothing ever un-marks content, so a loaded set only grows and can never go stale. */
-  #terminalRefusalsLoaded = new Set<string>();
+  
 
-  /** DOD-M15-REFUSALTERMINAL-1 review F3: when the load above last FAILED, per session. Bounds the
-   *  retry and the ERROR to once a minute instead of once per witnessed leaf. */
-  #terminalRefusalsReadFailedAt = new Map<string, number>();
+  
 
   /** Test seam: collapse the grace window so a test does not have to wait two real seconds. The
    *  window itself is covered by its own case. */
@@ -1720,12 +838,10 @@ export class SessionNodeManager {
   readonly #srLastRespreadAt = new Map<string, number>();
   readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
-  /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
-  #parkedDrainBackstopMs: number;
-  #parkedDrainLastBackstopAt = 0;
-  /** DOD-PARK-DRAIN-1: the composition root's parked-mailbox drain — see setParkedDrainHook. */
-  #parkedDrainHook: ((agentName: string, reason: ParkedDrainReason) => void) | null = null;
-  #parkedDrainHookAbsenceLogged = false;
+
+
+
+
   // Agents whose removeStandingReceiverForAgent ran while an #ensureStandingReceiver for them was
   // in flight (parked on createNode/start, so the map had no entry to delete yet). The in-flight
   // ensure checks this after start() and tears the fresh node down instead of installing an SR for
@@ -1793,65 +909,13 @@ export class SessionNodeManager {
   // session can never produce a root the counterparty agrees with, so it must never be reported as
   // safe to close — the close would be signed, refused as `leaf_count_mismatch`, and the receipt
   // lost for good.
-  #diverged = new Set<string>();
 
-  /**
-   * Rehydrate `#diverged` from `sessions.diverged_at` — `DOD-M15-DIVERGE-DURABLE-1`.
-   *
-   * The Set stays as the hot read (the seal gate consults it per close), and the column is the
-   * truth. Loaded once at boot rather than queried per read so the gate's cost does not change.
-   */
-  #loadDivergedFromDb(): void {
-    if (!this.#db) return;
-    const rows = this.#db
-      .prepare(
-        `SELECT s.session_id AS sid, a.agent_name AS agent
-           FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
-          WHERE s.diverged_at IS NOT NULL`,
-      )
-      .all() as Array<{ sid: string; agent: string }>;
-    for (const r of rows) this.#diverged.add(this.#k(r.agent, r.sid));
-    if (rows.length > 0) {
-      this.#logger.info("session.diverged.restored", {
-        count: rows.length,
-        impact:
-          "these sessions provably cannot seal bilaterally and are refused at the seal gate — before " +
-          "this was durable, a restart made them read as healthy",
-      });
-    }
-  }
 
-  /**
-   * Record that this session's tree and the relay's counter have provably parted.
-   *
-   * Idempotent, and deliberately does NOT touch `updated_at`: that column drives the inbox's
-   * last-spoke ordering, and divergence is not activity.
-   */
-  markSessionDiverged(agentName: string, sessionId: string): void {
-    this.#diverged.add(this.#k(agentName, sessionId));
-    if (!this.#db) return;
-    /**
-     * KEYED ON (agent_id, session_id) — review F3, and the loopback case makes it concrete.
-     *
-     * This was `WHERE session_id = ?` alone. The table's PK is composite for a documented reason
-     * (`DOD-LOOP-1`, on the CREATE TABLE above): **two of one operator's agents can hold both ends
-     * of the SAME session_id on ONE daemon**, so `sessions` holds two rows. Unkeyed, marking one
-     * side diverged marked BOTH, and the clear below wiped BOTH — so side B sealing its half
-     * erased side A's divergence, and after a restart A's seal gate read healthy and signed a close
-     * that could only be refused. The line's own defect, produced by the line's own clear.
-     *
-     * Every other per-session UPDATE in this file keys on both columns; these two were the
-     * exceptions.
-     */
-    this.#db
-      .prepare("UPDATE sessions SET diverged_at = ? WHERE agent_id = ? AND session_id = ? AND diverged_at IS NULL")
-      .run(Date.now(), this.#requireAgentId(agentName), sessionId);
-  }
 
-  /** Whether this session has provably parted from the relay's ordering. */
-  isSessionDiverged(agentName: string, sessionId: string): boolean {
-    return this.#diverged.has(this.#k(agentName, sessionId));
-  }
+
+
+
+
   // DOD-M15-FRAME-1 (review F1): sessions frozen because a frame failed to verify against the
   // expected counterparty. Consulted by `reviveSessionNode` — a teardown writes `interrupted`,
   // which is the REVIVABLE status, so without this the next `cello_receive` silently rebuilt the
@@ -2086,40 +1150,8 @@ export class SessionNodeManager {
   // One structure with two labels rather than two sets, deliberately: a second set is a second thing
   // for every gate to remember to consult, and the one that gets forgotten is the one that matters.
   #contentDesynced = new Map<string, "tampered" | "unverifiable">();
-  /**
-   * Frames refused because they named a content-hash algorithm this build cannot read, keyed by
-   * session → the refused frame's content hash → the name it used. Review F2, corrected by F-D.
-   *
-   * ⚠️ KEYED BY THE FRAME, NOT THE SESSION, and the first version was keyed by the session. That
-   * made it fire on the NORMAL case: after one junk-alg frame, every subsequent park recovery on
-   * that session logged a WARN forever, for entirely unrelated messages — and the text asserted the
-   * two events were "the same message arriving twice by different routes", which nothing had
-   * established. A warning that fires on the benign steady state is not a signal.
-   *
-   * Hash-keyed, the claim becomes a fact and the event fires exactly once per affected message: the
-   * entry is removed the moment it is reconciled.
-   */
-  #unreadableAlgSeen = new Map<string, Map<string, string>>();
-  /**
-   * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1, widened by `029c` review F4 — the content hashes this
-   * side refused ON THE DIRECT PATH, for any reason, so the park path can say so when the same
-   * message arrives the other way.
-   *
-   * One map rather than one per refusal: what the park path needs to know is "did we turn this
-   * content away and tell somebody so", and the reason is already on the notice.
-   *
-   * **The silence this closes.** A direct-path refusal sends no delivery ACK, so the sender's TTF
-   * backstop parks the message and it arrives through the relay mailbox seconds later — where the
-   * ENVELOPE's signature is what authenticates it, and recovery correctly accepts it. So the
-   * message is delivered, with no per-message proof, moments after the operator was told it was
-   * refused. Nothing tied the two events together, which is the same shape the algorithm refusal
-   * above already had and the same remedy.
-   *
-   * Same bounded shape and the same reason: it is fed entirely by a remote party, so losing an
-   * entry costs one reconciliation line and an unbounded map would be a leak with a peer's hand on
-   * the tap.
-   */
-  #refusedOnDirectPath = new Map<string, Set<string>>();
+  
+  
   // DOD-MSG-4 (strict in-order): the RELAY is the ordering authority (Structure 2). For each
   // message the relay witnesses, it delivers B a (content_hash -> canonical sequence) binding via
   // the leaf_deliver stream. B records it here — keyed #k(agent,session) -> (contentHashHex -> seq)
@@ -2280,8 +1312,8 @@ export class SessionNodeManager {
   // the CLI refuses a send from an offline agent. Without this the fix ships unwatched.
   // INERT unless the daemon is started with CELLO_FAULT_INJECTION=1; the IPC handler that sets it
   // refuses outright otherwise, so a normal daemon cannot be talked into dropping messages.
-  #parkFaultRemaining = 0;
-  #parkFaultCause = "standing_receiver_creating";
+
+
   // The incident needs BOTH halves: the direct dial has to fail (or the park path is never entered
   // — measured, the counterparty's session node accepts the frame and reports delivered:true even
   // with its agent away), and the park deposit that follows has to be refused. One without the
@@ -2302,12 +1334,7 @@ export class SessionNodeManager {
   // costs one attempt, not one per message.
   #redialNotBefore = new Map<string, number>();
 
-  /** Arm the park-deposit fault. Returns the count now armed. */
-  injectParkFault(count: number, cause?: string): number {
-    this.#parkFaultRemaining = Math.max(0, count);
-    if (cause) this.#parkFaultCause = cause;
-    return this.#parkFaultRemaining;
-  }
+
 
   /** Arm the direct-send fault — makes the next N sends take the dial-failure path. */
   injectSendFault(count: number): number {
@@ -2331,14 +1358,7 @@ export class SessionNodeManager {
     return this.#connectionLossRemaining;
   }
 
-  getSendFaultRemaining(): number {
-    return this.#sendFaultRemaining;
-  }
 
-  /** Remaining armed park faults — so a test can assert the fault was actually consumed. */
-  getParkFaultRemaining(): number {
-    return this.#parkFaultRemaining;
-  }
 
   // M12-P12: the durable enqueue for a park deposit that FAILED. Distinct from onTtf because the
   // cause is distinct — nothing timed out here, the deposit was refused — and an event named for
@@ -2347,22 +1367,9 @@ export class SessionNodeManager {
   // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
   // claim durability — nor commit the leaf that claim now authorises.
   #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean) | null = null;
-  /**
-   * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
-   * endpoint from the session entry and calls this when a send is NOT confirmed delivered
-   * (direct-fail or TTF expiry). The daemon's hook seals (sealToRecipient) + deposits via
-   * ContentParkClient. Best-effort.
-   */
-  /**
-   * SEC-1 / review M4: parked entries already refused by the authentication gate, keyed
-   * `${agent}:${session}:${contentHash}` → the refusal reason. Bounded (see
-   * #rememberRefusedParkedEntry) because its keys come from a REMOTE mailbox.
-   */
-  readonly #refusedParkedEntries = new Map<string, ParkAuthFailure>();
 
-  #contentParkHook:
-    | ((args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>)
-    | null = null;
+
+
 
   constructor(opts: {
     factory: ISessionNodeFactory;
@@ -2419,6 +1426,65 @@ export class SessionNodeManager {
   }) {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
+
+    // ⚠️ BUILT FIRST, AND THE ORDER IS LOAD-BEARING: `#authorship` and `#refusals` close over
+    // `this.#records`. Nothing invokes them during construction today (every context member is a
+    // lazy arrow), but tsc caught this exact class once on `#logger`, and the next line added to
+    // this constructor is the one that would pay for it.
+    this.#records = new SessionRecords({
+      logger: this.#logger,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      witnessUnreadable: this.#witnessUnreadable,
+    });
+    this.#authorship = new AuthorshipVerifier({
+      logger: this.#logger,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      getSessionRecord: (a, sid) => this.getSessionRecord(a, sid),
+      getSessionTree: (a, sid) => this.getSessionTree(a, sid),
+      isSessionDiverged: (a, sid) => this.#records.isSessionDiverged(a, sid),
+      sessionGenesisPrevRoot: (a, sid) => this.#sessionGenesisPrevRoot(a, sid),
+      relaySessionIdBytes: (a, sid) => this.#activeNodes.get(this.#k(a, sid))?.relaySessionIdBytes,
+      heldContentFor: (a, sid) => this.#heldContent.get(this.#k(a, sid)),
+    });
+
+    this.#refusals = new InboundRefusals({
+      logger: this.#logger,
+      // A function, not a value: the database is opened after construction, so a snapshot taken
+      // here would be null for the life of the process.
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      cancelLeafFetch: (key, hashHex) => this.#cancelLeafFetch(key, hashHex),
+      noteContentRefusal: (a, sid, reason, detail) => this.noteContentRefusal(a, sid, reason, detail),
+      recordTranscriptMessage: (...args) => this.#records.recordTranscriptMessage(...args),
+      recordWitnessedSequence: (a, sid, h, n) => this.recordWitnessedSequence(a, sid, h, n),
+      getTier: (a, pk) => this.#records.getTier(a, pk),
+      resolveTierBound: (a, t, f) => this.#records.resolveTierBound(a, t, f),
+      mailboxRouteAvailable: (a) => this.#mailboxRouteAvailable(a),
+      receivedBytesTotal: (a, sid) => this.#getReceivedBytesTotal(a, sid),
+      verifyAuthorshipClaim: (a, sid, s1, sig, h) => this.#authorship.verifyAuthorshipClaim(a, sid, s1, sig, h),
+    });
+
+    this.#park = new ParkRecovery({
+      logger: this.#logger,
+      refusals: this.#refusals,
+      shuttingDown: () => this.#shuttingDown,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      ownPubkeyHex: (a) => this.#ownPubkeyHex(a),
+      activeEntry: (key) => this.#activeNodes.get(key),
+      agentsWithLiveReceiver: () => this.#standingReceivers.keys(),
+      agentWantsReceiver: (a) => this.#agentsWantingReceiver.has(a),
+      getSessionRecord: (a, sid) => this.getSessionRecord(a, sid),
+      getSealCarry: (pk, sid) => this.getSealCarry(pk, sid),
+      getSessionTree: (a, sid) => this.getSessionTree(a, sid),
+      recordOrderingRecord: (a, sid, s1, s2, h, cid) => this.recordOrderingRecord(a, sid, s1, s2, h, cid),
+      ingestReceivedContent: (a, sid, c, h, cid, seq, alg) => this.ingestReceivedContent(a, sid, c, h, cid, seq, alg),
+      witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
+      noteAcknowledgeable: (a, sid, seq, h) => this.#noteAcknowledgeable(a, sid, seq, h),
+    }, opts.parkedDrainBackstopMs ?? 300_000);
     this.#dbPath = opts.dbPath;
     if (typeof opts.contentTtfMs === "number" && opts.contentTtfMs > 0) {
       this.#contentTtfMs = opts.contentTtfMs;
@@ -2428,7 +1494,6 @@ export class SessionNodeManager {
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
     this.#srReservationRetryMs = opts.standingReceiverReservationRetryMs ?? 5 * 60_000;
-    this.#parkedDrainBackstopMs = opts.parkedDrainBackstopMs ?? 300_000;
     // REQUIRED, no fallback (INV-9, audit finding). This line used to read
     // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
     // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
@@ -2471,38 +1536,9 @@ export class SessionNodeManager {
     this.#onSessionTerminal = hook;
   }
 
-  /**
-   * MSG-001-3b (2b): inject the live content-park deposit (seal + ContentParkClient.deposit).
-   * Injected by the composition root (daemon.ts). When absent, a not-confirmed send still records
-   * the durable awaiting entry (crash backstop) but does not deposit live.
-   * DOD-LEAVEMSG-1 (cello-unit-reviewer HIGH fix): the hook returns a TYPED result — `{ok:true}` or
-   * `{ok:false, reason}` — mirroring RetryQueue's ParkFn contract. It must NEVER resolve `{ok:true}`
-   * merely because it didn't throw: the production hook's own failure branches (standing receiver
-   * unavailable, relay explicitly rejects the deposit) log-and-return without throwing, and a
-   * throw-only contract would silently report those as success — the exact "system lies about its
-   * own health" bug the reviewer caught (a park that never happened reported to the operator as
-   * "dispatched to relay," with the durable retry_queue backstop skipped because sendContent's own
-   * caller only enqueues on an honest {ok:false}).
-   */
-  setContentParkHook(
-    fn: (args: { agentName: string; sessionId: string; recipientPubkeyHex: string; relayPeerId: string; relayAddrs: readonly string[]; contentHashHex: string; content: Uint8Array; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; structure1Signature?: Uint8Array; leafKind?: number; contentHashAlg: string | undefined }) => Promise<{ ok: true } | { ok: false; reason: string; cause?: string; retryAfterMs?: number }>,
-  ): void {
-    this.#contentParkHook = fn;
-  }
 
-  /**
-   * DOD-PARK-DRAIN-1: inject the parked-mailbox drain (daemon.ts → contentPark.autoRecoverForAgent).
-   *
-   * The manager owns the two events that mean "content may be waiting for this agent on a relay":
-   * a standing receiver was (re)built, and the slow backstop sweep. It does not own the drain
-   * itself — that needs the agent's key provider and the inbound ingest funnel. So it calls out.
-   *
-   * Injected by the composition root, not passed to the constructor: the manager is built long
-   * before the content park exists (content-park.ts documents why that ordering is load-bearing).
-   */
-  setParkedDrainHook(fn: (agentName: string, reason: ParkedDrainReason) => void): void {
-    this.#parkedDrainHook = fn;
-  }
+
+
 
   /**
    * DOD-PARK-DRAIN-1 (review F6): why there is no standing-receiver node to dial from — named
@@ -2521,144 +1557,9 @@ export class SessionNodeManager {
     return "no_standing_receiver";
   }
 
-  /** Ask for a drain. Never throws — a broken drain must never cost the caller its receiver. */
-  #fireParkedDrain(agentName: string, reason: ParkedDrainReason): void {
-    const hook = this.#parkedDrainHook;
-    if (this.#shuttingDown) return;
-    if (!hook) {
-      // DOD-PARK-DRAIN-1 (review F4): an unwired hook silently reverts this entire unit, and the
-      // defect it fixes was itself a trigger that silently was not there. Say so — once, because
-      // the fire points are on a timer grid. Not an error: a SessionNodeManager built by a test
-      // that does not exercise the drain is legitimate.
-      if (!this.#parkedDrainHookAbsenceLogged) {
-        this.#parkedDrainHookAbsenceLogged = true;
-        this.#logger.warn("content.recover.drain.hook.absent", { agentName, reason });
-      }
-      return;
-    }
-    // The success-side trail. Without it, a live run cannot say WHICH trigger delivered the
-    // content — which is exactly the claim the outstanding acceptance clause has to evidence.
-    this.#logger.info("content.recover.drain.triggered", { agentName, reason });
-    try {
-      hook(agentName, reason);
-    } catch (err: unknown) {
-      this.#logger.warn("content.recover.drain.hook.failed", {
-        agentName,
-        reason,
-        error: extractErrorMessage(err),
-      });
-    }
-  }
 
-  /**
-   * MSG-001-3b (2b): deposit un-confirmed content to the relay store-and-forward backstop — keyed
-   * to the recipient, on the SAME relay this session is witnessed by — so an offline recipient
-   * recovers it (at the sequence the witness already assigned, R1). Best-effort, never throws.
-   * DOD-LEAVEMSG-1: returns whether the deposit actually succeeded (false if no hook/relay is
-   * configured, or the hook rejects) so a caller with a live response to shape (sendContent) can
-   * distinguish "genuinely parked" from "nothing recoverable" instead of guessing. Callers that
-   * fire this from an async backstop with no live caller (the TTF-expiry path) may ignore the
-   * result — the deposit itself and its logging are unchanged either way.
-   */
-  /**
-   * `contentHashAlg` is `string | undefined`, NOT optional — B2b-1 review F4's shape, applied to the
-   * last place it was missing.
-   *
-   * Optional, dropping it at a call site was neither a typecheck error nor a test failure, because
-   * absent silently means `sha256` and that is the only value in play today. Measured: the
-   * direct-dial-fail route's mutant SURVIVED the whole daemon suite. Requiring the argument — even
-   * when its value is `undefined` — forces each of the three callers to state what this message was
-   * hashed under, so a new fourth caller cannot omit it by accident.
-   */
-  async #parkContent(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, parkLeafKind?: number): Promise<ParkAttempt> {
-    // Fault injection FIRST, so it reproduces the real shape: the refusal happens at the same point
-    // the live hook refuses (before any deposit), with the same event and the same `cause`.
-    if (this.#parkFaultRemaining > 0) {
-      this.#parkFaultRemaining -= 1;
-      this.#logger.warn("content.park.deposit.failed", {
-        sessionId,
-        contentHash: contentHashHex,
-        reason: "standing_receiver_unavailable",
-        cause: this.#parkFaultCause,
-        injected: true,
-      });
-      return { outcome: "refused", cause: this.#parkFaultCause };
-    }
-    const hook = this.#contentParkHook;
-    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    // M12-P12 (review F6): "no park target configured" is NOT a refused deposit. Content in a
-    // session with no relay was never recoverable through the park, so queuing it for re-park would
-    // be a lie that grows the DB forever — every boot and every agent start would retry a row whose
-    // only possible outcome is no_persisted_relay_endpoint. Reported as unconfigured, not refused.
-    if (!hook || !entry || !entry.relayPeerId || !entry.relayAddrs) return { outcome: "unconfigured" };
-    try {
-      const result = await hook({
-        // SEC-1: the hook must sign as the SENDING agent — it needs to know who that is.
-        agentName,
-        sessionId,
-        recipientPubkeyHex: entry.counterpartyPubkey,
-        relayPeerId: entry.relayPeerId,
-        relayAddrs: entry.relayAddrs,
-        contentHashHex,
-        content,
-        // DOD-MSG-4 (2b): carry the relay's signed ordering record so the parked entry is self-ordering
-        // on recover too (sealed INTO the ciphertext envelope — INV-3: the relay still sees only ciphertext).
-        structure1Cbor,
-        structure2Cbor,
-        // 034-CARRYLEAF: the author's signature over `structure1Cbor`, so the RECIPIENT can witness
-        // this leaf if its author never does. Without it the mailbox route stays truncatable.
-        structure1Signature,
-        // 034-CARRYLEAF: the leaf DOMAIN, so a recovered leaf is never witnessed under a guess.
-        leafKind: parkLeafKind,
-        // B2b: the park route must name the same algorithm the direct frame did, or the recipient
-        // verifies the same message two different ways depending on which route it took.
-        contentHashAlg,
-      });
-      // DOD-LEAVEMSG-1 (reviewer HIGH fix): check the TYPED result, not just "didn't throw" — the
-      // production hook's own failure branches (standing receiver unavailable, relay explicitly
-      // rejects) resolve normally after logging, they never throw. A throw-only check would report
-      // those as success.
-      if (!result.ok) {
-        this.#logger.warn("content.park.deposit.failed", {
-          sessionId,
-          contentHash: contentHashHex,
-          reason: result.reason,
-          cause: result.cause,
-        });
-        return {
-          outcome: "refused",
-          cause: result.cause ?? result.reason,
-          ...(result.retryAfterMs !== undefined ? { retryAfterMs: result.retryAfterMs } : {}),
-        };
-      }
-      return { outcome: "parked" };
-    } catch (err: unknown) {
-      /**
-       * THE CODE GOES IN `cause`, THE PARAGRAPH GOES IN THE LOG — B2b-2 constraint 6.
-       *
-       * `cause` is documented as the machine-readable half and is handed to callers that branch on
-       * it. Putting `err.message` there meant a producer-side refusal — this build cannot seal that
-       * algorithm — was indistinguishable from a relay outage, so it inherited the relay's guidance:
-       * *"queued, and will be re-sent when the relay link is back."* The relay was never asked, and
-       * every re-park throws in the same place, so that sends the operator to the wrong subsystem
-       * and then tells them to wait for a recovery that cannot happen.
-       *
-       * `instanceof`, not a string test: an untyped failure keeps the old behaviour exactly, so this
-       * narrows what the caller can distinguish without changing anything it could not.
-       */
-      const coded = err instanceof ParkEnvelopeError ? err : null;
-      this.#logger.warn("content.park.deposit.failed", {
-        sessionId,
-        contentHash: contentHashHex,
-        ...(coded === null ? {} : { reason: coded.reason, detail: coded.detail }),
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return {
-        outcome: "refused",
-        cause: coded?.reason ?? (err instanceof Error ? err.message : String(err)),
-      };
-    }
-  }
+
+
 
   // ─── Initialization ──────────────────────────────────────────────────────
 
@@ -3232,7 +2133,7 @@ export class SessionNodeManager {
      * with `no such column: s.agent_id` on exactly those legacy databases, which are the ones a
      * restart matters most for.
      */
-    this.#loadDivergedFromDb();
+    this.#records.loadDivergedFromDb();
 
     // DOD-TIER-1 (address-book Step 1): give `contacts` its tier metadata (tier / provenance /
     // last_offered_moniker / away_message). Pure ADD COLUMN, no rebuild — so it runs AFTER the
@@ -3592,7 +2493,7 @@ export class SessionNodeManager {
     // disclosed address cannot be recalled.
     let relayOnly = true;
     try {
-      relayOnly = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== null) !== "off";
+      relayOnly = relayOnlyState((key) => this.#records.getSetting(agentName, key), this.#db !== null) !== "off";
     } catch (err) {
       this.#logger.warn("settings.relay_only.unreadable", {
         agentName,
@@ -3797,183 +2698,9 @@ export class SessionNodeManager {
     return this.#sealLeafStore?.getCarry(agentPubkeyHex, sessionIdHex) ?? [];
   }
 
-  /**
-   * DOD-LOG-1 / PERSIST-002 (AC-010): append one readable message to the durable transcript, keyed
-   * by the canonical leaf `sequence` so it joins to the committed hash chain. The blob is stored as
-   * plaintext bytes: the whole DB is SQLCipher-encrypted at rest, so there is no per-column cipher.
-   * Idempotent on replay (INSERT OR IGNORE). Never throws into the caller's content path — but it
-   * REPORTS: returns false when the row did not land, so a caller for whom the row is a delivery
-   * precondition can fail instead of proceeding (review F2). Before Tier 1 the return value would
-   * have been pointless, because `cello_receive` served content from the in-memory buffer and the
-   * lost row only cost the unread count. Delivery reads the transcript now, so a swallowed received
-   * row is TOTAL content loss and the caller has to know.
-   */
-  recordTranscriptMessage(
-    agentName: string,
-    sessionId: string,
-    sequence: number,
-    /**
-     * DOD-M15-REFUSEDEVIDENCE-1 adds `'quarantined'` — received and REFUSED, kept as evidence and
-     * never delivered. It goes through THIS writer rather than a second one so that the attribution
-     * rule, the blob handling and the write-failure logging cannot drift between a delivered message
-     * and a refused one. One store, one writer.
-     */
-    direction: "sent" | "received" | "quarantined",
-    plaintext: Uint8Array,
-    correlationId?: string,
-    /**
-     * DOD-M15-SEALWIRE-1 bullet 5: the VERIFIED authorship proof, when there is one.
-     *
-     * Optional because there legitimately is not always one — the ordering decode can fail SOFT and
-     * the message is still ingested via hash-dedup. Optional is NOT the same as unremarked: absence
-     * is written into the row as `attribution = 'local_session_state'`, so a reader can tell a row
-     * whose author was proven from one whose author was assumed. That distinction is the bullet.
-     */
-    authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array },
-    /** Required on a `'quarantined'` row and meaningless on any other: WHY it was refused. */
-    quarantineReason?: string,
-    /**
-     * DOD-M15-REFUSEDEVIDENCE-1: the sender's key when there is one but no verified signature to go
-     * with it. A refused frame often has an identified sender and an unusable proof — a tampered
-     * message is still FROM someone — and dropping the key because the signature failed would throw
-     * away the half of the attribution that survived.
-     */
-    senderPubkeyHexOverride?: string | null,
-  ): boolean {
-    if (!this.#db) return false;
-    try {
-      const agentId = this.#requireAgentId(agentName);
-      const blob = Buffer.from(plaintext);
-      this.#db
-        .prepare(
-          `INSERT OR IGNORE INTO transcript
-             (agent_id, session_id, sequence, direction, blob, created_at, sender_pubkey, sender_sig, attribution, quarantine_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          agentId, sessionId, sequence, direction, blob, Date.now(),
-          authorship
-            ? Buffer.from(authorship.senderPubkey).toString("hex")
-            : senderPubkeyHexOverride ?? null,
-          authorship ? Buffer.from(authorship.senderSig) : null,
-          /**
-           * THREE values, not two — caught by CELLO_Coder_1 reviewing the first version, and it was
-           * the same defect this column exists to prevent, surviving one layer up in the enum.
-           *
-           * `local_session_state` covered two OPPOSITE rows: one this agent AUTHORED (provenance
-           * fully known, merely not third-party-provable) and one RECEIVED on the soft fallback
-           * (provenance unknown — something arrived on a socket and was trusted). A reader shown the
-           * transcript later could not separate "he wrote this himself" from "nobody checked".
-           * Structurally identical rows with different trustworthiness is exactly what I refused to
-           * ship when I rejected a nullable signature column.
-           *
-           * No plumbing needed: `direction` already carries the answer at write time.
-           */
-          /**
-           * DIRECTION FIRST — DOD-M15-SEALWIRE-1 bullet 5, sent half.
-           *
-           * This used to read `authorship ? "verified_signature" : …`, which was right while only
-           * RECEIVED rows could carry a signature. Now a SENT row carries one too — our own, over
-           * the Structure-1 bytes we put on the wire — and labelling that `verified_signature` would
-           * be false in the way this column exists to prevent: **we did not verify it, we produced
-           * it.** Nobody checked a counterparty's key; there was no counterparty in the act.
-           *
-           * So the three values keep meaning three different things:
-           *   `self_authored`      — this agent wrote it. Now PROVABLE when a signature is stored.
-           *   `verified_signature` — someone else wrote it and we checked their key against it.
-           *   `local_session_state`— someone else wrote it and nobody checked anything.
-           */
-          direction === "sent" ? "self_authored" : authorship ? "verified_signature" : "local_session_state",
-          quarantineReason ?? null,
-        );
-      this.#logger.info("transcript.message.recorded", { sessionId, agentName, sequence, direction, correlationId });
-      return true;
-    } catch (err: unknown) {
-      // M8C-INBOX-1 (reviewer F2): a RECEIVED-row write failure is not cosmetic — since INBOX-1 the
-      // transcript is the AUTHORITY for unread (getUnreadSummary).
-      //
-      // UPDATED for DOD-COATTEND-1 (review F2). This comment used to end "...while cello_receive
-      // still delivers it live from the in-memory buffer (masking the loss)", and that mitigation
-      // was the whole reason a swallowed write was survivable. Tier 1 DELETED it: delivery reads
-      // the transcript now, so a lost received row is not an undercount, it is the message never
-      // reaching ANY session while the doorbell rings and the leaf sits in the hash chain. The
-      // sentence is corrected rather than kept, because as written it reassured a reader about a
-      // safety net that no longer exists. Sent-row failures stay a warning (they only affect the
-      // durable readable transcript, not delivery).
-      // A QUARANTINED row that fails to write is an ERROR for the same reason a received one is,
-      // and a different one: nothing else holds these bytes. The message was refused, so it was
-      // never delivered and never acked in a way that brings it back — a failed write here is the
-      // evidence gap this unit exists to close, reopened by a disk fault.
-      const level = direction === "sent" ? "warn" : "error";
-      this.#logger[level]("transcript.message.record.failed", {
-        sessionId, agentName, sequence, direction,
-        reason: err instanceof Error ? err.message : String(err),
-        correlationId,
-        ...(direction === "received" ? { impact: "content_undeliverable_message_lost" } : {}),
-        ...(direction === "quarantined" ? { impact: "refused_message_not_retained_no_other_copy_exists" } : {}),
-      });
-      return false;
-    }
-  }
 
-  /**
-   * DOD-LOG-1: read a session's durable transcript back (after a restart), decrypted and ordered by
-   * canonical sequence then direction. A blob that fails to decrypt (tamper/wrong key) is skipped
-   * with a loud log rather than crashing the read.
-   */
-  readTranscript(
-    agentName: string,
-    sessionId: string,
-  ): { messages: TranscriptEntry[]; undecryptable: number } {
-    if (!this.#db) return { messages: [], undecryptable: 0 };
-    const rows = this.#db
-      .prepare(
-        `SELECT sequence, direction, blob, created_at, quarantine_reason FROM transcript
-         WHERE agent_id = ? AND session_id = ? ORDER BY sequence ASC, direction ASC`,
-      )
-      .all(this.#requireAgentId(agentName), sessionId) as Array<{ sequence: number; direction: string; blob: Uint8Array; created_at: number; quarantine_reason: string | null }>;
-    const messages: TranscriptEntry[] = [];
-    // PERSIST-002 (AC-010): the blob is plaintext (whole-DB SQLCipher at rest), so there is no
-    // per-row decrypt step that can fail — `undecryptable` stays 0 and is kept only for callers that
-    // already read the field.
-    for (const r of rows) {
-      const blob = r.blob instanceof Uint8Array ? r.blob : new Uint8Array(r.blob);
-      /**
-       * DOD-M15-REFUSEDEVIDENCE-1 — THE READ IS REDACTED, THE STORAGE IS NOT.
-       *
-       * The entry stays at its position, because a hole where a message was is the evidence gap
-       * this unit exists to close, one level up: the operator must be able to see that something
-       * arrived here and was refused. What is withheld is the TEXT, and `text` carries the
-       * withholding statement rather than being omitted — every existing renderer of this array
-       * prints `text`, so a missing field would print nothing and an unfiltered one would print the
-       * payload. The statement is the fail-safe value for both.
-       *
-       * ⚠️ THREE-WAY, not `!== "sent" ? "received"`. The old expression labelled anything that was
-       * not `sent` as `received`, which would have handed a refused message to every reader as a
-       * delivered one — with its text.
-       */
-      const direction: TranscriptEntry["direction"] =
-        r.direction === "sent" ? "sent" : r.direction === "quarantined" ? "quarantined" : "received";
-      if (direction === "quarantined") {
-        // No `?? "refused"` default — review F11. See `readQuarantined` for why a generic label for
-        // an impossible state is worse than an empty one.
-        const reason = r.quarantine_reason as string;
-        const redaction = quarantineRedaction(reason, sessionId, r.sequence);
-        messages.push({
-          sequence: r.sequence, direction, createdAt: r.created_at,
-          text: redaction.text,
-          // The key ENDS in `guidance` so `vocabulary.ts` rewrites the verb for a CLI reader — see
-          // the note on `quarantineRedaction`.
-          withheld_guidance: redaction.guidance,
-          refusalReason: reason,
-          withheld: true,
-        });
-        continue;
-      }
-      messages.push({ sequence: r.sequence, direction, text: new TextDecoder().decode(blob), createdAt: r.created_at });
-    }
-    return { messages, undecryptable: 0 };
-  }
+
+
 
   /**
    * DOD-COATTEND-1 (review F5) — the single next RECEIVED message after `afterSeq`, or null.
@@ -4034,87 +2761,10 @@ export class SessionNodeManager {
     this.#logger.info("message.watermark.advanced", { agentName, sessionId, sequence: seq });
   }
 
-  /**
-   * The ONE definition of "unread" in this daemon: a RECEIVED transcript row whose sequence is
-   * beyond the agent's persisted read watermark. A constant, not a copy-pasted string, so the
-   * INBOX unread count and the DOD-CURSOR-DURABLE-1 read-before-write gate can never drift into
-   * disagreeing about what "unread" means — the gate deciding one thing while the inbox shows
-   * another is precisely the bug this shape prevents. Interpolated SQL only (no user input).
-   */
-  static readonly #UNREAD_RECEIVED_WHERE = `
-           t.direction = 'received'
-           AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
 
-  static readonly #REFUSED_SESSIONS_CAP = 200;
-  static readonly #TERMINAL_STATUSES = `('sealed','abandoned','seal_interrupted_pending','interrupted')`;
 
-  /** INBOX-1 (N2): per-session unread summary for an agent — sessions that have RECEIVED transcript
-   *  messages beyond the read watermark, excluding terminal sessions (sealed, abandoned,
-   *  seal_interrupted_pending) which belong in getEndedUnread instead.
-   *  Sessions with no sessions row are treated as non-terminal (LEFT JOIN).
-   *  Content-free (counts + ids + last seq, never message text); a COUNT/MAX query, no decrypt. */
-  getUnreadSummary(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number }> {
-    if (!this.#db) return [];
-    const rows = this.#db
-      .prepare(
-        `SELECT t.session_id AS session_id,
-                COUNT(*)      AS unread_count,
-                MAX(t.sequence) AS last_seq
-         FROM transcript t
-         LEFT JOIN message_watermarks w
-           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
-         LEFT JOIN sessions s
-           ON s.agent_id = t.agent_id AND s.session_id = t.session_id
-         WHERE t.agent_id = ?
-           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}
-           AND (s.status IS NULL OR s.status NOT IN ${SessionNodeManager.#TERMINAL_STATUSES})
-         GROUP BY t.session_id
-         HAVING unread_count > 0
-         ORDER BY t.session_id ASC`,
-      )
-      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number }>;
-    return rows;
-  }
 
-  /** DOD-SEALED-INBOX-1: terminal sessions with unread received messages that have not been
-   *  dismissed. These are answering-machine style messages left in an ENDED session — the operator
-   *  can read them via cello_transcript but cannot advance the watermark via cello_receive.
-   *  Only returned when read_at IS NULL (not yet dismissed).
-   *
-   *  DOD-SEALED-INBOX-2: named `getEndedUnread`, not `getSealedUnread`, and it SELECTS `s.status`.
-   *  All four #TERMINAL_STATUSES belong here — that part was always right — but only `sealed` is
-   *  NOTARIZED. The old name and the caller's hardcoded `session_state: "sealed"` asserted a
-   *  cryptographic receipt for `abandoned`, `interrupted` and `seal_interrupted_pending` sessions,
-   *  which have none. Callers must render the row's own status; there is nothing to infer from
-   *  membership in this list beyond "it ended". */
-  getEndedUnread(agentName: string): Array<{ session_id: string; unread_count: number; last_seq: number; status: string }> {
-    if (!this.#db) return [];
-    const rows = this.#db
-      .prepare(
-        // M12-P17 (review F2): return the ACTUAL status. `#TERMINAL_STATUSES` spans four states and
-        // they are NOT equivalent — an `interrupted` session is not committed, still accepts
-        // appends, and may have a counterparty waiting to seal. Stamping "sealed" over all four
-        // told an agent that live work was dead history: symptom B inverted.
-        `SELECT t.session_id AS session_id,
-                COUNT(*)      AS unread_count,
-                MAX(t.sequence) AS last_seq,
-                s.status      AS status
-         FROM transcript t
-         LEFT JOIN message_watermarks w
-           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
-         JOIN sessions s
-           ON s.agent_id = t.agent_id AND s.session_id = t.session_id
-         WHERE t.agent_id = ?
-           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}
-           AND s.status IN ${SessionNodeManager.#TERMINAL_STATUSES}
-           AND s.read_at IS NULL
-         GROUP BY t.session_id
-         HAVING unread_count > 0
-         ORDER BY t.session_id ASC`,
-      )
-      .all(this.#requireAgentId(agentName)) as Array<{ session_id: string; unread_count: number; last_seq: number; status: string }>;
-    return rows;
-  }
+
 
   /** DOD-SEALED-INBOX-1: mark a terminal session as dismissed — sets read_at to now.
    *  Only valid for terminal sessions; active/interrupted sessions return session_not_terminal. */
@@ -4133,72 +2783,17 @@ export class SessionNodeManager {
     return { ok: true };
   }
 
-  /**
-   * DOD-CURSOR-DURABLE-1: how many RECEIVED messages in THIS session the agent has not read —
-   * the durable half of the read-before-write gate. Same predicate as getUnreadSummary (shared
-   * constant above), scoped to one session.
-   *
-   * This is DURABLE and PER-AGENT, where the send gate's other authority (the connection cursor) is
-   * in-memory and per-connection. It is what lets a stateless client — the `cello` CLI, one process
-   * per command — prove it has read the counterparty, which a dead socket's cursor never can.
-   *
-   * FAILS CLOSED: an uninitialized DB returns a positive count (treated as "unread"), never 0. A 0
-   * here unblocks a send; guessing 0 from a broken DB would silently defeat the gate.
-   */
-  getUnreadReceivedCount(agentName: string, sessionId: string): number {
-    if (!this.#db) return 1; // fail closed — never unblock a send because the DB is unavailable
-    const row = this.#db
-      .prepare(
-        `SELECT COUNT(*) AS unread_count
-         FROM transcript t
-         LEFT JOIN message_watermarks w
-           ON w.agent_id = t.agent_id AND w.session_id = t.session_id
-         WHERE t.agent_id = ?
-           AND t.session_id = ?
-           AND ${SessionNodeManager.#UNREAD_RECEIVED_WHERE}`,
-      )
-      .get(this.#requireAgentId(agentName), sessionId) as { unread_count: number } | undefined;
-    // Absent row → "I cannot count", which is NOT "you are caught up". Answer the same way the
-    // #db guard above does. Unreachable today (SELECT COUNT(*) with no GROUP BY always yields a
-    // row), but a fail-OPEN default inside a fail-CLOSED gate is a defect that only needs the query
-    // to change once. The two branches must never disagree about what "unknown" means.
-    return row ? row.unread_count : 1;
-  }
 
-  /** M8C-CONTACT-1: is this pubkey a known contact of this agent? */
-  isContact(agentName: string, pubkey: string): boolean {
-    if (!this.#db) return false;
-    const row = this.#db.prepare("SELECT 1 FROM contacts WHERE agent_id = ? AND pubkey = ?").get(this.#requireAgentId(agentName), normalizeContactPubkey(pubkey));
-    return row !== undefined;
-  }
 
-  /** DOD-TIER-1: the reachability tier for a counterparty of this agent. The RESULT is total — an
-   *  absent contact row (undefined), a NULL `tier`, or a corrupt out-of-range value all resolve to
-   *  UNKNOWN via `normalizeTier`, so the return is always in 0..4 and guards the JS `null >= 0`/`0 ||
-   *  1`/`grid[99]` traps. It is a SECURITY read (Step 2 gates inbound bounds on it), so it FAILS
-   *  CLOSED, never open: an uninitialized DB throws (same contract as addContact) rather than
-   *  silently returning UNKNOWN and admitting a BLOCKED sender; an unresolvable/retired agent name
-   *  throws via #requireAgentId. Both are invariant violations a caller must surface, not swallow. */
-  getTier(agentName: string, pubkey: string): number {
-    // Fail CLOSED: a read that decides whether to admit a sender must not degrade to "unclassified"
-    // when it cannot reach the ACL — that would admit a blocked contact. Throw as addContact does.
-    if (!this.#db) throw new Error(`getTier('${agentName}'): database not initialized`);
-    const row = this.#db
-      .prepare("SELECT tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
-      .get(this.#requireAgentId(agentName), normalizeContactPubkey(pubkey)) as { tier: number | null } | undefined;
-    if (row && row.tier !== null && !isKnownTierValue(row.tier)) {
-      // A stored tier outside 0..4 is corruption — surface it. normalizeTier still maps it to the
-      // tighter UNKNOWN so the caller is safe, but a silent map would hide a broken row.
-      this.#logger.warn("contact.tier.corrupt", { agentName, pubkey, storedTier: row.tier });
-    }
-    return normalizeTier(row?.tier);
-  }
+
+
+
 
   /** DOD-TIER-4: the DISPLAY/relationship check — is this counterparty a genuine contact (KNOWN or
    *  above)? Replaces the old binary `isContact` for behaviour that keyed on "we have a relationship"
    *  (e.g. the away-response wording). An UNKNOWN-tier contact (a mere row) is NOT known. */
   isKnown(agentName: string, pubkey: string): boolean {
-    return this.getTier(agentName, pubkey) >= TIER.KNOWN;
+    return this.#records.getTier(agentName, pubkey) >= TIER.KNOWN;
   }
 
   /** DOD-TIER-4: the POLICY gate — may an inbound session from this counterparty be auto-accepted
@@ -4206,168 +2801,20 @@ export class SessionNodeManager {
    *  relay mailbox (LEAVEMSG-1), out of scope for this unit; defined here as the seam. Being merely
    *  KNOWN is NOT enough to auto-accept — whitelisting is the deliberate `cello_contact_set_tier` act. */
   isAutoAccept(agentName: string, pubkey: string): boolean {
-    return this.getTier(agentName, pubkey) >= TIER.WHITELISTED;
+    return this.#records.getTier(agentName, pubkey) >= TIER.WHITELISTED;
   }
 
-  /** DOD-TIER-BOUNDS-SETTINGS: the effective bound for (agent, tier, field) — a per-agent SETTINGS
-   *  override if one is set and valid, else the hardcoded grid default (DEFAULT_TIER_BOUNDS). With no
-   *  settings this is byte-identical to Step 2 (the daemon runs on defaults alone). A stored value
-   *  that is somehow non-positive/non-finite (should be impossible — validated at SET time) falls back
-   *  to the grid default rather than removing the bound (INV-TIER-BOUND, defensive). BLOCKED is never
-   *  settable — it always returns the fixed grid value (0). */
-  resolveTierBound(agentName: string, tier: number, field: "max_sessions" | "max_bytes"): number {
-    const gridDefault = field === "max_sessions"
-      ? tierBoundsFor(tier).maxSessionsPerSender
-      : tierBoundsFor(tier).maxBytesPerSession;
-    const name = settableTierName(tier);
-    if (name === null) return gridDefault; // BLOCKED or out-of-range — fixed, not overridable
-    const raw = this.getSetting(agentName, boundSettingKey(name, field));
-    if (raw === null) return gridDefault; // unset → default
-    const parsed = Number(raw);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
-      // Should be impossible (validated at SET time) → a config-integrity failure. Surface it: this
-      // reverts a possibly-TIGHTENED bound to the looser default, so a silent revert would hide a real
-      // problem. Still fail SAFE (grid default, never unbounded — INV-TIER-BOUND).
-      this.#logger.warn("settings.bound.corrupt", { agentName, tier, field, raw });
-      return gridDefault;
-    }
-    return parsed;
-  }
 
-  /** M8C-CONTACT-1: pin a contact at add time — idempotent (re-adding an existing contact is a
-   *  no-op, never refreshes added_at; identity does not get re-resolved). MONIKER-3 AC2: an
-   *  optional pet name; a NEW non-null moniker on re-add updates it, absence leaves it untouched.
-   *  THROWS on an invalid moniker — callers validate first; this is the can-never-be-stored
-   *  backstop (same contract as DbIdentityStore.setMoniker).
-   *
-   *  DOD-TIER-1/4: a NEW row is stamped `tier` (never NULL) and an optional `provenance`
-   *  ('accepted' | 'initiated' | null). The `tier` defaults to the least-privilege UNKNOWN floor —
-   *  a caller GRANTS trust by passing a higher tier explicitly. Every production creation path is a
-   *  deliberate operator action and passes KNOWN (initiate, engage/reply, explicit cello_contact_add
-   *  — DEC-AB-1). INSERT OR IGNORE means an EXISTING contact is untouched — tier and provenance pin
-   *  at first add, exactly as `added_at`/`moniker` already do; re-adding never downgrades a contact
-   *  the operator has since promoted. Raising the tier later is `cello_contact_set_tier`'s job. */
-  addContact(agentName: string, pubkey: string, moniker?: string | null, provenance?: string | null, tier: number = TIER.UNKNOWN): void {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!pubkey) return;
-    // Review F1: a missing DB handle must FAIL the write loudly — returning silently here let
-    // the handler log contact.added and report ok:true for a row that never landed.
-    if (!this.#db) throw new Error(`addContact('${agentName}'): database not initialized`);
-    if (moniker !== undefined && moniker !== null && validateMoniker(moniker) === null) {
-      throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
-    }
-    // DOD-TIER-4 (review F3): the stored tier must be a known 0..4 constant — a can-never-be-stored
-    // backstop mirroring the moniker validation above. All callers pass a TIER constant; this catches
-    // a future caller (or a bad refactor) that would otherwise persist a corrupt tier the read side
-    // must then defensively normalize.
-    if (!isKnownTierValue(tier)) {
-      throw new Error(`invalid contact tier for agent '${agentName}': ${tier} (must be 0..4)`);
-    }
-    const agentId = this.#requireAgentId(agentName);
-    this.#db
-      .prepare("INSERT OR IGNORE INTO contacts (agent_id, pubkey, added_at, tier, provenance) VALUES (?, ?, ?, ?, ?)")
-      .run(agentId, pubkey, Date.now(), tier, provenance ?? null);
-    if (moniker !== undefined && moniker !== null) {
-      this.#db
-        .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
-        .run(moniker, agentId, pubkey);
-    }
-  }
 
-  /** MONIKER-3 AC3: rename (string) or clear (null) an EXISTING contact's pet name. Returns false
-   *  when no such contact — fail-loud at the caller, never a silent no-op success. Same
-   *  validate-throw backstop as addContact. */
-  setContactMoniker(agentName: string, pubkey: string, moniker: string | null): boolean {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    // Review F2: false means exactly "no such contact" — a null DB handle throws instead, so the
-    // operator is never sent chasing a nonexistent missing-contact problem.
-    if (!this.#db) throw new Error(`setContactMoniker('${agentName}'): database not initialized`);
-    if (moniker !== null && validateMoniker(moniker) === null) {
-      throw new Error(`invalid contact moniker for agent '${agentName}': must match ${MONIKER_RE.source}`);
-    }
-    const res = this.#db
-      .prepare("UPDATE contacts SET moniker = ? WHERE agent_id = ? AND pubkey = ?")
-      .run(moniker, this.#requireAgentId(agentName), pubkey);
-    // DOD-RENAME-1: setting the local pet name IS the operator acting on a rename — resolve any
-    // pending notice for this contact (whether they adopted the offered name or chose their own).
-    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
-    return res.changes > 0;
-  }
 
-  /**
-   * M10B / DOD-END-SURFACE-1 — decide whether ONE signal is presented to ONE counterparty.
-   *
-   * `present: null` CLEARS the choice, which is not the same as `false`: cleared means "no opinion,
-   * use the signal's own default", while false means "specifically not this person". Collapsing
-   * them would make an operator unable to undo an omission without knowing what the default was.
-   *
-   * Deliberately does NOT require an existing contact row, unlike the tier/moniker/away setters. A
-   * decision about what to disclose is meaningful before a relationship is established — indeed
-   * that is when it matters most — and refusing here would force the operator to add someone as a
-   * contact in order to withhold something from them.
-   */
-  setContactSignalPref(agentName: string, pubkey: string, signalHash: string, present: boolean | null): void {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) throw new Error(`setContactSignalPref('${agentName}'): database not initialized`);
-    const agentId = this.#requireAgentId(agentName);
-    if (present === null) {
-      this.#db
-        .prepare("DELETE FROM contact_signal_prefs WHERE agent_id = ? AND contact_pubkey = ? AND signal_hash = ?")
-        .run(agentId, pubkey, signalHash);
-      this.#logger.info("signal.presentation.pref.cleared", { agentName, pubkey: pubkey.slice(0, 16), signalHash: signalHash.slice(0, 16) });
-      return;
-    }
-    this.#db
-      .prepare(
-        `INSERT INTO contact_signal_prefs (agent_id, contact_pubkey, signal_hash, present, set_at)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(agent_id, contact_pubkey, signal_hash) DO UPDATE SET present = excluded.present, set_at = excluded.set_at`,
-      )
-      .run(agentId, pubkey, signalHash, present ? 1 : 0, Date.now());
-    this.#logger.info("signal.presentation.pref.set", {
-      agentName, pubkey: pubkey.slice(0, 16), signalHash: signalHash.slice(0, 16), present,
-    });
-  }
 
-  /**
-   * The explicit per-counterparty choices for this contact: signal hash → present.
-   *
-   * A signal ABSENT from this map has no choice recorded and falls back to its own
-   * `default_present`. Returns an EMPTY map on an uninitialised DB rather than throwing, because
-   * this is a preference read on the presentation path and losing preferences must not break a
-   * session — but note the direction that failure takes: with no preferences, `default_present`
-   * decides, and consent still gates everything upstream in SQL. It can therefore only fall back to
-   * the operator's standing default, never to disclosing something consent has not cleared.
-   */
-  getContactSignalPrefs(agentName: string, pubkey: string): Map<string, boolean> {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) return new Map();
-    const rows = this.#db
-      .prepare("SELECT signal_hash, present FROM contact_signal_prefs WHERE agent_id = ? AND contact_pubkey = ?")
-      .all(this.#requireAgentId(agentName), pubkey) as Array<{ signal_hash: string; present: number }>;
-    return new Map(rows.map((r) => [r.signal_hash, r.present !== 0]));
-  }
 
-  /** DOD-AWAY-TIER-1: set (or clear, with null) a contact's per-contact away message. Returns false
-   *  when no such contact — fail-loud at the caller (same contract as setContactMoniker/setContactTier). */
-  setContactAwayMessage(agentName: string, pubkey: string, message: string | null): boolean {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) throw new Error(`setContactAwayMessage('${agentName}'): database not initialized`);
-    const res = this.#db
-      .prepare("UPDATE contacts SET away_message = ? WHERE agent_id = ? AND pubkey = ?")
-      .run(message, this.#requireAgentId(agentName), pubkey);
-    return res.changes > 0;
-  }
+
+
+
+
+
+
 
   /** DOD-AWAY-TIER-1: resolve the most-specific CUSTOM away text for a counterparty, most-specific
    *  first: per-contact `away_message` → per-tier away setting → agent default away setting. Returns
@@ -4387,69 +2834,23 @@ export class SessionNodeManager {
       this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: "contact" }); // obs AC
       return row.away_message; // 1. per-contact
     }
-    const tierName = settableTierName(this.getTier(agentName, pubkey));
+    const tierName = settableTierName(this.#records.getTier(agentName, pubkey));
     if (tierName !== null) {
-      const tierAway = this.getSetting(agentName, awayTierSettingKey(tierName));
+      const tierAway = this.#records.getSetting(agentName, awayTierSettingKey(tierName));
       if (tierAway !== null) {
         this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: "tier" });
         return tierAway; // 2. per-tier
       }
     }
-    const agentDefault = this.getSetting(agentName, AWAY_DEFAULT_KEY);
+    const agentDefault = this.#records.getSetting(agentName, AWAY_DEFAULT_KEY);
     // 3. agent default, else null → caller applies the system default (code). Level logged HERE.
     this.#logger.debug("contact.away.resolved", { agentName, pubkey, level: agentDefault !== null ? "agent_default" : "system" });
     return agentDefault;
   }
 
-  /** DOD-CONTACT-VIEW-1: set an EXISTING contact's reachability tier. Returns false when no such
-   *  contact — fail-loud at the caller, never a silent no-op success (same contract as
-   *  setContactMoniker). The caller validates the tier is a known constant BEFORE calling; this
-   *  stores whatever it is handed (the handler is the validation boundary). */
-  setContactTier(agentName: string, pubkey: string, tier: number): boolean {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) throw new Error(`setContactTier('${agentName}'): database not initialized`);
-    const res = this.#db
-      .prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?")
-      .run(tier, this.#requireAgentId(agentName), pubkey);
-    return res.changes > 0;
-  }
 
-  /** DOD-RENAME-1 (Option C): record a self-declared name a peer offered, at the moment the offer is
-   *  SEEN. The stored local pet name (contacts.moniker) is SACROSANCT — this only ever touches
-   *  last_offered_moniker and the notice queue, never the moniker (AC2). A rename NOTICE is queued
-   *  only when the peer is a contact the operator has PERSONALLY NAMED (moniker non-null), a name was
-   *  seen BEFORE (last_offered_moniker non-null), and the new offer DIFFERS (AC3). The first-ever
-   *  offer just records the baseline (no notice); a repeat of the same name is idempotent (AC4).
-   *  Called only when a moniker WAS offered (caller-guarded), so silence never clears the baseline
-   *  (AC5). Limitation: last_offered_moniker updates only on the RECEIVING side of an offer, so rename
-   *  detection works only for peers who INITIATE to you — a property, not a bug. */
-  recordOfferedMoniker(agentName: string, pubkey: string, offered: string): void {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    // Fail CLOSED like getTier/setContactTier: a silent skip here would drop a rename baseline update
-    // (and any notice) while the daemon reports healthy — the inbound path always has an open DB.
-    if (!this.#db) throw new Error(`recordOfferedMoniker('${agentName}'): database not initialized`);
-    const agentId = this.#requireAgentId(agentName);
-    const row = this.#db
-      .prepare("SELECT last_offered_moniker, moniker FROM contacts WHERE agent_id = ? AND pubkey = ?")
-      .get(agentId, pubkey) as { last_offered_moniker: string | null; moniker: string | null } | undefined;
-    if (!row) return; // not a contact — no row to hold a baseline or a notice
-    if (offered === row.last_offered_moniker) return; // idempotent — same name already seen (AC4)
-    // A genuine change from a previously-seen name, for a contact the operator has named → notice.
-    if (row.last_offered_moniker !== null && row.moniker !== null) {
-      this.#db
-        .prepare("INSERT OR REPLACE INTO contact_rename_notices (agent_id, pubkey, offered_name, noticed_at) VALUES (?, ?, ?, ?)")
-        .run(agentId, pubkey, offered, Date.now());
-      // Observability: log the FACT, never the attacker-chosen name (same rule as moniker.rejected).
-      this.#logger.info("contact.rename.noticed", { agentName, pubkey });
-    }
-    this.#db
-      .prepare("UPDATE contacts SET last_offered_moniker = ? WHERE agent_id = ? AND pubkey = ?")
-      .run(offered, agentId, pubkey);
-  }
+
+
 
   /** DOD-RENAME-1: pending rename notices for an agent, oldest first (surfaced in
    *  cello_check_notifications — an INBOX pull, never a real-time push). */
@@ -4467,122 +2868,15 @@ export class SessionNodeManager {
       .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }>;
   }
 
-  /** DOD-RENAME-1: clear a pending rename notice — the operator acted (adopted a name or removed the
-   *  contact). Idempotent (no notice → no-op). Fail-closed on a missing DB, like the writes above. */
-  clearRenameNotice(agentName: string, pubkey: string): void {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) throw new Error(`clearRenameNotice('${agentName}'): database not initialized`);
-    this.#db
-      .prepare("DELETE FROM contact_rename_notices WHERE agent_id = ? AND pubkey = ?")
-      .run(this.#requireAgentId(agentName), pubkey);
-  }
 
-  /** M8C-CONTACT-1: known stays known until explicitly removed. */
-  removeContact(agentName: string, pubkey: string): boolean {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) return false;
-    const res = this.#db.prepare("DELETE FROM contacts WHERE agent_id = ? AND pubkey = ?").run(this.#requireAgentId(agentName), pubkey);
-    // DOD-RENAME-1: a removed contact has no pending rename to resolve.
-    if (res.changes > 0) this.clearRenameNotice(agentName, pubkey);
-    /**
-     * OUTSIDE the `changes > 0` guard — review N2, and inside it the F2 fix did nothing for the
-     * case that matters.
-     *
-     * The pin is written on every ACCEPTED INBOUND session. A contact row is written only on an
-     * outbound initiate, an explicit add, a reply, or a trust-signal presentation — and an inbound
-     * requester is deliberately NOT auto-added. So a counterparty you never replied to (away-mode
-     * auto-ack is exactly this) has a pin and no contact row.
-     *
-     * Guarded, `cello_contact_remove` for them returned `{ ok: true, removed: false }`, cleared
-     * nothing, and the identity refusal stayed permanent — the original lockout, now wearing an
-     * `ok: true`, which is harder to notice than the original.
-     */
-    const pinsCleared = this.clearPinnedCounterpartyPrimary(agentName, pubkey);
-    return res.changes > 0 || pinsCleared > 0;
-  }
 
-  /**
-   * Forget the pinned threshold group key for a counterparty, so the next session re-pins.
-   *
-   * DOD-M15-OFFER-SIGNED-1 review F2 — WITHOUT THIS THE REFUSAL WAS PERMANENT. The identity-change
-   * check refuses a counterparty whose group key differs from the one recorded in an earlier
-   * session, and its guidance told the operator to confirm out of band and then remove the contact
-   * so the new identity is pinned afresh. `removeContact` deleted a row in `contacts`; the pin lives
-   * in `sessions.counterparty_primary_pubkey`, and nothing in the daemon ever cleared it.
-   *
-   * So an operator who did exactly as instructed — called their counterparty, confirmed the
-   * re-registration was genuine, removed the contact, retried — got the identical refusal, with no
-   * way out short of editing the database. A security control that cannot be reset by the person it
-   * protects is a lockout, and the printed remedy made it worse by reading as though it worked.
-   *
-   * Nulls the column rather than deleting the session rows: those rows are the transcript record,
-   * and a re-pin is not a reason to lose them.
-   */
-  clearPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): number {
-    if (!this.#db) return 0;
-    const res = this.#db
-      .prepare(
-        // NO `updated_at` BUMP — review N6. `CAP_COUNTS` counts an interrupted session only while
-        // `updated_at` is inside the staleness window, so touching it here reset the clock on every
-        // stale session with that counterparty, re-inflating their per-sender cap — while removing
-        // the contact simultaneously dropped them to UNKNOWN tier, which LOWERS it. The operator
-        // follows the printed remedy and their counterparty's next session is refused for cap,
-        // through a reason string deliberately identical to every other refusal. A second lockout
-        // that says nothing. Nothing needs the timestamp: every candidate row ends up NULL.
-        "UPDATE sessions SET counterparty_primary_pubkey = NULL WHERE agent_id = ? AND counterparty_pubkey = ?",
-      )
-      .run(this.#requireAgentId(agentName), counterpartyPubkeyHex);
-    return Number(res.changes);
-  }
 
-  /** MONIKER-4: the operator's pet name for a pubkey (whoLabel's top tier), or null. Read-only
-   *  and tolerant of a not-yet-open DB (a missing label degrades the doorbell, never blocks it). */
-  getContactMoniker(agentName: string, pubkey: string): string | null {
-    // A public key is bytes; its hex case is not part of its identity. Normalized HERE so the
-    // query below cannot see two spellings of one contact — see `contact-pubkey-case.ts`.
-    pubkey = normalizeContactPubkey(pubkey);
-    if (!this.#db) {
-      // Review F2: the last fully-silent branch in the resolution chain — the label degrades to
-      // fingerprint, which is correct, but say so rather than returning null wordlessly.
-      this.#logger.debug("moniker.local.db_unavailable", { agentName, pubkey });
-      return null;
-    }
-    const row = this.#db
-      .prepare("SELECT moniker FROM contacts WHERE agent_id = ? AND pubkey = ?")
-      .get(this.#requireAgentId(agentName), pubkey) as { moniker: string | null } | undefined;
-    return row?.moniker ?? null;
-  }
 
-  /** M8C-CONTACT-1 + DOD-CONTACT-VIEW-1: list an agent's contacts, oldest-added first, each with its
-   *  pet name (MONIKER-3), tier + provenance (the address-book metadata), and a READ-side LEFT JOIN
-   *  against `sessions` for how many SEALED sessions were shared and when they last spoke (MAX
-   *  updated_at). No new stored data — a pure read. A contact with no sessions shows 0 / null (never),
-   *  not an error. The JOIN is scoped by agent_id so one agent's sessions never bleed into another's. */
-  listContacts(agentName: string): Array<{
-    pubkey: string; added_at: number; moniker: string | null;
-    tier: number | null; provenance: string | null; sealed_count: number; last_spoke: number | null;
-  }> {
-    if (!this.#db) return [];
-    return this.#db
-      .prepare(
-        `SELECT c.pubkey, c.added_at, c.moniker, c.tier, c.provenance,
-                COUNT(CASE WHEN s.status = 'sealed' THEN 1 END) AS sealed_count,
-                MAX(s.updated_at) AS last_spoke
-         FROM contacts c
-         LEFT JOIN sessions s ON s.agent_id = c.agent_id AND s.counterparty_pubkey = c.pubkey
-         WHERE c.agent_id = ?
-         GROUP BY c.pubkey, c.added_at, c.moniker, c.tier, c.provenance
-         ORDER BY c.added_at ASC`,
-      )
-      .all(this.#requireAgentId(agentName)) as Array<{
-        pubkey: string; added_at: number; moniker: string | null;
-        tier: number | null; provenance: string | null; sealed_count: number; last_spoke: number | null;
-      }>;
-  }
+
+
+
+
+
 
   /**
    * M8C-ABUSE-1: cumulative inbound byte total for a session (anti-drip-feed accounting).
@@ -4606,172 +2900,9 @@ export class SessionNodeManager {
     return row.total;
   }
 
-  /**
-   * DOD-M15-REFUSEDEVIDENCE-1 — RETAIN a message that was refused. Retention is universal; DELIVERY
-   * is what is withheld.
-   *
-   * Every refusal path that can store calls this. It writes the plaintext, the sender's key, the
-   * sender's signature and the refusal reason into the transcript, flagged `'quarantined'` so it is
-   * excluded by construction from delivery and from unread counts.
-   *
-   * ⚠️ STORING HOSTILE CONTENT IS SAFE; INTERPOLATING IT IS NOT. The blob is a bound parameter and
-   * the database never parses it — SQL injection is not the risk here and must not be defended
-   * against. The risk is on the way OUT, so nothing below puts `content` into a log line, an error
-   * message or a path. The log carries the length and the hash.
-   *
-   * Returns the sequence it was stored at, or `null` when it was not stored — which happens only for
-   * a reason the caller is expected to log.
-   */
-  #quarantineRefusedContent(
-    agentName: string,
-    sessionId: string,
-    reason: string,
-    content: Uint8Array,
-    contentHashHex: string,
-    opts: {
-      senderPubkeyHex?: string | null;
-      authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array };
-      canonicalSeq?: number;
-      correlationId?: string;
-    },
-  ): number | null {
-    const sequence = this.#retainRefusedContent(agentName, sessionId, reason, content, contentHashHex, opts);
-    /**
-     * DOD-M15-REFUSALTERMINAL-1 — **THE FUNNEL, and the reason it lives here.**
-     *
-     * Every refusal that retains evidence passes through this method carrying its reason and its
-     * content hash, so this is the one place where "which reasons stop the work" can be a LIST
-     * rather than a decision copied into seven branches. `TERMINAL_REFUSAL_REASONS` decides; the
-     * six other reasons that reach here — a hash mismatch, an unreadable algorithm, a missing salt,
-     * an unresolved sender, an orphaned session, a terminal screen block — all keep retrying, and
-     * each of them can succeed on a later attempt.
-     *
-     * AFTER the retention, deliberately: the evidence has to exist before anything stops going to
-     * look for the message.
-     */
-    this.#considerTerminalRefusal(agentName, sessionId, contentHashHex, reason);
-    return sequence;
-  }
+  
 
-  /** DOD-M15-REFUSEDEVIDENCE-1: the retention itself. Reached only through the funnel above. */
-  #retainRefusedContent(
-    agentName: string,
-    sessionId: string,
-    reason: string,
-    content: Uint8Array,
-    contentHashHex: string,
-    opts: {
-      /** The sender's key when this side resolved one. `null` is itself evidence. */
-      senderPubkeyHex?: string | null;
-      /** The VERIFIED authorship proof, when the frame carried one that checked out. */
-      authorship?: { senderPubkey: Uint8Array; senderSig: Uint8Array };
-      /** The relay-assigned position, for a refusal that DOES occupy one (a screener block). */
-      canonicalSeq?: number;
-      correlationId?: string;
-    },
-  ): number | null {
-    if (!this.#db) return null;
-    try {
-      const agentId = this.#requireAgentId(agentName);
-      /**
-       * ⚠️ **DEDUP FIRST — review F1, and without it retention KILLS THE CONVERSATION IT PROTECTS.**
-       *
-       * Six of the seven retaining exits refuse WITHOUT ACKNOWLEDGING, which is exactly what makes
-       * the sender's daemon redeliver. Each redelivery re-enters here, above the leaf dedup, and
-       * would take a fresh negative sequence — another full copy of the same bytes. The park drain's
-       * own comment measures that loop at *"~120 repeats per message, forever"*.
-       *
-       * **And retained bytes spend the delivery budget** (`#getReceivedBytesTotal` counts them, which
-       * is what makes the bound honest). So a counterparty on a newer build sends ONE message, the
-       * version skew refuses it un-acked, and twenty-five drains later the conversation's 25 MB is
-       * gone — permanently, because the cap does not reset. Honest traffic then hits
-       * `session_size_limit_exceeded` and the daemon tells the operator to start a new conversation.
-       *
-       * The counterbalance, stated properly this time: **evidence and delivery share one monotonic
-       * budget, and when evidence wins the conversation stops working.** Entry 69 claimed there was
-       * nothing to trade off, and this is what that claim was hiding.
-       *
-       * Keyed on (session, reason, bytes) rather than a hash column: SQLite compares BLOBs directly
-       * and short-circuits on length, the candidate set is one session's refusals, and it needs no
-       * schema change. Same bytes refused the same way is ONE piece of evidence — how many times it
-       * arrived is already counted by the refusal notice. The same bytes refused for a DIFFERENT
-       * reason is a different fact and keeps its own row.
-       */
-      const already = this.#db
-        .prepare(
-          `SELECT sequence FROM transcript
-           WHERE agent_id = ? AND session_id = ? AND direction = 'quarantined'
-             AND quarantine_reason = ? AND blob = ?`,
-        )
-        .get(agentId, sessionId, reason, Buffer.from(content)) as { sequence: number } | undefined;
-      if (already) {
-        this.#logger.debug("session.content.quarantine.duplicate", {
-          agentName, sessionId, reason, sequence: already.sequence,
-          contentHash: contentHashHex, correlationId: opts.correlationId,
-        });
-        return already.sequence;
-      }
-      /**
-       * THE BOUND. A session at its byte cap retains no more.
-       *
-       * `senderPubkeyHex` is absent exactly when there is no session row or no counterparty
-       * (`session_orphaned`, `sender_unresolved`), so there is no contact to look a tier up on. Those
-       * take the UNKNOWN tier — the tightest bound, and the right one for a sender we cannot name.
-       */
-      const tier = opts.senderPubkeyHex ? this.getTier(agentName, opts.senderPubkeyHex) : TIER.UNKNOWN;
-      const cap = this.resolveTierBound(agentName, tier, "max_bytes");
-      const prior = this.#getReceivedBytesTotal(agentName, sessionId);
-      if (prior + content.length > cap) {
-        this.#logger.warn("session.content.quarantine.skipped", {
-          agentName, sessionId, reason, contentHash: contentHashHex,
-          bytes: content.length, prior, cap, tier,
-          correlationId: opts.correlationId,
-          skipped: "byte_budget_exhausted",
-          impact: "this refused message was NOT retained: the conversation has already spent its storage budget, so there is no evidence of it beyond this line and the refusal notice.",
-        });
-        return null;
-      }
-      /**
-       * WHERE IT SITS.
-       *
-       * A screener block already leafed at its canonical position, and the quarantine row takes that
-       * same sequence so the leaf and the evidence describe one event — DoD 7's leaf index is
-       * untouched by this unit.
-       *
-       * A refusal with NO leaf takes the next NEGATIVE sequence for the session. A leaf position is
-       * never negative, so the two spaces cannot collide, and descending from −1 means two refusals
-       * cannot overwrite each other. This is what lets `session_orphaned` — a session id with no
-       * `sessions` row at all — live in the same table as everything else, which is the whole point
-       * of one store rather than two.
-       */
-      let sequence = opts.canonicalSeq;
-      if (sequence === undefined || sequence < 0) {
-        const low = this.#db
-          .prepare("SELECT MIN(sequence) AS lo FROM transcript WHERE agent_id = ? AND session_id = ? AND direction = 'quarantined'")
-          .get(agentId, sessionId) as { lo: number | null };
-        sequence = Math.min(low.lo ?? 0, 0) - 1;
-      }
-      const stored = this.recordTranscriptMessage(
-        agentName, sessionId, sequence, "quarantined", content, opts.correlationId,
-        opts.authorship, reason, opts.senderPubkeyHex ?? null,
-      );
-      if (!stored) return null;
-      this.#logger.info("session.content.quarantined", {
-        agentName, sessionId, reason, sequence,
-        contentHash: contentHashHex, bytes: content.length,
-        signature: opts.authorship ? "verified" : "none",
-        correlationId: opts.correlationId,
-      });
-      return sequence;
-    } catch (err: unknown) {
-      this.#logger.error("session.content.quarantine.failed", {
-        agentName, sessionId, reason, contentHash: contentHashHex,
-        error: extractErrorMessage(err),
-        impact: "a refused message could not be retained, so nothing holds a copy of it — it cannot be shown to anyone or reported.",
-      });
-      return null;
-    }
-  }
+  
 
   /**
    * DOD-M15-REFUSEDEVIDENCE-1 — retain a message refused OUTSIDE `ingestReceivedContent`.
@@ -4794,7 +2925,7 @@ export class SessionNodeManager {
     senderPubkeyHex: string | null,
     correlationId?: string,
   ): number | null {
-    return this.#quarantineRefusedContent(agentName, sessionId, reason, content, contentHashHex, {
+    return this.#refusals.quarantineRefusedContent(agentName, sessionId, reason, content, contentHashHex, {
       senderPubkeyHex, correlationId,
     });
   }
@@ -4847,7 +2978,7 @@ export class SessionNodeManager {
     return {
       reason: rec.reason,
       senderPubkeyHex: rec.senderPubkeyHex,
-      senderLabel: rec.senderPubkeyHex === null ? null : this.getContactMoniker(agentName, rec.senderPubkeyHex),
+      senderLabel: rec.senderPubkeyHex === null ? null : this.#records.getContactMoniker(agentName, rec.senderPubkeyHex),
       // `attribution` is the column that exists to answer exactly this, so it is read rather than
       // inferred from `sender_sig` being non-null — a stored signature that was never checked
       // against the sender's key would otherwise be reported as VERIFIED.
@@ -4934,8 +3065,8 @@ export class SessionNodeManager {
     agentName: string,
     counterpartyPubkey: string,
   ): { ok: true } | { ok: false; reason: CapacityReason } {
-    const tier = this.getTier(agentName, counterpartyPubkey);
-    const perSenderCap = this.resolveTierBound(agentName, tier, "max_sessions");
+    const tier = this.#records.getTier(agentName, counterpartyPubkey);
+    const perSenderCap = this.#records.resolveTierBound(agentName, tier, "max_sessions");
     const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {
       // BYTE-IDENTICAL to every other refusal, deliberately — DOD-TIER-3. A BLOCKED sender and an
@@ -4955,88 +3086,17 @@ export class SessionNodeManager {
     return { ok: true };
   }
 
-  /** M8C-TGDOOR-1: the daemon-wide Telegram bot settings, or null if never configured. */
-  getTelegramSettings(): { botToken: string; allowlistedChatId: string } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT bot_token, allowlisted_chat_id FROM telegram_settings WHERE id = 1")
-      .get() as { bot_token: string; allowlisted_chat_id: string } | undefined;
-    return row ? { botToken: row.bot_token, allowlistedChatId: row.allowlisted_chat_id } : null;
-  }
 
-  /** M8C-TGDOOR-1: persist (or replace) the singleton Telegram settings row. */
-  setTelegramSettings(botToken: string, allowlistedChatId: string): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare(
-        `INSERT INTO telegram_settings (id, bot_token, allowlisted_chat_id, updated_at) VALUES (1, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET bot_token = excluded.bot_token, allowlisted_chat_id = excluded.allowlisted_chat_id, updated_at = excluded.updated_at`,
-      )
-      .run(botToken, allowlistedChatId, Date.now());
-  }
 
-  /** DOD-SETTINGS-1: read a per-agent setting, or null if unset. The get-with-default is the CALLER's
-   *  job (an unset key falls back to the hardcoded grid/system default — the daemon runs correctly on
-   *  defaults alone, AC3). Returns null on a missing DB (settings are always optional). */
-  getSetting(agentName: string, key: string): string | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT value FROM agent_settings WHERE agent_id = ? AND key = ?")
-      .get(this.#requireAgentId(agentName), key) as { value: string } | undefined;
-    return row?.value ?? null;
-  }
 
-  /**
-   * DOD-SETTINGS-1: DELETE a per-agent setting so the built-in default applies again.
-   *
-   * Deleting is NOT storing "". `getSetting` returns null for both, but the away-text resolver walks
-   * per-contact → per-tier → agent-default → system default, and an empty string is a VALUE that
-   * wins that walk and blanks the reply. Unsetting is the only way back to the default, and until
-   * this existed there was no way back at all: `cello_settings_set` accepted a string, refused an
-   * empty one, and told the caller to "pass null to clear" — a null it coerced to undefined and
-   * rejected as missing_params. Following that guidance from the CLI set the literal text "null",
-   * so an operator trying to remove their away message ended up broadcasting the word "null" to
-   * every caller.
-   *
-   * Returns whether a row was actually removed, so the handler can report what it did rather than
-   * claiming a clear it never performed.
-   */
-  deleteSetting(agentName: string, key: string): boolean {
-    if (!this.#db) throw new Error(`deleteSetting('${agentName}'): database not initialized`);
-    // Same dual-layer key check as setSetting — an unknown key here means a caller hand-typed one,
-    // and silently reporting "cleared" for a key that never existed would be the same class of lie.
-    if (!isValidSettingKey(key)) throw new Error(`invalid_key: '${key}' is not a known setting`);
-    const res = this.#db
-      .prepare("DELETE FROM agent_settings WHERE agent_id = ? AND key = ?")
-      .run(this.#requireAgentId(agentName), key);
-    return res.changes > 0;
-  }
 
-  /** DOD-SETTINGS-1: write a per-agent setting (upsert). Key VALIDATION is the handler's boundary
-   *  (isValidSettingKey); value validation for typed settings (finite bounds, etc.) belongs to the
-   *  specific consumer. Throws on a missing DB — a write that silently no-ops would be a lie. */
-  setSetting(agentName: string, key: string, value: string): void {
-    if (!this.#db) throw new Error(`setSetting('${agentName}'): database not initialized`);
-    // Store-level backstop (review F2): the handler validates the key, but the dual-layer convention
-    // (cf. MONIKER-1) means an unknown key can NEVER be stored — an internal caller that hand-typed a
-    // key instead of using the builders would otherwise persist a setting that never takes effect.
-    if (!isValidSettingKey(key)) throw new Error(`invalid_key: '${key}' is not a known setting`);
-    this.#db
-      .prepare(
-        `INSERT INTO agent_settings (agent_id, key, value, updated_at) VALUES (?, ?, ?, ?)
-         ON CONFLICT(agent_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-      )
-      .run(this.#requireAgentId(agentName), key, value, Date.now());
-  }
 
-  /** DOD-SETTINGS-1: all explicitly-set settings for an agent (the ones that OVERRIDE a default),
-   *  key-sorted. Unset keys are absent — the operator sees only what they changed. */
-  getAllSettings(agentName: string): Array<{ key: string; value: string }> {
-    if (!this.#db) return [];
-    return this.#db
-      .prepare("SELECT key, value FROM agent_settings WHERE agent_id = ? ORDER BY key ASC")
-      .all(this.#requireAgentId(agentName)) as Array<{ key: string; value: string }>;
-  }
+
+
+
+
+
+
 
   /** DOD-LOOP-1: whether the given agent has a standing receiver ready (any agent if omitted). */
   getStandingReceiverReady(agentName?: string): boolean {
@@ -5132,7 +3192,7 @@ export class SessionNodeManager {
     // TypeScript had no reason to complain about, and the whole `"unknown"` branch was unreachable
     // dead code. The fix for the disclosure window silently did nothing, which is worse than not
     // having written it: the DoD said the window was closed and it was wide open.
-    const state = relayOnlyState((key) => this.getSetting(agentName, key), this.#db !== null);
+    const state = relayOnlyState((key) => this.#records.getSetting(agentName, key), this.#db !== null);
     if (state === "unknown") {
       this.#logger.warn("settings.relay_only.unreadable", {
         agentName,
@@ -5758,7 +3818,7 @@ export class SessionNodeManager {
           // DOD-M15-CORROBORATE-1: a relay's witness alert reaches the operator's inbox from here.
           // The DETACHED clients get the same callback from the builder in daemon.ts.
           onWitnessAlert: (alert) => { this.recordRelayWitnessAlert(agentName, alert); },
-          onWitnessUnreadable: (relayPeerId, why) => { this.recordRelayWitnessUnreadable(agentName, relayPeerId, why); },
+          onWitnessUnreadable: (relayPeerId, why) => { this.#records.recordRelayWitnessUnreadable(agentName, relayPeerId, why); },
         });
         this.#relayClients.set(clientKey, client);
       }
@@ -6574,7 +4634,7 @@ export class SessionNodeManager {
       // Delivery no longer drains that buffer (it reads the transcript against a per-connection
       // bookmark), so its length is now "everything that ever arrived", not "what nobody read" —
       // reporting it would tell the operator every message of a healthy conversation went unread.
-      const unreadCount = this.getUnreadReceivedCount(agentName, sessionId);
+      const unreadCount = this.#records.getUnreadReceivedCount(agentName, sessionId);
       this.#sessionTerminal.set(tkey, { type: "sealed", unreadCount });
     }
     const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
@@ -6683,7 +4743,7 @@ export class SessionNodeManager {
     // drop diagnosable — it fires on both the destroy (sealed) and retire (sealing) paths.
     // DOD-COATTEND-1: same correction as the terminal marker above — the buffer is no longer
     // drained by delivery, so its length no longer means "unread". The watermark does.
-    const unreadCount = this.getUnreadReceivedCount(agentName, sessionId);
+    const unreadCount = this.#records.getUnreadReceivedCount(agentName, sessionId);
     if (unreadCount > 0) {
       this.#logger.info("session.receive.buffer.evicted", { sessionId, agentName, unreadCount });
     }
@@ -6729,11 +4789,7 @@ export class SessionNodeManager {
      * session, and a fresh check reloads them on demand. `#terminalRefusalsReadFailedAt` goes too,
      * so a torn-down session's back-off does not delay the first read after it is revived.
      */
-    this.#terminallyRefused.delete(key);
-    this.#terminalRefusalsLoaded.delete(key);
-    this.#terminalRefusalsReadFailedAt.delete(key);
-    this.#unreadableAlgSeen.delete(key);
-    this.#refusedOnDirectPath.delete(key);
+    this.#refusals.evictSession(agentName, sessionId);
     this.#responderSealSubmitted.delete(key);
     // DOD-MSG-4: drop the strict-in-order bookkeeping (witness map, held plaintext, high-water)
     // so a torn-down session retains no stale ordering state or buffered plaintext.
@@ -8152,7 +6208,7 @@ export class SessionNodeManager {
       // Prune to the cap — oldest first.
       this.#db.prepare(
         `DELETE FROM refused_sessions WHERE agent_id = ? AND session_id NOT IN (
-           SELECT session_id FROM refused_sessions WHERE agent_id = ? ORDER BY refused_at DESC LIMIT ${SessionNodeManager.#REFUSED_SESSIONS_CAP}
+           SELECT session_id FROM refused_sessions WHERE agent_id = ? ORDER BY refused_at DESC LIMIT ${REFUSED_SESSIONS_CAP}
          )`,
       ).run(agentId, agentId);
     } catch (err: unknown) {
@@ -9414,7 +7470,7 @@ export class SessionNodeManager {
        * Either way it is the author's signature over the author's own ordering claim, which is the
        * only form the relay accepts when the recipient witnesses on their behalf.
        */
-      const attempt = await this.#parkContent(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
+      const attempt = await this.#park.parkContent(agentName, sessionId, hashHex, content, frameS1, orderingS2, contentHashAlg, frameSig, leafKind);
       if (attempt.outcome === "parked") {
         /**
          * 🔗 A PARK IS A DELIVERY, so the chain advances here too — `DOD-M15-SELFCHAIN-1`.
@@ -9625,7 +7681,7 @@ export class SessionNodeManager {
       // The durable evidence already exists and was simply not consulted: our own ctrl leaf is in
       // `session_seal_leaves`. Recover the escalation values from it instead of submitting again.
       if (!this.#responderSealSubmitted.has(sealKey)) {
-        const durable = this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
+        const durable = this.#park.recoverOwnSealCtrlLeaf(agentName, sessionId);
         if (durable === "unknown") {
           // REFUSE, do not submit. A second ctrl leaf makes the session unsealable forever, and the
           // question "is one already there?" just failed to answer. Refusing costs this close; a
@@ -9909,74 +7965,9 @@ export class SessionNodeManager {
       });
   }
 
-  /**
-   * DAEMON-004: cross-check received content against its hash, append the
-   * verified leaf to the daemon-owned tree, and buffer it for cello_receive.
-   * A hash MISMATCH is genuine tamper — rejected without append or buffer.
-   *
-   * SCOPE / finding #5 — what this cross-check does and does NOT prove today:
-   * `contentHash` here is carried in the SAME content_frame as `content`, so this
-   * comparison only catches wire corruption of a single frame — it does NOT prove
-   * the content matches what the sender independently committed. Full tamper-
-   * evidence (EARS behavior #2) requires cross-checking against the K_local-signed
-   * content_hash leaf the sender submits to the RELAY on a separate channel; that
-   * relay hash-submit path is MSG-001's scope and does not exist yet. Until MSG-001
-   * lands, a malicious sender that sends matching (content, hash) in one frame is
-   * not detected here — only the relay-relayed signed leaf closes that gap.
-   *
-   * @returns the appended leaf index (as sequenceNumber) on success.
-   */
-  /**
-   * Mark this session's content unverifiable — review F1, and every path that fails the cross-check
-   * must come through here.
-   *
-   * It gates `getSealUpgradeReadiness().tampered` and the auto-acknowledge check, i.e. whether this
-   * agent's key signs anything covering content it could not check. Three refusal paths reach it and
-   * they carry different labels, because what the operator is told must differ; **what the gate does
-   * must not.**
-   *
-   * TAMPERED NEVER DOWNGRADES. A session that has already seen a hash mismatch stays `tampered` even
-   * if a later frame merely names an unreadable algorithm — otherwise a sender that had been caught
-   * could clear its own alarm by sending one more frame with a junk algorithm name, and the seal
-   * would auto-complete.
-   */
-  /**
-   * Remember that THIS frame was refused for naming an unreadable algorithm, so the park path can
-   * say so if the same message comes back the other way (review F2/F-D).
-   *
-   * BOUNDED, and it has to be: a peer that keeps sending unreadable frames would otherwise grow this
-   * without limit, and it is fed entirely by a remote party. The cap is per session and it drops the
-   * OLDEST entry — losing one only costs a missing reconciliation line, whereas an unbounded map fed
-   * by a counterparty is the leak class this codebase has already caught twice.
-   */
-  #noteUnreadableAlgFrame(agentName: string, sessionId: string, contentHash: Uint8Array, declaredAlg: string): void {
-    const key = this.#k(agentName, sessionId);
-    let byHash = this.#unreadableAlgSeen.get(key);
-    if (!byHash) { byHash = new Map(); this.#unreadableAlgSeen.set(key, byHash); }
-    if (byHash.size >= MAX_UNREADABLE_ALG_FRAMES) {
-      const oldest = byHash.keys().next();
-      if (!oldest.done) byHash.delete(oldest.value);
-    }
-    byHash.set(Buffer.from(contentHash).toString("hex"), declaredAlg);
-  }
+  
 
-  /**
-   * Remember that THIS frame was refused for carrying no usable proof of who wrote it, so the park
-   * path can say so when the same content arrives through the relay mailbox — review H1.
-   *
-   * Bounded for the same reason and by the same cap as `#noteUnreadableAlgFrame`: a peer sending
-   * unprovable frames feeds this map, so it drops the oldest rather than growing.
-   */
-  #noteRefusedOnDirectPath(agentName: string, sessionId: string, contentHash: Uint8Array): void {
-    const key = this.#k(agentName, sessionId);
-    let hashes = this.#refusedOnDirectPath.get(key);
-    if (!hashes) { hashes = new Set(); this.#refusedOnDirectPath.set(key, hashes); }
-    if (hashes.size >= MAX_UNREADABLE_ALG_FRAMES) {
-      const oldest = hashes.values().next();
-      if (!oldest.done) hashes.delete(oldest.value);
-    }
-    hashes.add(Buffer.from(contentHash).toString("hex"));
-  }
+  
 
   /**
    * ─── DOD-M15-NO-SILENT-REFUSAL-1: refusals the RECEIVING operator can actually see ────────────
@@ -10466,117 +8457,7 @@ export class SessionNodeManager {
     this.#contentDesynced.set(key, why);
   }
 
-  /**
-   * 024-ORPHANTRIAGE — the three signals, read from evidence this side owns.
-   *
-   * ⚠️ **THE SEQUENCE NUMBER ON THE FRAME IS NOT ONE OF THEM.** "Was there an ongoing conversation
-   * up to this point" is tempting to answer from the position the sender wrote, and that answer is
-   * worthless: the sender picks the number, so anyone wanting the reach-out branch writes a large
-   * one. It is answered from OUR transcript rows instead — a partial local record of that
-   * conversation is something an attacker cannot put there from the wire.
-   *
-   * ⚠️ **"KNOWN" IS A TIER, NOT A ROW — review F1/F2, and reading it as a row inverted the unit.**
-   * `contacts` rows are written from the WIRE with no operator action: `inbound-sessions.ts` calls
-   * `addContact(..., "signal_presentation")` at `TIER.UNKNOWN` for any inbound offer inside the
-   * acceptance bound, because the trust-signal foreign key needs a row to point at. And BLOCKING a
-   * contact is an UPDATE to `TIER.BLOCKED`, so the row survives that too. A `SELECT … WHERE pubkey`
-   * therefore answers "yes, known" for a stranger who merely dialled, AND for a key the operator
-   * deliberately blocked — handing both the reach-out branch, which is the exact population this
-   * unit exists to refuse. `DOD-TIER-4` had already settled this and retired `isContact` for it:
-   * *"An UNKNOWN-tier contact (a mere row) is NOT known."* The tier is read from the row already
-   * being fetched, so the case-insensitivity below survives (`getTier` compares case-sensitively).
-   *
-   * ⚠️ **HEX CASE IS NOT A DIFFERENCE IN IDENTITY.** This unit originally worked around that with its
-   * own `lower(pubkey)` lookup, because `contacts.pubkey` was stored verbatim from the IPC parameter
-   * and an exact match would report a contact the operator can SEE in `cello_contacts` as an unknown
-   * stranger. The workaround is gone: `contact-pubkey-case.ts` now normalizes every contacts
-   * accessor and folds the rows already on disk, so there is one spelling and one rule.
-   */
-  #orphanEvidence(
-    agentName: string,
-    sessionId: string,
-    verifiedSignerUnmatched: Uint8Array | undefined,
-  ): OrphanEvidence {
-    const signerPubkeyHex = verifiedSignerUnmatched === undefined
-      ? null
-      : Buffer.from(verifiedSignerUnmatched).toString("hex");
-    /**
-     * ⚠️ `"not_checked"` IS NOT A COSMETIC THIRD STATE — review F6.
-     *
-     * These two were `false` on every path that did not look, and the log event then reported them
-     * as readings. An investigator filtering `session.content.orphaned` days later would read
-     * `ongoingConversation: false` and conclude there was no local trace, when nothing had been
-     * asked. Clause 1 says the branch RECORDS these; a default wearing the shape of a measurement
-     * is not a record, and it is the cheapest possible way to mislead the one person who comes
-     * looking.
-     */
-    const notChecked: OrphanEvidence = {
-      signerPubkeyHex, knownContact: "not_checked", contactMoniker: null, ongoingConversation: "not_checked",
-    };
-    // With no verifiable signature the other two signals mean nothing — a claimed key is a string
-    // anyone can type — so they are not looked up at all rather than looked up and ignored.
-    if (signerPubkeyHex === null) return notChecked;
-    try {
-      /**
-       * ⚠️ NO `!this.#db` SHORT-CIRCUIT — review F7, and it was the silent half of this guard.
-       *
-       * The catch below logs ERROR for exactly this outcome; a bare `if (!this.#db) return` did not,
-       * and the state is reachable while the operator still gets a notice — `noteContentRefusal`
-       * keeps its own in-memory fallback when the write fails, so a daemon with an unusable store
-       * still surfaces a refusal saying "that key is not in your address book" about a key that may
-       * well be in it, with nothing anywhere recording that the address book was never opened.
-       * Throwing into the catch is also what this file's other contact reads do (`getTier`,
-       * `addContact`), and for the same reason: a read that decides how to treat a sender must not
-       * degrade to "unclassified" in silence.
-       */
-      if (!this.#db) throw new Error("database is not open");
-      const agentId = this.#requireAgentId(agentName);
-      const contact = this.#db
-        .prepare("SELECT moniker, tier FROM contacts WHERE agent_id = ? AND pubkey = ?")
-        .get(agentId, normalizeContactPubkey(signerPubkeyHex)) as { moniker: string | null; tier: number | null } | undefined;
-      /**
-       * ⚠️ **QUARANTINED ROWS ARE NOT A LOCAL TRACE, AND WITHOUT THIS CLAUSE THE PROBE WRITES ITS
-       * OWN EVIDENCE.** Found where `023-REFUSEDEVIDENCE` met `024-ORPHANTRIAGE`.
-       *
-       * This signal answers *"does this machine hold any part of a conversation under the id the
-       * message names?"*, and a `true` is one of the two conditions that flips the triage from
-       * REPORT-ONLY to offering the operator a reach-out. Since 023, a refused message is RETAINED
-       * as a transcript row — so an unfiltered `SELECT 1 FROM transcript` sees the row this very
-       * refusal just wrote.
-       *
-       * From the operator's chair, unfiltered: a stranger with a vouched key probes an id nobody
-       * opened; the first probe is refused and retained; the second probe finds the first one's row,
-       * reads as an ongoing conversation, and the operator is invited to reach out. **The attacker
-       * manufactures the signal by sending twice** — which is precisely the outcome 024 exists to
-       * prevent, reintroduced by the unit that made evidence durable.
-       *
-       * `direction != 'quarantined'` is the same exclusion every delivery reader uses, and it is the
-       * right one: what is asked here is whether anything was ever DELIVERED under this id.
-       */
-      const trace = this.#db
-        .prepare("SELECT 1 AS present FROM transcript WHERE agent_id = ? AND session_id = ? AND direction != 'quarantined' LIMIT 1")
-        .get(agentId, sessionId) as { present: number } | undefined;
-      return {
-        signerPubkeyHex,
-        knownContact: contact !== undefined && normalizeTier(contact.tier) >= TIER.KNOWN,
-        contactMoniker: contact?.moniker ?? null,
-        ongoingConversation: trace !== undefined,
-      };
-    } catch (err: unknown) {
-      /**
-       * NOT A SILENT FALLBACK. Both signals come back `"not_checked"`, which the triage treats
-       * exactly as it treats a stranger — REPORT, the action that is safe when nothing is known — and
-       * which the log distinguishes from a measured `false`. A read failure here must never invent
-       * the reach-out branch, and it must never be invisible.
-       */
-      this.#logger.error("session.content.orphaned.evidence.failed", {
-        agentName, sessionId,
-        error: extractErrorMessage(err),
-        impact: "the address book and transcript could not be read, so a message whose signature DID verify is being reported to the operator as coming from a key nothing is known about. The advice is the safe one; it may be more cautious than the evidence warrants.",
-      });
-      return notChecked;
-    }
-  }
+  
 
   async ingestReceivedContent(
     agentName: string,
@@ -10669,7 +8550,7 @@ export class SessionNodeManager {
        * tier — `#quarantineRefusedContent` bounds it at UNKNOWN and files it at a negative position,
        * outside the chain it never joined.
        */
-      const keptOrphan = this.#quarantineRefusedContent(agentName, sessionId, "session_orphaned", content, contentHashHex, { correlationId });
+      const keptOrphan = this.#refusals.quarantineRefusedContent(agentName, sessionId, "session_orphaned", content, contentHashHex, { correlationId });
       /**
        * 024-ORPHANTRIAGE — TWO ACTIONS EXIST AND THE EVIDENCE DECIDES WHICH.
        *
@@ -10681,7 +8562,7 @@ export class SessionNodeManager {
        * checked against the key inside their own signed bytes, "known" comes from OUR address book,
        * and "ongoing" comes from OUR transcript rows rather than the sequence number they chose.
        */
-      const evidence = this.#orphanEvidence(agentName, sessionId, verifiedSignerUnmatched);
+      const evidence = this.#refusals.orphanEvidence(agentName, sessionId, verifiedSignerUnmatched);
       const triage = triageOrphanedContent(evidence, retentionSentence(sessionId, keptOrphan));
       /**
        * BOTH SURFACES, per Invariant 2. The log is the durable forensic record and carries the
@@ -10737,7 +8618,7 @@ export class SessionNodeManager {
       // before this: `sealed_session_annex` covers the park-drain and held-drift routes, not this
       // exit. Something arriving into a signed, closed conversation is exactly the kind of thing an
       // operator later wants to produce.
-      this.#quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
+      this.#refusals.quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
       /**
@@ -10790,7 +8671,7 @@ export class SessionNodeManager {
       // against, so `content_hash_mismatch` here would be an exit-point label standing in for
       // "their build is newer than ours" (Invariant 2). Refused by its own name instead.
       this.#markContentUnverifiable(agentName, sessionId, "unverifiable");
-      this.#noteUnreadableAlgFrame(agentName, sessionId, contentHash, algResolved.value);
+      this.#refusals.noteUnreadableAlgFrame(agentName, sessionId, contentHash, algResolved.value);
       this.#logger.error("session.content.cross_check.failed", {
         sessionId, correlationId,
         reason: "content_hash_alg_unknown",
@@ -10804,7 +8685,7 @@ export class SessionNodeManager {
       // DOD-M15-REFUSEDEVIDENCE-1 — RETAINED. The algorithm name is an unsigned claim by whoever
       // sent the frame, so this branch is reachable by crafting as well as by version skew, and the
       // crafted case is one to be able to show someone.
-      this.#quarantineRefusedContent(agentName, sessionId, "content_hash_alg_unknown", content, contentHashHex, {
+      this.#refusals.quarantineRefusedContent(agentName, sessionId, "content_hash_alg_unknown", content, contentHashHex, {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
       // DOD-M15-REFUSED-INBOUND-SILENT-1: the SAME strings the log just carried, to the operator.
@@ -10856,7 +8737,7 @@ export class SessionNodeManager {
       // DOD-M15-REFUSEDEVIDENCE-1 — RETAINED. We could not check it, which is precisely why the
       // bytes have to survive: the question of what they actually were stays open, and a hash we
       // could not verify answers none of it.
-      this.#quarantineRefusedContent(agentName, sessionId, "content_hash_salt_unavailable", content, contentHashHex, {
+      this.#refusals.quarantineRefusedContent(agentName, sessionId, "content_hash_salt_unavailable", content, contentHashHex, {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
       // DOD-M15-REFUSED-INBOUND-SILENT-1 — and this branch needed it MORE than the two that had it.
@@ -10906,7 +8787,7 @@ export class SessionNodeManager {
        * bytes. That is what makes the row evidence rather than a note: the signature is checked
        * against the key inside the sender's signed bytes, not against anything this side chose.
        */
-      this.#quarantineRefusedContent(agentName, sessionId, "content_hash_mismatch", content, contentHashHex, {
+      this.#refusals.quarantineRefusedContent(agentName, sessionId, "content_hash_mismatch", content, contentHashHex, {
         senderPubkeyHex: this.#activeNodes.get(this.#k(agentName, sessionId))?.counterpartyPubkey ?? record.counterparty_pubkey ?? null,
         ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
         correlationId,
@@ -10934,7 +8815,7 @@ export class SessionNodeManager {
       // absence is the evidence. The guidance below says to report this; this is the artifact there
       // is to report. Bounded at the UNKNOWN tier — there is no contact to look a tier up on, which
       // is the same fact that made it unattributable.
-      const keptUnresolved = this.#quarantineRefusedContent(agentName, sessionId, "sender_unresolved", content, contentHashHex, { correlationId });
+      const keptUnresolved = this.#refusals.quarantineRefusedContent(agentName, sessionId, "sender_unresolved", content, contentHashHex, { correlationId });
       this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
@@ -11089,8 +8970,8 @@ export class SessionNodeManager {
       // DOD-TIER-2 AC2: the per-session byte cap is the sender's TIER cap (DEFAULT_TIER_BOUNDS),
       // applied to EVERY sender — no tier is unbounded (INV-TIER-BOUND), so a contact is no longer
       // "exempt entirely". A stranger (no row → UNKNOWN) keeps the 25 MB cap; KNOWN+ get more.
-      const senderTier = this.getTier(agentName, senderPubkey);
-      const cap = this.resolveTierBound(agentName, senderTier, "max_bytes");
+      const senderTier = this.#records.getTier(agentName, senderPubkey);
+      const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
@@ -11347,8 +9228,8 @@ export class SessionNodeManager {
       // synchronous window (the totals can go stale across the screenInbound await). Applied to EVERY
       // sender — a contact is no longer exempt (INV-TIER-BOUND). Must mirror the primary gate exactly
       // so a sender can never pass one and fail the other.
-      const senderTier = this.getTier(agentName, senderPubkey);
-      const cap = this.resolveTierBound(agentName, senderTier, "max_bytes");
+      const senderTier = this.#records.getTier(agentName, senderPubkey);
+      const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
       const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
@@ -11407,7 +9288,7 @@ export class SessionNodeManager {
       // retaining at release is not available — it is retained here, at the position the leaf will
       // take. `held_content` is not a substitute: that row is deleted the moment the gap fills.
       if (terminalBlock) {
-        const keptHeld = this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
+        const keptHeld = this.#refusals.quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
           senderPubkeyHex: senderPubkey, canonicalSeq,
           ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
           correlationId,
@@ -11462,7 +9343,7 @@ export class SessionNodeManager {
      * sent, not what a filter made of it.
      */
     if (terminalBlock) {
-      const keptBlocked = this.#quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
+      const keptBlocked = this.#refusals.quarantineRefusedContent(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", content, contentHashHex, {
         senderPubkeyHex: senderPubkey, canonicalSeq: leafIndex,
         ...(verifiedAuthorship ? { authorship: verifiedAuthorship } : {}),
         correlationId,
@@ -11615,6 +9496,20 @@ export class SessionNodeManager {
     this.#scheduleLeafFetchIfUnresolved(agentName, sessionId, contentHashHex);
   }
 
+  /**
+   * Cancel a pending leaf fetch for one piece of content. The TIMERS stay the manager's — it has
+   * three users and only one of them moved — so `#markContentTerminallyRefused`, now in
+   * `inbound-refusals.ts`, asks for the cancellation instead of reaching into the map.
+   */
+  #cancelLeafFetch(key: string, contentHashHex: string): void {
+    const timerKey = `${key}::${contentHashHex}`;
+    const t = this.#leafFetchTimers.get(timerKey);
+    if (t !== undefined) {
+      clearTimeout(t);
+      this.#leafFetchTimers.delete(timerKey);
+    }
+  }
+
   /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: this content is here — no fetch is owed for it, and any
    *  pending one is cancelled. Called wherever content actually lands. */
   #markContentResolved(agentName: string, sessionId: string, contentHashHex: string): void {
@@ -11630,172 +9525,18 @@ export class SessionNodeManager {
     }
   }
 
-  /**
-   * DOD-M15-REFUSALTERMINAL-1 — the funnel. A refusal stops the work ONLY if its reason is in
-   * `TERMINAL_REFUSAL_REASONS`; every other reason keeps retrying, which is what makes a transient
-   * screener block or a version skew recoverable.
-   *
-   * One place decides, so "is this reason terminal?" is answerable from the set rather than from
-   * thirteen call sites.
-   */
-  #considerTerminalRefusal(agentName: string, sessionId: string, contentHashHex: string, reason: string): void {
-    if (!TERMINAL_REFUSAL_REASONS.has(reason)) return;
-    this.#markContentTerminallyRefused(agentName, sessionId, contentHashHex, reason);
-  }
+  
 
-  /**
-   * DOD-M15-REFUSALTERMINAL-1: this content can NEVER be accepted on this session — cancel the
-   * pending fetch and make sure no future one is scheduled, across restarts.
-   *
-   * The durable write comes FIRST and the in-memory cache second, so a process that dies between
-   * them wakes up with the stop still in force. A failed write is announced at ERROR and the
-   * in-memory mark is still taken: the loop stops for the life of THIS process, and the log says
-   * plainly that it will resume after a restart. That is a degraded stop, not a silent one.
-   */
-  #markContentTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string, reason: string): void {
-    const key = this.#k(agentName, sessionId);
-    /**
-     * Read BEFORE the write, so the announcement below fires on the TRANSITION rather than on every
-     * re-refusal. The same message can be refused again by a drain triggered for another reason, and
-     * an INFO line per repeat is a smaller version of the noise this unit exists to remove.
-     *
-     * The durable write is still ATTEMPTED every time, deliberately: `INSERT OR IGNORE` costs
-     * nothing when the row is already there, and skipping it would mean a write that failed once —
-     * the branch that logs the error below — never got another chance to succeed.
-     */
-    const alreadyKnown = this.#isTerminallyRefused(agentName, sessionId, contentHashHex);
-    try {
-      if (!this.#db) throw new Error("database is not open");
-      const agentId = this.#requireAgentId(agentName);
-      this.#db
-        .prepare(
-          `INSERT OR IGNORE INTO terminal_content_refusals
-             (agent_id, session_id, content_hash, reason, marked_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(agentId, sessionId, contentHashHex, reason, Date.now());
-      /**
-       * ⚠️ **BOUNDED, because the counterparty chooses how many rows exist — review F7.**
-       *
-       * One row per distinct content hash aimed at a closed conversation, and the funnel that calls
-       * this runs even when the byte cap has already stopped RETENTION. So a peer who has exhausted
-       * the session's storage budget can still write rows here, indefinitely, on a table nothing
-       * else deletes. Every sibling store in this file is bounded (`MAX_UNREADABLE_ALG_FRAMES`, the
-       * tier byte cap, `MAX_REFUSAL_READERS`); this one was not.
-       *
-       * Oldest-dropped, so the newest refusals keep their stop and the loop stays closed for what
-       * is arriving now. A dropped row costs at most one extra fetch for content nobody is sending
-       * any more — the pre-fix behaviour for that one hash, and nothing worse.
-       */
-      const dropped = this.#db
-        .prepare(
-          `DELETE FROM terminal_content_refusals
-            WHERE agent_id = ? AND session_id = ? AND content_hash NOT IN (
-              SELECT content_hash FROM terminal_content_refusals
-               WHERE agent_id = ? AND session_id = ?
-               ORDER BY marked_at DESC LIMIT ${MAX_TERMINAL_REFUSALS_PER_SESSION}
-            )`,
-        )
-        .run(agentId, sessionId, agentId, sessionId);
-      if (Number(dropped.changes) > 0) {
-        // Loud, because it means a counterparty has aimed more than the cap's worth of distinct
-        // messages at one closed conversation — which is abuse, not ordinary traffic.
-        this.#logger.warn("session.content.terminal_refusal.evicted", {
-          agentName, sessionId, dropped: Number(dropped.changes),
-          cap: MAX_TERMINAL_REFUSALS_PER_SESSION,
-          impact:
-            "more distinct messages have been refused on this closed conversation than the cap keeps a record of, so the oldest stops were dropped. If one of those arrives again it costs one wasted fetch; nothing is delivered and nothing is lost.",
-        });
-      }
-    } catch (err: unknown) {
-      this.#logger.error("session.content.terminal_refusal.persist.failed", {
-        agentName, sessionId, reason,
-        contentHash: contentHashHex,
-        error: extractErrorMessage(err),
-        impact:
-          "this message can never be accepted on this conversation, and that fact could not be written down. Fetching for it stops while this daemon runs, and RESUMES after the next restart — which is the loop that filled a log with a quarter of a million refusals for one message.",
-        guidance:
-          "This is a fault on THIS machine, not with the counterparty. Check free disk space and the permissions on ~/.cello; session.refusal.persist.failed in this log usually appears alongside it with the underlying error.",
-      });
-    }
-    let set = this.#terminallyRefused.get(key);
-    if (!set) { set = new Set(); this.#terminallyRefused.set(key, set); }
-    set.add(contentHashHex);
-    // The same cancellation `#markContentResolved` performs, for the opposite fact: an already-armed
-    // grace timer must not fire for content we have just decided never to accept.
-    const timerKey = `${key}::${contentHashHex}`;
-    const t = this.#leafFetchTimers.get(timerKey);
-    if (t !== undefined) {
-      clearTimeout(t);
-      this.#leafFetchTimers.delete(timerKey);
-    }
-    if (!alreadyKnown) {
-      this.#logger.info("session.content.terminal_refusal", {
-        agentName, sessionId, reason,
-        contentHash: contentHashHex,
-        impact:
-          "no further attempt will be made to fetch this message. The conversation it was sent to is closed and signed, so no retry could ever have succeeded.",
-      });
-    }
-  }
+  
 
-  /**
-   * DOD-M15-REFUSALTERMINAL-1: has this content already been refused terminally?
-   *
-   * Reads the durable rows for a session ONCE and caches them, so the hot path — a witnessed leaf
-   * on a healthy session — costs one `Set` lookup rather than a query per message. A read failure
-   * returns `false`: the cost is the loop continuing, which is the pre-fix behaviour, and it is
-   * announced rather than swallowed. Answering `true` on a failed read would be the dangerous
-   * direction, because it silently stops fetching content that was never refused.
-   */
-  #isTerminallyRefused(agentName: string, sessionId: string, contentHashHex: string): boolean {
-    const key = this.#k(agentName, sessionId);
-    /**
-     * ⚠️ **A FAILING READ MUST NOT BE RETRIED PER MESSAGE — review F3.**
-     *
-     * The loaded flag is set only on success, so a database that throws (a full disk, a corrupt
-     * page) sent this method back to SQLite on EVERY witnessed leaf, logged an ERROR each time, and
-     * — because nothing was ever cached — made `alreadyKnown` false forever, so the mark's INFO
-     * fired on every refusal too. That is the ~2/s log growth this unit exists to end, reproduced
-     * by its own fix in the failure mode.
-     *
-     * Backed off instead: one attempt per session per minute, so the read still recovers when the
-     * disk does, and the ERROR is bounded rather than proportional to traffic.
-     */
-    const failedAt = this.#terminalRefusalsReadFailedAt.get(key);
-    const backedOff = failedAt !== undefined && Date.now() - failedAt < TERMINAL_REFUSAL_READ_RETRY_MS;
-    if (!this.#terminalRefusalsLoaded.has(key) && !backedOff && this.#db) {
-      try {
-        const rows = this.#db
-          .prepare("SELECT content_hash FROM terminal_content_refusals WHERE agent_id = ? AND session_id = ?")
-          .all(this.#requireAgentId(agentName), sessionId) as Array<{ content_hash: string }>;
-        let set = this.#terminallyRefused.get(key);
-        if (!set) { set = new Set(); this.#terminallyRefused.set(key, set); }
-        for (const r of rows) set.add(r.content_hash);
-        this.#terminalRefusalsLoaded.add(key);
-        this.#terminalRefusalsReadFailedAt.delete(key);
-      } catch (err: unknown) {
-        this.#terminalRefusalsReadFailedAt.set(key, Date.now());
-        this.#logger.error("session.content.terminal_refusal.read.failed", {
-          agentName, sessionId,
-          error: extractErrorMessage(err),
-          retryInMs: TERMINAL_REFUSAL_READ_RETRY_MS,
-          impact:
-            "the record of messages this conversation can never accept could not be read, so this daemon may keep fetching one of them. Nothing is lost; the cost is repeated work and log noise. The read is retried once a minute rather than on every message, so this line is bounded — its absence for a while does NOT mean the fault cleared.",
-          guidance:
-            "This is a fault on THIS machine, not with any counterparty. Check free disk space and the permissions on ~/.cello; the error above carries SQLite's own message.",
-        });
-      }
-    }
-    return this.#terminallyRefused.get(key)?.has(contentHashHex) === true;
-  }
+  
 
   #scheduleLeafFetchIfUnresolved(agentName: string, sessionId: string, contentHashHex: string): void {
     const key = this.#k(agentName, sessionId);
     if (this.#resolvedContent.get(key)?.has(contentHashHex)) return;
     // DOD-M15-REFUSALTERMINAL-1: a refusal nothing can get past is the end of the work, not a
     // reason to come back in two seconds.
-    if (this.#isTerminallyRefused(agentName, sessionId, contentHashHex)) return;
+    if (this.#refusals.isTerminallyRefused(agentName, sessionId, contentHashHex)) return;
     const timerKey = `${key}::${contentHashHex}`;
     // ONE fetch per content hash. The relay redelivers, and a redelivery carries the same sequence —
     // scheduling per redelivery turns a slow relay into a storm against itself.
@@ -11812,7 +9553,7 @@ export class SessionNodeManager {
         impact: "the relay told us this message exists and its plaintext never arrived directly — "
           + "fetching it now instead of waiting for the periodic sweep",
       });
-      this.#fireParkedDrain(agentName, "witnessed_leaf_unresolved");
+      this.#park.fireParkedDrain(agentName, "witnessed_leaf_unresolved");
     }, this.#leafFetchGraceMs);
     timer.unref?.();
     this.#leafFetchTimers.set(timerKey, timer);
@@ -11838,10 +9579,6 @@ export class SessionNodeManager {
    */
   getUndeliverableSeqs(agentName: string, sessionId: string): readonly number[] {
     return [...(this.#undeliverableSeqs.get(this.#k(agentName, sessionId)) ?? [])];
-  }
-
-  getHighWaterSeq(agentName: string, sessionId: string): number {
-    return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
   }
 
   /**
@@ -11935,7 +9672,7 @@ export class SessionNodeManager {
     // only where the parting is PROVEN — an ack came back behind our frontier — never where it is
     // merely suspected, because a gate that refuses a healthy session forever is worse than the bug
     // it guards: force-abandon, with no receipt, becomes the only exit.
-    const diverged = this.#diverged.has(key);
+    const diverged = this.#records.isSessionDiverged(agentName, sessionId);
     return {
       ready: missingLeaves === 0 && heldCount === 0 && !diverged,
       treeSize, highWaterSeq, heldCount, missingLeaves,
@@ -11995,87 +9732,9 @@ export class SessionNodeManager {
     return { state: "ready" };
   }
 
-  /** DOD-M12B-INDEX-1 — this agent's own K_local pubkey, for attributing its own held content.
-   *  Null when it cannot be resolved: an UNATTRIBUTED annex row is true, a falsely attributed one
-   *  is not, and this is the record that outlives the session. */
-  /**
-   * Test seam for `#recoverOwnSealCtrlLeaf` (documented on the method itself, below). The
-   * distinction it draws — "there is none" versus "I could not tell" — is the whole safety
-   * property, and it had no coverage at any level.
-   */
-  recoverOwnSealCtrlLeafForTest(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
-    return this.#recoverOwnSealCtrlLeaf(agentName, sessionId);
-  }
 
-  /**
-   * DOD-M12B-INTERRUPTED-ESCALATE-1 — our own SEAL ctrl leaf, if a previous run already posted one.
-   *
-   * Returns the two values a unilateral escalation runs on, rebuilt from durable state:
-   * the ctrl leaf's relay-assigned sequence, and the root the tree WOULD have with that leaf
-   * appended. The content hash cannot be recomputed — the seal payload embeds a `close_timestamp`
-   * — so it is read out of the signed Structure 1 the store already holds.
-   *
-   * Null when there is no own ctrl leaf, which is the ordinary first-close case.
-   */
-  #recoverOwnSealCtrlLeaf(agentName: string, sessionId: string): { reportedRootHex: string; sequenceNumber: number } | "none" | "unknown" {
-    const ownPubkey = this.#ownPubkeyHex(agentName);
-    // "I CANNOT TELL" IS NOT "THERE IS NONE". Returning the absent answer here would let the caller
-    // submit a second SEAL ctrl leaf — the exact permanent loss this method exists to prevent — on
-    // the strength of a lookup that failed. Every path that could not determine the answer says so.
-    if (!ownPubkey) {
-      this.#logger.warn("session.seal.leaf.recover.failed", {
-        sessionId, agentName, reason: "own_pubkey_unresolved",
-        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
-      });
-      return "unknown";
-    }
-    let own: SealCarryLeaf | undefined;
-    try {
-      own = this.getSealCarry(ownPubkey, sessionId)
-        .find((l) => l.leafKind === LEAF_KIND_CTRL && l.senderPubkeyHex === ownPubkey);
-    } catch (err: unknown) {
-      this.#logger.warn("session.seal.leaf.recover.failed", {
-        sessionId, agentName, reason: "carry_read_failed",
-        error: err instanceof Error ? err.message : String(err),
-        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
-      });
-      return "unknown";
-    }
-    if (!own) return "none";
-    try {
-      // Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq,
-      // timestamp], plus last_seen_hash at index 6 on a v2 claim (020-ACKHASH). content_hash is
-      // index 1 in both.
-      const s1 = decodeStructure1(own.structure1Cbor);
-      if (!s1.ok) {
-        this.#logger.warn("session.seal.leaf.recover.failed", {
-          // NAMED AT ITS CAUSE — review F2. This read `structure1_content_hash_missing`, which was
-          // accurate when the only check was `contentHash instanceof Uint8Array`. It now fires for an
-          // unknown layout, undecodable CBOR and a malformed field too, and sends an operator to
-          // audit a content hash when the layout is what disagreed. `structure1Reason` carries which.
-          sessionId, agentName, reason: "structure1_decode_failed", structure1Reason: s1.reason,
-          impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
-        });
-        return "unknown";
-      }
-      const contentHashHex = Buffer.from(s1.fields.contentHash).toString("hex");
-      return {
-        reportedRootHex: this.getSessionTree(agentName, sessionId).rootWithAppendedHex(contentHashHex),
-        sequenceNumber: own.sequenceNumber,
-      };
-    } catch (err: unknown) {
-      // NOT a decode failure — review F3. `decodeStructure1` never throws, so the only thrower left
-      // inside this try is the tree derivation below it. Calling this `structure1_decode_failed`
-      // pointed at CBOR for a fault in `rootWithAppendedHex`, and made one reason string mean two
-      // unrelated things in the same log event.
-      this.#logger.warn("session.seal.leaf.recover.failed", {
-        sessionId, agentName, reason: "seal_root_derivation_threw",
-        error: err instanceof Error ? err.message : String(err),
-        impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
-      });
-      return "unknown";
-    }
-  }
+
+
 
   #ownPubkeyHex(agentName: string): string | null {
     if (!this.#db) return null;
@@ -12240,7 +9899,7 @@ export class SessionNodeManager {
     // DOD-LOG-1: persist the readable RECEIVED plaintext to the durable transcript, keyed by the
     // canonical leaf sequence so it joins the committed hash chain (survives restart; INV-3 — the
     // relay/directory never see this plaintext, only the hash).
-    const durable = this.recordTranscriptMessage(
+    const durable = this.#records.recordTranscriptMessage(
       agentName, sessionId, leafIndex, "received", content, correlationId,
       // DOD-M15-SEALWIRE-1 bullet 5: present only when the ordering record verified AND the signer
       // matched this session's counterparty. Undefined on the soft fallback, which the row records
@@ -12449,8 +10108,8 @@ export class SessionNodeManager {
    * carries. This is a separate, purely local read, and nothing it returns crosses the wire.
    */
   capDiagnostics(agentName: string, counterpartyPubkey: string): { tier: number; cap: number; counted: number; mustClear: number; blocked: boolean } {
-    const tier = this.getTier(agentName, counterpartyPubkey);
-    const cap = this.resolveTierBound(agentName, tier, "max_sessions");
+    const tier = this.#records.getTier(agentName, counterpartyPubkey);
+    const cap = this.#records.resolveTierBound(agentName, tier, "max_sessions");
     const counted = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     return {
       tier, cap, counted,
@@ -12700,7 +10359,7 @@ export class SessionNodeManager {
         agentName, sessionId, assignedSeq, nextExpected, contentHash: contentHashHex, correlationId,
         impact: "this side's tree is ahead of the relay's counter, so the two can no longer agree on a root — the message is kept in the local record and this session can no longer be sealed bilaterally",
       });
-      this.markSessionDiverged(agentName, sessionId);
+      this.#records.markSessionDiverged(agentName, sessionId);
       const { leafIndex } = this.appendSessionLeaf(agentName, sessionId, kind, contentHashHex, correlationId);
       return { placed: true, leafIndex, diverged: true };
     }
@@ -13001,7 +10660,7 @@ export class SessionNodeManager {
               "held_content needs the two proof columns so a restart carries them.",
           });
         }
-        if (!this.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
+        if (!this.#records.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
           this.#logger.error("session.content.released.transcript.failed", {
             agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
             impact: "this side's own message is committed to the chain but missing from its transcript",
@@ -13079,7 +10738,7 @@ export class SessionNodeManager {
   }
 
   pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {
-    this.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
+    this.#records.recordTranscriptMessage(agentName, sessionId, seq, "received", new TextEncoder().encode(content), "test");
     const key = this.#k(agentName, sessionId);
     let buf = this.#receivedContent.get(key);
     if (!buf) { buf = []; this.#receivedContent.set(key, buf); }
@@ -13104,7 +10763,7 @@ export class SessionNodeManager {
     // DOD-SEALED-INBOX-2 lesson, which is what makes this a status read and not a "is it over" read.
     const record = this.getSessionRecord(agentName, sessionId);
     if (record?.status !== "sealed") return null;
-    return { type: "sealed", unreadCount: this.getUnreadReceivedCount(agentName, sessionId) };
+    return { type: "sealed", unreadCount: this.#records.getUnreadReceivedCount(agentName, sessionId) };
   }
 
   /**
@@ -13221,7 +10880,7 @@ export class SessionNodeManager {
     // to shape (the TTF timer fires long after cello_send already returned) — the deposit's own
     // success/failure logging inside #parkContent is the only observability this path needs.
     // B2b-1 review F2 — the THIRD `#parkContent` caller, and the one that was left unthreaded.
-    void this.#parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
+    void this.#park.parkContent(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
   }
 
   /**
@@ -13406,302 +11065,9 @@ export class SessionNodeManager {
     return decodeParkEnvelope(plaintext);
   }
 
-  /**
-   * SEC-1 — THE ONLY WAY PARKED CONTENT ENTERS THE TRANSCRIPT.
-   *
-   * Authentication and ingest are FUSED here on purpose, and must stay fused. A caller cannot ingest
-   * parked content without passing the signature gate, because this is the only entry point. Exposing
-   * a separate `decode → ingest` path — with the signature check as its own optional step — is a
-   * downgrade attack: an attacker omits the thing that triggers the check, and the check never runs.
-   * A gate the caller can skip by leaving a field out is not a gate.
-   *
-   * FAILS CLOSED. No signature / bad signature / signer is not this session's counterparty / no
-   * session at all → REFUSED, nothing is appended, nothing is written, and the caller MUST NOT
-   * confirm-delete the entry from the relay (a forgery must not be able to evict itself, and a
-   * genuine bug must not silently eat mail).
-   */
-  async recoverParkedEntry(
-    agentName: string,
-    sessionId: string,
-    recipientPubkey: Uint8Array,
-    unsealed: Uint8Array,
-    contentHash: Uint8Array,
-    correlationId?: string,
-  ): Promise<
-    | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
-    | { ok: false; reason: string }
-  > {
-    const contentHashHex = Buffer.from(contentHash).toString("hex");
 
-    // Review M4: a refused entry is deliberately NOT confirm-deleted (a forgery must not be able to
-    // evict itself), which means an adversary could otherwise make us unseal + Ed25519-verify the
-    // same forged entries on EVERY reconnect, forever — turning the mailbox into an amplification
-    // vector against our own recover path. Remember what we already refused and skip the crypto on
-    // re-pull. Still never confirmed, so nothing is destroyed. In-memory and BOUNDED: the cost of
-    // forgetting across a restart is one more verify, which is exactly the pre-existing behavior.
-    const refusalKey = `${this.#k(agentName, sessionId)}:${contentHashHex}`;
-    const remembered = this.#refusedParkedEntries.get(refusalKey);
-    if (remembered) {
-      this.#logger.warn("content.recover.unauthenticated", {
-        agentName,
-        sessionId,
-        contentHash: contentHashHex,
-        reason: remembered,
-        repeat: true,
-        correlationId,
-      });
-      return { ok: false, reason: remembered };
-    }
 
-    const env = decodeParkEnvelope(unsealed);
-    const verdict = authenticateParkedEntry({
-      env,
-      sessionIdHex: sessionId,
-      recipientPubkey,
-      contentHash,
-      counterpartyPubkeyHex: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
-    });
 
-    if (!verdict.ok) {
-      // SEC-1: loud, and specific about WHICH gate refused — a silent drop here would look
-      // identical to "no mail", which is how an injection attempt would go unnoticed.
-      this.#rememberRefusedParkedEntry(refusalKey, verdict.reason);
-      this.#logger.warn("content.recover.unauthenticated", {
-        agentName,
-        sessionId,
-        contentHash: contentHashHex,
-        reason: verdict.reason,
-        envelopeVersion: env.version,
-        correlationId,
-      });
-      return { ok: false, reason: verdict.reason };
-    }
-
-    // Authenticated. The ordering record (when present) is still verified independently by
-    // #recordFrameOrdering — it answers a different question (WHERE this message sits in the
-    // canonical sequence, per the relay) and is still best-effort: a bad record must not block a
-    // message whose AUTHORSHIP we have now proven.
-    // DOD-FRONTIER-STRAND-1 AC1: keep the VERIFIED position and hand it to ingest, so dedup can
-    // tell a redelivery (same position) from a genuinely new identical message (new position).
-    let recoveredSeq: number | null = null;
-    if (env.structure1Cbor && env.structure2Cbor) {
-      recoveredSeq = this.recordOrderingRecord(agentName, sessionId, env.structure1Cbor, env.structure2Cbor, contentHash, correlationId);
-    }
-
-    this.#logger.info("content.recover.verified", {
-      agentName,
-      sessionId,
-      contentHash: contentHashHex,
-      correlationId,
-    });
-
-    /**
-     * DOD-M15-SEALWIRE-1 part B1 — RECOVERED-FROM-PARK CONTENT CARRIES NO ALGORITHM NAME, and that
-     * is correct today rather than an oversight.
-     *
-     * The park envelope has no field for one, so this passes `undefined`, which resolves to
-     * `sha256`. In part B1 that was exactly right and provably so: no sender salted, so every parked
-     * entry in existence had been hashed unsalted.
-     *
-     * ✅ FIXED IN PART B2a, at BOTH sites: here, and the independent verifier in `content-park.ts`.
-     * The envelope carries the algorithm from v3 onward, and a v2 envelope's absent field resolves to
-     * `sha256` — which is what a peer predating the field actually used.
-     *
-     * > **⛔ THE LAST SENTENCE HERE READ "Every envelope this build emits is still v2, because
-     * > nothing salts yet." THAT IS FALSE NOW.** B2b-2 turned salting on: a session holding an
-     * > agreed salt hashes under `hmac-sha256-salt-v1`, so this build DOES emit v3 envelopes.
-     * > Rewritten rather than deleted, per `DOD-M15-CLAIM-COMMENTS-1` — the sentence is why the
-     * > staleness survived, and an absence would read as deliberate.
-     * >
-     * > The consequence is not theoretical: a v2 envelope carrying a SALTED hash recomputes unsalted
-     * > at the far end and reports `content_hash_mismatch` — a false tamper claim on honest content,
-     * > which also blocks auto-co-sign at seal. Measured on 2026-08-24.
-     *
-     * ─── AND THE REFUSAL DOES NOT HOLD — review F2 ────────────────────────────────────────────
-     *
-     * A direct-path refusal sends no delivery ACK, so the sender's TTF backstop parks the message
-     * and it arrives here seconds later, where `undefined` means `sha256` and it may well succeed.
-     * A frame refused BY NAME on one path is then accepted on the other, with nothing tying the two
-     * together in the log — an operator sees an ERROR and, ten seconds on, a healthy delivery.
-     *
-     * That is not repaired by refusing here as well: today's park entry genuinely IS `sha256`, and
-     * refusing it would drop good mail. What is wrong is the SILENCE, so the reconciliation is
-     * logged instead — the two events become one story, and B2 removes the ambiguity for real by
-     * putting the name in the envelope.
-     */
-    /**
-     * ⚠️ LOGGED AFTER THE INGEST, NOT BEFORE IT — review B2a F1, and the previous version of this
-     * block ANNOUNCED A DELIVERY THAT DOES NOT HAPPEN.
-     *
-     * It fired on a memo hit and said *"the message is being delivered by the other route"*, which
-     * was true-by-construction only while the park path passed `undefined` for the algorithm. Part
-     * B2a made the park path carry `env.contentHashAlg` — so a peer that names an unreadable
-     * algorithm on the direct path AND parks the same content as v3 with the same name is refused
-     * AGAIN here, re-arms the memo, is never confirm-deleted, and repeats on every drain. An
-     * unbounded stream of warnings asserting a delivery that never occurs, drowning the real
-     * reconciliation when the sender eventually re-parks as v2.
-     *
-     * The claim is only sound once the ingest has actually succeeded, so it is made there.
-     */
-    const memoKey = this.#k(agentName, sessionId);
-    const priorDeclaredAlg = this.#unreadableAlgSeen.get(memoKey)?.get(contentHashHex);
-    /**
-     * `DOD-M15-AUTHORSHIP-ABSENT-1` review H1 — READ BEFORE THE INGEST, reported after it.
-     *
-     * Same reasoning as `priorDeclaredAlg` directly above: the memo says what THIS side did to this
-     * content on the direct path, and the ingest below is what decides whether the other route
-     * succeeded. Reading it after would race the clear.
-     */
-    /**
-     * ⚠️ **REFUSING AN UNNOTARIZABLE MAILBOX MESSAGE WAS TRIED HERE AND REVERTED — recorded so the
-     * next attempt starts from what actually blocks it, not from the compatibility argument that
-     * does not.**
-     *
-     * The mailbox is the remaining route for the withholding attack: a counterparty who parks a
-     * message with no ordering record AND no signature over its ordering claim delivers something
-     * readable that can never enter a receipt. The obvious fix is to refuse it here.
-     *
-     * **It cannot ship yet, and the reason is our OWN path, not an older peer's.** `SEC-1` AC5 is
-     * explicit: the crash-backstop shape — signed by the sender, no ordering record — is legal and
-     * must be accepted. That envelope is produced when content is queued before anything witnessed
-     * it, and from the recipient's side it is INDISTINGUISHABLE from an attacker's stripped one. So
-     * this refusal rejects our own crash recovery along with the attack.
-     *
-     * **What closes it:** make the crash backstop sign an ordering claim at enqueue time, the way
-     * the live park path now does (`#signOwnContentClaim` already produces exactly this artifact).
-     * Then "no ordering record and no signed claim" is a shape only a modified client emits, and
-     * refusing it costs nothing real. The retry queue already carries the two columns for it —
-     * `structure1_sig` and `leaf_kind` — which were added for this and are populated on the live
-     * path today.
-     */
-    const refusedForAuthorship = this.#refusedOnDirectPath.get(memoKey)?.has(contentHashHex) === true;
-    const result = await this.ingestReceivedContent(
-      agentName, sessionId, env.content, contentHash, correlationId, recoveredSeq ?? undefined,
-      // The envelope's own claim, verbatim — `undefined` on a v2 envelope, which resolves to
-      // `sha256` and is exactly right for a peer that predates the field.
-      env.contentHashAlg,
-    );
-    /**
-     * `ok` IS NOT "DELIVERED" — review B2a pass-2 F1, and this is the same class the F1 fix was
-     * raised for, one predicate over.
-     *
-     * `ingestReceivedContent` returns `ok` in three shapes and only one is a delivery:
-     *   `{ok, held: true}`       — buffered behind an ordering gap; not appended, not shown YET.
-     *   `{ok, screenedOut: true}` — leafed and PERMANENTLY never shown to the agent.
-     * Announcing *"the message was delivered by the other route"* for either is a false all-clear on
-     * the operator's one line about this message, and the memo is deleted in the same breath, so
-     * nothing ever re-raises it.
-     *
-     * Leaving the memo ARMED on `held` is deliberate: the release path re-enters ingest, which is
-     * when delivery actually happens, and the claim becomes true there.
-     *
-     * ⚠️ THE `screenedOut` CLAUSE IS UNREACHABLE TODAY and is kept anyway — said out loud so nobody
-     * reads it as covered. A terminal inbound block needs a detector the shipping security gateway
-     * does not wire, so it returns only `allow` and a fail-closed non-terminal `block`. Measured: a
-     * mutant dropping just that clause SURVIVES the suite. It stays because the day a detector is
-     * wired, this line is the difference between an all-clear and a permanent silent discard — and
-     * finding that then costs more than the clause costs now.
-     */
-    /**
-     * ─── WITNESS A RECOVERED MESSAGE ITS SENDER NEVER WITNESSED — 034-CARRYLEAF review F1 ────────
-     *
-     * The mailbox route's half of the withholding fix. `recoveredSeq` absent means no relay ordering
-     * record came with it, which is the same shape the direct path treats as "their submit never
-     * happened" — and it is reached the same two ways: their relay was briefly unreachable, or they
-     * are withholding on purpose.
-     *
-     * ⚠️ THE SIGNATURE COMES FROM THE ENVELOPE, AND ONLY A v4 ENVELOPE HAS ONE. `parkSig`
-     * authenticates the DEPOSIT — it signs `(session_id, recipient_pubkey, content_hash)` — and the
-     * relay will not accept it, because a counter-submit is admissible only against the author's own
-     * signature over their own ordering claim. A v2 or v3 envelope therefore cannot be witnessed on
-     * its author's behalf, and is left alone rather than guessed at.
-     *
-     * **So this route is closed against a peer running a stock client, and open to one that
-     * deliberately emits an older envelope.** Requiring v4 is the step that closes it completely,
-     * and it waits on nothing in the field emitting v2 or v3 — the same tolerate-then-enforce
-     * sequence every bilateral wire change in this milestone follows.
-     */
-    if (
-      result.ok && result.held !== true && result.screenedOut !== true &&
-      recoveredSeq === null && env.structure1Cbor && env.structure1Signature
-    ) {
-      const kind = env.leafKind;
-      if (typeof kind === "number") {
-        this.#witnessReceivedLeaf(agentName, sessionId, contentHash, env.structure1Cbor, env.structure1Signature, kind, correlationId);
-      }
-    }
-    if (priorDeclaredAlg !== undefined && result.ok && result.held !== true && result.screenedOut !== true) {
-      // Cleared ONLY on a real reconciliation. Clearing on the lookup (as this did) forgets the
-      // refusal even when the recovery fails, so the next genuine reconciliation says nothing.
-      const byHash = this.#unreadableAlgSeen.get(memoKey);
-      byHash?.delete(contentHashHex);
-      if (byHash && byHash.size === 0) this.#unreadableAlgSeen.delete(memoKey);
-      this.#logger.warn("content.recover.alg_refusal_reconciled", {
-        agentName, sessionId, correlationId,
-        contentHash: contentHashHex,
-        priorDeclaredAlg,
-        recoveredAlg: env.contentHashAlg ?? "(absent → sha256)",
-        impact: "THIS EXACT MESSAGE was refused on the direct path because it named an algorithm this build cannot read, and the same content has now been accepted via the relay park under an algorithm this build CAN read. The refusal did not hold: the message was delivered by the other route.",
-      });
-    }
-    /**
-     * ⚠️ **THE AUTHORSHIP REFUSAL DOES NOT HOLD EITHER, AND THIS IS WHERE IT SAYS SO** — review H1.
-     *
-     * `DOD-M15-AUTHORSHIP-ABSENT-1` refuses a direct-path frame with no usable proof of who wrote
-     * it. Refusing sends no delivery ACK, so the sender's TTF backstop parks the message and it
-     * arrives here — where the ENVELOPE's signature over (session_id, recipient_pubkey,
-     * content_hash) is what authenticates it, and `authenticateParkedEntry` above has already
-     * accepted it. That is correct and it is deliberately NOT changed here: gating mail retrieval
-     * on a per-message record the relay-degraded path is allowed to omit is the false-positive shape
-     * this whole unit is careful to avoid, and the order that added the refusal scopes the park
-     * envelope out explicitly.
-     *
-     * What must not stand is the SILENCE. Without this line the operator reads "refused" and then
-     * watches the message appear, with nothing connecting the two — the same reconciliation gap the
-     * algorithm refusal above already pays for. What they need to know is the part that is really
-     * lost: the message arrived, and its INDIVIDUAL author is attested by the mailbox envelope
-     * rather than by a signature over that message's own bytes.
-     *
-     * Same `ok && !held && !screenedOut` predicate as above, and for the same reason: `ok` is not
-     * "delivered".
-     */
-    if (refusedForAuthorship && result.ok && result.held !== true && result.screenedOut !== true) {
-      const hashes = this.#refusedOnDirectPath.get(memoKey);
-      hashes?.delete(contentHashHex);
-      if (hashes && hashes.size === 0) this.#refusedOnDirectPath.delete(memoKey);
-      /**
-       * ⚠️ RENAMED FROM `…authorship_refusal_reconciled` by `029c` review F4, because the memo it
-       * reads now covers EVERY direct-path refusal and not only the authorship one. Keeping the old
-       * name would have put "no usable proof of who wrote it" on a message that was actually
-       * refused for not decrypting — a wrong cause is worse than a general one.
-       *
-       * The specific reason is already on the operator's notice; what this event adds is that the
-       * refusal did not hold.
-       */
-      this.#logger.warn("content.recover.refusal_reconciled", {
-        agentName, sessionId, correlationId,
-        contentHash: contentHashHex,
-        impact: "THIS EXACT MESSAGE was refused on the direct path and the same content has now been accepted from the relay mailbox, where the sealed envelope proves the sender. The refusal did not hold: the message WAS delivered by the other route. What the direct path could not confirm is still unconfirmed — the mailbox proves WHO sent it and nothing about the check that refused it — so the receipt can show this message arrived without showing everything a directly-delivered one would.",
-        guidance: "Nothing to do about this message. The fix named on the original refusal still stands: until the cause clears, every message on this session takes the slower route and lands with less attached to it.",
-      });
-    }
-    return result;
-  }
-
-  /**
-   * Review M4: bounded memo of parked entries we have already refused, so a mailbox stuffed with
-   * forgeries cannot force an unbounded unseal+verify on every reconnect. FIFO-capped — the cap
-   * matters more than the retention: forgetting an entry only costs one extra verification, whereas
-   * an unbounded map would be a memory leak fed by a remote party (the exact class the DOD-MSG-4
-   * review already caught once in the offered-moniker map).
-   */
-  #rememberRefusedParkedEntry(key: string, reason: ParkAuthFailure): void {
-    if (this.#refusedParkedEntries.size >= MAX_REFUSED_PARKED_ENTRIES) {
-      const oldest = this.#refusedParkedEntries.keys().next();
-      if (!oldest.done) this.#refusedParkedEntries.delete(oldest.value);
-    }
-    this.#refusedParkedEntries.set(key, reason);
-  }
 
   /**
    * DOD-MSG-4 (2b): public entry for the recover path to verify + record a parked entry's ordering
@@ -13726,7 +11092,7 @@ export class SessionNodeManager {
     // mail retrieval on a record the relay-degraded path is allowed to omit, which is the
     // false-positive shape this unit is careful to avoid. The live direct path is where the ordering
     // record IS the proof, and that is where `fatal` is consumed.
-    return this.#recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
+    return this.#refusals.recordFrameOrdering(agentName, sessionId, structure1Cbor, structure2Cbor, contentHash, correlationId, "park").seq;
   }
 
   /**
@@ -16258,641 +13624,18 @@ export class SessionNodeManager {
     this.#ownChainStore?.record(ownPubkeyHex, sessionId, contentHash, Date.now());
   }
 
-  /**
-   * `DOD-M15-AUTHORSHIP-ABSENT-1` — DID THIS SENDER PROVE THEY WROTE THIS MESSAGE?
-   *
-   * The one place that answers it, for both callers, so "checked" cannot mean two different things
-   * in two places. It takes the signature as an ARGUMENT rather than digging it out of a structure,
-   * which is the whole of the fix: the signature used to be read only from `structure2_cbor` — the
-   * RELAY's record — so a receiver could not check authorship without a relay record, and refusing
-   * on its absence would have made the relay a precondition for reading mail. The content frame now
-   * carries the signature beside the bytes it signs, exactly as `hash_submit` always has, and this
-   * method does not care which of the two handed it over.
-   *
-   * It VERIFIES and it does not LOG. The severity of each verdict differs by caller — the content
-   * frame refuses an `unusable`, the park path shrugs at one — and a method that logged its own
-   * conclusion would either report a refusal that did not happen or stay silent on one that did.
-   */
-  #verifyAuthorshipClaim(
-    agentName: string,
-    sessionId: string,
-    structure1Cbor: Uint8Array,
-    senderSignature: Uint8Array,
-    contentHash: Uint8Array,
-  ): AuthorshipVerdict {
-    // Structure 1 content_hash is index 1 and sender_pubkey index 2 in BOTH layouts — 020-ACKHASH
-    // appended last_seen_hash at 6 rather than inserting it, so neither read moved. A v2 claim
-    // decodes here exactly as a v1 one does; its hash is not consulted, because this unit ships
-    // reading and not enforcing.
-    const s1 = decodeStructure1(structure1Cbor);
-    // A layout this build cannot name yields no pubkey and no hash, so there is nothing to check the
-    // signature against. Its reason is carried out so an unreadable CLAIM and a wrong SIGNATURE stay
-    // distinguishable — they take the same outcome by different routes.
-    if (!s1.ok) return { verdict: "unusable", reason: s1.reason };
-    const s1Hash = s1.fields.contentHash;
-    const s1Pubkey = s1.fields.senderPubkey;
-    // The SENDER's Ed25519 signature over the exact signed bytes — the same check the relay
-    // performs. `verify` never throws, so a wrong-width or garbage signature lands here as `false`:
-    // supplied and refuted, which is a different fact from not supplied at all.
-    if (!verify(s1Pubkey, structure1Cbor, senderSignature)) {
-      return { verdict: "refuted", reason: "bad_signature" };
-    }
-    // Sovereign-node cross-check: the signer MUST be THIS session's counterparty, not an unrelated
-    // key. Review M1: compare BYTES, not hex strings — `counterparty_pubkey` is stored verbatim from
-    // the IPC param and is never case-normalized, so a string compare would fail for a mixed-case
-    // pubkey and silently strip the canonical ordering from every message in that session.
-    const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-    if (!pubkeyMatchesHex(s1Pubkey, counterparty)) {
-      /**
-       * REFUTED when the counterparty is KNOWN and the signer is someone else.
-       *
-       * This is the session-open MITM detection from the 2026-08-21 T-of-N investigation, which
-       * found this check *"fires correctly, and its answer is thrown away."* A rogue quorum of the
-       * directories holding shares for agent B can sign a false SessionAssignment naming M's key as
-       * B's, and everything downstream is genuinely real — M signs with M's own valid key. Nothing
-       * is missing for A to notice. This comparison is where the substitution shows, because
-       * `counterparty_pubkey` comes from A's own request and is untouched by anything the directory
-       * returns.
-       *
-       * ⚠️ AN EARLIER VERSION OF THIS COMMENT ADDED "it shows only when the record is present" —
-       * true when the proof was optional, and no longer the shape of the code: a content frame with
-       * no checkable proof is refused before it reaches ingest, so M cannot decline to supply one
-       * and be admitted anyway. Rewritten rather than deleted, because that sentence is the evidence
-       * of what the gap was. The park envelope is the remaining path where the ordering record is
-       * genuinely optional, and there the sender's authorship is proven by the envelope's own
-       * signature instead.
-       *
-       * `verified_unmatched` stays soft deliberately: with no counterparty on record we cannot prove
-       * the signer either way, and refusing there would strand a session whose row we failed to read
-       * rather than one that is under attack. It is also the only signal the orphan branch has.
-       */
-      return counterparty
-        ? { verdict: "refuted", reason: "signer_not_counterparty" }
-        : { verdict: "verified_unmatched", senderPubkey: s1Pubkey };
-    }
-    /**
-     * ─── THE BINDING CHECKS RUN LAST, AND THE ORDER IS A SECURITY PROPERTY ───────────────────────
-     *
-     * ⚠️ **THEY USED TO RUN FIRST, AND THAT HANDED THE ATTACKER A FREEZE-SUPPRESSION SWITCH** —
-     * review of `029b`, and it is the finding that mattered most.
-     *
-     * Everything below this line is `unusable`: the message is REFUSED and the session lives.
-     * Everything above it is `refuted`: the session FREEZES. So a check that can answer `unusable`
-     * before the signature has been verified lets a peer choose the softer outcome — flip one
-     * unauthenticated byte of `session_id` inside your own claim and a garbage signature, or a
-     * signature by a MITM's own key, stops being an identity incident and becomes a quiet refusal.
-     * The session-open MITM detection this function exists to serve was bypassable by exactly the
-     * party it detects.
-     *
-     * So the order is: decode → SIGNATURE → SIGNER → then what the proof is about. By the time
-     * either check below runs, the claim provably came from this session's counterparty, and the
-     * only question left is which message and which conversation they made it for.
-     *
-     * `seal-frontier-verify` already does it in this order (verify at :55, session id at :77). This
-     * code had it inverted.
-     */
-    // The claim must bind to THIS content. A signature over somebody else's bytes verifies perfectly
-    // and proves nothing about this message — without this, one signed claim could be replayed onto
-    // every frame that follows it.
-    if (!bytesEqual(s1Hash, contentHash)) {
-      return { verdict: "unusable", reason: AUTHORSHIP_CONTENT_HASH_MISMATCH };
-    }
-    /**
-     * ⚠️ **AND IT MUST BIND TO THIS CONVERSATION** — review M4, ruled in by Andre 2026-09-04.
-     *
-     * Binding the content and the signer is not enough on its own: a claim the counterparty
-     * genuinely signed in another session verifies unchanged here for the same bytes. Not a
-     * stranger and not forged content — a real line of theirs, landing in a transcript it was never
-     * written for, with a signature that checks out. That is worse than an unsigned message,
-     * because the receipt then PROVES something that did not happen.
-     *
-     * `session_id` has been in Structure 1 since v1 and this path never read it.
-     * `seal-frontier-verify` already compares it; the live receive path simply did not.
-     *
-     * **THE TWO VALUES CANNOT DIVERGE, and that is what makes this safe to enforce.** Both are
-     * derived from ONE session id on each side, by construction:
-     *   initiator — `sessionId = hex(assignment.session_id)` (`initiate-session-handler`) and
-     *               `relayParams.sessionIdBytes = assignment.session_id` (`daemon.ts`);
-     *   responder — `acceptSession(parsed.sessionIdHex)` and
-     *               `sessionIdBytes = Buffer.from(parsed.sessionIdHex, "hex")` (`inbound-sessions`);
-     *   direct/persisted — `relaySessionIdBytes = Buffer.from(sessionId, "hex")`.
-     * The two names exist because one keys the in-memory maps and one goes on the wire, not because
-     * they can hold different values. Getting this wrong would refuse EVERY message on EVERY live
-     * session, so it is stated rather than assumed.
-     *
-     * REFUSED, not frozen — and the sentence is TRUE where it now stands. The signature has
-     * verified and the signer has been matched to this session's counterparty three lines above;
-     * what is wrong is only the conversation the claim was made for, which is a replay rather than
-     * an identity fault. Said because an earlier version of this comment made the same claim from
-     * ABOVE the verification, where none of it had happened yet.
-     */
-    const expectedSessionId = this.#activeNodes.get(this.#k(agentName, sessionId))?.relaySessionIdBytes
-      ?? Uint8Array.from(Buffer.from(sessionId, "hex"));
-    if (!bytesEqual(s1.fields.sessionId, expectedSessionId)) {
-      return { verdict: "unusable", reason: AUTHORSHIP_SESSION_MISMATCH };
-    }
-    /**
-     * ─── AND IT MUST ACKNOWLEDGE SOMETHING THAT WAS ACTUALLY SAID — 033-ACKEMIT ──────────────────
-     *
-     * **THIS IS THE HALF THAT NEEDS NO RELAY, and it is the reason the unit exists.** Everything the
-     * check consumes is on this machine: the counterparty's own signed bytes, and our own tree. We
-     * do not ask the relay what position 7 held — we already know, because we placed the leaf there.
-     *
-     * Until now a signed acknowledgement was a NUMBER. "I saw position 7" attests to a position and
-     * never to content, so the only thing binding the acknowledgement to a message was the relay's
-     * separate receipt over `content_hash ‖ seq ‖ timestamp`. Withhold the relay's half and the
-     * signed claim is an unbacked number — which is how a counterparty seals one message short.
-     * With the hash signed, the claim stands on its own and the relay is no longer load-bearing for
-     * it.
-     *
-     * It runs LAST for the reason the two checks above run last: everything from here down answers
-     * `unusable`, which refuses the message and leaves the session alive, while a `refuted` FREEZES
-     * it. A check that could answer before the signature and the signer were established would hand
-     * a peer a switch for choosing the softer outcome. By this line the claim provably came from
-     * this session's counterparty, about this content, in this conversation — the only question
-     * left is whether what they say they saw is what we sent.
-     */
-    const ackVerdict = this.#verifyAcknowledgedContent(agentName, sessionId, s1.fields);
-    if (ackVerdict) return ackVerdict;
-    /**
-     * ─── AND IT MUST LINK TO THEIR OWN PREVIOUS MESSAGE — `DOD-M15-SELFCHAIN-1` ──────────────────
-     *
-     * The check above asks whether they are right about what WE said. This one asks whether they
-     * are right about what THEY said, and it is the check that makes the ORDER of the conversation
-     * provable rather than merely its contents.
-     *
-     * **THIS IS THE HALF THAT NEEDS NO RELAY**, in the strongest sense: the expected value is the
-     * last message we received from them, which is a fact about our own inbox. A relay that is
-     * absent, slow, colluding or lying cannot change it, and cannot wave a broken chain past us.
-     */
-    const chainVerdict = this.#verifySenderSelfChain(agentName, sessionId, s1.fields);
-    if (chainVerdict) return chainVerdict;
-    return { verdict: "verified", senderPubkey: s1Pubkey, senderSig: senderSignature };
-  }
+  
 
-  /**
-   * Does this claim's `last_seen_hash` name content this side actually put at that position?
-   *
-   * Returns `undefined` when the acknowledgement holds, or the `unusable` verdict to refuse with.
-   * Split out of `#verifyAuthorshipClaim` so the three refusal causes can be named separately —
-   * a claim that carries NO hash, one that names a position we never reached, and one that names
-   * the wrong content — rather than collapsing into a single "the proof was bad".
-   *
-   * ⚠️ MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH (§5). A v1 claim carries no content
-   * assertion at all, and treating that as "fine, skip the check" would recreate the fail-open this
-   * unit is closing one layer down: an attacker who wants to evade a mismatch check simply never
-   * supplies a checkable proof. `decodeStructure1` has already refused a v2 whose hash is the wrong
-   * width, so `lastSeenHash === null` here means exactly one thing — a v1 layout — and it is
-   * refused by its own name.
-   */
-  /**
-   * Does this claim link to the last message we actually received from this sender?
-   *
-   * ─── Why the expected value is our INBOX and not our tree ──────────────────────────────────────
-   *
-   * The tree holds every leaf in canonical order and records no authorship, so it cannot say which
-   * of them this sender wrote. What can is the acknowledgement state this daemon already keeps: the
-   * last content hash received from the counterparty, updated on every message as it is ingested.
-   * That IS their previous message, by definition.
-   *
-   * It is seeded at session registration with the session GENESIS, so a sender's first message has
-   * a real expected value rather than a special case — "they have not spoken here yet" is a value,
-   * derived per session, and not an absence.
-   *
-   * ⚠️ RUNS BEFORE THIS MESSAGE IS INGESTED, which is what makes the comparison meaningful: the
-   * state still holds their PREVIOUS message. Moving this after ingest would compare a message to
-   * itself and pass every time.
-   */
-  #verifySenderSelfChain(
-    agentName: string,
-    sessionId: string,
-    fields: { prevOwnHash: Uint8Array },
-  ): { verdict: "unusable"; reason: string } | undefined {
-    const key = this.#k(agentName, sessionId);
-    const genesis = this.#sessionGenesisPrevRoot(agentName, sessionId);
-    /**
-     * ⚠️ THE EXPECTED VALUE IS OUR INBOX — `#lastAck` — AND NOT THE SESSION GENESIS.
-     *
-     * `#lastFromCounterparty` is the last content hash we accepted FROM THIS COUNTERPARTY, written
-     * on every successful ingest. That IS their previous message, by definition. The genesis is only
-     * the answer before they have said anything.
-     *
-     * It used to read the relay client's acknowledgement with the genesis as a fallback, which is
-     * the same conflation the emitter had: on a session with no relay client the fallback never
-     * moved, so the counterparty's SECOND message was refused as a broken chain for the rest of the
-     * conversation. Four live-transport fixtures caught it the moment the emitter started producing
-     * a real chain.
-     */
-    const expected = this.#lastFromCounterparty.get(key) ?? genesis;
-    /**
-     * ⚠️ NO EXPECTED VALUE MEANS NO COMPARISON, AND THIS IS THE ONE PLACE THAT IS NOT A FAIL-OPEN —
-     * because of WHO CONTROLS THE ABSENCE. Whether this side holds a starting point for the session
-     * depends on our own assignment and our own database. Nothing the sender puts on the wire can
-     * cause it, so it is not a switch they can reach for. A session restored from a row written
-     * before this existed is the real case, and refusing there would refuse every message on it for
-     * something the counterparty did not do.
-     */
-    if (!expected) {
-      this.#logger.info("session.content.self_chain.unverifiable", {
-        agentName, sessionId,
-        impact:
-          "this side holds no record of this sender's previous message in this session, so the " +
-          "link inside their signed bytes was not compared. The message is accepted; it is already " +
-          "bound to this conversation and to its author by the checks above.",
-      });
-      return undefined;
-    }
-    if (bytesEqual(fields.prevOwnHash, expected)) return undefined;
-    /**
-     * ─── OUR OWN GAP IS NOT THEIR TAMPERING, AND THE DIFFERENCE IS DECIDABLE ─────────────────────
-     *
-     * `expected` is the last message from them we ACCEPTED. Our record can legitimately be behind
-     * theirs: a message of theirs can arrive out of order and be HELD, be refused by the inbound
-     * screen, or be lost in flight. In every one of those cases their next message links to
-     * something real that we simply do not have at the front of our record — and refusing it would
-     * be a fabricated tamper report caused by our own gap, against a party that did nothing.
-     *
-     * So a link naming ANY message we have accepted from them is accepted, and the gap is reported
-     * as OUR problem. A link naming something we have never held from them is the actual accusation:
-     * it is either invented or it belongs to a conversation this is not.
-     *
-     * ⚠️ THIS IS DELIBERATELY WEAKER THAN THE RELAY'S CHECK, AND SAYING SO IS THE POINT. The relay
-     * holds the whole ordered log and refuses anything but the immediate predecessor; the directory
-     * does the same at seal time. This side holds only what reached it, so the strongest honest
-     * question it can ask is "did you name something you actually said to me?". Two strict checkers
-     * plus one honest one beats three checkers where the weakest one fabricates accusations.
-     */
-    const seen = this.#receivedFromCounterparty.get(key);
-    if (seen?.has(Buffer.from(fields.prevOwnHash).toString("hex"))) {
-      this.#logger.info("session.content.self_chain.behind", {
-        agentName, sessionId,
-        impact:
-          "this message links to an earlier message from your counterparty than the last one this " +
-          "side accepted, so this side's copy of the conversation has a gap in it. The message is " +
-          "accepted — the link names something they really did send you. The gap is on this side.",
-      });
-      return undefined;
-    }
-    return { verdict: "unusable", reason: AUTHORSHIP_SELF_CHAIN_MISMATCH };
-  }
+  
 
-  /**
-   * Every content hash accepted from the counterparty on a session, so a link to one of THEIR
-   * earlier messages can be told apart from a link to something they never sent.
-   *
-   * ⚠️ BOUNDED, because it is fed by a peer. A conversation must not cost unbounded memory because
-   * the other side kept talking: the oldest entries are dropped past the cap, and a link older than
-   * that is refused. That is the right way round — the cap makes the check STRICTER as it bites,
-   * never looser.
-   */
-  readonly #receivedFromCounterparty = new Map<string, Set<string>>();
-  /** The MOST RECENT of those, which is what an honest next message links to. */
-  readonly #lastFromCounterparty = new Map<string, Uint8Array>();
+  
+  
 
-  #noteReceivedFromCounterparty(agentName: string, sessionId: string, contentHash: Uint8Array): void {
-    const key = this.#k(agentName, sessionId);
-    this.#lastFromCounterparty.set(key, Uint8Array.from(contentHash));
-    let seen = this.#receivedFromCounterparty.get(key);
-    if (!seen) { seen = new Set<string>(); this.#receivedFromCounterparty.set(key, seen); }
-    seen.add(Buffer.from(contentHash).toString("hex"));
-    while (seen.size > SELF_CHAIN_MEMORY) {
-      // Sets iterate in insertion order, so the first entry is the oldest.
-      const oldest = seen.values().next().value as string | undefined;
-      if (oldest === undefined) break;
-      seen.delete(oldest);
-    }
-  }
+  
 
-  #verifyAcknowledgedContent(
-    agentName: string,
-    sessionId: string,
-    fields: { lastSeenSeq: number; lastSeenHash: Uint8Array },
-  ): { verdict: "unusable"; reason: string } | undefined {
-    /**
-     * ⚠️ **A v1 CLAIM IS REFUSED THE MOMENT IT NAMES A POSITION — and accepted when it names none.
-     * The split is the whole rule, so it is stated rather than left to the reader.**
-     *
-     * `last_seen_seq >= 1` with no hash IS the defect: "I saw position 7" attests to a position and
-     * never to content, which is the unbacked number this unit exists to stop accepting. Treating
-     * that as "fine, skip the check" would recreate `DOD-M15-AUTHORSHIP-ABSENT-1` one layer down —
-     * an attacker evading a mismatch check simply never supplies a checkable proof.
-     *
-     * `last_seen_seq === 0` with no hash claims nothing about our messages, so there is no check to
-     * skip and nothing to bind. A sender genuinely in that state — a session brokered without a
-     * relay assignment, which the directory does not always return — has nothing to acknowledge,
-     * and refusing them would stop the product's own advertised journey to close a hole they are
-     * not in.
-     *
-     * **THE BOUND, SAID PLAINLY:** a peer can decline to bind by never acknowledging anything.
-     * That costs them their own ratification of our history rather than falsifying it, and it is
-     * the same under-claiming the relay has always allowed (it refuses a `last_seen_seq` that runs
-     * AHEAD of its counter, never one that lags). This unit does not change that either way, and
-     * the follow-on that does is the receiver submitting a hash for what it received.
-     */
-    /**
-     * ⚠️ THE "NO ACKNOWLEDGEMENT AT ALL" BRANCH IS GONE, and its absence is the point.
-     *
-     * It used to accept a claim carrying no `last_seen_hash` as long as it also named no position —
-     * honest, and a shape a peer could choose. `DOD-M15-SELFCHAIN-1` deleted every layout that can
-     * express it: there is one Structure 1 and both chain links are required, so a claim without one
-     * does not decode at all and never reaches this method. `AUTHORSHIP_ACK_HASH_ABSENT` is kept as
-     * a reason because the wording that routes off it is still reachable from other callers.
-     */
-    /**
-     * THE GENESIS IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing, and
-     * that case is a defined 32 bytes — the agreed starting point of this two-party chain, derived
-     * from both keys, the session id and the session timestamp. Not 32 zero bytes: a constant
-     * identical across every session is one an attacker can present for any session, so the one
-     * position most exposed to a forged acknowledgement would be the only one nobody could check.
-     */
-    if (fields.lastSeenSeq <= 0) {
-      const genesis = this.#sessionGenesisPrevRoot(agentName, sessionId);
-      /**
-       * ⚠️ **SOFT HERE, AND THIS IS THE ONE BRANCH WHERE THAT IS NOT A FAIL-OPEN — the reasoning is
-       * the load-bearing part, so it is written down rather than assumed.**
-       *
-       * `last_seen_seq` 0 means "I have received nothing from you", and the hash that goes with it
-       * is the session's agreed starting point. It is a genuine value and this daemon always emits
-       * it — but as a CHECK it is close to redundant, because the thing it establishes (that this
-       * claim was made for THIS session) has already been established three lines above by the
-       * session-id binding, against a value derived from the same session id.
-       *
-       * **What an attacker gains by reaching this branch: nothing.** They cannot skip the real
-       * comparison by claiming 0, because claiming 0 is claiming to have acknowledged NOTHING of
-       * ours — it removes their own ratification of our history rather than falsifying it, and the
-       * positional check below is what a claim about our messages has to survive. And they cannot
-       * cause the absence either: whether we hold a genesis depends on our own assignment and our
-       * own database, never on anything they send.
-       *
-       * The alternative was refusing, and it would have been the wrong kind of strict: a session
-       * restored from a row written before this column existed holds no genesis, and every first
-       * message on it would be refused for something the counterparty did not do.
-       */
-      if (!genesis) {
-        this.#logger.info("session.content.ack_hash.genesis_unavailable", {
-          agentName, sessionId,
-          impact:
-            "this message acknowledges nothing yet, and this side holds no recorded starting point " +
-            "for the session, so the acknowledgement was not compared. The message is accepted: it " +
-            "is already bound to this conversation by the session id inside the signed bytes.",
-        });
-        return undefined;
-      }
-      return bytesEqual(fields.lastSeenHash, genesis)
-        ? undefined
-        : { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_MISMATCH };
-    }
-    /**
-     * ─── THE ACKNOWLEDGED CONTENT MUST BE SOMETHING THIS SIDE ACTUALLY HOLDS ─────────────────────
-     *
-     * ⚠️ **AN EARLIER VERSION OF THIS CHECK WAS POSITION-ONLY AND HAD A HOLE THE ATTACKER COULD
-     * OPEN THEMSELVES. It is kept described, not deleted, because the false reasoning is the part
-     * worth not repeating.**
-     *
-     * It compared `hashAt(last_seen_seq - 1)` and WAIVED the whole comparison on a session marked
-     * diverged, on this stated ground: *"Who controls this absence? Not the peer: divergence is
-     * caused by OUR submit failing, and nothing the counterparty sends can produce it."*
-     *
-     * **That was false, and the party who could falsify it is the exact attacker this line names.**
-     * Send a message direct-only and never submit its hash: we have no ordering record, so it is
-     * appended at the tail and our tree runs one ahead of the relay's counter. Our very next send
-     * then gets an assigned position BEHIND our frontier, `placeOwnLeaf` takes its
-     * `position_behind_frontier` branch and calls `markSessionDiverged` — and from that moment every
-     * inbound acknowledgement skipped the check entirely. **One withheld message plus one reply from
-     * us disabled the guard, using the behaviour the guard exists to catch.**
-     *
-     * A second defect sat beside it: a claim naming a position our tree has not reached was refused
-     * outright, and a HELD own leaf is exactly that — `placeOwnLeaf` returns `{placed: false}` when
-     * the relay hands us a position ahead of our tail, so the leaf is not in the tree while the
-     * counterparty has already received it and is acknowledging it. We refused their reply for a
-     * transient gap on our own machine.
-     *
-     * **So the question asked is now about CONTENT, not about an index.** Is the hash they name
-     * something this side has — placed in the tree, or held pending a gap? That cannot be switched
-     * off by divergence (it consults no positions), it cannot false-refuse a held leaf, and it still
-     * refuses a hash we have never held, which is the falsehood the check exists to catch.
-     *
-     * The POSITION is then used only to make the check STRONGER where it is safe to: on a session
-     * whose indices still mean relay positions, the hash must sit exactly where they say it does.
-     * Divergence loses that strengthening and keeps the membership test, rather than losing both.
-     */
-    const tree = this.getSessionTree(agentName, sessionId);
-    const ackHex = Buffer.from(fields.lastSeenHash).toString("hex");
-    const heldHere = this.#heldContent.get(this.#k(agentName, sessionId));
-    const held = heldHere ? [...heldHere.values()].some((e) => e.contentHashHex === ackHex) : false;
-    if (tree.indexOfHash(ackHex) === -1 && !held) {
-      return { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_UNKNOWN };
-    }
-    /**
-     * THE POSITIONAL STRENGTHENING. Skipped — with a WARN, never silently — when this side's indices
-     * no longer mean relay positions, or when the leaf at that position is still held. Neither is
-     * a pass: the membership test above has already run and refused anything we do not hold.
-     */
-    const atPosition = tree.hashAt(fields.lastSeenSeq - 1);
-    if (this.isSessionDiverged(agentName, sessionId) || atPosition === null) {
-      this.#logger.warn("session.content.ack_hash.position_unverifiable", {
-        agentName, sessionId, lastSeenSeq: fields.lastSeenSeq,
-        diverged: this.isSessionDiverged(agentName, sessionId),
-        impact:
-          "the acknowledged content IS in this side's record, so the claim was accepted — but its " +
-          "POSITION was not checked, because this session's local positions no longer line up with " +
-          "the relay's, or the leaf at that position has not been placed yet.",
-      });
-      return undefined;
-    }
-    return ackHex === atPosition
-      ? undefined
-      : { verdict: "unusable", reason: AUTHORSHIP_ACK_HASH_MISMATCH };
-  }
+  
 
-  /**
-   * `DOD-M15-AUTHORSHIP-ABSENT-1` — the refusal an inbound frame gets when its authorship cannot be
-   * established. NOT a freeze: see `AuthorshipVerdict` for why those are different facts.
-   *
-   * Both surfaces, always. The ERROR is the durable forensic record an investigation reads days
-   * later; the notice is the CONTROL — the thing that actually reaches the operator, who otherwise
-   * watches a conversation go quiet and concludes the other person stopped replying.
-   */
-  #refuseUnprovenAuthorship(
-    agentName: string,
-    sessionId: string,
-    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation"
-      | typeof AUTHORSHIP_SELF_CHAIN_MISMATCH | AckHashReason,
-    contentHash: Uint8Array,
-    detail: Record<string, unknown>,
-    correlationId?: string,
-  ): void {
-    /**
-     * ⚠️ **THREE REASONS, THREE SENTENCES — AND THE THIRD USED TO BORROW THE SECOND'S** (review of
-     * `029b`, and it is the operator half of the same finding as the check order).
-     *
-     * A replayed claim is the one branch on this path that is potentially ADVERSARIAL: a real,
-     * valid, correctly-signed line of your counterparty's, presented in a conversation it was not
-     * written for. It was reaching the operator under the `unusable` wording, which says the proof
-     * was "unreadable, or signed over different content" — neither is true — and under guidance
-     * telling them to go and ask their counterparty to upgrade. A version number is not the
-     * question, and sending someone to chase one spends their attention on the wrong thing.
-     */
-    const impact =
-      reason === "authorship_proof_absent"
-        ? "a message arrived carrying no proof of who wrote it, so it was NOT ingested, NOT shown and NOT attributed to anyone. Every message in this conversation has to be provable to whoever reads its receipt later, and this one could not be."
-        : reason === "authorship_wrong_conversation"
-          ? "a message arrived carrying a VALID signature by this conversation's counterparty — made for a DIFFERENT conversation. The same message, or an old one of theirs, was presented here. It was NOT ingested, NOT shown and NOT added to this conversation's record."
-          /**
-           * 033-ACKEMIT. Says what was OBSERVED — the two records disagree about what was said —
-           * and stops there. It does NOT say the counterparty is lying: the same signal is what a
-           * genuine fault on their side looks like, and naming a conclusion the code did not reach
-           * is the error-fidelity defect this milestone was opened for.
-           */
-          /**
-           * ⚠️ THREE CAUSES, THREE SENTENCES — review F5. They shared one, and it described none of
-           * them properly: an ABSENT acknowledgement has no part that "does not match", because it
-           * has no part at all.
-           *
-           * All three say what was OBSERVED and stop there. None says the counterparty is lying:
-           * the same signal is what a genuine fault on their side looks like, and naming a
-           * conclusion the code did not reach is the error-fidelity defect this milestone exists
-           * for.
-           */
-          /**
-           * `DOD-M15-SELFCHAIN-1` — THE ORDER, NOT THE CONTENT, AND IT NEEDS ITS OWN WORDS.
-           *
-           * This reached the operator under the generic `authorship_proof_unusable` sentence, which
-           * says the proof was "unreadable, or signed over different content". Neither is true: the
-           * proof is perfect and it is about this conversation. What is in dispute is WHERE this
-           * message sits — and telling someone their decoder failed sends them to audit the wrong
-           * subsystem entirely. The reason's own comment claimed it was "named apart from the
-           * acknowledgement reasons"; the surface collapsed it back, which is error substitution on
-           * the strongest evidence this protocol can produce.
-           */
-          : reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
-            ? "a message arrived that is genuinely from your counterparty, about this conversation, and correctly signed — and it names a message of THEIR OWN that they never sent you. Each message says which of their own came before it, and that is what fixes the ORDER of the conversation. This one points somewhere your record has never been. It was NOT ingested and NOT shown."
-          : reason === AUTHORSHIP_ACK_HASH_ABSENT
-            ? "a message arrived that is genuinely from your counterparty and genuinely about this conversation — and it does not say which of your messages they had received. Their build is older than yours: a message has to say what it is answering, so that nobody can later leave your last message out of the receipt. It was NOT ingested and NOT shown."
-          : reason === AUTHORSHIP_ACK_HASH_MISMATCH
-            ? "a message arrived that is genuinely from your counterparty — and it names a DIFFERENT message of yours in the position where your own record holds one. Both sides agree the message exists; you disagree about which one sits there. It was NOT ingested and NOT shown."
-          : reason === AUTHORSHIP_ACK_HASH_UNKNOWN
-            ? "a message arrived that is genuinely from your counterparty — and it says they received something from you that this side has no record of ever holding. It was NOT ingested and NOT shown. This is the check that stops someone quietly rewriting what was said before the receipt is made."
-            : "a message arrived whose proof of authorship could not be checked against it — it was unreadable, or it was signed over different content. It was NOT ingested, NOT shown and NOT attributed to anyone.";
-    /**
-     * ⚠️ THE VERB IS THE COUNTERPARTY'S, AND THE GUIDANCE SAYS SO. The reader is the RECEIVING
-     * operator, and there is nothing on their machine to change — the missing signature is produced
-     * on the sender's. Telling them to do something local would be an affordance that resolves to
-     * nothing. So it names the one move that works (tell them to upgrade) and the one that settles
-     * the other explanation (confirm out of band), and it stops at two.
-     *
-     * ⚠️ **IT USED TO OPEN "Nothing was shown and nothing was stored." THAT SENTENCE WAS FALSE** —
-     * review H1, and it is kept here rather than deleted because it is the exact shape this
-     * milestone exists to catch: a refusal that announces a stronger outcome than it delivers.
-     *
-     * Refusing sends no delivery ACK, so the sender's TTF backstop parks the message and it arrives
-     * through the relay mailbox seconds later, where the ENVELOPE's signature authenticates it and
-     * recovery accepts it — correctly, and with no per-message proof. So the message may well be
-     * delivered, moments after the operator was told it was not. The reconciliation is logged
-     * (`content.recover.refusal_reconciled`) and the sentence below now says what is
-     * actually true of this path: nothing was shown YET, and this refusal does not stop the copy
-     * coming the other way.
-     */
-    const guidance = reason === "authorship_wrong_conversation"
-      ? "STOPPED ON PURPOSE, and this one is NOT a version problem — do not go and ask them about " +
-        "their build. The signature is real and it is theirs; what is wrong is that it was made for " +
-        "another conversation, so something replayed it into this one. That is either software on " +
-        "one of your machines re-sending an old message into the wrong session, or someone in " +
-        "between doing it deliberately. ONE thing to do: ask your counterparty OUT OF BAND (a " +
-        "channel that is not this one) whether they meant to send this, before you continue here."
-      /**
-       * ⚠️ **THIS BRANCH SHIPPED AS `NaNcopy in the relay mailbox…` AND NOTHING NOTICED** — review
-       * F1, and it is worth more than the one-line fix.
-       *
-       * Splitting the guidance in two dropped the opening literal and left behind the `+` that had
-       * joined it, which is not a concatenation with nothing on its left — it is a UNARY PLUS on the
-       * next string. `+"REACH YOU BY…"` is `NaN`, and `NaN + "copy in the relay mailbox…"` is a
-       * perfectly good string. So the flagship refusal of this whole milestone reached the operator
-       * beginning mid-word with `NaN`, with its "STOPPED ON PURPOSE" framing and its reason gone.
-       *
-       * **The test was green because it asked the wrong question.** The only assertion on this
-       * string was `.toMatch(/upgrade/i)`, and "tell them to upgrade" survives at the tail. A
-       * substring match on a sentence cannot see that the sentence lost its head — so the assertion
-       * below pins what it OPENS with, which a truncation cannot survive.
-       */
-      /**
-       * 033-ACKEMIT — TWO PATHS, AND THE FIRST IS THE ONE THAT ACTUALLY HAPPENS.
-       *
-       * Capped at two (Invariant 4): an affordance list that enumerates everything is a menu. The
-       * verb is the counterparty's in both cases — there is nothing to change on this machine — so
-       * it names the one move that fixes the likely cause and the one that settles the other.
-       */
-      /**
-       * ⚠️ AND THREE REMEDIES, because the shared one was WRONG for two of the three. It told the
-       * reader their counterparty's build was probably old — which is impossible for a claim that
-       * carries an acknowledgement, since only a newer build sends one — and then told them to
-       * abandon the conversation. Two is the cap on each (Invariant 4); the verb is the
-       * counterparty's in every case, because there is nothing to change on this machine.
-       */
-      : reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
-      ? "STOPPED ON PURPOSE, and this is the most serious of these refusals. " +
-        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-        " Their signature is real and it is about this conversation. What does not hold is the " +
-        "ORDER: this message names one of their own as the one before it, and that message was " +
-        "never sent to you. Either something between you is rearranging what they say, or their " +
-        "agent's record of what it has said went out of step. THIS SESSION IS NOW FROZEN — no " +
-        "further message on it will be accepted, because carrying on writes a disputed order into " +
-        "the receipt. Reach them OUT OF BAND — a channel that is not this one — and ask them to " +
-        "read back the last few things they sent you. If it matches what you have, open a NEW " +
-        "session; if it does not, do not."
-      : reason === AUTHORSHIP_ACK_HASH_ABSENT
-      ? "STOPPED ON PURPOSE, and this is NOT about their signature — it verified. " +
-        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-        " Their build is older than yours and does not say what it has received. Ask which version " +
-        "they are running and tell them to upgrade — only they can fix it, and this will keep " +
-        "happening until they do."
-      /**
-       * ⚠️ THESE TWO SHARED ONE SENTENCE, AND THE TEST THAT WAS MEANT TO CATCH THAT COULD NOT SEE
-       * IT — `DOD-M15-SELFCHAIN-1`.
-       *
-       * The file's thesis is "three causes, three sentences", and it compared ABSENT against
-       * MISMATCH and stopped. Mismatch and unknown-content shared a remedy the whole time; the pair
-       * was never compared, so the defect the test existed for was live inside it.
-       *
-       * They are not the same situation. A MISMATCH means you both agree a message sits at that
-       * position and disagree about which one — a record that has drifted. UNKNOWN CONTENT means
-       * they are acknowledging something this side never held at all, which is the shape of content
-       * being attributed to you that you did not send. The second is the more serious reading and
-       * the operator's next move differs, so it gets its own sentence.
-       */
-      : reason === AUTHORSHIP_ACK_HASH_MISMATCH
-      ? "STOPPED ON PURPOSE, and this is NOT about their signature or their version — both are " +
-        "fine. " +
-        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-        " Your record of this conversation and theirs have stopped agreeing about what you sent " +
-        "them. Confirm with them OUT OF BAND what they actually received from you. If it matches " +
-        "what you sent, this was a fault and a new session will clear it; if it does not, do not " +
-        "carry on in this one."
-      : reason === AUTHORSHIP_ACK_HASH_UNKNOWN
-      ? "STOPPED ON PURPOSE, and this one is more serious than a record that has drifted. " +
-        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-        " They are acknowledging a message from you that this side has NEVER held — not at that " +
-        "position, not anywhere. Either their record contains something you did not send, or " +
-        "yours is missing something you did. Ask them OUT OF BAND to read you back what they " +
-        "believe you sent. Do not continue this conversation until you know which of the two it " +
-        "is: carrying on writes their version into the receipt."
-      : "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. " +
-      // Review F2: chosen from what THIS machine can do, not asserted. An agent with no identity
-      // key cannot open a mailbox copy either, and telling them to wait for one would be the same
-      // false promise on a different refusal.
-      (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-      " Almost always their CELLO build is older than this one: a build from before message signing " +
-      "does not attach a signature at all. Ask which version they are running, and tell them to " +
-      "upgrade — this will keep happening until they do, and only they can fix it. If they are on " +
-      "the SAME version as you, that explanation does not hold: confirm with them OUT OF BAND " +
-      "before opening another session.";
-    this.#logger.error("session.content.refused", {
-      agentName, sessionId, correlationId, reason, ...detail, impact, guidance,
-    });
-    this.noteContentRefusal(agentName, sessionId, reason, { kind: REFUSAL_KINDS.REFUSED, impact, guidance });
-    // Armed AFTER the refusal is filed, so the memo can never claim a refusal that did not happen.
-    this.#noteRefusedOnDirectPath(agentName, sessionId, contentHash);
-  }
+  
 
   /**
    * An inbound content frame refused before it could be read — the ENCRYPTION gate's three causes.
@@ -16943,168 +13686,10 @@ export class SessionNodeManager {
      *
      * Armed AFTER the notice is filed, so the memo can never claim a refusal that did not happen.
      */
-    this.#noteRefusedOnDirectPath(agentName, sessionId, contentHash);
+    this.#refusals.noteRefusedOnDirectPath(agentName, sessionId, contentHash);
   }
 
-  #recordFrameOrdering(
-    agentName: string,
-    sessionId: string,
-    structure1Cbor: Uint8Array,
-    structure2Cbor: Uint8Array,
-    contentHash: Uint8Array,
-    correlationId?: string,
-    source: string = "content_frame",
-    // DOD-FRONTIER-STRAND-1 AC1: RETURNS the verified canonical position so the caller hands it
-    // straight to ingest. It was void, and the position was only stashed in the hash-keyed
-    // #witnessedSeq map — which cannot hold two positions for one hash, so two identical
-    // messages collapsed there before dedup ran. Returning it is what makes per-message dedup
-    // possible at all.
-    //
-    // DOD-M15-FRAME-1: `null` no longer says enough. It meant "no position" for six different
-    // reasons, two of which are PROOF THAT THE SIGNER IS NOT WHO THIS SESSION IS WITH — and the
-    // caller treated all six alike and ingested the content regardless. The check ran, answered
-    // correctly, and its answer was thrown away.
-    //
-    // `fatal` separates the two questions Invariant 2 keeps apart: sequence POSITION may stay soft
-    // (a missing ordering record is the documented relay-degraded path and refusing it would make
-    // the relay a precondition for reading mail), while IDENTITY may never be. A bad signature, or
-    // a signature by a key that is not this session's counterparty, is an identity failure that the
-    // sender supplied and that we verified — not an absence we could not resolve.
-    // `DOD-M15-AUTHORSHIP-ABSENT-1` — THE AUTHORSHIP FIELDS ARE GONE FROM THIS RETURN, and their
-    // absence is the point rather than a tidy-up. This method used to be the only place that
-    // verified a signer, so the content frame had to take its proof from here; the proof now
-    // arrives on the frame beside the bytes it signs and is verified before this is ever called.
-    // Returning a second copy would give the caller two answers to one question, and the day they
-    // disagreed the caller would have picked whichever it read first.
-  ): {
-    seq: number | null;
-    fatal?: { reason: string };
-  } {
-    try {
-      const s2 = decode(structure2Cbor) as unknown[];
-      const seq = typeof s2?.[0] === "number" ? s2[0] : -1;
-      const s2Sig = s2?.[3];
-      if (!(s2Sig instanceof Uint8Array) || seq < 1) {
-        // SOFT: we could not read the record, so we learned nothing about the signer either way.
-        // Position falls back to the witness stream, exactly as an absent record does.
-        // The Structure 1 reason is carried so an unreadable RECORD and an unnamed LAYOUT are
-        // distinguishable in the log — they arrive at the same soft outcome by different routes.
-        const s1Layout = decodeStructure1(structure1Cbor);
-        this.#logger.warn("session.content.ordering.malformed", {
-          sessionId,
-          correlationId,
-          ...(s1Layout.ok ? {} : { structure1Reason: s1Layout.reason }),
-        });
-        return { seq: null };
-      }
-      /**
-       * `DOD-M15-AUTHORSHIP-ABSENT-1` — the same verifier the content frame uses, handed the
-       * signature the RELAY committed (`structure2_cbor` index 3) instead of the one the frame
-       * carries. Two claims about the same message, and both must hold: if the relay's copy of the
-       * sender's signature does not verify against the bytes on the frame, one of them has been
-       * altered in flight.
-       *
-       * The verdicts map to this path's own severities, which are NOT the content frame's:
-       * an `unusable` record leaves POSITION unknown and is soft here, because position may always
-       * fall back to the witness stream. Identity is the half that may never be soft, and it is
-       * established before this is called.
-       */
-      const auth = this.#verifyAuthorshipClaim(agentName, sessionId, structure1Cbor, s2Sig, contentHash);
-      if (auth.verdict === "unusable") {
-        /**
-         * ⚠️ **THE ACK CAUSES REACH THIS PATH TOO, AND THEY ARE NOT A DECODER PROBLEM** — review F7.
-         *
-         * `#verifyAuthorshipClaim` has two callers. This one is reached from park RECOVERY, where
-         * it is the only authorship check that runs — so 033-ACKEMIT's acknowledgement causes
-         * started arriving here and fell into the generic `else` below, which logs
-         * `…ordering.malformed` and buries the cause in `structure1Reason`. That event name sends
-         * the next reader to audit a decoder for a record that decoded perfectly.
-         *
-         * SOFT, like every other `unusable` on this path, and deliberately: position may always
-         * fall back to the witness stream, and a recovered parked message is authenticated by the
-         * ENVELOPE's own signature rather than by this. What changes is that the log says which
-         * thing disagreed.
-         */
-        if (ACK_HASH_REASONS.has(auth.reason)) {
-          this.#logger.warn("session.content.ordering.ack_hash_unverified", {
-            sessionId, correlationId, reason: auth.reason,
-            impact:
-              "a recovered message's acknowledgement of what its sender had received does not " +
-              "reconcile with this side's record, so no canonical POSITION was taken from it. The " +
-              "message itself is authenticated by its park envelope and is not refused here.",
-          });
-        } else if (auth.reason === AUTHORSHIP_CONTENT_HASH_MISMATCH) {
-          // SOFT: the record does not describe this content. Nothing is proven about the signer's
-          // identity — only that this record and these bytes do not belong together.
-          this.#logger.warn("session.content.ordering.hash_mismatch", { sessionId, correlationId });
-        } else if (auth.reason === AUTHORSHIP_SESSION_MISMATCH) {
-          // Its own name, because `…malformed` points a reader at a decoder and this record decoded
-          // perfectly — it belongs to another conversation. Unreachable in practice on this path:
-          // `authenticateParkedEntry` binds `session_id` in the park TBS before anything is
-          // unsealed, so a mismatched record cannot get this far. Named anyway, because an event
-          // that lies about its cause is worse the day it does fire.
-          this.#logger.warn("session.content.ordering.session_mismatch", { sessionId, correlationId });
-        } else {
-          this.#logger.warn("session.content.ordering.malformed", {
-            sessionId, correlationId, structure1Reason: auth.reason,
-          });
-        }
-        return { seq: null };
-      }
-      if (auth.verdict === "refuted" && auth.reason === "bad_signature") {
-        // FATAL. The sender supplied a signature and it does not verify against the key inside its
-        // own record. That is not an absence we could not resolve — it is a proof that failed.
-        this.#logger.warn("session.content.ordering.bad_signature", { sessionId, correlationId });
-        return { seq: null, fatal: { reason: "bad_signature" } };
-      }
-      // Sovereign-node cross-check: the signer MUST be THIS session's counterparty, not an unrelated
-      // key. FAIL CLOSED (review L) — if the counterparty pubkey is unknown we cannot prove the signer,
-      // so we do NOT trust the framed ordering record (fall back to the witness stream / arrival). The
-      // "B does not trust the counterparty for ordering" invariant is non-negotiable; never fail open.
-      if (auth.verdict !== "verified") {
-        /**
-         * FATAL when the counterparty is KNOWN and the signer is someone else (`refuted`). SOFT when
-         * we simply do not know who the counterparty is (`verified_unmatched`) — the reasoning for
-         * both, and the MITM substitution this catches, lives on `#verifyAuthorshipClaim`.
-         *
-         * The soft half is the one that matters HERE: `counterparty_unknown` means we cannot prove
-         * the signer either way, so we decline to take a POSITION from a record we cannot attribute,
-         * and the caller falls back to the witness stream. Nothing about the message is refused on
-         * this path — that decision was already made, on the frame's own proof.
-         */
-        const reason = auth.verdict === "refuted" ? auth.reason : "counterparty_unknown";
-        this.#logger.warn("session.content.ordering.wrong_signer", { sessionId, reason, correlationId });
-        return auth.verdict === "refuted" ? { seq: null, fatal: { reason } } : { seq: null };
-      }
-      // Verified — record the relay-assigned canonical sequence (1-based → 0-based leaf index) for the gate.
-      this.recordWitnessedSequence(agentName, sessionId, Buffer.from(contentHash).toString("hex"), seq - 1);
-      this.#logger.info("session.content.ordering.recorded", {
-        sessionId,
-        canonicalSeq: seq - 1,
-        source,
-        correlationId,
-      });
-      /**
-       * THE POSITION, AND ONLY THE POSITION — `DOD-M15-AUTHORSHIP-ABSENT-1`.
-       *
-       * `DOD-M15-SEALWIRE-1` bullet 5 had this return the verified proof as well, because this was
-       * the only place a signer was ever checked and the transcript row needed it from somewhere.
-       * The frame now carries the sender's signature beside the bytes it signs and the caller
-       * verifies it before calling this at all, so the proof reaches the transcript from there. What
-       * this answers is the question it is named for: WHERE the relay says this message sits.
-       */
-      return { seq: seq - 1 };
-    } catch (err: unknown) {
-      this.#logger.warn("session.content.ordering.decode_failed", {
-        sessionId,
-        error: err instanceof Error ? err.message : String(err),
-        correlationId,
-      });
-    }
-    // No verified position — the caller falls back to the announced hash-dedup path. SOFT: a decode
-    // throw tells us nothing about the signer, so it is the absent case, not the refuted one.
-    return { seq: null };
-  }
+  
 
   async #handleContentStream(agentName: string, sessionId: string, stream: Stream, remotePeerId?: string): Promise<void> {
     // CLOSING THIS STREAM IS WHAT KEEPS THE SESSION ALIVE PAST ITS 33RD MESSAGE.
@@ -17433,7 +14018,7 @@ export class SessionNodeManager {
        * about their key.
        */
       if (!(s1Cbor instanceof Uint8Array) || !(senderSig instanceof Uint8Array)) {
-        this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
+        this.#refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_absent", contentHash, {
           // WHICH half is missing. A sender on an older build supplies neither; a stripped frame is
           // likelier to be missing one, and an investigator should not have to guess which.
           hasStructure1: s1Cbor instanceof Uint8Array,
@@ -17441,7 +14026,7 @@ export class SessionNodeManager {
         }, correlationId);
         return;
       }
-      const authorship = this.#verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
+      const authorship = this.#authorship.verifyAuthorshipClaim(agentName, sessionId, s1Cbor, senderSig, contentHash);
       if (authorship.verdict === "refuted") {
         /**
          * THE FORENSIC LINE, BEFORE THE FREEZE. `session.content.identity.frozen` records that a
@@ -17469,7 +14054,7 @@ export class SessionNodeManager {
          * name would send someone to audit a decoder, and would spend the operator's attention
          * asking their counterparty about a version number that is not the question.
          */
-        this.#refuseUnprovenAuthorship(
+        this.#refusals.refuseUnprovenAuthorship(
           agentName, sessionId,
           authorship.reason === AUTHORSHIP_SESSION_MISMATCH
             ? "authorship_wrong_conversation"
@@ -17518,7 +14103,7 @@ export class SessionNodeManager {
         verifiedSignerUnmatched = authorship.senderPubkey;
       }
       if (s2Cbor instanceof Uint8Array) {
-        const ordering = this.#recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
+        const ordering = this.#refusals.recordFrameOrdering(agentName, sessionId, s1Cbor, s2Cbor, contentHash, correlationId);
         if (ordering.fatal) {
           await this.#freezeOnIdentityFailure(agentName, sessionId, ordering.fatal.reason, correlationId);
           return;
@@ -17579,7 +14164,7 @@ export class SessionNodeManager {
          * That is the path this unit exists for: a conversation that ran while the relay was down is
          * precisely the one whose order gets disputed later.
          */
-        this.#noteReceivedFromCounterparty(agentName, sessionId, contentHash);
+        this.#authorship.noteReceivedFromCounterparty(agentName, sessionId, contentHash);
         /**
          * 033-ACKEMIT review F1 — ACKNOWLEDGE WHAT ARRIVED, HERE, not when the relay gets round to
          * delivering its copy back to us.
@@ -17629,7 +14214,7 @@ export class SessionNodeManager {
            */
           const framedKind = frame["leaf_kind"];
           if (typeof framedKind !== "number") {
-            this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
+            this.#refusals.refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
               detail: "leaf_kind_absent",
             }, correlationId);
             return;
@@ -18418,37 +15003,18 @@ export class SessionNodeManager {
     void this.#rebuildStandingReceiver(agentName);
   }
 
-  /**
-   * DOD-PARK-DRAIN-1: the backstop sweep — every agent holding a standing receiver gets a drain
-   * every #parkedDrainBackstopMs, whether or not anything happened.
-   *
-   * The trigger-driven drains (agent start, receiver rebuild, signaling reconnect) are what
-   * actually deliver. This exists because the incident was a MISSING trigger, and a missing
-   * trigger is invisible: the daemon looked healthy, the content was intact on the relay, and the
-   * only thing that ever moved it was a human restarting the daemon. With the sweep, the worst a
-   * future gap in trigger coverage can cost is one interval of latency. Safe by construction —
-   * ingest is deduped and the relay is delete-on-confirm, so a redundant drain pulls nothing.
-   */
-  #parkedDrainBackstopTick(now: number): void {
-    if (this.#parkedDrainHook === null) return;
-    if (now - this.#parkedDrainLastBackstopAt < this.#parkedDrainBackstopMs) return;
-    this.#parkedDrainLastBackstopAt = now;
-    for (const agentName of this.#standingReceivers.keys()) {
-      if (!this.#agentsWantingReceiver.has(agentName)) continue; // agent went offline
-      this.#fireParkedDrain(agentName, "periodic_backstop");
-    }
-  }
+
 
   /** Start the reservation watchdog (idempotent). Stopped by gracefulShutdown. */
   #startReservationWatchdog(): void {
     if (this.#reservationWatchdog !== null) return;
     // Arm the backstop clock from the START of watching, not from the epoch — otherwise the first
     // tick always fires a sweep on top of the install drain that just ran.
-    this.#parkedDrainLastBackstopAt = Date.now();
+    this.#park.armBackstopClock(Date.now());
     this.#reservationWatchdog = setInterval(() => {
       try {
         this.#reservationWatchdogTick();
-        this.#parkedDrainBackstopTick(Date.now());
+        this.#park.parkedDrainBackstopTick(Date.now());
       } catch (err: unknown) {
         this.#logger.warn("session.standing_receiver.watchdog.failed", { error: extractErrorMessage(err) });
       }
@@ -19121,7 +15687,7 @@ export class SessionNodeManager {
     // lost reservation, and the auth_ok rebuild), because the defect this closes was a trigger
     // hooked to the wrong connection: content parks when the RELAY link dies, and the drain was
     // waiting on DIRECTORY SIGNALING to reconnect — which it never had to, having never dropped.
-    this.#fireParkedDrain(agentName, "standing_receiver_ready");
+    this.#park.fireParkedDrain(agentName, "standing_receiver_ready");
     return { outcome: "installed" };
   }
 
@@ -19947,7 +16513,7 @@ export class SessionNodeManager {
     // have delivered this content anyway. So this is an accelerator, not a rescue — worth having,
     // and worth describing accurately. (The send path deliberately does not fire one: the same
     // backstop covers it, at a cost of at most one interval.)
-    this.#fireParkedDrain(agentName, "session_revived");
+    this.#park.fireParkedDrain(agentName, "session_revived");
     return { ok: true };
   }
 
@@ -20245,7 +16811,7 @@ export class SessionNodeManager {
       // which is a status the seal gate still acts on, so the fact was forgotten while it was still
       // load-bearing. A terminal status is the one point at which no future close can be refused,
       // so the flag has nothing left to protect.
-      this.#diverged.delete(this.#k(agentName, sessionId));
+      this.#records.clearDivergedMemo(agentName, sessionId);
       // DURABLE too (DOD-M15-DIVERGE-DURABLE-1) — otherwise a sealed session comes back after a
       // restart still carrying a refusal for a close that can no longer happen.
       // (agent_id, session_id) — see markSessionDiverged. Unkeyed, one side sealing cleared the

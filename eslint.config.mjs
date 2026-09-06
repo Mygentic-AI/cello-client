@@ -17,6 +17,28 @@ export default [
     rules: {
       ...tsPlugin.configs.recommended.rules,
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
+      // ─── THE RATCHET (036-GODFILE) — a file this big stops being reviewable ────────────────────
+      //
+      // WHY A CEILING AT ALL, because the argument is a measurement and not a preference. In
+      // mid-July nine commits took `daemon.ts` apart, from ~6.5k lines to 2,081 on 14 July. It is
+      // 6,080 today — fully regrown in under two months, because nothing stood in the way. A split
+      // with no ratchet behind it buys about six weeks. This rule is what stands in the way.
+      //
+      // 3,000 IS MEASURED, NOT CHOSEN. The largest production file that is not grandfathered below
+      // is `document-handlers.ts` at 2,415, so 3,000 is a real cap with working headroom rather
+      // than a number that fits whatever exists. It sits deliberately BELOW 036-GODFILE's own
+      // 4,000 pass bar, so the target of that split lands inside the ordinary ceiling instead of
+      // needing a permanent exemption. No test file exceeds it either (largest: 2,248), so tests
+      // are covered by the same rule — one mechanism, per the pattern this file already follows.
+      //
+      // ⚠️ COMMENTS AND BLANK LINES COUNT, AND THAT IS THE DELIBERATE TRADE. `skipComments` is
+      // tempting here: half of `session-node-manager.ts` is prose, that prose is an asset, and this
+      // rule charges for it. It stays off anyway, because the status line for the split is
+      // `wc -l` — if the rule counted a different number than the command everyone runs, the two
+      // would disagree at exactly the moment someone is deciding whether a file passed. One
+      // measure. If a file is genuinely large because of load-bearing prose, split it into modules
+      // that each carry their own prose; that is the outcome this rule is for.
+      "max-lines": ["error", { max: 3000, skipBlankLines: false, skipComments: false }],
       // CELLO uses SQLCipher for local storage. Period. `node:sqlite` writes PLAINTEXT to disk and
       // is an experimental Node builtin, so importing it (a) silently drops encryption-at-rest and
       // (b) makes Node print `ExperimentalWarning: SQLite` on every command, on every Node < 24.
@@ -76,6 +98,32 @@ export default [
       "core/daemon/src/identity-migration.ts",
     ],
     rules: { "no-restricted-imports": "off" },
+  },
+  {
+    // ─── GRANDFATHERED SIZE — TWO ENTRIES, AND BOTH ONLY EVER SHRINK ───────────────────────────
+    //
+    // Same contract as the KNOWN DEBT list above: a visible allowlist, no second mechanism, and a
+    // number that is never raised. Raising one of these is not a fix; it is the regrowth this rule
+    // exists to catch, spelled with a config change.
+    //
+    //   - session-node-manager.ts — 036-GODFILE's subject. LOWER THIS NUMBER AFTER EVERY PART
+    //       LANDS. The rule is what holds the ground each part takes: without it the file can drift
+    //       back between parts and nothing notices. When the split is finished the number is set to
+    //       the final size, which is below the ordinary 3,000 ceiling — so this entry ends up
+    //       STRICTER than the default, which is the point of a ratchet.
+    //   - daemon.ts — OWED, and explicitly not 036-GODFILE's work. It needs the same treatment for
+    //       the same reason: it is the file that already proved a split without a ratchet does not
+    //       hold. It is grandfathered here only so this rule can land today instead of waiting on a
+    //       second refactor. (`directory-node.ts`, ~7.4k lines, is the third of these and lives in
+    //       the trustless-cello repo, outside this config's reach — no gate here keeps a precise
+    //       count of it true, so it is deliberately given as a magnitude rather than a figure that
+    //       silently rots.)
+    files: ["core/daemon/src/session-node-manager.ts"],
+    rules: { "max-lines": ["error", { max: 16934, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["core/daemon/src/daemon.ts"],
+    rules: { "max-lines": ["error", { max: 6080, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],
