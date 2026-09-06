@@ -16569,7 +16569,21 @@ export class SessionNodeManager {
         " Their build is older than yours and does not say what it has received. Ask which version " +
         "they are running and tell them to upgrade — only they can fix it, and this will keep " +
         "happening until they do."
-      : reason === AUTHORSHIP_ACK_HASH_MISMATCH || reason === AUTHORSHIP_ACK_HASH_UNKNOWN
+      /**
+       * ⚠️ THESE TWO SHARED ONE SENTENCE, AND THE TEST THAT WAS MEANT TO CATCH THAT COULD NOT SEE
+       * IT — `DOD-M15-SELFCHAIN-1`.
+       *
+       * The file's thesis is "three causes, three sentences", and it compared ABSENT against
+       * MISMATCH and stopped. Mismatch and unknown-content shared a remedy the whole time; the pair
+       * was never compared, so the defect the test existed for was live inside it.
+       *
+       * They are not the same situation. A MISMATCH means you both agree a message sits at that
+       * position and disagree about which one — a record that has drifted. UNKNOWN CONTENT means
+       * they are acknowledging something this side never held at all, which is the shape of content
+       * being attributed to you that you did not send. The second is the more serious reading and
+       * the operator's next move differs, so it gets its own sentence.
+       */
+      : reason === AUTHORSHIP_ACK_HASH_MISMATCH
       ? "STOPPED ON PURPOSE, and this is NOT about their signature or their version — both are " +
         "fine. " +
         (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
@@ -16577,6 +16591,14 @@ export class SessionNodeManager {
         "them. Confirm with them OUT OF BAND what they actually received from you. If it matches " +
         "what you sent, this was a fault and a new session will clear it; if it does not, do not " +
         "carry on in this one."
+      : reason === AUTHORSHIP_ACK_HASH_UNKNOWN
+      ? "STOPPED ON PURPOSE, and this one is more serious than a record that has drifted. " +
+        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
+        " They are acknowledging a message from you that this side has NEVER held — not at that " +
+        "position, not anywhere. Either their record contains something you did not send, or " +
+        "yours is missing something you did. Ask them OUT OF BAND to read you back what they " +
+        "believe you sent. Do not continue this conversation until you know which of the two it " +
+        "is: carrying on writes their version into the receipt."
       : "STOPPED ON PURPOSE. This copy was refused and the message itself was not kept. " +
       // Review F2: chosen from what THIS machine can do, not asserted. An agent with no identity
       // key cannot open a mailbox copy either, and telling them to wait for one would be the same

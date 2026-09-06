@@ -23,7 +23,7 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
-import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSION_V2 } from "@cello-protocol/protocol-types";
+import { encodeCbor, encodeStructure1, computeGenesisPrevRoot, STRUCTURE1_VERSION } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent, buildRelayAckTbs } from "@cello-protocol/crypto";
 import { AgentRelayClient, LEAF_KIND_MSG } from "../session-relay-client.js";
 import { makeFakeRelay, tick, noopLogger } from "./relay-client-fake.js";
@@ -76,7 +76,7 @@ async function sentFrames(node: CelloNode | null): Promise<Array<Record<string, 
 }
 
 function ackHash(arr: unknown[]): Uint8Array {
-  expect(arr.length, "v2 is SEVEN fields — six means the emitter was reverted").toBe(7);
+  expect(arr.length, "the one layout is EIGHT fields — fewer means an emitter was reverted to a shape that no longer exists").toBe(8);
   expect(arr[6], "index 6 must be the 32-byte ack hash").toBeInstanceOf(Uint8Array);
   return arr[6] as Uint8Array;
 }
@@ -162,7 +162,7 @@ async function submittedStructure1(opts: { genesis?: Uint8Array; deliverFirst?: 
 }
 
 describe("033-ACKEMIT — production EMITS what it saw", () => {
-  it("★ every submit is a SEVEN-field, VERSION 2 Structure 1 — the shape, read off the wire", async () => {
+  it("★ every submit is the EIGHT-field Structure 1, carrying BOTH chain links — read off the wire", async () => {
     /**
      * The load-bearing emitter test. Revert `lastSeenHash` out of the encode call in
      * `#doSubmitOnce` and this reddens on `arr.length` and on `arr[0]`.
@@ -174,10 +174,15 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
      */
     const { arr, result } = await submittedStructure1({ genesis: GENESIS });
     expect(result.ok, `the submit itself must succeed: ${result.reason}`).toBe(true);
-    expect(arr.length, "v2 is SEVEN fields — six means the emitter was reverted").toBe(7);
-    expect(arr[0], "the VERSION tag is what tells a reader index 6 is an ack hash, not a submission id").toBe(STRUCTURE1_VERSION_V2);
+    expect(arr.length, "the one layout is EIGHT fields — fewer means an emitter was reverted to a shape that no longer exists").toBe(8);
+    expect(arr[0], "one domain tag, one layout — index 6 is the acknowledgement and index 7 the self link").toBe(STRUCTURE1_VERSION);
     expect(arr[6], "index 6 must be BYTES, not CBOR undefined dressed as a present key").toBeInstanceOf(Uint8Array);
     expect((arr[6] as Uint8Array).length, "a SHA-256 root is exactly 32 bytes — never a prefix").toBe(32);
+    // `DOD-M15-SELFCHAIN-1`: and the SELF link beside it, under the same rule. Asserted separately
+    // from the acknowledgement because two 32-byte fields side by side is exactly where a reader
+    // transposes them and every other assertion still passes.
+    expect(arr[7], "index 7 must be BYTES — the sender's link to their own previous message").toBeInstanceOf(Uint8Array);
+    expect((arr[7] as Uint8Array).length).toBe(32);
   });
 
   it("★ the FIRST message of a session carries the session's GENESIS — the exact bytes, not zeros", async () => {
@@ -231,64 +236,68 @@ describe("033-ACKEMIT — production EMITS what it saw", () => {
     ).not.toBe(Buffer.from(GENESIS).toString("hex"));
   });
 
-  it("★ NO seed ⇒ v1 claiming POSITION ZERO — the one honest emission, and it asserts nothing", async () => {
+  it("★ NO SEED ⇒ NO SEND — the shape that used to be emitted here does not exist", async () => {
     /**
-     * ⚠️ **THE BOUND ON THIS UNIT, PINNED AS A TEST RATHER THAN LEFT IN A COMMENT.**
+     * ⚠️ **THIS TEST WAS INVERTED BY `DOD-M15-SELFCHAIN-1`, AND THE OLD REASONING IS KEPT BECAUSE
+     * IT WAS SOUND AT THE TIME.**
      *
-     * A session registered with no genesis and no assignment to derive one from has nothing to
-     * acknowledge, and the honest claim is `last_seen_seq: 0` with no hash: "I have seen nothing of
-     * yours, and I assert nothing about your content."
+     * It used to assert that a session with no starting point emitted a SIX-field claim —
+     * `last_seen_seq: 0` with no hash, "I have seen nothing of yours, and I assert nothing about
+     * your content." That was honest, it was not the fail-open the unit closed, and refusing there
+     * had been measured as worse: sessions brokered without a relay assignment were treated as real,
+     * and refusing left them unable to be witnessed at all.
      *
-     * That is NOT the fail-open this unit closes. The hole is a claim naming a POSITION with no
-     * content behind it — `last_seen_seq >= 1` and no hash — and the receiving daemon refuses
-     * exactly that, which the receive-side test below pins. This names no position.
+     * Two things changed. There is now ONE Structure 1 layout and both chain links are required, so
+     * the six-field claim cannot be encoded. And a session with no directory assignment was ruled
+     * (2026-09-06) not to be a thing this protocol has — it is refused at the inbound door and
+     * surfaced to the operator, because a conversation with no agreed starting point is one whose
+     * order could never be proven.
      *
-     * An earlier version REFUSED the submit here, and it was wrong for a measurable reason:
-     * sessions brokered without a relay assignment are real (the directory does not always return
-     * one), and refusing left them unable to be witnessed at all — trading a hole this claim does
-     * not have for a failure of the thing the product is for.
+     * So the honest outcome is the opposite of what it was: the send is REFUSED rather than
+     * downgraded. An unlinked message is invisible until the conversation's order is disputed,
+     * which is far too late for anyone to act on.
      */
-    const { arr, result } = await submittedStructure1({ genesis: undefined });
-    expect(result.ok, "the leaf is still witnessed — an unacknowledging claim is not a broken one").toBe(true);
-    expect(arr.length, "SIX fields: there is no hash, and an invented one would be worse than none").toBe(6);
-    expect(arr[0]).toBe(1);
-    expect(arr[4], "and it names NO position, which is what makes the absent hash honest").toBe(0);
+    const { result } = await submittedStructure1({ genesis: undefined });
+    expect(result.ok, "a message that could not be placed in a provable order is not sent").toBe(false);
+    expect(result.ok ? "" : result.reason).toBe("session_unchainable");
   });
 
-  it("★ INDEX 6 IS EXCLUSIVE: a v2 claim carrying a submission id is REFUSED, not coerced", () => {
+  it("★ A MALFORMED LINK IS REFUSED AT THE LAST POINT BEFORE SIGNING, never dropped to a shorter shape", () => {
     /**
-     * `DOD-M15-SUBMIT-ID-1` reserved index 6 for a sender-minted submission id and the relay
-     * tolerates that shape. From this unit index 6 is the ack hash, and the two are mutually
-     * exclusive ON THE WIRE — a length check cannot tell them apart, only the version tag can.
+     * ⚠️ THIS TEST REPLACES "INDEX 6 IS EXCLUSIVE", AND THE REPLACEMENT IS THE WHOLE STORY.
      *
-     * The encoder is the enforcement point: there is no way to ask it for both, so a v2 claim
-     * cannot carry a submission id and a caller that tries gets an exception rather than a frame
-     * whose index 6 means whichever the reader guesses.
+     * That one existed because index 6 had TWO meanings — a sender-minted submission id under one
+     * version tag, an acknowledgement hash under another — and a reader branching on array length
+     * would conflate them. It pinned that the encoder could not be asked for both.
+     *
+     * `DOD-M15-SELFCHAIN-1` deleted every layout but one, so index 6 has a single meaning and the
+     * ambiguity it guarded is gone with the shapes. The submission id was never emitted by any
+     * client; the retry dedup it served now keys on the SIGNED pair (prev_own_hash, content_hash).
+     *
+     * What survives, and is worth keeping, is the encoder's refusal: a link of the wrong width
+     * throws rather than emitting something shorter. That matters more for the SELF link than for
+     * the acknowledgement — a bad acknowledgement surfaces immediately when the counterparty
+     * refuses the message, while a missing self link is invisible in any single message and only
+     * shows up later, as a conversation whose order cannot be proven.
      */
     const senderPubkey = new Uint8Array(32).fill(0x11);
     const sessionId = new Uint8Array(16).fill(0x22);
     const contentHash = new Uint8Array(32).fill(0x33);
+    const ok = { contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000 };
 
-    // A malformed ack hash is REFUSED at the last point before signing — never silently dropped to
-    // v1, which is the downgrade the layout exists to close.
-    expect(() =>
-      encodeStructure1({
-        contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000,
-        lastSeenHash: new Uint8Array(16).fill(0x5b),
-        prevOwnHash: new Uint8Array(32).fill(0xb4),
-      }),
-    ).toThrow(/32 bytes/);
+    expect(() => encodeStructure1({
+      ...ok, lastSeenHash: new Uint8Array(16).fill(0x5b), prevOwnHash: new Uint8Array(32).fill(0xb4),
+    })).toThrow(/last_seen_hash must be 32 bytes/);
 
-    // And the shapes stay distinguishable: v1 six fields, v2 seven with the version saying so.
-    const v1 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000
-,
-      lastSeenHash: new Uint8Array(32).fill(0xa7),
-      prevOwnHash: new Uint8Array(32).fill(0xb4), })) as unknown[];
-    const v2 = decode(encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq: 1, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x44)
-,
-      prevOwnHash: new Uint8Array(32).fill(0xb4), })) as unknown[];
-    expect([v1.length, v1[0]]).toEqual([6, 1]);
-    expect([v2.length, v2[0]]).toEqual([7, 2]);
+    expect(() => encodeStructure1({
+      ...ok, lastSeenHash: new Uint8Array(32).fill(0xa7), prevOwnHash: new Uint8Array(16).fill(0x5b),
+    })).toThrow(/prev_own_hash must be 32 bytes/);
+
+    // And the one good shape is the one layout: eight fields under the one domain tag.
+    const good = decode(encodeStructure1({
+      ...ok, lastSeenHash: new Uint8Array(32).fill(0xa7), prevOwnHash: new Uint8Array(32).fill(0xb4),
+    })) as unknown[];
+    expect([good.length, good[0]]).toEqual([8, 3]);
   });
 });
 
@@ -324,8 +333,8 @@ describe("033-ACKEMIT — the OTHER production emitter: an unwitnessed send", ()
     expect(frame, "the send must reach the wire for this to prove anything").toBeDefined();
     const arr = decode(frame!["structure1_cbor"] as Uint8Array) as unknown[];
 
-    expect(arr.length, "SEVEN fields — six means this emitter was reverted while the other stayed").toBe(7);
-    expect(arr[0]).toBe(STRUCTURE1_VERSION_V2);
+    expect(arr.length, "EIGHT fields — fewer means this emitter was reverted while the other stayed").toBe(8);
+    expect(arr[0]).toBe(STRUCTURE1_VERSION);
     /**
      * THE VALUE, NOT THE SHAPE. The fixture seeds the session's genesis as 0x9c repeated — the
      * value a completed session open leaves — so this names what the claim acknowledges rather than
@@ -439,8 +448,10 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
       lastSeenSeq: 0,
       timestamp: 1_750_000_000_000,
-      lastSeenHash: new Uint8Array(32).fill(0x9c),
-      prevOwnHash: new Uint8Array(32).fill(0xb4),
+      lastSeenHash: GENESIS,
+      // Their FIRST message, so their self link is the session's starting point — the value this
+      // side holds. A placeholder is refused as a broken chain before the acknowledgement is read.
+      prevOwnHash: GENESIS,
     });
     const authorSig = await author.sign(withheld);
 
@@ -608,8 +619,11 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
     const s1 = encodeStructure1({
       contentHash, senderPubkey: authorPub,
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
-      lastSeenSeq: 0, timestamp: 1_750_000_000_000, lastSeenHash: new Uint8Array(32).fill(0x9c),
-      prevOwnHash: new Uint8Array(32).fill(0xb4),
+      lastSeenSeq: 0, timestamp: 1_750_000_000_000, lastSeenHash: GENESIS,
+      // The author's FIRST message, so their self link is the session's starting point. A
+      // placeholder is refused as a broken chain, and the message would never be ingested — which
+      // is the precondition every assertion below rests on.
+      prevOwnHash: GENESIS,
     });
     const sig = await author.sign(s1);
     const s2 = encodeCbor([1, authorPub, contentHash, sig]) as Uint8Array;
@@ -791,7 +805,14 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
    */
   async function deliverClaim(opts: {
     lastSeenSeq: number;
-    lastSeenHash?: Uint8Array;
+    /**
+     * REQUIRED, because the layout is (`DOD-M15-SELFCHAIN-1`). A claim with no acknowledgement is
+     * not a shape this protocol has any more, so a fixture cannot build one to deliver — and the
+     * three tests that used to omit it are rewritten below rather than deleted.
+     */
+    lastSeenHash: Uint8Array;
+    /** Their own previous message. Defaults to the session's starting point — their first message. */
+    prevOwnHash?: Uint8Array;
     /** Mark the session diverged before the claim arrives — the state an unwitnessed append leaves. */
     diverged?: boolean;
     /** Leave our own leaf HELD rather than placed, which is what an ahead-of-tail position produces. */
@@ -808,8 +829,18 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
       lastSeenSeq: opts.lastSeenSeq,
       timestamp: 1_750_000_000_000,
-      ...(opts.lastSeenHash ? { lastSeenHash: opts.lastSeenHash } : {}),
-      prevOwnHash: new Uint8Array(32).fill(0xb4),
+      lastSeenHash: opts.lastSeenHash,
+      /**
+       * The counterparty's OWN previous message. This fixture delivers ONE message from them, so
+       * their self link is the session's starting point — the same value this side holds, which is
+       * what makes the receive-side chain check pass and lets these tests measure the
+       * ACKNOWLEDGEMENT rather than the chain.
+       *
+       * ⚠️ IT IS THE FIXTURE'S REAL GENESIS, NOT A STAND-IN. A placeholder here is refused as
+       * `self_chain_mismatch` before the acknowledgement is ever compared, and every test in this
+       * block would then be measuring the wrong guard while still going red for a plausible reason.
+       */
+      prevOwnHash: opts.prevOwnHash ?? GENESIS,
     });
     const signature = await kp.sign(structure1);
 
@@ -905,16 +936,33 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      * would recreate `DOD-M15-AUTHORSHIP-ABSENT-1` one layer down — a bad proof refused and a
      * missing one waved through.
      */
-    const { notice, received } = await deliverClaim({ lastSeenSeq: 1 });
-    expect(notice, "an absent acknowledgement of a real position is not a lenient case").toBeDefined();
-    expect(notice!.reason).toBe("ack_hash_absent");
-    expect(received).toBe(0);
-    expect(notice!.guidance, "the likely cause IS their build here, and only they can fix it").toMatch(/upgrade/i);
     /**
-     * AND THE OTHER TWO MUST NOT SAY THIS. A peer that sends an acknowledgement at all is on a build
-     * NEWER than v1 by construction, so "ask them to upgrade" is impossible as a cause there — which
-     * is exactly what the shared sentence used to tell them.
+     * ⚠️ THE SHAPE THIS TEST WAS WRITTEN AGAINST NO LONGER EXISTS, and that is a stronger outcome
+     * than the check it was pinning.
+     *
+     * It used to deliver a claim naming position 1 with NO acknowledgement, and assert the receiver
+     * refused it as `ack_hash_absent` — the fail-open where an attacker evades a mismatch check by
+     * never supplying a checkable proof.
+     *
+     * `DOD-M15-SELFCHAIN-1` deleted every layout that can express it: there is one Structure 1 and
+     * both links are required, so a claim without an acknowledgement cannot be encoded, cannot be
+     * signed, and cannot reach a receiver. The evasion is closed by construction rather than by a
+     * branch — which is why the assertion moved to the encoder.
+     *
+     * The receiver's `ack_hash_absent` branch is kept and is now unreachable from the wire. That is
+     * deliberate: it is the last line of defence if a shape like this ever returns, and a defence
+     * that costs one comparison is worth keeping even when nothing can trigger it today.
      */
+    expect(() => encodeStructure1({
+      contentHash: wireContentHash(BODY),
+      senderPubkey: new Uint8Array(32).fill(0x11),
+      sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
+      lastSeenSeq: 1,
+      timestamp: 1_750_000_000_000,
+      lastSeenHash: new Uint8Array(0),
+      prevOwnHash: new Uint8Array(32).fill(0xb4),
+    }), "a claim naming a position with no acknowledgement cannot be built at all")
+      .toThrow(/last_seen_hash must be 32 bytes/);
   }, 60_000);
 
   it("★★ a RECEIVED message advances the acknowledgement — not the relay delivering its copy back", async () => {
@@ -944,8 +992,10 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
       contentHash: theirHash, senderPubkey,
       sessionId: Uint8Array.from(Buffer.from(SID, "hex")),
       lastSeenSeq: 0, timestamp: 1_750_000_000_000,
-      lastSeenHash: new Uint8Array(32).fill(0x9c),
-      prevOwnHash: new Uint8Array(32).fill(0xb4),
+      lastSeenHash: GENESIS,
+      // Their FIRST message, so their self link is the session's starting point — the value this
+      // side holds. A placeholder is refused as a broken chain before the acknowledgement is read.
+      prevOwnHash: GENESIS,
     });
     const sig = await kp.sign(s1);
     const s2 = encodeCbor([1, senderPubkey, theirHash, sig]) as Uint8Array;
@@ -1009,22 +1059,35 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      * The previous tests asserted the SHARED name and passed in all three cases, which is what made
      * it invisible. This one asserts they DIFFER.
      */
-    const absent = await deliverClaim({ lastSeenSeq: 1 });
+    /**
+     * ⚠️ ONE OF THE THREE CAUSES IS NO LONGER REACHABLE FROM THE WIRE, and the test says so rather
+     * than quietly dropping to two.
+     *
+     * `ack_hash_absent` needed a claim that names a position and carries no acknowledgement.
+     * `DOD-M15-SELFCHAIN-1` deleted every layout that can express one, so it cannot be built,
+     * signed, or delivered. Its branch and its wording are kept as a last line of defence; what
+     * cannot be asserted any more is its behaviour end to end.
+     *
+     * The two that remain are still compared, because the defect this test was written for was
+     * three causes SHARING one sentence — and two sharing one is the same defect.
+     */
+    // MISMATCH: position 1 exists on this side and holds 0xd1; the claim names 0xd2 for it.
+    const mismatch = await deliverClaim({ lastSeenSeq: 1, lastSeenHash: new Uint8Array(32).fill(0xd2) });
     if (fx) { await fx.cleanup(); fx = null; }
-    const mismatch = await deliverClaim({ lastSeenSeq: 1, lastSeenHash: new Uint8Array(32).fill(0xee) });
+    // UNKNOWN CONTENT: a position this side has never reached at all.
+    const unknown = await deliverClaim({ lastSeenSeq: 999, lastSeenHash: new Uint8Array(32).fill(0xee) });
 
-    expect(absent.notice!.reason).not.toBe(mismatch.notice!.reason);
-    expect(absent.notice!.impact).not.toBe(mismatch.notice!.impact);
-    expect(absent.notice!.guidance).not.toBe(mismatch.notice!.guidance);
+    expect(unknown.notice!.reason).not.toBe(mismatch.notice!.reason);
+    expect(unknown.notice!.impact).not.toBe(mismatch.notice!.impact);
+    expect(unknown.notice!.guidance).not.toBe(mismatch.notice!.guidance);
 
-    // The version remedy belongs to the ABSENT cause and to nothing else.
-    expect(absent.notice!.guidance, "an older build IS the cause here").toMatch(/upgrade/i);
     expect(
       mismatch.notice!.guidance,
       "a peer that sent an acknowledgement is NOT on an older build — sending the operator to ask about a version spends their trust on the wrong question",
     ).not.toMatch(/upgrade/i);
+    expect(unknown.notice!.guidance).not.toMatch(/upgrade/i);
     // And neither one accuses anybody.
-    for (const n of [absent.notice!, mismatch.notice!]) {
+    for (const n of [mismatch.notice!, unknown.notice!]) {
       expect(n.impact + n.guidance, "name what was observed, never a conclusion about the peer").not.toMatch(/malicious|lying|attack/i);
     }
   }, 120_000);
@@ -1088,8 +1151,24 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      * same under-claiming the relay has always allowed, since it refuses a `last_seen_seq` that runs
      * ahead of its counter and never one that lags.
      */
-    const { notice, received } = await deliverClaim({ lastSeenSeq: 0 });
-    expect(notice, `a claim that acknowledges nothing asserts nothing to refuse: ${notice?.reason}`).toBeUndefined();
+    /**
+     * ⚠️ REWRITTEN: THE SHAPE CHANGED, THE RULE DID NOT.
+     *
+     * This used to deliver a claim naming position 0 with NO acknowledgement and assert it was
+     * accepted — the honest under-claim, "I have seen nothing of yours", which asserts nothing
+     * about our messages and so has no check to skip.
+     *
+     * That shape cannot be encoded any more. The rule survives it: a claim naming position 0
+     * carries the session's STARTING POINT as its acknowledgement — a value, never an absence — and
+     * that is accepted, because it says the same honest thing in the one layout there is.
+     *
+     * **The bound, unchanged:** a peer can still decline to bind by never acknowledging anything
+     * beyond the start. That costs them their own ratification of our history rather than
+     * falsifying it, and is the same under-claiming the relay has always allowed — it refuses a
+     * `last_seen_seq` that runs AHEAD of its counter, never one that lags.
+     */
+    const { notice, received } = await deliverClaim({ lastSeenSeq: 0, lastSeenHash: GENESIS });
+    expect(notice, `a claim that acknowledges only the start asserts nothing to refuse: ${notice?.reason}`).toBeUndefined();
     expect(received, "and the message is delivered").toBe(1);
   }, 60_000);
 });
