@@ -257,7 +257,10 @@ function retryQueueAlters(text: string): string[] {
 
 /** The ALTERs to replay BEFORE the re-key, keyed by table, read live from source. */
 function altersBeforeRekey(): Record<string, string[]> {
-  const manager = readFileSync(join(SRC, "session-node-manager.ts"), "utf8");
+  // 037-SESSIONCORE moved the schema out of session-node-manager.ts into session-schema.ts. The
+  // ALTERs this guard replays are read from where they now live, so the guard cannot end up
+  // parsing a file with no ALTERs in it and passing on an empty replay.
+  const manager = readFileSync(join(SRC, "session-schema.ts"), "utf8");
   const retry = readFileSync(join(SRC, "retry-queue.ts"), "utf8");
   return {
     sessions: literalAlters(manager, "sessions"),
@@ -380,7 +383,7 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
     const alters = altersBeforeRekey();
     expect(
       alters["sessions"]!.length,
-      "no ALTER TABLE sessions ADD COLUMN literals were found in session-node-manager.ts — the " +
+      "no ALTER TABLE sessions ADD COLUMN literals were found in session-schema.ts — the " +
         "parser is reading a shape that no longer exists, and an empty replay is a silent pass",
     ).toBeGreaterThan(5);
     expect(
@@ -419,9 +422,9 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
      * ever written inside a comment this goes red: fix it by not writing SQL in a comment.
      */
     const groundTruth: Record<string, { table: string; file: string }> = {
-      sessions: { table: "sessions", file: "session-node-manager.ts" },
-      contacts: { table: "contacts", file: "session-node-manager.ts" },
-      transcript: { table: "transcript", file: "session-node-manager.ts" },
+      sessions: { table: "sessions", file: "session-schema.ts" },
+      contacts: { table: "contacts", file: "session-schema.ts" },
+      transcript: { table: "transcript", file: "session-schema.ts" },
     };
     for (const [key, { table, file }] of Object.entries(groundTruth)) {
       const raw = readFileSync(join(SRC, file), "utf8");
@@ -606,7 +609,11 @@ describe("DOD-M15-MIGRATION-GUARD-1 — the upgrade preserves DATA in all seven 
      * above silently skipping it and the whole file passing while a column is unguarded.
      */
     const READ_BY_THIS_GUARD: Record<string, string> = {
-      "session-node-manager.ts": "replayed BEFORE the re-key (sessions', and contacts.moniker)",
+      "session-schema.ts":
+        "replayed BEFORE the re-key (sessions', and contacts.moniker). Held by " +
+        "session-node-manager.ts until 037-SESSIONCORE split the schema into its own file; this " +
+        "guard follows the ALTERs rather than the filename, which is why moving them turned it " +
+        "RED instead of silently emptying the replay.",
       "retry-queue.ts": "replayed BEFORE the re-key — its constructor runs later, but on the second boot of an old database the columns are already present",
       "contacts-tier-migration.ts": "deliberately NOT replayed: runs AFTER the re-key, and its columns must NOT be in the pinned DDL — see the grandfather test above",
       "agent-id-migration.ts": "the migration under test; its ALTERs are the rebuild's own",
