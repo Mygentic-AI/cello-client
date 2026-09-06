@@ -123,7 +123,23 @@ export interface SessionNegotiationContext {
  * that the TransportSelector then consumes.
  */
 export type SessionNegotiationResult =
-  | { ok: true; assignment: SessionAssignment }
+  | {
+      ok: true;
+      assignment: SessionAssignment;
+      /**
+       * 038-KEYBIND. The COUNTERPARTY's FROST group public key, hex — the value the initiator
+       * records so a responder-first seal can be verified locally instead of accepted
+       * `signer_key_not_held`.
+       *
+       * IT TRAVELS AS ITS OWN FIELD RATHER THAN BEING READ OFF `assignment` at the call site, and
+       * that is deliberate. The same bytes ride on the frame, but the frame carries them whether or
+       * not anyone checked them. This field only exists on a result that came through
+       * `verifyAssignmentSignature`, which refuses unless the counterparty's own identity key signed
+       * for the key. Pinning a counterparty's permanent trust anchor is exactly the operation that
+       * must not be reachable from an unchecked field.
+       */
+      counterpartyPrimaryHex: string;
+    }
   | { ok: false; reason: string; guidance: string };
 
 /**

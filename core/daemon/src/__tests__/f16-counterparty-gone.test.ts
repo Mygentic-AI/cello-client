@@ -25,7 +25,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { SessionNegotiator } from "../transport-selector.js";
@@ -86,7 +86,10 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
     const dir = join(celloDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   /** Full seam-4 flow: A initiates a real direct session to B; returns both sides. */
@@ -154,7 +157,7 @@ describe("M8B F16: counterparty-gone surfaces on cello_receive and cello_status"
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment };
+        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
       },
     };
     const A = await startDaemon({

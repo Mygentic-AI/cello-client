@@ -222,6 +222,21 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
+    /**
+     * ─── 038-KEYBIND: THE INITIATOR NOW LEARNS THE RESPONDER'S GROUP KEY ────────────────────────
+     *
+     * Only the responder used to record a counterparty group key — it took the initiator's from the
+     * assignment's `signer_pubkey`. The initiator learned nothing, so when the RESPONDER closed the
+     * conversation first, the seal certificate arrived signed by a key this daemon did not hold and
+     * was accepted `verified:false` / `signer_key_not_held`. The receipt for a real conversation was
+     * taken on trust in the channel it came over rather than checked.
+     *
+     * AFTER `createSessionNode`, not before: this is an UPDATE on the session row, and there is no
+     * row until the node is created. The one thing that would make it worse than doing nothing is
+     * writing an unverified key here — so the value comes from the negotiation result, which exists
+     * only once the responder's own identity key has signed for it.
+     */
+    sessionNodeManager.recordCounterpartyPrimary(agentName, sessionId, negotiation.counterpartyPrimaryHex);
     // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
     // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
     // the source of truth for dialability (a NATed node advertises a relay-circuit address; a

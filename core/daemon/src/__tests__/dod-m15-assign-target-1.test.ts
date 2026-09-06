@@ -29,7 +29,7 @@ import { describe, it, expect } from "vitest";
 import { generateKeypair } from "@cello-protocol/crypto";
 import { createOutboundSessions, type OutboundSessionDeps } from "../outbound-sessions.js";
 import { registerInitiateSessionHandler, type InitiateSessionDeps } from "../initiate-session-handler.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger } from "../types.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
@@ -48,11 +48,11 @@ function makeLogger(): { logger: Logger; events: LogEvent[] } {
 const AGENT = "alice";
 const SESSION_ID = new Uint8Array(16).fill(7);
 /** This agent's own K_local identity — what `participant_a` must carry. */
-const OWN_PUBKEY = new Uint8Array(32).fill(0xaa);
+const OWN_PUBKEY = fixtureIdentity().pubkey;
 /** The counterparty the operator actually typed — what `participant_b` must carry. */
-const ASKED_FOR = new Uint8Array(32).fill(0xbb);
+const ASKED_FOR = fixtureIdentity().pubkey;
 /** Somebody else entirely. */
-const IMPOSTOR = new Uint8Array(32).fill(0xcc);
+const IMPOSTOR = fixtureIdentity().pubkey;
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
@@ -64,6 +64,8 @@ interface Harness {
   dials: string[];
   sessionNodesCreated: string[];
   counterpartyConnects: string[][];
+  /** 038-KEYBIND: the responder group keys the initiator pinned, in order. */
+  counterpartyPrimaries: string[];
 }
 
 /**
@@ -115,11 +117,14 @@ async function makeHarness(opts: {
   const dials: string[] = [];
   const sessionNodesCreated: string[] = [];
   const counterpartyConnects: string[][] = [];
+  const counterpartyPrimaries: string[] = [];
 
   const sessionNodeManager = {
     getStandingReceiverInfo: () => ({ peerId: "12D3KooWInitiatorReceiver", addrs: ["/ip4/127.0.0.1/tcp/3"] }),
     getSessionNodePeerId: () => null,
     recordSessionGenesis: () => {},
+    // 038-KEYBIND: the initiator records the responder's group key once the negotiation proved it.
+    recordCounterpartyPrimary: (_agent: string, _sid: string, hex: string) => { counterpartyPrimaries.push(hex); },
     createSessionNode: async (sessionId: string) => {
       sessionNodesCreated.push(sessionId);
       return { ok: true as const };
@@ -177,7 +182,7 @@ async function makeHarness(opts: {
     buildRelayConnectParams: async () => undefined,
   } as unknown as InitiateSessionDeps);
 
-  return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects };
+  return { openSessionAs, events, dials, sessionNodesCreated, counterpartyConnects, counterpartyPrimaries };
 }
 
 /** Every step that would have put bytes on the wire toward the named peer. */

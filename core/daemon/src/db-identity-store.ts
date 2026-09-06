@@ -69,6 +69,10 @@ const CREATE_AGENTS_SQL = `
     reg_ml_dsa_pubkey      TEXT,
     reg_registered_at      INTEGER,
     reg_status             TEXT,
+    -- 038-KEYBIND: hex 64-byte Ed25519 signature by k_local_seed's public half over
+    -- (k_local_pubkey, reg_primary_pubkey). Minted once at the tail of registration — the only
+    -- moment both keys are on this machine together — and never re-derived by a second DKG.
+    reg_key_binding        TEXT,
     -- agent↔user link captured at registration.
     link_agent_id          TEXT,
     link_pre_auth_token    TEXT,
@@ -162,6 +166,13 @@ export function ensureIdentitySchema(db: DaemonDatabase): void {
     if (!cols.some((c) => c.name === "moniker")) {
       // Outbound-name override. Nullable → existing agents keep the agent-name default.
       db.exec("ALTER TABLE agents ADD COLUMN moniker TEXT");
+    }
+    if (!cols.some((c) => c.name === "reg_key_binding")) {
+      // 038-KEYBIND. Nullable, because an operator's existing row cannot grow a signature by a
+      // migration — the value is minted by the daemon holding the seed, on the next registration.
+      // A null here is not tolerated at the protocol boundary: the directory refuses to serve an
+      // assignment without a binding, so an agent with a null column re-registers to get one.
+      db.exec("ALTER TABLE agents ADD COLUMN reg_key_binding TEXT");
     }
   }
   db.exec(CREATE_ACTIVE_NAME_INDEX_SQL);
@@ -387,10 +398,11 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
     primaryPubkey: string;
     mlDsaPubkey: string;
     registeredAt: number;
+    keyBinding: string;
   }): Promise<void> {
     this.#updateRow(
-      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_status = 'active', state = 'registered'",
-      [opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt],
+      "reg_agent_id = ?, reg_primary_pubkey = ?, reg_ml_dsa_pubkey = ?, reg_registered_at = ?, reg_key_binding = ?, reg_status = 'active', state = 'registered'",
+      [opts.agentId, opts.primaryPubkey, opts.mlDsaPubkey, opts.registeredAt, opts.keyBinding],
     );
     this.#logger.info("registration.state.persisted", {
       agentId: opts.agentId,
@@ -465,6 +477,10 @@ export class DbRegistrationPersistence implements DaemonRegistrationPersistence 
       mlDsaPubkey: String(r["reg_ml_dsa_pubkey"]),
       registeredAt: Number(r["reg_registered_at"]),
       status: String(r["reg_status"]),
+      // 038-KEYBIND: null for a row written before this column existed. `String(null)` would hand
+      // callers the four characters "null" as if they were a signature, which is why this is a
+      // typeof check and not the String() every field above uses.
+      keyBinding: typeof r["reg_key_binding"] === "string" ? r["reg_key_binding"] : null,
     };
   }
 

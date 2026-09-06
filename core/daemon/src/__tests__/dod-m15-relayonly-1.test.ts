@@ -289,7 +289,7 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
       resolveCurrentAgent: (_c, explicit) => explicit ?? null,
       NO_CURRENT_AGENT_RESPONSE: { ok: false, reason: "no_current_agent" },
       resolvedSessionNegotiator: {
-        negotiate: async () => ({ ok: true as const, assignment }),
+        negotiate: async () => ({ ok: true as const, assignment, counterpartyPrimaryHex: "11".repeat(32) }),
       } as unknown as SessionNegotiator,
       transportSelector: { dial: async () => ({ ok: true, mode: "relay" }) } as never,
       autoNatService: { getDialability: () => ({ dialable: false }) } as unknown as IAutoNatService,

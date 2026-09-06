@@ -51,6 +51,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import { registerFixtureSigner } from "./helpers/signed-assignment.js";
 
 const CBOR_ENC = new Encoder({ tagUint8Array: false });
 
@@ -231,7 +232,10 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
     const dir = join(celloDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   /**
@@ -263,7 +267,7 @@ describe("M8B FINDING-1: unilateral seal escalation on retry close", () => {
           signature_type: "frost",
           signer_pubkey: new Uint8Array(32),
         };
-        return { ok: true, assignment };
+        return { ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) };
       },
     };
 

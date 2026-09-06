@@ -14,7 +14,7 @@ import { FileKeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -134,8 +134,8 @@ const sid = (n: number) => Uint8Array.from(Array.from({ length: 16 }, (_, i) => 
 describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and without a moniker", () => {
   it("a name buys NO trust: known/unknown, contact membership, and the acceptance bound are unchanged", async () => {
     const h = await startHarness();
-    const nameless = "aa".repeat(32);
-    const named = "bb".repeat(32);
+    const nameless = fixtureIdentity().pubkeyHex;
+    const named = fixtureIdentity().pubkeyHex;
 
     // Two strangers: one offers a name, one does not. Same screening inputs otherwise.
     h.inject(await assignmentFrame(nameless, h.bobPubkey, sid(1)));
@@ -155,7 +155,7 @@ describe("MONIKER-5 AC2 — screening outcomes are byte-identical with and witho
 
   it("AC1: cello_list_sessions and cello_contact_list surface the resolved who", async () => {
     const h = await startHarness();
-    const initiator = "cc".repeat(32);
+    const initiator = fixtureIdentity().pubkeyHex;
 
     h.inject(await assignmentFrame(initiator, h.bobPubkey, sid(1), "Wonderland_Alice"));
     await wait(150);

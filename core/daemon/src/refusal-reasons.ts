@@ -138,6 +138,17 @@ export const REFUSAL_REASONS = {
   /** The inbound assignment failed verification (signature, signer, or shape). */
   INBOUND_ASSIGNMENT_INVALID: "inbound_assignment_invalid",
   /**
+   * 038-KEYBIND — the caller's assignment carried no proof that its threshold key is theirs, or
+   * carried one that does not hold.
+   *
+   * ⚠️ ITS OWN REASON, not folded into INBOUND_ASSIGNMENT_INVALID, because the remedy is different
+   * and the other one's remedy is actively wrong here. "The assignment did not verify" tells the
+   * caller their frame was damaged and to start a new session; a retry cannot produce a binding
+   * that was never minted. What this actually means is that the caller registered against a
+   * directory that predates the proof, and the fix is on their side and is a re-registration.
+   */
+  INBOUND_ASSIGNMENT_KEY_BINDING: "inbound_assignment_key_binding",
+  /**
    * `DOD-M15-SELFCHAIN-1` — a session was offered with NO directory assignment to anchor it.
    *
    * ⚠️ TREATED AS SUSPICIOUS, NOT AS A MISSING OPTIONAL. Every real session is brokered: the
@@ -280,6 +291,14 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "There is nothing for you to retry — the other party holds the session and has been told to " +
     "start a new one. If it repeats for the SAME counterparty, do not accept anything from them " +
     "until you have confirmed out of band that they still control the identity you know them by.",
+  [REFUSAL_REASONS.INBOUND_ASSIGNMENT_KEY_BINDING]:
+    "REFUSED ON PURPOSE. Your session record did not carry the proof that the threshold signing key " +
+    "on it is yours — the signature your own identity key makes over it at registration. Without " +
+    "that, they would be taking a directory's word for which key is yours, and recording it as your " +
+    "identity for every future conversation. Retrying will not produce it. Run cello_status: if your " +
+    "agent registered before this proof existed, re-register it and the proof is minted and " +
+    "published; if it is current, the directory node that brokered this is dropping the field, and " +
+    "another node will serve it.",
 };
 
 /**

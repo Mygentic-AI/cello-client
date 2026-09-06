@@ -13,7 +13,7 @@
  */
 
 import { encodeCbor } from "@cello-protocol/protocol-types";
-import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider } from "@cello-protocol/crypto";
+import { mlDsaKeygen, mlDsaKeygenWithBytes, FileMlDsaKeyProvider, buildKeyBindingTbs } from "@cello-protocol/crypto";
 import type { IThresholdSigner, MlDsaKeyProvider } from "@cello-protocol/crypto";
 import type { RegistrationState } from "@cello-protocol/protocol-types";
 import { NetworkDirectoryNode, runNetworkDkg } from "./network-directory-node.js";
@@ -132,6 +132,7 @@ export class RegistrationManager {
     state: RegistrationState,
     mlDsaPubkeyHex: string,
     mlDsaSecretKeyBlob: Uint8Array | null,
+    keyBinding: string,
   ): Array<() => Promise<void>> {
     const persistence = this.#ctx.persistence!;
     const ops: Array<() => Promise<void>> = [];
@@ -143,8 +144,31 @@ export class RegistrationManager {
       primaryPubkey: state.primary_pubkey,
       mlDsaPubkey: state.ml_dsa_pubkey,
       registeredAt: state.registered_at,
+      keyBinding,
     }));
     return ops;
+  }
+
+  /**
+   * 038-KEYBIND — sign the statement "this FROST group key is mine" with K_local.
+   *
+   * ⚠️ NEVER A RE-DKG. An agent that already exists holds both keys and can produce this on
+   * demand: K_local is on this machine and the group key is either just out of the DKG or handed
+   * back by the directory on `already_registered`. Key refresh preserves the group key
+   * (`session-ceremony.ts` aborts if the primary changes), so the binding is signed once for the
+   * life of the agent — which is why every path that learns a `primary_pubkey` mints one, rather
+   * than only the path that ran a ceremony.
+   *
+   * The signer is a key NO DIRECTORY HOLDS. That is the whole property: the directory carries this
+   * value to the counterparty and cannot forge it, cannot swap it, and cannot lift it onto another
+   * identity — the signed bytes name the K_local it belongs to as well as the group key.
+   */
+  async #mintKeyBinding(kLocalPubkeyHex: string, primaryPubkeyHex: string): Promise<string> {
+    const tbs = buildKeyBindingTbs(
+      new Uint8Array(Buffer.from(kLocalPubkeyHex, "hex")),
+      new Uint8Array(Buffer.from(primaryPubkeyHex, "hex")),
+    );
+    return Buffer.from(await this.#ctx.keyProvider.sign(tbs)).toString("hex");
   }
 
   /**
@@ -237,7 +261,10 @@ export class RegistrationManager {
         // state is persisted whenever persistence is present — NOT gated on the ml-dsa blob (so an
         // already_registered agent is never left durably-unregistered when the blob is absent).
         if (this.#ctx.persistence) {
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
+          // 038-KEYBIND: this agent is already registered, so no ceremony runs — but both keys are
+          // here (K_local locally, the group key in the frame), which is all the binding needs.
+          const keyBinding = await this.#mintKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, keyBinding));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -395,10 +422,25 @@ export class RegistrationManager {
       if (!ok) return { error: "identity_persist_failed" };
     }
 
+    /**
+     * ─── 038-KEYBIND: MINT THE BINDING, THEN HAND IT OVER WITH THE GROUP KEY ────────────────────
+     *
+     * THE TAIL OF REGISTRATION IS THE ONLY MOMENT THIS CAN HAPPEN. At agent creation the group key
+     * does not exist — a FROST DKG's group key is the sum of every participant's commitment, so by
+     * construction it is nobody's existing key. After this frame the ceremony is over. Right here
+     * is the one point where K_local's private half and the finished group key are both on this
+     * machine.
+     *
+     * It rides on `dkg_complete` rather than in a frame of its own so the directory can never hold
+     * a group key it has no binding for: one frame, both values, or neither.
+     */
+    const keyBinding = await this.#mintKeyBinding(kLocalPubkeyHex, dkgPrimaryPubkeyHex);
+
     // Step 5c: send dkg_complete (SignalingManager CBOR/lp-encodes the frame)
     const dkgSent = await this.#ctx.sendSignalingFrame({
       type: "dkg_complete",
       primary_pubkey: dkgPrimaryPubkeyHex,
+      key_binding: keyBinding,
     });
     if (!dkgSent.ok) {
       return { error: dkgSent.reason ?? "directory_unreachable" };
@@ -436,7 +478,10 @@ export class RegistrationManager {
         };
         // SI-003: persist before caching the registered state (see the dkg_ready branch).
         if (this.#ctx.persistence) {
-          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
+          // 038-KEYBIND: the DKG ran but the directory already had a profile, so the group key it
+          // returns is the authoritative one — bind THAT, not the one this run derived.
+          const rebinding = await this.#mintKeyBinding(kLocalPubkeyHex, state.primary_pubkey);
+          const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob, rebinding));
           if (!ok) return { error: "identity_persist_failed" };
         }
         this.#registrationState = state;
@@ -460,7 +505,19 @@ export class RegistrationManager {
     // SI-003: AWAIT the final identity persists before reporting success, and cache the registered
     // state only after they commit — a register-success guarantees a durable identity row.
     if (this.#ctx.persistence) {
-      const ok = await this.#persistAll(this.#identityPersistOps(state, mlDsaPubkeyHex, mlDsaSecretKeyBlob));
+      /**
+       * 038-KEYBIND — RE-MINT AGAINST THE DIRECTORY'S ANSWER, do not reuse the value sent above.
+       *
+       * `register_success` carries the primary_pubkey the directory considers canonical. It is the
+       * same key on every healthy registration, and reusing `keyBinding` would be right in exactly
+       * that case — but if the two ever differ, the stored binding would name a group key this
+       * agent is not actually registered under, and it would verify perfectly while pointing at the
+       * wrong key. Binding what was ANSWERED costs one signature and cannot drift.
+       */
+      const ok = await this.#persistAll(this.#identityPersistOps(
+        state, mlDsaPubkeyHex, mlDsaSecretKeyBlob,
+        primaryPubkey === dkgPrimaryPubkeyHex ? keyBinding : await this.#mintKeyBinding(kLocalPubkeyHex, primaryPubkey),
+      ));
       if (!ok) return { error: "identity_persist_failed" };
     }
     this.#registrationState = state;

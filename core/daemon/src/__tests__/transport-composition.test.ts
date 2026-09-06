@@ -104,7 +104,7 @@ describe("AC-010: composition root wires transport adapters by CELLO_ENV", () =>
 
   /** Stub negotiator: returns a canned assignment (the WIRE-001/SIGNAL-001 seam). */
   function stubNegotiator(assignment: SessionAssignment): SessionNegotiator {
-    return { negotiate: async () => ({ ok: true, assignment }) };
+    return { negotiate: async () => ({ ok: true, assignment, counterpartyPrimaryHex: "11".repeat(32) }) };
   }
 
   async function connectMcp(socketPath: string): Promise<IpcClient> {

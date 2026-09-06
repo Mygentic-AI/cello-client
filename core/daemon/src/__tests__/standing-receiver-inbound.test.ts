@@ -23,7 +23,7 @@ import { createNode } from "@cello-protocol/transport";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -145,7 +145,7 @@ describe("M8B F14 (daemon): inbound accept path ensures the standing receiver; d
       // receiver's door, and the assignment now has to get through it the way a real one does.
       const { frame } = await makeSignedAssignmentFrame({
         sessionId: SID_BYTES,
-        initiatorPubkey: new Uint8Array(32).fill(3),
+        initiatorPubkey: fixtureIdentity().pubkey,
         responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
         initiatorSessionPeerId: "initiator-peer-f14",
         // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.
