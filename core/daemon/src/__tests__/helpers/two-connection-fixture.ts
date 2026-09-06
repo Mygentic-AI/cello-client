@@ -262,11 +262,18 @@ export async function startTwoConnectionFixture(
        * leaves that state empty, and every send on the fixture is then refused for having nothing
        * to chain to — the fixture would exercise a refusal path instead of the behaviour it was
        * written for, which is the failure this seam exists to prevent.
+       *
+       * ⚠️ AND IT IS CALLED AGAIN AFTERWARDS, which is not a belt-and-braces duplicate. The seam
+       * does two things: it holds the value in memory (what the registration above needs) and it
+       * writes it to the session ROW. The row does not exist until `createSessionNode` inserts it,
+       * so the first call's write updates nothing — and a session with an empty column is one whose
+       * chain cannot be resumed after a restart. The second call is what puts it on disk.
        */
       agreeGenesis();
       if (!sessionOpts?.relay) {
         await snm.createSessionNode(sessionId, agent, counterpartyPubkey, peerId, "fixture");
         agreeKey();
+        agreeGenesis();
         return;
       }
       // A REAL keypair, not a stub: the park path signs the entry, and `sealParkEnvelope` is the
@@ -282,6 +289,7 @@ export async function startTwoConnectionFixture(
         sessionIdBytes: Buffer.from(sessionId, "hex"),
       });
       agreeKey();
+      agreeGenesis();
     },
     seedSent(agent, sessionId, text) {
       const snm = handle.getSessionNodeManager();

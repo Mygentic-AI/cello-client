@@ -36,6 +36,7 @@ import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import { LEAF_KIND_DOC } from "../session-relay-client.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
@@ -127,6 +128,12 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
 
+    // Both sides agree the session's starting point before either builds its node — see
+    // `helpers/session-genesis.ts` for why the order and the sharing are both load-bearing.
+    agreeSessionGenesis(SID, [
+      { mgr: A.manager, agentName: "alice" },
+      { mgr: B.manager, agentName: "bob" },
+    ]);
     const created = await A.manager.createSessionNode(SID, "alice", bobPub, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");

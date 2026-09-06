@@ -246,8 +246,21 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
    */
   function opener(relayOnly: string | null, counterpartyAddrs: string[]) {
     const dialled: string[][] = [];
+    /**
+     * ⚠️ THE PARTICIPANTS AND THE TIMESTAMP ARE NOT DECORATION — `DOD-M15-SELFCHAIN-1`.
+     *
+     * They were absent, because nothing in this file read them. The handler now derives the
+     * session's chain starting point from exactly these four values and records it, so an
+     * assignment without them is a shape production never produces: the negotiator verifies the
+     * directory's threshold signature over a to-be-signed structure built from them, and an
+     * assignment missing one could not have got past that check. This fixture stubs the negotiator,
+     * which is what let an impossible shape reach the handler.
+     */
     const assignment = {
       session_id: new Uint8Array(32).fill(0xab),
+      participant_a: { pubkey: new Uint8Array(32).fill(0xa1) },
+      participant_b: { pubkey: new Uint8Array(32).fill(0xb2) },
+      session_timestamp: 1_750_000_000_000,
       counterparty_session_peer_id: "12D3KooWTheirs",
       counterparty_session_addrs: counterpartyAddrs,
       counterparty_pubkey: "cd".repeat(32),
@@ -260,6 +273,8 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
       // which is what the off-path test below needs in order to be testing what it claims.
       hasDatabase: () => true,
       createSessionNode: async () => ({ ok: true }),
+      // The handler records the session's chain starting point right after the node is created.
+      recordSessionGenesis: () => {},
       connectToCounterparty: async (_a: string, _s: string, addrs: string[]) => {
         dialled.push(addrs);
         return { ok: true };
