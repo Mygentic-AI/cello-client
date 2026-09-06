@@ -132,6 +132,24 @@ const SIGNED_ENVELOPE_VERSIONS = new Set<number>([
   PARK_ENVELOPE_VERSION_S1SIG,
 ]);
 
+/**
+ * ⚠️ **REFUSING EVERY NON-v4 ENVELOPE WAS TRIED HERE AND IS THE WRONG RULE — recorded so it is not
+ * tried again.**
+ *
+ * The compatibility argument for keeping v2/v3 IS void: CELLO is alpha with no users, and there is
+ * no mail anywhere predating this build. But the version is not what matters, and refusing on it
+ * broke thirty-three tests for a reason worth keeping: **v2 is also what this build emits for its
+ * own paths that have no ordering claim to sign** — the direct-retry enqueue, and any park of
+ * content that was never witnessed and never framed.
+ *
+ * The property that actually matters is whether a recovered message can EVER enter a receipt, and
+ * that is decided by what the envelope carries, not by its version number. The rule therefore lives
+ * at park recovery (`session-node-manager`), where both halves are visible: an envelope with no
+ * relay ordering record AND no signature over its ordering claim is refused, because it is a
+ * message that is readable and permanently unnotarizable — which is the withholding attack's whole
+ * shape on this route.
+ */
+
 export interface ParkEnvelope {
   /** 1 = legacy/unsigned (bare content or the pre-SEC-1 shape). 2 = signed. */
   version: number;

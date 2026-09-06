@@ -276,6 +276,12 @@ const REKEY_TARGETS: readonly RekeyTarget[] = [
         content_hash_hex TEXT,
         structure1_cbor BLOB,
         structure2_cbor BLOB,
+        -- 034-CARRYLEAF. Same trap as every column above, and the consequence here is the
+        -- withholding hole re-opening on the one boot a legacy database upgrades: a re-parked
+        -- message would reach its recipient with no signature over its ordering claim and no leaf
+        -- domain, so they could read it and never witness it, and it could never enter a receipt.
+        structure1_sig BLOB,
+        leaf_kind INTEGER,
         content_hash_alg TEXT
       )`,
     indexSql: (t) => [

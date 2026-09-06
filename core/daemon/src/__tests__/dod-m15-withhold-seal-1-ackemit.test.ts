@@ -654,21 +654,43 @@ describe("034-CARRYLEAF — a message its sender never witnessed is witnessed by
       }
     };
 
+    /** The refusal reason a frame gets, or `undefined` when it was accepted. */
+    const refusalFor = async (withLeafKind: boolean): Promise<string | undefined> => {
+      const f = await startTwoConnectionFixture({ dirPrefix: "cello-carryleaf-refuse-" });
+      try {
+        await f.createSession(SID, "alice", Buffer.from(authorPub).toString("hex"), PEER);
+        await f.snm.handleContentFrameForTest(
+          "alice", SID,
+          inboundFrame({ structure1_cbor: s1, sender_signature: sig, ...(withLeafKind ? {} : { leaf_kind: undefined }) }),
+          PEER,
+        );
+        await new Promise((r) => setTimeout(r, 200));
+        return f.snm.takeContentRefusals("alice", SID, "op")[0]?.reason;
+      } finally {
+        await f.cleanup();
+      }
+    };
+
     expect(await attempts(false), "a withheld message MUST be witnessed by its receiver").toBe(1);
     expect(await attempts(true), "one its sender already witnessed must NOT be re-submitted").toBe(0);
     /**
-     * ⚠️ **AND A PEER TOO OLD TO NAME THE LEAF DOMAIN IS LEFT ALONE — review F5, and it is a real
-     * bound on when this attack is closed.**
+     * ⚠️ **A FRAME THAT NAMES NO LEAF DOMAIN IS REFUSED, and the lenient version of this was the
+     * exploit path.**
      *
-     * A leaf kind selects a HASH DOMAIN. Witnessing their leaf under a guessed one would put a
-     * wrong statement in the canonical record, which is worse than leaving a gap the seal can name.
-     * The consequence, stated rather than buried: **withholding is only closed between two peers
-     * that both carry this build.**
+     * It used to deliver the message and merely decline to witness it, "because a peer too old to
+     * send the field should be left alone". That sentence was inherited from a compatibility
+     * argument that does not apply — CELLO is alpha with no users, and there is no older peer. What
+     * the leniency bought was an opt-out: emit the shape an earlier build emitted and your message
+     * is delivered AND permanently unwitnessable, which is the withholding this line exists to
+     * stop, reachable by anyone willing to modify their client.
+     *
+     * A leaf kind selects a HASH DOMAIN, so guessing one is not an option either. Refused is the
+     * only remaining answer, and it costs nothing real: every current sender names it.
      */
     expect(
-      await attempts(false, false),
-      "a frame that does not say which domain its leaf belongs to is NOT witnessed on a guess",
-    ).toBe(0);
+      await refusalFor(false),
+      "a frame that does not say which domain its leaf belongs to does not get in at all",
+    ).toBe("authorship_proof_unusable");
   }, 120_000);
 });
 
@@ -782,6 +804,9 @@ describe("033-ACKEMIT — what the operator is told when the RELAY refuses", () 
 function inboundFrame(fields: Record<string, unknown>): Uint8Array {
   return lp.encode.single(encodeCbor({
     type: "content_frame",
+    // 034-CARRYLEAF: production names the leaf DOMAIN on every content frame, and a frame without
+    // one is refused — witnessing under a guessed domain puts a wrong statement in the record.
+    leaf_kind: LEAF_KIND_MSG,
     session_id: SID,
     content_hash: wireContentHash(BODY),
     content_bytes: sealSessionContent(CONTENT_KEY, BODY),

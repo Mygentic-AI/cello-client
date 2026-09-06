@@ -633,7 +633,7 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  function makeManager(dbName: string) {
+  function makeManager(dbName: string, opts: { respreadEveryMs?: number } = {}) {
     const { logger, events } = makeLogger();
     const manager = new SessionNodeManager({
       securityGateway: new PassthroughGatewayClient(),
@@ -641,6 +641,10 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       logger,
       dbPath: join(tempDir, dbName),
       standingReceiverWatchdogIntervalMs: 250,
+      // The re-spread rides this clock deliberately — a reservation is scarce, so a decayed agent
+      // re-asks on the reservation retry interval and not on the watchdog's grid. Five minutes in
+      // production; a test that waited that out would just be a test nobody runs.
+      ...(opts.respreadEveryMs !== undefined ? { standingReceiverReservationRetryMs: opts.respreadEveryMs } : {}),
     });
     return { manager, events };
   }
@@ -773,6 +777,51 @@ describe("W: a standing receiver that LOSES its reservation gets another one", (
       try { await dying.node.stop(); } catch { /* already stopped */ }
     }
   }, 120_000);
+
+  it("W1c: an IDLE agent holding fewer relays than it was offered takes the rest — no ratchet", async () => {
+    /**
+     * THE RATCHET, and it is the difference between this mechanism being true and being true for a
+     * while. Relays are spread when a receiver is BUILT and only ever lost in between: a running
+     * node cannot retake a lost circuit, and a relay announced later is skipped while any circuit is
+     * held. An agent in conversation re-spreads constantly — the receiver is handed into each
+     * session and a fresh one built behind it — so this is about the agent nobody has talked to for
+     * a day. It loses relays one at a time and ends up exactly where this unit found it: reachable
+     * through one relay, one relay away from being reachable through none.
+     *
+     * Driven here by ANNOUNCING a relay after the fact rather than killing one, because that is the
+     * same decay with a cleaner cause and it pins the other half — a pool that grows is picked up.
+     */
+    const first = await startHopRelay();
+    const later = await startHopRelay();
+    const { manager, events } = makeManager("w1c.db", { respreadEveryMs: 1_000 });
+    await manager.initialize();
+    try {
+      await seedAgents(manager.getDb(), ["alice"]);
+      manager.setDirectoryRelayEndpoints("alice", [{ relayPeerId: first.peerId, relayAddrs: [first.addr] }]);
+      await manager.ensureStandingReceiverForAgent("alice");
+      expect(await waitUntil(() => (manager.getStandingReceiverInfo("alice")?.addrs ?? [])
+        .some((a) => a.includes(`/p2p/${first.peerId}/p2p-circuit`)), 45_000)).toBe(true);
+
+      // A second relay appears in the pool. Nothing asks for anything; the agent is idle.
+      manager.setDirectoryRelayEndpoints("alice", [
+        { relayPeerId: first.peerId, relayAddrs: [first.addr] },
+        { relayPeerId: later.peerId, relayAddrs: [later.addr] },
+      ]);
+
+      expect(
+        await waitUntil(() => (manager.getStandingReceiverInfo("alice")?.addrs ?? [])
+          .filter((a) => a.includes("/p2p-circuit")).length === 2, 60_000),
+        "an idle agent holding fewer relays than it was offered rebuilds to take the rest — " +
+          "otherwise the count only ever falls and the spread decays back to a single relay",
+      ).toBe(true);
+      expect(events.some((e) => e.event === "session.standing_receiver.respread")).toBe(true);
+      expect(manager.isRelayCarvedOutInbound("alice", later.peerId), "and the new one earns its carve-out").toBe(true);
+    } finally {
+      await manager.gracefulShutdown();
+      await first.node.stop();
+      await later.node.stop();
+    }
+  }, 180_000);
 
   it("W1b: the LAST reservation dies → zero held → the receiver IS rebuilt", async () => {
     // The other half of the count, and the half W1 no longer covers. Holding none is not a

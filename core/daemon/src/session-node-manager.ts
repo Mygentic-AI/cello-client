@@ -1716,6 +1716,8 @@ export class SessionNodeManager {
   /** The reason the last reservation attempt was refused, per agent — captured at the rejection so
    *  the retry and give-up can name a CAUSE instead of only their own exit point. */
   readonly #srLastRejectionReason = new Map<string, string>();
+  /** 032-RELAYSPREAD: when this agent's receiver was last re-spread, so it never rides the 30s grid. */
+  readonly #srLastRespreadAt = new Map<string, number>();
   readonly #srReservationRetry = new Map<string, { attempts: number; nextAt: number; correlationId: string; lastReason?: string }>();
   #reservationWatchdog: ReturnType<typeof setInterval> | null = null;
   /** DOD-PARK-DRAIN-1: how often the backstop drain rides the watchdog grid — see #parkedDrainBackstopTick. */
@@ -2257,7 +2259,7 @@ export class SessionNodeManager {
   // `persisted` delivery ACK on the same /cello/content/1.0.0 protocol. A persisted ACK cancels the
   // timer (content.delivery.acked); TTF expiry hands the content to the park backstop.
   // Keyed sessionId → contentHashHex → entry.
-  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string }>>();
+  #awaitingAck = new Map<string, Map<string, { timer: ReturnType<typeof setTimeout>; content: Uint8Array; correlationId?: string; structure1Cbor?: Uint8Array; structure2Cbor?: Uint8Array; contentHashAlg?: string; structure1Signature?: Uint8Array; leafKind?: number }>>();
   // TTF (time-to-flush) for an un-acked content entry. Injectable so tests can drive
   // expiry deterministically; production default sits in the Part-4 proposed 10–30s band.
   #contentTtfMs = 20_000;
@@ -2270,7 +2272,7 @@ export class SessionNodeManager {
   // Injected after construction because RetryQueue is built later in daemon.ts.
   #onSessionTerminal: ((sessionId: string, terminalStatus: "sealed" | "abandoned") => void) | null = null;
   #onAwaitingPersisted: ((agentName: string, sessionId: string, contentHashHex: string) => void) | null = null;
-  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void) | null = null;
+  #onAwaitingTtf: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void) | null = null;
   // M12-P12 verification: force the next N park deposits to be REFUSED, so the failure this unit
   // fixes can be produced on demand instead of waited for. The real failure is a race — the deposit
   // is refused only in the seconds-long window while the sender's standing receiver rebuilds — and
@@ -2344,7 +2346,7 @@ export class SessionNodeManager {
   // M12-P13 (review HIGH-1): returns whether the content is ACTUALLY queued. `false` means the
   // queue dropped it (today: the content-derived dedupe key collided), and the caller must then not
   // claim durability — nor commit the leaf that claim now authorises.
-  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean) | null = null;
+  #onParkFailed: ((agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean) | null = null;
   /**
    * MSG-001-3b (2b): the live content-park deposit. The manager resolves the recipient + relay
    * endpoint from the session entry and calls this when a send is NOT confirmed delivered
@@ -2452,8 +2454,8 @@ export class SessionNodeManager {
    */
   setAwaitingAckHooks(hooks: {
     onPersisted?: (agentName: string, sessionId: string, contentHashHex: string) => void;
-    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => void;
-    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string) => boolean;
+    onTtf?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => void;
+    onParkFailed?: (agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, structure1Cbor?: Uint8Array, structure2Cbor?: Uint8Array, contentHashAlg?: string, structure1Signature?: Uint8Array, leafKind?: number) => boolean;
   }): void {
     this.#onAwaitingPersisted = hooks.onPersisted ?? null;
     this.#onAwaitingTtf = hooks.onTtf ?? null;
@@ -7105,6 +7107,7 @@ export class SessionNodeManager {
     this.#standingReceivers.clear();
     this.#srReservationRetry.clear();
     this.#srLastRejectionReason.clear();
+    this.#srLastRespreadAt.clear();
 
     // Release the SQLite handle so the DB file is no longer held open after shutdown
     // (review L5). Queries guard on `#db === null` and degrade to empty/null.
@@ -9238,7 +9241,9 @@ export class SessionNodeManager {
        *
        * So the session key encrypts the copy that goes ON THE WIRE, below, and nothing else.
        */
-      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, orderingS1, orderingS2, contentHashAlg);
+      // 034-CARRYLEAF: the SIGNED claim and its domain ride the awaiting entry, so a message that
+      // ends up re-parked after a restart still reaches its recipient in a shape they can witness.
+      this.#trackAwaitingAck(agentName, sessionId, content, contentHash, correlationId, frameS1 ?? orderingS1, orderingS2, contentHashAlg, frameSig, leafKind);
       /**
        * THE WIRE COPY. `content_hash` above was computed over the PLAINTEXT and stays that way: the
        * transcript, the seal and the salted hash all depend on it meaning what it means today, and
@@ -13132,7 +13137,7 @@ export class SessionNodeManager {
    * route reads this map, and a v2 envelope omits the field entirely whenever the value is `sha256`,
    * which is every value in play today. That re-opened the exact finding the fix closed.
    */
-  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined): void {
+  #trackAwaitingAck(agentName: string, sessionId: string, content: Uint8Array, contentHash: Uint8Array, correlationId: string | undefined, structure1Cbor: Uint8Array | undefined, structure2Cbor: Uint8Array | undefined, contentHashAlg: string | undefined, structure1Signature?: Uint8Array, leafKind?: number): void {
     const hashHex = Buffer.from(contentHash).toString("hex");
     const ackKey = this.#k(agentName, sessionId);
     let bySession = this.#awaitingAck.get(ackKey);
@@ -13149,7 +13154,7 @@ export class SessionNodeManager {
     // B2b-1 review F2: the algorithm rides WITH the entry. The TTF-expiry park route reads this map
     // minutes later, in-process, and without it that copy names nothing (= sha256) while the direct
     // frame named something else — the same message, two claims about what it is, no restart needed.
-    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor, contentHashAlg });
+    bySession.set(hashHex, { timer, content, correlationId, structure1Cbor, structure2Cbor, contentHashAlg, structure1Signature, leafKind });
   }
 
   /**
@@ -13202,7 +13207,7 @@ export class SessionNodeManager {
       // M12-P12 (review pass 2): the ordering record travels on THIS path too. It is in hand — the
       // very next statement hands it to #parkContent — and a TTF row written without it re-parks in
       // arrival order, which is the divergent-leaf-index failure the durable columns exist to stop.
-      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg);
+      this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg, entry.structure1Signature, entry.leafKind);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
         sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
@@ -13546,6 +13551,28 @@ export class SessionNodeManager {
      * Same reasoning as `priorDeclaredAlg` directly above: the memo says what THIS side did to this
      * content on the direct path, and the ingest below is what decides whether the other route
      * succeeded. Reading it after would race the clear.
+     */
+    /**
+     * ⚠️ **REFUSING AN UNNOTARIZABLE MAILBOX MESSAGE WAS TRIED HERE AND REVERTED — recorded so the
+     * next attempt starts from what actually blocks it, not from the compatibility argument that
+     * does not.**
+     *
+     * The mailbox is the remaining route for the withholding attack: a counterparty who parks a
+     * message with no ordering record AND no signature over its ordering claim delivers something
+     * readable that can never enter a receipt. The obvious fix is to refuse it here.
+     *
+     * **It cannot ship yet, and the reason is our OWN path, not an older peer's.** `SEC-1` AC5 is
+     * explicit: the crash-backstop shape — signed by the sender, no ordering record — is legal and
+     * must be accepted. That envelope is produced when content is queued before anything witnessed
+     * it, and from the recipient's side it is INDISTINGUISHABLE from an attacker's stripped one. So
+     * this refusal rejects our own crash recovery along with the attack.
+     *
+     * **What closes it:** make the crash backstop sign an ordering claim at enqueue time, the way
+     * the live park path now does (`#signOwnContentClaim` already produces exactly this artifact).
+     * Then "no ordering record and no signed claim" is a shape only a modified client emits, and
+     * refusing it costs nothing real. The retry queue already carries the two columns for it —
+     * `structure1_sig` and `leaf_kind` — which were added for this and are populated on the live
+     * path today.
      */
     const refusedForAuthorship = this.#refusedOnDirectPath.get(memoKey)?.has(contentHashHex) === true;
     const result = await this.ingestReceivedContent(
@@ -17583,28 +17610,31 @@ export class SessionNodeManager {
            * We hold their signature over their own bytes. So we hand it to the relay ourselves.
            */
           /**
-           * ⚠️ **THE KIND COMES OFF THE FRAME, AND WITHOUT IT WE DECLINE TO WITNESS — review F5.**
+           * ─── THE KIND COMES OFF THE FRAME, AND A FRAME WITHOUT ONE IS REFUSED ─────────────────
            *
-           * A leaf kind selects a HASH DOMAIN, and documents and rejection envelopes ride this same
-           * frame. Hardcoding `msg` meant a document witnessed on its author's behalf entered the
-           * relay's canonical log described as something it is not. A peer too old to send the field
-           * is left alone rather than guessed at: witnessing their leaf under the wrong domain would
-           * be a worse outcome than not witnessing it, because it puts a wrong statement in the
-           * record instead of leaving a gap the seal can name.
+           * A leaf kind selects a HASH DOMAIN — documents and rejection envelopes ride this same
+           * frame — so witnessing under a guessed domain would put a wrong statement in the
+           * canonical record.
+           *
+           * ⚠️ **THIS USED TO DECLINE TO WITNESS AND DELIVER THE MESSAGE ANYWAY, "because a peer
+           * too old to send the field should be left alone". THAT SENTENCE WAS INHERITED, NOT
+           * DERIVED, AND IT LEFT THE WHOLE ATTACK OPEN.** CELLO is alpha with no users; there is no
+           * older peer to protect. What the leniency actually bought was an opt-out: emit the shape
+           * a 2026-09-04 build emitted, and your message is delivered AND cannot be witnessed —
+           * which is precisely the withholding this line exists to stop, reachable by anyone
+           * willing to modify their client.
+           *
+           * So it is refused. Missing, malformed and mismatched take one path (§5), and a peer that
+           * cannot say which domain its own leaf belongs to has supplied an unusable proof.
            */
           const framedKind = frame["leaf_kind"];
-          if (typeof framedKind === "number") {
-            void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
-          } else {
-            this.#logger.info("session.content.witness_received.kind_unknown", {
-              agentName, sessionId, correlationId,
-              impact:
-                "a message arrived that its sender never had witnessed, and the frame did not say " +
-                "which leaf domain it belongs to — their build predates the field. It was NOT " +
-                "witnessed on their behalf, because witnessing it under a guessed domain would put " +
-                "a wrong statement in the record rather than leave a gap the seal can name.",
-            });
+          if (typeof framedKind !== "number") {
+            this.#refuseUnprovenAuthorship(agentName, sessionId, "authorship_proof_unusable", contentHash, {
+              detail: "leaf_kind_absent",
+            }, correlationId);
+            return;
           }
+          void this.#witnessReceivedLeaf(agentName, sessionId, contentHash, s1Cbor, senderSig, framedKind, correlationId);
         }
         void this.#sendDeliveryAck(agentName, sessionId, contentHash, correlationId);
       }
@@ -18329,8 +18359,63 @@ export class SessionNodeManager {
        * is that it never STOPS BEING REACHABLE while that is true — the surviving relays carry it,
        * the loss is named in the log with its cause, and the lost relay's inbound carve-out is
        * revoked above. That is availability, not restoration in place.
+       *
+       * WHICH LEAVES A RATCHET, and `#respreadIfDecayed` below is what stops it: relays are only
+       * ever lost between rebuilds, never regained, so an agent nobody talks to walks itself back
+       * down to one relay — the exact state this unit exists to get it out of.
        */
     }
+    for (const agentName of this.#standingReceivers.keys()) {
+      if (this.#agentsWantingReceiver.has(agentName)) this.#respreadIfDecayed(agentName);
+    }
+  }
+
+  /**
+   * 032-RELAYSPREAD — **AN IDLE AGENT MUST NOT RATCHET ITSELF BACK DOWN TO ONE RELAY.**
+   *
+   * Spreading happens when a receiver is BUILT, and between builds the count only falls: a lost
+   * circuit cannot be retaken by a running node (a circuit listener is fixed at node creation), and
+   * a relay the directory announces later is skipped while any circuit is held. An agent in
+   * conversation re-spreads constantly — the receiver is handed into each session and a fresh one
+   * is built behind it — so this is about the agent nobody has talked to for a day. It loses relays
+   * one at a time, nothing pulls it back up, and it ends up exactly where this unit found it:
+   * reachable through one relay, one relay away from being reachable through none.
+   *
+   * **THE COST OF FIXING IT IS A NEW PEER ID**, which is why it is fenced three ways rather than
+   * simply rebuilding on sight:
+   *   - **ONLY WHEN IDLE.** A rebuild replaces the receiver's transport identity, and a counterparty
+   *     may be holding the old one from a `session_offer_accept`. With a live session for this agent
+   *     we leave it alone — a degraded spread costs redundancy, a changed peer id mid-conversation
+   *     costs the conversation.
+   *   - **ONLY WHEN THERE IS SOMETHING TO GAIN.** Holding every relay that was offered is not decay.
+   *   - **ON ITS OWN SLOW CLOCK**, never the watchdog's 30-second grid. A reservation is scarce —
+   *     the relay holds it for its full TTL even after we disconnect — so this reuses the
+   *     reservation retry interval rather than inventing a faster one.
+   */
+  #respreadIfDecayed(agentName: string): void {
+    if (this.#shuttingDown) return;
+    const sr = this.#standingReceivers.get(agentName);
+    if (!sr || sr.relayPeerIds.length === 0) return;                    // zero held is the loud path
+    for (const entry of this.#activeNodes.values()) {
+      if (entry.agentName === agentName) return;                        // in conversation — hands off
+    }
+    const offered = this.#reservationCircuitAddrs(agentName).addrs.length;
+    if (sr.relayPeerIds.length >= offered) return;                      // nothing to gain
+    const now = Date.now();
+    const last = this.#srLastRespreadAt.get(agentName) ?? 0;
+    if (now - last < this.#srReservationRetryMs) return;
+    this.#srLastRespreadAt.set(agentName, now);
+    this.#logger.info("session.standing_receiver.respread", {
+      agentName,
+      reservationsHeld: sr.relayPeerIds.length,
+      relaysOffered: offered,
+      impact: "this agent is idle and holds fewer relay reservations than it was offered, so its " +
+        "receiver is being rebuilt to take the rest. Without this it can only lose relays between " +
+        "rebuilds, and an agent nobody talks to drifts back down to a single relay — one relay " +
+        "away from being unreachable behind NAT, which is the state this whole mechanism exists " +
+        "to keep it out of.",
+    });
+    void this.#rebuildStandingReceiver(agentName);
   }
 
   /**
@@ -18953,6 +19038,11 @@ export class SessionNodeManager {
     // reservations that genuinely completed, so a directory that merely NAMES a relay cannot dial
     // in behind it, however many relays it names.
     gater.setReservedRelayPeers(heldRelayPeerIds);
+    // The re-spread clock starts HERE, at the build, not at the epoch. Otherwise the first decay
+    // re-spreads instantly — undoing the "a lost relay does not rebuild the receiver" rule seconds
+    // after it fires, and changing the peer id of an agent that just lost one relay of three. The
+    // ratchet this guards against runs over hours; nothing about it needs answering in a second.
+    this.#srLastRespreadAt.set(agentName, Date.now());
     this.#standingReceivers.set(agentName, {
       node,
       gater,

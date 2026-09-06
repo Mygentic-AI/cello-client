@@ -1,3 +1,4 @@
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 /**
  * CELLO-M8C-LEAVEMSG-1 — sender-half response shaping
  *
@@ -130,7 +131,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("leave a message");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: true, delivered: false, parked: true });
     expect(parkCalls).toBe(1);
   });
@@ -162,7 +163,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("why did this park?");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: true, delivered: false, parked: true });
 
     const failed = captured.filter((e) => e.event === "session.content.direct.send.failed");
@@ -186,7 +187,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay param
 
     const content = new TextEncoder().encode("hello");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
@@ -209,7 +210,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("hello");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
@@ -239,7 +240,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("hello");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
   });
 
@@ -275,7 +276,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
 
     const content = new TextEncoder().encode("must not vanish");
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
 
     // The honest failure response is unchanged — this is additive durability, not a shape change.
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
@@ -334,7 +335,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to park");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
 
     const rows = snm.getDb()!
@@ -381,7 +382,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     expect(snm.injectParkFault(1)).toBe(1);
     const content = new TextEncoder().encode("injected refusal");
     const hashHex = Buffer.from(msgLeafHash(content)).toString("hex");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
 
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable" });
     expect(hookCalls, "the fault must short-circuit BEFORE the deposit, like a real refusal").toBe(0);
@@ -423,7 +424,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("queued, not lost");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, reason: "session_stream_unavailable", durable: true });
 
     // Review (hollow test): asserting the FLAG alone pins "the park was refused", never "the content
@@ -451,7 +452,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr"); // no relay
 
     const content = new TextEncoder().encode("nowhere to go");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, durable: false });
   });
 
@@ -556,10 +557,10 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const same = new TextEncoder().encode("ok");
-    const first = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-1");
+    const first = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-1", LEAF_KIND_MSG);
     expect(first).toMatchObject({ ok: false, durable: true });
 
-    const second = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-2");
+    const second = await snm.sendContent("alice", SID, same, msgLeafHash(same), "corr-2", LEAF_KIND_MSG);
     expect(second, "the queue dropped this copy — saying otherwise commits a leaf for nothing").toMatchObject({ ok: false, durable: false });
 
     // Exactly one durable row, and therefore exactly one message that can ever be re-parked.
@@ -592,7 +593,7 @@ describe("M8C-LEAVEMSG-1: sender-half response shaping", () => {
     });
 
     const content = new TextEncoder().encode("no hook, no queue");
-    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send");
+    const res = await snm.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG);
     expect(res).toMatchObject({ ok: false, durable: false });
   });
 

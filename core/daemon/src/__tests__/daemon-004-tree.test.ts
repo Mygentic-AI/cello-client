@@ -1,3 +1,4 @@
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 /**
  * CELLO-M7-DAEMON-004 — SessionNodeManager: daemon-owned tree persistence,
  * restart survival, content send (dead-stream contract), and content ingest.
@@ -299,7 +300,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const contentHash = msgLeafHash(content);
-    const res = await mgr.sendContent("alice", sid, content, contentHash);
+    const res = await mgr.sendContent("alice", sid, content, contentHash, undefined, LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
   });
@@ -315,7 +316,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
     const content = new TextEncoder().encode("hello");
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content));
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content, undefined, LEAF_KIND_MSG));
     expect(res.ok).toBe(false);
     if (!res.ok) {
       expect(typeof res.reason).toBe("string");
@@ -411,7 +412,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
     const correlationId = "flow-abc-123";
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
     expect(node.sent.length).toBe(1);
 
@@ -471,7 +472,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("loopback-hi");
     const correlationId = "flow-roundtrip-1";
-    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId);
+    const res = await mgr.sendContent("alice", sid, content, msgLeafHash(content), correlationId, LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
     // The loopback delivers synchronously into the handler, which ingests async — drain.
     await new Promise((r) => setImmediate(r));
@@ -508,7 +509,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       // The frame is otherwise perfectly well-formed. Only the sender is wrong.
       node.deliverAs = "stranger-peer-id";
       const content = new TextEncoder().encode("a message alice never received");
-      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-x");
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-x", LEAF_KIND_MSG);
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received"), "nothing may be ingested").toBeUndefined();
@@ -810,7 +811,7 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
       const content = new TextEncoder().encode("a real message");
-      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok");
+      await mgr.sendContent("alice", sid, content, msgLeafHash(content), "corr-ok", LEAF_KIND_MSG);
       await new Promise((r) => setImmediate(r));
 
       expect(events.find((e) => e.event === "session.content.received")).toBeDefined();

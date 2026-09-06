@@ -37,7 +37,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { seedAgents } from "./helpers/seed-agents.js";
 import { agreeSessionGenesis } from "./helpers/session-genesis.js";
-import { LEAF_KIND_DOC } from "../session-relay-client.js";
+import { LEAF_KIND_MSG, LEAF_KIND_DOC } from "../session-relay-client.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import { encodeCbor } from "@cello-protocol/protocol-types";
@@ -167,7 +167,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "the price is 40,000 and we close on Friday";
     const content = new TextEncoder().encode(text);
-    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-send") as { ok: boolean; delivered?: boolean };
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-send", LEAF_KIND_MSG) as { ok: boolean; delivered?: boolean };
     expect(sent.ok, "the send failed even though both sides agreed a key").toBe(true);
     expect(
       sent.delivered,
@@ -206,7 +206,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "a sentence a relay must not be able to read";
     const content = new TextEncoder().encode(text);
-    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire");
+    await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-wire", LEAF_KIND_MSG);
     await pollFor(() => B.manager.takeReceivedContent("bob", SID));
 
     const frame = seen.find((f) => f["type"] === "content_frame");
@@ -313,7 +313,7 @@ describe("DOD-M15-EPHEMERAL-AUTH-1: the real exchange, over a real connection", 
 
     const text = "this must not travel in the clear";
     const content = new TextEncoder().encode(text);
-    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-nokey") as { ok: boolean; delivered?: boolean };
+    const sent = await A.manager.sendContent("alice", SID, content, msgLeafHash(content), "corr-nokey", LEAF_KIND_MSG) as { ok: boolean; delivered?: boolean };
 
     expect(
       sent.delivered,

@@ -1,3 +1,4 @@
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 /**
  * Seam 3 — two-session-core content round-trip over REAL local libp2p, in-process.
  *
@@ -171,7 +172,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     const text = "hello over real libp2p";
     const content = new TextEncoder().encode(text);
     const hash = msgLeafHash(content);
-    const sent = await A.manager.sendContent("alice", SID, content, hash, "corr-A");
+    const sent = await A.manager.sendContent("alice", SID, content, hash, "corr-A", LEAF_KIND_MSG);
     expect(sent.ok).toBe(true);
 
     // B: the content arrives, cross-checks, appends to B's daemon-owned tree, and buffers.
@@ -249,7 +250,7 @@ describe("Seam 3: two-session-core content round-trip over real libp2p", () => {
     // Send content under a hash that does NOT match it (wire tamper of a single frame).
     const content = new TextEncoder().encode("genuine content");
     const wrongHash = msgLeafHash(new TextEncoder().encode("different content"));
-    const sent = await A.manager.sendContent("alice", SID, content, wrongHash, "corr-A");
+    const sent = await A.manager.sendContent("alice", SID, content, wrongHash, "corr-A", LEAF_KIND_MSG);
     expect(sent.ok).toBe(true);
 
     // B rejects on cross-check: no buffered content, empty tree, and the cross-check warns.

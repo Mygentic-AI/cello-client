@@ -1,6 +1,6 @@
 {
   "name": "@cello-protocol/gateway",
-  "version": "0.0.51",
+  "version": "0.0.53",
   "private": false,
   "type": "module",
   "engines": {

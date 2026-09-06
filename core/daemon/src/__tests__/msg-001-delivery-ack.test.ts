@@ -1,3 +1,4 @@
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 /**
  * CELLO-M7-MSG-001 — delivery ACK / TTF (send + receive), re-homed onto the daemon.
  *
@@ -174,7 +175,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("hello over the wire");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a");
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
 
     // The receiver ingested it (buffered for cello_receive).
@@ -210,7 +211,7 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
 
     const content = new TextEncoder().encode("level test");
     const hash = msgLeafHash(content);
-    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a");
+    const res = await mgrA.sendContent("alice", SID, content, hash, "corr-a", LEAF_KIND_MSG);
     expect(res.ok).toBe(true);
 
     const ackFrame = (level: string): unknown =>
