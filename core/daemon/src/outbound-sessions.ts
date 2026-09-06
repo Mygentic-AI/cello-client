@@ -510,12 +510,33 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
        * dial them.
        *
        * ⚠️ IT MUST BE HERE, BEFORE THE RETURN — not at ingest, where the existing wrong-signer
-       * check lives. THE DIALER SPEAKS FIRST: on the accepting path we dial, hand over the session
-       * node, and send the opening message before the counterparty has said anything we could
-       * check. The ingest check freezes the session on their REPLY, which protects us from being
-       * deceived by their answer and does nothing about what we already disclosed. The exposure is
-       * exactly one message, and for a broadcast — send-first, no reply expected — a silent
-       * substituted recipient is never detected at all.
+       * check lives.
+       *
+       * ─── AND THE REASON IS NOT "the first message goes out in plaintext" (review F3) ──────────
+       *
+       * That was the premise this check was written from and IT DOES NOT HOLD IN THIS TREE, which
+       * is worth stating because a reader who assumed it would think this guard is holding a line
+       * it is not. On the initiator side the content key is agreed from a peer ephemeral that must
+       * verify against the session's counterparty record, and that record is the operator's own
+       * `target_pubkey` — not `participant_b` (`session-ephemerals.ts`). A substituted counterparty
+       * cannot sign a passing half, and a send with no agreed key throws rather than going out
+       * (`content-encryption-status.ts` states the rule as absolute). No plaintext leaves.
+       *
+       * ─── What was actually wrong, which is a better reason than the one it replaces ──────────
+       *
+       * 1. ERROR SUBSTITUTION, and it is the serious one. A substituted counterparty surfaced to
+       *    the operator as `session.key.refused`, whose guidance names *"something in the middle of
+       *    your connection substituting its own key"* — pointing at the relay and the network for a
+       *    fault that was entirely the directory's. The operator was told to distrust the right
+       *    thing for the wrong reason and sent to investigate the wrong party.
+       * 2. THE DIAL ITSELF DISCLOSES. We hand the impostor our session peer id and, on a direct
+       *    address, our IP — permanently — before anything has failed.
+       * 3. THE SEAL ANCHOR DISAGREES WITH THE SESSION. `recordSessionGenesis` anchors the
+       *    transcript to `participant_a`/`participant_b` while the session's own counterparty
+       *    record holds what the operator asked for. Refusing here keeps those two provably equal.
+       *
+       * The ingest wrong-signer check still runs and still freezes on a bad reply; it is now the
+       * second line rather than the first, and it is not what makes this safe.
        *
        * Both sides of both comparisons are LOCAL values: `targetHex` is the operator's own input
        * and `ownPubkeyHex` is this daemon's loaded identity. Neither is influenced by anything the

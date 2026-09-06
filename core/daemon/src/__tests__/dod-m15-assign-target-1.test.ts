@@ -8,10 +8,12 @@
  *
  * ─── Why the return value alone is not the test ────────────────────────────────────────────────
  *
- * The substitution IS eventually caught — `#verifyAuthorshipClaim` freezes the session when the
- * impostor's first message is signed by the wrong key. But THE DIALER SPEAKS FIRST: we dial, hand
- * over the session node, and send the opening message before any reply can be checked. The exposure
- * is exactly one message, and one message is usually the reason the call was made.
+ * The substitution IS eventually caught downstream, and — review F3 — no plaintext was ever at
+ * risk: content encryption binds to the operator's own `target_pubkey`, so an impostor cannot key
+ * the session and a send with no key throws. What the dial costs instead is disclosure and
+ * misattribution: we hand the impostor our session peer id and our IP, and the operator is then
+ * told by `session.key.refused` that something *in the middle of the connection* substituted a key
+ * — the relay and the network blamed for a fault that was entirely the directory's.
  *
  * So every refusal case here asserts that NOTHING DIALLED — `transportSelector.dial`,
  * `createSessionNode` and `connectToCounterparty` all uncalled. A test that only checked
