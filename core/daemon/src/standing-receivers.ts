@@ -1,9 +1,19 @@
 /**
  * CELLO Daemon — THE STANDING RECEIVER: THE NODE THAT IS ALWAYS LISTENING
  *
- * Split out of `session-node-manager.ts` by 037-SESSIONCORE. One pre-created node per agent with an
- * open gater, kept alive at all times and handed to the first inbound session — then immediately
- * replaced, so there is always one waiting.
+ * Split out of `session-node-manager.ts` by 037-SESSIONCORE. One pre-created node per agent, kept
+ * alive at all times and handed to the first inbound session — then immediately replaced, so there
+ * is always one waiting.
+ *
+ * ⚠️ **ITS GATER IS NOT OPEN, and this sentence used to say it was.** `DOD-M15-ASSIGN-1` closed
+ * exactly that: the gater admits NOBODY inbound until a session offer names the dialer, while
+ * leaving this node's own outbound errands open (`allowedPeerId: null` — see the construction
+ * below, which says the same thing in the imperative).
+ *
+ * The wrong version is called out rather than quietly corrected because of what believing it costs:
+ * a reader who thinks the gater is open reads an unnamed-dialer rejection as a BUG and opens it, or
+ * waves off the hardening as already done. It was inherited from the manager's own header, which is
+ * corrected in the same commit.
  *
  * Moved verbatim, comments included.
  *
@@ -63,7 +73,6 @@ export interface StandingReceiverContext {
   readonly directoryRelayEndpoints: Map<string, Array<{ relayPeerId: string; relayAddrs: string[] }>>;
   readonly srRetryDelaysMs: number[];
   readonly srReservationTimeoutMs: number;
-  readonly offeredDialer: Map<string, string>;
   /** The AutoNAT prober list, injected by the composition root. */
   autoNatProbers(): string[];
 
@@ -87,6 +96,16 @@ export interface StandingReceiverContext {
 export class StandingReceivers {
   readonly #ctx: StandingReceiverContext;
 
+  /**
+   * The dialer an inbound session offer named, per agent.
+   *
+   * ⚠️ OWNED HERE, not shared by reference like the other maps — because unlike them it has NO
+   * reader left in the manager. It was passed across with the rest on the first pass; a review
+   * measured that every read had moved with the four `*OfferedDialer` methods, so the by-reference
+   * argument that is correct for the other nine does not apply to it.
+   */
+  readonly #offeredDialer = new Map<string, string>();
+
   constructor(ctx: StandingReceiverContext) {
     this.#ctx = ctx;
   }
@@ -96,7 +115,7 @@ export class StandingReceivers {
     return this.#ctx.db();
   }
 
-  async startReceiverNode(
+  async #startReceiverNode(
     agentName: string,
     sessionId: string,
     gater: SessionConnectionGater,
@@ -410,7 +429,7 @@ export class StandingReceivers {
     return { node, seed: receiverSeed };
   }
   /** One standing-receiver create attempt (extracted for the M8B F14 retry loop). */
-  async tryCreateStandingReceiver(
+  async #tryCreateStandingReceiver(
     agentName: string,
     correlationId: string,
   ): Promise<{ outcome: "installed" | "aborted" } | { outcome: "failed"; error: string }> {
@@ -452,7 +471,7 @@ export class StandingReceivers {
      */
     let seed: Uint8Array;
     try {
-      ({ node, seed } = await this.startReceiverNode(agentName, sessionId, gater, reservations.addrs, correlationId));
+      ({ node, seed } = await this.#startReceiverNode(agentName, sessionId, gater, reservations.addrs, correlationId));
     } catch (err: unknown) {
       // extractErrorMessage, NOT String(err): the transport throws structured
       // plain objects ({ reason, message }), and String() destroys both into
@@ -639,7 +658,7 @@ export class StandingReceivers {
           this.#ctx.standingReceiverRemoving.delete(agentName);
           return;
         }
-        const result = await this.tryCreateStandingReceiver(agentName, correlationId);
+        const result = await this.#tryCreateStandingReceiver(agentName, correlationId);
         if (result.outcome !== "failed") return; // installed, or cleanly aborted (shutdown/offline)
         lastError = result.error;
       }
@@ -1016,16 +1035,17 @@ export class StandingReceivers {
     // With an agentName: that agent's own standing-receiver node (needed when the dial must
     // originate from a SPECIFIC agent — e.g. the startup content-park re-park, where the
     // depositor is the original sender). Without one: any ready standing receiver (outbound
-    // content-park deposit/pull to the relay — open gater, not session-scoped).
+    // content-park deposit/pull to the relay — not session-scoped, and OUTBOUND, which is the
+    // half of the gater that is open; inbound admits nobody until a dialer is named).
     if (agentName !== undefined) return this.#ctx.standingReceivers.get(agentName)?.node ?? null;
-    return this.anyStandingReceiver()?.node ?? null;
+    return this.#anyStandingReceiver()?.node ?? null;
   }
   /**
    * First ready standing receiver (any agent) — for agent-agnostic OUTBOUND use. Its gater admits
    * nobody INBOUND until a session names them (DOD-M15-ASSIGN-1); outbound stays open, which is the
    * property these callers depend on.
    */
-  anyStandingReceiver(): { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null {
+  #anyStandingReceiver(): { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService } | null {
     for (const sr of this.#ctx.standingReceivers.values()) return sr;
     return null;
   }
@@ -1065,7 +1085,7 @@ export class StandingReceivers {
     // DOD-LOOP-1: the daemon-level autonat source is any ready standing receiver; null until one
     // exists (the composition root falls back to LocalAutoNatStub). Per-session advertised dialability
     // comes from the initiating agent's own SR via getStandingReceiverInfo, not this daemon-level value.
-    return this.anyStandingReceiver()?.autoNat ?? null;
+    return this.#anyStandingReceiver()?.autoNat ?? null;
   }
   /**
    * Which peer this agent's standing receiver is currently admitting INBOUND — `null` for nobody.
@@ -1110,7 +1130,7 @@ export class StandingReceivers {
     if (!sr) return "no_receiver";
     if (initiatorSessionPeerId === "") return "no_peer_named";
     sr.gater.admitInboundPeer(initiatorSessionPeerId);
-    this.#ctx.offeredDialer.set(this.#ctx.sessionKey(agentName, sessionIdHex), initiatorSessionPeerId);
+    this.#offeredDialer.set(this.#ctx.sessionKey(agentName, sessionIdHex), initiatorSessionPeerId);
     return "narrowed";
   }
   /**
@@ -1129,11 +1149,11 @@ export class StandingReceivers {
    * before the signed document arrives.
    */
   getOfferedDialer(agentName: string, sessionIdHex: string): string | null {
-    return this.#ctx.offeredDialer.get(this.#ctx.sessionKey(agentName, sessionIdHex)) ?? null;
+    return this.#offeredDialer.get(this.#ctx.sessionKey(agentName, sessionIdHex)) ?? null;
   }
   /** Forget the offered dialer for ONE session — called on BOTH the claim and the refusal paths. */
   clearOfferedDialer(agentName: string, sessionIdHex: string): void {
-    this.#ctx.offeredDialer.delete(this.#ctx.sessionKey(agentName, sessionIdHex));
+    this.#offeredDialer.delete(this.#ctx.sessionKey(agentName, sessionIdHex));
   }
   /**
    * RE-CLOSE the standing receiver — but ONLY if this session is still the one holding it.

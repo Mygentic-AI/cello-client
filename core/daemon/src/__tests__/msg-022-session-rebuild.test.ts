@@ -341,15 +341,22 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // The collaborator prefixes are NAMED, not matched as "any private field". A general
         // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
         // establishment step — a false positive that makes this guard noisy and then ignored.
+        //
+        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 13 session
+        // collaborators are here. `#securityGateway` and `#factory` are deliberately NOT — neither
+        // is reached from establishment today. If a screening or node-building step ever routes
+        // through one, ADD IT HERE FIRST: the guard will not report a step it cannot see, which is
+        // the exact failure this widening was written to prevent.
         /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
     const takenByRevival = (c: string): boolean => {
       const names = [c, ...(EQUIVALENT.has(c) ? [EQUIVALENT.get(c)!] : [])];
-      // Same normalisation on the revival side: `.ensureStandingReceiver(` matches whether it is
-      // reached directly or through a collaborator.
-      return names.some((n) => revive.includes(`${n.replace(/^#/, "this.#")}(`) || revive.includes(`${n.slice(1)}(`) || revive.includes(`.${n.slice(1)}(`));
+      // No collaborator-aware clause is needed on THIS side: `revive.includes("foo(")` already
+      // matches `.foo(`, so a `.${name}(` test would be dead code. (One was added and removed —
+      // its comment claimed work the existing check already did.)
+      return names.some((n) => revive.includes(`${n.replace(/^#/, "this.#")}(`) || revive.includes(`${n.slice(1)}(`));
     };
     const missing = [...calls].filter((c) => !EXEMPT.has(c) && !takenByRevival(c));
 

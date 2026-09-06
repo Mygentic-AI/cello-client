@@ -5,8 +5,10 @@
  *   1. Per-session nodes: fresh transport key + Peer ID, connectionGater allows
  *      only the designated counterparty. Created during cello_initiate_session
  *      (outbound) or cello_await_session (inbound, via standing receiver handoff).
- *   2. Standing receiver node: pre-created, open gater, kept alive at all times.
- *      Handed to the first inbound session; immediately replaced.
+ *   2. Standing receiver node: pre-created, kept alive at all times, handed to the first inbound
+ *      session and immediately replaced. Its gater is NOT open — `DOD-M15-ASSIGN-1` made it admit
+ *      nobody inbound until a session offer names the dialer (see `standing-receivers.ts`). This
+ *      line said "open gater" for as long as that was true and for a while after it was not.
  *   3. 32-node cap: enforced before any new node is created.
  *   4. Session status in the DB: active → sealed (on close) or interrupted
  *      (on graceful shutdown or SIGKILL-restart detection).
@@ -673,6 +675,11 @@ export class SessionNodeManager {
    */
   readonly #leafRecords: SessionLeafRecords;
 
+  // CELLO-M7-TRANSPORT-001: the directory-node multiaddrs serving as AutoNAT probers (SI-002).
+  // Empty () => [] when the directory is in 'reconnecting' state — AutoNAT cannot run and
+  // dialability stays the conservative default.
+  readonly #autoNatProbers: () => string[];
+
   /**
    * 037-SESSIONCORE — the always-listening node, one per agent.
    *
@@ -680,12 +687,10 @@ export class SessionNodeManager {
    * paths still read them and stayed behind, and two sources of truth for "which agents have a
    * receiver" would be worse than one shared one.
    */
-  readonly #autoNatProbers: () => string[];
-
   readonly #receivers: StandingReceivers;
 
   /** ─── DELEGATORS — the standing-receiver API other files call ───────────────────────── */
-standingReceiverAbsenceReason(agentName: string): "daemon_shutting_down" | "standing_receiver_creating" | "agent_offline" | "no_standing_receiver" { return this.#receivers.standingReceiverAbsenceReason(agentName); }
+  standingReceiverAbsenceReason(agentName: string): "daemon_shutting_down" | "standing_receiver_creating" | "agent_offline" | "no_standing_receiver" { return this.#receivers.standingReceiverAbsenceReason(agentName); }
   getStandingReceiverInfo(agentName: string): { peerId: string; addrs: string[] } | null { return this.#receivers.getStandingReceiverInfo(agentName); }
   getStandingReceiverReady(agentName?: string): boolean { return this.#receivers.getStandingReceiverReady(agentName); }
   getStandingReceiverNode(agentName?: string): CelloNode | null { return this.#receivers.getStandingReceiverNode(agentName); }
@@ -866,24 +871,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   #standingReceivers = new Map<string, { node: CelloNode; gater: SessionConnectionGater; autoNat: NodeAutoNatService; /** DOD-M12B-SESSION-SEED-1: this receiver's transport seed; follows the node into the session at handoff. */ seed: Uint8Array; /** 032-RELAYSPREAD: every relay this receiver holds a live circuit reservation with. Empty means unreachable behind NAT. Replaces `hasReservation` plus one `relayPeerId`, which together could not describe a receiver holding two. */ relayPeerIds: string[] }>();
   #standingReceiverCreating = new Set<string>();
-  /**
-   * (agentName, sessionId) → the peer id that session's `session_offer` named as the dialer.
-   *
-   * KEYED BY SESSION, not by agent (review F1). Keyed by agent alone, two overlapping inbound
-   * sessions destroyed each other: offer P narrows to peer P, offer Q overwrites with peer Q, then
-   * assignment P arrives and MISMATCHES — refusing a legitimate session while accusing the directory
-   * of naming two dialers, which it had not. It then cleared Q's record too, so assignment Q passed
-   * unchecked. An attacker could therefore disarm the check by provoking one mismatch.
-   *
-   * The gap between offer and assignment spans a cross-region threshold ceremony, so overlapping
-   * sessions are ordinary, not exotic. `DOD-M15-OFFER-EXPIRY-1` already prescribed this fix shape —
-   * "bind the narrowing to the session id it came from" — and the session id was in hand at both
-   * ends the whole time.
-   *
-   * DOD-M15-OFFER-SIGNED-1: read back when the SIGNED assignment arrives, so an unsigned offer
-   * cannot name a peer the signed document does not.
-   */
-  #offeredDialer = new Map<string, string>();
   // M8B F14: agents that SHOULD have a standing receiver — marked by
   // ensureStandingReceiverForAgent (cello_start_agent / the inbound accept path) and
   // unmarked by removeStandingReceiverForAgent (cello_set_agent_offline). Consulted by the
@@ -936,9 +923,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // it holds one tiny entry per sealed session for the daemon's lifetime and is cleared on
   // restart. Idempotent: a sealed session always answers "sealed" to a receive.
   #sessionTerminal = new Map<string, { type: "sealed"; unreadCount: number }>();
-  // CELLO-M7-TRANSPORT-001: the directory-node multiaddrs serving as AutoNAT
-  // probers (SI-002). Empty () => [] when the directory is in 'reconnecting'
-  // state — AutoNAT cannot run and dialability stays the conservative default.
 
   // M7-SESSION-003: per-session direct-path counterparty liveness, observed on the
   // session node's onPeerConnect ('alive') / onPeerDisconnect ('gone'). This is
@@ -1457,34 +1441,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#autoNatProbers = opts.autoNatProbers ?? (() => []);
     this.#srRetryDelaysMs = opts.standingReceiverRetryDelaysMs ?? [1_000, 5_000, 15_000];
     this.#srReservationTimeoutMs = opts.standingReceiverReservationTimeoutMs ?? 15_000;
-    // ⚠️ BUILT AFTER the retry/timeout settings it captures — those get their defaults applied on
-    // the two lines above, and a collaborator constructed before them captures `undefined`. The
-    // same class tsc caught on `#logger`. Repeating the defaults at the call site would be worse:
-    // two places deciding one number is how they stop agreeing.
-    this.#receivers = new StandingReceivers({
-      logger: this.#logger,
-      records: this.#records,
-      park: this.#park,
-      factory: this.#factory,
-      db: () => this.#db,
-      shuttingDown: () => this.#shuttingDown,
-      sessionKey: (a, sid) => this.#k(a, sid),
-      standingReceivers: this.#standingReceivers,
-      standingReceiverCreating: this.#standingReceiverCreating,
-      agentsWantingReceiver: this.#agentsWantingReceiver,
-      srReservationRetry: this.#srReservationRetry,
-      srLastRejectionReason: this.#srLastRejectionReason,
-      srLastRespreadAt: this.#srLastRespreadAt,
-      directoryRelayEndpoints: this.#directoryRelayEndpoints,
-      standingReceiverRemoving: this.#standingReceiverRemoving,
-      srRetryDelaysMs: this.#srRetryDelaysMs,
-      srReservationTimeoutMs: this.#srReservationTimeoutMs,
-      offeredDialer: this.#offeredDialer,
-      autoNatProbers: () => this.#autoNatProbers(),
-      proveToRelay: (a, circuitAddr, node, cid, surface) => this.#proveToRelay(a, circuitAddr, node, cid, surface),
-      reservationCircuitAddrs: (a) => this.#reservationCircuitAddrs(a),
-      authenticateStandingReceiver: (a, node, relayPeerId, heldCircuitAddr, cid) => this.#authenticateStandingReceiver(a, node, relayPeerId, heldCircuitAddr, cid),
-    });
     // ⚠️ BUILT AFTER the retry/timeout settings it captures. Those come from `opts` with defaults
     // applied HERE, and a collaborator constructed above them would capture `undefined` — the
     // same class tsc caught on `#logger`. Duplicating the defaults at the call site would be
@@ -1507,7 +1463,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       standingReceiverRemoving: this.#standingReceiverRemoving,
       srRetryDelaysMs: this.#srRetryDelaysMs,
       srReservationTimeoutMs: this.#srReservationTimeoutMs,
-      offeredDialer: this.#offeredDialer,
       autoNatProbers: () => this.#autoNatProbers(),
       proveToRelay: (a, circuitAddr, node, cid, surface) => this.#proveToRelay(a, circuitAddr, node, cid, surface),
       reservationCircuitAddrs: (a) => this.#reservationCircuitAddrs(a),
