@@ -16689,7 +16689,8 @@ export class SessionNodeManager {
   #refuseUnprovenAuthorship(
     agentName: string,
     sessionId: string,
-    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation" | AckHashReason,
+    reason: "authorship_proof_absent" | "authorship_proof_unusable" | "authorship_wrong_conversation"
+      | typeof AUTHORSHIP_SELF_CHAIN_MISMATCH | AckHashReason,
     contentHash: Uint8Array,
     detail: Record<string, unknown>,
     correlationId?: string,
@@ -16726,6 +16727,19 @@ export class SessionNodeManager {
            * conclusion the code did not reach is the error-fidelity defect this milestone exists
            * for.
            */
+          /**
+           * `DOD-M15-SELFCHAIN-1` — THE ORDER, NOT THE CONTENT, AND IT NEEDS ITS OWN WORDS.
+           *
+           * This reached the operator under the generic `authorship_proof_unusable` sentence, which
+           * says the proof was "unreadable, or signed over different content". Neither is true: the
+           * proof is perfect and it is about this conversation. What is in dispute is WHERE this
+           * message sits — and telling someone their decoder failed sends them to audit the wrong
+           * subsystem entirely. The reason's own comment claimed it was "named apart from the
+           * acknowledgement reasons"; the surface collapsed it back, which is error substitution on
+           * the strongest evidence this protocol can produce.
+           */
+          : reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+            ? "a message arrived that is genuinely from your counterparty, about this conversation, and correctly signed — and it names a message of THEIR OWN that they never sent you. Each message says which of their own came before it, and that is what fixes the ORDER of the conversation. This one points somewhere your record has never been. It was NOT ingested and NOT shown."
           : reason === AUTHORSHIP_ACK_HASH_ABSENT
             ? "a message arrived that is genuinely from your counterparty and genuinely about this conversation — and it does not say which of your messages they had received. Their build is older than yours: a message has to say what it is answering, so that nobody can later leave your last message out of the receipt. It was NOT ingested and NOT shown."
           : reason === AUTHORSHIP_ACK_HASH_MISMATCH
@@ -16788,6 +16802,17 @@ export class SessionNodeManager {
        * abandon the conversation. Two is the cap on each (Invariant 4); the verb is the
        * counterparty's in every case, because there is nothing to change on this machine.
        */
+      : reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+      ? "STOPPED ON PURPOSE, and this is the most serious of these refusals. " +
+        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
+        " Their signature is real and it is about this conversation. What does not hold is the " +
+        "ORDER: this message names one of their own as the one before it, and that message was " +
+        "never sent to you. Either something between you is rearranging what they say, or their " +
+        "agent's record of what it has said went out of step. THIS SESSION IS NOW FROZEN — no " +
+        "further message on it will be accepted, because carrying on writes a disputed order into " +
+        "the receipt. Reach them OUT OF BAND — a channel that is not this one — and ask them to " +
+        "read back the last few things they sent you. If it matches what you have, open a NEW " +
+        "session; if it does not, do not."
       : reason === AUTHORSHIP_ACK_HASH_ABSENT
       ? "STOPPED ON PURPOSE, and this is NOT about their signature — it verified. " +
         (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
@@ -17421,6 +17446,12 @@ export class SessionNodeManager {
           agentName, sessionId,
           authorship.reason === AUTHORSHIP_SESSION_MISMATCH
             ? "authorship_wrong_conversation"
+            /**
+             * `DOD-M15-SELFCHAIN-1` — its own name on the surface the operator reads, not only in a
+             * log field. See the sentences in `#refuseUnprovenAuthorship`.
+             */
+            : authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+              ? AUTHORSHIP_SELF_CHAIN_MISMATCH
             : ACK_HASH_REASONS.has(authorship.reason)
               /**
                * ⚠️ THE SPECIFIC CAUSE, NOT THE CLASS — review F5, and the diff's own comment on
@@ -17435,6 +17466,23 @@ export class SessionNodeManager {
               : "authorship_proof_unusable",
           contentHash, { detail: authorship.reason }, correlationId,
         );
+        /**
+         * ─── AND THE SESSION FREEZES — `DOD-M15-SELFCHAIN-1`, the escalation clause ──────────────
+         *
+         * ⚠️ ONLY THIS ONE OF THE `unusable` CAUSES FREEZES, and the split is the whole rule.
+         *
+         * The acknowledgement causes say the sender is wrong about what WE said, which a record
+         * that has drifted produces honestly, and refusing the message is proportionate. This one
+         * says they are wrong about what THEY said — the one thing a party cannot be honestly
+         * mistaken about for long — so continuing writes a disputed order into the receipt. There
+         * is nothing to gain from message N+1 on a conversation whose order is already in question.
+         *
+         * The freeze is what makes the refusal an ESCALATION rather than a dropped frame: it is
+         * visible in the session's own state, not only in a notice the operator has to go and read.
+         */
+        if (authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH) {
+          await this.#freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
+        }
         return;
       }
       if (authorship.verdict === "verified") {
