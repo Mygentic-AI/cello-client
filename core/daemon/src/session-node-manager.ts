@@ -145,7 +145,8 @@ export class SessionNodeManager {
   /** `DOD-M15-SELFCHAIN-1` — this agent's own last message per session, so the next one links to it. */
   #ownChainStore: SessionOwnChainStore | null = null;
   // M9-CORE-001: the inbound screening seam. Every byte that reaches the agent passes
-  // through #appendVerifiedContent's buffer write; screenInbound gates it there, on every
+  // through `session-content-ingest.ts`'s appendVerifiedContent buffer write; screenInbound gates
+  // it there, on every
   // arrival path (direct, held-release, recovered-park). Defaults to always-allow when no
   // gateway is configured (SI-001: still a verdict, not an ungated pass).
   readonly #securityGateway: SecurityGatewayClient;
@@ -859,7 +860,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   // the cache is rebuilt from it on first access (so it survives a restart).
   #trees = new Map<string, SessionTree>();
   // DAEMON-004: per-session FIFO buffer of verified received content awaiting
-  // cello_receive. Populated by ingestReceivedContent / the content stream handler.
+  // cello_receive. Populated by `session-content-ingest.ts` — ingestReceivedContent and the
+  // content stream handler.
   #receivedContent = new Map<string, ReceivedContentEntry[]>();
   // F1-b: a terminal answer for a sealed session, set at seal teardown BEFORE the
   // received-content buffer is evicted. A blocking cello_receive waiting when the seal
@@ -973,7 +975,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * ⚠️ **IT MIRRORS THE RELAY CLIENT'S `#lastSeen` RATHER THAN REPLACING IT, and the duplication is
    * deliberate.** The submit path needs the value on the client, because that is where the claim is
    * built; the unwitnessed content path needs it here, because a session with no relay client has no
-   * client to read it from. Both are written from ONE place — `#noteAcknowledgeable` below — so they
+   * client to read it from. Both are written from ONE place — `noteAcknowledgeable`, in
+   * `session-content-ingest.ts` — so they
    * cannot come to disagree, and the client is preferred on read because it also sees leaves the
    * relay delivered that never came through this path.
    */
@@ -1874,7 +1877,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   }
 
   /**
-   * DOD-M15-REFUSEDEVIDENCE-1 — retain a message refused OUTSIDE `ingestReceivedContent`.
+   * DOD-M15-REFUSEDEVIDENCE-1 — retain a message refused OUTSIDE `ingestReceivedContent`
+   * (`session-content-ingest.ts`).
    *
    * Review F6. The park drain terminally-blocks a message that arrived for an already-committed
    * session, then confirm-deletes the relay copy — the one other route in the tree that discarded
@@ -2321,6 +2325,18 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     return { ok: true, peerId, addrs };
   }
 
+  /**
+   * M7 DOD-SPINE-6 / MSG-001-3b: connect a session node to the relay witness and
+   * store the client on the active entry. Best-effort: a connect/auth failure logs
+   * and leaves relayClient undefined — the session is NOT destroyed and the direct
+   * content path keeps working (the relay-park/recovery path is MSG-001-3b's domain).
+   *
+   * ⚠️ THIS BLOCK SPENT TWO MILESTONES ABOVE THE WRONG METHOD. It sat stacked on top of
+   * `relayLeafHandler`'s own docblock, so the file showed two descriptions in a row and the first
+   * one described a method further down the page. The content split then carried it verbatim into
+   * `session-content-ingest.ts`, where `#connectSessionRelay` does not exist at all and the
+   * misattribution could no longer be worked out from context. Returned to the method it describes.
+   */
   async #connectSessionRelay(
     sessionId: string,
     node: CelloNode,
@@ -3625,7 +3641,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       // an interrupted session is not terminal. (1) #receivedContent must stay drainable — the
       // record survives, and cello_receive legitimately reads buffered unread messages after a
       // transient relay blip; evicting would silently discard deliverable plaintext. (2) Evict
-      // also cancels armed TTF timers (#clearAwaitingForSession) — on a dying session the TTF
+      // also cancels armed TTF timers (`clearAwaitingForSession`, in `session-content-send.ts`) — on
+      // a dying session the TTF
       // park backstop is exactly what must fire for un-acked content (MSG-001). The caches are
       // reclaimed when the session later seals (destroy/retire paths) or at daemon restart.
       // M8B F14 (fix 1): the relay-detected interruption is the THIRD teardown path that
@@ -3723,7 +3740,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     if (landed) {
       // DOD-M12B-SESSION-SEED-1 (review F3): `seal_interrupted_pending` is NOT a state revival
       // exists for, and the first build's comment wrongly grouped it with `interrupted`.
-      // `ingestReceivedContent` refuses it outright, and BOTH sweeps that could otherwise close a
+      // `ingestReceivedContent` (in `session-content-ingest.ts`) refuses it outright, and BOTH
+      // sweeps that could otherwise close a
       // session — `listRestartOrphanedSessions` and `listExpiredUnrevivableSessions` — filter
       // `status = 'interrupted'`, so a pending-seal session is unrevivable AND unswept. Keeping its
       // identity meant holding it until the process exited. Entry 42's own measurement is that 59%
@@ -4690,7 +4708,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   /** DOD-AWAY-WRAP-1: peek at the hex of the most-recently buffered (last) received message without
    *  consuming it. Used by sendAwayResponse to detect [[WRAP]]-signalled messages and skip the away
-   *  reply. Returning the last entry (not the first) is intentional — #appendVerifiedContent always
+   *  reply. Returning the last entry (not the first) is intentional — the ingest file's
+   *  appendVerifiedContent always
    *  pushes to the tail, so the tail is the message that just triggered onContentArrived. */
   peekLatestReceivedContentHex(agentName: string, sessionId: string): string | null {
     const buf = this.#receivedContent.get(this.#k(agentName, sessionId));
@@ -4700,7 +4719,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   /**
    * TEST-ONLY (M8C-INBOX-1 reviewer F1): buffer a received message + persist its transcript row,
-   * exactly as the real inbound path (#appendVerifiedContent) does, WITHOUT standing up a session
+   * exactly as the real inbound path (appendVerifiedContent, in `session-content-ingest.ts`) does,
+   * WITHOUT standing up a session
    * tree — so a test can drive a live cello_receive that advances the read watermark (the N3
    * "delivery marks read" coupling). Only reachable via the CELLO_ENV=test IPC hook.
    */
@@ -5165,7 +5185,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
      */
     if (!frame.adoptionClosed) this.#salts.markSaltPending(agentName, sessionId);
     // Held outside the try so the catch can retire a stream that was opened and then failed to
-    // write — the same leak, and the same fix, as `#sendDeliveryAck`.
+    // write — the same leak, and the same fix, as `#sendDeliveryAck` in `session-content-ingest.ts`.
     let saltStream: Stream | undefined;
     try {
       const stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
@@ -7096,7 +7116,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       if (status === "sealed" || status === "abandoned") {
         // DOD-M12B-STRAND-1: held frames outlive the chain that could have carried them.
         //
-        // Once a session is terminal, `ingestReceivedContent` refuses it — and #releaseHeld is only
+        // Once a session is terminal, `ingestReceivedContent` (in `session-content-ingest.ts`)
+        // refuses it — and #releaseHeld is only
         // reachable from ingest — so no code path that exists can ever release a held frame again.
         // Left alone the rows sit on disk, unreachable by any surface, while the teardown alarm
         // reports `lost: 0`: a success message for content that has just become permanently

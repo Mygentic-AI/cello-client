@@ -53,12 +53,6 @@ export class SessionContentIngest {
   }
 
   /**
-   * M7 DOD-SPINE-6 / MSG-001-3b: connect a session node to the relay witness and
-   * store the client on the active entry. Best-effort: a connect/auth failure logs
-   * and leaves relayClient undefined — the session is NOT destroyed and the direct
-   * content path keeps working (the relay-park/recovery path is MSG-001-3b's domain).
-   */
-  /**
    * DOD-M12B-REVIVE-RELAY-1 — the relay witness leaf handler, shared by establishment and revival.
    *
    * Extracted because a REVIVED session must register the same handler. It was inline in

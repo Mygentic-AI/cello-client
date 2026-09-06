@@ -219,8 +219,13 @@ describe("every seal-completion path flips the status itself", () => {
          * function was called". Accepting both keeps the teeth: delete EITHER and this goes red,
          * because what is gone is the flip.
          */
-        const flipped = window.includes(".markSealed(")
-          || /updateSessionStatus\([^)]*"sealed"/.test(window);
+        // PER LINE, for the reason the file filter above is per line: `[^)]*` crosses newlines, so
+        // over a 14-line joined window it would happily match an `updateSessionStatus(` on one line
+        // against a `"sealed"` on another that has nothing to do with it. Nothing in this window
+        // declares that signature today, so it is not reachable — it is the identical trap sitting
+        // one refactor away, and it costs one `.some()` to close now rather than after it fires.
+        const flipped = window.split("\n").some((l) =>
+          l.includes(".markSealed(") || (l.includes("updateSessionStatus(") && l.includes('"sealed"')));
         expect(
           flipped,
           `${file}:${i + 1} tears the node down as sealed without flipping the status first. ` +
