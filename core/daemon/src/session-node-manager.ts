@@ -9914,15 +9914,36 @@ export class SessionNodeManager {
    * verified leaf to the daemon-owned tree, and buffer it for cello_receive.
    * A hash MISMATCH is genuine tamper — rejected without append or buffer.
    *
-   * SCOPE / finding #5 — what this cross-check does and does NOT prove today:
-   * `contentHash` here is carried in the SAME content_frame as `content`, so this
-   * comparison only catches wire corruption of a single frame — it does NOT prove
-   * the content matches what the sender independently committed. Full tamper-
-   * evidence (EARS behavior #2) requires cross-checking against the K_local-signed
-   * content_hash leaf the sender submits to the RELAY on a separate channel; that
-   * relay hash-submit path is MSG-001's scope and does not exist yet. Until MSG-001
-   * lands, a malicious sender that sends matching (content, hash) in one frame is
-   * not detected here — only the relay-relayed signed leaf closes that gap.
+   * SCOPE / finding #5 — what this cross-check proves BY ITSELF, and what proves the rest:
+   * `contentHash` here is carried in the SAME content_frame as `content`, so this comparison on its
+   * own catches wire corruption of a single frame and nothing more. It is not what establishes that
+   * the sender committed to these bytes. That proof arrives separately and is checked BEFORE any
+   * caller reaches this method.
+   *
+   * ⚠️ **THIS PARAGRAPH USED TO SAY THAT PROOF DID NOT EXIST, AND THAT SENTENCE IS WHY IT IS
+   * REWRITTEN RATHER THAN DELETED.** It read: *"Full tamper-evidence (EARS behavior #2) requires
+   * cross-checking against the K_local-signed content_hash leaf the sender submits to the RELAY on a
+   * separate channel; that relay hash-submit path is MSG-001's scope and **does not exist yet**.
+   * Until MSG-001 lands, a malicious sender that sends matching (content, hash) in one frame is not
+   * detected here."* It was true when it was written. It stopped being true, and it names the exact
+   * bypass — in a PUBLIC repository, where a reader collecting every "not enforced" sentence is
+   * handed a hole that was already closed. The old wording is kept above because the gap was real
+   * and the record of it is the thing worth not losing.
+   *
+   * What closes it today — and note it is NOT only the route the old sentence predicted:
+   *   - The relay hash-submit path EXISTS (`relay-node.ts` `#processHashSubmit`), so the separate
+   *     channel the paragraph was waiting for is built.
+   *   - `DOD-M15-AUTHORSHIP-ABSENT-1` then made the relay unnecessary for this question: the
+   *     sender's signature over their own Structure 1 travels on the content frame beside the bytes
+   *     it signs. `#verifyAuthorshipClaim` verifies it against the pubkey inside those signed bytes
+   *     and matches the signer to this session's counterparty; a frame carrying nothing checkable is
+   *     refused by name (`authorship_proof_absent`), so omitting the proof is not the softer option
+   *     it once was. That verdict reaches this method as `verifiedAuthorship`.
+   *   - The PARK-RECOVERY caller deliberately passes no `verifiedAuthorship`, and is not an
+   *     exception to the above: recovered mail is authenticated by its park ENVELOPE's own
+   *     signature (`authenticateParkedEntry`) before it is unsealed. Two routes, both cryptographic,
+   *     and the transcript row records which one attested the message rather than implying a proof
+   *     it does not have.
    *
    * @returns the appended leaf index (as sequenceNumber) on success.
    */
