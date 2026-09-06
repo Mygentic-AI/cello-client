@@ -17,12 +17,13 @@ import { describe, it, expect, vi } from "vitest";
 import { RegistrationManager, type RegistrationContext, type SignalingSendResult } from "../registration-manager.js";
 import type { ConsortiumEndpoint } from "../directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
+import { generateKeypair } from "@cello-protocol/crypto";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
-import type { KeyProvider } from "@cello-protocol/crypto";
 
 const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
-const stubKeyProvider = { async getPublicKey() { return new Uint8Array(32); } } as unknown as KeyProvider;
+// 038-KEYBIND: registration now SIGNS the key binding with K_local, so the stub must sign.
+const stubKeyProvider = generateKeypair();
 const stubNode = {} as unknown as CelloNode;
 
 function makeRecordingPersistence() {
