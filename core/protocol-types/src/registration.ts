@@ -192,6 +192,22 @@ export interface AgentProfile {
   status: "active";
   /** Hex-encoded 16-byte CSPRNG agent ID */
   agent_id: string;
+  /**
+   * 038-KEYBIND. Hex 64-byte Ed25519 signature by this agent's K_local over
+   * (`k_local_pubkey`, `primary_pubkey`), taken from `dkg_complete`.
+   *
+   * The directory STORES and SERVES it; it can neither produce nor alter one, because the signer is
+   * a key no directory holds. That is what makes the directory an untrusted carrier here rather
+   * than an authority: the only thing it can do to this value is withhold it, and both clients
+   * refuse a session assignment that arrives without one.
+   *
+   * Optional on the TYPE for the profile rows of agents registered before the field existed. Those
+   * agents cannot be reached — not because the directory refuses (it cannot verify a binding, so it
+   * brokers and logs `session.key_binding.unavailable` naming which side is unbound) but because
+   * BOTH CLIENTS refuse an assignment that arrives without one. The operator re-registers, which
+   * mints the binding from key material the daemon already holds.
+   */
+  key_binding?: string;
 }
 
 // ─── RegistrationState (stored locally by client) ────────────────────────────
