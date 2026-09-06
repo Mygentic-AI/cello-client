@@ -23,6 +23,7 @@
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { describe, it, expect, afterEach } from "vitest";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { CONTENT_HASH_ALGS, wireContentHash } from "../wire-content-hash.js";
 import { evaluateSealUpgrade } from "../seal-upgrade.js";
 import { sealParkEnvelope } from "../park-envelope.js";
@@ -62,8 +63,16 @@ async function contentFrame(fields: Record<string, unknown>): Promise<Uint8Array
     sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
-    lastSeenHash: new Uint8Array(32).fill(0xa7),
-    prevOwnHash: new Uint8Array(32).fill(0xb4),
+    /**
+     * ⚠️ BOTH CHAIN LINKS ARE THE SESSION'S STARTING POINT — `DOD-M15-SELFCHAIN-1`.
+     *
+     * A first message has received nothing and said nothing, and both of those are the same defined
+     * value: what this fixture's session agreed. Arbitrary fills here get the frame refused for a
+     * broken chain, in tests about a hash ALGORITHM — and a refusal for the wrong reason is
+     * invisible to a test that only looks for the presence of one.
+     */
+    lastSeenHash: TEST_SESSION_GENESIS,
+    prevOwnHash: TEST_SESSION_GENESIS,
   });
   return lp.encode.single(encodeCbor({
     type: "content_frame", session_id: SID, content_bytes: sealSessionContent(new Uint8Array(32).fill(0x7e), CONTENT), content_encryption: SESSION_CONTENT_ENCRYPTION_V1,

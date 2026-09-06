@@ -36,6 +36,7 @@ import { decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import type { CelloNode } from "@cello-protocol/transport";
 import { startTwoConnectionFixture, FakeNode, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { wireContentHash } from "../wire-content-hash.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
@@ -87,14 +88,24 @@ async function signedClaim(
   opts: { contentHash?: Uint8Array } = {},
 ): Promise<{ structure1: Uint8Array; signature: Uint8Array; pubkeyHex: string }> {
   const senderPubkey = await kp.getPublicKey();
+  /**
+   * ⚠️ BOTH CHAIN LINKS ARE THE SESSION'S STARTING POINT, not two arbitrary fills —
+   * `DOD-M15-SELFCHAIN-1`.
+   *
+   * They were `0xa7…` and `0xb4…`, from when nothing compared them. They are compared now. A first
+   * message has received nothing and said nothing, and BOTH of those cases are the same defined
+   * value: the starting point this fixture's session agreed. Leaving arbitrary bytes here made an
+   * otherwise-perfect frame get refused for a broken chain, in tests written about a missing
+   * signature — a refusal for the wrong reason reads as a pass to a test that only counts refusals.
+   */
   const structure1 = encodeStructure1({
     contentHash: opts.contentHash ?? wireContentHash(BODY),
     senderPubkey,
     sessionId: Buffer.from(SID, "hex"),
     lastSeenSeq: 0,
     timestamp: 1_750_000_000_000,
-    lastSeenHash: new Uint8Array(32).fill(0xa7),
-    prevOwnHash: new Uint8Array(32).fill(0xb4),
+    lastSeenHash: TEST_SESSION_GENESIS,
+    prevOwnHash: TEST_SESSION_GENESIS,
   });
   return {
     structure1,

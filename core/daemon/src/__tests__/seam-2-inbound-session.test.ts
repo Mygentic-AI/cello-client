@@ -582,7 +582,19 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 
-  it("logs malformed and ignores a session_assignment frame with no assignment payload", async () => {
+  /**
+   * ⚠️ THIS TEST CHANGED ITS MIND ABOUT WHAT THIS FRAME *IS* — `DOD-M15-SELFCHAIN-1`.
+   *
+   * It used to assert a `malformed` warning: a frame with no assignment was filed as a badly
+   * shaped message and dropped. Ruled 2026-09-06 that it is nothing of the kind. Every real
+   * session is brokered — the directory signs an establishment record, both sides verify it, and
+   * the conversation's starting point comes out of those signed bytes. A session offered without
+   * one is a conversation whose order could never be proven by anyone, so it is refused as
+   * suspicious and the operator is told, rather than tidied into a log line nobody opens.
+   *
+   * The assertions below are therefore about a SECURITY REFUSAL, not a parse failure.
+   */
+  it("refuses a session_assignment frame with no assignment payload, loudly and by name", async () => {
     const { logger, events } = makeLogger();
     await makeAgentDir("bob");
     const node = new FakeNode();
@@ -595,9 +607,15 @@ describe("Seam 2: inbound session_assignment → acceptSession → cello_await_s
     await wait(50);
 
     expect(h.getSessionNodeManager().getSessionRecord("bob", SID_HEX)).toBeNull();
-    const malformed = events.find((e) => e.event === "session.inbound.assignment.malformed");
-    expect(malformed).toBeDefined();
-    expect(malformed!.context["reason"]).toBe("missing_assignment_or_ids");
+    const refused = events.find((e) => e.event === "session.inbound.assignment.no_assignment");
+    expect(refused, "the refusal must be reported, not swallowed").toBeDefined();
+    // ERROR, not warn: nothing legitimate produces this frame, and the level is what decides
+    // whether the operator's tooling shows it at all.
+    expect(refused!.level).toBe("error");
+    expect(
+      String(refused!.context["impact"]),
+      "the log must say what it COSTS the operator, not just that a field was absent",
+    ).toMatch(/starting point/);
     expect(events.find((e) => e.event === "session.inbound.accepted")).toBeUndefined();
   });
 
