@@ -151,6 +151,7 @@ describe("M8C-AUTOSTART-1: use_agent auto-start + F5/F18", () => {
       primaryPubkey: "aa".repeat(32),
       mlDsaPubkey: "bb".repeat(32),
       registeredAt: 1_700_000_000_000,
+      keyBinding: "cc".repeat(64),
     });
 
     const res = (await client.send("cello_use_agent", { name: "reggie" })) as Result;

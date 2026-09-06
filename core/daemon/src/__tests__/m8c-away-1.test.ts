@@ -36,7 +36,7 @@ import type { Stream } from "@libp2p/interface";
 import { Encoder, decode } from "cbor-x";
 import * as lp from "it-length-prefixed";
 import { markAsAutoReply } from "../away-detection.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -192,7 +192,10 @@ describe("M8C-AWAY-1: away response", () => {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   async function start(logger: Logger, node: CelloNode, signalingConnect?: () => Promise<ConnectResult>, securityGateway?: SecurityGatewayClient): Promise<Awaited<ReturnType<typeof startDaemon>>> {
@@ -255,7 +258,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
 
     // Press the switch.
@@ -284,7 +287,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
     // logic — the unknown-sender ("Dispatched.") branch is covered by m8c-contact-1.test.ts.
     h.getSessionNodeManager().addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
@@ -324,7 +327,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
     snm.setContactAwayMessage("bob", initiatorPubkey, "Hey - reach me on Signal");
 
@@ -352,7 +355,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
 
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
@@ -373,7 +376,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     snm.addContact("bob", initiatorPubkey, undefined, null, TIER.KNOWN);
     snm.setContactAwayMessage("bob", initiatorPubkey, "my home address is 123 Main St"); // would-be leak
 
@@ -401,7 +404,7 @@ describe("M8C-AWAY-1: away response", () => {
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
     await connectAs("bob"); // bob is now ATTENDED
 
-    const initiatorPubkey = "ef".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     injectRef.inject!(await assignmentFrame(initiatorPubkey, bobPubkey));
     await wait(150);
 
@@ -669,10 +672,11 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
-    snm.addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
+    const caller = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", caller, undefined, null, TIER.KNOWN);
 
     // Step 1: inbound session request → daemon sends away greeting (seq 0, sent).
-    injectRef.inject!(await assignmentFrame("cd".repeat(32), bobPubkey));
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
     await wait(150);
 
     // Step 2: caller sends a [[WRAP]] message → daemon skips away reply.
@@ -697,9 +701,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode(), makeInjectableSignaling(injectRef));
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
-    h.getSessionNodeManager().addContact("bob", "cd".repeat(32), undefined, null, TIER.KNOWN);
+    const caller = fixtureIdentity().pubkeyHex;
+    h.getSessionNodeManager().addContact("bob", caller, undefined, null, TIER.KNOWN);
 
-    injectRef.inject!(await assignmentFrame("cd".repeat(32), bobPubkey));
+    injectRef.inject!(await assignmentFrame(caller, bobPubkey));
     await wait(150);
 
     const { messages } = h.getSessionNodeManager().readTranscript("bob", SID_HEX);
@@ -1159,7 +1164,7 @@ describe("M8C-AWAY-1: away response", () => {
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
     const snm = h.getSessionNodeManager();
-    const initiatorPubkey = "cd".repeat(32);
+    const initiatorPubkey = fixtureIdentity().pubkeyHex;
     // A KNOWN contact is told; a stranger (no contact row → UNKNOWN) is not.
     if (tier >= TIER.KNOWN) snm.addContact("bob", initiatorPubkey, undefined, null, tier);
     // Pre-seed the sender to their cap so the NEXT assignment is refused for over-cap, not blocked.

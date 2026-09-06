@@ -15,6 +15,9 @@
  */
 import { describe, it, expect } from "vitest";
 import { verifyBilateralSealCertificate, wireSessionOfferHandler, wireSessionCeremonyHandler, sendSealFrostSignature } from "../session-ceremony.js";
+import { generateKeypair } from "@cello-protocol/crypto";
+import { buildSealTbs, encodeCbor } from "@cello-protocol/protocol-types";
+import { bindLegibilityToTbs } from "../seal-legibility-tbs.js";
 import type { DaemonRegistrationPersistence } from "../registration-persistence.js";
 import type { SignalingSeam } from "../registration-context.js";
 import type { Logger } from "../types.js";
@@ -72,6 +75,89 @@ describe("F2-a: verifyBilateralSealCertificate returns a reason on verified:fals
       cert,
     );
     expect(verdict).toMatchObject({ ok: false, reason: "no_signer_pubkey" });
+  });
+});
+
+/**
+ * 038-KEYBIND — the RESPONDER-FIRST close, which used to be unverifiable by the initiator.
+ *
+ * The seal is signed by whichever party closed FIRST. When that was the responder, the initiator
+ * held no copy of their group key — it never learned one — so it took the certificate on faith and
+ * reported `signer_key_not_held`. The session assignment now carries the responder's group key with
+ * a binding under the responder's own identity key, the initiator verifies that binding before it
+ * accepts the assignment, and records the result. This asserts the consequence: the same
+ * certificate that used to be accepted unverified now VERIFIES.
+ */
+describe("038-KEYBIND: a responder-first seal verifies locally instead of signer_key_not_held", () => {
+  /** A share whose commitments[0] is this agent's OWN group key — what the verifier loads. */
+  function shareWithOwnPrimary(ownPrimary: Uint8Array) {
+    return { commitmentsCbor: encodeCbor([ownPrimary]) as Uint8Array };
+  }
+
+  async function responderSignedCert(responderGroup: ReturnType<typeof generateKeypair>) {
+    const sessionId = new Uint8Array(16).fill(3);
+    const sealedRoot = new Uint8Array(32).fill(4);
+    const leafCount = 6;
+    const closeTimestamp = 1_700_000_000_000;
+    // The seal TBS with no legibility — bindLegibilityToTbs is a no-op for null, so this is the
+    // same bytes the directory would sign.
+    const tbs = bindLegibilityToTbs(buildSealTbs(sessionId, sealedRoot, leafCount, closeTimestamp), null);
+    const ctx = new TextEncoder().encode("cello-frost-seal-v1");
+    const framed = new Uint8Array(ctx.length + 1 + tbs.length);
+    framed.set(ctx, 0); framed[ctx.length] = 0x00; framed.set(tbs, ctx.length + 1);
+    return {
+      sessionId, sealedRoot, leafCount, closeTimestamp,
+      frostSignature: await responderGroup.sign(framed),
+      signerPubkey: await responderGroup.getPublicKey(),
+      signatureType: "frost" as const,
+      legibility: null,
+    };
+  }
+
+  it("BEFORE the recording exists (no counterparty primary) it is still accepted unverified — the branch that stays", async () => {
+    const ownGroup = generateKeypair();
+    const responderGroup = generateKeypair();
+    const verdict = await verifyBilateralSealCertificate(
+      {
+        persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
+        agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
+        counterpartyPrimaryHex: null,
+      },
+      await responderSignedCert(responderGroup),
+    );
+    expect(verdict).toMatchObject({ ok: true, verified: false, reason: "signer_key_not_held" });
+  });
+
+  it("★ WITH the responder's group key recorded, the same certificate VERIFIES", async () => {
+    const ownGroup = generateKeypair();
+    const responderGroup = generateKeypair();
+    const verdict = await verifyBilateralSealCertificate(
+      {
+        persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
+        agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
+        // What 038-KEYBIND puts on the session row: the responder's group key, proved theirs by a
+        // binding under their own identity key before it was ever written down.
+        counterpartyPrimaryHex: Buffer.from(await responderGroup.getPublicKey()).toString("hex"),
+      },
+      await responderSignedCert(responderGroup),
+    );
+    // `verified: true` — not merely "it did not fail". A recording that pinned the WRONG key would
+    // take the signer_not_a_session_participant branch below, which is a different outcome.
+    expect(verdict).toMatchObject({ ok: true, verified: true });
+  });
+
+  it("a WRONG recorded key is a refusal, not a shrug — the recording is load-bearing", async () => {
+    const ownGroup = generateKeypair();
+    const responderGroup = generateKeypair();
+    const verdict = await verifyBilateralSealCertificate(
+      {
+        persistence: makePersistence(shareWithOwnPrimary(await ownGroup.getPublicKey())),
+        agentPubkeyHex: AGENT_PUBKEY_HEX, logger: noopLogger,
+        counterpartyPrimaryHex: Buffer.from(await generateKeypair().getPublicKey()).toString("hex"),
+      },
+      await responderSignedCert(responderGroup),
+    );
+    expect(verdict).toMatchObject({ ok: false, reason: "signer_not_a_session_participant" });
   });
 });
 

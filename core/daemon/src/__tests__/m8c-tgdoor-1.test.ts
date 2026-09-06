@@ -26,7 +26,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { TelegramBotClient, TelegramUpdate } from "../telegram-bot-client.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, fixtureIdentity } from "./helpers/signed-assignment.js";
 
 function msgLeafHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(new Uint8Array([0x00])).update(content).digest());
@@ -240,7 +240,7 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     // gets the frame past the door the accept path now has to open.
     const { frame } = await makeSignedAssignmentFrame({
       sessionId: SID_BYTES,
-      initiatorPubkey: new Uint8Array(Buffer.from("dd".repeat(32), "hex")),
+      initiatorPubkey: fixtureIdentity().pubkey,
       responderPubkey: new Uint8Array(Buffer.from(bobPubkey, "hex")),
       initiatorSessionPeerId: "initiator-peer-id",
       // DOD-INBOUND-GUARD-1: a complete assignment carries the responder's accepted endpoint.

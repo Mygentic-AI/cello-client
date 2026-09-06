@@ -84,6 +84,19 @@ export interface DkgComplete {
   type: "dkg_complete";
   /** Hex-encoded FROST group public key (32 bytes). Derived from DKG commitments. */
   primary_pubkey: string;
+  /**
+   * 038-KEYBIND. Hex-encoded 64-byte Ed25519 signature by this agent's K_local over
+   * (`k_local_pubkey`, `primary_pubkey`) under `CONTEXT_KEY_BINDING`.
+   *
+   * THIS FRAME IS THE ONLY MOMENT IT CAN BE MADE. At agent creation the group key does not exist
+   * yet; after registration the DKG is over. This is the one point where both keys are on the
+   * machine together, and no re-DKG is ever needed to produce it again — the group key is preserved
+   * across key refresh, so it is signed once for the life of the agent.
+   *
+   * The directory stores it and serves it on every session assignment. It cannot forge one (it
+   * holds no K_local) and it cannot swap one (the binding names the identity it belongs to).
+   */
+  key_binding: string;
 }
 
 // ─── Direction: directory → client ───────────────────────────────────────────

@@ -29,6 +29,17 @@ export interface RegistrationStateRecord {
   mlDsaPubkey: string;
   registeredAt: number;
   status: string;
+  /**
+   * 038-KEYBIND. Hex 64-byte Ed25519 signature by this agent's K_local over
+   * (k_local_pubkey, primaryPubkey). Null for an agent whose row predates the column.
+   *
+   * ⚠️ **WRITTEN, AND READ BY NOTHING YET** — said plainly rather than implied, because the careful
+   * null-handling around it otherwise reads as a decision some caller acts on, and no caller
+   * exists. The live copy is the one on the DIRECTORY's profile, which is what rides on every
+   * session assignment; this is the agent's own record of what it signed, kept so a future
+   * re-upload does not have to re-derive it from a value a directory supplied.
+   */
+  keyBinding: string | null;
 }
 
 export interface MlDsaKeypairRecord {
@@ -75,6 +86,12 @@ export interface DaemonRegistrationPersistence {
     primaryPubkey: string;
     mlDsaPubkey: string;
     registeredAt: number;
+    /**
+     * 038-KEYBIND. The binding minted at the tail of registration, hex. Persisted BESIDE the share
+     * because it is the same kind of artifact: produced once, for the life of the agent, from key
+     * material that is only ever together on this machine.
+     */
+    keyBinding: string;
   }): Promise<void>;
   persistFrostKeyShare(opts: {
     epochId: string;
@@ -160,12 +177,16 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
     primaryPubkey: string;
     mlDsaPubkey: string;
     registeredAt: number;
+    keyBinding: string;
   }): Promise<void> {
     await this.#writeJsonAtomic(FILE_REGISTRATION_STATE, {
       agentId: opts.agentId,
       primaryPubkey: opts.primaryPubkey,
       mlDsaPubkey: opts.mlDsaPubkey,
       registeredAt: opts.registeredAt,
+      // 038-KEYBIND: a public signature, not a secret — but it lives with the rest of the
+      // registration record because it is meaningless apart from the two keys it names.
+      keyBinding: opts.keyBinding,
       status: "active",
     });
     this.#logger.info("registration.state.persisted", {
@@ -235,6 +256,9 @@ export class FileRegistrationPersistence implements DaemonRegistrationPersistenc
       mlDsaPubkey: reqStr(obj, "mlDsaPubkey", FILE_REGISTRATION_STATE),
       registeredAt: reqNum(obj, "registeredAt", FILE_REGISTRATION_STATE),
       status: reqStr(obj, "status", FILE_REGISTRATION_STATE),
+      // NOT `reqStr`: a file written before 038-KEYBIND has no such field, and that is a value to
+      // report (null), not a corrupt-file throw that would make the agent unloadable.
+      keyBinding: typeof obj["keyBinding"] === "string" ? obj["keyBinding"] : null,
     };
   }
 

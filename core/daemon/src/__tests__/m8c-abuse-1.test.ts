@@ -23,7 +23,7 @@ import { createHash } from "node:crypto";
 import { FileKeyProvider, generateKeypair } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 import {
   ABUSE_MAX_SESSION_RECEIVED_BYTES,
   ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER,
@@ -123,7 +123,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   async function start(logger: Logger, node: CelloNode, signalingConnect?: () => Promise<ConnectResult>): Promise<Awaited<ReturnType<typeof startDaemon>>> {
@@ -200,7 +203,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const h = await start(makeLogger().logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     const db = snm.getDb();
-    const strangerPubkey = "ee".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     const now = Date.now();
     const aliceId = resolveAgentId(db, "alice");
     for (let i = 0; i < ABUSE_MAX_SESSIONS_PER_UNKNOWN_SENDER; i++) {
@@ -231,7 +234,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
 
-    const strangerPubkey = "ee".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     // Pre-seed the per-sender cap's worth of active sessions directly (bypassing acceptance, so
     // the sender stays genuinely unknown — see the previous test's note).
     const now = Date.now();
@@ -273,7 +276,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     await snm.ensureStandingReceiverForAgent("bob");
 
     // A BLOCKED contact (tier 0). getTier → BLOCKED → per-sender cap 0 → refused before any state.
-    const blockedPubkey = "b0".repeat(32);
+    const blockedPubkey = fixtureIdentity().pubkeyHex;
     const bobId = resolveAgentId(snm.getDb(), "bob");
     snm.addContact("bob", blockedPubkey);
     snm.getDb().prepare("UPDATE contacts SET tier = ? WHERE agent_id = ? AND pubkey = ?").run(TIER.BLOCKED, bobId, blockedPubkey);
@@ -313,7 +316,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
 
-    const strangerPubkey = "3c".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     // DOD-M15-RESPONDER-VERIFY-1: the first ACCEPTED session pins this signer as the stranger's
     // threshold key, so every later knock from the same pubkey must be signed by the SAME keypair —
     // a fresh one per knock is correctly refused as an identity substitution, which would mask the
@@ -364,7 +367,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
 
-    const strangerPubkey = "4d".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     // Seed the cap's worth of GHOSTS: interrupted, created 1h ago, 0 messages, no received rows,
     // no live node (liveness never marked) — the exact post-restart shape from the live block.
     const old = Date.now() - 60 * 60 * 1000;
@@ -465,7 +468,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
 
-    const strangerPubkey = "6d".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     const bobId = resolveAgentId(snm.getDb(), "bob");
     // Sessions the COUNTERPARTY interrupted, so they legitimately count — young enough that the
     // half-open reaper leaves them alone, and carrying content so it could not take them anyway.
@@ -537,7 +540,7 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     await snm.ensureStandingReceiverForAgent("bob");
 
-    const attackerPubkey = "5e".repeat(32);
+    const attackerPubkey = fixtureIdentity().pubkeyHex;
     const old = Date.now() - 60 * 60 * 1000;
     const sids: string[] = [];
     const bobId = resolveAgentId(snm.getDb(), "bob");

@@ -34,7 +34,7 @@ import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { Stream } from "@libp2p/interface";
 import { markAsAutoReply } from "../away-detection.js";
-import { makeSignedAssignmentFrame } from "./helpers/signed-assignment.js";
+import { makeSignedAssignmentFrame, registerFixtureSigner, fixtureIdentity } from "./helpers/signed-assignment.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 function makeLogger(): { logger: Logger; events: LogEvent[] } {
@@ -107,7 +107,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const dir = join(tempDir, "agents", name);
     await mkdir(dir, { recursive: true });
     const kp = await FileKeyProvider.load(join(dir, "key"));
-    return Buffer.from(await kp.getPublicKey()).toString("hex");
+    const hex = Buffer.from(await kp.getPublicKey()).toString("hex");
+    // 038-KEYBIND: a REAL agent, so the assignment fixture can sign a key binding as it.
+    registerFixtureSigner(hex, kp);
+    return hex;
   }
 
   async function start(opts: {
@@ -293,7 +296,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob"); // bob unattended — no client connected
 
-    const strangerPubkey = "cd".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
     // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
     // key map is keyed by (agent, session) and does not need the session to exist yet, so this
@@ -320,7 +323,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await makeAgentDir("alice");
     const h = await start({ logger: makeLogger().logger, node: new FakeNode() });
     const snm = h.getSessionNodeManager();
-    const strangerPubkey = "7c".repeat(32);
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
     // An inbound-originated active session whose counterparty is NOT yet a contact (the CC-1 world:
     // accepting the connection did not add them). A brand-new empty session → first send needs no
     // read-before-write catch-up (M8C-CURSOR-1 C3).
@@ -354,7 +357,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await wait(50);
     await h.getSessionNodeManager().ensureStandingReceiverForAgent("bob");
 
-    const knownPubkey = "ef".repeat(32);
+    const knownPubkey = fixtureIdentity().pubkeyHex;
     h.getSessionNodeManager().addContact("bob", knownPubkey, undefined, null, TIER.KNOWN); // KNOWN BEFORE this session
 
     // 007-CRYPTO: an away auto-reply is a live send, and a live send needs an agreed key. The
@@ -434,6 +437,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
             signature_type: "frost",
             signer_pubkey: new Uint8Array(32),
           },
+          // 038-KEYBIND: the real negotiator only returns this once the counterparty's own identity
+          // key has signed for it; this stub skips verification entirely, as it does for every other
+          // field on the assignment above.
+          counterpartyPrimaryHex: "11".repeat(32),
         };
       },
     };

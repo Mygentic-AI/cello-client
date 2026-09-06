@@ -144,6 +144,8 @@ describe("PERSIST-002 Unit 2 — DbRegistrationPersistence (AC-002/AC-003/AC-005
       primaryPubkey: "primarypub",
       mlDsaPubkey: "mldsapub",
       registeredAt: 1234,
+      // 038-KEYBIND: persisted beside the share, and reloaded below with the rest of the bundle.
+      keyBinding: "ab".repeat(64),
     });
     await p.persistAgentUserLink({ agentId: "agent-1", preAuthToken: "tok-abc", linkedAt: 5678 });
 
