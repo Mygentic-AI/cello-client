@@ -345,7 +345,18 @@ export class HeldContent {
     if (!held) { held = new Map(); this.#ctx.heldContent.set(key, held); }
     held.set(canonicalSeq, { content: new Uint8Array(), contentHashHex, origin: "sent", kind: "msg" });
   }
-  /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
+  /**
+   * ⚠️ **ORPHANED COMMENT, OWNER UNKNOWN — do not attach it to the method below.** It reads
+   * *"@returns true iff the UPDATE was executed without error (a failed write is logged, never
+   * thrown)"*, and `annexHeldContentOnTerminal` returns `void` and runs no such UPDATE. It was
+   * already stranded in `session-node-manager.ts` before 037 moved this code, and Rule C carried it
+   * verbatim rather than dropping a sentence that is true of SOMETHING.
+   *
+   * Kept, marked, and NOT reattached: the nearest candidate by behaviour is
+   * `SessionQueries.markCounterpartyAbandoned`, which already has its own doc — so attaching it
+   * there on a guess is the same defect this marker exists to stop. Delete it only once its owner is
+   * identified, or reattach it then.
+   */
   /**
    * DOD-M12B-STRAND-1 — move a terminal session's held frames to the annex.
    *
