@@ -812,6 +812,29 @@ export interface SentAuthorship {
 }
 
 /**
+ * One message that has been sent and is waiting for the counterparty's delivery acknowledgement.
+ *
+ * Named rather than inline because the map it lives in is now shared between the manager and the
+ * content pipeline, and a shared shape spelled out twice is a shape that stops agreeing.
+ *
+ * ⚠️ **EVERYTHING NEEDED TO RE-PARK THIS MESSAGE IS HERE, and that is why the entry is this fat.**
+ * When the acknowledgement never comes, the retry has to reproduce the message the peer would have
+ * refused — the same bytes, the same hash algorithm, the same signed Structure 1 and the same leaf
+ * kind. A retry that rebuilds any of those from what the session holds NOW answers "how would we
+ * send this today", which is a different message with a different hash, and the peer refuses it.
+ */
+export interface AwaitingAckEntry {
+  timer: ReturnType<typeof setTimeout>;
+  content: Uint8Array;
+  correlationId?: string;
+  structure1Cbor?: Uint8Array;
+  structure2Cbor?: Uint8Array;
+  contentHashAlg?: string;
+  structure1Signature?: Uint8Array;
+  leafKind?: number;
+}
+
+/**
  * `DOD-M15-AUTHORSHIP-ABSENT-1` — the answer to "did the sender prove they wrote this message?",
  * with the three NOT-YES cases kept apart because they are three different facts about the peer.
  *

@@ -135,7 +135,7 @@ export default [
     //       count of it true, so it is deliberately given as a magnitude rather than a figure that
     //       silently rots.)
     files: ["core/daemon/src/session-node-manager.ts"],
-    rules: { "max-lines": ["error", { max: 10945, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 7129, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon.ts"],

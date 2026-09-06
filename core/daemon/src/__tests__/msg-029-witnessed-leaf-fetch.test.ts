@@ -152,7 +152,13 @@ describe("DOD-M12B-LEAF-TRIGGERS-FETCH-1: a witnessed leaf we cannot read is a f
    */
   it("WIRING: content arriving on the real ingest path marks it resolved", async () => {
     const { readFileSync } = await import("node:fs");
-    const code = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8")
+    // ⚠️ POINTED AT THE INGEST FILE, not the manager. `ingestReceivedContent` moved there when the
+    // content path was split out; the manager keeps a one-line delegator, which contains neither
+    // the log line nor the call. This test went red on its own precondition — the design working —
+    // and repointing it is the whole change. Relaxing the assertion instead would have left the
+    // fetch-cancel wiring unpinned, which is the exact signal-received-and-ignored defect the file
+    // exists to catch.
+    const code = readFileSync(join(import.meta.dirname, "..", "session-content-ingest.ts"), "utf-8")
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     const a = code.indexOf("session.content.received");
     expect(a, "the receipt site moved — this test must follow it").toBeGreaterThan(-1);
@@ -160,7 +166,7 @@ describe("DOD-M12B-LEAF-TRIGGERS-FETCH-1: a witnessed leaf we cannot read is a f
     const before = code.slice(Math.max(0, a - 1200), a);
 
     expect(
-      before.includes("#markContentResolved("),
+      before.includes("markContentResolved("),
       "without this, content that arrives on the direct path never cancels its scheduled fetch — " +
       "so every healthy message costs a relay round trip two seconds later",
     ).toBe(true);
