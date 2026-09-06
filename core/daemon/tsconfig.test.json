@@ -122,6 +122,10 @@
     "src/__tests__/helpers/hold-singleton-lock.ts",
     "src/__tests__/helpers/park-relay.ts",
     "src/__tests__/helpers/seed-agents.ts",
+    // `DOD-M15-SELFCHAIN-1`. New and clean on creation, which is this list's admission criterion.
+    // It hands out the value every fixture's session chains to, so a signature drift here would
+    // land silently in dozens of files at once — exactly the case for having the compiler see it.
+    "src/__tests__/helpers/session-genesis.ts",
     "src/__tests__/helpers/spawn-real-daemon.ts",
     "src/__tests__/helpers/two-connection-fixture.ts"
   ]

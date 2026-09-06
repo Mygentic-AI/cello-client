@@ -49,7 +49,7 @@ import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { normalizeContactPubkey, foldContactPubkeyCase } from "./contact-pubkey-case.js";
-import { REFUSAL_KINDS, REFUSAL_REASONS, REFUSAL_GUIDANCE, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
+import { REFUSAL_KINDS, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";

@@ -24,7 +24,6 @@ import {
   it,
   expect,
 } from "@claude-flow/testing";
-import { generateKeypair } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "../structure1.js";
 import {
   buildStructure2,
@@ -67,61 +66,17 @@ function loadScanResultFixture() {
   ) as { expected_cbor_hex: string };
 }
 
-/** Build a real Structure 2 from a live keypair for round-trip tests. */
-async function makeStructure2(seq = 1, lastSeenSeq = 0) {
-  const kp = generateKeypair();
-  const content = new TextEncoder().encode("merkle-002 test content");
-  const sessionId = new Uint8Array(16).fill(0x10);
-  const ts = 1_700_000_000_000;
-
-  // Mint the three sender-side inputs Structure 2 binds — content hash, pubkey, and the sender's
-  // signature over the canonical Structure 1 — directly. This used to be driven through
-  // buildEnvelopeV1 (the M6 MessageEnvelope module, now deleted); the SUBJECT here was always
-  // buildStructure2, never the envelope.
-  const senderPubkey = await kp.getPublicKey();
-  const contentHash = new Uint8Array(await crypto.subtle.digest("SHA-256", content));
-  // Both chain links are required (`DOD-M15-SELFCHAIN-1`). Their VALUES are irrelevant to this
-  // file — the subject is `buildStructure2`, which binds the sender signature and never reads them
-  // — so a fixed pair keeps the fixture stable and says plainly that they are not under test here.
-  const structure1 = encodeStructure1({
-    contentHash,
-    senderPubkey,
-    sessionId,
-    lastSeenSeq,
-    timestamp: ts,
-    lastSeenHash: new Uint8Array(32).fill(0xa7),
-    prevOwnHash: new Uint8Array(32).fill(0xb4),
-  });
-  const senderSignature = await kp.sign(structure1);
-
-  const env = {
-    sender_pubkey: senderPubkey,
-    content_hash: contentHash,
-    sender_signature: senderSignature,
-    session_id: sessionId,
-    last_seen_seq: lastSeenSeq,
-    timestamp: ts,
-  };
-  const prevRoot = new Uint8Array(32).fill(0x00);
-
-  const s2Result = buildStructure2(
-    seq,
-    env.sender_pubkey,
-    env.content_hash,
-    env.sender_signature,
-    prevRoot
-  );
-  if (!s2Result.ok) throw new Error(`buildStructure2 failed: ${s2Result.error.reason}`);
-
-  return {
-    structure2: s2Result.structure2,
-    envelope: env,
-    sessionId,
-    lastSeenSeq,
-    ts,
-    kp,
-  };
-}
+/**
+ * ⚠️ `makeStructure2()` LIVED HERE AND IS GONE, along with the four describes it fed.
+ *
+ * Every one of them tested `verifyStructure2Signature`, which this unit deleted: it had no
+ * production caller and it hand-rolled its own copy of the Structure 1 encoder, which had drifted
+ * from the real one. Tests of a deleted function are not coverage to preserve.
+ *
+ * What they asserted is not lost. The property — a signature over Structure 1 verifies, and any
+ * tampering with it does not — is asserted against the SHIPPING verifier in the daemon's own
+ * suites, where the bytes come from the real encoder rather than a second copy of it.
+ */
 
 // ─── AC-001: Structure 1 canonical CBOR fixture (regression guard) ───────────
 

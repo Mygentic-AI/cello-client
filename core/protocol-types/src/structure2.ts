@@ -18,7 +18,6 @@
  */
 
 import { encodeCbor } from "./cbor.js";
-import { verify } from "@cello-protocol/crypto";
 import type { EnvelopeError } from "./types.js";
 
 
