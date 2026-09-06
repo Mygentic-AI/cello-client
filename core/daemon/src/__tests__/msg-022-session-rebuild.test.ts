@@ -325,13 +325,31 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
       ["#evictPeersOutsideGate", "establishment promotes an open receiver; revival builds a fresh node behind a gater that is narrow from birth, so no peer can predate the gate"],
     ]);
 
+    /**
+     * ⚠️ THE PATTERN READS THROUGH A COLLABORATOR, and it has to. 037-SESSIONCORE moved several of
+     * these steps into collaborators, so establishment now calls `this.#receivers.ensureStandingReceiver(...)`
+     * where it once called `this.#ensureStandingReceiver(...)`. A pattern pinned to the old shape
+     * stops SEEING the step — and this test's own stale-exemption check then reports it as a step
+     * establishment no longer makes, which is exactly what happened and is why it went red rather
+     * than quietly comparing a shorter list.
+     *
+     * Normalising on the LAST segment keeps the comparison about the step rather than about where
+     * the method now lives, which is the property the test is actually for.
+     */
     const calls = new Set(
-      [...establish.matchAll(/this\.(#?[A-Za-z][A-Za-z0-9_]*)\(/g)].map((m) => `#${m[1]!.replace(/^#/, "")}`),
+      [...establish.matchAll(
+        // The collaborator prefixes are NAMED, not matched as "any private field". A general
+        // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
+        // establishment step — a false positive that makes this guard noisy and then ignored.
+        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+      )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
     const takenByRevival = (c: string): boolean => {
       const names = [c, ...(EQUIVALENT.has(c) ? [EQUIVALENT.get(c)!] : [])];
-      return names.some((n) => revive.includes(`${n.replace(/^#/, "this.#")}(`) || revive.includes(`${n.slice(1)}(`));
+      // Same normalisation on the revival side: `.ensureStandingReceiver(` matches whether it is
+      // reached directly or through a collaborator.
+      return names.some((n) => revive.includes(`${n.replace(/^#/, "this.#")}(`) || revive.includes(`${n.slice(1)}(`) || revive.includes(`.${n.slice(1)}(`));
     };
     const missing = [...calls].filter((c) => !EXEMPT.has(c) && !takenByRevival(c));
 

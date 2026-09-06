@@ -330,7 +330,20 @@ describe("DOD-M15-RELAYONLY-1 — the DIAL, driven through the real handler", ()
 });
 
 describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS", () => {
-  const SNM_PATH = join(import.meta.dirname, "..", "session-node-manager.ts");
+  /**
+   * ⚠️ THE CHOKE POINT MOVED, AND THIS GUARD FOLLOWS THE CODE RATHER THAN THE FILENAME.
+   *
+   * 037-SESSIONCORE split the standing receiver out of `session-node-manager.ts` into
+   * `standing-receivers.ts`. `getStandingReceiverInfo` — the single method every publish path leaves
+   * through — went with it, along with `publishableEndpoint` and the factory call.
+   *
+   * Pointing this at the new file is the whole change. Leaving it on the manager would have scanned
+   * a one-line DELEGATOR: `publishableEndpoint` absent, the `!== null` sentinel absent, and the
+   * factory never called — so this guard would have gone red for the wrong reason, and a later
+   * reader "fixing" it by relaxing the assertions would have disarmed the leak protection entirely.
+   * It DID go red, including its own vacuity precondition, which is the design working.
+   */
+  const SNM_PATH = join(import.meta.dirname, "..", "standing-receivers.ts");
 
   it("★★ the suppression is IN the choke point, not at its call sites", () => {
     /**
@@ -428,7 +441,11 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
     const src = readFileSync(SNM_PATH, "utf8");
     const raw = src.split("\n")
       .map((line, i) => ({ line: line.trim(), n: i + 1 }))
-      .filter((r) => r.line.includes("#factory.createNode("));
+      // Matches `#factory.createNode(` and `#ctx.factory.createNode(` alike: 037-SESSIONCORE moved
+      // the wrapper into a collaborator that reaches the factory through its context, and a pattern
+      // pinned to the old spelling would have found zero calls — which this guard's own precondition
+      // correctly reports as vacuous rather than passing.
+      .filter((r) => /factory\.createNode\(/.test(r.line));
     expect(raw.length, "precondition: the factory must still be called somewhere, or this guard is vacuous")
       .toBeGreaterThan(0);
     const offenders = raw.filter((r) => !r.line.includes("...config, relayOnly"));
@@ -467,7 +484,7 @@ describe("DOD-M15-RELAYONLY-1 — the leak cannot come back in through a BYPASS"
       // that is NOT a predicate is one that could be building an endpoint, and that is the shape
       // that must be looked at against this line.
       if (line.includes(".some(")) return;
-      leaks.push(`session-node-manager.ts:${i + 1}`);
+      leaks.push(`standing-receivers.ts:${i + 1}`);
     });
 
     expect(
