@@ -149,6 +149,17 @@ export const REFUSAL_REASONS = {
    * cannot participate in the record, or trying to open a conversation that leaves none.
    */
   SESSION_WITHOUT_ASSIGNMENT: "session_without_assignment",
+  /**
+   * A session offer whose directory assignment IS there and cannot be read — its session id or one
+   * of its two participants is missing or malformed.
+   *
+   * ⚠️ SEPARATE FROM `SESSION_WITHOUT_ASSIGNMENT`, AND THE SPLIT IS THE POINT. Both came out of the
+   * same `null` return, so a wire or version fault was reaching the operator under a notice reading
+   * "NOTHING LEGITIMATE PRODUCES THIS. TREAT IT AS SUSPICIOUS." One exit point standing in for two
+   * causes, and the wrong one of the two was the loud one — which teaches an operator to scroll
+   * past the notice that matters.
+   */
+  ASSIGNMENT_UNREADABLE: "assignment_unreadable",
 } as const;
 
 export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASONS];
@@ -241,6 +252,15 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "LEGITIMATE PRODUCES THIS. IF THEY LOOK LIKE SOMEONE YOU KNOW, reach them OUT OF BAND — send " +
     "an email or a direct message, some channel that is not this one — and tell them their agent " +
     "cannot hold a provable conversation with anyone while it is in this state.",
+  [REFUSAL_REASONS.ASSIGNMENT_UNREADABLE]:
+    // "REFUSED ON PURPOSE" is a cross-cutting invariant (`DOD-M15-GUARD-HEARD-1`): every refusal
+    // guidance says the refusal was deliberate, so an operator never reads one as a malfunction.
+    "REFUSED ON PURPOSE, AND PROBABLY NOT AN ATTACK. Somebody tried to open a conversation with " +
+    "you and the directory record they brought could not be read — a field it must carry is " +
+    "missing or the wrong shape. That is what a version difference between their agent and yours " +
+    "looks like, and it is by far the likeliest explanation. Ask them OUT OF BAND — a channel that " +
+    "is not this one — which version they are running; if you are both current, ask them to try " +
+    "again, because a record damaged in transit produces exactly this too.",
   [REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED]:
     "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you have " +
     "completed sessions with before. Either they genuinely re-registered — confirm that with them " +

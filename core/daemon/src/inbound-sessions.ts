@@ -1178,8 +1178,49 @@ export function createInboundSessions(deps: InboundSessionDeps) {
        * defensively and fall back to empty. A refusal the operator can see with a partial id beats
        * one they cannot see at all.
        */
-      const looseSessionId = typeof frame["session_id"] === "string" ? frame["session_id"] : "";
-      const looseSender = typeof frame["sender_pubkey"] === "string" ? frame["sender_pubkey"] : "";
+      /**
+       * ⚠️ THE IDENTIFIERS COME OFF THE ASSIGNMENT, NOT OFF THE FRAME — and reading them off the
+       * frame is why this refusal could never name the conversation it refused.
+       *
+       * A `session_assignment` frame is `{ type, assignment }`. There is no top-level `session_id`
+       * and no top-level `sender_pubkey`, so both reads were ALWAYS empty — which made the error
+       * log identify nothing and, worse, made the inbox record conditional on a value that could
+       * never be truthy. The operator's notice was never written at all.
+       *
+       * Read defensively, because by definition the assignment did not fully parse. A partial id is
+       * worth far more than a refusal nobody can attach to anything.
+       */
+      const loose = (frame["assignment"] ?? {}) as Record<string, unknown>;
+      const looseSessionId = frameValueToHex(loose["session_id"]) ?? "";
+      const looseParticipantA = (loose["participant_a"] ?? {}) as Record<string, unknown>;
+      const looseSender = frameValueToHex(looseParticipantA["pubkey"]) ?? "";
+      /**
+       * ⚠️ FOUR CONDITIONS REACH HERE AND ONLY ONE OF THEM IS "NO ASSIGNMENT" — the other three are
+       * a MALFORMED one, and calling those "nothing legitimate produces this" would be an
+       * exit-point label standing in for three different causes.
+       *
+       * No `assignment` object at all is the security case: a session offered with no directory
+       * record behind it. A present-but-unreadable assignment is a wire or version fault, and the
+       * operator's move is to compare builds, not to treat their counterparty as hostile.
+       */
+      const noAssignmentAtAll = !frame["assignment"] || typeof frame["assignment"] !== "object";
+      if (!noAssignmentAtAll) {
+        logger.error("session.inbound.assignment.unreadable", {
+          sessionId: looseSessionId,
+          counterpartyPubkey: looseSender,
+          correlationId,
+          impact:
+            "a session offer arrived carrying a directory assignment this build could not read — " +
+            "its session id or one of its two participants is missing or malformed. REFUSED, and " +
+            "recorded for the operator's inbox. This is a wire or version fault, not a reason to " +
+            "suspect the counterparty.",
+        });
+        if (streamAgentName) {
+          recordRefusal(streamAgentName, looseSessionId, looseSender, REFUSAL_REASONS.ASSIGNMENT_UNREADABLE);
+          sessionNodeManager.recordRefusedSession(streamAgentName, looseSessionId, REFUSAL_REASONS.ASSIGNMENT_UNREADABLE);
+        }
+        return;
+      }
       logger.error("session.inbound.assignment.no_assignment", {
         sessionId: looseSessionId,
         counterpartyPubkey: looseSender,
@@ -1200,9 +1241,15 @@ export function createInboundSessions(deps: InboundSessionDeps) {
        */
       if (streamAgentName) {
         recordRefusal(streamAgentName, looseSessionId, looseSender, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
-        if (looseSessionId) {
-          sessionNodeManager.recordRefusedSession(streamAgentName, looseSessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
-        }
+        /**
+         * ⚠️ NOT GATED ON THE SESSION ID ANY MORE. It was `if (looseSessionId)`, and with the id
+         * read from the wrong place that condition was never true — so the durable half of "surface
+         * it to the operator's inbox" never ran once. On THIS branch the id is genuinely absent (a
+         * frame with no assignment carries none), and a refusal recorded without one is still a
+         * refusal the operator can see. An empty id is a worse record than a full one; it is a far
+         * better record than none.
+         */
+        sessionNodeManager.recordRefusedSession(streamAgentName, looseSessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
       }
       return;
     }
