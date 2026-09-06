@@ -1212,6 +1212,13 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#factory = opts.factory;
     this.#logger = opts.logger;
 
+    // REQUIRED, no fallback (INV-9, audit finding). This check used to read
+    // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
+    // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
+    // was hardened to throw while this constructor was not, so the inbound screen had a silent
+    // always-allow path that nothing in the product reached TODAY and any future refactor could.
+    // "Currently unreachable" is a property of today's call sites, not of the code.
+    //
     // ⚠️ CHECKED AND ASSIGNED FIRST, ahead of every collaborator, because the content pipeline
     // built below is handed this client by value and a constructor cannot hand out a field it has
     // not set yet. Moving it up also means a caller that forgot to screen is told so before the
@@ -1491,12 +1498,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     });
     this.#srWatchdogIntervalMs = opts.standingReceiverWatchdogIntervalMs ?? 30_000;
     this.#srReservationRetryMs = opts.standingReceiverReservationRetryMs ?? 5 * 60_000;
-    // REQUIRED, no fallback (INV-9, audit finding). This line used to read
-    // `opts.securityGateway ?? new PassthroughGatewayClient()` — the identical shape as the defect
-    // that reopened this milestone, one layer down and still shipping in the binary. `daemon.ts`
-    // was hardened to throw while this constructor was not, so the inbound screen had a silent
-    // always-allow path that nothing in the product reached TODAY and any future refactor could.
-    // "Currently unreachable" is a property of today's call sites, not of the code.
   }
 
   /**
