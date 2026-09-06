@@ -26,6 +26,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis, TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
@@ -161,6 +162,9 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     await wireAgentKeyProviders(mgrA, mgrA.getDb());
     await wireAgentKeyProviders(mgrB, mgrB.getDb());
 
+    // Both sides agree the session's starting point before either creates its node — see
+    // `helpers/session-genesis.ts` for why the order and the sharing both matter.
+    agreeSessionGenesis(SID, [{ mgr: mgrA, agentName: "alice" }, { mgr: mgrB, agentName: "bob" }]);
     await mgrA.createSessionNode(SID, "alice", bobPub, nodeB.getPeerId(), "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -198,9 +202,8 @@ describe("MSG-001: delivery ACK / TTF (daemon)", () => {
     managers.push(mgrA);
     await seedAgentKeys(mgrA.getDb(), ["alice"]);
     await wireAgentKeyProviders(mgrA, mgrA.getDb());
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    mgrA.setSessionGenesisForTest("alice", SID, new Uint8Array(32).fill(0x9c));
+    // The session's starting point, seeded BEFORE creation — see `helpers/session-genesis.ts`.
+    mgrA.setSessionGenesisForTest("alice", SID, TEST_SESSION_GENESIS);
     await mgrA.createSessionNode(SID, "alice", "bobpk", "bob-peer", "corr-a");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgrA.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));

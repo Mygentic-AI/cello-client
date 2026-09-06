@@ -27,16 +27,26 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { encodeCbor as encode } from "@cello-protocol/protocol-types";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
 import { SessionNodeManager } from "../session-node-manager.js";
 
 const AGENT_PUB = "aa".repeat(32);
 const SESSION = "bb".repeat(16);
 
-/** Canonical Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp]. */
+/**
+ * A Structure 1 leaf, built with the REAL encoder rather than a hand-rolled array.
+ *
+ * It was hand-rolled, and when `DOD-M15-SELFCHAIN-1` made both chain links required this fixture
+ * kept emitting the old six-field shape — so every leaf here became undecodable and nine tests
+ * reported "I cannot judge this carry" instead of the verdict they were written to check. A fixture
+ * that hand-rolls the layout it is testing against cannot notice that the layout moved.
+ *
+ * The chain links are filler: these tests compare CONTENT HASHES and read `last_seen_seq`. Nothing
+ * here verifies a chain, so the links only have to be the right width.
+ */
 function structure1(contentHash: Uint8Array): Uint8Array {
-  return new Uint8Array(encode([1, contentHash, new Uint8Array(32), new Uint8Array(16), 0, 1]));
+  return s1WithLastSeen(contentHash, 0);
 }
 
 function contentHash(fill: number): Uint8Array {
@@ -51,7 +61,15 @@ function contentHash(fill: number): Uint8Array {
  * tell "acknowledged nothing" from "the field is ignored".
  */
 function s1WithLastSeen(hash: Uint8Array, lastSeenSeq: number): Uint8Array {
-  return new Uint8Array(encode([1, hash, new Uint8Array(32), new Uint8Array(16), lastSeenSeq, 1]));
+  return encodeStructure1({
+    contentHash: hash,
+    senderPubkey: new Uint8Array(32),
+    sessionId: new Uint8Array(16),
+    lastSeenSeq,
+    timestamp: 1,
+    lastSeenHash: new Uint8Array(32).fill(0x11),
+    prevOwnHash: new Uint8Array(32).fill(0x22),
+  });
 }
 
 const COUNTERPARTY_PUB = "cc".repeat(32);
@@ -178,8 +196,18 @@ describe("DOD-M15-SEALWIRE-1: 'I cannot judge' is not 'you are lying'", () => {
 
   it("★ a leaf whose content hash is the wrong SHAPE cannot accuse", () => {
     const rows = completeCarry([contentHash(1)], contentHash(0xc1), contentHash(0xc2));
-    (rows[0] as { structure1Cbor: Uint8Array }).structure1Cbor =
-      new Uint8Array(encode([1, new Uint8Array(8), new Uint8Array(32), new Uint8Array(16), 0, 1]));
+    // The CURRENT layout, every field present — only the content hash is 8 bytes instead of 32. If
+    // this fixture emitted a stale layout instead, it would be testing "I don't know this shape",
+    // which is a different refusal and would pass even if the width check were deleted.
+    (rows[0] as { structure1Cbor: Uint8Array }).structure1Cbor = encodeStructure1({
+      contentHash: new Uint8Array(8),
+      senderPubkey: new Uint8Array(32),
+      sessionId: new Uint8Array(16),
+      lastSeenSeq: 0,
+      timestamp: 1,
+      lastSeenHash: new Uint8Array(32).fill(0x11),
+      prevOwnHash: new Uint8Array(32).fill(0x22),
+    });
     const v = managerWith(rows).verifyCertifiedRoot(AGENT_PUB, SESSION, rootOf([contentHash(1)]), rows.length);
     expect(v.verdict).toBe("cannot_judge");
     expect(v.verdict === "cannot_judge" && v.reason).toMatch(/content_hash/);

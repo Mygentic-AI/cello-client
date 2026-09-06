@@ -9,7 +9,7 @@
 import { describe, it, expect } from "vitest";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { Encoder, decode } from "cbor-x";
+import { decode } from "cbor-x";
 import { generateKeypair, verify, buildRelayAckTbs, msgLeafHash, ctrlLeafHash, docLeafHash, rejectLeafHash, opaqueLeafHash } from "@cello-protocol/crypto";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import {
@@ -25,12 +25,9 @@ import { RelayReceiptStore } from "../relay-receipt-store.js";
 import { SessionSealLeafStore } from "../session-seal-leaf-store.js";
 import { makeFakeRelay, tick, noopLogger, fakeNode } from "./relay-client-fake.js";
 
-/**
- * The fake relay rig moved to `relay-client-fake.ts` when the SEALWIRE sender-leg tests needed the
- * same one. Imported rather than re-declared: two hand-written relay stubs drift, and only one of
- * them learns about the next appended frame field.
- */
-const CBOR_ENC = new Encoder({ tagUint8Array: false });
+// The fake relay rig lives in `relay-client-fake.ts` (imported above) because the SEALWIRE
+// sender-leg tests needed the same one: two hand-written relay stubs drift, and only one of them
+// learns about the next appended frame field.
 
 /**
  * 033-ACKEMIT — the acknowledgement seed every registered session now carries.
@@ -71,24 +68,25 @@ describe("session-relay-client: relay auth payload", () => {
 });
 
 describe("session-relay-client: Structure 1", () => {
-  it("encodes [1, content_hash, sender_pubkey, session_id, last_seen_seq, ts] decodable by the relay", async () => {
+  it("encodes [3, content_hash, sender_pubkey, session_id, last_seen_seq, ts, last_seen_hash, prev_own_hash] decodable by the relay", async () => {
     const kp = generateKeypair();
     const senderPubkey = await kp.getPublicKey();
     const contentHash = new Uint8Array(32).fill(0xab);
     const sessionId = new Uint8Array(16).fill(0x01);
     const lastSeenSeq = 0;
     const timestamp = 1_750_000_000_000;
+    const lastSeenHash = new Uint8Array(32).fill(0xa7);
+    const prevOwnHash = new Uint8Array(32).fill(0xb4);
 
-    const s1 = encodeStructure1({ contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp
-,
-      lastSeenHash: new Uint8Array(32).fill(0xa7),
-      prevOwnHash: new Uint8Array(32).fill(0xb4), });
+    const s1 = encodeStructure1({
+      contentHash, senderPubkey, sessionId, lastSeenSeq, timestamp, lastSeenHash, prevOwnHash,
+    });
 
-    // Mirror the relay's decodeStructure1: a 6-element array with the exact field shapes.
+    // Mirror the relay's decodeStructure1: an 8-element array with the exact field shapes.
     const arr = decode(s1) as unknown[];
     expect(Array.isArray(arr)).toBe(true);
-    expect(arr.length).toBe(6);
-    expect(arr[0]).toBe(1);
+    expect(arr.length).toBe(8);
+    expect(arr[0]).toBe(3);
     expect(Buffer.from(arr[1] as Uint8Array).equals(Buffer.from(contentHash))).toBe(true);
     expect(Buffer.from(arr[2] as Uint8Array).equals(Buffer.from(senderPubkey))).toBe(true);
     expect(Buffer.from(arr[3] as Uint8Array).equals(Buffer.from(sessionId))).toBe(true);
@@ -106,6 +104,16 @@ describe("session-relay-client: Structure 1", () => {
     expect(timestamp).toBeGreaterThan(0xffffffff);
     expect(typeof arr[5]).toBe("bigint");
     expect(Number(arr[5])).toBe(timestamp);
+    /**
+     * THE TWO CHAIN LINKS, ASSERTED SEPARATELY AND BY POSITION — `DOD-M15-SELFCHAIN-1`.
+     *
+     * They are both 32 bytes and sit side by side, so a swap between them would produce bytes of
+     * exactly the same shape. The fixture fills them with different values for that reason: an
+     * encoder that emitted them in the other order would still be a valid 8-element array, and a
+     * length check would not notice.
+     */
+    expect(Buffer.from(arr[6] as Uint8Array).equals(Buffer.from(lastSeenHash))).toBe(true);
+    expect(Buffer.from(arr[7] as Uint8Array).equals(Buffer.from(prevOwnHash))).toBe(true);
   });
 
   it("signature over the raw Structure 1 bytes verifies (relay verifies the exact bytes, not a re-encode)", async () => {
@@ -640,7 +648,15 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
     // Now simulate a counterparty leaf_deliver (authored by someone else).
     const counterpartyPub = new Uint8Array(32).fill(0xcc);
-    const s1Cbor = CBOR_ENC.encode([1, new Uint8Array(32).fill(0xdd), counterpartyPub, sid, 0, 1_750_000_000_000]);
+    const s1Cbor = encodeStructure1({
+      contentHash: new Uint8Array(32).fill(0xdd),
+      senderPubkey: counterpartyPub,
+      sessionId: sid,
+      lastSeenSeq: 0,
+      timestamp: 1_750_000_000_000,
+      lastSeenHash: TEST_GENESIS,
+      prevOwnHash: TEST_GENESIS,
+    });
     const s2Cbor = new Uint8Array([0x04, 0x05, 0x06]);
     relay.push({
       type: "leaf_deliver",
@@ -712,7 +728,15 @@ describe("AgentRelayClient: sealLeafStore capture (F1 — FED-OPTIONB-SEAL-001)"
 
     // The relay echoes our OWN leaf back as leaf_deliver (this happens in the protocol).
     // Build a Structure1 authored by US so #isOwnLeaf detects it.
-    const s1Cbor = CBOR_ENC.encode([1, contentHash, pub, sid, 0, 1_750_000_000_000]);
+    const s1Cbor = encodeStructure1({
+      contentHash,
+      senderPubkey: pub,
+      sessionId: sid,
+      lastSeenSeq: 0,
+      timestamp: 1_750_000_000_000,
+      lastSeenHash: TEST_GENESIS,
+      prevOwnHash: TEST_GENESIS,
+    });
     relay.push({
       type: "leaf_deliver",
       session_id: sid,
