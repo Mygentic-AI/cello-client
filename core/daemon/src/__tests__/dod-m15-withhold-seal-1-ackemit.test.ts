@@ -974,9 +974,11 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      * signed, and cannot reach a receiver. The evasion is closed by construction rather than by a
      * branch — which is why the assertion moved to the encoder.
      *
-     * The receiver's `ack_hash_absent` branch is kept and is now unreachable from the wire. That is
-     * deliberate: it is the last line of defence if a shape like this ever returns, and a defence
-     * that costs one comparison is worth keeping even when nothing can trigger it today.
+     * The receiver's `ack_hash_absent` branch has since been DELETED (036-GODFILE). It was kept for
+     * a while as a "last line of defence", which is the argument this codebase should distrust: a
+     * branch no input can reach is not a defence, it is an unexecuted claim, and the constant it
+     * compared against was never assigned anywhere — measured, not assumed. The guarantee lives in
+     * the encoder and the decoder, which is where this test now asserts it.
      */
     expect(() => encodeStructure1({
       contentHash: wireContentHash(BODY),
@@ -1090,8 +1092,8 @@ describe("033-ACKEMIT — the receiving daemon CHECKS it, with NO RELAY ANYWHERE
      *
      * `ack_hash_absent` needed a claim that names a position and carries no acknowledgement.
      * `DOD-M15-SELFCHAIN-1` deleted every layout that can express one, so it cannot be built,
-     * signed, or delivered. Its branch and its wording are kept as a last line of defence; what
-     * cannot be asserted any more is its behaviour end to end.
+     * signed, or delivered — and 036-GODFILE then deleted the receiver branch and its wording,
+     * which no input could reach and no code ever produced the reason for.
      *
      * The two that remain are still compared, because the defect this test was written for was
      * three causes SHARING one sentence — and two sharing one is the same defect.

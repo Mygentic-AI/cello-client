@@ -985,9 +985,6 @@ const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
  */
 const AUTHORSHIP_SELF_CHAIN_MISMATCH = "self_chain_mismatch";
 
-/** A v1 claim: it carries no `last_seen_hash`, so it asserts a POSITION and no content at all. */
-const AUTHORSHIP_ACK_HASH_ABSENT = "ack_hash_absent";
-
 /** The hash names content this side does not hold at the position the claim names. */
 const AUTHORSHIP_ACK_HASH_MISMATCH = "ack_hash_mismatch";
 
@@ -998,13 +995,12 @@ const AUTHORSHIP_ACK_HASH_UNKNOWN = "ack_hash_unknown_content";
 /**
  * The set that routes an `unusable` reason to the acknowledgement wording rather than the generic
  * one. A SET, not a string prefix test: a name-shaped check would silently adopt any future reason
- * someone happens to call `ack_*`, and give it a sentence written for these four.
+ * someone happens to call `ack_*`, and give it a sentence written for these three.
  */
 export type AckHashReason =
-  typeof AUTHORSHIP_ACK_HASH_ABSENT | typeof AUTHORSHIP_ACK_HASH_MISMATCH | typeof AUTHORSHIP_ACK_HASH_UNKNOWN;
+  typeof AUTHORSHIP_ACK_HASH_MISMATCH | typeof AUTHORSHIP_ACK_HASH_UNKNOWN;
 
 const ACK_HASH_REASONS: ReadonlySet<string> = new Set<string>([
-  AUTHORSHIP_ACK_HASH_ABSENT,
   AUTHORSHIP_ACK_HASH_MISMATCH,
   AUTHORSHIP_ACK_HASH_UNKNOWN,
 ]);
@@ -16459,12 +16455,11 @@ export class SessionNodeManager {
    * a claim that carries NO hash, one that names a position we never reached, and one that names
    * the wrong content — rather than collapsing into a single "the proof was bad".
    *
-   * ⚠️ MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH (§5). A v1 claim carries no content
-   * assertion at all, and treating that as "fine, skip the check" would recreate the fail-open this
-   * unit is closing one layer down: an attacker who wants to evade a mismatch check simply never
-   * supplies a checkable proof. `decodeStructure1` has already refused a v2 whose hash is the wrong
-   * width, so `lastSeenHash === null` here means exactly one thing — a v1 layout — and it is
-   * refused by its own name.
+   * ⚠️ MISSING, MALFORMED AND MISMATCHED TAKE ONE PATH (§5). Treating an unverifiable claim as
+   * "fine, skip the check" would recreate the fail-open this unit closes one layer down: an
+   * attacker who wants to evade a mismatch check simply never supplies a checkable proof.
+   * `decodeStructure1` refuses any claim whose hash is absent or the wrong width, so every claim
+   * reaching this method carries one and the only questions left are position and content.
    */
   /**
    * Does this claim link to the last message we actually received from this sender?
@@ -16611,13 +16606,12 @@ export class SessionNodeManager {
      * the follow-on that does is the receiver submitting a hash for what it received.
      */
     /**
-     * ⚠️ THE "NO ACKNOWLEDGEMENT AT ALL" BRANCH IS GONE, and its absence is the point.
+     * ⚠️ THERE IS NO "NO ACKNOWLEDGEMENT AT ALL" BRANCH, and its absence is the point.
      *
-     * It used to accept a claim carrying no `last_seen_hash` as long as it also named no position —
-     * honest, and a shape a peer could choose. `DOD-M15-SELFCHAIN-1` deleted every layout that can
-     * express it: there is one Structure 1 and both chain links are required, so a claim without one
-     * does not decode at all and never reaches this method. `AUTHORSHIP_ACK_HASH_ABSENT` is kept as
-     * a reason because the wording that routes off it is still reachable from other callers.
+     * A claim carrying no `last_seen_hash` cannot exist: there is one Structure 1 layout and both
+     * chain links are required, so such a claim does not decode and never reaches this method.
+     * Nothing here may treat a missing acknowledgement as "fine, skip the check" — that is the
+     * fail-open where an attacker evades a mismatch check by supplying nothing checkable.
      */
     /**
      * THE GENESIS IS A VALUE, NEVER AN ABSENCE. The first message of a session has seen nothing, and
@@ -16788,8 +16782,6 @@ export class SessionNodeManager {
            */
           : reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
             ? "a message arrived that is genuinely from your counterparty, about this conversation, and correctly signed — and it names a message of THEIR OWN that they never sent you. Each message says which of their own came before it, and that is what fixes the ORDER of the conversation. This one points somewhere your record has never been. It was NOT ingested and NOT shown."
-          : reason === AUTHORSHIP_ACK_HASH_ABSENT
-            ? "a message arrived that is genuinely from your counterparty and genuinely about this conversation — and it does not say which of your messages they had received. Their build is older than yours: a message has to say what it is answering, so that nobody can later leave your last message out of the receipt. It was NOT ingested and NOT shown."
           : reason === AUTHORSHIP_ACK_HASH_MISMATCH
             ? "a message arrived that is genuinely from your counterparty — and it names a DIFFERENT message of yours in the position where your own record holds one. Both sides agree the message exists; you disagree about which one sits there. It was NOT ingested and NOT shown."
           : reason === AUTHORSHIP_ACK_HASH_UNKNOWN
@@ -16861,12 +16853,6 @@ export class SessionNodeManager {
         "the receipt. Reach them OUT OF BAND — a channel that is not this one — and ask them to " +
         "read back the last few things they sent you. If it matches what you have, open a NEW " +
         "session; if it does not, do not."
-      : reason === AUTHORSHIP_ACK_HASH_ABSENT
-      ? "STOPPED ON PURPOSE, and this is NOT about their signature — it verified. " +
-        (this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE) +
-        " Their build is older than yours and does not say what it has received. Ask which version " +
-        "they are running and tell them to upgrade — only they can fix it, and this will keep " +
-        "happening until they do."
       /**
        * ⚠️ THESE TWO SHARED ONE SENTENCE, AND THE TEST THAT WAS MEANT TO CATCH THAT COULD NOT SEE
        * IT — `DOD-M15-SELFCHAIN-1`.
