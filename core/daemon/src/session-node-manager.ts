@@ -82,6 +82,7 @@ import { RefusalNotices } from "./refusal-notices.js";
 import { SessionEphemerals } from "./session-ephemerals.js";
 import { SessionLiveness } from "./session-liveness.js";
 import { WitnessAlerts } from "./witness-alerts.js";
+import { HeldContent } from "./held-content.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -663,6 +664,16 @@ export class SessionNodeManager {
    */
   readonly #witness: WitnessAlerts;
 
+  /**
+   * 037-SESSIONCORE — content we have verified but cannot show yet, because it arrived ahead of
+   * a gap. The MAP stays shared: ingest, placeOwnLeaf and sealReadiness all read it, and two
+   * sources of truth for "what are we holding" would be worse than one shared one.
+   */
+  readonly #held: HeldContent;
+
+  /** ─── DELEGATORS — the held-content seams other files call ──────────────────────────── */
+holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, contentHashHex: string): void { return this.#held.holdOwnLeafForTest(agentName, sessionId, canonicalSeq, contentHashHex); }
+
   /** ─── DELEGATORS — the witness-alert API other files call ────────────────────────────── */
   recordRelayWitnessAlert(agentName: string, alert: RelayWitnessAlert): void { return this.#witness.recordRelayWitnessAlert(agentName, alert); }
   getWitnessAlerts(agentName: string): ReadonlyArray<WitnessAlertNotice> { return this.#witness.getWitnessAlerts(agentName); }
@@ -909,10 +920,10 @@ export class SessionNodeManager {
 
   // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
   // process; the Map is the working copy from then on.
-  #heldRestored = new Set<string>();
+
   // DOD-M12B-SEAL-STUCK-1: sessions whose post-restore release has been attempted. Separate from
   // #heldRestored so a READ-ONLY probe can hydrate without performing (or consuming) the release.
-  #heldReleased = new Set<string>();
+
   // DOD-M12B-SEAL-STUCK-1: sessions whose ordering state THIS PROCESS has observed — a relay
   // witness recorded for it. `#witnessedSeq` is memory-only, so for a session that predates this
   // daemon "no gap recorded" means "not recorded", not "no gap", and that difference decides
@@ -1334,7 +1345,7 @@ export class SessionNodeManager {
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       heldContentFor: (key) => this.#heldContent.get(key),
-      ensureHeldRestored: (a, sid, opts) => this.#ensureHeldRestored(a, sid, opts),
+      ensureHeldRestored: (a, sid, opts) => this.#held.ensureHeldRestored(a, sid, opts),
       awaitingAck: this.#awaitingAck,
       contentEncryptionState: (a, sid) => this.#ephemerals.contentEncryptionState(a, sid),
       freezeSession: (a, sid, reason, narrative, cid) => this.#freezeSession(a, sid, reason, narrative, cid),
@@ -1378,6 +1389,20 @@ export class SessionNodeManager {
     });
 
     this.#witness = new WitnessAlerts({ logger: this.#logger });
+
+    this.#held = new HeldContent({
+      logger: this.#logger,
+      queries: this.#queries,
+      records: this.#records,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      heldContent: this.#heldContent,
+      witnessedSeq: this.#witnessedSeq,
+      getSessionTree: (a, sid) => this.getSessionTree(a, sid),
+      appendSessionLeaf: (a, sid, kind, h, cid) => this.appendSessionLeaf(a, sid, kind, h, cid),
+      appendVerifiedContent: (a, sid, c, h, pk, cid, orig, auth) => this.#appendVerifiedContent(a, sid, c, h, pk, cid, orig, auth),
+    });
     this.#dbPath = opts.dbPath;
     if (typeof opts.contentTtfMs === "number" && opts.contentTtfMs > 0) {
       this.#contentTtfMs = opts.contentTtfMs;
@@ -1956,21 +1981,7 @@ export class SessionNodeManager {
     };
   }
 
-  /** M8C-ABUSE-1 (reviewer HIGH fix, D18): bytes currently sitting in the out-of-order hold
-   *  buffer for this session — NOT yet committed leaves, but real bytes in memory that would
-   *  otherwise let multiple held chunks each individually pass the size gate while cumulatively
-   *  exceeding it once #releaseHeld drains them. */
-  #getHeldBytesTotal(agentName: string, sessionId: string): number {
-    // DOD-M12B-STRAND-1: hydrate first. Reading the Map before the durable holds are back
-    // under-counts, and this gate exists to stop several held chunks each passing the size cap
-    // individually while cumulatively exceeding it — an under-count is the bypass.
-    this.#ensureHeldRestored(agentName, sessionId);
-    const held = this.#heldContent.get(this.#k(agentName, sessionId));
-    if (!held) return 0;
-    let total = 0;
-    for (const entry of held.values()) total += entry.content.length;
-    return total;
-  }
+
 
 
 
@@ -3476,8 +3487,7 @@ export class SessionNodeManager {
     // torn down and given a node again inside ONE process would never re-read its durable holds —
     // the frames would sit in the table, unreleasable, which is indistinguishable from the loss
     // this unit exists to stop.
-    this.#heldRestored.delete(key);
-    this.#heldReleased.delete(key);
+    this.#held.evictSession(agentName, sessionId);
     // DOD-M15-DIVERGE-1: `#diverged` is NOT evicted here, and the omission is the point.
     //
     // It was, and that made the gate that reads it best-effort in exactly the population it targets.
@@ -6459,7 +6469,7 @@ export class SessionNodeManager {
       const senderTier = this.#records.getTier(agentName, senderPubkey);
       const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#queries.getReceivedBytesTotal(agentName, sessionId);
-      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      const heldTotal = this.#held.getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
@@ -6717,7 +6727,7 @@ export class SessionNodeManager {
       const senderTier = this.#records.getTier(agentName, senderPubkey);
       const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
       const priorTotal = this.#queries.getReceivedBytesTotal(agentName, sessionId);
-      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      const heldTotal = this.#held.getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
@@ -6754,7 +6764,7 @@ export class SessionNodeManager {
       : this.#witnessedSeq.get(key)?.get(contentHashHex);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
-      this.#ensureHeldRestored(agentName, sessionId);
+      this.#held.ensureHeldRestored(agentName, sessionId);
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
       // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
@@ -6940,7 +6950,7 @@ export class SessionNodeManager {
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
-    const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
+    const released = this.#held.releaseHeld(agentName, sessionId, senderPubkey);
     return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
   }
 
@@ -7119,7 +7129,7 @@ export class SessionNodeManager {
     // active session — and a read that appends leaves, advances the root and rings the doorbell is
     // a diagnostic command that delivers messages. The release still runs on every path that was
     // going to mutate anyway.
-    this.#ensureHeldRestored(agentName, sessionId, { release: false });
+    this.#held.ensureHeldRestored(agentName, sessionId, { release: false });
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
@@ -7691,7 +7701,7 @@ export class SessionNodeManager {
   ): { placed: true; leafIndex: number; diverged?: true; unwitnessed?: true } | { placed: false; heldAt: number } {
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.
-    this.#ensureHeldRestored(agentName, sessionId);
+    this.#held.ensureHeldRestored(agentName, sessionId);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
 
     if (assignedSeq === undefined) {
@@ -7789,244 +7799,11 @@ export class SessionNodeManager {
 
 
 
-  /**
-   * DOD-M12B-STRAND-1 — restore this session's held frames into memory.
-   *
-   * Called when a session node is (re)created, which is the moment the session becomes able to
-   * append again. Loading at daemon boot instead would be wrong for the same reason the old code
-   * was wrong: a frame is only releasable against a tree, and the tree is loaded per session.
-   *
-   * A frame whose content the tree ALREADY HOLDS at that position is dropped — re-appending it
-   * would change the root a seal signs over. That test is `hashAt`, not `canonical_seq < frontier`:
-   * the two counters are different spaces and this file documents them drifting, so the index
-   * comparison alone would destroy a frame the tree never held. See the drift branch below.
-   */
-  #ensureHeldRestored(agentName: string, sessionId: string, opts?: { release?: boolean }): void {
-    const key = this.#k(agentName, sessionId);
-    if (!this.#heldRestored.has(key)) {
-      // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
-      // away instead of recursing.
-      this.#heldRestored.add(key);
-      this.#restoreHeldContent(agentName, sessionId);
-    }
-    // A RESTORED FRAME MAY ALREADY BE IN ORDER, and nothing else would ever notice.
-    //
-    // #releaseHeld has one caller: the tail of a successful inbound ingest. Every other way the tree
-    // grows — an outbound send leaf, a queued or rejected leaf — advances the frontier without
-    // draining. While holds died with the session node that cost seconds; now the hold is durable,
-    // so the stall is durable too: the counterparty's message sits on disk at exactly the next slot,
-    // is never delivered, and `sealReadiness` counts it, so the session cannot close either.
-    // Undeliverable AND unsealable, forever, from one restart.
-    //
-    // TRACKED SEPARATELY FROM THE HYDRATION. A read-only caller (the status surface) hydrates and
-    // must NOT release — otherwise `cello status` appends leaves, advances the session root, writes
-    // transcript rows and rings the doorbell, which makes a diagnostic command the thing that
-    // delivers messages. One shared flag would also let that read CONSUME the release the next real
-    // ingest was going to perform, which is the stall above, reintroduced.
-    if (opts?.release === false) return;
-    if (this.#heldReleased.has(key)) return;
-    this.#heldReleased.add(key);
-    if (this.#heldContent.get(key)?.size) {
-      const counterparty = this.#queries.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-      if (counterparty) this.#releaseHeld(agentName, sessionId, counterparty);
-    }
-  }
 
-  #restoreHeldContent(agentName: string, sessionId: string): void {
-    if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string; leaf_kind: string }>;
-    try {
-      rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin, leaf_kind
-           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
-      ).all(this.#requireAgentId(agentName), sessionId) as never;
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.restore.failed", {
-        agentName, sessionId,
-        impact: "verified content held before the restart is not in memory and cannot be released",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
-    if (rows.length === 0) return;
-    const key = this.#k(agentName, sessionId);
-    let held = this.#heldContent.get(key);
-    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    const tree = this.getSessionTree(agentName, sessionId);
-    const frontier = tree.size();
-    let restored = 0;
-    let superseded = 0;
-    let drifted = 0;
-    for (const row of rows) {
-      // ASK THE TREE WHAT IS AT THAT POSITION — do not infer it from the index.
-      //
-      // `canonical_seq` is the RELAY's sequence space; `frontier` is this tree's msg-leaf count.
-      // The two drift, on purpose and by documented cases: the relay counts CTRL leaves the tree
-      // never appends, and a first message whose relay submit failed leaves the tree one ahead.
-      // Under drift `canonical_seq < frontier` is TRUE for a frame the tree has never held, and
-      // deleting on that comparison destroys verified content while reporting it as tidy-up —
-      // the exact failure this unit exists to end, reintroduced on the recovery path.
-      const occupant = tree.hashAt(row.canonical_seq);
-      if (occupant === row.content_hash_hex) {
-        this.#queries.deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        superseded++;
-        continue;
-      }
-      if (row.canonical_seq < frontier) {
-        // The position is taken by DIFFERENT content. The frame cannot be appended (that would
-        // rewrite a committed leaf) and must not be deleted (it is verified content nobody else
-        // holds), so it goes to the annex that exists for exactly this — content that arrived for
-        // a chain that can no longer carry it — and only then does the row go.
-        const annexed = this.#queries.recordSealedAnnex(
-          agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob),
-          // DOD-M12B-INDEX-1: our own held send is attributed to US, never to the counterparty.
-          row.origin === "sent"
-            ? this.#queries.ownPubkeyHex(agentName)
-            : this.#queries.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null,
-        );
-        this.#logger.error("session.content.held.position_drifted", {
-          agentName, sessionId, canonicalSeq: row.canonical_seq, frontier,
-          contentHash: row.content_hash_hex, occupant, annexed,
-          correlationId: row.correlation_id ?? undefined,
-          impact: annexed
-            ? "the relay's position for this frame is occupied by different content — it cannot join the chain and is readable only from the annex"
-            : "the relay's position for this frame is occupied by different content AND the annex write failed — the durable row is kept rather than destroyed",
-        });
-        if (annexed) this.#queries.deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        drifted++;
-        continue;
-      }
-      held.set(row.canonical_seq, {
-        content: new Uint8Array(row.content_blob),
-        ...(row.original_blob ? { originalContent: new Uint8Array(row.original_blob) } : {}),
-        contentHashHex: row.content_hash_hex,
-        ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
-        ...(row.screened_out ? { screenedOut: true } : {}),
-        ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
-        ...(row.leaf_kind === "doc" ? { kind: "doc" as const } : {}),
-        /**
-         * ⚠️ `restoredAcrossRestart` EXISTS TO NAME A LOSS, NOT TO CHANGE BEHAVIOUR — review pass 2, H1.
-         *
-         * `held_content` has no authorship columns, so a SENT message held behind a gap and released
-         * after a daemon restart comes back with **no signature** — its transcript row records
-         * `self_authored` with no proof, indistinguishable from an unwitnessed send. That is the
-         * defect bullet 5 exists to end, reappearing on the recovery path, and it was silent.
-         *
-         * The proof cannot be reconstructed here: it was made over Structure-1 bytes this process no
-         * longer holds. **So the honest move is to say so, not to fabricate one** — a proof that
-         * cannot be checked, presented as one that can, is worse than the absence.
-         *
-         * Two BLOB columns would close it properly (this table already carries two `ALTER TABLE …
-         * ADD COLUMN` migrations, so the pattern exists). Under a frozen gate a log is additive and
-         * tightenable where a schema change is neither, so this announces the loss now and
-         * `DOD-M15-HELD-AUTHORSHIP-1` carries the column.
-         */
-        restoredAcrossRestart: true,
-      });
-      restored++;
-    }
-    if (held.size === 0) this.#heldContent.delete(key);
-    this.#logger.info("session.content.held.restored", {
-      agentName, sessionId, restored, superseded, drifted, frontier,
-      canonicalSeqs: [...held.keys()].sort((a, b) => a - b),
-      // The flow ids of the frames that came back, so a restored message ties to the
-      // `session.content.held` that opened its flow before the restart.
-      correlationIds: rows.map((r) => r.correlation_id).filter((c): c is string => c !== null),
-    });
-  }
 
-  /**
-   * DOD-MSG-4: drain held out-of-order content in canonical order. After a leaf is appended, any
-   * held entry whose canonical sequence equals the new next-expected index is now in order — append
-   * it, then check again (a single fill can release a run of consecutive held messages).
-   */
-  #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): number {
-    const key = this.#k(agentName, sessionId);
-    // DOD-M12B-STRAND-1: hydrate before scanning. Restoring eagerly at session-node creation put
-    // it behind writes that can fail — one failed `sessions` row upsert and the frames stayed on
-    // disk, invisible, which is the same outcome as losing them.
-    this.#ensureHeldRestored(agentName, sessionId);
-    const held = this.#heldContent.get(key);
-    if (!held) return 0;
-    let released = 0;
-    for (;;) {
-      const nextExpected = this.getSessionTree(agentName, sessionId).size();
-      const entry = held.get(nextExpected);
-      if (!entry) break;
-      held.delete(nextExpected);
-      // DOD-M12B-STRAND-1: released content leaves the durable store in the same breath. A row
-      // that outlives its release would re-append the same content on the next boot — growing the
-      // tree and changing a root that has already been signed.
-      this.#queries.deleteHeldContent(agentName, sessionId, nextExpected);
-      // DOD-M12B-INDEX-1: OUR OWN held message. It leafs at its canonical index and is transcribed
-      // as SENT — never routed down the received path, which would attribute our words to the
-      // counterparty in the sealed record and hand them back to our own agent as inbound.
-      if (entry.origin === "sent") {
-        // The KIND the leaf was placed with, not a hardcoded "msg" — a document leaf that had to
-        // wait for its position must come back as a document leaf, or the two sides disagree about
-        // what the chain contains.
-        this.appendSessionLeaf(agentName, sessionId, entry.kind ?? "msg", entry.contentHashHex, entry.correlationId);
-        // A DOCUMENT frame takes a leaf and NO transcript row — matching what the immediate-append
-        // path does for one. Writing one would put raw CBOR into the operator's transcript as
-        // something they said, which is the same attribution failure as releasing it inbound.
-        if (entry.kind === "doc") {
-          released++;
-          this.#logger.info("session.content.released", {
-            sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
-          });
-          if (held.size === 0) { this.#heldContent.delete(key); break; }
-          continue;
-        }
-        // OBSERVED, not assumed — the received path already does this. The leaf commits either way,
-        // so a dropped transcript write means the operator's OWN message is missing from their own
-        // transcript with the chain saying it is there, and nothing anywhere said so.
-        // bullet 5: the proof was captured at submit time and rides the held entry — see #heldContent.
-        /**
-         * THE RESTART LOSS, ANNOUNCED — review pass 2, H1. Only for an entry that actually crossed a
-         * restart: an in-memory held entry carries its proof, and an unwitnessed send legitimately
-         * has none, so warning on every absent proof would fire on a designed benign state and bury
-         * the one occurrence that means something.
-         */
-        if (entry.restoredAcrossRestart === true && entry.authorship === undefined) {
-          this.#logger.warn("session.content.released.authorship.lost", {
-            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
-            impact:
-              "this message was held behind a gap, survived a daemon restart, and is now committed with " +
-              "attribution 'self_authored' and NO signature. Its transcript row asserts its author rather " +
-              "than proving one, and is indistinguishable from a send the relay never witnessed.",
-            guidance:
-              "Not recoverable after the fact — the signature covered Structure-1 bytes this process no longer " +
-              "holds, and fabricating one would be worse than the absence. Tracked as DOD-M15-HELD-AUTHORSHIP-1: " +
-              "held_content needs the two proof columns so a restart carries them.",
-          });
-        }
-        if (!this.#records.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
-          this.#logger.error("session.content.released.transcript.failed", {
-            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
-            impact: "this side's own message is committed to the chain but missing from its transcript",
-          });
-        }
-      } else if (entry.screenedOut) {
-        this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
-        // The SAME witness leak as the immediate-append terminal-block branch (see the block comment
-        // at the `if (terminalBlock)` append in `ingestReceivedContent`), on the held path. This
-        // branch also bypasses `#appendVerifiedContent`, where the drop lives — so a blocked message
-        // that arrived out of order left `missingLeaves` stuck at 1 and the session unsealable.
-        this.#witnessedSeq.get(key)?.delete(entry.contentHashHex);
-      } else {
-        this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);
-      }
-      released++;
-      this.#logger.info("session.content.released", {
-        sessionId,
-        sequenceNumber: nextExpected,
-        screenedOut: entry.screenedOut === true,
-        correlationId: entry.correlationId,
-      });
-      if (held.size === 0) { this.#heldContent.delete(key); break; }
-    }
-    return released;
-  }
+
+
+
 
   /** DAEMON-004: pop the oldest verified received content for cello_receive. */
   takeReceivedContent(agentName: string, sessionId: string): ReceivedContentEntry | null {
@@ -8711,21 +8488,7 @@ export class SessionNodeManager {
     entry?.relayClient?.noteReceivedLeaf(sessionIdHex, relaySeq, contentHash);
   }
 
-  /**
-   * Test seam: put an own leaf in the HELD state instead of the tree — 033-ACKEMIT.
-   *
-   * The state `placeOwnLeaf` produces when the relay assigns a position ahead of our tail: the leaf
-   * exists on this side and is not in the tree, while the counterparty already has it from the relay
-   * and can acknowledge it. Reproducing it through the real hold map rather than by asserting the
-   * tree is short is what makes the acknowledgement test measure the case instead of a neighbour of
-   * it.
-   */
-  holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, contentHashHex: string): void {
-    const key = this.#k(agentName, sessionId);
-    let held = this.#heldContent.get(key);
-    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    held.set(canonicalSeq, { content: new Uint8Array(), contentHashHex, origin: "sent", kind: "msg" });
-  }
+
 
   /**
    * Test seam: put the session's genesis prev_root where a completed session open leaves it —
@@ -12330,69 +12093,7 @@ export class SessionNodeManager {
     return flipped;
   }
 
-  /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
-  /**
-   * DOD-M12B-STRAND-1 — move a terminal session's held frames to the annex.
-   *
-   * A held frame is content this agent RECEIVED and VERIFIED. When its session ends it can never
-   * join that chain (appending behind a committed root is not an option, and ingest refuses a
-   * terminal session outright), but it is still the operator's mail and no other copy exists —
-   * the sender was never acknowledged for it. `sealed_session_annex` is where M12-P17 already puts
-   * content that arrives for an ended session; this is the same content arriving slightly earlier.
-   *
-   * ANNEX FIRST, DELETE SECOND, per row. A crash between them costs a duplicate the annex's
-   * INSERT OR IGNORE absorbs; the other order costs the message. A row whose annex write fails is
-   * KEPT — the retention sweep will find it again, and a leftover row is cheaper than a lost one.
-   */
-  #annexHeldContentOnTerminal(agentName: string, sessionId: string, status: "sealed" | "abandoned"): void {
-    if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; content_hash_hex: string; held_at: number; origin: string }>;
-    try {
-      rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, content_hash_hex, held_at, origin
-           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
-      ).all(this.#requireAgentId(agentName), sessionId) as never;
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.annex.scan.failed", {
-        agentName, sessionId, status,
-        impact: "held frames for a terminal session were not moved to the annex and remain unreadable",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
-    if (rows.length === 0) return;
-    const counterparty = this.#queries.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null;
-    let annexed = 0;
-    let kept = 0;
-    for (const row of rows) {
-      // DOD-M12B-INDEX-1: ATTRIBUTION. A `sent` row is our own message. Stamping the counterparty's
-      // pubkey on it would put our words in their mouth in the one record that survives the
-      // session — the same failure the release path was changed to avoid, on the drain it did not
-      // touch. `#ownPubkeyHex` is null only when the identity cannot be resolved, and a null sender
-      // reads as "unattributed", which is true, rather than as a false attribution.
-      const sender = row.origin === "sent" ? this.#queries.ownPubkeyHex(agentName) : counterparty;
-      if (this.#queries.recordSealedAnnex(agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob), sender)) {
-        this.#queries.deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        // AND OUT OF THE IN-MEMORY MAP. Measured live 2026-08-17 on daemon 0.0.170: this frame is
-        // now safe in the annex and its durable row is gone — but teardown still found it in the
-        // map, counted `held_content` for the session, got 0, and fired
-        // `session.content.held.lost`: "verified content was destroyed". Ten frames were annexed
-        // and the same ten were reported destroyed, in the same second. A false alarm on the most
-        // serious event in the system is worse than no alarm, because the next investigation goes
-        // looking for content that was never lost.
-        this.#heldContent.get(this.#k(agentName, sessionId))?.delete(row.canonical_seq);
-        annexed++;
-      } else {
-        kept++;
-      }
-    }
-    this.#logger.warn("session.content.held.annexed", {
-      agentName, sessionId, status, annexed, kept,
-      // The consumer of `held_at`: how long the oldest frame waited before its session ended.
-      oldestHeldMs: Date.now() - Math.min(...rows.map((r) => r.held_at)),
-      impact: "these messages arrived and verified but never joined the chain — they are readable from the annex, not the transcript",
-    });
-  }
+
 
   #updateSessionStatus(
     agentName: string,
@@ -12523,7 +12224,7 @@ export class SessionNodeManager {
         // Left alone the rows sit on disk, unreachable by any surface, while the teardown alarm
         // reports `lost: 0`: a success message for content that has just become permanently
         // unreadable. The annex is the store built for exactly this shape.
-        this.#annexHeldContentOnTerminal(agentName, sessionId, status);
+        this.#held.annexHeldContentOnTerminal(agentName, sessionId, status);
         try {
           this.#onSessionTerminal?.(sessionId, status);
         } catch (hookErr: unknown) {
