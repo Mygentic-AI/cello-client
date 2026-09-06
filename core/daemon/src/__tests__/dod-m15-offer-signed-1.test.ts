@@ -114,6 +114,8 @@ function harness(opts: {
     recordCounterpartyPrimary: () => {},
     recordOfferedMoniker: () => {},
     addContact: () => {},
+    // The responder records the session's chain starting point immediately before accepting it.
+    recordSessionGenesis: () => {},
     acceptSession: async () => ({ ok: true }),
     resolveAgentId: () => "agent-id",
     // Throws on purpose: the trust-signal projection catches it and logs signal.projection.failed,

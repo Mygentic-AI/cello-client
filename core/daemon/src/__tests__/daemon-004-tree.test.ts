@@ -47,6 +47,7 @@ import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { seedAgents, wireAgentKeyProviders } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -463,6 +464,8 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
      * from a signer it has no record of, and the test would be measuring that instead of the
      * round trip it is named for.
      */
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(sid, [{ mgr, agentName: "alice" }]);
     await mgr.createSessionNode(sid, "alice", alicePubkeyHex(mgr), "bob-peer-id", "corr-1");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
@@ -800,7 +803,9 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "ok.db"), node as unknown as CelloNode);
       // On a loopback the sender IS the counterparty — see the round-trip test above.
-      await mgr.createSessionNode(sid, "alice", alicePubkeyHex(mgr), "bob-peer-id", "corr-1");
+      // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(sid, [{ mgr, agentName: "alice" }]);
+    await mgr.createSessionNode(sid, "alice", alicePubkeyHex(mgr), "bob-peer-id", "corr-1");
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 

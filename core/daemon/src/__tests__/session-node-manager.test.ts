@@ -57,6 +57,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openTestDb } from "./helpers/encrypted-db.js";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import {
@@ -834,10 +835,9 @@ describe("SessionNodeManager — integration tests", () => {
     cleanupNodes.push(counterparty);
     try {
       const sid = "1b".repeat(16);
-      const created = // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
- // session it cannot anchor, and a fixture builds one below the paths that record it.
- manager.setSessionGenesisForTest("alice", sid, new Uint8Array(32).fill(0x9c));
- await manager.createSessionNode(sid, "alice", "bpub", counterparty.getPeerId(), "corr");
+      // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+      agreeSessionGenesis(sid, [{ mgr: manager, agentName: "alice" }]);
+      const created = await manager.createSessionNode(sid, "alice", "bpub", counterparty.getPeerId(), "corr");
       expect(created.ok).toBe(true);
       if (!created.ok) return;
 
@@ -866,9 +866,8 @@ describe("SessionNodeManager — integration tests", () => {
     await seedAgents(manager.getDb(), ["alice"]);
     try {
       const sid = "1c".repeat(16);
-      // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-      // session it cannot anchor, and a fixture builds one below the paths that record it.
-      manager.setSessionGenesisForTest("alice", sid, new Uint8Array(32).fill(0x9c));
+      // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+      agreeSessionGenesis(sid, [{ mgr: manager, agentName: "alice" }]);
       await manager.createSessionNode(sid, "alice", "bpub", "12D3KooWFakePeer", "corr");
       const r = await manager.connectToCounterparty("alice", sid, []);
       expect(r.ok).toBe(false);
