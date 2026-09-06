@@ -226,7 +226,24 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     targetHex: string,
     sr: { peerId: string; addrs: string[] },
     correlationId: string,
-    agentName: string,
+    /**
+     * WHO WE ARE — name and key together, as ONE object, and the shape is the point (review F2).
+     *
+     * `ownPubkeyHex` is this agent's own K_local pubkey, hex. It is passed in rather than looked up
+     * here because every caller has already resolved it and already refuses (`agent_not_found`)
+     * when it cannot; a second lookup would invent an absence case at the one place that must not
+     * have one — the target check below has to compare against a real key or refuse, never against
+     * an empty string that happens to mismatch.
+     *
+     * ⚠️ AN OBJECT RATHER THAN TWO POSITIONAL STRINGS, because as positional parameters they sat
+     * adjacent to `targetHex` and `correlationId` and a swap COMPILED. Only one of the three call
+     * sites is unit-reachable (the cross-node one needs a live visiting connection), so a slip at
+     * either of the other two would have made every cross-region session refuse with
+     * `assignment_names_different_self` — a security-flavoured refusal for a wiring bug, on the
+     * exact path sovereign-node redundancy depends on, with nothing red. Named properties make that
+     * swap a type error instead of a test we do not have.
+     */
+    identity: { agentName: string; ownPubkeyHex: string },
     signalFilter?: { include?: string[]; exclude?: string[] },
     /**
      * `DOD-M15-UNILATERAL-1`: opt this conversation in to the HIGH-STAKES seal tier.
@@ -238,6 +255,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
      */
     highStakes?: boolean,
   ): Promise<SessionNegotiationResult> {
+    const { agentName, ownPubkeyHex } = identity;
     let resolveFrame!: (f: Record<string, unknown>) => void;
     const pending = new Promise<Record<string, unknown>>((r) => { resolveFrame = r; });
     const unregister = signaling.registerInboundHandler((frame) => {
@@ -480,13 +498,94 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
        * the design and enforced nowhere.
        *
        * THE BOUND, equally explicit: a THRESHOLD of this agent's own directories, colluding, could
-       * still sign an assignment naming the wrong counterparty. That is the designed-for limit, not
-       * the everyday one. The substitution is caught at ingest by the wrong-signer check
-       * (`DOD-M15-FRAME-1`) and closed by relay corroboration (`DOD-M15-CORROBORATE-1`).
+       * still produce a VALID SIGNATURE over an assignment naming the wrong counterparty. That is
+       * the designed-for limit of the signature check and it does not move. What that signature can
+       * no longer buy them is a session: `DOD-M15-ASSIGN-TARGET-1` below compares the participants
+       * the slip names against the two values this daemon already holds, and refuses before
+       * anything dials. Ingest-time wrong-signer detection (`DOD-M15-FRAME-1`) and relay
+       * corroboration (`DOD-M15-CORROBORATE-1`) still run — they are now the second line, not the
+       * first.
        */
       const verified = await verifyAssignmentSignature(assignment, getPersistence(agentName), logger, agentName, correlationId);
       if (!verified.ok) {
         return { ok: false, reason: verified.reason, guidance: verified.guidance };
+      }
+      /**
+       * DOD-M15-ASSIGN-TARGET-1 — THE SLIP MUST NAME WHO YOU ASKED FOR.
+       *
+       * A verified signature says the slip is genuine. It says nothing about WHO it is about, and
+       * until now nothing on the client compared `participant_b` to the pubkey the operator typed.
+       * A colluding quorum could name an impostor, the signature would verify, and the daemon would
+       * dial them.
+       *
+       * ⚠️ IT MUST BE HERE, BEFORE THE RETURN — not at ingest, where the existing wrong-signer
+       * check lives.
+       *
+       * ─── AND THE REASON IS NOT "the first message goes out in plaintext" (review F3) ──────────
+       *
+       * That was the premise this check was written from and IT DOES NOT HOLD IN THIS TREE, which
+       * is worth stating because a reader who assumed it would think this guard is holding a line
+       * it is not. On the initiator side the content key is agreed from a peer ephemeral that must
+       * verify against the session's counterparty record, and that record is the operator's own
+       * `target_pubkey` — not `participant_b` (`session-ephemerals.ts`). A substituted counterparty
+       * cannot sign a passing half, and a send with no agreed key throws rather than going out
+       * (`content-encryption-status.ts` states the rule as absolute). No plaintext leaves.
+       *
+       * ─── What was actually wrong, which is a better reason than the one it replaces ──────────
+       *
+       * 1. ERROR SUBSTITUTION, and it is the serious one. A substituted counterparty surfaced to
+       *    the operator as `session.key.refused`, whose guidance names *"something in the middle of
+       *    your connection substituting its own key"* — pointing at the relay and the network for a
+       *    fault that was entirely the directory's. The operator was told to distrust the right
+       *    thing for the wrong reason and sent to investigate the wrong party.
+       * 2. THE DIAL ITSELF DISCLOSES. We hand the impostor our session peer id and, on a direct
+       *    address, our IP — permanently — before anything has failed.
+       * 3. THE SEAL ANCHOR DISAGREES WITH THE SESSION. `recordSessionGenesis` anchors the
+       *    transcript to `participant_a`/`participant_b` while the session's own counterparty
+       *    record holds what the operator asked for. Refusing here keeps those two provably equal.
+       *
+       * The ingest wrong-signer check still runs and still freezes on a bad reply; it is now the
+       * second line rather than the first, and it is not what makes this safe.
+       *
+       * Both sides of both comparisons are LOCAL values: `targetHex` is the operator's own input
+       * and `ownPubkeyHex` is this daemon's loaded identity. Neither is influenced by anything the
+       * directory returned, which is what makes the comparison worth anything.
+       *
+       * Case-insensitive because `target_pubkey` is operator input, accepted as `[0-9a-fA-F]{64}`.
+       */
+      const namedTarget = Buffer.from(assignment.participant_b.pubkey).toString("hex").toLowerCase();
+      if (namedTarget !== targetHex.toLowerCase()) {
+        logger.error("session.assignment.target_mismatch", {
+          agentName, correlationId,
+          askedForPrefix: targetHex.toLowerCase().slice(0, 16), namedPrefix: namedTarget.slice(0, 16),
+          impact: "the directory returned a validly-signed assignment naming a counterparty other than the one requested; it was refused before any dial, so no conversation was opened and nothing was sent",
+        });
+        return {
+          ok: false,
+          reason: "assignment_names_different_counterparty",
+          // ⚠️ LEAD WITH THE ATTRIBUTION, and the reason is measurable rather than stylistic (review
+          // F1). The directory echoes the `target_pubkey` we sent it straight back into
+          // `participant_b`, so an operator TYPO cannot produce this — a typo puts the same wrong
+          // key on both sides and matches. This fault is 100% directory-side. Guidance that opened
+          // by telling the operator to re-check the key sent them to the one place it cannot be.
+          guidance: "The directory returned a session assignment naming a counterparty other than the one you asked for. No conversation was opened and nothing you wrote was sent. This is not a typo on your side — the directory echoes back the key you sent it, so a mismatch means the node that answered departed from the protocol. Run cello_status to see which directory node answered, then retry cello_initiate_session; a different node will serve the request. Only if it repeats across nodes is it worth confirming the key with the counterparty's operator out of band.",
+        };
+      }
+      const namedSelf = Buffer.from(assignment.participant_a.pubkey).toString("hex").toLowerCase();
+      if (namedSelf !== ownPubkeyHex.toLowerCase()) {
+        logger.error("session.assignment.self_mismatch", {
+          agentName, correlationId,
+          ownPrefix: ownPubkeyHex.toLowerCase().slice(0, 16), namedPrefix: namedSelf.slice(0, 16),
+          impact: "the directory returned a validly-signed assignment putting a different agent in this agent's own seat; it was refused before any dial, so no conversation was opened and nothing was sent",
+        });
+        return {
+          ok: false,
+          reason: "assignment_names_different_self",
+          // Same correction as above (review F1): the directory derives `participant_a` from the key
+          // the signaling stream AUTHENTICATED with, not from anything the operator typed, so "check
+          // which agent is selected" names a cause that cannot produce this either.
+          guidance: "The directory returned a session assignment naming a different agent as this side of the conversation. No conversation was opened and nothing you wrote was sent. This is not a local selection problem — the directory derives this side from the key your daemon authenticated with, so a mismatch means the node that answered is brokering sessions in another agent's name. Run cello_status to see which directory node answered, then retry cello_initiate_session; a different node will serve the request.",
+        };
       }
       logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
       return { ok: true, assignment };
@@ -657,7 +756,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.warn("session.crossnode.failed", { agentName, brokerNode: owningNodeId, reason: "visiting_connection_unreachable", correlationId });
         return { ok: false, reason: "visiting_connection_unreachable", guidance: `Could not establish a visiting connection to the counterparty's home node (${owningNodeId}) within 10s. Retry.` };
       }
-      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, agentName, signalFilter, highStakes);
+      const result = await runSessionRequestOverSignaling(visiting.mgr, targetHex, sr, correlationId, { agentName, ownPubkeyHex: agentPubkeyHex }, signalFilter, highStakes);
       if (result.ok) {
         releaseReason = "handoff-complete";
         // Fix #1: remember the broker for this session so cello_close_session can reconnect to complete the seal.
@@ -814,7 +913,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             logger.warn("session.discovery.no_reply", { agentName: ctx.agentName, attempt, correlationId: ctx.correlationId });
             if (attempt < MAX_ATTEMPTS) { await sleepMs(backoffs[attempt - 1]); continue; }
             logger.info("session.discovery.unsupported_fallback", { agentName: ctx.agentName, correlationId: ctx.correlationId });
-            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter, highStakes);
+            return await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, { agentName: ctx.agentName, ownPubkeyHex: agentRec.pubkey }, signalFilter, highStakes);
           }
           // DIRECTORY-SIDE lookup fault (DB error / malformed reply): RETRYABLE — but a DIRECTORY fault,
           // reported truthfully as directory_unreachable, NEVER as the counterparty being offline.
@@ -868,7 +967,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
             action.kind === "same_node"
               // SAME-NODE: the target is on the node we're already connected to. The existing path runs
               // unchanged — ZERO visiting connections, ZERO new frames beyond the one discovery_lookup.
-              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, ctx.agentName, signalFilter, highStakes)
+              ? await runSessionRequestOverSignaling(signaling, targetHex, sr, ctx.correlationId, { agentName: ctx.agentName, ownPubkeyHex: agentRec.pubkey }, signalFilter, highStakes)
               // CROSS-NODE: reach into the target's home over a transient visiting connection.
               : await runCrossNodeSetup(ctx.agentName, kp, agentRec.pubkey, action.owningNodeId, targetHex, sr, ctx.correlationId, signalFilter, highStakes);
 
