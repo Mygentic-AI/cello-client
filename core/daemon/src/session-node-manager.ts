@@ -1392,10 +1392,6 @@ export class SessionNodeManager {
     return this.#connectionLossRemaining;
   }
 
-  getSendFaultRemaining(): number {
-    return this.#sendFaultRemaining;
-  }
-
   /** Remaining armed park faults — so a test can assert the fault was actually consumed. */
   getParkFaultRemaining(): number {
     return this.#parkFaultRemaining;
@@ -10920,10 +10916,6 @@ export class SessionNodeManager {
    */
   getUndeliverableSeqs(agentName: string, sessionId: string): readonly number[] {
     return [...(this.#undeliverableSeqs.get(this.#k(agentName, sessionId)) ?? [])];
-  }
-
-  getHighWaterSeq(agentName: string, sessionId: string): number {
-    return this.#highWaterSeq.get(this.#k(agentName, sessionId)) ?? -1;
   }
 
   /**
