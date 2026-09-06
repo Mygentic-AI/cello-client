@@ -273,11 +273,6 @@ export class SessionSeal {
   }
 
   /**
-   * FED-OPTIONB-SEAL-001: the complete ordered leaf chain (both parties) a UNILATERAL seal carries to the
-   * directory for the OFFLINE tree rebuild. Empty when no leaves were logged (e.g. a direct-only session
-   * with no relay witness) — the caller then has nothing to carry and the seal stays bilateral/pending.
-   */
-  /**
    * REBUILD THE CERTIFIED ROOT FROM THIS DAEMON'S OWN LEAVES — `DOD-M15-SEALWIRE-1` bullet 2.
    *
    * The receipt used to prove only that the directory signed SOMETHING: the client took the sealed
@@ -402,6 +397,15 @@ export class SessionSeal {
       : { verdict: "mismatch", ownRootHex, detail: "root_disagrees: same leaf count, different leaves or different order" };
   }
 
+  /**
+   * FED-OPTIONB-SEAL-001: the complete ordered leaf chain (both parties) a UNILATERAL seal carries to the
+   * directory for the OFFLINE tree rebuild. Empty when no leaves were logged (e.g. a direct-only session
+   * with no relay witness) — the caller then has nothing to carry and the seal stays bilateral/pending.
+   *
+   * ⚠️ Stranded on `verifyCertifiedRoot` before this split — the third block found doing that, and the
+   * reason the rule is now written down: a method reduced to a delegator leaves its documentation
+   * behind, and the block below it ends up carrying two descriptions of which the first is a stranger.
+   */
   getSealCarry(agentPubkeyHex: string, sessionIdHex: string): SealCarryLeaf[] {
     if (!this.#ctx.sealLeafStore && this.#db) {
       this.#ctx.sealLeafStore = new SessionSealLeafStore(this.#db, this.#ctx.logger);
@@ -409,11 +413,6 @@ export class SessionSeal {
     return this.#ctx.sealLeafStore?.getCarry(agentPubkeyHex, sessionIdHex) ?? [];
   }
 
-  /**
-   * M7-SESSION-001 (M-1 PUSH): register the session-state-change callback.
-   * Called by the composition root (daemon.ts) after the NotificationDispatcher
-   * exists. Setter injection avoids a construction-order/circular dependency.
-   */
   /** Fix #1 EXTENSION: inject the broker-connection opener. Setter injection, same construction-order reason. */
   setEnsureSealBroker(
     cb: (agentName: string, sessionId: string) => Promise<{ stop: (reason: string) => Promise<void> } | null>,
@@ -449,7 +448,7 @@ export class SessionSeal {
 
   /**
    * M8B FINDING-6 (cascade-2): persist a seal certificate for a session that may have NO local
-   * `sessions` row. recordSealCertificate above is an `UPDATE ... WHERE` — a SILENT no-op when the
+   * `sessions` row. recordSealCertificate (a manager delegator onto `session-queries.ts`) is an `UPDATE ... WHERE` — a SILENT no-op when the
    * row is absent (the exact trap the cascade-2 reviewer flagged). The ABSENT party (B), learning of
    * a seal on reconnect via seal_unilateral_notification, may never have persisted a row for this
    * session. This ensures a minimal stub row first (INSERT OR IGNORE — a no-op if a row already

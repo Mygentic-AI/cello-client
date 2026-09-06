@@ -500,7 +500,7 @@ export class SessionNodeManager {
 
   /**
    * Closing a conversation and proving it closed — readiness, the SEAL leaf, the carry, the
-   * certificate, and the auto-acknowledgement gate. Ten of its methods keep delegators below
+   * certificate, and the auto-acknowledgement gate. Eleven of its methods keep delegators below
    * because 86 call sites outside this class name them on the manager.
    */
   readonly #seal: SessionSeal;
@@ -1752,6 +1752,11 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     return this.#activeNodes.get(this.#k(agentName, sessionId))?.node.getPeerId() ?? null;
   }
 
+  /**
+   * M7-SESSION-001 (M-1 PUSH): register the session-state-change callback.
+   * Called by the composition root (daemon.ts) after the NotificationDispatcher
+   * exists. Setter injection avoids a construction-order/circular dependency.
+   */
   setOnSessionStateChanged(
     cb: (
       agentName: string,
@@ -3360,7 +3365,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
 
   // ─── The seal path's public surface, kept on the manager ───────────────────────────────────
   //
-  // These ten live in `session-seal.ts`; their documentation is there, next to the code it
+  // These eleven live in `session-seal.ts`; their documentation is there, next to the code it
   // describes. They stay reachable here because 86 call sites outside this class — the close
   // handler, the seal coordinator, the escalation and certificate-pull paths, and `daemon.ts`
   // itself — name them on the manager. Signatures are DERIVED for the same reason as the content
@@ -4171,15 +4176,6 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   }
 
   /**
-   * Test seam: force this session's own salt half, so the LOCAL-defect path is reachable.
-   *
-   * `generateSaltContribution` cannot produce a degenerate half, which is the point of it — so the
-   * only way to exercise "our own random source is broken" end-to-end is to stand in for the broken
-   * source. Named `…ForTest` like every other seam in this file, and it writes the same map
-   * production writes rather than a parallel one, so a test cannot pass against state the daemon
-   * never reads.
-   */
-  /**
    * Test seam: run the auto-acknowledge gate, exactly as the counterparty's SEAL ctrl leaf does.
    *
    * `DOD-M15-SEALWIRE-1` part B1, review F-B. The gate has ONE production call site — inside the
@@ -4190,7 +4186,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * `content_verification_unavailable` branch had no coverage anywhere in the repo and two mutants
    * on it survived the full gate.
    *
-   * It calls the REAL private method rather than reproducing its logic, so a test cannot pass
+   * It calls the REAL method (public on `SessionSeal` since the split, private before it) rather than reproducing its logic, so a test cannot pass
    * against a decision production does not make.
    */
   runAutoAcknowledgeGateForTest(agentName: string, sessionId: string, correlationId = "test"): void {

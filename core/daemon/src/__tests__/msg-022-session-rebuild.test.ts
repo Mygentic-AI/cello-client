@@ -342,7 +342,7 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
         // establishment step — a false positive that makes this guard noisy and then ignored.
         //
-        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 15 session
+        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 16 session
         // collaborators are here. `#securityGateway` and `#factory` are deliberately NOT — neither
         // is reached from establishment today. If a screening or node-building step ever routes
         // through one, ADD IT HERE FIRST: the guard will not report a step it cannot see, which is
@@ -358,7 +358,12 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // session would come back reporting itself healthy with nothing reading its inbound stream
         // — the counterparty's messages landing on a dead socket until the five-minute mailbox poll
         // rescued them. That is the precise defect this file exists to catch.
-        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+        //
+        // `#seal` is here for the same reason and BEFORE it costs anything: the seal path moved out
+        // next, and establishment routes through no seal step today. Adding the prefix the moment
+        // the collaborator exists is the discipline this comment asks for — waiting until a step
+        // actually routes through it means waiting until the guard has already stopped seeing one.
+        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 

@@ -312,6 +312,19 @@ export class SessionSalts {
   ownSaltHalf(agentName: string, sessionId: string): Uint8Array | null {
     return this.#saltContributions.get(this.#ctx.sessionKey(agentName, sessionId)) ?? null;
   }
+  /**
+   * Test seam: force this session's own salt half, so the LOCAL-defect path is reachable.
+   *
+   * `generateSaltContribution` cannot produce a degenerate half, which is the point of it — so the
+   * only way to exercise "our own random source is broken" end-to-end is to stand in for the broken
+   * source. Named `…ForTest` like every other seam, and it writes the same map production writes
+   * rather than a parallel one, so a test cannot pass against state the daemon never reads.
+   *
+   * ⚠️ This block stayed in `session-node-manager.ts` when the method moved here, and ended up
+   * stacked on an unrelated test seam — the fourth found doing that. `#saltContributions` above is
+   * "the same map production writes"; the sentence was true where it was written and unverifiable
+   * where it landed.
+   */
   setSaltContributionForTest(agentName: string, sessionId: string, contribution: Uint8Array): void {
     this.#saltContributions.set(this.#ctx.sessionKey(agentName, sessionId), contribution);
   }
