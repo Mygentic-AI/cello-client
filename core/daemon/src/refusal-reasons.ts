@@ -217,11 +217,18 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
    * Naming it now would be an affordance that resolves to nothing: the reader would go looking for
    * a contact they do not have, which is worse than no advice because they will try to follow it.
    *
-   * ⚠️ AND IT IS THE ADVICE A STRANGER ACTUALLY NEEDS. The notice below branches on whether the
-   * operator recognises them, because you cannot reach an unknown agent out of band — there is no
-   * channel and no one to ask. Reporting is the only action that would work for the stranger case,
-   * and it is precisely the one that does not exist yet, so today that branch can only say "do not
-   * accept". That is what makes provisioning it worth doing rather than a nicety.
+   * ⚠️ AND IT IS THE ADVICE A STRANGER ACTUALLY NEEDS. The notice below gives ONE instruction, for
+   * a counterparty the operator recognises: reach them out of band. You cannot do that with an
+   * unknown agent — there is no channel and no one to ask.
+   *
+   * ⚠️ AND THE STRANGER CASE IS SAID BY SAYING NOTHING, deliberately. A draft ended with "if you do
+   * not know them, do not accept a session from them" — which restates the header: it was ALREADY
+   * refused, and the reader is not being offered a choice. Advice that repeats the outcome spends
+   * the reader's attention and gives them nothing to do with it.
+   *
+   * Reporting is the only action that would work for the stranger, and it is precisely the one that
+   * does not exist yet. That is what makes provisioning it worth doing rather than a nicety: today
+   * the notice has nothing at all to offer that reader.
    *
    * ⛔ TRIGGER: when `CELLO_Reporting` is provisioned and its pubkey published, add a sentence here
    * telling the operator to report the attempt to it, and drop the assertion in that test.
@@ -233,8 +240,7 @@ export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
     "is a conversation whose order could never be proven afterwards, by you or by anyone. NOTHING " +
     "LEGITIMATE PRODUCES THIS. IF THEY LOOK LIKE SOMEONE YOU KNOW, reach them OUT OF BAND — send " +
     "an email or a direct message, some channel that is not this one — and tell them their agent " +
-    "cannot hold a provable conversation with anyone while it is in this state. IF YOU DO NOT KNOW " +
-    "THEM, there is nobody to ask and nothing to confirm: do not accept a session from them.",
+    "cannot hold a provable conversation with anyone while it is in this state.",
   [REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED]:
     "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you have " +
     "completed sessions with before. Either they genuinely re-registered — confirm that with them " +
