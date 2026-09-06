@@ -2027,29 +2027,15 @@ export class AgentRelayClient {
      * AUTHOR's, already made. Logging "this submit acknowledges nothing" about it would be false,
      * and this daemon's own seed is irrelevant to a claim it did not write.
      */
-    if (!lastSeen && !carried) {
-      /**
-       * ⚠️ **v1, AND ONLY BECAUSE THERE IS NOTHING TO ACKNOWLEDGE.** Same rule as the content
-       * claim's, and the receiving half is `#verifyAcknowledgedContent` — a v1 claim is refused the
-       * moment it names position 1 or beyond, and accepted when it names none.
-       *
-       * Reaching here means the session was registered with no genesis and no assignment to derive
-       * one from, and no counterparty leaf has been delivered. `last_seen_seq: 0` with no hash says
-       * "I have seen nothing of yours", which is true, and asserts nothing about content — so it is
-       * not the unbacked number this unit exists to stop signing.
-       *
-       * It does not refuse the submit, and an earlier version did. Sessions brokered without a
-       * relay assignment are real, and refusing there left them unable to be witnessed at all.
-       */
-      this.#logger.info("session.relay.submit.unacknowledged", {
-        relayPeerId: this.#relayPeerId,
-        session: sessionIdHex,
-        impact:
-          "this submit acknowledges nothing: the session has no recorded starting point and no " +
-          "counterparty leaf has arrived on it. The leaf is witnessed as normal; the claim simply " +
-          "makes no assertion about what this agent has received.",
-      });
-    }
+    /**
+     * ⚠️ THE `session.relay.submit.unacknowledged` LOG THAT WAS HERE IS GONE, AND ITS ABSENCE IS
+     * DELIBERATE — `DOD-M15-SELFCHAIN-1`.
+     *
+     * It fired on exactly the condition the refusal below fires on (no seed, not a carried leaf)
+     * and told the operator "the leaf is witnessed as normal". That is now false: nothing is
+     * witnessed, the submit is refused. Two lines about one condition, one of them wrong, is how a
+     * reader ends up trusting the wrong one — so the refusal below is the only thing that speaks.
+     */
     // The published encoder from protocol-types — the ONE definition of the field order, pinned by
     // `structure1-canonical.json` (v1) and `structure1-v2-canonical.json` (v2). A second local copy
     // lived here until 020-ACKHASH; it drifted, and the drift was invisible because both copies

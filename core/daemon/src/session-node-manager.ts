@@ -8304,6 +8304,18 @@ export class SessionNodeManager {
       );
     }
     /**
+     * ⚠️ THE IN-MEMORY RECORD, READ BEFORE THE DATABASE — and this ordering is the fix, not a
+     * cache.
+     *
+     * `recordSessionGenesis` is called BEFORE the session node exists, because registering the
+     * session is what seeds the relay client's acknowledgement state and the seed has to be
+     * available by then. At that moment there is no session ROW to write to — `createSessionNode`
+     * inserts it — so a database-only record would still be empty at the one moment it is read.
+     * The row is written from this map when the insert happens, and read back after a restart.
+     */
+    const recorded = this.#sessionGenesis.get(this.#k(agentName, sessionId));
+    if (recorded) return recorded;
+    /**
      * THE RESTART CASE. A session restored from the database re-registers with no assignment, so
      * the derivation above has nothing to work from and the stored copy is the only answer. Read
      * second, never first: the live assignment is authoritative, and a stored value that ever
@@ -8317,9 +8329,7 @@ export class SessionNodeManager {
     // A stored value of the wrong width is not a genesis. Refusing it here sends the caller down its
     // own named refusal, which is a better outcome than signing an acknowledgement of 17 bytes.
     if (bytes && bytes.length === 32) return bytes;
-    // LAST, and only ever populated by `setSessionGenesisForTest` — a fixture building a session
-    // below the paths that record one. Read after both real sources so it cannot shadow either.
-    return this.#testGenesis.get(this.#k(agentName, sessionId));
+    return undefined;
   }
 
   /**
@@ -8330,13 +8340,19 @@ export class SessionNodeManager {
    * first write is the one derived closest to the assignment that opened the session.
    */
   /**
-   * Record the session's starting point from the ASSIGNMENT, for a session that has one and no
-   * relay params — `DOD-M15-SELFCHAIN-1`.
+   * Record the session's starting point from the ASSIGNMENT — `DOD-M15-SELFCHAIN-1`.
+   *
+   * ⚠️ **CALL THIS BEFORE `createSessionNode` / `acceptSession`, NOT AFTER.** Registering the
+   * session is what seeds the relay client's acknowledgement state, so the value has to exist by
+   * then; recorded afterwards, the first message of the session has nothing to chain to and is
+   * refused. Both the initiator and the responder derive this from the same FROST-signed assignment
+   * before they build anything.
    *
    * ⚠️ THE ANCHOR BELONGS TO THE SESSION, NOT TO THE RELAY, and treating it as the relay's was a
-   * real gap. It was persisted only when `relay.assignment` was present, which is relay-mode only —
-   * so a DIRECT-mode session, which is brokered and FROST-signed exactly like any other, recorded
-   * no starting point at all. Every message on it then had nothing to chain to.
+   * real gap. It was derived only when a relay assignment CARRY was present — and that carry is
+   * built only for a relay-mode assignment that also carries a per-node relay signature. So a
+   * direct-mode session, brokered and FROST-signed exactly like any other, recorded no starting
+   * point at all, and every message on it had nothing to chain to.
    *
    * Both transport modes get their assignment from the same ceremony and derive the same value from
    * it. The relay is how the conversation travels; it is not what makes the conversation provable.
@@ -8353,15 +8369,46 @@ export class SessionNodeManager {
     } as RelayAssignmentCarry);
   }
 
+  /**
+   * The starting point of each live session's chain, in memory.
+   *
+   * ⚠️ NOT A CACHE OF THE DATABASE — it is the only copy that exists at the moment the value is
+   * first needed. It is recorded before the session node is built, and the session ROW does not
+   * exist until that build inserts it (`#insertSessionRow` writes the column from here). The row is
+   * what survives a restart; this is what the session open itself reads.
+   */
+  readonly #sessionGenesis = new Map<string, Uint8Array>();
+
   #persistGenesisPrevRoot(agentName: string, sessionId: string, assignment: RelayAssignmentCarry): void {
-    if (!this.#db) return;
+    let genesis: Uint8Array;
     try {
-      const genesis = computeGenesisPrevRoot(
+      genesis = computeGenesisPrevRoot(
         assignment.participantA,
         assignment.participantB,
         Uint8Array.from(Buffer.from(sessionId, "hex")),
         assignment.sessionTimestamp,
       );
+    } catch (err: unknown) {
+      /**
+       * The DERIVATION failed, which is a different failure from the write below and must not be
+       * reported as one. It means the assignment's own fields are not what this function needs, and
+       * no amount of database health would help.
+       */
+      this.#logger.error("session.genesis.derive.failed", {
+        agentName, sessionId,
+        error: err instanceof Error ? err.message : String(err),
+        impact:
+          "this session's starting point could not be computed from its assignment, so nothing " +
+          "sent on it can be chained and every send will be refused by name. The session open " +
+          "continues; the conversation cannot.",
+      });
+      return;
+    }
+    // The in-memory record FIRST, and unconditionally: it is what the session open reads, and it
+    // must not depend on a database write that may not have anywhere to land yet.
+    this.#sessionGenesis.set(this.#k(agentName, sessionId), genesis);
+    if (!this.#db) return;
+    try {
       this.#db
         .prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
         .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
@@ -14377,22 +14424,23 @@ export class SessionNodeManager {
    */
   setSessionGenesisForTest(agentName: string, sessionId: string, genesis: Uint8Array): void {
     /**
-     * ⚠️ HELD IN MEMORY AS WELL AS WRITTEN, and the in-memory half is what makes it usable BEFORE
-     * the session row exists — `DOD-M15-SELFCHAIN-1`.
+     * ⚠️ WRITES THE SAME MAP PRODUCTION WRITES, deliberately — `DOD-M15-SELFCHAIN-1`.
      *
-     * Fixtures call this after `createSessionNode`, and the relay client seeds its acknowledgement
-     * state DURING that call. Without the map the seed is missing, and every send on the fixture is
-     * refused for having no starting point — the fixture would exercise a refusal path instead of
-     * the behaviour it was written for, which is the exact failure this seam exists to prevent.
+     * This seam exists because a fixture builds a session below the paths that derive a starting
+     * point from a directory assignment; it does NOT exist to install a second, quieter source of
+     * the value. Sharing the map means a fixture and a real session read through exactly the same
+     * lookup, so a change to that lookup cannot pass the tests while breaking production.
      *
-     * Read LAST in `#sessionGenesisPrevRoot`, after the live assignment and the stored row, so it
-     * can never shadow a real value. Empty in production: nothing outside a fixture writes it.
+     * ⚠️ CALL IT BEFORE `createSessionNode`, the same rule production follows: registering the
+     * session is what seeds the relay client's acknowledgement state, and a value recorded after
+     * that leaves the first send with nothing to chain to.
      */
-    this.#testGenesis.set(this.#k(agentName, sessionId), Uint8Array.from(genesis));
+    this.#sessionGenesis.set(this.#k(agentName, sessionId), Uint8Array.from(genesis));
     /**
      * The durable half is BEST EFFORT. Some fixtures run against a database whose schema was never
      * created, and a seam that threw there would turn "this fixture has no sessions table" into a
-     * failure of whatever it was actually testing.
+     * failure of whatever it was actually testing. Harmless when the row does not exist yet either:
+     * `#insertSessionRow` writes the column from the map above.
      */
     try {
       this.#db
@@ -14400,9 +14448,6 @@ export class SessionNodeManager {
         .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
     } catch { /* see above — the in-memory half is the load-bearing one */ }
   }
-
-  /** See `setSessionGenesisForTest`. Empty in production. */
-  readonly #testGenesis = new Map<string, Uint8Array>();
 
   /**
    * Test seam: drop the agreed key while leaving the session up — the state before an exchange
@@ -19675,13 +19720,23 @@ export class SessionNodeManager {
     if (!this.#db) return false;
     const now = Date.now();
     try {
+      /**
+       * ⚠️ THE SESSION'S STARTING POINT GOES IN AT INSERT — `DOD-M15-SELFCHAIN-1`.
+       *
+       * It is recorded before this row exists (the session open needs it before the node is built),
+       * so an UPDATE at that moment has nothing to match. Writing it here is what puts it on disk,
+       * and on disk is what lets the chain be resumed after a restart. `null` when nothing recorded
+       * one, which is a session whose sends will be refused by name rather than silently unlinked.
+       */
+      const genesis = this.#sessionGenesis.get(this.#k(agentName, sessionId));
       this.#db
         .prepare(
           `INSERT INTO sessions
-           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+           (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, genesis_prev_root)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(sessionId, this.#requireAgentId(agentName), counterpartyPubkey, status, now, now);
+        .run(sessionId, this.#requireAgentId(agentName), counterpartyPubkey, status, now, now,
+             genesis ? Buffer.from(genesis) : null);
       return true;
     } catch (err: unknown) {
       // D4 review F2: this helper serves the CREATE/ACCEPT paths (and interrupt-restore) — the old

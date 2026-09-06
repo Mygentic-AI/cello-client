@@ -183,6 +183,31 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     // M7 DOD-SPINE-6 / MSG-001-3b: relay witness params from the FROST-signed assignment
     // + this agent's K_local. N_A connects to the relay and submits message-leaf hashes.
     const relayParams = await buildRelayConnectParams(agentName, assignment);
+    /**
+     * ─── RECORD THE SESSION'S STARTING POINT — `DOD-M15-SELFCHAIN-1` ─────────────────────────────
+     *
+     * ⚠️ BEFORE THE NODE IS BUILT, NOT AFTER, and the order is the whole fix. Creating the session
+     * node registers it with the relay client, and THAT is what seeds the acknowledgement state
+     * every message chains to. Recorded afterwards, the seed is missing at the one moment it is
+     * read, and the session's first message — including its own SEAL leaf on close — is refused for
+     * having nothing to link to. That is what it did: a close on a relay-witnessed session never
+     * escalated, because the seal leaf could not be submitted.
+     *
+     * Derived from the FROST-signed assignment this handler already holds, for EVERY transport
+     * mode. It used to be derived only from the relay-assignment CARRY, which is built only for a
+     * relay-mode assignment that also carries a per-node relay signature — so a direct-mode
+     * session, brokered and signed exactly like any other, recorded no starting point at all.
+     *
+     * The anchor belongs to the session. The relay is how the conversation travels; it is not what
+     * makes the conversation provable.
+     */
+    sessionNodeManager.recordSessionGenesis(
+      agentName,
+      sessionId,
+      assignment.participant_a.pubkey,
+      assignment.participant_b.pubkey,
+      assignment.session_timestamp,
+    );
     const created = await sessionNodeManager.createSessionNode(
       sessionId,
       agentName,
@@ -197,25 +222,6 @@ export function registerInitiateSessionHandler(deps: InitiateSessionDeps): {
     if (!created.ok) {
       return { ok: false, reason: created.reason, guidance: created.guidance };
     }
-    /**
-     * ─── RECORD THE SESSION'S STARTING POINT — `DOD-M15-SELFCHAIN-1` ─────────────────────────────
-     *
-     * Derived from the FROST-signed assignment this handler already holds, and written for EVERY
-     * transport mode. It used to be persisted only alongside relay params, which is relay-mode
-     * only — so a direct-mode session, brokered and signed exactly like any other, recorded no
-     * starting point and every message on it had nothing to chain to.
-     *
-     * The anchor belongs to the session. The relay is how the conversation travels; it is not what
-     * makes the conversation provable.
-     */
-    sessionNodeManager.recordSessionGenesis(
-      agentName,
-      sessionId,
-      assignment.participant_a.pubkey,
-      assignment.participant_b.pubkey,
-      assignment.session_timestamp,
-    );
-
     // SEAM 1b: the session node N_A must hold the connection its content stream rides — so
     // dial the counterparty THROUGH N_A. The counterparty's advertised SESSION addresses are
     // the source of truth for dialability (a NATed node advertises a relay-circuit address; a

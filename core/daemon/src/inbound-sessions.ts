@@ -910,6 +910,28 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       // M7 DOD-SPINE-6 / MSG-001-3b: relay witness for the receiver. Build from the
       // inbound assignment's relay endpoint + this agent's K_local + the 16-byte session id.
       const relayParams = await buildResponderRelayParams(parsed, getKeyProvider(agentName), logger, agentName);
+      /**
+       * ─── RECORD THE SESSION'S STARTING POINT — `DOD-M15-SELFCHAIN-1` ───────────────────────────
+       *
+       * ⚠️ BEFORE `acceptSession`, for the same reason the initiator records it before creating its
+       * node: accepting registers the session with the relay client, and that registration is what
+       * seeds the acknowledgement state every message chains to. Recorded afterwards, this side's
+       * first message has nothing to link to and is refused.
+       *
+       * This value was already being derived on this path — a few lines below, and used only to
+       * SHOW the operator. Deriving the anchor of the chain and then only displaying it is what
+       * left the responder with no starting point of its own.
+       *
+       * The two sides derive the SAME value from the same FROST-signed assignment, which is what
+       * makes each side able to check the other's first link.
+       */
+      sessionNodeManager.recordSessionGenesis(
+        agentName,
+        parsed.sessionIdHex,
+        Buffer.from(parsed.participantAPubkeyHex, "hex"),
+        Buffer.from(parsed.participantBPubkeyHex, "hex"),
+        parsed.sessionTimestamp,
+      );
       const result = await sessionNodeManager.acceptSession(
         parsed.sessionIdHex,
         agentName,
@@ -938,6 +960,9 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       // baked into the FROST-signed session-establishment TBS and derived by the initiator
       // and directory — NOT the daemon's (empty) tree root. computeGenesisPrevRoot sorts
       // the pubkeys internally, so natural (A, B) order is correct.
+      //
+      // Shown to the operator. The copy this daemon USES was recorded before `acceptSession`
+      // above — see the note there for why the order matters.
       const genesisPrevRootHex = Buffer.from(
         computeGenesisPrevRoot(
           Buffer.from(parsed.participantAPubkeyHex, "hex"),
