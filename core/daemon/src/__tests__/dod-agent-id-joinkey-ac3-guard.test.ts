@@ -20,17 +20,28 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-/** The files that own the seven re-keyed tables' SQL. */
-const DATA_ACCESS_FILES = [
-  join(HERE, "..", "session-node-manager.ts"),
-  join(HERE, "..", "retry-queue.ts"),
-];
+/**
+ * EVERY daemon source file, not a list of the ones that owned the SQL when this was written.
+ *
+ * ⚠️ It WAS a list — `session-node-manager.ts` and `retry-queue.ts`, described as "the files that
+ * own the seven re-keyed tables' SQL". That stopped being true the moment the god-file split began:
+ * the schema, the queries, the records, the held content, the leaf records and the relay path all
+ * hold SQL now and none of them was scanned. Nothing was actually missed — no session table is
+ * scoped on `agent_name` anywhere — but the failure mode of a list is that forgetting an entry
+ * makes the loop SHORTER, never red, so nobody would have learned otherwise.
+ *
+ * The rule this guard enforces is universal: no query anywhere may scope a session table on a
+ * mutable display label. A universal rule deserves a universal scan, and a glob cannot shrink.
+ */
+const DATA_ACCESS_FILES = readdirSync(join(HERE, ".."))
+  .filter((f) => f.endsWith(".ts"))
+  .map((f) => join(HERE, "..", f));
 
 /** Strip block and line comments — prose about agent_name is fine; only executable SQL matters. */
 function stripComments(src: string): string {
@@ -51,27 +62,71 @@ const SCOPING_PATTERNS: Array<{ re: RegExp; what: string }> = [
 ];
 
 /**
- * The ONE sanctioned use: the resolver reads agent_id FROM the agents table, keyed by name. Matching
- * it against `agents` (not a session table) is exactly the demotion working — the name is a lookup
- * key on its OWN table, and a foreign key nowhere.
+ * THE SANCTIONED USE, stated as the rule rather than as two query shapes.
+ *
+ * The rule is *"`agent_name` never scopes a SESSION table"*. It has always been legal against the
+ * `agents` table itself: that is the one place the name is a lookup key on its own row, and a
+ * foreign key nowhere. It is how a name is resolved to an id in the first place.
+ *
+ * ⚠️ This used to be two hard-coded SELECT shapes, and it only looked adequate because the scan
+ * was pointed at two files. Widening the scan to the whole directory surfaced SIXTEEN legitimate
+ * `agents`-table lookups it did not recognise — none of them a violation, all of them reported as
+ * one. **An exemption written as a list of shapes is the same defect as a scan written as a list of
+ * files:** it goes stale silently, and the failure is a false accusation rather than a miss.
+ *
+ * So: a line is exempt when every table it names IS `agents`. A line that touches any other table
+ * while scoping on `agent_name` is the thing this guard exists to catch, and it is still caught.
  */
-const RESOLVER_RE = /SELECT\s+agent_name\s+FROM\s+agents|SELECT\s+agent_id\s+FROM\s+agents\s+WHERE\s+agent_name/i;
+const TABLE_RE = /\b(?:FROM|JOIN|INTO|UPDATE)\s+([A-Za-z_][\w]*)/gi;
+/**
+ * ⚠️ IT TAKES A WINDOW, NOT A LINE, because SQL wraps. A statement like
+ *
+ *     `UPDATE agents SET frost_epoch_id=?, …
+ *        WHERE agent_name=?`
+ *
+ * puts the table on one line and the predicate on another, so a per-line exemption sees a bare
+ * `WHERE agent_name=?` naming no table at all and reports a legitimate `agents` update as a
+ * violation. Looking back to the nearest table token is what makes the exemption match the way
+ * people actually write the query.
+ */
+function onlyTouchesAgentsTable(window: string): boolean {
+  const tables = [...window.matchAll(TABLE_RE)].map((m) => m[1]!.toLowerCase());
+  return tables.length > 0 && tables.every((t) => t === "agents");
+}
+
+/**
+ * The ONE file-level exemption, and it is the migration that created the column this rule protects.
+ *
+ * `agent-id-migration.ts` backfills `agent_id` onto the session tables by joining them to `agents`
+ * ON `agent_name`. That join is the entire point of it: before it ran, the name was the only key
+ * there was. It can only be written the way the rule forbids, and it runs once.
+ */
+const EXEMPT_FILES = new Set(["agent-id-migration.ts"]);
 
 describe("DOD-AGENT-ID-JOINKEY-1 AC3 — agent_name never scopes a session-table query", () => {
   it("the scan covers the data-access files (it has teeth)", () => {
     for (const f of DATA_ACCESS_FILES) {
       expect(readFileSync(f, "utf8").length, `${f} must be readable and non-empty`).toBeGreaterThan(0);
     }
+    // And it is looking at real SQL, not an empty directory: a scan that reads nothing containing
+    // `agent_name` at all would report no offenders forever.
+    const mentions = DATA_ACCESS_FILES.filter((f) => /agent_name/.test(readFileSync(f, "utf8")));
+    expect(mentions.length, "no daemon source mentions agent_name — this scan is matching nothing")
+      .toBeGreaterThan(0);
   });
 
   it("no PRIMARY KEY / WHERE / JOIN / ON CONFLICT / INSERT scopes on agent_name", () => {
     const offenders: string[] = [];
     for (const file of DATA_ACCESS_FILES) {
+      if (EXEMPT_FILES.has(file.split("/").pop()!)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
-      // Look at each SQL-ish line; skip the sanctioned agents-table resolver.
-      for (const [i, rawLine] of code.split("\n").entries()) {
+      // Look at each SQL-ish line; skip the sanctioned agents-table lookups.
+      const codeLines = code.split("\n");
+      for (const [i, rawLine] of codeLines.entries()) {
         if (!/agent_name/.test(rawLine)) continue;
-        if (RESOLVER_RE.test(rawLine)) continue;
+        // Six lines is comfortably more than the longest wrapped statement in the tree and far less
+        // than the distance to an unrelated one.
+        if (onlyTouchesAgentsTable(codeLines.slice(Math.max(0, i - 6), i + 1).join(" "))) continue;
         for (const { re, what } of SCOPING_PATTERNS) {
           if (re.test(rawLine)) {
             offenders.push(`${file.slice(HERE.length + 1)}:${i + 1}  [${what}]  ${rawLine.trim().slice(0, 100)}`);
@@ -93,6 +148,7 @@ describe("DOD-AGENT-ID-JOINKEY-1 AC3 — agent_name never scopes a session-table
     // wraps is not missed by the per-line pass above.
     const offenders: string[] = [];
     for (const file of DATA_ACCESS_FILES) {
+      if (EXEMPT_FILES.has(file.split("/").pop()!)) continue;
       const code = stripComments(readFileSync(file, "utf8"));
       const m = code.match(/PRIMARY\s+KEY\s*\([^)]*\bagent_name\b[^)]*\)/gi);
       if (m) offenders.push(`${file.slice(HERE.length + 1)}: ${m.join(" ; ")}`);

@@ -164,18 +164,38 @@ describe("every seal-completion path flips the status itself", () => {
   // fifth seal site can be added in a file nobody remembers to add here, and the suite stays green.
   // Every daemon source file is checked; anything genuinely exempt goes in EXEMPT with a reason.
   const SRC_DIR = join(import.meta.dirname, "..");
-  const EXEMPT: Record<string, string> = {
-    // The teardown itself. It is the function whose early return causes the defect — it cannot
-    // call the wrapper that exists to work around it.
-    "session-node-manager.ts": "writes the status inline, below the #activeNodes guard this pins around",
+  /**
+   * ⚠️ EMPTY, AND THAT IS THE CORRECT STATE — an exemption that exempts nothing is worse than none.
+   *
+   * It used to hold `session-node-manager.ts`, on the grounds that the teardown itself "writes the
+   * status inline, below the `#activeNodes` guard this pins around". That was true when the
+   * teardown lived there. `destroySessionNode` moved to `session-lifecycle.ts` with the rest of the
+   * session-lifecycle path, and the manager now matches this scan's own filter ZERO times — so the
+   * entry excluded a file that was never going to be scanned, while reading as a considered
+   * decision about live code. The three files that DO match are all checked, and if the teardown
+   * ever needs exempting again the entry can come back with a reason that is true on the day.
+   */
+  const EXEMPT: Record<string, string> = {};
+  /**
+   * A CALL on ONE line, which is the same rule the per-site scan below uses.
+   *
+   * It used to be `/destroySessionNode\([^)]*"sealed"/` over the whole file, and `[^)]*` crosses
+   * newlines — so the moment the content path was split out and something DECLARED the method,
+   * a four-line type signature with `reason: "sealed" | "interrupted" | "error"` matched. That
+   * file has no teardown in it at all, so the scan then demanded a `markSealed` next to a call
+   * that does not exist and failed on a file that could not possibly be wrong. A declaration is
+   * not a call, and the two filters agreeing is what keeps this scan pointed at real sites.
+   */
+  const isComment = (line: string): boolean => {
+    const t = line.trim();
+    return t.startsWith("//") || t.startsWith("*") || t.startsWith("/*");
   };
+  const isSealTeardownCall = (line: string): boolean =>
+    !isComment(line) && line.includes("destroySessionNode(") && line.includes('"sealed"');
   const FILES = readdirSync(SRC_DIR)
     .filter((f) => f.endsWith(".ts"))
     .filter((f) => !(f in EXEMPT))
-    .filter((f) => {
-      const src = readFileSync(join(SRC_DIR, f), "utf-8");
-      return /destroySessionNode\([^)]*"sealed"/.test(src);
-    });
+    .filter((f) => readFileSync(join(SRC_DIR, f), "utf-8").split("\n").some(isSealTeardownCall));
 
   it("the scan finds the seal-completion files at all — an empty list would pin nothing", () => {
     expect(FILES.length).toBeGreaterThan(0);
@@ -185,9 +205,7 @@ describe("every seal-completion path flips the status itself", () => {
     it(`${file}: each destroySessionNode(..., "sealed") is preceded by markSealed`, () => {
       const src = readFileSync(join(SRC_DIR, file), "utf-8");
       const lines = src.split("\n");
-      const sealTeardowns = lines
-        .map((l, i) => ({ l, i }))
-        .filter(({ l }) => l.includes('destroySessionNode(') && l.includes('"sealed"'));
+      const sealTeardowns = lines.map((l, i) => ({ l, i })).filter(({ l }) => isSealTeardownCall(l));
 
       expect(sealTeardowns.length, `${file} must still contain the seal teardown this pins`).toBeGreaterThan(0);
 
@@ -199,13 +217,33 @@ describe("every seal-completion path flips the status itself", () => {
           .slice(Math.max(0, i - 14), i)
           .filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*"))
           .join("\n");
+        /**
+         * TWO ways to flip it, and both are the property — review of the content-path split.
+         *
+         * The wrapper `markSealed` is one. The other is the inline `updateSessionStatus(…,
+         * "sealed")`, which is what the send path does and has always done; it simply used to live
+         * in the one file this scan exempts, so the scan never had to know about it. When the
+         * content path moved to its own file the site became visible and the check called a
+         * correct, deliberate, commented flip a defect.
+         *
+         * What is being pinned is "the row is flipped before the teardown", not "one named
+         * function was called". Accepting both keeps the teeth: delete EITHER and this goes red,
+         * because what is gone is the flip.
+         */
+        // PER LINE, for the reason the file filter above is per line: `[^)]*` crosses newlines, so
+        // over a 14-line joined window it would happily match an `updateSessionStatus(` on one line
+        // against a `"sealed"` on another that has nothing to do with it. Nothing in this window
+        // declares that signature today, so it is not reachable — it is the identical trap sitting
+        // one refactor away, and it costs one `.some()` to close now rather than after it fires.
+        const flipped = window.split("\n").some((l) =>
+          l.includes(".markSealed(") || (l.includes("updateSessionStatus(") && l.includes('"sealed"')));
         expect(
-          window,
+          flipped,
           `${file}:${i + 1} tears the node down as sealed without flipping the status first. ` +
           `destroySessionNode returns early at 'if (!entry) return' and writes the status below that ` +
           `guard, so for a session with no live node — every interrupted one — the receipt lands and ` +
           `the row never moves.`,
-        ).toContain(".markSealed(");
+        ).toBe(true);
       }
     });
   }

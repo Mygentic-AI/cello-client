@@ -20,8 +20,13 @@ import type { SessionRecords } from "./session-records.js";
 import type { SessionTree, WritableSessionTreeLeafKind } from "./session-tree.js";
 import type { SentAuthorship } from "./session-node-types.js";
 
-/** One piece of content held behind an ordering gap. */
-type HeldEntry = {
+/**
+ * One piece of content held behind an ordering gap.
+ *
+ * Exported because the content pipeline shares the very same map — see the note on `heldContent`
+ * below. Two files spelling one shape out separately is how they stop agreeing.
+ */
+export type HeldEntry = {
   content: Uint8Array; originalContent?: Uint8Array; contentHashHex: string; correlationId?: string;
   screenedOut?: boolean; origin?: "sent"; kind?: WritableSessionTreeLeafKind; authorship?: SentAuthorship;
   restoredAcrossRestart?: boolean;

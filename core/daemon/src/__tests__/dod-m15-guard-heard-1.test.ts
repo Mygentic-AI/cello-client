@@ -34,7 +34,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { registerNotificationHandlers, type NotificationHandlerDeps } from "../notification-handlers.js";
@@ -281,18 +281,36 @@ describe("DOD-M15-GUARD-HEARD-1: no security refusal is recorded with a loose st
      * still reads as coverage — and the tests above would happily prove that a reason no code path
      * can produce reaches the inbox beautifully.
      */
-    // NO `catch { return "" }` here. It silently turned a renamed or split file into an empty
-    // string, so the scan would check two files instead of three and say nothing — masked today
-    // only because all three reasons happen to live in one of them.
-    const sources = ["inbound-sessions.ts", "session-node-manager.ts", "outbound-sessions.ts"]
+    /**
+     * ⚠️ EVERY DAEMON SOURCE FILE, NOT A LIST OF THREE — and the list is what went wrong.
+     *
+     * It named `inbound-sessions.ts`, `session-node-manager.ts` and `outbound-sessions.ts`, and it
+     * already had a comment arguing against a `catch { return "" }` on the grounds that it would
+     * "check two files instead of three and say nothing". The list itself has the identical
+     * failure: the god-file split moved the refusal emitters out, the manager now contributes
+     * ZERO `REFUSAL_REASONS.` references, and `inbound-refusals.ts` — which has one — was never
+     * scanned. Nothing was actually missed, because the reasons happen to live in a file still on
+     * the list. Nobody would have learned otherwise.
+     *
+     * A loop over a hand-maintained list gets SHORTER when someone forgets an entry, never red.
+     * Three separate guards in this suite went blind that way during the split. A glob cannot
+     * shrink, and the next file to emit a refusal is scanned the day it is written.
+     */
+    const sourceFiles = readdirSync(SRC).filter((f) => f.endsWith(".ts"));
+    const sources = sourceFiles
       .map((f) => {
         const text = readFileSync(join(SRC, f), "utf8");
-        expect(text.length, `${f} is empty — the emitter scan would silently check less`).toBeGreaterThan(0);
         // Comments do not emit. A commented-out reference used to satisfy this scan, so a real
         // emission could be replaced by a bare literal with the old line left as a `// was: …` note.
         return text.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
       })
       .join("\n");
+    // The scan must be reading something that emits, or it proves nothing about every reason at
+    // once — the state the manager half of it had silently reached.
+    expect(
+      /REFUSAL_REASONS\./.test(sources),
+      "no daemon source references REFUSAL_REASONS — the emitter scan is matching nothing",
+    ).toBe(true);
 
     const memberFor: Record<string, string> = Object.fromEntries(
       Object.entries(REFUSAL_REASONS).map(([member, value]) => [value, member]),

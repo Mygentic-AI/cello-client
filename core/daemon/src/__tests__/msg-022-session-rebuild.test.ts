@@ -271,7 +271,11 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
    */
   it("PARITY: every call establishment makes, revival makes too", async () => {
     const { readFileSync } = await import("node:fs");
-    const src = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8");
+    // POINTED AT THE LIFECYCLE FILE. `acceptSession` and `reviveSessionNode` moved there together
+    // when the session-lifecycle path left the manager, so both regions travelled as a pair and the
+    // comparison is unchanged — it is still establishment against revival, in one file. This went
+    // red on its own "region start not found" precondition, which is the design working.
+    const src = readFileSync(join(import.meta.dirname, "..", "session-lifecycle.ts"), "utf-8");
     const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
     const region = (from: string, to: string): string => {
@@ -342,12 +346,43 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
         // establishment step — a false positive that makes this guard noisy and then ignored.
         //
-        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 13 session
+        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 17 session
         // collaborators are here. `#securityGateway` and `#factory` are deliberately NOT — neither
         // is reached from establishment today. If a screening or node-building step ever routes
         // through one, ADD IT HERE FIRST: the guard will not report a step it cannot see, which is
         // the exact failure this widening was written to prevent.
-        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+        //
+        // ⚠️ AND IT HAPPENED, EXACTLY AS WARNED. `#contentIn` / `#contentOut` were added when the
+        // content path moved out of the manager, and the list was not. Establishment's call went
+        // from `this.#registerContentHandler(` to `this.#contentIn.registerContentHandler(`, which
+        // this pattern cannot match AT ALL — after `this.` it needs a name followed immediately by
+        // `(`. So the step vanished from the scan and the test stayed green with the content
+        // handler no longer required of revival. The step is still there today; what was lost was
+        // the requirement. The next edit that dropped it would have left this green, and a revived
+        // session would come back reporting itself healthy with nothing reading its inbound stream
+        // — the counterparty's messages landing on a dead socket until the five-minute mailbox poll
+        // rescued them. That is the precise defect this file exists to catch.
+        //
+        // `#seal` is here for the same reason and BEFORE it costs anything: the seal path moved out
+        // next, and establishment routes through no seal step today. Adding the prefix the moment
+        // the collaborator exists is the discipline this comment asks for — waiting until a step
+        // actually routes through it means waiting until the guard has already stopped seeing one.
+        //
+        // `#relay` proves the point a THIRD time, and this one DID cost coverage. Establishment's
+        // `#connectSessionRelay` and revival's `#reconnectRevivedSessionRelay` both moved onto it,
+        // so BOTH sides lost the step at once — and losing it symmetrically is worse than losing it
+        // on one side, because parity still held and the scan stayed green while no longer checking
+        // the single most important step it exists to check: that a revived session reconnects its
+        // relay witness rather than merely filing a handler.
+        //
+        // ⚠️ AND `#ctx.` IS OPTIONAL IN FRONT OF ALL OF THEM. Inside a collaborator a call on a
+        // sibling reads `this.#ctx.relay.connectSessionRelay(`, not `this.#relay.connectSessionRelay(`.
+        // Without this clause the pattern matched NOTHING in the lifecycle file — not a step lost,
+        // EVERY step lost, and a scan that derives an empty list from one region and compares it to
+        // an empty list from the other passes for the emptiest possible reason. That is the fourth
+        // time this pattern has gone blind; the first three each cost one step, and this one would
+        // have cost all of them.
+        /this\.(?:#ctx\.)?(?:#?(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal|relay)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
@@ -390,14 +425,18 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
     // so it logged "live inbound path back" over a client whose stream was null and delivery fell
     // straight back to the five-minute mailbox poll.
     const { readFileSync } = await import("node:fs");
-    const code = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8")
+    // POINTED AT THE RELAY FILE. `#reconnectRevivedSessionRelay` moved there when the relay path
+    // left the manager, and it is PUBLIC on that class — the manager calls it. This test went red
+    // on its own "method not found" precondition, which is the design working; repointing it is the
+    // whole change.
+    const code = readFileSync(join(import.meta.dirname, "..", "session-relay.ts"), "utf-8")
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     // BOUNDED BY THE NEXT METHOD. The first version used `indexOf("\n  }\n")`, which does not match
     // this file's formatting — it returned -1, so `slice(a, -1)` scanned almost the whole file and
-    // found `client.connect(` in `#connectSessionRelay`. The test passed with the call reverted,
+    // found `client.connect(` in `connectSessionRelay`. The test passed with the call reverted,
     // which is the same hollowness it was written to fix.
-    const a = code.indexOf("async #reconnectRevivedSessionRelay(");
-    const b = code.indexOf("async reviveSessionNode(", a);
+    const a = code.indexOf("async reconnectRevivedSessionRelay(");
+    const b = code.indexOf("getSessionRelayForTest(", a);
     expect(a, "method not found").toBeGreaterThan(-1);
     expect(b, "region end not found").toBeGreaterThan(a);
     const body = code.slice(a, b);
