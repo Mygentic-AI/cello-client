@@ -122,11 +122,21 @@ export default [
     //       shipped. It is NOT acceptable for new behaviour, and it is NOT acceptable "to get the
     //       build green". The comments around the seams were trimmed first, to keep the raise to
     //       the code itself. It comes back down at the next extraction.
-    //   - session-node-manager.ts — 036-GODFILE's subject. LOWER THIS NUMBER AFTER EVERY PART
-    //       LANDS. The rule is what holds the ground each part takes: without it the file can drift
-    //       back between parts and nothing notices. When the split is finished the number is set to
-    //       the final size, which is below the ordinary 3,000 ceiling — so this entry ends up
-    //       STRICTER than the default, which is the point of a ratchet.
+    //   - session-node-manager.ts — 036-GODFILE's subject, SPLIT AND FINISHED: 20,368 lines down
+    //       to 3,392 across twenty-two modules. The number below is the final size and it does not
+    //       move again except downward.
+    //       ⚠️ IT IS 3,392, WHICH IS LOOSER THAN THE 3,000 DEFAULT, and this comment used to
+    //       promise the opposite — that the finished file would end up STRICTER than baseline. It
+    //       does not, and the reason is a deliberate seam rather than a shortfall. Two methods
+    //       stayed: `gracefulShutdown` is PROCESS teardown (it closes the database, sets the
+    //       shutting-down flag and stops the reservation watchdog) and `#evictSessionCaches`
+    //       clears the eleven shared containers every collaborator writes. Between them they are
+    //       ~390 lines — almost exactly the gap. Moving either would put mutation of the manager's
+    //       own lifecycle state behind a collaborator's context: a collaborator able to switch off
+    //       the process that owns it. That trade is worse than 392 lines, and this number records
+    //       the decision rather than hiding it.
+    //       So this file is the ONE daemon file allowed above the default. Anyone who thinks that
+    //       is wrong should move those two methods and lower the number, not raise it.
     //   - daemon.ts — OWED, and explicitly not 036-GODFILE's work. It needs the same treatment for
     //       the same reason: it is the file that already proved a split without a ratchet does not
     //       hold. It is grandfathered here only so this rule can land today instead of waiting on a
@@ -140,6 +150,39 @@ export default [
   {
     files: ["core/daemon/src/daemon.ts"],
     rules: { "max-lines": ["error", { max: 6080, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    /**
+     * ⚠️ THE FILES THE SPLIT CREATED, EACH RATCHETED AT ITS OWN SIZE — and this is the whole
+     * lesson of `daemon.ts`, applied forward instead of after the fact.
+     *
+     * The 3,000 default would let every one of these grow by hundreds of lines before anything
+     * said a word, and that is precisely how the last split came undone: `daemon.ts` went 6,279 →
+     * 2,081 in July and was back to 6,077 within two months, because nothing was holding the
+     * ground it took. A ceiling a file is nowhere near is not a ratchet; it is a ceiling.
+     *
+     * Each number is the size on the day the file was created. Raise one only for a test that
+     * covers a defect that file shipped — the same single exception the manager's entry names —
+     * and lower it whenever the file gets smaller.
+     */
+    files: ["core/daemon/src/session-content-ingest.ts"],
+    rules: { "max-lines": ["error", { max: 2286, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["core/daemon/src/session-lifecycle.ts"],
+    rules: { "max-lines": ["error", { max: 1840, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["core/daemon/src/session-relay.ts"],
+    rules: { "max-lines": ["error", { max: 1624, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["core/daemon/src/session-content-send.ts"],
+    rules: { "max-lines": ["error", { max: 1352, skipBlankLines: false, skipComments: false }] },
+  },
+  {
+    files: ["core/daemon/src/session-seal.ts"],
+    rules: { "max-lines": ["error", { max: 1111, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],
