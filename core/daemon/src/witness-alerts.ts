@@ -20,6 +20,15 @@ export interface WitnessAlertContext {
   readonly logger: Logger;
 }
 
+/**
+ * ⚠️ **THE CAP KEEPS THE FIRST, NOT THE LAST** — review F1, and the direction is the whole point.
+ *
+ * The relay's own queue drops the NEWEST when full, precisely so a flood cannot push the first
+ * real observation out. This list did the opposite (`slice(-20)`), which handed the mute button
+ * straight back one layer up: at the relay's 120-submits-per-minute limit, about ten seconds of
+ * fabricated alerts evicted the genuine one before any operator read it. Repeats of one event also
+ * collapse — see the dedupe in `recordRelayWitnessAlert` — so a flood cannot even fill it.
+ */
 const WITNESS_ALERT_CAP = 20;
 
 export class WitnessAlerts {
@@ -49,15 +58,6 @@ export class WitnessAlerts {
    * larger number". A marker the operator can see costs one boolean.
    */
   readonly #witnessTruncated = new Set<string>();
-  /**
-   * ⚠️ **THE CAP KEEPS THE FIRST, NOT THE LAST** — review F1, and the direction is the whole point.
-   *
-   * The relay's own queue drops the NEWEST when full, precisely so a flood cannot push the first
-   * real observation out. This list did the opposite (`slice(-20)`), which handed the mute button
-   * straight back one layer up: at the relay's 120-submits-per-minute limit, about ten seconds of
-   * fabricated alerts evicted the genuine one before any operator read it. Repeats of one event also
-   * collapse — see the dedupe in `recordRelayWitnessAlert` — so a flood cannot even fill it.
-   */
   /**
    * Record what one relay says it saw on one of this agent's sessions, for the operator to read.
    *

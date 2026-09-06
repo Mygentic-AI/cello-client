@@ -10,9 +10,18 @@
  * build that predates the salt" from "our own write failed", because those have opposite remedies
  * and people have already been sent the wrong way once.
  *
- * ⚠️ THIS CLASS OWNS THE ELEVEN PER-SESSION SALT MAPS. They used to be eleven of the twenty-four
- * containers `#evictSessionCaches` cleared by hand — the shape that makes forgetting a session mean
- * knowing every map that might hold a piece of it. One `evictSession` call now.
+ * ⚠️ THIS CLASS OWNS ELEVEN PER-SESSION SALT MAPS, of which **TEN** were cleared by hand in
+ * `#evictSessionCaches`. One `evictSession` call replaces those ten.
+ *
+ * ⚠️ **`#saltPending` IS THE ELEVENTH AND IT IS NOT ONE OF THEM — DO NOT ADD IT TO `evictSession`.**
+ * It holds a PROMISE that an outbound send is awaiting, and teardown must SETTLE it, not drop it.
+ * The caller does that on the next line (`settleSaltPending(..., "closed")`), which is what lets a
+ * send in flight return `session_torn_down` instead of waiting forever.
+ *
+ * This is not hypothetical: it was added to `evictSession` for tidiness, and because `evictSession`
+ * runs first, `settleSaltPending` then found nothing and returned — so the promise never resolved,
+ * its 5-second timer found nothing either, and `cello_send` hung with no error, no log and no
+ * timeout. The whole suite stayed green, because nothing covers that branch.
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger, SessionRecord } from "./types.js";
@@ -68,7 +77,7 @@ export interface SaltContext {
   ): Promise<void>;
 }
 
-  export class SessionSalts {
+export class SessionSalts {
   readonly #ctx: SaltContext;
 
   constructor(ctx: SaltContext) {
@@ -1489,7 +1498,6 @@ export interface SaltContext {
   evictSession(agentName: string, sessionId: string): void {
     const key = this.#ctx.sessionKey(agentName, sessionId);
     this.#saltContributions.delete(key);
-    this.#saltPending.delete(key);
     this.#sessionSalts.delete(key);
     this.#saltRepairedAgainst.delete(key);
     this.#saltRepairedAgainstFingerprint.delete(key);

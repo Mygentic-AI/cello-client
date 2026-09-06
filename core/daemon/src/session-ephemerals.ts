@@ -11,7 +11,10 @@
  * ⚠️ THE SECRET IS DESTROYED EXPLICITLY, NOT LEFT TO THE GARBAGE COLLECTOR. `destroySessionEphemeral`
  * zeroes the bytes; dropping the reference would leave them in the heap for as long as the process
  * lives, which is the difference between a throwaway key and one an attacker can find in a core
- * dump. Every teardown path goes through `destroyFor`.
+ * dump. Every PER-SESSION teardown goes through `destroySessionEphemeralFor`; shutdown goes through
+ * `destroyAll`, which does the same zeroing for every live session at once rather than one at a
+ * time. Two entry points, one guarantee — said precisely because "every path goes through one
+ * method" was the earlier wording and it was not true of shutdown.
  */
 import type { Logger } from "./types.js";
 import type { ActiveSessionEntry } from "./session-node-types.js";
@@ -37,7 +40,7 @@ import {
   SESSION_KEY_ANNOUNCE_RETRY_MS,
 } from "./session-node-types.js";
 
-/** What the ephemeral key agreement needs from the manager. Four things. */
+/** What the ephemeral key agreement needs from the manager. */
 export interface SessionEphemeralContext {
   readonly logger: Logger;
   sessionKey(agentName: string, sessionId: string): string;

@@ -749,7 +749,10 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   forgetSaltContributionForTest(agentName: string, sessionId: string): void { return this.#salts.forgetSaltContributionForTest(agentName, sessionId); }
   async contentHashForSession(agentName: string, sessionId: string, content: Uint8Array): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> { return this.#salts.contentHashForSession(agentName, sessionId, content); }
   abandonUnsaltedHash(agentName: string, sessionId: string): void { return this.#salts.abandonUnsaltedHash(agentName, sessionId); }
-  isContentSaltActive(agentName: string, sessionId: string): boolean { return this.#salts.isContentSaltActive(agentName, sessionId); }
+  isContentSaltActive(agentName: string, sessionId: string): boolean { return this.#salts.isContentSaltActive(agentName, sessionId); }  // Seams for the teardown-must-settle regression (037-SESSIONCORE): arm a pending salt
+  // agreement, then observe the outcome a dropped promise would leave unreachable.
+  markSaltPendingForTest(agentName: string, sessionId: string): void { return this.#salts.markSaltPending(agentName, sessionId); }
+  saltForHashingForTest(agentName: string, sessionId: string): Promise<{ salt: Uint8Array | null; reason?: string }> { return this.#salts.saltForHashing(agentName, sessionId); }
 
   /**
    * ─── DELEGATORS — the mailbox API other files call, unchanged by the split ───────────────────
@@ -2346,8 +2349,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
    * ONE daemon, so a bare session_id is ambiguous between them. This composite string key — the
    * agent name and the hex session id joined by a 0x1f unit separator (which appears in neither) —
    * is the key for every in-memory session-core map (#activeNodes, #trees, #receivedContent,
-   * #sessionLiveness, #contentDesynced, #responderSealSubmitted, #awaitingAck). #relayClients is
-   * already per-agent (its own key), and the standing receivers are keyed by agent name directly.
+   * #contentDesynced, #responderSealSubmitted, #awaitingAck) and for the per-session maps the
+   * collaborators own, which build the same key the same way. #relayClients is already per-agent
+   * (its own key), and the standing receivers are keyed by agent name directly.
    */
   #k(agentName: string, sessionId: string): string {
     return `${agentName}\x1f${sessionId}`;
@@ -3355,9 +3359,8 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     this.#contentDesynced.delete(key);
     /**
      * DOD-M15-NO-SILENT-REFUSAL-1 review N2: the UNPERSISTED half IS torn down, and only that half.
-     *
-     * `#refusalFallback` is in memory and restores exactly what the deleted Map did, so it belongs
-     * in the teardown set exactly as that Map did. Leaving it out meant a daemon that could not
+     * The in-memory fallback (now `RefusalNotices`' own, dropped by its `evictSession`) restores
+     * what the deleted Map did, so it belongs in the teardown set exactly as that Map did. Leaving it out meant a daemon that could not
      * write to disk — already in trouble — grew without bound in memory as well. The durable rows
      * stay, for the reason below.
      */
@@ -3414,9 +3417,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
      * once per revival is the right frequency too: it is what an operator reading a fresh log needs
      * in order to know why this session has no salt.
      */
+    // SALTSPLIT-1 HIGH-2 goes with its mirror. SETTLED, never deleted: a send awaiting the
+    // agreement must be TOLD the session is gone, not left waiting on a promise nobody resolves.
     this.#salts.settleSaltPending(agentName, sessionId, "closed");
-    // DOD-M15-SALTSPLIT-1 HIGH-2: goes with its mirror. The session is being torn down, so there is
-    // no discard decision left for it to protect.
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's

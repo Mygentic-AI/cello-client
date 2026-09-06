@@ -38,8 +38,10 @@ export interface HeldContentContext {
   requireAgentId(agentName: string): string;
   /**
    * ⚠️ THE HELD MAP ITSELF, shared by reference rather than owned here — `ingestReceivedContent`,
-   * `placeOwnLeaf` and `sealReadiness` all read it and all stayed behind. Splitting the map would
-   * have meant two sources of truth for "what are we holding", which is worse than sharing one.
+   * `placeOwnLeaf`, `sealReadiness` and `getUndeliverableSeqs` all read it and all stayed behind.
+   * Splitting the map would have meant two sources of truth for "what are we holding", which is
+   * worse than sharing one. It is only ever ASSIGNED once, at construction, so there is one Map
+   * object and no two-writer divergence.
    */
   readonly heldContent: Map<string, Map<number, HeldEntry>>;
   readonly witnessedSeq: Map<string, Map<string, number>>;

@@ -366,15 +366,21 @@ export class SessionLiveness {
   }
 
   /**
-   * Drop the liveness verdict and any impairment for a torn-down session.
+   * Drop the liveness verdict for a torn-down session.
    *
    * The direct-path liveness flag goes because the seal gate has already read its verdict, so a
    * destroyed or retired session must not retain a stale alive/gone state that a later read could
    * mistake for a live one.
+   *
+   * ⚠️ **`#impairmentCause` IS DELIBERATELY LEFT ALONE — clearing it here loses an operator notice.**
+   * It was added for symmetry and reverted. `getSessionImpairment` gates on liveness, so the cause
+   * looks unreachable — but `noteImpairmentRetention` reads it UNGATED, and on the path where
+   * `markSessionImpaired` declines because liveness is already `gone`, the retained cause is what
+   * produces the `outbound_message_lost` notice: *"your message is gone, send it again."* Clearing
+   * it here means the operator is told nothing instead. The cause is cleared where it should be,
+   * in `clearSessionImpairment`.
    */
   evictSession(agentName: string, sessionId: string): void {
-    const key = this.#ctx.sessionKey(agentName, sessionId);
-    this.#sessionLiveness.delete(key);
-    this.#impairmentCause.delete(key);
+    this.#sessionLiveness.delete(this.#ctx.sessionKey(agentName, sessionId));
   }
 }
