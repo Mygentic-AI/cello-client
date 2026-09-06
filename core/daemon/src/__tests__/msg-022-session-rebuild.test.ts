@@ -342,7 +342,7 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // `#\w+\.` prefix also matches `this.#logger.debug(`, which reports `debug` as an
         // establishment step — a false positive that makes this guard noisy and then ignored.
         //
-        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 16 session
+        // ⚠️ THE COST OF NAMING THEM IS THAT AN UNNAMED ONE IS INVISIBLE. All 17 session
         // collaborators are here. `#securityGateway` and `#factory` are deliberately NOT — neither
         // is reached from establishment today. If a screening or node-building step ever routes
         // through one, ADD IT HERE FIRST: the guard will not report a step it cannot see, which is
@@ -363,7 +363,14 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
         // next, and establishment routes through no seal step today. Adding the prefix the moment
         // the collaborator exists is the discipline this comment asks for — waiting until a step
         // actually routes through it means waiting until the guard has already stopped seeing one.
-        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
+        //
+        // `#relay` proves the point a THIRD time, and this one DID cost coverage. Establishment's
+        // `#connectSessionRelay` and revival's `#reconnectRevivedSessionRelay` both moved onto it,
+        // so BOTH sides lost the step at once — and losing it symmetrically is worse than losing it
+        // on one side, because parity still held and the scan stayed green while no longer checking
+        // the single most important step it exists to check: that a revived session reconnects its
+        // relay witness rather than merely filing a handler.
+        /this\.(?:#(?:receivers|records|queries|notices|salts|park|held|liveness|ephemerals|refusals|authorship|witness|leafRecords|contentIn|contentOut|seal|relay)\.)?(#?[A-Za-z][A-Za-z0-9_]*)\(/g,
       )].map((m) => `#${m[1]!.replace(/^#/, "")}`),
     );
 
@@ -406,14 +413,18 @@ describe("DOD-M12B-SESSION-SEED-1: an interrupted session can be revived on its 
     // so it logged "live inbound path back" over a client whose stream was null and delivery fell
     // straight back to the five-minute mailbox poll.
     const { readFileSync } = await import("node:fs");
-    const code = readFileSync(join(import.meta.dirname, "..", "session-node-manager.ts"), "utf-8")
+    // POINTED AT THE RELAY FILE. `#reconnectRevivedSessionRelay` moved there when the relay path
+    // left the manager, and it is PUBLIC on that class — the manager calls it. This test went red
+    // on its own "method not found" precondition, which is the design working; repointing it is the
+    // whole change.
+    const code = readFileSync(join(import.meta.dirname, "..", "session-relay.ts"), "utf-8")
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     // BOUNDED BY THE NEXT METHOD. The first version used `indexOf("\n  }\n")`, which does not match
     // this file's formatting — it returned -1, so `slice(a, -1)` scanned almost the whole file and
-    // found `client.connect(` in `#connectSessionRelay`. The test passed with the call reverted,
+    // found `client.connect(` in `connectSessionRelay`. The test passed with the call reverted,
     // which is the same hollowness it was written to fix.
-    const a = code.indexOf("async #reconnectRevivedSessionRelay(");
-    const b = code.indexOf("async reviveSessionNode(", a);
+    const a = code.indexOf("async reconnectRevivedSessionRelay(");
+    const b = code.indexOf("getSessionRelayForTest(", a);
     expect(a, "method not found").toBeGreaterThan(-1);
     expect(b, "region end not found").toBeGreaterThan(a);
     const body = code.slice(a, b);
