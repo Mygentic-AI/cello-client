@@ -3,8 +3,12 @@
  *
  * Split out of `session-node-manager.ts` by 036-GODFILE. This module is DECLARATIONS ONLY — the
  * interfaces the manager passes around, the bounds it enforces, the operator-facing reason tables,
- * and four pure helpers. No session state and no behaviour live here, which is what makes it safe
- * to import from anywhere.
+ * and seven small helpers. No session state and no module-level mutable state lives here, which is
+ * what makes it safe to import from anywhere.
+ *
+ * ⚠️ NOT ALL SEVEN ARE PURE, so do not treat them as constants: `capStaleBefore` reads
+ * `Date.now()`, and `heldRelayIdsOf` reads live libp2p node state. Both give a different answer at
+ * a different moment, which matters if you are tempted to hoist a call out of a loop.
  *
  * Everything is moved verbatim, comments included. The prose is the asset: much of it records why a
  * bound has the value it has, or a defect that came back once already.
@@ -908,7 +912,11 @@ export const AUTHORSHIP_ACK_HASH_UNKNOWN = "ack_hash_unknown_content";
 /**
  * The set that routes an `unusable` reason to the acknowledgement wording rather than the generic
  * one. A SET, not a string prefix test: a name-shaped check would silently adopt any future reason
- * someone happens to call `ack_*`, and give it a sentence written for these three.
+ * someone happens to call `ack_*`, and give it a sentence written for the two that are in it.
+ *
+ * (The count in this sentence has been wrong twice — it said "four" when the set held three, and
+ * the deletion of `ack_hash_absent` decremented the wrong number rather than recounting. It is a
+ * count of the SET below, so read that rather than trusting this.)
  */
 export type AckHashReason =
   typeof AUTHORSHIP_ACK_HASH_MISMATCH | typeof AUTHORSHIP_ACK_HASH_UNKNOWN;
@@ -1053,11 +1061,12 @@ export const SELF_CHAIN_MEMORY = 256;
  * disagreeing about what "unread" means — the gate deciding one thing while the inbox shows
  * another is precisely the bug this shape prevents. Interpolated SQL only (no user input).
  *
- * ⚠️ IT LIVES HERE, NOT ON A CLASS, BECAUSE 036-GODFILE SPLIT ITS TWO READERS APART. The unread
- * counts moved to `session-records.ts` while other consumers stayed in `session-node-manager.ts`.
- * A `static #private` could not be shared across that boundary, and the obvious workaround —
- * copying the string into the new file — is exactly the drift the comment above forbids. One
- * exported constant, two importers, still one definition.
+ * ⚠️ IT LIVES HERE, NOT ON A CLASS, BECAUSE 036-GODFILE MOVED ITS READERS OUT. All three unread
+ * queries went to `session-records.ts`, so today there is exactly ONE importer. It is exported
+ * rather than left a `static #private` because a `#private` cannot cross a file boundary at all —
+ * so the moment a second reader appears in another module, the only way to give it the value would
+ * be to copy the string, which is precisely the drift the paragraph above forbids. Exported now so
+ * that nobody is ever tempted.
  */
 export const UNREAD_RECEIVED_WHERE = `
            t.direction = 'received'

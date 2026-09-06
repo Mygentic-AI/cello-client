@@ -9,10 +9,16 @@
  * Moved verbatim, comments included. Much of the prose here records a defect that came back once
  * already, and several of the bounds exist because the map they guard is fed by a remote party.
  *
- * ⚠️ THIS CLASS OWNS THE FIVE MAPS IT MAINTAINS, which is what made it a seam. Each is fed by an
- * inbound peer and each is bounded for that reason. They used to be cleared field-by-field from the
- * manager's cache eviction; that is now one `evictSession` call, which is the point — a caller that
- * had to know five field names in order to forget a session knew too much.
+ * ⚠️ THIS CLASS OWNS THE FIVE PER-SESSION CONTAINERS IT MAINTAINS, which is what made it a seam.
+ * THREE of them are capped per session because a remote peer feeds them (`#terminallyRefused`,
+ * `#unreadableAlgSeen`, `#refusedOnDirectPath`); the other two — `#terminalRefusalsLoaded`, a SET
+ * rather than a map, and `#terminalRefusalsReadFailedAt` — carry no cap and grow one entry per
+ * session, so `evictSession` is the only thing that releases them. Said precisely because "each is
+ * bounded" reads as a safety property and only three of the five have it.
+ *
+ * They used to be cleared field-by-field from the manager's cache eviction; that is now one
+ * `evictSession` call, which is the point — a caller that had to know five field names in order to
+ * forget a session knew too much.
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";

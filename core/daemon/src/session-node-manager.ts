@@ -1427,6 +1427,17 @@ export class SessionNodeManager {
     this.#factory = opts.factory;
     this.#logger = opts.logger;
 
+    // ⚠️ BUILT FIRST, AND THE ORDER IS LOAD-BEARING: `#authorship` and `#refusals` close over
+    // `this.#records`. Nothing invokes them during construction today (every context member is a
+    // lazy arrow), but tsc caught this exact class once on `#logger`, and the next line added to
+    // this constructor is the one that would pay for it.
+    this.#records = new SessionRecords({
+      logger: this.#logger,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      witnessUnreadable: this.#witnessUnreadable,
+    });
     this.#authorship = new AuthorshipVerifier({
       logger: this.#logger,
       sessionKey: (a, sid) => this.#k(a, sid),
@@ -1454,14 +1465,6 @@ export class SessionNodeManager {
       mailboxRouteAvailable: (a) => this.#mailboxRouteAvailable(a),
       receivedBytesTotal: (a, sid) => this.#getReceivedBytesTotal(a, sid),
       verifyAuthorshipClaim: (a, sid, s1, sig, h) => this.#authorship.verifyAuthorshipClaim(a, sid, s1, sig, h),
-    });
-
-    this.#records = new SessionRecords({
-      logger: this.#logger,
-      db: () => this.#db,
-      sessionKey: (a, sid) => this.#k(a, sid),
-      requireAgentId: (a) => this.#requireAgentId(a),
-      witnessUnreadable: this.#witnessUnreadable,
     });
 
     this.#park = new ParkRecovery({
@@ -9493,16 +9496,10 @@ export class SessionNodeManager {
     this.#scheduleLeafFetchIfUnresolved(agentName, sessionId, contentHashHex);
   }
 
-  /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: this content is here — no fetch is owed for it, and any
-   *  pending one is cancelled. Called wherever content actually lands. */
   /**
-   * Cancel a pending leaf fetch for one piece of content.
-   *
-   * 036-GODFILE Parts 3+4: `#markContentTerminallyRefused` moved into `inbound-refusals.ts`, and it
-   * cancelled a timer out of this map. The TIMERS stay here — they are the manager's lifecycle, and
-   * `#markContentResolved` and `#scheduleLeafFetchIfUnresolved` are the other two users — so the
-   * moved code asks for a cancellation instead of reaching into the map. Same three lines, one
-   * caller further away.
+   * Cancel a pending leaf fetch for one piece of content. The TIMERS stay the manager's — it has
+   * three users and only one of them moved — so `#markContentTerminallyRefused`, now in
+   * `inbound-refusals.ts`, asks for the cancellation instead of reaching into the map.
    */
   #cancelLeafFetch(key: string, contentHashHex: string): void {
     const timerKey = `${key}::${contentHashHex}`;
@@ -9513,6 +9510,8 @@ export class SessionNodeManager {
     }
   }
 
+  /** DOD-M12B-LEAF-TRIGGERS-FETCH-1: this content is here — no fetch is owed for it, and any
+   *  pending one is cancelled. Called wherever content actually lands. */
   #markContentResolved(agentName: string, sessionId: string, contentHashHex: string): void {
     const key = this.#k(agentName, sessionId);
     let set = this.#resolvedContent.get(key);
@@ -9673,7 +9672,7 @@ export class SessionNodeManager {
     // only where the parting is PROVEN — an ack came back behind our frontier — never where it is
     // merely suspected, because a gate that refuses a healthy session forever is worse than the bug
     // it guards: force-abandon, with no receipt, becomes the only exit.
-    const diverged = this.#records.hasDivergedMemo(agentName, sessionId);
+    const diverged = this.#records.isSessionDiverged(agentName, sessionId);
     return {
       ready: missingLeaves === 0 && heldCount === 0 && !diverged,
       treeSize, highWaterSeq, heldCount, missingLeaves,

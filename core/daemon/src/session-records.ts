@@ -9,7 +9,8 @@
  *
  * ⚠️ EVERY QUERY IN HERE JOINS ON `agent_id`, NEVER `agent_name`. The name is a display label — it
  * is mutable and reusable after retirement — so joining on it silently attaches one agent's rows to
- * another's. `#requireAgentId` is the only way in.
+ * another's. `agent_name` appears only as a PROJECTION: `loadDivergedFromDb` is agent-unscoped and
+ * selects it to rebuild an in-memory key, which is a read of the label rather than a match on it.
  */
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
@@ -814,11 +815,6 @@ export class SessionRecords {
   }
   /** Whether this session has provably parted from the relay's ordering. */
   isSessionDiverged(agentName: string, sessionId: string): boolean {
-    return this.#diverged.has(this.#ctx.sessionKey(agentName, sessionId));
-  }
-
-  /** Is this session's local chain known to have diverged from the relay's? In-memory memo only. */
-  hasDivergedMemo(agentName: string, sessionId: string): boolean {
     return this.#diverged.has(this.#ctx.sessionKey(agentName, sessionId));
   }
 
