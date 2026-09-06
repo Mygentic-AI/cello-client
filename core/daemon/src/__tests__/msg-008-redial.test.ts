@@ -31,6 +31,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -111,6 +112,12 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     await B.manager.ensureStandingReceiverForAgent("bob");
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
+    // Both sides agree the session's starting point before either builds its node — see
+    // `helpers/session-genesis.ts` for why the order and the sharing are both load-bearing.
+    agreeSessionGenesis(SID, [
+      { mgr: A.manager, agentName: "alice" },
+      { mgr: B.manager, agentName: "bob" },
+    ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
@@ -181,6 +188,11 @@ describe("DOD-M12B-REDIAL-1: a lost connection is re-dialled on demand", () => {
     // The responder's half: it accepted a session it never dialled, so it holds no address for the
     // counterparty. That is a real limitation of this fix and the operator should be able to see it
     // rather than infer it from a message that parks.
+    // A starting point for this solo session too. It has no counterparty and nobody receives
+    // from it, but a send with nothing to chain to is REFUSED before it reaches the transport —
+    // and the transport is what this test is about. Without it the send would fail one step
+    // earlier, for a different reason, and never reach the re-dial branch below.
+    agreeSessionGenesis(SID, [{ mgr: A.manager, agentName: "alice" }]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn", "corr-A");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key. STILL
     // SEEDED HERE, unlike the connected cases above: this session has no counterparty and never

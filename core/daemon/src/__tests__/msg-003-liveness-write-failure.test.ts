@@ -31,6 +31,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { SessionNodeManager } from "../session-node-manager.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import { seedAgentKeys, wireAgentKeyProviders } from "./helpers/seed-agents.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger } from "../types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 
@@ -115,6 +116,12 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     await B.manager.ensureStandingReceiverForAgent("bob");
     const bInfo = B.manager.getStandingReceiverInfo("bob");
     expect(bInfo).not.toBeNull();
+    // Both sides agree the session's starting point before either builds its node — see
+    // `helpers/session-genesis.ts` for why the order and the sharing are both load-bearing.
+    agreeSessionGenesis(SID, [
+      { mgr: A.manager, agentName: "alice" },
+      { mgr: B.manager, agentName: "bob" },
+    ]);
     const created = await A.manager.createSessionNode(SID, "alice", B_PUB, bInfo!.peerId, "corr-A");
     expect(created.ok).toBe(true);
     if (!created.ok) throw new Error("createSessionNode failed");
@@ -179,6 +186,11 @@ describe("DOD-M12B-ACK-1: liveness stops claiming `alive` when writes fail", () 
     A.manager.markSessionLivenessForTest("alice", SID, "alive");
     // Force the true starting state by using a session the connect event never labelled.
     const UNSEEN = "66".repeat(16);
+    // A starting point for this one too. It is a solo session — nobody receives from it — but a
+    // send with nothing to chain to is REFUSED before it can reach the transport, and this test's
+    // subject is what the FAILED TRANSPORT does to liveness. Without it the send would fail one
+    // step earlier, for a different reason, and the assertion below would pass by accident.
+    agreeSessionGenesis(UNSEEN, [{ mgr: A.manager, agentName: "alice" }]);
     // A counterparty key nobody will ever check: this session has no peer, never connects, and the
     // assertion is about LIVENESS. `B_PUB` is now seeded per test inside `liveSession`, and reaching
     // for it here would tie an unrelated test to that session's identity.
