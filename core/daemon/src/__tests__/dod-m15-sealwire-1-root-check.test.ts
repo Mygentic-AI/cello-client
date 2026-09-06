@@ -29,7 +29,7 @@
 import { describe, it, expect } from "vitest";
 import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { buildMerkleTree, merkleRoot } from "@cello-protocol/crypto";
-import { SessionNodeManager } from "../session-node-manager.js";
+import { SessionSeal } from "../session-seal.js";
 
 const AGENT_PUB = "aa".repeat(32);
 const SESSION = "bb".repeat(16);
@@ -110,14 +110,23 @@ function completeHashes(msgHashes: Uint8Array[], ownCtrl: Uint8Array, peerCtrl: 
   return [...msgHashes, ownCtrl, peerCtrl];
 }
 
-function managerWith(rows: unknown[]): SessionNodeManager {
-  const mgr = Object.create(SessionNodeManager.prototype) as SessionNodeManager;
-  (mgr as unknown as { getSealCarry: () => unknown[] }).getSealCarry = () => rows;
-  return mgr;
+/**
+ * ⚠️ BUILT ON `SessionSeal`, not on the manager — the class that OWNS `verifyCertifiedRoot`.
+ *
+ * It used to say `SessionNodeManager.prototype`, and that worked only while the method lived
+ * there. The manager now forwards to `this.#seal`, and a bare prototype object has no `#seal`, so
+ * every case here died on a `TypeError` about a private member. Nothing about what is being tested
+ * changed: the same method, given the same stubbed carry, is asked the same questions and the
+ * assertions below are untouched. Only the class it is reached on moved.
+ */
+function managerWith(rows: unknown[]): SessionSeal {
+  const seal = Object.create(SessionSeal.prototype) as SessionSeal;
+  (seal as unknown as { getSealCarry: () => unknown[] }).getSealCarry = () => rows;
+  return seal;
 }
 
 /** A complete bilateral carry plus the hash list it corresponds to. */
-function managerWithCarry(hashes: Uint8Array[]): { mgr: SessionNodeManager; hashes: Uint8Array[] } {
+function managerWithCarry(hashes: Uint8Array[]): { mgr: SessionSeal; hashes: Uint8Array[] } {
   const msgs = hashes.slice(0, Math.max(0, hashes.length - 2));
   const own = hashes[hashes.length - 2] ?? contentHash(0xc1);
   const peer = hashes[hashes.length - 1] ?? contentHash(0xc2);

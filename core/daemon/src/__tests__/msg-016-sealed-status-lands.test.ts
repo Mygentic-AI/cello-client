@@ -179,8 +179,12 @@ describe("every seal-completion path flips the status itself", () => {
    * that does not exist and failed on a file that could not possibly be wrong. A declaration is
    * not a call, and the two filters agreeing is what keeps this scan pointed at real sites.
    */
+  const isComment = (line: string): boolean => {
+    const t = line.trim();
+    return t.startsWith("//") || t.startsWith("*") || t.startsWith("/*");
+  };
   const isSealTeardownCall = (line: string): boolean =>
-    line.includes("destroySessionNode(") && line.includes('"sealed"');
+    !isComment(line) && line.includes("destroySessionNode(") && line.includes('"sealed"');
   const FILES = readdirSync(SRC_DIR)
     .filter((f) => f.endsWith(".ts"))
     .filter((f) => !(f in EXEMPT))
