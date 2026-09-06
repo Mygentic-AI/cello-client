@@ -27,6 +27,7 @@ import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { TIER } from "../contacts-tier-migration.js";
 import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -323,6 +324,8 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // An inbound-originated active session whose counterparty is NOT yet a contact (the CC-1 world:
     // accepting the connection did not add them). A brand-new empty session → first send needs no
     // read-before-write catch-up (M8C-CURSOR-1 C3).
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID_HEX, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID_HEX, "alice", strangerPubkey, "stranger-peer", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
@@ -379,15 +382,13 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const snm = h.getSessionNodeManager();
     const SID_UNKNOWN = "11".repeat(32);
     const SID_KNOWN = "22".repeat(32);
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x9c));
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID_UNKNOWN, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID_UNKNOWN, "alice", "strangerpubkeyhex", "peer-1", "corr-1");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_UNKNOWN, new Uint8Array(32).fill(0x7e));
-    // The session's starting point, seeded BEFORE creation: `createSessionNode` refuses a
-    // session it cannot anchor, and a fixture builds one below the paths that record it.
-    snm.setSessionGenesisForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x9c));
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID_KNOWN, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID_KNOWN, "alice", "knownpubkeyhex", "peer-2", "corr-2");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_KNOWN, new Uint8Array(32).fill(0x7e));

@@ -48,6 +48,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
 import { startDaemon } from "../daemon.js";
 import { connectToDaemon } from "../ipc-client.js";
+import { agreeSessionGenesis } from "./helpers/session-genesis.js";
 import type { Logger, DaemonConfig } from "../types.js";
 import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-manager.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
@@ -282,6 +283,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
     await new Promise((r) => setTimeout(r, 50)); // let signaling connect
     const snm = h.getSessionNodeManager();
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -413,6 +416,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
     await new Promise((r) => setTimeout(r, 50)); // let signaling connect
     const snm = h.getSessionNodeManager();
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -585,6 +590,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex, 120) });
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
@@ -621,6 +628,8 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node, signalingConnect: makeRespondingSignaling(captured, cpKp, cpPubkeyHex) });
     await new Promise((r) => setTimeout(r, 50));
     const snm = h.getSessionNodeManager();
+    // The session's starting point, seeded BEFORE the node exists — see `helpers/session-genesis.ts`.
+    agreeSessionGenesis(SID, [{ mgr: snm, agentName: "alice" }]);
     await snm.createSessionNode(SID, "alice", cpPubkeyHex, "bob-peer-id", "corr");
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));

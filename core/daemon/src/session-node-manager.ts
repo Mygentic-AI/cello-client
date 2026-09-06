@@ -13008,6 +13008,23 @@ export class SessionNodeManager {
     if (!entry) throw new Error(`patchRelayClientForTest: no active node for (${agentName}, ${sessionId})`);
     entry.relayClient = relayClient;
     entry.relaySessionIdBytes = relaySessionIdBytes;
+    /**
+     * ⚠️ REGISTER THE SESSION TOO — the seam must leave the state production leaves.
+     *
+     * A relay client that has never been told about a session holds no starting point for it, and
+     * since `DOD-M15-SELFCHAIN-1` every submit on such a session is refused: there is nothing for
+     * the chain links to anchor to. Production always registers, because attaching a relay is what
+     * registration IS. A seam that attached the client and skipped the registration left fixtures
+     * exercising a refusal path, and the failure surfaced as "the seal never happened" in a test
+     * about away-mode replies.
+     */
+    relayClient.registerSession(
+      Buffer.from(relaySessionIdBytes).toString("hex"),
+      entry.node,
+      undefined,
+      entry.relayAssignment,
+      this.#sessionGenesisPrevRoot(agentName, sessionId),
+    );
   }
 
   pushReceivedContentForTest(agentName: string, sessionId: string, seq: number, content: string, senderPubkey: string): void {

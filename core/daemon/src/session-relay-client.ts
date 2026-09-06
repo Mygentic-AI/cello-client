@@ -642,9 +642,13 @@ export class AgentRelayClient {
      * Supplied by the caller because `session-node-manager` is where the session record lives. When
      * it is absent an ASSIGNMENT can still produce it (both participant keys and the session
      * timestamp are on the carry), and that covers re-registration of a session whose row predates
-     * the column. When NEITHER is available the session has no seed, and its first submit claims
-     * position 0 with no hash — which asserts nothing about content and is therefore honest, rather
-     * than a claim about a position it cannot back.
+     * the column.
+     *
+     * ⚠️ WHEN NEITHER IS AVAILABLE THE SESSION CANNOT SUBMIT AT ALL — and this sentence used to say
+     * the opposite, that the first submit would claim position 0 with no hash. That shape no longer
+     * exists: `DOD-M15-SELFCHAIN-1` made both chain links required, so a session with no starting
+     * point has nothing for them to anchor to and every submit on it is refused by name. Registering
+     * without a seed is therefore a real fault, not a degraded mode.
      */
     genesisPrevRoot?: Uint8Array,
   ): void {

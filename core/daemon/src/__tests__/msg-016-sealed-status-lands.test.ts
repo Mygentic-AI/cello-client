@@ -28,7 +28,9 @@ import { describe, it, expect, afterEach } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { encode } from "cbor-x";
 import { join } from "node:path";
+import { encodeStructure1 } from "@cello-protocol/protocol-types";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
+import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 
 const SID = "9a".repeat(32);
 const PEER = "9b".repeat(32);
@@ -245,14 +247,24 @@ describe("DOD-M12B-INTERRUPTED-ESCALATE-1: a ctrl leaf posted before the restart
     const own = await ownPubkeyHex(fx);
     // The leaf store is created lazily; this call is what makes its table exist.
     fx.snm.getSealCarry(own, SID);
-    // Structure 1 is [version, content_hash, sender_pubkey, session_id, last_seen_seq, timestamp] —
-    // the content hash at index 1 is what the root is rebuilt from, and it cannot be recomputed
-    // because the seal payload embeds a close_timestamp.
+    // The content hash at index 1 is what the root is rebuilt from, and it cannot be recomputed
+    // because the seal payload embeds a close_timestamp. Built with the REAL encoder rather than a
+    // hand-rolled array: this fixture kept emitting the old six-field layout after both chain links
+    // became required, so the leaf it planted no longer decoded and the recovery correctly reported
+    // "I cannot read this" — a test about finding a leaf, failing because it wrote an unreadable one.
     const contentHash = new Uint8Array(32).fill(0xa7);
     fx.snm.getDb().prepare(
       `INSERT INTO session_seal_leaves (agent_pubkey, session_id, sequence_number, leaf_kind, sender_pubkey_hex, structure2_cbor, structure1_cbor, stored_at)
        VALUES (?, ?, 7, 2, ?, ?, ?, 0)`,
-    ).run(own, SID, own, Buffer.from(encode([7])), Buffer.from(encode([1, contentHash, new Uint8Array(32), new Uint8Array(16), 0, 0])));
+    ).run(own, SID, own, Buffer.from(encode([7])), Buffer.from(encodeStructure1({
+      contentHash,
+      senderPubkey: new Uint8Array(32),
+      sessionId: new Uint8Array(16),
+      lastSeenSeq: 0,
+      timestamp: 0,
+      lastSeenHash: TEST_SESSION_GENESIS,
+      prevOwnHash: TEST_SESSION_GENESIS,
+    })));
 
     const got = fx.snm.recoverOwnSealCtrlLeafForTest("alice", SID);
     expect(got, "a ctrl leaf we posted before the restart must be FOUND, not reported absent").not.toBe("none");
