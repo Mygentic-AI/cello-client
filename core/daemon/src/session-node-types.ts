@@ -1045,3 +1045,23 @@ export function carryContentHashInputs(carry: readonly SealCarryLeaf[]): LeafInp
  */
 export const SELF_CHAIN_MEMORY = 256;
 
+
+/**
+ * The ONE definition of "unread" in this daemon: a RECEIVED transcript row whose sequence is
+ * beyond the agent's persisted read watermark. A constant, not a copy-pasted string, so the
+ * INBOX unread count and the DOD-CURSOR-DURABLE-1 read-before-write gate can never drift into
+ * disagreeing about what "unread" means — the gate deciding one thing while the inbox shows
+ * another is precisely the bug this shape prevents. Interpolated SQL only (no user input).
+ *
+ * ⚠️ IT LIVES HERE, NOT ON A CLASS, BECAUSE 036-GODFILE SPLIT ITS TWO READERS APART. The unread
+ * counts moved to `session-records.ts` while other consumers stayed in `session-node-manager.ts`.
+ * A `static #private` could not be shared across that boundary, and the obvious workaround —
+ * copying the string into the new file — is exactly the drift the comment above forbids. One
+ * exported constant, two importers, still one definition.
+ */
+export const UNREAD_RECEIVED_WHERE = `
+           t.direction = 'received'
+           AND t.sequence > COALESCE(w.last_delivered_seq, -1)`;
+
+export const REFUSED_SESSIONS_CAP = 200;
+export const TERMINAL_STATUSES = `('sealed','abandoned','seal_interrupted_pending','interrupted')`;
