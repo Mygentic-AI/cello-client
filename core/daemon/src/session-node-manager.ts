@@ -9920,15 +9920,14 @@ export class SessionNodeManager {
    * the sender committed to these bytes. That proof arrives separately and is checked BEFORE any
    * caller reaches this method.
    *
-   * ⚠️ **THIS PARAGRAPH USED TO SAY THAT PROOF DID NOT EXIST, AND THAT SENTENCE IS WHY IT IS
-   * REWRITTEN RATHER THAN DELETED.** It read: *"Full tamper-evidence (EARS behavior #2) requires
-   * cross-checking against the K_local-signed content_hash leaf the sender submits to the RELAY on a
-   * separate channel; that relay hash-submit path is MSG-001's scope and **does not exist yet**.
-   * Until MSG-001 lands, a malicious sender that sends matching (content, hash) in one frame is not
-   * detected here."* It was true when it was written. It stopped being true, and it names the exact
-   * bypass — in a PUBLIC repository, where a reader collecting every "not enforced" sentence is
-   * handed a hole that was already closed. The old wording is kept above because the gap was real
-   * and the record of it is the thing worth not losing.
+   * ⚠️ **THE RULE THIS PARAGRAPH EXISTS TO ENFORCE: a comment that says a protection is missing
+   * must be re-read whenever the protection lands, because in a PUBLIC repository it keeps handing
+   * a reader a hole that is already closed.** This one said: *"Full tamper-evidence (EARS behavior
+   * #2) requires cross-checking against the K_local-signed content_hash leaf the sender submits to
+   * the RELAY on a separate channel; that relay hash-submit path is MSG-001's scope and **does not
+   * exist yet**. Until MSG-001 lands, a malicious sender that sends matching (content, hash) in one
+   * frame is not detected here — only the relay-relayed signed leaf closes that gap."* True when
+   * written; the quote stays because its last clause predicts the wrong closure, as below.
    *
    * What closes it today — and note it is NOT only the route the old sentence predicted:
    *   - The relay hash-submit path EXISTS (`relay-node.ts` `#processHashSubmit`), so the separate
@@ -9941,9 +9940,10 @@ export class SessionNodeManager {
    *     it once was. That verdict reaches this method as `verifiedAuthorship`.
    *   - The PARK-RECOVERY caller deliberately passes no `verifiedAuthorship`, and is not an
    *     exception to the above: recovered mail is authenticated by its park ENVELOPE's own
-   *     signature (`authenticateParkedEntry`) before it is unsealed. Two routes, both cryptographic,
-   *     and the transcript row records which one attested the message rather than implying a proof
-   *     it does not have.
+   *     signature (`authenticateParkedEntry`) before any of it is ingested — note the order is
+   *     unseal THEN authenticate, so the envelope signature gates the append, not the decrypt.
+   *     Two routes, both cryptographic, and the transcript row records which one attested the
+   *     message rather than implying a proof it does not have.
    *
    * @returns the appended leaf index (as sequenceNumber) on success.
    */

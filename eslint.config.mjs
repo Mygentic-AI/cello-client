@@ -17,18 +17,10 @@ export default [
     rules: {
       ...tsPlugin.configs.recommended.rules,
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
-      // CELLO uses SQLCipher for local storage. Period. `node:sqlite` writes PLAINTEXT to disk and
-      // is an experimental Node builtin, so importing it (a) silently drops encryption-at-rest and
-      // (b) makes Node print `ExperimentalWarning: SQLite` on every command, on every Node < 24.
-      //
-      // It keeps getting added by AI coders reaching for a builtin instead of the project's DB
-      // layer. This rule is the stop. Use `openEncryptedDatabase` / `openEncryptedDatabaseAtPath`
-      // from `core/daemon/src/sqlcipher-db.ts` — SQLCipher can also open a plaintext file, so there
-      // is no legacy-read case that needs `node:sqlite` either.
       // ─── THE RATCHET (036-GODFILE) — a file this big stops being reviewable ────────────────────
       //
       // WHY A CEILING AT ALL, because the argument is a measurement and not a preference. In
-      // mid-July nine commits took `daemon.ts` apart, from 6,279 lines to 2,081 on 14 July. It is
+      // mid-July nine commits took `daemon.ts` apart, from ~6.5k lines to 2,081 on 14 July. It is
       // 6,080 today — fully regrown in under two months, because nothing stood in the way. A split
       // with no ratchet behind it buys about six weeks. This rule is what stands in the way.
       //
@@ -47,6 +39,14 @@ export default [
       // measure. If a file is genuinely large because of load-bearing prose, split it into modules
       // that each carry their own prose; that is the outcome this rule is for.
       "max-lines": ["error", { max: 3000, skipBlankLines: false, skipComments: false }],
+      // CELLO uses SQLCipher for local storage. Period. `node:sqlite` writes PLAINTEXT to disk and
+      // is an experimental Node builtin, so importing it (a) silently drops encryption-at-rest and
+      // (b) makes Node print `ExperimentalWarning: SQLite` on every command, on every Node < 24.
+      //
+      // It keeps getting added by AI coders reaching for a builtin instead of the project's DB
+      // layer. This rule is the stop. Use `openEncryptedDatabase` / `openEncryptedDatabaseAtPath`
+      // from `core/daemon/src/sqlcipher-db.ts` — SQLCipher can also open a plaintext file, so there
+      // is no legacy-read case that needs `node:sqlite` either.
       "no-restricted-imports": ["error", {
         paths: [{
           name: "node:sqlite",
@@ -114,8 +114,10 @@ export default [
     //   - daemon.ts — OWED, and explicitly not 036-GODFILE's work. It needs the same treatment for
     //       the same reason: it is the file that already proved a split without a ratchet does not
     //       hold. It is grandfathered here only so this rule can land today instead of waiting on a
-    //       second refactor. (`directory-node.ts`, 7,403 lines, is the third of these and lives in
-    //       the trustless-cello repo, outside this config's reach.)
+    //       second refactor. (`directory-node.ts`, ~7.4k lines, is the third of these and lives in
+    //       the trustless-cello repo, outside this config's reach — no gate here keeps a precise
+    //       count of it true, so it is deliberately given as a magnitude rather than a figure that
+    //       silently rots.)
     files: ["core/daemon/src/session-node-manager.ts"],
     rules: { "max-lines": ["error", { max: 20389, skipBlankLines: false, skipComments: false }] },
   },

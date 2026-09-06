@@ -46,6 +46,30 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
+      # 036-GODFILE — the ratchet's one bypass, closed.
+      #
+      # `max-lines` in eslint.config.mjs is what stops session-node-manager.ts regrowing after the
+      # split, and what stops daemon.ts's history (6.5k → 2,081 → 6,080 in two months) repeating.
+      # But ANY file can switch it off for itself with one line — `/* eslint-disable max-lines */`
+      # — and CI would stay green forever afterwards. Inline disables are already a live habit in
+      # this tree, so this is not hypothetical.
+      #
+      # `noInlineConfig: true` would close it too, and is rejected: it kills every legitimate
+      # `eslint-disable-next-line` in the repo to stop one abuse. This grep closes only the abuse,
+      # and it is greppable and visible — the same shape as the visible-allowlist pattern the
+      # ESLint config already uses, rather than a second hidden mechanism.
+      #
+      # Raising a grandfathered number in eslint.config.mjs is a reviewable diff; disabling the
+      # rule from inside the file it governs is not, which is the whole difference.
+      - name: Ratchet may not be disabled from inside a file
+        run: |
+          if grep -rn "eslint-disable.*max-lines" core/*/src; then
+            echo "::error::A file disables the max-lines ratchet inline. Split the file instead."
+            echo "If a ceiling is genuinely wrong, change it in eslint.config.mjs where it is reviewable."
+            exit 1
+          fi
+          echo "No inline max-lines disables."
+
       - name: Test
         run: pnpm run test
 
