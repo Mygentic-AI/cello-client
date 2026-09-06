@@ -21,22 +21,14 @@
 // `wireContentHash` is gone from this file on purpose: its ONE use was the receive-path cross-check,
 // which now goes through `contentHashFor` so the comparison runs under the algorithm the sender
 // named. A direct call here would be a hash computed without asking what the frame said (part B1).
-import { contentHashFor, resolveContentHashAlg, CONTENT_HASH_ALGS, type ContentHashAlg } from "./wire-content-hash.js";
+import { contentHashFor, resolveContentHashAlg, type ContentHashAlg } from "./wire-content-hash.js";
 import { CAPACITY_REASONS, type CapacityReason } from "./refusal-reasons.js";
-import {
-  onPeerSaltFrame,
-  ownSaltFrame,
-  SALT_ADOPTION_LABEL_MAX,
-  SALT_ADOPTION_LABELS,
-  SALT_FREEZE_GUIDANCE,
-  type SaltAgreementFrame,
-} from "./session-salt-agreement.js";
+import { ownSaltFrame, SALT_ADOPTION_LABEL_MAX, type SaltAgreementFrame } from "./session-salt-agreement.js";
 import {
   CONTENT_ENCRYPTION_REASONS,
   CONTENT_ENCRYPTION_GUIDANCE,
   CONTENT_ENCRYPTION_INBOUND_GUIDANCE,
   SESSION_CONTENT_ENCRYPTION_V1,
-  type ContentEncryptionReason,
 } from "./content-encryption-status.js";
 import {
   type DaemonDatabase,
@@ -46,12 +38,9 @@ import {
 } from "./sqlcipher-db.js";
 import { migrateToEncryptedIfNeeded } from "./identity-migration.js";
 import { ensureIdentitySchema } from "./db-identity-store.js";
-import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
-import { TIER, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
-import { normalizeContactPubkey, foldContactPubkeyCase } from "./contact-pubkey-case.js";
+import { TIER } from "./contacts-tier-migration.js";
+import { normalizeContactPubkey } from "./contact-pubkey-case.js";
 import { REFUSAL_KINDS, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
-import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
-import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { settableTierName, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
 import { publishableEndpoint, relayOnlyState } from "./relay-only.js";
 import { randomUUID, createHash, randomBytes } from "node:crypto";
@@ -63,13 +52,12 @@ import type { Stream } from "@libp2p/interface";
 import type { Logger, SessionRecord, SealReadinessView } from "./types.js";
 import { MAX_SESSION_NODES, STANDING_RECEIVER_AGENT_NAME } from "./types.js";
 import { SessionConnectionGater } from "./session-connection-gater.js";
-import { SessionTree, sessionTreeLeafKindFromDb, type WritableSessionTreeLeafKind } from "./session-tree.js";
+import { SessionTree, type WritableSessionTreeLeafKind } from "./session-tree.js";
 import { CELLO_CONTENT_PROTOCOL_ID, NodeAutoNatService, type CelloNode, type IAutoNatService } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import {
-  verify, buildMerkleTree, merkleRoot, generateSaltContribution, SESSION_SALT_BYTES,
-  generateSessionEphemeral, destroySessionEphemeral, deriveSessionSecrets, type SessionEphemeral,
-  signSessionEphemeral, verifySessionEphemeral, sealSessionContent, openSessionContent,
+  verify, buildMerkleTree, merkleRoot,
+  type SessionEphemeral, sealSessionContent, openSessionContent,
 } from "@cello-protocol/crypto";
 import { encodeSealPayload } from "@cello-protocol/protocol-types";
 // `PARK_ENVELOPE_REASONS` is deliberately NOT imported here. The reason codes are compared inside
@@ -87,7 +75,14 @@ import { AuthorshipVerifier } from "./authorship-verification.js";
 import { InboundRefusals } from "./inbound-refusals.js";
 import { SessionRecords } from "./session-records.js";
 import { ParkRecovery } from "./park-recovery.js";
-import { REFUSED_SESSIONS_CAP } from "./session-node-types.js";
+import { SessionSalts } from "./session-salts.js";
+import { ensureSessionSchema } from "./session-schema.js";
+import { SessionQueries } from "./session-queries.js";
+import { RefusalNotices } from "./refusal-notices.js";
+import { SessionEphemerals } from "./session-ephemerals.js";
+import { SessionLiveness } from "./session-liveness.js";
+import { WitnessAlerts } from "./witness-alerts.js";
+import { HeldContent } from "./held-content.js";
 import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { RelayReceiptStore, type RelayReceipt } from "./relay-receipt-store.js";
 import { SessionSealLeafStore, type SealCarryLeaf } from "./session-seal-leaf-store.js";
@@ -95,7 +90,6 @@ import { SessionOwnChainStore } from "./session-own-chain-store.js";
 import type { SealUpgradeReadiness } from "./seal-upgrade.js";
 import { certifiedLeafSetFrom } from "./sealed-leaf-set.js";
 import type { SealFrontierLeaf } from "./seal-frontier-verify.js";
-import { addColumnIfMissing } from "./column-birth.js";
 import { retentionSentence, type QuarantineFrameMeta } from "./quarantine-framing.js";
 import {
   GATEWAY_UNAVAILABLE,
@@ -117,16 +111,12 @@ import {
   type AbandonNoticeResult,
   type AckHashReason,
   type ActiveSessionEntry,
-  CAP_COUNTS,
-  CAP_COUNT_SQL,
   CIRCUIT_RELAY_ID,
   CONTENT_MAX_INBOUND_STREAMS,
   CONTENT_STREAM_LINGER_MS,
   type CreateSessionResult,
   type ISessionNodeFactory,
   LEAF_FETCH_GRACE_MS,
-  MAX_REFUSALS_PER_READ,
-  MAX_REFUSAL_READERS,
   type ParkedDrainReason,
   type QuarantinedRecord,
   RECEIVED_BUFFER_CAP,
@@ -139,9 +129,6 @@ import {
   type ReceivedContentEntry,
   type RefusalNotice,
   type RelayConnectParams,
-  SALT_AGREEMENT_WAIT_MS,
-  SESSION_KEY_ANNOUNCE_RETRIES,
-  SESSION_KEY_ANNOUNCE_RETRY_MS,
   SHUTDOWN_STEP_DEADLINE_MS,
   SR_RESERVATION_MAX_RETRIES,
   type SentAuthorship,
@@ -149,11 +136,7 @@ import {
   type SessionNodeConfig,
   type SessionRevivalIdentity,
   type TranscriptEntry,
-  UNSALTED_GUIDANCE,
-  UNSALTED_REASONS,
-  type UnsaltedReason,
   type WitnessAlertNotice,
-  capStaleBefore,
   carryContentHashInputs,
   heldRelayIdsOf,
   relayPeerIdOf,
@@ -264,7 +247,7 @@ export class SessionNodeManager {
       if (!entry.relayClient || !entry.relaySessionIdBytes) return { error: "relay_unavailable" };
       return { node: entry.node, relayClient: entry.relayClient, relaySessionIdBytes: entry.relaySessionIdBytes };
     }
-    const ep = this.getPersistedRelayEndpoint(agentName, sessionId);
+    const ep = this.#queries.getPersistedRelayEndpoint(agentName, sessionId);
     if (!ep) return { error: "no_persisted_relay_endpoint" };
     const node = this.getStandingReceiverNode(agentName);
     if (!node) return { error: "standing_receiver_unavailable" };
@@ -490,108 +473,21 @@ export class SessionNodeManager {
     });
   }
 
-  /**
-   * DOD-M15-CORROBORATE-1: witness alerts this agent's relays have reported, oldest first, capped.
-   *
-   * ⚠️ **IN MEMORY, AND A DAEMON RESTART LOSES THEM** — review F4. This comment used to say a relay
-   * that still holds the observation re-delivers it on the next connection. It does not:
-   * `drainWitnessAlerts` splices, so once an alert has been delivered the relay no longer holds it.
-   * Nothing here is a durable record of anything; the relay operator's own log is, and so is the
-   * signature on the alert, which the operator can keep. Said plainly rather than left as an implied
-   * guarantee.
-   *
-   * Nothing clears the list before that restart, and that is deliberate: an alert an operator can
-   * silence is one an attacker can wait out.
-   */
-  readonly #witnessAlerts = new Map<string, WitnessAlertNotice[]>();
-  /**
-   * ⚠️ **THE CAP KEEPS THE FIRST, NOT THE LAST** — review F1, and the direction is the whole point.
-   *
-   * The relay's own queue drops the NEWEST when full, precisely so a flood cannot push the first
-   * real observation out. This list did the opposite (`slice(-20)`), which handed the mute button
-   * straight back one layer up: at the relay's 120-submits-per-minute limit, about ten seconds of
-   * fabricated alerts evicted the genuine one before any operator read it. Repeats of one event also
-   * collapse — see the dedupe in `recordRelayWitnessAlert` — so a flood cannot even fill it.
-   */
-  static readonly #WITNESS_ALERT_CAP = 20;
+
+
   /**
    * Review F7: relays that sent a witness alert this build could not read or verify, per agent.
    * Peer id → cause + count. NO session and NO party: it reports that our witness layer is not
    * working, never anything about a participant.
    */
   readonly #witnessUnreadable = new Map<string, Map<string, { why: string; count: number }>>();
-  /**
-   * Agents whose alert list hit the cap — fallback-finder LOW 2. Without this the inbox renders a
-   * full list that looks complete, and "twenty alerts" is indistinguishable from "twenty of some
-   * larger number". A marker the operator can see costs one boolean.
-   */
-  readonly #witnessTruncated = new Set<string>();
 
-  /**
-   * Record what one relay says it saw on one of this agent's sessions, for the operator to read.
-   *
-   * ⚠️ **IT DOES NOT FREEZE THE SESSION, AND THAT IS THE DESIGN.** A client freezing on its OWN
-   * verification is safe: it limits only what that client trusts. Freezing on a REMOTE party's
-   * say-so hands any single relay the power to end any conversation it carries, and to write an
-   * accusatory record about a counterparty who did nothing. The identity freeze stays where it is —
-   * on this daemon's own check of an inbound frame — and this surfaces a second, independent
-   * observation next to it. One witness reports; it does not rule.
-   */
-  recordRelayWitnessAlert(agentName: string, alert: RelayWitnessAlert): void {
-    const list = this.#witnessAlerts.get(agentName) ?? [];
-    /**
-     * ONE ROW PER (WITNESS, SESSION) — review F1's second half. A relay reports every refused
-     * submission, and a determined submitter can produce a great many; twenty rows saying the same
-     * thing is not twenty facts, it is one fact and nineteen ways to push another one off the list.
-     * The repeat updates the count and the last-seen time and leaves the row where it is.
-     */
-    /**
-     * Keyed on the relay's PEER ID, not on `relayId` — fallback-finder LOW 1. `relayId` is absent
-     * for any relay that could not sign, so two DIFFERENT such relays reporting on one session
-     * collapsed into a single row and the operator read one witness where there were two. The peer
-     * id is the transport identity this client is actually talking to and is always known.
-     */
-    const key = `${alert.witnessPeerId}::${alert.sessionIdHex}`;
-    const existing = list.find((n) => n.key === key);
-    if (existing) {
-      existing.occurrences += 1;
-      existing.lastObservedAt = alert.observedAt;
-      // A later repeat that IS verifiable upgrades the row: the operator should end up holding the
-      // strongest form of the claim they were sent, never the weakest one that arrived first.
-      existing.alert = alert.verifiable ? alert : existing.alert;
-      // `firstObservedAt` is deliberately untouched — see its note on the type.
-    } else if (list.length >= SessionNodeManager.#WITNESS_ALERT_CAP) {
-      // Keep the first. See the cap's own note for why this direction is load-bearing.
-      this.#witnessTruncated.add(agentName);
-      this.#logger.warn("session.witness.alert.list_full", {
-        agentName, held: list.length,
-        impact: "this alert was not recorded; the earlier ones are kept and still shown, and the " +
-          "inbox now says the list is incomplete rather than looking whole",
-      });
-      return;
-    } else {
-      list.push({ key, alert, occurrences: 1, firstObservedAt: alert.observedAt, lastObservedAt: alert.observedAt });
-    }
-    this.#witnessAlerts.set(agentName, list);
-    this.#logger.error("session.witness.alert.recorded", {
-      agentName,
-      sessionId: alert.sessionIdHex,
-      relayId: alert.relayId ?? "(unnamed)",
-      submitterIsCounterparty: alert.submitterIsCounterparty,
-      verifiable: alert.verifiable,
-      impact: "surfaced to the operator on the next cello_inbox; the session is NOT frozen by it",
-    });
-  }
 
-  /** The witness alerts an agent has been told about, oldest first, one row per witness+session. */
-  getWitnessAlerts(agentName: string): ReadonlyArray<WitnessAlertNotice> {
-    return this.#witnessAlerts.get(agentName) ?? [];
-  }
 
-  /** Whether this agent's alert list hit its cap, so the inbox can say the list is incomplete. */
-  witnessAlertsTruncated(agentName: string): boolean {
-    return this.#witnessTruncated.has(agentName);
-  }
+
+
+
+
 
 
 
@@ -718,6 +614,145 @@ export class SessionNodeManager {
    * even when a trigger is missing.
    */
   readonly #park: ParkRecovery;
+
+  /**
+   * 037-SESSIONCORE Unit 1 — the per-session content salt, and the eleven maps it maintains.
+   *
+   * Those eleven were the largest single block of the twenty-four per-session containers that
+   * `#evictSessionCaches` cleared by hand. They leave with the code that fills them.
+   */
+  readonly #salts: SessionSalts;
+
+  /**
+   * 037-SESSIONCORE — the methods that are SQL and nothing else.
+   *
+   * Grouped by SHAPE rather than subject: "holds no state, calls nothing but the agent-id lookup,
+   * and actually touches the database" is a property a reader can check on any one of them
+   * without knowing which subsystem it serves.
+   *
+   * ⚠️ THE `touches the database` CLAUSE IS LOAD-BEARING. A first pass grouped on "holds no state"
+   * alone and swept in `#evictPeersOutsideGate`, which operates on libp2p connections and is not
+   * SQL at all. A source-scanning parity test caught the mis-grouping; the filter now requires the
+   * method to name `#db`.
+   */
+  readonly #queries: SessionQueries;
+
+  /**
+   * 037-SESSIONCORE — the refusals an operator can actually see.
+   *
+   * A refusal whose only consumer is the log is not a control: from the receiving operator's
+   * chair the conversation just goes quiet, and they conclude the other person stopped replying.
+   */
+  readonly #notices: RefusalNotices;
+
+  /**
+   * 037-SESSIONCORE — the throwaway per-session keypair and the content key its halves agree.
+   *
+   * It owns the four maps that hold the secrets, which is the right place for them: the teardown
+   * that ZEROES them lives beside the code that mints them, rather than being one line in a
+   * cache-eviction method that has to remember every map in the class.
+   */
+  readonly #ephemerals: SessionEphemerals;
+
+  /**
+   * 037-SESSIONCORE — connection liveness, and the impairment that explains a degraded session.
+   */
+  readonly #liveness: SessionLiveness;
+
+  /**
+   * 037-SESSIONCORE — what a relay reported seeing, when it does not reconcile with our record.
+   */
+  readonly #witness: WitnessAlerts;
+
+  /**
+   * 037-SESSIONCORE — content we have verified but cannot show yet, because it arrived ahead of
+   * a gap. The MAP stays shared: ingest, placeOwnLeaf and sealReadiness all read it, and two
+   * sources of truth for "what are we holding" would be worse than one shared one.
+   */
+  readonly #held: HeldContent;
+
+  /** ─── DELEGATORS — the held-content seams other files call ──────────────────────────── */
+holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, contentHashHex: string): void { return this.#held.holdOwnLeafForTest(agentName, sessionId, canonicalSeq, contentHashHex); }
+
+  /** ─── DELEGATORS — the witness-alert API other files call ────────────────────────────── */
+  recordRelayWitnessAlert(agentName: string, alert: RelayWitnessAlert): void { return this.#witness.recordRelayWitnessAlert(agentName, alert); }
+  getWitnessAlerts(agentName: string): ReadonlyArray<WitnessAlertNotice> { return this.#witness.getWitnessAlerts(agentName); }
+  witnessAlertsTruncated(agentName: string): boolean { return this.#witness.witnessAlertsTruncated(agentName); }
+
+  /** ─── DELEGATORS — the liveness API other files call, unchanged by the split ───────────── */
+  getSessionLiveness(agentName: string, sessionId: string): "alive" | "impaired" | "gone" | "unknown" { return this.#liveness.getSessionLiveness(agentName, sessionId); }
+  getSessionImpairment(agentName: string, sessionId: string): SessionImpairment | null { return this.#liveness.getSessionImpairment(agentName, sessionId); }
+  markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "impaired" | "gone"): void { return this.#liveness.markSessionLivenessForTest(agentName, sessionId, state); }
+
+  /** ─── DELEGATORS — the test seams other files call, unchanged by the split ─────────────── */
+  mintSessionEphemeralForTest(agentName: string, sessionId: string): void { return this.#ephemerals.mintSessionEphemeralForTest(agentName, sessionId); }
+  sessionEphemeralPublicForTest(agentName: string, sessionId: string): Uint8Array | null { return this.#ephemerals.sessionEphemeralPublicForTest(agentName, sessionId); }
+  setSessionEphemeralForTest(agentName: string, sessionId: string, ephemeral: SessionEphemeral): void { return this.#ephemerals.setSessionEphemeralForTest(agentName, sessionId, ephemeral); }
+  setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void { return this.#ephemerals.setSessionContentKeyForTest(agentName, sessionId, key); }
+  forgetSessionContentKeyForTest(agentName: string, sessionId: string): void { return this.#ephemerals.forgetSessionContentKeyForTest(agentName, sessionId); }
+  async signOwnEphemeralForTest(agentName: string, sessionId: string): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> { return this.#ephemerals.signOwnEphemeralForTest(agentName, sessionId); }
+  async handleEphemeralFrameForTest(agentName: string, sessionId: string, frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array }, correlationId = "test"): Promise<void> { return this.#ephemerals.handleEphemeralFrameForTest(agentName, sessionId, frame, correlationId); }
+
+  /** ─── DELEGATORS — the refusal-notice API other files call, unchanged by the split ────────── */
+  noteContentRefusal(agentName: string, sessionId: string, reason: string, detail: { kind: RefusalKind; impact: string; guidance: string }): void { return this.#notices.noteContentRefusal(agentName, sessionId, reason, detail); }
+  takeContentRefusals(agentName: string, sessionId: string, consumerId: string): Array<Omit<RefusalNotice, "sessionId">> { return this.#notices.takeContentRefusals(agentName, sessionId, consumerId); }
+  dismissContentRefusals(agentName: string, sessionId: string): number { return this.#notices.dismissContentRefusals(agentName, sessionId); }
+  takeAgentContentRefusals(agentName: string, consumerId: string): { notices: RefusalNotice[]; truncated: boolean } { return this.#notices.takeAgentContentRefusals(agentName, consumerId); }
+
+  /**
+   * ─── DELEGATORS — the query API other files call, unchanged by the split ────────────────────
+   */
+  listExpiredUnrevivableSessions(nowMs: number, windowMs: number): Array<{ agentName: string; sessionId: string; cause: string | null }> { return this.#queries.listExpiredUnrevivableSessions(nowMs, windowMs); }
+  listRestartOrphanedSessions(): Array<{ agentName: string; sessionId: string; messageCount: number; status: "interrupted" | "seal_interrupted_pending" }> { return this.#queries.listRestartOrphanedSessions(); }
+  readQuarantined(agentName: string, sessionId: string, sequence?: number): QuarantinedRecord[] { return this.#queries.readQuarantined(agentName, sessionId, sequence); }
+  getPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): string | null { return this.#queries.getPinnedCounterpartyPrimary(agentName, counterpartyPubkeyHex); }
+  recordSealedAnnex(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, senderPubkeyHex: string | null): boolean { return this.#queries.recordSealedAnnex(agentName, sessionId, contentHashHex, content, senderPubkeyHex); }
+  findNextReceivedAfter(agentName: string, sessionId: string, afterSeq: number): { sequence: number; text: string } | null { return this.#queries.findNextReceivedAfter(agentName, sessionId, afterSeq); }
+  getSealInterruptedArtifacts(agentName: string, sessionId: string): { role: string; ownLeaf: unknown; counterpartyLeaf: unknown; merkleRoot: string; nonce: string; } | null { return this.#queries.getSealInterruptedArtifacts(agentName, sessionId); }
+  getSessionsByStatus(status: "active" | "sealed" | "interrupted"): SessionRecord[] { return this.#queries.getSessionsByStatus(status); }
+  recordRefusedSession(agentName: string, sessionId: string, reason: string): void { return this.#queries.recordRefusedSession(agentName, sessionId, reason); }
+  getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> { return this.#queries.getAgentRelayEndpoints(agentName); }
+  countActiveSessionsFromUnknownSenders(agentName: string): number { return this.#queries.countActiveSessionsFromUnknownSenders(agentName); }
+  getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null { return this.#queries.getSealCertificate(agentName, sessionId); }
+  setSessionName(agentName: string, sessionId: string, sessionName: string | null): boolean { return this.#queries.setSessionName(agentName, sessionId, sessionName); }
+  getPersistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null { return this.#queries.getPersistedRelayEndpoint(agentName, sessionId); }
+  markRestartSealGaveUp(agentName: string, sessionId: string, reason: string): void { return this.#queries.markRestartSealGaveUp(agentName, sessionId, reason); }
+  dismissSession(agentName: string, sessionId: string): { ok: true } | { ok: false; reason: string } { return this.#queries.dismissSession(agentName, sessionId); }
+  agentNameForId(agentId: string): string | null { return this.#queries.agentNameForId(agentId); }
+  getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }> { return this.#queries.getRenameNotices(agentName); }
+  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null { return this.#queries.getCertifiedLeafSet(agentName, sessionId); }
+  sessionsConsumingCap(agentName: string, counterpartyPubkey: string, limit = 10): string[] { return this.#queries.sessionsConsumingCap(agentName, counterpartyPubkey, limit); }
+  advanceLastDeliveredSeq(agentName: string, sessionId: string, seq: number): void { return this.#queries.advanceLastDeliveredSeq(agentName, sessionId, seq); }
+  countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number { return this.#queries.countActiveSessionsForCounterparty(agentName, counterpartyPubkey); }
+  getCertifiedLeafSetState(agentName: string, sessionId: string): { state: string; detail: string | null } | null { return this.#queries.getCertifiedLeafSetState(agentName, sessionId); }
+  getSessionRecord(agentName: string, sessionId: string): SessionRecord | null { return this.#queries.getSessionRecord(agentName, sessionId); }
+  hasDatabase(): boolean { return this.#queries.hasDatabase(); }
+  readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> { return this.#queries.readSealedAnnex(agentName, sessionId); }
+  counterpartyAbandonedAt(agentName: string, sessionId: string): number | null { return this.#queries.counterpartyAbandonedAt(agentName, sessionId); }
+  getSealedRootHex(agentName: string, sessionId: string): string | null { return this.#queries.getSealedRootHex(agentName, sessionId); }
+  getLastDeliveredSeq(agentName: string, sessionId: string): number { return this.#queries.getLastDeliveredSeq(agentName, sessionId); }
+  markSessionsInterruptedByLocalShutdownForTest(): void { return this.#queries.markSessionsInterruptedByLocalShutdownForTest(); }
+  wasSessionRefused(agentName: string, sessionId: string): boolean { return this.#queries.wasSessionRefused(agentName, sessionId); }
+  countReceivedMessages(agentName: string, sessionId: string): number { return this.#queries.countReceivedMessages(agentName, sessionId); }
+  markInterruptedByCounterpartyForTest(agentName: string, sessionId: string): void { return this.#queries.markInterruptedByCounterpartyForTest(agentName, sessionId); }
+  recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void { return this.#queries.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson); }
+  recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void { return this.#queries.recordCounterpartyPrimary(agentName, sessionId, primaryPubkeyHex); }
+
+  /**
+   * ─── DELEGATORS — the salt API other files call, unchanged by the split ─────────────────────
+   *
+   * `daemon.ts` and `session-content-handlers.ts` still say `manager.contentHashForSession(...)`.
+   * Keeping the surface identical is what lets the suite stand as evidence that this was a
+   * restructure and not a rewrite.
+   */
+  setSaltContributionForTest(agentName: string, sessionId: string, contribution: Uint8Array): void { return this.#salts.setSaltContributionForTest(agentName, sessionId, contribution); }
+  forgetSaltContributionForTest(agentName: string, sessionId: string): void { return this.#salts.forgetSaltContributionForTest(agentName, sessionId); }
+  async contentHashForSession(agentName: string, sessionId: string, content: Uint8Array): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> { return this.#salts.contentHashForSession(agentName, sessionId, content); }
+  abandonUnsaltedHash(agentName: string, sessionId: string): void { return this.#salts.abandonUnsaltedHash(agentName, sessionId); }
+  isContentSaltActive(agentName: string, sessionId: string): boolean { return this.#salts.isContentSaltActive(agentName, sessionId); }  // Seams for the teardown-must-settle regression (037-SESSIONCORE): arm a pending salt
+  // agreement, then observe the outcome a dropped promise would leave unreachable.
+  markSaltPendingForTest(agentName: string, sessionId: string): void { return this.#salts.markSaltPending(agentName, sessionId); }
+  saltForHashingForTest(agentName: string, sessionId: string): Promise<{ salt: Uint8Array | null; reason?: string }> { return this.#salts.saltForHashing(agentName, sessionId); }
 
   /**
    * ─── DELEGATORS — the mailbox API other files call, unchanged by the split ───────────────────
@@ -880,26 +915,18 @@ export class SessionNodeManager {
   // 'gone' into "call cello_close_session".
   // DOD-M12B-ACK-1 adds 'impaired': connection up, our writes on it failing. It sits BELOW
   // 'alive' and never above 'gone' — see #markSessionImpaired.
-  #sessionLiveness = new Map<string, "alive" | "impaired" | "gone">();
+
   // DOD-M12B-ACK-1: WHY a session is impaired and what became of the content. Separate from the
   // state above because the state is what surfaces print and this is what they must explain.
-  #impairmentCause = new Map<string, SessionImpairment>();
 
-  /**
-   * DOD-M15-NO-SILENT-REFUSAL-1 review F6 — refusal notices that could NOT be persisted.
-   *
-   * Empty in every healthy daemon. It exists so that a database failure costs the restart property
-   * and nothing else: without it, the operator-facing surface for a refusal disappears entirely the
-   * moment the write fails, which is strictly worse than the in-memory Map this store replaced.
-   * `session.refusal.persist.failed` fires at ERROR on every entry that lands here.
-   */
-  #refusalFallback = new Map<string, Map<string, { kind: RefusalKind; impact: string; guidance: string; count: number; surfacedTo: Map<string, number> }>>();
+
+
   // DOD-M12B-STRAND-1: sessions whose durable holds have been read back. One read per session per
   // process; the Map is the working copy from then on.
-  #heldRestored = new Set<string>();
+
   // DOD-M12B-SEAL-STUCK-1: sessions whose post-restore release has been attempted. Separate from
   // #heldRestored so a READ-ONLY probe can hydrate without performing (or consuming) the release.
-  #heldReleased = new Set<string>();
+
   // DOD-M12B-SEAL-STUCK-1: sessions whose ordering state THIS PROCESS has observed — a relay
   // witness recorded for it. `#witnessedSeq` is memory-only, so for a session that predates this
   // daemon "no gap recorded" means "not recorded", not "no gap", and that difference decides
@@ -929,99 +956,15 @@ export class SessionNodeManager {
   // the ordinary cause is two builds that do not match. The refusal carries the freezing site's own
   // words instead.
   #frozenSessions = new Map<string, { reason: string; guidance: string }>();
-  /**
-   * DOD-M15-SEALWIRE-1 bullet 6 (part A) — the salt agreement's two pieces of per-session state.
-   *
-   * `#saltContributions` — OUR random half, MINTED ONCE PER SESSION. This being a map rather than a
-   * fresh call at each send is the whole correctness of the exchange: we re-announce on every
-   * counterparty connect, and a contribution regenerated per reconnect would have both sides
-   * deriving against a moving value with the fingerprints never settling — a session that
-   * reconnects and still disagrees, which reads as a network fault rather than a bug here.
-   *
-   * `#sessionSalts` — a CACHE over `sessions.content_salt`, which is the durable copy. Both are
-   * cleared by `#evictSessionCaches`: the contribution is worthless once a salt exists, and the
-   * salt is re-read from the row on revival, which is exactly what Decision #8 persists it for.
-   */
-  #saltContributions = new Map<string, Uint8Array>();
-  #sessionSalts = new Map<string, Uint8Array>();
-  /**
-   * The peer half we last answered with a repair, hex — review F14, and it is what makes the repair
-   * TERMINATE. Without it, two daemons that already hold the same salt trade contributions forever
-   * once a reconnect leaves a stale copy queued on each side. See `onPeerSaltFrame`'s
-   * `alreadyRepairedAgainstPeerHalf`.
-   */
-  #saltRepairedAgainst = new Map<string, string>();
-  /**
-   * THE MIRROR OF THE ABOVE — the peer FINGERPRINT we last answered with our half, hex.
-   *
-   * 006-CRYPTO finding 1. `#saltRepairedAgainst` terminates the salt-HOLDER's direction only. A side
-   * holding no salt answered every fingerprint with its contribution, and a latched holder answers
-   * every contribution with its fingerprint — so after one failed persist plus a reconnect, two
-   * healthy daemons repair at each other for the life of the session, one new stream and one INFO
-   * line each per round trip. Keyed on the peer's fingerprint BYTES for the same reason the other
-   * map is keyed on its half: a genuinely NEW fingerprint is new information and must still be
-   * answered; only an identical re-offer is the loop.
-   */
-  #saltRepairedAgainstFingerprint = new Map<string, string>();
-  /**
-   * THE LABEL THE PEER GAVE when it closed adoption — 006-CRYPTO finding 2.
-   *
-   * The wire carries WHY, `session-salt-agreement.ts` makes it a union so a caller cannot close
-   * without saying why, and the agreement's `detail` puts it in the log. It was going no further:
-   * `#settleSaltPending(..., "closed")` recorded only that it was closed, so every one of the four
-   * reasons arrived at the operator as "they had already hashed messages".
-   *
-   * Stored raw and rendered through `#peerClosedReason`, which maps anything outside the known set
-   * to a non-asserting reason — the peer chooses these bytes.
-   */
-  #saltPeerClosedLabel = new Map<string, string>();
-  /**
-   * THIS SESSION'S THROWAWAY KEYPAIR — `DOD-M15-KEYAGREE-1`, the lifecycle half (006-CRYPTO).
-   *
-   * **A `Map`, never a field on the session row, and that is the whole point.** The secret is held
-   * in memory and nowhere else: not in SQLite, not in a backup, not in an export. Forward secrecy is
-   * not a property of minting a fresh key — it is a property of the old one being GONE — so anything
-   * that made this durable would void it permanently and silently.
-   *
-   * Minted ONCE per session, at the moment the session becomes active, and destroyed at every site
-   * that drops the `#activeNodes` entry — see `#destroySessionEphemeralFor`, which explains why it
-   * is keyed to the entry rather than to the cache eviction. A revived session therefore mints a
-   * FRESH one and re-keys, which is Decisions Carried #5; that is only true because the interrupt
-   * path destroys, and an earlier version of this comment asserted it while the interrupt path
-   * silently kept the old key for hours.
-   *
-   * ⚠️ NOTHING SENDS THE PUBLIC HALF YET. The exchange, the signature over it, and encrypting
-   * content with the agreed secret are `007-CRYPTO`, and they are one wire format that ships
-   * together. Until that lands, this keypair is minted, held and destroyed correctly and no message
-   * is encrypted with it — which `#contentEncryptionStatus` states on the session itself rather than
-   * leaving a reader to assume.
-   */
-  #sessionEphemerals = new Map<string, SessionEphemeral>();
-  /**
-   * THE AGREED CONTENT KEY — `DOD-M15-EPHEMERAL-AUTH-1` (007-CRYPTO).
-   *
-   * Present only once the peer's SIGNED ephemeral has been verified against the counterparty
-   * identity this session is with. Absent means every message body on this session goes out under
-   * the transport's protection alone, and `#contentEncryptionState` says which of the reasons that
-   * is — never silence.
-   *
-   * In memory only, and destroyed with the ephemeral it came from. It is the same secret one step
-   * on, so persisting it would void forward secrecy exactly as persisting the ephemeral would.
-   */
-  #sessionContentKeys = new Map<string, Uint8Array>();
-  /**
-   * WHICH peer ephemeral produced the key we hold, hex — 007-CRYPTO, review F1.
-   *
-   * The idempotence guard keys on THIS rather than on "a key exists", because a re-keying peer sends
-   * a DIFFERENT half and must be adopted, while the same half re-announced on every connect must
-   * not churn. Keying on presence meant the side that never restarted kept a stale key and every
-   * message failed to decrypt — reported to its operator as possible tampering.
-   */
-  #sessionContentKeyPeerHalf = new Map<string, string>();
-  /**
-   * WHY this session has no content key, when it has none. A closed reason, never a free string.
-   */
-  #contentEncryptionReasons = new Map<string, ContentEncryptionReason>();
+
+
+
+
+
+
+
+
+
   /**
    * Resolve an agent's long-term identity signer.
    *
@@ -1034,104 +977,14 @@ export class SessionNodeManager {
   #keyProviderResolver: ((agentName: string) => KeyProvider | undefined) | null = null;
   /** Test-only observer of decoded inbound content frames — see `observeInboundContentFramesForTest`. */
   #inboundFrameObserver: ((frame: Record<string, unknown>) => void) | null = null;
-  /**
-   * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
-   *
-   * `#saltPending` — an agreement that has actually gone out and not yet been answered. The first
-   * send waits on it (constraint 2). Absent means *nothing is in flight*, which is not the same as
-   * "no salt": a park-only session never starts one at all, and must not wait (constraint 5).
-   *
-   * `#hashedWithoutSalt` — this session has already computed an unsalted content hash. Decision #8
-   * closes adoption at the moment content is HASHED, and for a session's first message that is a
-   * full network round trip before any leaf, held row or in-flight entry exists. Without this flag
-   * the frontier count reads empty for exactly the window in which adopting would split the
-   * transcript.
-   *
-   * `#unsaltedAnnounced` — the fallback has been stated for this session. Decision #15 says once per
-   * session; a per-message warning is a filter waiting to be written.
-   *
-   * All three are per-session and in-memory by design, and are dropped with the rest of a session's
-   * caches on eviction — a revived session re-reads its salt from the row, re-derives its frontier
-   * from durable state, and starts a fresh agreement if it reconnects.
-   */
-  #saltPending = new Map<string, {
-    settled: Promise<"agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed">;
-    resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed") => void;
-    timer: ReturnType<typeof setTimeout>;
-    boundMs: number;
-  }>();
-  /**
-   * HOW THE LAST AGREEMENT ENDED, kept after `#saltPending` is cleared.
-   *
-   * ⚠️ FOUND BY FALSIFYING MY OWN FIX. `#settleSaltPending` deletes the pending entry, so a send that
-   * arrives AFTER an agreement has already failed finds nothing pending and is told
-   * `no_agreement_started` — *"your counterparty was not connected"* — when in fact they were
-   * connected and our own dial to them failed. The outcome was observable only to a send that
-   * happened to already be waiting, which is the minority case.
-   *
-   * So the verdict outlives the wait. An ABSENT entry still means what it always meant — no
-   * agreement was ever started, the park-only case — and that distinction is the whole reason this
-   * is a separate map rather than a default.
-   */
-  #saltLastOutcome = new Map<string, "timeout" | "closed" | "persist_failed" | "announce_failed">();
-  #hashedWithoutSalt = new Map<string, number>();
 
-  /**
-   * `#hashedWithSalt` — how many content hashes this session has computed UNDER its salt and not yet
-   * landed anywhere a count can see (`DOD-M15-SALTSPLIT-1`, review HIGH-2).
-   *
-   * The mirror of `#hashedWithoutSalt`, and it exists for the same window: a hash is computed, then a
-   * relay round trip happens, and only afterwards does the message appear as a leaf, a hold or an
-   * awaiting-ack entry. In between, every count reads zero.
-   *
-   * It is read by `#discardUnspentSalt` alone. "Unspent" must mean *nothing has been hashed under
-   * it*, and without this the answer is *nothing has FINISHED being hashed under it* — which is the
-   * question nobody asked, answered destructively.
-   *
-   * Never decremented on success: a salted hash that reaches the wire is spent forever, and unlike
-   * the unsalted counter there is no `abandonUnsaltedHash` equivalent to undo. It is cleared only
-   * with the rest of the session's caches. **For a discard decision, erring toward "spent" is the
-   * safe direction** — a salt kept is recoverable, a salt erased is not.
-   */
-  #hashedWithSalt = new Map<string, number>();
 
-  /**
-   * `#saltSuspended` — the peer has told us it can never hold a salt, so ours must not be USED. The
-   * bytes stay on disk (`DOD-M15-SALTSPLIT-1`, the other lane's authorization argument).
-   *
-   * ⚠️ THIS REPLACED AN IMMEDIATE, IRREVERSIBLE ERASE, AND THE REFRAMING IS THE WHOLE POINT.
-   *
-   * I defended the erase as a compatibility question — a legacy peer might send the misleading frame,
-   * we are pre-launch, do not carry weight for a state nobody is in. All true, and it does not reach
-   * the question. **It is an AUTHORIZATION question:** the receiver performed an irreversible
-   * destruction of durable key material on a peer's bare assertion with nothing to check it against.
-   * Re-derived against an empty database — *would I let one side erase the other's key material on an
-   * unauthenticated claim carrying no evidence?* No. My own empty-database rule argued FOR a guard,
-   * not against one.
-   *
-   * And my own trigger was the proof I walked past: `frontier_unreadable` is not a legacy peer, it is
-   * a **healthy current peer having one bad second**. Fixing the producer made our side stop emitting
-   * it wrongly and left the receiver built to obey it — *one side of that exchange correct by
-   * construction, the other still correct by luck.*
-   *
-   * A salt that cannot be used is inert. The destruction is what turned a transient disagreement into
-   * a permanent one, so **nothing irreversible hangs on the claim any more** and proving the claim
-   * stops being load-bearing.
-   *
-   * ⚠️ IN MEMORY ON PURPOSE, AND THE ERASE IS DEFERRED RATHER THAN CANCELLED. A durable mark needs a
-   * column, and this milestone has lost data twice in the rebuild DDL. In-memory alone would split
-   * the transcript at the next restart — unsalted now, salted after a reboot — so the salt IS erased,
-   * at the first unsalted hash, which is the moment erasing becomes both harmless (nothing was hashed
-   * under it) and REQUIRED (keeping it would re-salt after a restart). Before that moment a corrected
-   * announce carrying a matching fingerprint un-suspends and the session recovers fully salted, which
-   * erasure makes impossible even in principle: the far side cannot re-derive without both halves.
-   *
-   * A restart before either outcome loses the mark, we are salted again, the peer refuses one message,
-   * and the announce re-runs and re-suspends. **One refused message, then convergence** — against a
-   * dead session.
-   */
-  #saltSuspended = new Set<string>();
-  #unsaltedAnnounced = new Set<string>();
+
+
+
+
+
+
   // DOD-M12B-ACK-1: pending linger-resets for inbound content streams the peer has not closed.
   // Held so shutdown can drop them rather than leave timers pointing at a torn-down node.
   #lingeringStreams = new Set<ReturnType<typeof setTimeout>>();
@@ -1441,7 +1294,7 @@ export class SessionNodeManager {
     this.#authorship = new AuthorshipVerifier({
       logger: this.#logger,
       sessionKey: (a, sid) => this.#k(a, sid),
-      getSessionRecord: (a, sid) => this.getSessionRecord(a, sid),
+      getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       isSessionDiverged: (a, sid) => this.#records.isSessionDiverged(a, sid),
       sessionGenesisPrevRoot: (a, sid) => this.#sessionGenesisPrevRoot(a, sid),
@@ -1457,13 +1310,13 @@ export class SessionNodeManager {
       sessionKey: (a, sid) => this.#k(a, sid),
       requireAgentId: (a) => this.#requireAgentId(a),
       cancelLeafFetch: (key, hashHex) => this.#cancelLeafFetch(key, hashHex),
-      noteContentRefusal: (a, sid, reason, detail) => this.noteContentRefusal(a, sid, reason, detail),
+      noteContentRefusal: (a, sid, reason, detail) => this.#notices.noteContentRefusal(a, sid, reason, detail),
       recordTranscriptMessage: (...args) => this.#records.recordTranscriptMessage(...args),
       recordWitnessedSequence: (a, sid, h, n) => this.recordWitnessedSequence(a, sid, h, n),
       getTier: (a, pk) => this.#records.getTier(a, pk),
       resolveTierBound: (a, t, f) => this.#records.resolveTierBound(a, t, f),
       mailboxRouteAvailable: (a) => this.#mailboxRouteAvailable(a),
-      receivedBytesTotal: (a, sid) => this.#getReceivedBytesTotal(a, sid),
+      receivedBytesTotal: (a, sid) => this.#queries.getReceivedBytesTotal(a, sid),
       verifyAuthorshipClaim: (a, sid, s1, sig, h) => this.#authorship.verifyAuthorshipClaim(a, sid, s1, sig, h),
     });
 
@@ -1473,11 +1326,11 @@ export class SessionNodeManager {
       shuttingDown: () => this.#shuttingDown,
       sessionKey: (a, sid) => this.#k(a, sid),
       requireAgentId: (a) => this.#requireAgentId(a),
-      ownPubkeyHex: (a) => this.#ownPubkeyHex(a),
+      ownPubkeyHex: (a) => this.#queries.ownPubkeyHex(a),
       activeEntry: (key) => this.#activeNodes.get(key),
       agentsWithLiveReceiver: () => this.#standingReceivers.keys(),
       agentWantsReceiver: (a) => this.#agentsWantingReceiver.has(a),
-      getSessionRecord: (a, sid) => this.getSessionRecord(a, sid),
+      getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
       getSealCarry: (pk, sid) => this.getSealCarry(pk, sid),
       getSessionTree: (a, sid) => this.getSessionTree(a, sid),
       recordOrderingRecord: (a, sid, s1, s2, h, cid) => this.recordOrderingRecord(a, sid, s1, s2, h, cid),
@@ -1485,6 +1338,74 @@ export class SessionNodeManager {
       witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
       noteAcknowledgeable: (a, sid, seq, h) => this.#noteAcknowledgeable(a, sid, seq, h),
     }, opts.parkedDrainBackstopMs ?? 300_000);
+
+    this.#salts = new SessionSalts({
+      logger: this.#logger,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      activeEntry: (key) => this.#activeNodes.get(key),
+      getSessionTree: (a, sid) => this.getSessionTree(a, sid),
+      getSessionRecord: (a, sid) => this.#queries.getSessionRecord(a, sid),
+      heldContentFor: (key) => this.#heldContent.get(key),
+      ensureHeldRestored: (a, sid, opts) => this.#held.ensureHeldRestored(a, sid, opts),
+      awaitingAck: this.#awaitingAck,
+      contentEncryptionState: (a, sid) => this.#ephemerals.contentEncryptionState(a, sid),
+      freezeSession: (a, sid, reason, narrative, cid) => this.#freezeSession(a, sid, reason, narrative, cid),
+      sendSaltFrame: (a, sid, cid, override) => this.#sendSaltFrame(a, sid, cid, override),
+    });
+
+    this.#queries = new SessionQueries({
+      logger: this.#logger,
+      db: () => this.#db,
+      requireAgentId: (a) => this.#requireAgentId(a),
+      sessionKey: (a, sid) => this.#k(a, sid),
+      unkey: (key, agentName) => this.#unk(key, agentName),
+    });
+
+    this.#notices = new RefusalNotices({
+      logger: this.#logger,
+      queries: this.#queries,
+      db: () => this.#db,
+      requireAgentId: (a) => this.#requireAgentId(a),
+      sessionKey: (a, sid) => this.#k(a, sid),
+      unkey: (key, agentName) => this.#unk(key, agentName),
+    });
+
+    this.#ephemerals = new SessionEphemerals({
+      logger: this.#logger,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      activeEntry: (key) => this.#activeNodes.get(key),
+      keyProvider: (a) => this.#keyProviderResolver?.(a),
+      freezeSessionForKeyRefusal: (a, sid, reason, cid) => this.#freezeSessionForKeyRefusal(a, sid, reason, cid),
+    });
+
+    this.#liveness = new SessionLiveness({
+      logger: this.#logger,
+      queries: this.#queries,
+      notices: this.#notices,
+      ephemerals: this.#ephemerals,
+      counterpartyAddrs: this.#counterpartyAddrs,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      activeEntry: (key) => this.#activeNodes.get(key),
+      sendSaltFrame: (a, sid, cid, override) => this.#sendSaltFrame(a, sid, cid, override),
+    });
+
+    this.#witness = new WitnessAlerts({ logger: this.#logger });
+
+    this.#held = new HeldContent({
+      logger: this.#logger,
+      queries: this.#queries,
+      records: this.#records,
+      db: () => this.#db,
+      sessionKey: (a, sid) => this.#k(a, sid),
+      requireAgentId: (a) => this.#requireAgentId(a),
+      heldContent: this.#heldContent,
+      witnessedSeq: this.#witnessedSeq,
+      getSessionTree: (a, sid) => this.getSessionTree(a, sid),
+      appendSessionLeaf: (a, sid, kind, h, cid) => this.appendSessionLeaf(a, sid, kind, h, cid),
+      appendVerifiedContent: (a, sid, c, h, pk, cid, orig, auth) => this.#appendVerifiedContent(a, sid, c, h, pk, cid, orig, auth),
+    });
     this.#dbPath = opts.dbPath;
     if (typeof opts.contentTtfMs === "number" && opts.contentTtfMs > 0) {
       this.#contentTtfMs = opts.contentTtfMs;
@@ -1591,791 +1512,7 @@ export class SessionNodeManager {
      * is not what makes the conversation provable.
      */
     this.#ownChainStore = new SessionOwnChainStore(this.#db, this.#logger);
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS sessions (
-        session_id TEXT NOT NULL,
-        agent_id TEXT NOT NULL,
-        counterparty_pubkey TEXT NOT NULL,
-        status TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        -- DOD-LOOP-1: composite key so two of the operator's agents can hold both ends of the
-        -- SAME session_id on ONE daemon (the loopback case). A bare session_id PK would reject
-        -- the second end's row.
-        -- DOD-AGENT-ID-JOINKEY-1: keyed on the STABLE agent_id, never the mutable, reuse-freed
-        -- agent_name. The display name lives on the agents table and is joined in for reads.
-        PRIMARY KEY (agent_id, session_id)
-      )
-    `);
-
-    // M7-SESSION-001: idempotent schema extension — add message_count and interrupted_at
-    // columns if they do not exist. ALTER TABLE IF NOT EXISTS COLUMN is not supported by
-    // older SQLite; we use a try/catch per column as the idempotent approach.
-    for (const ddl of [
-      "ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
-      "ALTER TABLE sessions ADD COLUMN interrupted_at TEXT",
-      /**
-       * Decisions Carried #8 — THE SESSION SALT, persisted.
-       *
-       * Agreed once at session open from BOTH sides' random contributions, and unchanged for the
-       * life of the session. It is NOT a key: it decrypts nothing, and it is what lets this
-       * operator's own transcript stay verifiable — the content hash is recomputed from stored
-       * plaintext on the receive path and again for any later check, and salted it is underivable
-       * without this value.
-       *
-       * PERSISTED because the alternative is silent corruption. ⚠️ FUTURE TENSE, deliberately
-       * (review F10): NOTHING WRITES OR READS THIS COLUMN YET. `DOD-M15-SEALWIRE-1` will add the
-       * contribution exchange and the lookup — "does this session already have a salt? yes → use it,
-       * no → agree one" — and without the column that lookup would fail after a restart, mint a
-       * fresh salt, and split the transcript at the crash: every leaf before it unverifiable, with
-       * nothing saying so. The column lands now because it must exist before the code that needs it.
-       *
-       * NULL for every session opened before this column existed; those keep the unsalted hash.
-       */
-      "ALTER TABLE sessions ADD COLUMN content_salt BLOB",
-      /**
-       * DOD-M15-FREEZE-STATUS-1 — carried here for the OTHER LANE (`CELLO_Support`), agreed in
-       * session `e3adcaa7…`. Two lanes must not both edit this file (§2e, one file two branches), so
-       * the columns land in one migration and every line of behaviour stays on their side. Nothing
-       * in this lane reads or writes them.
-       *
-       *   `frozen_at`     epoch-ms when `#freezeOnIdentityFailure` fired. NULL = never frozen.
-       *   `frozen_reason` the `reason` already passed to that method. NULL iff `frozen_at` is NULL.
-       *
-       * ⚠️ THE WRITE MUST LAND BEFORE `destroySessionNode`, NOT AFTER — FRAME-1 review F1's
-       * ordering, and the reason the in-memory `#frozenSessions.add` already sits before the
-       * teardown. `destroySessionNode` writes `interrupted`, which is the REVIVABLE status, so a
-       * durable mark landing after it lets a read race the teardown and revive the session out from
-       * under the freeze — the disk reproducing the bug the memory mark was moved early to fix.
-       *
-       * Why it earns a slot rather than waiting: `#frozenSessions` is memory-only today, so a
-       * restart UN-FREEZES a session that was frozen because a party signed with a key that was not
-       * the counterparty's. The next read revives it and re-admits that peer, while the log still
-       * says the session will not be revived.
-       */
-      "ALTER TABLE sessions ADD COLUMN frozen_at INTEGER",
-      "ALTER TABLE sessions ADD COLUMN frozen_reason TEXT",
-      // MSG-001-3b (MSG-2 startup-flush): persist the session's relay endpoint so the
-      // crash-backstop flush can deposit un-acked content after a restart, when the
-      // in-memory entry is gone. relay_addrs is a JSON array of multiaddr strings.
-      "ALTER TABLE sessions ADD COLUMN relay_peer_id TEXT",
-      "ALTER TABLE sessions ADD COLUMN relay_addrs TEXT",
-      // M7-SESSION-004 (AC-005): persist the seal certificate's legibility object with the
-      // sealed record so it survives a daemon restart and is readable on the cert-read surface
-      // (cello_get_sealed_receipt). JSON string with hex-encoded pubkeys; NULL until sealed.
-      // Inline idempotent migration (NOT Flyway — this is the client-side SQLite, AC-011).
-      /**
-       * 033-ACKEMIT — THE SESSION'S GENESIS PREV_ROOT, and it is persisted for ONE reason: a
-       * restart.
-       *
-       * It is a pure function of the two participant keys, the session id and the SESSION
-       * TIMESTAMP — and the timestamp arrives on the directory-signed relay assignment and lives
-       * nowhere else. A session restored from this table after a daemon restart re-registers with
-       * no assignment in hand, so without this column the daemon could not say what the first
-       * message of that session acknowledges, and every send on it would be refused rather than
-       * signed. Deriving is still preferred where the assignment IS in memory; this is what makes
-       * the derivation survive the process.
-       *
-       * NULL for every session opened before this column existed. Those sessions acknowledge
-       * nothing until the counterparty has sent something — they claim position 0 with no hash,
-       * which asserts nothing rather than asserting a position they cannot back — and from the
-       * first leaf they receive they acknowledge content like any other session.
-       */
-      "ALTER TABLE sessions ADD COLUMN genesis_prev_root BLOB",
-      "ALTER TABLE sessions ADD COLUMN seal_legibility TEXT",
-      "ALTER TABLE sessions ADD COLUMN sealed_root_hex TEXT",
-      // M7 legibility-TBS-binding (responder verify): the counterparty's FROST primary (group)
-      // pubkey, taken from the FROST-signed SessionAssignment's signer_pubkey. The responder uses
-      // it to VERIFY the bilateral seal signature locally (the seal is signed by the initiator's
-      // primary), not just accept it. NULL when this party initiated (it uses its own primary).
-      "ALTER TABLE sessions ADD COLUMN counterparty_primary_pubkey TEXT",
-      // DOD-SESSION-NAME-1: the operator's own human-readable label for this session. LOCAL AND
-      // COSMETIC — it is never sent to the relay or directory, never in a wire frame, never in the
-      // transcript, never in the seal or a Merkle leaf, and the counterparty never sees it. It
-      // cannot influence protocol behaviour.
-      // NULL MEANS SOMETHING: a session closed through an agent usually carries a name, so an
-      // unnamed closed session is a hint it did not close cleanly. Never auto-generate a default —
-      // a fabricated name destroys that signal.
-      "ALTER TABLE sessions ADD COLUMN session_name TEXT",
-      // DOD-SEALED-INBOX-1: local-only housekeeping flag — epoch-ms timestamp set by cello_dismiss.
-      // Never propagated, never part of the seal ceremony or hash chain. A dismissed terminal
-      // session is excluded from cello_inbox's ended_unread section. Distinct from the read
-      // watermark: this records "operator acknowledged via dismiss", not "operator received via
-      // cello_receive". NULL = not yet dismissed.
-      "ALTER TABLE sessions ADD COLUMN read_at INTEGER",
-      // DOD-M12B-ABANDON-NOTIFY-1: epoch-ms when the counterparty told us they force-abandoned.
-      // Deliberately NOT a status — the session stays sealable, so the operator can still take a
-      // unilateral receipt. It stops this side calling them, nothing more.
-      "ALTER TABLE sessions ADD COLUMN counterparty_abandoned_at INTEGER",
-      // DOD-CAP-SELF-HEAL-1: WHO caused this session to be interrupted — 'counterparty' when their
-      // stream dropped, 'local' when OUR daemon stopped or started. Only theirs counts against the
-      // acceptance bound. Without this the bound is all-time rather than concurrent: every restart
-      // flips every live session to `interrupted`, nothing ever resolves them, and a pair of agents
-      // that has talked three times can never talk again. NULL means "not recorded" and is treated
-      // as the counterparty's, because the safe default for an anti-abuse bound is to count it.
-      "ALTER TABLE sessions ADD COLUMN interrupted_by TEXT",
-      // DOD-M12B-RESTART-SEAL-1: when automatic sealing exhausted this session, and why. Durable
-      // because the resolver's attempt budget is in memory — without it a machine that restarts
-      // several times a day re-runs the whole budget against a hopeless session on every boot.
-      "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_at INTEGER",
-      "ALTER TABLE sessions ADD COLUMN restart_seal_gave_up_reason TEXT",
-      // DOD-M15-DIVERGE-DURABLE-1: epoch-ms when this session's tree and the relay's counter
-      // provably parted, so it can never seal bilaterally. NULL = not diverged.
-      //
-      // DURABLE, and the reason is that the read site cannot tell "not diverged" from "forgotten":
-      // both are false and both read READY. `#diverged` was in memory, so a restart turned a
-      // session that provably cannot seal into one the gate was happy to close.
-      //
-      // NOT the trade `frontier-mismatch.ts` makes on purpose. A frontier mismatch is re-detected
-      // by the very next close, so losing it costs a recomputation. Divergence is re-detected only
-      // by the next send that gets an ack behind the frontier — which on a finished conversation
-      // never comes. Losing it costs a WRONG ANSWER.
-      "ALTER TABLE sessions ADD COLUMN diverged_at INTEGER",
-    ]) {
-      try {
-        this.#db.exec(ddl);
-      } catch (err: unknown) {
-        // Only swallow the idempotent "duplicate column name" case (the column
-        // already exists from a prior init). Any other failure — disk full,
-        // SQLITE_LOCKED, corruption — must propagate, otherwise the daemon would
-        // run without these columns and later silently read undefined.
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!msg.includes("duplicate column name")) throw err;
-      }
-    }
-
-    // M12-P18: sessions this agent REFUSED (abuse cap etc.). DURABLE and separate from the in-memory
-    // refusedSessionRequests inbox list, for one reason: content parked for a refused session arrives
-    // AFTER the refusal and often after a restart, and at drain time `counterparty_unknown` cannot
-    // tell "content for a session I declined" from "content I might still want". This table is that
-    // missing memory. Deleting parked content matched here judges NOTHING about the content — it acts
-    // on OUR OWN refusal, so it does not violate the SEC-1 rule that a forgery must not evict itself.
-    // Bounded by pruning on write (keep the most recent N per agent); a refused session id is never
-    // reused (directory-assigned, unique), so forgetting an old one only means its stale parked
-    // content is not proactively swept — the relay TTL backstop still applies.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS refused_sessions (
-        agent_id   TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        reason     TEXT NOT NULL,
-        refused_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id)
-      )
-    `);
-
-    // M12-P17: the POST-SEAL ANNEX — verified content that arrived for a session which had already
-    // ended. It cannot join the sealed chain (that would change `sealed_root` and invalidate the
-    // notarization), and it must not be thrown away: it is a real message, provably sent to this
-    // operator, that no one would otherwise ever read.
-    //
-    // A SEPARATE TABLE is the point, not an implementation detail. Inertness has to be structural:
-    // nothing here is joined by `getUnreadSummary`, `getEndedUnread`, any inbox count or any wake
-    // path, so this content CANNOT ring a doorbell or reach agent context no matter what a future
-    // caller does. If it lived in `transcript` behind a flag, the next reader would key on the row
-    // and not the flag — which is exactly how an agent came to obey an instruction out of a sealed
-    // conversation.
-    //
-    // Keyed on (agent_id, content_hash): `session_id` is recorded for display but is NOT part of the
-    // key, because the sibling case this design must also serve — content we cannot attribute to a
-    // session at all — has no session to key on.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS sealed_session_annex (
-        agent_id      TEXT NOT NULL,
-        content_hash  TEXT NOT NULL,
-        session_id    TEXT NOT NULL,
-        sender_pubkey TEXT,
-        content       BLOB NOT NULL,
-        arrived_at    INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, content_hash)
-      )
-    `);
-
-    // M7-SESSION-001 (H-1): side table holding the verified bilateral
-    // SEAL-INTERRUPTED commitment artifacts. A side table (CREATE TABLE IF NOT
-    // EXISTS) is inherently idempotent — no ALTER TABLE / duplicate-column
-    // handling required. We keep BOTH parties' signed leaves and the agreed
-    // Merkle root so the achieved commitment is never discarded.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS seal_interrupted_artifacts (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        own_leaf TEXT NOT NULL,
-        counterparty_leaf TEXT NOT NULL,
-        merkle_root TEXT NOT NULL,
-        nonce TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        -- DOD-LOOP-1: composite key (per-agent end of a loopback session).
-        PRIMARY KEY (agent_id, session_id)
-      )
-    `);
-
-    // DAEMON-004 (AC-007 / SI-001): the daemon-owned per-session Merkle tree,
-    // persisted as an ordered list of leaf hashes. The (session_id, leaf_index)
-    // primary key enforces append-order uniqueness; a fresh daemon reconstructs
-    // each tree from these rows so the transcript survives a restart. Querying
-    // by session_id ORDER BY leaf_index is the only read pattern.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS session_tree_leaves (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        leaf_index INTEGER NOT NULL,
-        leaf_kind TEXT NOT NULL,
-        leaf_hash_hex TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        -- DOD-LOOP-1: composite key so each agent's end has its own append-ordered tree.
-        PRIMARY KEY (agent_id, session_id, leaf_index)
-      )
-    `);
-
-    // DOD-M15-INCLUSION-1: the leaf set the DIRECTORY certified — a different tree from the one
-    // above, and the distinction is the whole reason this table exists.
-    //
-    // `session_tree_leaves` holds this agent's CONTENT leaves. The certified root covers every leaf
-    // the relay ordered, CONTROL leaves included, and nothing appends a ctrl leaf to the local tree
-    // (`submitSealLeaf` computes its root without mutating it). So an audit path built from
-    // `session_tree_leaves` lands on a root no certificate names — it proves this machine agrees
-    // with itself, which is worth nothing to the third party a proof is FOR.
-    //
-    // Rows land only after the Merkle root over them reproduces the FROST-signed `sealed_root`
-    // (`certifiedLeafSetFrom`), so what is stored here is the consortium's leaf set and not the
-    // directory's word for it. Written once at seal time; read only by the inclusion-proof surface,
-    // ORDER BY leaf_index.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS session_certified_leaves (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        leaf_index INTEGER NOT NULL,
-        content_hash_hex TEXT NOT NULL,
-        recorded_at INTEGER NOT NULL,
-        -- DOD-LOOP-1: composite key so each agent's end of a loopback session keeps its own set.
-        PRIMARY KEY (agent_id, session_id, leaf_index)
-      )
-    `);
-
-    // WHY a session has no certified leaf set — fallback-finder finding 1, and the reason it is a
-    // TABLE rather than a log line.
-    //
-    // `getCertifiedLeafSet` returns null for four different situations: no seal frame ever carried
-    // the leaves, the directory shipped a set that does not reproduce the root it signed, a leaf was
-    // malformed, or the write failed. The worst of those — a directory contradicting its own FROST
-    // signature — is the strongest misbehaviour signal this client can produce, and it was going to
-    // one ERROR line while the operator was told the most benign of the four: "normal for the party
-    // that was absent at seal time." A detection whose only consumer is a log is not a control.
-    //
-    // One row per session, replaced on every attempt, so the state is the LAST thing that happened
-    // rather than a history. Read only by the inclusion-proof surface, to name the cause.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS session_certified_leaves_state (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        state TEXT NOT NULL,
-        detail TEXT,
-        recorded_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id)
-      )
-    `);
-
-    // DOD-M12B-STRAND-1 — content we RECEIVED and VERIFIED but cannot append yet.
-    //
-    // Held content used to live only in `#heldContent`, a Map that died with the session node. The
-    // teardown path said so itself: "the content is unrecoverable by the time we are here."
-    // Measured on one daemon in one morning: 367 held, 8 released, **24 destroyed**. Each
-    // destruction is permanent and one-sided — the sender was never acknowledged, so it believes
-    // the message is merely pending, while the only copy the receiver will ever see is gone and
-    // every later message in that session is stuck behind a gap nothing can fill.
-    //
-    // `canonical_seq` is the RELAY's position, not a local counter, and it is part of the key: that
-    // is what lets a frame come back after a restart and land at its OWN index rather than the next
-    // free slot. Appending it anywhere else would change the root the seal signs over.
-    //
-    // Keyed on agent_id, never agent_name — agent_name is a mutable display label (see the repo
-    // guide). `content_blob` is the SCREENED copy that gets delivered; `original_blob` is the peer's
-    // raw bytes, which the release path needs because classification reads byte 0 and the screened
-    // copy is no longer a CBOR map header for a document frame.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS held_content (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        canonical_seq INTEGER NOT NULL,
-        content_blob BLOB NOT NULL,
-        original_blob BLOB,
-        content_hash_hex TEXT NOT NULL,
-        screened_out INTEGER NOT NULL DEFAULT 0,
-        correlation_id TEXT,
-        held_at INTEGER NOT NULL,
-        -- DOD-M12B-INDEX-1: 'received' (default) or 'sent'. A held frame of OUR OWN must be
-        -- released down the sent path — appended and transcribed as sent — never down the received
-        -- path, which would put our words in the counterparty's mouth in the sealed record and hand
-        -- them back to our own agent through cello_receive as though they had just arrived.
-        origin TEXT NOT NULL DEFAULT 'received',
-        -- DOD-M12B-INDEX-1: 'msg' or 'doc'. A held document leaf must come back as a document leaf.
-        leaf_kind TEXT NOT NULL DEFAULT 'msg',
-        PRIMARY KEY (agent_id, session_id, canonical_seq)
-      )
-    `);
-
-    // DOD-M12B-INDEX-1: `CREATE TABLE IF NOT EXISTS` is a NO-OP against a table that already
-    // exists, so a database created between DOD-M12B-STRAND-1 and this change has `held_content`
-    // WITHOUT `origin`. On those every insert throws and every restore throws — holds go back to
-    // memory-only, silently at the surface, and that now includes our own sent messages, which
-    // nobody else holds a copy of. Loud in the log is not the same as visible.
-    try {
-      this.#db.exec("ALTER TABLE held_content ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-    // DOD-M12B-INDEX-1: and the LEAF KIND. `#releaseHeld` used to append every held frame as "msg",
-    // so a document leaf that had to wait for its position came back as a conversation message —
-    // the distinction survived the immediate append and was destroyed by the hold, unrecoverably
-    // after a restart.
-    try {
-      this.#db.exec("ALTER TABLE held_content ADD COLUMN leaf_kind TEXT NOT NULL DEFAULT 'msg'");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-
-    // DOD-LOG-1 (PERSIST-LOG-001) / PERSIST-002 (AC-010): the durable, ENCRYPTED-at-rest readable
-    // transcript. Each row is keyed by the canonical leaf `sequence`, so it JOINS to
-    // session_tree_leaves(leaf_index) — a stored message is provably behind a committed hash-chain
-    // leaf, not a loose dump. `blob` holds the readable plaintext bytes; encryption at rest is now
-    // provided by whole-DB SQLCipher, not a per-column cipher (relay/directory never see it — INV-3).
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS transcript (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        sequence INTEGER NOT NULL,
-        direction TEXT NOT NULL,        -- 'sent' | 'received'
-        blob BLOB NOT NULL,             -- readable plaintext bytes (whole-DB SQLCipher-encrypted at rest)
-        created_at INTEGER NOT NULL,
-        -- ─── DOD-M15-SEALWIRE-1 bullet 5: the row proves AUTHORSHIP, or says it cannot ──────────
-        --
-        -- Before this, a row was (message, direction) and attribution came entirely from local
-        -- session state: "this arrived on the socket I believed was Bob's". That is fine while the
-        -- transcript is only ever read by its owner, and worthless the moment it is shown to anyone
-        -- else — which is the whole point of a notarized record.
-        --
-        -- sender_sig holds one of TWO things, and which one is told by direction:
-        --   RECEIVED row -> the sender's signature over their own Structure-1 bytes, carried on the
-        --                   content frame BESIDE those bytes, stored ONLY after the receiver
-        --                   verified it against the pubkey inside them (#verifyAuthorshipClaim).
-        --                   Verified, never claimed.
-        --                   ⚠️ THIS USED TO READ "the Structure-2 signature ... (#recordFrameOrdering)"
-        --                   and it named a real place: until DOD-M15-AUTHORSHIP-ABSENT-1 the only
-        --                   copy of that signature this side ever saw was the one the RELAY had
-        --                   committed at Structure-2 index 3, so a message with no relay record had
-        --                   no checkable author at all. Rewritten rather than deleted: an auditor
-        --                   reading the old sentence goes looking for Structure-2 bytes that, on a
-        --                   relay-degraded message, do not exist.
-        --   SENT row     -> OUR OWN signature over the Structure-1 bytes we put on the wire, taken
-        --                   from the submit result. Produced, not verified — there was no
-        --                   counterparty in the act, so it must NEVER be labelled verified_signature.
-        --
-        -- ⚠️ self_authored COVERS TWO PROVENANCES, and sender_sig IS NOT NULL is the discriminator.
-        -- Named here because it is the same shape this column exists to prevent, one level up: a
-        -- provable sent row and an unprovable one share a label, so a reader keying on attribution
-        -- alone cannot tell them apart.
-        --   self_authored + sender_sig NOT NULL -> we wrote it and can prove we did
-        --   self_authored + sender_sig NULL     -> we wrote it; no proof was stored for this row
-        --
-        -- ⚠️ THE NULL CASE USED TO READ "the relay never witnessed it", and DOD-M15-AUTHORSHIP-ABSENT-1
-        -- made that false. Every content frame now carries this side's signature over its own
-        -- Structure 1 whether or not a relay witnessed the leaf, so an unwitnessed send is provable
-        -- too. Rewritten rather than deleted: the old sentence is why a NULL here was read as
-        -- ordinary. It is not ordinary now — it means this machine could not sign at all, or the row
-        -- came by a path that carries no proof, and both are worth a second look.
-        --
-        -- attribution is NOT NULL ON PURPOSE, and it is the load-bearing column. There is a soft
-        -- path — session.content.ordering.decode_failed falls back to hash-dedup — that ingests a
-        -- message with no verified signature, so rows legitimately without one WILL exist. A
-        -- nullable signature column and nothing else would rebuild the defect this bullet exists to
-        -- fix: a table that IMPLIES every row carries authorship proof, where some carry none and
-        -- nothing distinguishes them. Forcing every writer to name which it is makes silent NULL
-        -- impossible rather than merely discouraged.
-        sender_pubkey TEXT,             -- from INSIDE the sender's signed bytes; NULL unless verified
-        sender_sig BLOB,                -- the VERIFIED sender signature over structure1_cbor (see above); NULL unless verified
-        attribution TEXT NOT NULL DEFAULT 'local_session_state',  -- verified_signature | self_authored | local_session_state
-        PRIMARY KEY (agent_id, session_id, sequence, direction)
-      )
-    `);
-
-    /**
-     * DOD-M15-REFUSEDEVIDENCE-1 — the refusal reason on a QUARANTINED row.
-     *
-     * `direction` takes a third value, `'quarantined'`: a message that was received and REFUSED. It
-     * is stored the same way a delivered one is — plaintext blob, sender key, sender signature,
-     * attribution — because a hash with no original proves nothing, and the messages worth proving
-     * (an injection, a probe, a tampered frame) are exactly the refused ones.
-     *
-     * ⚠️ THE DIRECTION VALUE IS THE FLAG, AND THAT IS WHY IT IS NOT A BOOLEAN COLUMN. `direction` is
-     * in the primary key and every delivery and unread reader already filters it with an equality
-     * literal (`findNextReceivedAfter`, `#UNREAD_RECEIVED_WHERE`, `countReceivedMessages`). A row
-     * written `'quarantined'` therefore cannot be returned by `WHERE direction = 'received'` — it is
-     * excluded BY CONSTRUCTION, with no query edited and none left to remember. A boolean column
-     * alone would have been exclusion by EDIT, which rebuilds `DOD-UNREAD-1 D4a`'s phantom-session
-     * residue the first time a new query forgets the predicate.
-     *
-     * `attribution` needs no new value: the expression in `recordTranscriptMessage` is
-     * `direction === "sent" ? … : authorship ? "verified_signature" : "local_session_state"`, and
-     * `'quarantined'` is not `'sent'` — so a verified frame lands `verified_signature` and an
-     * unverified one `local_session_state`, which is the distinction the column exists for.
-     */
-    // Through `addColumnIfMissing`, not a hand-rolled try/catch — review F7. A bare `ADD COLUMN`
-    // wrapped in a duplicate-name test had already been written twice in this codebase, which is
-    // why the helper exists; a third copy rethrows correctly but emits no `db.column_birth.failed`,
-    // so a failure on a fresh operator's database would name neither the table nor the column. That
-    // is exactly the case — the FIRST run on a new machine — the helper was extracted for.
-    addColumnIfMissing(this.#db, this.#logger, {
-      table: "transcript",
-      column: "quarantine_reason",
-      sql: "ALTER TABLE transcript ADD COLUMN quarantine_reason TEXT",
-    });
-
-    // M8C-INBOX-1 (N2): per-agent, per-session read watermark. `last_delivered_seq` is the highest
-    // RECEIVED transcript sequence the operator has been shown via cello_receive (delivery marks
-    // read — no ack verb). Unread = received transcript rows with sequence > last_delivered_seq.
-    // Persisted so a missed doorbell (fire-and-forget push) is reconcilable via cello_check_notifications
-    // across daemon restarts, not just within one process (INV-PUSHPULL). Additive table.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS message_watermarks (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        last_delivered_seq INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id)
-      )
-    `);
-
-    // M8C-CONTACT-1: binary per-agent contact whitelist. This is an ACCESS-CONTROL LIST, not a
-    // setting — it belongs alongside message_watermarks/sessions as its own real subsystem, not
-    // behind the parked M9-CFG-001 config store. Identity PINS to the pubkey at add time (never
-    // re-resolved); known stays known until explicitly removed (no TTL/expiry on membership).
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS contacts (
-        agent_id TEXT NOT NULL,
-        pubkey TEXT NOT NULL,
-        added_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, pubkey)
-      )
-    `);
-    // MONIKER-3 AC1: the receiver's own pet name for a pubkey — the top tier of whoLabel.
-    // SQLite has no ADD COLUMN IF NOT EXISTS, so the ALTER is PRAGMA-guarded to stay
-    // idempotent; existing rows → NULL, no data loss.
-    // M10B / DOD-END-SURFACE-1 — per-counterparty presentation choice.
-    //
-    // `default_present` on the signal answers "show this by default"; this answers "show THIS signal
-    // to THIS person", which is the finer question an operator actually has: an endorsement that is
-    // right for a prospective client is not necessarily right for a competitor. Absent row = no
-    // opinion → the signal's own default applies, so this table only ever holds explicit choices.
-    //
-    // Keys on `agent_id`, never `agent_name` — the name is a mutable display label that is reusable
-    // after retirement, so keying on it would silently hand a NEW agent the retired one's
-    // disclosure choices. Same key as `contacts`, which this is an extension of.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS contact_signal_prefs (
-        agent_id TEXT NOT NULL,
-        contact_pubkey TEXT NOT NULL,
-        signal_hash TEXT NOT NULL,
-        present INTEGER NOT NULL,
-        set_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, contact_pubkey, signal_hash)
-      )
-    `);
-    /**
-     * DOD-M15-SEALWIRE-1 bullet 5: authorship columns on an EXISTING transcript.
-     *
-     * BEFORE `migrateSessionTablesToAgentId` — the rebuild copies the intersection of old and new
-     * columns, so a column added after it would be dropped on the upgrade boot and re-added empty.
-     * These have their second entry in that migration's pinned DDL; `DOD-M15-MIGRATION-GUARD-1`
-     * fails the build if the two ever disagree.
-     *
-     * `addColumnIfMissing` rather than a bare try/catch: it swallows ONLY `duplicate column name`
-     * and rethrows anything else, so broken DDL cannot be mistaken for "already applied".
-     */
-    // Written as three LITERAL statements rather than a loop over a column array. A loop needs its
-    // own parser in the guard (as retry_queue does); literals are read by the guard's generic one,
-    // so these are replayed automatically and cannot fall outside it.
-    addColumnIfMissing(this.#db, this.#logger, {
-      table: "transcript", column: "sender_pubkey",
-      sql: "ALTER TABLE transcript ADD COLUMN sender_pubkey TEXT",
-    });
-    addColumnIfMissing(this.#db, this.#logger, {
-      table: "transcript", column: "sender_sig",
-      sql: "ALTER TABLE transcript ADD COLUMN sender_sig BLOB",
-    });
-    addColumnIfMissing(this.#db, this.#logger, {
-      table: "transcript", column: "attribution",
-      sql: "ALTER TABLE transcript ADD COLUMN attribution TEXT NOT NULL DEFAULT 'local_session_state'",
-    });
-
-    const contactCols = this.#db.prepare("PRAGMA table_info(contacts)").all() as Array<{ name: string }>;
-    if (!contactCols.some((c) => c.name === "moniker")) {
-      this.#db.exec("ALTER TABLE contacts ADD COLUMN moniker TEXT");
-    }
-
-    // DOD-AGENT-ID-JOINKEY-1: finish REMOVE-001. Re-key the seven child tables from the mutable,
-    // reuse-freed `agent_name` to the stable `agent_id`, in ONE transaction. Runs AFTER every
-    // CREATE/ALTER above, so an existing table has its full historical column set before it is
-    // rebuilt, and BEFORE any read below touches it. A no-op once the tables carry `agent_id`.
-    //
-    // `retry_queue` (the seventh) is created later, by RetryQueue's constructor. On an existing
-    // database it already exists here and is re-keyed in the same transaction; on a fresh one it is
-    // absent, is skipped, and RetryQueue then creates it directly in the re-keyed shape.
-    migrateSessionTablesToAgentId(this.#db, this.#logger);
-
-    /**
-     * DOD-M15-DIVERGE-DURABLE-1: rehydrate the divergence set from `sessions.diverged_at`.
-     *
-     * AFTER `migrateSessionTablesToAgentId`, not with the column migrations that create the field.
-     * The query joins `sessions.agent_id` to `agents`, and on a database written before REMOVE-001
-     * that column does not exist until this migration adds it — placing the load earlier failed
-     * with `no such column: s.agent_id` on exactly those legacy databases, which are the ones a
-     * restart matters most for.
-     */
-    this.#records.loadDivergedFromDb();
-
-    // DOD-TIER-1 (address-book Step 1): give `contacts` its tier metadata (tier / provenance /
-    // last_offered_moniker / away_message). Pure ADD COLUMN, no rebuild — so it runs AFTER the
-    // agent-id re-key above (it never needs to appear in that migration's pinned DDL) and BEFORE any
-    // read below. Idempotent, no column DEFAULT, grandfathers existing contacts to WHITELISTED once.
-    migrateContactsAddTierMetadata(this.#db, this.#logger);
-
-    // §1.1: normalize frost_commitments / frost_verifying_shares to ONE CBOR encoding. Registration
-    // wrote them with the shared encoder; the refresh path wrote them with cbor-x's bare `encode`,
-    // so an agent's share blobs changed format the first time it ran `cello_refresh_shares` and both
-    // formats are on disk. Both producers now use encodeCbor; this rewrites what is already stored.
-    // Idempotent (a canonical blob re-encodes to itself and is skipped) and per-row fail-safe (an
-    // undecodable share is LEFT ALONE, never dropped — losing key material is worse than an old
-    // encoding cbor-x still reads).
-    migrateCborBlobsToCanonical(this.#db, this.#logger);
-
-    // M8C-TGDOOR-1: daemon-wide Telegram settings (bot token + allowlisted operator chat). A
-    // NEW dedicated table — NOT folded into the parked M9-CFG-001 config store, because a bot
-    // token has no sensible default (a required credential, unlike AWAY/TTL/CONTACT's real
-    // defaults) and can't legitimately wait for M9. Singleton row (id=1) — "token = daemon
-    // setting" (DoD), not per-agent.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS telegram_settings (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        bot_token TEXT NOT NULL,
-        allowlisted_chat_id TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      )
-    `);
-
-    // DOD-RENAME-1 (Option C): pending rename notices — one per (agent, contact). A notice is queued
-    // when a peer the operator has PERSONALLY NAMED offers a self-declared name that differs from the
-    // last one seen; it surfaces through cello_check_notifications (NOT a real-time push) and clears
-    // when the operator adopts a name (cello_contact_set_moniker) or removes the contact. Keyed on
-    // agent_id (the stable key); the offered name is charset-validated at the wire boundary but still
-    // operator-untrusted, so surfaces render it as a quoted CLAIM.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS contact_rename_notices (
-        agent_id TEXT NOT NULL,
-        pubkey TEXT NOT NULL,
-        offered_name TEXT NOT NULL,
-        noticed_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, pubkey)
-      )
-    `);
-
-    /**
-     * A PUBLIC KEY IS BYTES; ITS HEX CASE IS NOT PART OF ITS IDENTITY.
-     *
-     * ⚠️ **PLACED HERE FOR TWO ORDERING REASONS, and getting either wrong is a crash at boot.** It
-     * touches all three contact-keyed tables, so it runs after the LAST of them exists
-     * (`contact_rename_notices`, directly above); and the merge it performs on a collision keeps the
-     * more restrictive TIER, which it cannot read until `migrateContactsAddTierMetadata` has added
-     * that column.
-     *
-     * Normalizing the accessors alone would be worse than the bug for anyone who already has a
-     * mixed-case row: the row becomes UNREACHABLE rather than merely wrong, taking its block, its
-     * away message and its pet name with it. Idempotent and silent on a clean database.
-     */
-    foldContactPubkeyCase(this.#db, this.#logger);
-
-    // DOD-M15-NO-SILENT-REFUSAL-1: refusal notices — one per (agent, session, reason). Written every
-    // time an inbound message is refused; read by cello_receive and by the cello_inbox pull. Modelled
-    // on contact_rename_notices above and keyed the same way, on agent_id (the stable key) — the map
-    // this replaced was keyed on agent_name, a mutable display label, which was its second bug.
-    //
-    // DURABLE because the case this exists for is NOBODY ATTENDING. A notice held only in memory is
-    // lost to a restart and is only ever surfaced to whoever happens to call cello_receive on that
-    // exact session, which is a log line with extra steps.
-    //
-    // `content_refusal_reads` is the part rename notices do not need: they clear on operator action,
-    // these are read non-destructively PER CONSUMER. Two MCP windows attending one agent is ordinary,
-    // and under a single surfaced flag the first reader consumed the notice and the second was told
-    // nothing, permanently.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS content_refusal_notices (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        impact TEXT NOT NULL,
-        guidance TEXT NOT NULL,
-        count INTEGER NOT NULL,
-        first_at INTEGER NOT NULL,
-        last_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id, reason)
-      )
-    `);
-    /**
-     * DOD-M15-REFUSALTERMINAL-1 — the lifetime refusal count, which `content_refusal_notices` is
-     * NOT and never was.
-     *
-     * `cello_dismiss` DELETEs the notice row (`dismissContentRefusals`), so `notices.count` restarts
-     * at 1 after every dismissal. That is correct for the notice — the operator said "I know" and
-     * the next announcement should describe what happened since — and it is exactly why the number
-     * shown beside it cannot be described as a lifetime figure. Live on 2026-09-04 an inbox reported
-     * `times: 58` for a refusal that had fired tens of thousands of times.
-     *
-     * A separate table rather than a column, because the two have different lifetimes: this one is
-     * never deleted by anything an operator does. Same key, so the read is one LEFT JOIN.
-     */
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS content_refusal_totals (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        total INTEGER NOT NULL,
-        first_at INTEGER NOT NULL,
-        last_at INTEGER NOT NULL,
-        -- 1 when this row was SEEDED from an existing notice at upgrade rather than counted from
-        -- the first refusal. Its total is then a LOWER BOUND, not a figure, and the drain reports
-        -- it under a different field name so a reader cannot mistake one for the other.
-        seeded INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (agent_id, session_id, reason)
-      )
-    `);
-    /**
-     * ⚠️ **THE BACKFILL, and without it this unit ships the original lie with the new name on it.**
-     *
-     * Review finding 1. A new table is created EMPTY. Every daemon that already has refusal notices
-     * — including the one that produced this incident, whose notice sat at 58 — would report
-     * `times_since_dismissed: 59` beside a `times_total` of **1**, on the very field the guidance
-     * tells an operator to judge severity by. Smaller than the number it exists to dwarf.
-     *
-     * `count` is the best figure available at upgrade and it is a LOWER BOUND: dismissals before
-     * this build deleted history nothing can recover. So the row is marked `seeded` and reported as
-     * "at least", never as a total. A lower bound is a true statement; `total = 1` is not.
-     *
-     * `INSERT OR IGNORE` makes it idempotent and self-healing — it fills only rows that do not
-     * exist, so a real counted total is never overwritten by a seeded one, and running it at every
-     * boot costs one indexed scan of a table bounded by (sessions × reasons).
-     */
-    /**
-     * ⚠️ **AND `CREATE TABLE IF NOT EXISTS` IS A NO-OP AGAINST A TABLE THAT ALREADY EXISTS** —
-     * review F1b, and it is the same hazard `DOD-M12B-INDEX-1` records for `held_content.origin`
-     * three hundred lines above.
-     *
-     * The table shipped one commit earlier WITHOUT `seeded`, and that build ran on a real daemon to
-     * take this unit's live measurement. On that machine the `CREATE` does nothing, the backfill
-     * below names a column that is not there, and the throw comes out of schema init — **the daemon
-     * does not open at all.** The one machine that most needs the backfill is the one it would have
-     * bricked.
-     */
-    try {
-      this.#db.exec("ALTER TABLE content_refusal_totals ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0");
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!/duplicate column name/i.test(msg)) throw err;
-    }
-    this.#db.exec(`
-      INSERT OR IGNORE INTO content_refusal_totals
-        (agent_id, session_id, reason, total, first_at, last_at, seeded)
-      SELECT agent_id, session_id, reason, count, first_at, last_at, 1
-        FROM content_refusal_notices
-    `);
-    /**
-     * ⚠️ **THE INVARIANT: a lifetime total can never be SMALLER than a since-dismissal count.**
-     * Caught on the live daemon, not by review — the inbox read
-     * `times_since_dismissed: 78, times_total: 12`.
-     *
-     * `INSERT OR IGNORE` above only fills rows that are ABSENT. A row that already exists but began
-     * counting AFTER the notice did — the totals table shipped one commit before `seeded`, so its
-     * rows default to 0 and claim to be exact — is left alone, and then presents a partial tally as
-     * a lifetime figure. Smaller than the number beside it, which is the tell.
-     *
-     * `count` resets on dismissal and `total` does not, so in healthy operation `total >= count`
-     * always. `count > total` therefore means one thing only: this row's total did not start at the
-     * beginning. Repaired to the best floor available and marked `seeded`, because that is what it
-     * is. Runs at every boot — it is also the repair for a totals write that failed while the
-     * notice's succeeded.
-     */
-    this.#db.exec(`
-      UPDATE content_refusal_totals
-         SET total = (SELECT n.count FROM content_refusal_notices n
-                       WHERE n.agent_id = content_refusal_totals.agent_id
-                         AND n.session_id = content_refusal_totals.session_id
-                         AND n.reason = content_refusal_totals.reason),
-             seeded = 1
-       WHERE EXISTS (SELECT 1 FROM content_refusal_notices n
-                      WHERE n.agent_id = content_refusal_totals.agent_id
-                        AND n.session_id = content_refusal_totals.session_id
-                        AND n.reason = content_refusal_totals.reason
-                        AND n.count > content_refusal_totals.total)
-    `);
-    /**
-     * DOD-M15-REFUSALTERMINAL-1 — content this agent will never accept, so the daemon stops going
-     * to fetch it.
-     *
-     * **DURABLE BECAUSE THE DEFECT CROSSED RESTARTS.** The 62-hour loop spanned several `cello
-     * login` cycles; a marker held in a `Set` on the manager would have passed every test and
-     * shipped nothing.
-     *
-     * NOT the `'quarantined'` transcript row, which is the natural candidate and does not work: it
-     * is keyed on the BYTES, and the fetch scheduler is keyed on the content hash the sender
-     * committed to. On the two refusals where those provably differ (a tamper, an algorithm we
-     * cannot read) the row cannot answer the question this table is asked.
-     *
-     * Keyed on `agent_id` — the stable key. `agent_name` is a display label.
-     */
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS terminal_content_refusals (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        content_hash TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        marked_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id, content_hash)
-      )
-    `);
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS content_refusal_reads (
-        agent_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        reason TEXT NOT NULL,
-        consumer_id TEXT NOT NULL,
-        seen_count INTEGER NOT NULL,
-        seen_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, session_id, reason, consumer_id)
-      )
-    `);
-
-    // DOD-SETTINGS-1: a daemon-side per-agent settings store for REACHABILITY POLICY (the tier bounds
-    // overrides and the per-tier/agent away messages). A generic key-value table on the stable
-    // agent_id, in the same SQLCipher DB. Deliberately NOT M9-CFG-001's gateway config store: this is
-    // daemon reachability policy, not gateway SCREENING config, and the M9 store is unwired + plaintext.
-    // reconcile with DOD-CONFIG-1 later; this is daemon reachability policy, not gateway config.
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS agent_settings (
-        agent_id TEXT NOT NULL,
-        key TEXT NOT NULL,
-        value TEXT NOT NULL,
-        updated_at INTEGER NOT NULL,
-        PRIMARY KEY (agent_id, key)
-      )
-    `);
-
-    // M10 / DOD-STORE-CLIENT-1: the two trust-signal tables (wallet + received). Created HERE and
-    // deliberately last: `contact_trust_signals` carries a composite FK to `contacts(agent_id,
-    // pubkey)`, so its parent must exist and must already have been through the agent-id re-key
-    // above. SQLite resolves an FK's parent at DML time, not DDL time — so getting this order wrong
-    // would not fail here, it would fail on the first insert, which is a far worse place to find out.
-    ensureTrustSignalSchema(this.#db, this.#logger);
+    ensureSessionSchema(this.#db, this.#logger, () => this.#records.loadDivergedFromDb());
 
     // Step 2: Detect interrupted sessions (SIGKILL detection — AC-010).
     // Any 'active' row in a freshly-started daemon is a remnant of a prior
@@ -2450,18 +1587,7 @@ export class SessionNodeManager {
     return this.#db;
   }
 
-  /**
-   * DOD-M15-RELAYONLY-1: is the settings store readable RIGHT NOW?
-   *
-   * ⚠️ Exists because `getSetting` cannot answer it. That method returns `null` for BOTH "the key is
-   * unset" and "there is no database", and a security setting must tell those apart: unset-means-off
-   * is correct, db-gone-means-off publishes the operator's real address during the shutdown window.
-   * `getDb()` cannot stand in either — it THROWS when there is no database, which on a catch-less
-   * ceremony path is worse than the wrong answer.
-   */
-  hasDatabase(): boolean {
-    return this.#db !== null;
-  }
+
 
   /**
    * DOD-M15-RELAYONLY-1: build a transport node for THIS AGENT, with its privacy posture applied.
@@ -2702,86 +1828,20 @@ export class SessionNodeManager {
 
 
 
-  /**
-   * DOD-COATTEND-1 (review F5) — the single next RECEIVED message after `afterSeq`, or null.
-   *
-   * The delivery path asks this question inside a 20 ms poll, so it is asked ~47 times a second per
-   * blocked connection — ~1,400 times over a default 30 s receive. Answering it with
-   * `readTranscript()` meant, every single time: SELECT every row of the session with no predicate
-   * and no limit, `TextDecoder().decode()` every blob in it, build the array, then `.find()` one
-   * row and discard the rest. On a 200-message session with three co-attending connections blocking
-   * — which is the M8D use case, not a worst case — that is tens of thousands of blob decodes per
-   * second on the daemon's single synchronous SQLCipher handle, contending with the write path.
-   *
-   * The predicate belongs in SQL. This is O(1) on the existing (agent_id, session_id, sequence)
-   * key and decodes exactly the one blob it returns.
-   */
-  findNextReceivedAfter(
-    agentName: string,
-    sessionId: string,
-    afterSeq: number,
-  ): { sequence: number; text: string } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare(
-        `SELECT sequence, blob FROM transcript
-         WHERE agent_id = ? AND session_id = ? AND direction = 'received' AND sequence > ?
-         ORDER BY sequence ASC LIMIT 1`,
-      )
-      .get(this.#requireAgentId(agentName), sessionId, afterSeq) as { sequence: number; blob: Uint8Array } | undefined;
-    if (!row) return null;
-    const blob = row.blob instanceof Uint8Array ? row.blob : new Uint8Array(row.blob);
-    return { sequence: row.sequence, text: new TextDecoder().decode(blob) };
-  }
+
 
   // ─── M8C-INBOX-1 (N2/N3): read-watermark accessors ───────────────────────────
 
-  /** The highest RECEIVED transcript sequence delivered to the operator for (agent, session).
-   *  -1 when nothing has been delivered yet (so a seq-0 message reads as unread). */
-  getLastDeliveredSeq(agentName: string, sessionId: string): number {
-    if (!this.#db) return -1;
-    const row = this.#db
-      .prepare("SELECT last_delivered_seq FROM message_watermarks WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { last_delivered_seq: number } | undefined;
-    return row ? row.last_delivered_seq : -1;
-  }
-
-  /** Advance the read watermark (delivery marks read). MONOTONIC — never lowers, so a replayed or
-   *  out-of-order cello_receive cannot un-read already-read messages. */
-  advanceLastDeliveredSeq(agentName: string, sessionId: string, seq: number): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare(
-        `INSERT INTO message_watermarks (agent_id, session_id, last_delivered_seq)
-         VALUES (?, ?, ?)
-         ON CONFLICT(agent_id, session_id)
-         DO UPDATE SET last_delivered_seq = MAX(last_delivered_seq, excluded.last_delivered_seq)`,
-      )
-      .run(this.#requireAgentId(agentName), sessionId, seq);
-    this.#logger.info("message.watermark.advanced", { agentName, sessionId, sequence: seq });
-  }
 
 
 
 
 
 
-  /** DOD-SEALED-INBOX-1: mark a terminal session as dismissed — sets read_at to now.
-   *  Only valid for terminal sessions; active/interrupted sessions return session_not_terminal. */
-  dismissSession(agentName: string, sessionId: string): { ok: true } | { ok: false; reason: string } {
-    if (!this.#db) return { ok: false, reason: "db_not_open" };
-    const agentId = this.#requireAgentId(agentName);
-    const row = this.#db
-      .prepare("SELECT status FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(agentId, sessionId) as { status: string } | undefined;
-    if (!row) return { ok: false, reason: "session_not_found" };
-    const terminal = ["sealed", "abandoned", "seal_interrupted_pending", "interrupted"];
-    if (!terminal.includes(row.status)) return { ok: false, reason: "session_not_terminal" };
-    this.#db
-      .prepare("UPDATE sessions SET read_at = ? WHERE agent_id = ? AND session_id = ?")
-      .run(Date.now(), agentId, sessionId);
-    return { ok: true };
-  }
+
+
+
+
 
 
 
@@ -2852,21 +1912,6 @@ export class SessionNodeManager {
 
 
 
-  /** DOD-RENAME-1: pending rename notices for an agent, oldest first (surfaced in
-   *  cello_check_notifications — an INBOX pull, never a real-time push). */
-  getRenameNotices(agentName: string): Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }> {
-    if (!this.#db) return [];
-    // JOIN the local pet name so the notice can NAME the contact (AC3) — a notice only ever fires for
-    // a personally-named contact, so moniker is expected non-null (LEFT JOIN is defensive).
-    return this.#db
-      .prepare(
-        `SELECT n.pubkey, n.offered_name, n.noticed_at, c.moniker
-         FROM contact_rename_notices n
-         LEFT JOIN contacts c ON c.agent_id = n.agent_id AND c.pubkey = n.pubkey
-         WHERE n.agent_id = ? ORDER BY n.noticed_at ASC`,
-      )
-      .all(this.#requireAgentId(agentName)) as Array<{ pubkey: string; offered_name: string; noticed_at: number; moniker: string | null }>;
-  }
 
 
 
@@ -2878,27 +1923,8 @@ export class SessionNodeManager {
 
 
 
-  /**
-   * M8C-ABUSE-1: cumulative inbound byte total for a session (anti-drip-feed accounting).
-   *
-   * ⚠️ DOD-M15-REFUSEDEVIDENCE-1 — QUARANTINED BYTES COUNT, and the bound depends on it.
-   *
-   * Retaining refused messages puts real bytes on the operator's disk. Left out of this sum,
-   * retention would be an UNBOUNDED SIDE CHANNEL: a counterparty who can get messages refused —
-   * anyone who can trip the screener, which is anyone — stores against a budget that cannot see
-   * what they spent. Counting them makes total retention per session bounded by the same tier cap
-   * that bounds delivery, which is the bound the unit's no-truncation rule rests on.
-   *
-   * No new capability reaches an attacker from this: the counterparty already spends the session's
-   * byte budget by sending ordinary messages. Spending it with refused ones costs them the same.
-   */
-  #getReceivedBytesTotal(agentName: string, sessionId: string): number {
-    if (!this.#db) return 0;
-    const row = this.#db
-      .prepare("SELECT COALESCE(SUM(LENGTH(blob)), 0) AS total FROM transcript WHERE agent_id = ? AND session_id = ? AND direction IN ('received','quarantined')")
-      .get(this.#requireAgentId(agentName), sessionId) as { total: number };
-    return row.total;
-  }
+
+
 
   
 
@@ -2930,47 +1956,7 @@ export class SessionNodeManager {
     });
   }
 
-  /**
-   * DOD-M15-REFUSEDEVIDENCE-1: read retained refused messages back — all of a session's, or the one
-   * at `sequence`.
-   *
-   * Returns the RAW payload. Every caller that hands it to a reader must frame it first
-   * (`frameQuarantinedPayload`); nothing else in the tree may read this without doing so.
-   */
-  readQuarantined(agentName: string, sessionId: string, sequence?: number): QuarantinedRecord[] {
-    if (!this.#db) return [];
-    const rows = this.#db
-      .prepare(
-        `SELECT sequence, blob, created_at, sender_pubkey, sender_sig, attribution, quarantine_reason
-         FROM transcript
-         WHERE agent_id = ? AND session_id = ? AND direction = 'quarantined'
-           ${sequence === undefined ? "" : "AND sequence = ?"}
-         ORDER BY sequence ASC`,
-      )
-      .all(...(sequence === undefined
-        ? [this.#requireAgentId(agentName), sessionId]
-        : [this.#requireAgentId(agentName), sessionId, sequence])) as Array<{
-          sequence: number; blob: Uint8Array; created_at: number;
-          sender_pubkey: string | null; sender_sig: Uint8Array | null;
-          attribution: string; quarantine_reason: string | null;
-        }>;
-    return rows.map((r) => ({
-      sequence: r.sequence,
-      /**
-       * ⚠️ NOT `?? "refused"` — review F11. A generic default here is a label for a state that
-       * cannot occur: the column exists before any `'quarantined'` row can be written and
-       * `#quarantineRefusedContent` always supplies a reason. A default reads to the next maintainer
-       * as a supported case and would quietly stand in for a real bug. If a NULL ever appears, the
-       * empty reason travels to the frame and the caller, which is loud enough to chase.
-       */
-      reason: r.quarantine_reason as string,
-      content: r.blob instanceof Uint8Array ? r.blob : new Uint8Array(r.blob),
-      senderPubkeyHex: r.sender_pubkey,
-      senderSig: r.sender_sig === null ? null : (r.sender_sig instanceof Uint8Array ? r.sender_sig : new Uint8Array(r.sender_sig)),
-      attribution: r.attribution,
-      createdAt: r.created_at,
-    }));
-  }
+
 
   /** The metadata half of a framed quarantine read — everything known ABOUT the message, none of it
    *  taken from the message. Split out so the framing module never touches the database. */
@@ -2998,60 +1984,11 @@ export class SessionNodeManager {
     };
   }
 
-  /** M8C-ABUSE-1 (reviewer HIGH fix, D18): bytes currently sitting in the out-of-order hold
-   *  buffer for this session — NOT yet committed leaves, but real bytes in memory that would
-   *  otherwise let multiple held chunks each individually pass the size gate while cumulatively
-   *  exceeding it once #releaseHeld drains them. */
-  #getHeldBytesTotal(agentName: string, sessionId: string): number {
-    // DOD-M12B-STRAND-1: hydrate first. Reading the Map before the durable holds are back
-    // under-counts, and this gate exists to stop several held chunks each passing the size cap
-    // individually while cumulatively exceeding it — an under-count is the bypass.
-    this.#ensureHeldRestored(agentName, sessionId);
-    const held = this.#heldContent.get(this.#k(agentName, sessionId));
-    if (!held) return 0;
-    let total = 0;
-    for (const entry of held.values()) total += entry.content.length;
-    return total;
-  }
 
-  /** M8C-ABUSE-1: non-terminal sessions this agent currently holds with the given counterparty.
-   *  Reviewer HIGH fix (aeffb82f, D18): counting `status = 'active'` ONLY let a counterparty
-   *  evade the bound for free by disconnecting (a trivial, attacker-controlled action that flips
-   *  a session to 'interrupted' — markInterruptedWithDetails) and opening a fresh session,
-   *  repeated indefinitely. 'interrupted' sessions still accept content (ingestReceivedContent
-   *  explicitly allows both statuses) and are NOT terminal (sealed/seal_interrupted_pending are),
-   *  so they must still count against the bound. */
-  countActiveSessionsForCounterparty(agentName: string, counterpartyPubkey: string): number {
-    if (!this.#db) return 0;
-    const row = this.#db
-      .prepare(CAP_COUNT_SQL("agent_id = ? AND counterparty_pubkey = ?"))
-      .get(this.#requireAgentId(agentName), counterpartyPubkey, capStaleBefore()) as { n: number };
-    return row.n;
-  }
 
-  /** M8C-ABUSE-1 (anti-swarm) + DOD-TIER-2: non-terminal sessions this agent holds with UNKNOWN-tier
-   *  counterparties — the global cap counts across the whole stranger pool. A sender is exempt from
-   *  THIS pool iff it is a KNOWN+ contact (tier >= KNOWN); a bare stranger (no row → UNKNOWN) or an
-   *  explicitly UNKNOWN-tier contact both count. Keying on `tier >= KNOWN` (bounded to <= VIP so a
-   *  corrupt high value cannot grant pool-exemption) replaces the old row-existence proxy, which
-   *  would have let a merely-recorded UNKNOWN contact escape the anti-swarm cap. Same
-   *  'interrupted'-status fix as countActiveSessionsForCounterparty above. */
-  countActiveSessionsFromUnknownSenders(agentName: string): number {
-    if (!this.#db) return 0;
-    const row = this.#db
-      .prepare(
-        `SELECT COUNT(*) AS n FROM sessions s
-         WHERE s.agent_id = ?
-           AND ${CAP_COUNTS("s")}
-           AND NOT EXISTS (
-             SELECT 1 FROM contacts c
-             WHERE c.agent_id = s.agent_id AND c.pubkey = s.counterparty_pubkey
-               AND c.tier >= ${TIER.KNOWN} AND c.tier <= ${TIER.VIP}
-           )`,
-      )
-      .get(this.#requireAgentId(agentName), capStaleBefore()) as { n: number };
-    return row.n;
-  }
+
+
+
 
   /** M8C-ABUSE-1 + DOD-TIER-2/3: is a NEW inbound session from this counterparty within the
    *  acceptance bounds? The per-sender cap is now the sender's TIER cap (DEFAULT_TIER_BOUNDS), not a
@@ -3067,7 +2004,7 @@ export class SessionNodeManager {
   ): { ok: true } | { ok: false; reason: CapacityReason } {
     const tier = this.#records.getTier(agentName, counterpartyPubkey);
     const perSenderCap = this.#records.resolveTierBound(agentName, tier, "max_sessions");
-    const perSender = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
+    const perSender = this.#queries.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     if (perSender >= perSenderCap) {
       // BYTE-IDENTICAL to every other refusal, deliberately — DOD-TIER-3. A BLOCKED sender and an
       // over-cap UNKNOWN must be indistinguishable, or the refusal tells someone they are blocked.
@@ -3078,7 +2015,7 @@ export class SessionNodeManager {
     // The global stranger cap is only for the UNKNOWN pool. A KNOWN+ sender is past it by trust;
     // a BLOCKED sender was already refused above (cap 0).
     if (tier === TIER.UNKNOWN) {
-      const globalUnknown = this.countActiveSessionsFromUnknownSenders(agentName);
+      const globalUnknown = this.#queries.countActiveSessionsFromUnknownSenders(agentName);
       if (globalUnknown >= ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL) {
         return { ok: false, reason: CAPACITY_REASONS.ABUSE_BOUND_UNKNOWN_SESSIONS_GLOBAL };
       }
@@ -3412,8 +2349,9 @@ export class SessionNodeManager {
    * ONE daemon, so a bare session_id is ambiguous between them. This composite string key — the
    * agent name and the hex session id joined by a 0x1f unit separator (which appears in neither) —
    * is the key for every in-memory session-core map (#activeNodes, #trees, #receivedContent,
-   * #sessionLiveness, #contentDesynced, #responderSealSubmitted, #awaitingAck). #relayClients is
-   * already per-agent (its own key), and the standing receivers are keyed by agent name directly.
+   * #contentDesynced, #responderSealSubmitted, #awaitingAck) and for the per-session maps the
+   * collaborators own, which build the same key the same way. #relayClients is already per-agent
+   * (its own key), and the standing receivers are keyed by agent name directly.
    */
   #k(agentName: string, sessionId: string): string {
     return `${agentName}\x1f${sessionId}`;
@@ -3480,22 +2418,7 @@ export class SessionNodeManager {
     return this.#requireAgentId(agentName);
   }
 
-  /**
-   * Reverse lookup: the display name of a stable agent_id, or null if no such agent.
-   *
-   * Deliberately INCLUDES retired agents. Its caller (the startup awaiting-content re-park) holds an
-   * agent_id read off a durable row and needs a name to find that agent's standing receiver. A
-   * retired agent resolves to its name and then has no standing receiver, so the park fails cleanly
-   * and loudly — which is correct. Filtering retired agents out here would instead make the row
-   * unattributable and the failure mute.
-   */
-  agentNameForId(agentId: string): string | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT agent_name FROM agents WHERE agent_id = ?")
-      .get(agentId) as { agent_name: string } | undefined;
-    return row?.agent_name ?? null;
-  }
+
 
   /**
    * Create a new outbound session node.
@@ -3669,7 +2592,7 @@ export class SessionNodeManager {
     // Add to active map (keyed by (agentName, sessionId) — DOD-LOOP-1)
     // 006-CRYPTO: the session's throwaway keypair is minted here, with the node, so "a session is
     // active" and "a session has a key" are the same moment. All THREE activation paths mint.
-    this.#mintSessionEphemeral(agentName, sessionId);
+    this.#ephemerals.mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
@@ -3687,7 +2610,7 @@ export class SessionNodeManager {
     await this.#registerContentHandler(agentName, sessionId, node, counterpartyPubkey);
     // M7-SESSION-003 AC-004: act on the session node's peer events for direct-path
     // liveness. The session connection IS the authority for a direct session.
-    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, counterpartyPeerId);
+    this.#liveness.wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, counterpartyPeerId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: connect this session node to the relay as the
     // Structure-2 witness (non-fatal — direct content still works without it).
@@ -3817,7 +2740,7 @@ export class SessionNodeManager {
           onlineToken: () => this.getDirectoryOnlineToken(agentName),
           // DOD-M15-CORROBORATE-1: a relay's witness alert reaches the operator's inbox from here.
           // The DETACHED clients get the same callback from the builder in daemon.ts.
-          onWitnessAlert: (alert) => { this.recordRelayWitnessAlert(agentName, alert); },
+          onWitnessAlert: (alert) => { this.#witness.recordRelayWitnessAlert(agentName, alert); },
           onWitnessUnreadable: (relayPeerId, why) => { this.#records.recordRelayWitnessUnreadable(agentName, relayPeerId, why); },
         });
         this.#relayClients.set(clientKey, client);
@@ -4029,192 +2952,9 @@ export class SessionNodeManager {
     }
   }
 
-  /**
-   * M7-SESSION-003 AC-004: wire a session node's peer-connect / peer-disconnect
-   * events to per-session direct-path liveness. onPeerConnect → 'alive',
-   * onPeerDisconnect → 'gone', emitting session.liveness.changed at WARN. Combined
-   * with the transport keepalive (AC-005), a peer that vanished without a clean
-   * close still surfaces a disconnect and drives 'gone'.
-   *
-   * THE EVENT MUST BE FILTERED BY PEER (DOD-RELAY-KEEPALIVE-1 review, F2). The
-   * original wiring acted on EVERY peer event this node saw, justified by "the
-   * session node's gater restricts connections to the designated counterparty".
-   * That stopped being true: the session node also dials the RELAY as its
-   * Structure-2 witness (#connectSessionRelay), and the gater allows those peers
-   * outbound. So a relay link dropping declared the counterparty dead — at WARN,
-   * feeding the unilateral-seal gate — while the counterparty was sitting there
-   * perfectly alive. During the 2026-08-04 incident, when the relay link churned
-   * every 60-90 seconds, that fired continuously.
-   *
-   * `counterpartySessionPeerId` is the authority when known. When it is not (the
-   * peer id can be absent on a session whose assignment has not landed yet),
-   * every peer is honoured EXCEPT ones known to be relays for this session —
-   * degrading to the old over-eager behaviour minus its one known false positive,
-   * rather than to silence, because a liveness detector that never fires is worse
-   * than one that fires too often.
-   */
-  #wireSessionLiveness(
-    agentName: string,
-    sessionId: string,
-    node: CelloNode,
-    counterpartyPubkey: string,
-    correlationId: string,
-    counterpartySessionPeerId?: string,
-  ): void {
-    const key = this.#k(agentName, sessionId);
-    const isCounterparty = (peerId: string): boolean => {
-      if (counterpartySessionPeerId) return peerId === counterpartySessionPeerId;
-      const entry = this.#activeNodes.get(key);
-      return entry?.relayPeerId !== peerId;
-    };
-    /**
-     * Named rather than inline so the already-attached sweep below can invoke **this exact function**
-     * instead of a second copy of it. A copy is what would drift: the two would have to be kept in
-     * step by whoever edits either, and the failure would be silent.
-     */
-    const onCounterpartyAttached = (peerId: string): void => {
-      /**
-       * DOD-M12B-RESPONDER-ADDR-1 (review MEDIUM-4) — LEARN THE ADDRESS HERE, where it cannot race.
-       *
-       * The accept-time read was a race between two independent async chains: the responder accepts
-       * off a signaling frame, while the initiator dials only after its own `createSessionNode`. If
-       * accept looked before the dial landed it saw nothing, and the responder was back to holding
-       * no address — the state that made every reply after an interruption park forever.
-       *
-       * This fires exactly when the counterparty connects: on both sides, on the first connection,
-       * on every reconnect, and on a revived node too. It also REFRESHES, which the accept-time read
-       * never did — a counterparty that rebuilds its receiver would otherwise leave us dialling a
-       * dead address for the life of the session.
-       */
-      const observed = node
-        .getConnections()
-        .filter((c) => c.peerId === peerId && typeof c.remoteAddr === "string")
-        .map((c) => c.remoteAddr as string);
-      if (observed.length > 0) {
-        this.#counterpartyAddrs.set(key, [...new Set(observed)]);
-      }
-      const prior = this.#sessionLiveness.get(key);
-      this.#sessionLiveness.set(key, "alive");
-      if (prior !== "alive") {
-        this.#logger.info("session.liveness.changed", {
-          sessionId,
-          counterpartyPubkey,
-          transportPath: "direct",
-          liveness: "alive",
-          observedBy: "session_node",
-          correlationId,
-        });
-      }
-      /**
-       * DOD-M15-SEALWIRE-1 bullet 6 (part A) — ANNOUNCE OUR SALT STATE, here and nowhere else.
-       *
-       * This is the only hook that fires on BOTH sides for every way a session's direct path comes
-       * up: the initiator's first dial, the responder's inbound connection, every reconnect, and a
-       * revived node. `newStream` never dials — it only finds an already-open connection — so a
-       * send placed at `createSessionNode` would be an announcement to a peer that is not attached
-       * yet, and the responder's half has no dial of its own to hang one on at all.
-       *
-       * Fire-and-forget: a failed announcement must not turn a peer-connect handler into a rejected
-       * promise, and there is nothing to await it. We re-announce on the next connect, and
-       * `#handleSaltFrame` answers a peer contribution on a connection that is provably up — so a
-       * single lost frame does not strand the agreement.
-       */
-      void this.#sendSaltFrame(agentName, sessionId, correlationId);
-      // 007-CRYPTO: the signed ephemeral rides the SAME moment as the salt half — one connect, one
-      // round trip, the same peer-to-peer content stream. Fire-and-forget for the same reason: a
-      // failed announcement must not reject a peer-connect handler, and the next connect re-announces.
-      void this.#sendEphemeralFrame(agentName, sessionId, correlationId);
-    };
-    node.onPeerConnect(onCounterpartyAttached);
 
-    /**
-     * ⚠️ THE CONNECT THAT ALREADY HAPPENED — `DOD-M15-SALTANNOUNCE-LATE-1`.
-     *
-     * `onPeerConnect` above is `addEventListener("peer:connect", …)` (`core/transport/src/node.ts`),
-     * and **an event listener cannot fire for a connection that predates it.** On the
-     * `reuseStandingReceiver` path this session does not build a node — it TAKES the standing
-     * receiver's, which has been listening all along. So the ordinary sequence is:
-     *
-     *   1. `#tryCreateStandingReceiver` starts the node listening. It never calls this method, so
-     *      there is no handler yet.
-     *   2. The counterparty connects. `peer:connect` fires into nothing.
-     *   3. The session promotes that same node and registers the handler — one step too late.
-     *
-     * The handler then never runs, and everything hanging off it is silently skipped: **the salt is
-     * never announced** (`no_agreement_started`, the sender salts, the receiver holds none, and every
-     * message between them is refused) **and the counterparty's address is never learned or
-     * refreshed.** Measured live: `j-documents` 7 of 12 red, every failure a document update that
-     * never arrived, with no error shown to either operator.
-     *
-     * ⚠️ THE COMMENT ON THE HANDLER ABOVE NAMES THE OPPOSITE HAZARD, AND IT IS ALSO RIGHT: *"a send
-     * placed at `createSessionNode` would be an announcement to a peer that is not attached yet."*
-     * Both are real, which is why this is a SWEEP AFTER REGISTERING rather than a move. Too-early
-     * stays impossible — the sweep runs at the same point the handler is armed — and too-late stops
-     * being invisible, because an already-open connection is now looked at instead of waited for.
-     *
-     * Idempotent by construction: it invokes the SAME handler the event would have, so a peer that
-     * connects normally is unaffected, and a peer seen twice re-announces — which the announce path
-     * already tolerates (*"we re-announce on every reconnect"*).
-     */
-    try {
-      // `getConnections()` returns CONNECTIONS, and one peer can hold several — dedupe, or a peer
-      // with two open connections would run the attach path twice for no reason.
-      const attachedPeers = new Set(node.getConnections().map((c) => c.peerId));
-      for (const peerId of attachedPeers) {
-        if (!isCounterparty(peerId)) continue;
-        this.#logger.info("session.liveness.peer_already_attached", {
-          agentName, sessionId, peerId, correlationId,
-          impact: "this counterparty connected BEFORE the session's liveness handler was registered — on the standing-receiver promotion path that is the ordinary case, not a rare one. Running the attach path for it now: without this the salt is never announced (every message from the peer is then refused) and the counterparty's address is never learned.",
-        });
-        onCounterpartyAttached(peerId);
-      }
-    } catch (err: unknown) {
-      // Never let the sweep cost the caller its session: the handler is already armed, so a failure
-      // here degrades to exactly the behaviour that shipped before this fix.
-      this.#logger.warn("session.liveness.attached_sweep.failed", {
-        agentName, sessionId, correlationId, error: extractErrorMessage(err),
-        impact: "could not check for an already-attached counterparty. If one is attached, this session may never announce its salt and will refuse that peer's messages — the pre-fix behaviour.",
-      });
-    }
 
-    node.onPeerDisconnect((peerId: string) => {
-      if (!isCounterparty(peerId)) {
-        // Not silence: a relay link dropping is a real event, it is simply not a
-        // statement about the counterparty. It has its own signal
-        // (session.standing_receiver.reservation.lost / session.relay.reader.ended).
-        this.#logger.debug("session.liveness.unrelated_peer_disconnect", {
-          sessionId,
-          peerId,
-          correlationId,
-        });
-        return;
-      }
-      const prior = this.#sessionLiveness.get(key);
-      this.#sessionLiveness.set(key, "gone");
-      if (prior !== "gone") {
-        this.#logger.warn("session.liveness.changed", {
-          sessionId,
-          counterpartyPubkey,
-          transportPath: "direct",
-          liveness: "gone",
-          observedBy: "session_node",
-          correlationId,
-        });
-      }
-    });
-  }
 
-  /**
-   * M7-SESSION-003: read the direct-path counterparty liveness for a session.
-   * 'unknown' when no session node observation has occurred yet.
-   *
-   * DOD-M12B-ACK-1: 'impaired' is DAEMON-LOCAL and deliberately not on the relay's
-   * SessionLiveness wire type — the relay answers a different question (does it hold the
-   * recipient's standing connection) and its three states are a deployed bilateral contract.
-   */
-  getSessionLiveness(agentName: string, sessionId: string): "alive" | "impaired" | "gone" | "unknown" {
-    return this.#sessionLiveness.get(this.#k(agentName, sessionId)) ?? "unknown";
-  }
 
   /**
    * DOD-M12B-ACK-1 — live `/cello/content/1.0.0` stream counts on a session's direct path, or null
@@ -4247,142 +2987,13 @@ export class SessionNodeManager {
     }
   }
 
-  /**
-   * DOD-M12B-ACK-1 — the connection is up and delivery on it is not working.
-   *
-   * Liveness is otherwise driven ONLY by libp2p peer-connect/peer-disconnect, so it answers "is
-   * there a connection object?" while every surface that prints it is read as "can I talk to them?".
-   * Measured 2026-08-17: one session reported `alive` for 70 minutes after every write had started
-   * failing, another never stopped.
-   *
-   * ONLY 'gone' is protected, and 'gone' is NOT protected because a seal gate reads it — nothing in
-   * the code does. It is protected because the receive surface turns 'gone' into "call
-   * cello_close_session", and a failed write must never be able to produce that instruction.
-   *
-   * 'unknown' is DOWNGRADED just like 'alive', which is not obvious and is the point. A session
-   * whose recorded `counterpartySessionPeerId` has gone stale never sees a matching peer-connect,
-   * so it sits at 'unknown' while every send fails forever — the exact case documented at
-   * #wireSessionLiveness — and the receive surface renders 'unknown' as healthy-and-quiet, which is
-   * the 70-minute lie relocated one lane over. 'unknown' claims nothing; the surface built on it does.
-   */
-  #markSessionImpaired(
-    agentName: string,
-    sessionId: string,
-    opts: { cause: "direct_send" | "delivery_ack" | "content_key"; error: string; correlationId?: string },
-  ): void {
-    const key = this.#k(agentName, sessionId);
-    const prior = this.#sessionLiveness.get(key);
-    if (prior === "gone") {
-      // Declining is a decision, so it is logged. A silent early return here is the shape that let
-      // the original defect hide for a day: nothing recorded that writes were failing on a session
-      // every surface was still calling healthy.
-      this.#logger.debug("session.liveness.impairment.declined", {
-        sessionId, liveness: prior, cause: opts.cause, error: opts.error, correlationId: opts.correlationId,
-      });
-      return;
-    }
-    // The CAUSE is refreshed even when the state does not move, because the receive surface builds
-    // its guidance from it and a stale cause would describe the wrong failure.
-    this.#impairmentCause.set(key, { cause: opts.cause, retained: "unknown" });
-    if (prior === "impaired") return;
-    this.#sessionLiveness.set(key, "impaired");
-    this.#logger.warn("session.liveness.changed", {
-      sessionId,
-      counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
-      transportPath: "direct",
-      liveness: "impaired",
-      observedBy: opts.cause,
-      priorLiveness: prior ?? "unknown",
-      // `reason` is a contract string and `error` is the message — the convention every other
-      // failure log in this file follows. Collapsing them makes grouping by `reason` useless.
-      reason: "write_failed",
-      error: opts.error,
-      correlationId: opts.correlationId,
-    });
-  }
 
-  /**
-   * DOD-M12B-ACK-1 — what became of the content whose send caused the impairment.
-   *
-   * The receive surface has no memory of the last send, so without this it can only guess — and the
-   * guess it would make ("it was parked, do not resend") is FALSE in the two cases that matter
-   * most: a refused park whose durable enqueue was dropped, and one that threw. In both the message
-   * is gone and `cello_send` has already told the caller to send it again, so a receive that says
-   * "do not resend" contradicts it later, while the agent is sitting there waiting.
-   */
-  #noteImpairmentRetention(agentName: string, sessionId: string, retained: "parked" | "durable" | "lost"): void {
-    const key = this.#k(agentName, sessionId);
-    const current = this.#impairmentCause.get(key);
-    if (!current) return;
-    this.#impairmentCause.set(key, { cause: current.cause, retained });
-    /**
-     * ─── DOD-M15-NO-SILENT-REFUSAL-1: the notice fires HERE, and ONLY on `lost` ─────────────────
-     *
-     * ⚠️ **THE FIRST VERSION WROTE IT ON THE IMPAIRMENT TRANSITION, WHICH IS A SUCCESS PATH.**
-     *
-     * A direct send failing is the ORDINARY case when a counterparty is offline: the message is
-     * then parked with the relay and handed over when they come back, which is the leave-a-message
-     * feature working exactly as designed. Writing a notice at that moment told the operator "a
-     * message this side sent did not reach the counterparty" about a message that was in flight and
-     * would arrive — while `cello_send` was simultaneously telling them it was parked. Two surfaces,
-     * opposite stories, same message.
-     *
-     * By this line the outcome is known, and only one of the three is the operator's problem:
-     *   - `parked`   — with the relay, delivered when they come back. Nothing to tell.
-     *   - `durable`  — queued here, re-sent automatically. Nothing to tell.
-     *   - `lost`     — it could not be queued anywhere. It is gone, and only a resend recovers it.
-     *
-     * A FAILED ACK takes none of these branches (it never reaches this method), and that is correct:
-     * an acknowledgement this side owed them going missing costs the counterparty a redelivery, not
-     * the operator a message.
-     *
-     * NOT retracted when the connection recovers, unlike the impairment state it rides on: a
-     * recovered connection does not un-lose a message. That is also why the count is meaningful —
-     * it is the number of messages lost in this conversation, and it only ever grows.
-     */
-    if (retained !== "lost") return;
-    this.noteContentRefusal(agentName, sessionId, "outbound_message_lost", {
-      kind: REFUSAL_KINDS.OUTBOUND,
-      impact:
-        "a message you sent could not be delivered and could not be saved to send later, so it is gone. Nothing was added to the conversation and the other person never saw it. Everything you sent before it is unaffected.",
-      guidance:
-        "Send it again. This is the one case where resending is right — there is no copy of it anywhere, so nothing will deliver it for you. If it keeps happening, the connection to this person is not working: check cello_status for this conversation before sending anything long.",
-    });
-  }
 
-  /** DOD-M12B-ACK-1: why this session is impaired, for the surface that has to explain it. Null
-   *  when it is not impaired — a caller must not narrate a failure that is not current. */
-  getSessionImpairment(agentName: string, sessionId: string): SessionImpairment | null {
-    const key = this.#k(agentName, sessionId);
-    if (this.#sessionLiveness.get(key) !== "impaired") return null;
-    return this.#impairmentCause.get(key) ?? null;
-  }
 
-  /**
-   * DOD-M12B-ACK-1 — a delivery landed, so the impairment is over.
-   *
-   * Without this an `impaired` flag is a one-way door: one bad write would make a session report a
-   * broken conversation for the rest of its life, which is the same class of lie in the other
-   * direction. Called from BOTH send paths — an agent that mostly listens sends content rarely and
-   * ACKs constantly, so clearing only on content would leave exactly those sessions impaired
-   * forever. Only clears 'impaired': a successful write says nothing about a connection libp2p has
-   * already declared 'gone'.
-   */
-  #clearSessionImpairment(agentName: string, sessionId: string, observedBy: "direct_send" | "delivery_ack", correlationId?: string): void {
-    const key = this.#k(agentName, sessionId);
-    if (this.#sessionLiveness.get(key) !== "impaired") return;
-    this.#sessionLiveness.set(key, "alive");
-    this.#impairmentCause.delete(key);
-    this.#logger.info("session.liveness.changed", {
-      sessionId,
-      counterpartyPubkey: this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey,
-      transportPath: "direct",
-      liveness: "alive",
-      observedBy,
-      reason: "write_succeeded",
-      correlationId,
-    });
-  }
+
+
+
+
 
   /**
    * DOD-M12B-ABANDON-NOTIFY-1 — drive the REAL inbound content handler with one framed message and
@@ -4403,29 +3014,11 @@ export class SessionNodeManager {
     await this.#handleContentStream(agentName, sessionId, source, remotePeerId);
   }
 
-  /** DOD-CAP-SELF-HEAL-1 test seam: the shutdown sweep's effect, without a shutdown. Mirrors the
-   *  real UPDATE at gracefulShutdown so a test cannot pass against a label production never sets. */
-  markSessionsInterruptedByLocalShutdownForTest(): void {
-    // SCOPED TO UNLABELLED ROWS. Unscoped, this would relabel rows already marked
-    // `counterparty` — one call excusing every interruption every attacker ever caused, on every
-    // agent. Production never relabels; nor does this.
-    this.#db?.prepare("UPDATE sessions SET interrupted_by = 'local' WHERE status = 'interrupted' AND interrupted_by IS NULL").run();
-  }
 
-  /** DOD-CAP-SELF-HEAL-1 test seam: the counterparty's stream closing, without a real peer. */
-  markInterruptedByCounterpartyForTest(agentName: string, sessionId: string): void {
-    this.#db?.prepare(
-      "UPDATE sessions SET interrupted_by = 'counterparty' WHERE agent_id = ? AND session_id = ?",
-    ).run(this.#requireAgentId(agentName), sessionId);
-  }
 
-  /** Test seam (same spirit as getDb()): seed per-session direct-path liveness, which is otherwise
-   *  only set by the live node's onPeerConnect/onPeerDisconnect (#wireSessionLiveness). Lets a
-   *  DB-seeded test exercise the CC-5 reaper's "alive counterparty must survive" gate without standing
-   *  up a real libp2p peer connection. */
-  markSessionLivenessForTest(agentName: string, sessionId: string, state: "alive" | "impaired" | "gone"): void {
-    this.#sessionLiveness.set(this.#k(agentName, sessionId), state);
-  }
+
+
+
 
   /**
    * Hand the standing receiver to an inbound session.
@@ -4537,7 +3130,7 @@ export class SessionNodeManager {
     this.#standingReceivers.delete(agentName);
     // 006-CRYPTO: the hand-off path. A session promoted out of the standing receiver is as new as
     // one opened outbound, so it mints here too.
-    this.#mintSessionEphemeral(agentName, sessionId);
+    this.#ephemerals.mintSessionEphemeral(agentName, sessionId);
     this.#activeNodes.set(this.#k(agentName, sessionId), {
       node,
       agentName,
@@ -4598,7 +3191,7 @@ export class SessionNodeManager {
       });
     }
 
-    this.#wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, initiatorPeerId);
+    this.#liveness.wireSessionLiveness(agentName, sessionId, node, counterpartyPubkey, correlationId, initiatorPeerId);
 
     // M7 DOD-SPINE-6 / MSG-001-3b: the receiver also connects to the relay witness so
     // the relay can deliver the initiator's witnessed leaves (leaf_deliver) to it.
@@ -4761,18 +3354,17 @@ export class SessionNodeManager {
     this.#clearAwaitingForSession(agentName, sessionId);
     // M7-SESSION-003: drop the direct-path liveness flag (the seal gate already read
     // its verdict) so a destroyed/retired session retains no stale alive/gone state.
-    this.#sessionLiveness.delete(key);
+    this.#liveness.evictSession(agentName, sessionId);
     // M7-UPGRADE-002: drop the auto-acknowledge bookkeeping for a torn-down session.
     this.#contentDesynced.delete(key);
     /**
      * DOD-M15-NO-SILENT-REFUSAL-1 review N2: the UNPERSISTED half IS torn down, and only that half.
-     *
-     * `#refusalFallback` is in memory and restores exactly what the deleted Map did, so it belongs
-     * in the teardown set exactly as that Map did. Leaving it out meant a daemon that could not
+     * The in-memory fallback (now `RefusalNotices`' own, dropped by its `evictSession`) restores
+     * what the deleted Map did, so it belongs in the teardown set exactly as that Map did. Leaving it out meant a daemon that could not
      * write to disk — already in trouble — grew without bound in memory as well. The durable rows
      * stay, for the reason below.
      */
-    this.#refusalFallback.delete(key);
+    this.#notices.evictSession(agentName, sessionId);
     // DOD-M15-NO-SILENT-REFUSAL-1: the DURABLE notices are NOT torn down here, and the omission is
     // deliberate — this list is the documented teardown set, so anything absent from it needs a
     // reason. They live in `content_refusal_notices`, keyed on agent_id + session_id, and the
@@ -4805,16 +3397,12 @@ export class SessionNodeManager {
      * Decision #10 asks for. What must never happen is a NEW contribution mid-session without a
      * teardown, and that is why `#saltContributionFor` mints once rather than per send.
      */
-    this.#saltContributions.delete(key);
-    this.#sessionSalts.delete(key);
-    this.#saltRepairedAgainst.delete(key);
-    this.#saltRepairedAgainstFingerprint.delete(key);
-    this.#saltPeerClosedLabel.delete(key);
+    this.#salts.evictSession(agentName, sessionId);
     // The throwaway secret is destroyed where the `#activeNodes` entry is DROPPED, not here — see
     // `#destroySessionEphemeralFor`. This call is the belt to that braces: both teardown paths that
     // evict have already dropped the entry, so it is a no-op for them, and it is what catches any
     // future path that evicts without going through one of those.
-    this.#destroySessionEphemeralFor(agentName, sessionId);
+    this.#ephemerals.destroySessionEphemeralFor(agentName, sessionId);
     /**
      * B2b-2's three, and the pending one is SETTLED rather than dropped.
      *
@@ -4829,14 +3417,9 @@ export class SessionNodeManager {
      * once per revival is the right frequency too: it is what an operator reading a fresh log needs
      * in order to know why this session has no salt.
      */
-    this.#settleSaltPending(agentName, sessionId, "closed");
-    this.#hashedWithoutSalt.delete(key);
-    // DOD-M15-SALTSPLIT-1 HIGH-2: goes with its mirror. The session is being torn down, so there is
-    // no discard decision left for it to protect.
-    this.#hashedWithSalt.delete(key);
-    this.#saltSuspended.delete(key);
-    this.#unsaltedAnnounced.delete(key);
-    this.#saltLastOutcome.delete(key);
+    // SALTSPLIT-1 HIGH-2 goes with its mirror. SETTLED, never deleted: a send awaiting the
+    // agreement must be TOLD the session is gone, not left waiting on a promise nobody resolves.
+    this.#salts.settleSaltPending(agentName, sessionId, "closed");
     // HELD CONTENT IS LOST HERE, AND IT MUST SAY SO.
     //
     // These are frames we RECEIVED and VERIFIED and could not yet append, because the relay's
@@ -4907,8 +3490,7 @@ export class SessionNodeManager {
     // torn down and given a node again inside ONE process would never re-read its durable holds —
     // the frames would sit in the table, unreleasable, which is indistinguishable from the loss
     // this unit exists to stop.
-    this.#heldRestored.delete(key);
-    this.#heldReleased.delete(key);
+    this.#held.evictSession(agentName, sessionId);
     // DOD-M15-DIVERGE-1: `#diverged` is NOT evicted here, and the omission is the point.
     //
     // It was, and that made the gate that reads it best-effort in exactly the population it targets.
@@ -5133,8 +3715,7 @@ export class SessionNodeManager {
     // no per-session teardown fires for them, and this process is known to linger (a `cello logout`
     // was still alive 30+ seconds later). Without this, every live session's key survives the
     // shutdown in memory for as long as it lingers.
-    for (const ephemeral of this.#sessionEphemerals.values()) destroySessionEphemeral(ephemeral);
-    this.#sessionEphemerals.clear();
+    this.#ephemerals.destroyAll();
 
     // Stop ALL per-agent standing receivers (DOD-LOOP-1). In PARALLEL and BOUNDED: this was a
     // sequential await per agent with no deadline, so five agents meant five chances for one stuck
@@ -5173,270 +3754,13 @@ export class SessionNodeManager {
     }
   }
 
-  /**
-   * Return all sessions with a given status from SQLite.
-   * Used by cello status to surface interrupted sessions.
-   */
-  getSessionsByStatus(status: "active" | "sealed" | "interrupted"): SessionRecord[] {
-    if (!this.#db) return [];
-    // Spans EVERY agent (cello_status is daemon-wide), so no single name can be resolved up front —
-    // the display name is joined in from `agents`, its one source of truth. `agent_name` is no
-    // longer a `sessions` column, so without this join buildActiveSessions/buildInterruptedSessions
-    // read `row.agent_name` as undefined.
-    //
-    // DOD-AGENT-ID-JOINKEY-1 (reviewer Finding 1): INNER JOIN with `state != 'retired'`, NOT a bare
-    // LEFT JOIN. This is the LIVE-status + reaper surface, and a retired agent is gone from the
-    // runtime — its leftover session rows (kept for accountability, never re-statused) are not
-    // resumable and must not appear here. If they did, the half-open reaper would resolve their
-    // RETIRED name via #requireAgentId, which throws, taking down cello_status for the whole daemon.
-    // Excluding them also guarantees a non-null agent_name on every returned row. The full historical
-    // archive (getAllSessions) keeps its LEFT JOIN and still shows retired/orphaned rows.
-    return this.#db
-      .prepare(
-        `SELECT s.*, a.agent_name AS agent_name
-         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
-         WHERE s.status = ? AND a.state != 'retired'`,
-      )
-      .all(status) as unknown as SessionRecord[];
-  }
 
-  /**
-   * DOD-M12B-RESTART-SEAL-1 / DOD-M12B-PENDING-RESOLVE-1 — sessions that need a receipt and have
-   * nobody asking for one. TWO populations, one queue, each with its own safety argument.
-   *
-   * **(2) `seal_interrupted_pending` — a seal commitment nobody notarized.** Measured 2026-08-18 on
-   * the live store: 28 sessions, aged 0.3 to 12.8 days, one of them 14 messages long, 26 holding
-   * relay-witnessed seal leaves, and **not one with a sealed root**.
-   *
-   * **HALF OF THEM ARE NOT BILATERAL, and the first version of this comment claimed they were.**
-   * Measured split: 14 initiator rows, each carrying the counterparty's signed leaf — and 14
-   * responder rows with `counterparty_leaf = NULL`. A responder row is written by
-   * `inbound-seal-request.ts` from an UNSIGNED `seal_interrupted_request` frame, before its ack is
-   * even sent, so an ordinary send failure produces a one-sided pending row.
-   *
-   * So the licence is NOT "both parties signed". It is **somebody chose to end this**, on two
-   * branches: an initiator row carries the counterparty's signature, and a responder row exists
-   * because the counterparty sent a request to seal. And what makes the result VERIFIABLE is
-   * neither — it is that the directory rebuilds the tree from relay-witnessed leaves and checks
-   * their signatures, never consulting the commitment at all. The commitment is what makes it
-   * legitimate to ASK. (`close-session-handler.ts` states this in full; the first draft of this
-   * header contradicted it 200 lines away.) `PENDING-EXIT-1` built their exit and it works — but only when an operator runs
-   * `cello_close_session` on that session by hand, having somehow deduced they should. Nothing
-   * enumerated them, because both sweeps filtered `status = 'interrupted'`. An exit nobody is told
-   * about is not an exit.
-   *
-   * `interrupted_by` is deliberately NOT consulted for that population. It answers "did WE cause
-   * this, and may we therefore describe it" — and that is the wrong question once a seal was
-   * requested or signed. **SI-001 is not weakened:** it forbids notarizing *"a conversation nobody
-   * chose to end"*, and every row here was chosen to be ended by one side or the other. The only
-   * thing missing is the request to notarize it.
-   *
-   * **(1) `interrupted` — sessions our own stop orphaned, and only those.** Here `interrupted_by` is
-   * the whole safety argument. `'local'` means the boot sweep, the shutdown
-   * sweep, or the operator's own kill switch ended this session — nobody else did, and it cannot be
-   * resumed because the transport keypairs died with the process. Those are the ones the resolver
-   * may seal on its own.
-   *
-   * Everything else is excluded and must stay excluded:
-   *   'counterparty'        — they hung up. SI-001: the operator may still want to wait.
-   *   'relay_stream_close'  — our relay witness link ended; the session itself may be fine.
-   *   NULL                  — written before the column existed, so the cause is UNKNOWN. An
-   *                           unknown cause is not a licence to notarize; it is the reason not to.
-   *
-   * Same INNER JOIN discipline as getSessionsByStatus: a retired agent's rows are kept for
-   * accountability and are not resumable, so they are not offered for sealing either.
-   */
-  listRestartOrphanedSessions(): Array<{ agentName: string; sessionId: string; messageCount: number; status: "interrupted" | "seal_interrupted_pending" }> {
-    if (!this.#db) return [];
-    const rows = this.#db
-      .prepare(
-        // `message_count > 0` — a never-messaged interrupted session is a dead HANDSHAKE, which
-        // `classifySession` deliberately hides in the "failed" bucket so it does not clutter
-        // status. Sealing one spends a directory ceremony to obtain a receipt over nothing, and
-        // then moves it into the operator's CLOSED list, making the clutter visible. The whole
-        // justification for this work is "3,576 messages produced nothing" — zero messages is
-        // nothing to produce.
-        //
-        // `restart_seal_gave_up_at IS NULL` — a session we have already exhausted. Without it a
-        // machine restarting ~6 times a day re-runs five ceremonies against a hopeless session on
-        // every boot, forever.
-        `SELECT s.session_id AS session_id, s.message_count AS message_count, a.agent_name AS agent_name,
-                s.status AS status
-         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
-         WHERE a.state != 'retired'
-           AND (
-                 -- (1) OURS, and we can say so. SI-001 holds: an interrupted session with an
-                 -- unknown cause has no signatures behind it and must not be notarized.
-                 (s.status = 'interrupted' AND s.interrupted_by = 'local')
-                 -- (2) A seal commitment with nobody asking for it. review F5: the EXISTS is
-                 -- STRUCTURAL, not decoration. The header's licence is "a commitment was made", and
-                 -- a status check alone asserts that in prose while the query checks something
-                 -- else. Today status implies an artifact row by construction, which is exactly the
-                 -- kind of invariant that holds until someone adds a fourth writer.
-                 OR (s.status = 'seal_interrupted_pending'
-                     AND EXISTS (SELECT 1 FROM seal_interrupted_artifacts sa
-                                 WHERE sa.agent_id = s.agent_id AND sa.session_id = s.session_id))
-               )
-           AND s.message_count > 0
-           AND s.restart_seal_gave_up_at IS NULL
-         ORDER BY s.updated_at ASC`,
-      )
-      .all() as unknown as Array<{ session_id: string; message_count: number; agent_name: string; status: string }>;
-    return rows.map((r) => ({
-      agentName: r.agent_name,
-      sessionId: r.session_id,
-      messageCount: r.message_count ?? 0,
-      // Carried so a give-up can say something TRUE about this session: the two populations need
-      // different words, and force-abandon is right for one and destructive for the other.
-      status: r.status === "seal_interrupted_pending" ? "seal_interrupted_pending" as const : "interrupted" as const,
-    }));
-  }
 
-  /**
-   * DOD-M12B-REVIVAL-BOUND-1 — interrupted sessions that can no longer be revived, and must close.
-   *
-   * Andre, 2026-08-18: *"after that, those peer IDs and that peer connection needs to be shut down.
-   * It is an open connection that a malicious agent can farm for."* The tenet is **leave nothing
-   * open that is no longer needed**, and the threat model is a daemon that has been reprogrammed —
-   * so the guarantee has to hold on the side that is not the attacker.
-   *
-   * WHAT IS OPEN. `ingestReceivedContent` refuses `sealed`, `seal_interrupted_pending` and
-   * `abandoned`, but deliberately ACCEPTS `interrupted` — that acceptance is the only reason
-   * recovery can work. Nothing else ever leaves `interrupted`, so it means accepts FOREVER.
-   *
-   * **THIS IS THE BACKSTOP, NOT THE COMPLEMENT.** The seal path gets first refusal on every
-   * local-cause session, because a session whose ending we can describe truthfully earns a
-   * notarized receipt. But "the seal path owns it" is not the same as "the seal path will finish
-   * it", and two populations fall through the gap between those:
-   *
-   *   - **The resolver gave up.** `markRestartSealGaveUp` writes only `restart_seal_gave_up_at`;
-   *     the status stays `interrupted`, and `listRestartOrphanedSessions` then excludes the row by
-   *     `restart_seal_gave_up_at IS NULL` so it is never retried. `TERMINAL_SEAL_REFUSALS` has ten
-   *     entries and the measured figure is that 59% of seals that start never finish, so this is
-   *     the common case, not a corner.
-   *   - **Zero-message local sessions.** The resolver requires `message_count > 0` — a dead
-   *     handshake is not worth a ceremony. It is still an open write surface.
-   *
-   * Excluding those left them permanently interrupted and permanently writable, which is the exact
-   * condition this line exists to end. And the population is about to become the majority: no row
-   * has ever carried `interrupted_by = 'local'` yet, and from the next shutdown onward every
-   * shutdown-orphaned session will. So the sweep takes a local-cause session once the seal path
-   * has either declined it or exhausted it — never before.
-   *
-   * **THE CLOCK MUST BE ONE THE COUNTERPARTY CANNOT MOVE.** The obvious fallback for a row with no
-   * `interrupted_at` is `updated_at` — and it is exactly wrong. `ingestReceivedContent` accepts
-   * content into an `interrupted` session (that acceptance is this whole line's premise), and a
-   * successful ingest runs `UPDATE sessions SET message_count = ?, updated_at = <now>`. So
-   * `updated_at` is a clock the reprogrammed peer holds: one message every 24 hours and the session
-   * never expires, forever. The fallback would have handed the attacker the off switch for the
-   * control built to stop them.
-   *
-   * Instead the missing timestamps are STAMPED ONCE, by `#stampMissingInterruptedAt` immediately
-   * before this query runs, and this query reads `interrupted_at` and nothing else. The stamp is
-   * written under `WHERE interrupted_at IS NULL`, so it is monotone — set once, never moved, by us
-   * and not by a peer. A legacy row therefore gets its full window starting from the first sweep
-   * that sees it, which is later than the true interruption but is the only bound that is sound.
-   *
-   * Same retired-agent INNER JOIN as the sibling query: a retired agent's rows are kept for
-   * accountability, are not resumable, and are not writable either.
-   *
-   * **THE TIME ARITHMETIC IS LOAD-BEARING, AND BOTH OBVIOUS FORMS OF IT ARE WRONG.** These two
-   * columns do not hold the same kind of value:
-   *
-   *   `interrupted_at`  TEXT,    an ISO-8601 string — `new Date(now).toISOString()`.
-   *   `updated_at`      INTEGER, epoch milliseconds.
-   *
-   * There are FOUR writers of `status = 'interrupted'`, not three. The fourth is
-   * `destroySessionNode` → `#updateSessionStatus(…, "interrupted", "local")`, which historically
-   * wrote `interrupted_by` and **no timestamp at all** — and it is the path that produced the two
-   * rows in Entry 41. It now stamps `interrupted_at` like the others, so NULL is a legacy state
-   * rather than one production keeps creating.
-   *
-   * So a bare `interrupted_at <= ?` against a numeric bound is **always false** — the column has
-   * TEXT affinity and the bound parameter has none, so SQLite applies TEXT affinity to the
-   * parameter and compares them as STRINGS (`'2026-08-18T05:32:04.183Z' <= 1755000000000` → 0).
-   * The query silently returns nothing forever and reads as "nothing has expired yet". And
-   * `CAST(interrupted_at AS
-   * INTEGER)` is worse than useless: SQLite casts by taking the leading digits, so
-   * `'2026-08-18T05:32:04Z'` becomes **2026**, which is older than any epoch bound. That form
-   * abandons every interrupted session on the next boot, immediately, whatever its age. It was
-   * written, and `session-001`/`cello-list-sessions` failed on it in the gate.
-   *
-   * `strftime('%s', …) * 1000` parses the ISO string properly and returns NULL for anything it
-   * cannot parse — so a malformed or differently-formatted value falls through the COALESCE to
-   * `updated_at` rather than being read as the year 2026.
-   */
-  listExpiredUnrevivableSessions(
-    nowMs: number,
-    windowMs: number,
-  ): Array<{ agentName: string; sessionId: string; cause: string | null }> {
-    if (!this.#db) {
-      // ABSENT IS NOT FINE. An empty array here is indistinguishable from "the store is clean",
-      // which is the state this line exists to end — so the one boot where the sweep could not
-      // read the store must not look like the boots where it read it and found nothing.
-      this.#logger.error("session.revival_bound.enumerate.failed", {
-        error: "db not initialized",
-        impact: "no interrupted session was checked against the revival window this boot; any that "
-          + "have expired are still accepting content",
-      });
-      return [];
-    }
-    const rows = this.#db
-      .prepare(
-        `SELECT s.session_id AS session_id, s.interrupted_by AS cause, a.agent_name AS agent_name
-         FROM sessions s JOIN agents a ON a.agent_id = s.agent_id
-         WHERE s.status = 'interrupted' AND a.state != 'retired'
-           AND (COALESCE(s.interrupted_by, '') != 'local'
-                OR s.restart_seal_gave_up_at IS NOT NULL
-                OR s.message_count = 0)
-           AND CAST(strftime('%s', s.interrupted_at) AS INTEGER) * 1000 <= ?
-         ORDER BY CAST(strftime('%s', s.interrupted_at) AS INTEGER) * 1000 ASC`,
-      )
-      .all(nowMs - windowMs) as unknown as Array<{ session_id: string; cause: string | null; agent_name: string }>;
-    return rows.map((r) => ({ agentName: r.agent_name, sessionId: r.session_id, cause: r.cause }));
-  }
 
-  /**
-   * DOD-M12B-REVIVAL-BOUND-1 — give every timestamp-less interrupted session a clock, once.
-   *
-   * A row with `interrupted_at IS NULL` has no bound that can be evaluated, and skipping such rows
-   * would exempt the oldest sessions in the store from the control permanently — the same "open
-   * forever" failure wearing a different NULL. The two rows measured in Entry 41 are exactly this
-   * shape, written by a `destroySessionNode` path that set the cause and no timestamp.
-   *
-   * **`WHERE interrupted_at IS NULL` is the security property, not an optimisation.** It makes the
-   * stamp write-once: this can run on every sweep forever and a row's clock still cannot be moved
-   * after the first one. That is what disqualifies `updated_at`, which a peer moves with every
-   * message it sends into the still-accepting session.
-   *
-   * The cost is honest and bounded: a legacy row's window starts at the first sweep that sees it
-   * rather than at its true interruption, so it survives up to one window longer than it should.
-   * A late close is recoverable; a clock the counterparty winds is not.
-   *
-   * @returns how many rows were stamped.
-   */
-  #stampMissingInterruptedAt(nowMs: number): number {
-    if (!this.#db) return 0;
-    try {
-      const res = this.#db
-        .prepare("UPDATE sessions SET interrupted_at = ? WHERE status = 'interrupted' AND interrupted_at IS NULL")
-        .run(new Date(nowMs).toISOString()) as unknown as { changes?: number | bigint };
-      const stamped = Number(res?.changes ?? 0);
-      if (stamped > 0) {
-        this.#logger.info("session.revival_bound.clock.stamped", {
-          stamped,
-          impact: "these sessions had no interruption timestamp; their revival window starts now",
-        });
-      }
-      return stamped;
-    } catch (err: unknown) {
-      this.#logger.error("session.revival_bound.clock.stamp.failed", {
-        error: err instanceof Error ? err.message : String(err),
-        impact: "sessions with no interruption timestamp cannot be evaluated and stay open",
-      });
-      return 0;
-    }
-  }
+
+
+
+
 
   /**
    * DOD-M12B-REVIVAL-BOUND-1 — close every session the revival window has expired.
@@ -5455,8 +3779,8 @@ export class SessionNodeManager {
     // Stamp FIRST. A row with no clock cannot be evaluated by the query below, and this is the only
     // thing that gives it one. Running it before every sweep is safe because the write is scoped to
     // rows that have no timestamp yet.
-    this.#stampMissingInterruptedAt(nowMs);
-    const expired = this.listExpiredUnrevivableSessions(nowMs, windowMs);
+    this.#queries.stampMissingInterruptedAt(nowMs);
+    const expired = this.#queries.listExpiredUnrevivableSessions(nowMs, windowMs);
     let closed = 0;
     for (const s of expired) {
       try {
@@ -5503,83 +3827,9 @@ export class SessionNodeManager {
   }
 
 
-  /**
-   * DOD-M12B-RESTART-SEAL-1 — record that automatic sealing has exhausted this session.
-   *
-   * Durable on purpose. The resolver's attempt budget is in memory, so without this the budget
-   * resets on every boot and a session that can never seal costs five directory ceremonies a day
-   * for the life of the machine.
-   *
-   * IT IS NOT A DEAD END FOR THE OPERATOR. The row keeps status `interrupted`, so a manual
-   * `cello_close_session` still works on it and — since DOD-M12B-INTERRUPTED-ESCALATE-1 — still
-   * escalates to a unilateral seal. This column only withdraws the session from AUTOMATIC retries.
-   */
-  markRestartSealGaveUp(agentName: string, sessionId: string, reason: string): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare("UPDATE sessions SET restart_seal_gave_up_at = ?, restart_seal_gave_up_reason = ? WHERE agent_id = ? AND session_id = ?")
-      .run(Date.now(), reason, this.#requireAgentId(agentName), sessionId);
-  }
 
-  /**
-   * cello_list_sessions: every persisted session for one agent, regardless of
-   * status (active, interrupted, sealed, seal_interrupted_pending). Ordered most
-   * recently updated first so the live session surfaces at the top. This is the
-   * discovery surface that the by-id reads (cello_get_transcript /
-   * cello_get_sealed_receipt) depend on — without it an agent has no way to learn
-   * its own session ids after a restart or from a fresh MCP connection.
-   */
-  /**
-   * DOD-M15-REFUSED-INBOUND-SILENT-1, the DECLINED PROTECTION half — a FIELD, not an alert.
-   *
-   * An unsalted session is exactly as verifiable as every session shipped before salting existed,
-   * so there is nothing to interrupt the operator with and no event to fire. What was missing is
-   * STATE: nothing let anyone tell *"unsalted because this build predates the feature"* from
-   * *"unsalted because adoption was refused"* — and only the second says something about their
-   * setup. The session's own status now answers it, which costs nothing per message and cannot
-   * become a flood.
-   *
-   * The raw salt is dropped on the way out rather than passed through. `SELECT *` was handing the
-   * BLOB to a listing surface that has no use for it; the boolean is the whole question a reader of
-   * this list is asking, and shipping key material to answer a yes/no is not a trade worth making.
-   */
-  /**
-   * ⚠️ THE STORED COLUMN IS NOT THE ANSWER ON ITS OWN — 006-CRYPTO finding 3.
-   *
-   * A SUSPENDED salt keeps its bytes on disk deliberately (`DOD-M15-SALTSPLIT-1`: a salt kept is
-   * recoverable, a salt erased is not), while `#saltForHashing` returns null for it and every
-   * message goes out `sha256`. Reading the column alone therefore reported `true` at the exact
-   * moment the session had STOPPED salting — and because the field is emitted only when `false`,
-   * the agent saw nothing at all, which reads as "not unsalted".
-   *
-   * That is precisely the case this field was added for. Its own note above says it exists to tell
-   * *"unsalted because this build predates the feature"* from *"unsalted because adoption was
-   * refused"*, and the refused case was the one it could not report.
-   */
-  #saltStatusOf(row: SessionRecord, agentName: string | null): SessionRecord {
-    const { content_salt, ...rest } = row as SessionRecord & { content_salt?: Uint8Array | null };
-    const stored = content_salt != null && content_salt.length > 0;
-    const suspended =
-      agentName !== null && this.#saltSuspended.has(this.#k(agentName, String(row.session_id)));
-    /**
-     * 007-CRYPTO: the REAL state, not a constant. In 006 this was hardcoded `false` with a single
-     * reason, because nothing exchanged keys and saying so was the honest answer. It exchanges now,
-     * so a hardcode would be the stale claim that unit existed to remove.
-     *
-     * A row with no live agent name cannot be looked up in memory — an orphaned session, whose key
-     * (if it ever had one) died with the process. Reported as not-agreed rather than guessed at.
-     */
-    const enc: { key: Uint8Array; reason?: undefined } | { key: null; reason: ContentEncryptionReason } =
-      agentName === null
-        ? { key: null, reason: CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED }
-        : this.#contentEncryptionState(agentName, String(row.session_id));
-    return {
-      ...rest,
-      content_hashes_salted: stored && !suspended,
-      content_encrypted: enc.key !== null,
-      ...(enc.key === null ? { content_encryption_reason: enc.reason } : {}),
-    } as SessionRecord;
-  }
+
+
 
   getSessionsForAgent(agentName: string): SessionRecord[] {
     if (!this.#db) return [];
@@ -5589,7 +3839,7 @@ export class SessionNodeManager {
     const rows = this.#db
       .prepare("SELECT * FROM sessions WHERE agent_id = ? ORDER BY updated_at DESC")
       .all(this.#requireAgentId(agentName)) as unknown as SessionRecord[];
-    return rows.map((r) => ({ ...this.#saltStatusOf(r, agentName), agent_name: agentName }));
+    return rows.map((r) => ({ ...this.#salts.saltStatusOf(r, agentName), agent_name: agentName }));
   }
 
   /**
@@ -5613,7 +3863,7 @@ export class SessionNodeManager {
       // is missing — an orphaned session, which has no live in-memory state to be suspended in.
       .map((r) => {
         const row = r as SessionRecord & { agent_name?: string | null };
-        return this.#saltStatusOf(row, row.agent_name ?? null);
+        return this.#salts.saltStatusOf(row, row.agent_name ?? null);
       }) as unknown as SessionRecord[];
   }
 
@@ -5652,12 +3902,7 @@ export class SessionNodeManager {
     return this.#updateSessionStatus(agentName, sessionId, "sealed");
   }
 
-  recordSealCertificate(agentName: string, sessionId: string, sealedRootHex: string, legibilityJson: string): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare("UPDATE sessions SET seal_legibility = ?, sealed_root_hex = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
-      .run(legibilityJson, sealedRootHex, Date.now(), this.#requireAgentId(agentName), sessionId);
-  }
+
 
   /**
    * M8B FINDING-6 (cascade-2): persist a seal certificate for a session that may have NO local
@@ -5685,77 +3930,14 @@ export class SessionNodeManager {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(sessionId, this.#requireAgentId(agentName), counterpartyPubkeyHex, "sealed", now, now);
-    this.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson);
+    this.#queries.recordSealCertificate(agentName, sessionId, sealedRootHex, legibilityJson);
   }
 
-  /**
-   * M7 legibility-TBS-binding (responder verify): record the counterparty's FROST primary (group)
-   * pubkey from the FROST-signed SessionAssignment, so the responder can VERIFY the bilateral seal
-   * signature locally. Best-effort — a missing row (race) is a no-op; the seal then falls back to
-   * accept-without-verify (still sound: the live frame arrives over the authenticated Noise channel).
-   */
-  /**
-   * The counterparty's threshold group key as this agent has seen it BEFORE — trust on first use.
-   *
-   * DOD-M15-OFFER-SIGNED-1 / RESPONDER-VERIFY-1. The responder does not verify the assignment's
-   * signature (deferred to SESSION-004), so every field in it is whatever the directory said. That
-   * makes a same-frame check circular: a compromised directory just says the same thing twice.
-   *
-   * This is the one anchor the responder holds that a directory CANNOT retroactively change — its
-   * own memory of previous sessions with this counterparty. A directory that names a different
-   * threshold group key for someone you have already talked to is either substituting an identity
-   * or has been compromised since; neither is a session to accept quietly.
-   *
-   * THE BOUND, stated rather than glossed: this is worth nothing on FIRST contact, which is the
-   * definition of trust-on-first-use. It hardens every session after it, which is where a long-lived
-   * counterparty relationship actually lives.
-   *
-   * Keyed on `counterparty_pubkey` — the K_local IDENTITY, which is the stable thing — not on a
-   * session id or a display name.
-   */
-  getPinnedCounterpartyPrimary(agentName: string, counterpartyPubkeyHex: string): string | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare(
-        `SELECT counterparty_primary_pubkey FROM sessions
-          WHERE agent_id = ? AND counterparty_pubkey = ? AND counterparty_primary_pubkey IS NOT NULL
-          ORDER BY updated_at DESC LIMIT 1`,
-      )
-      .get(this.#requireAgentId(agentName), counterpartyPubkeyHex) as
-      | { counterparty_primary_pubkey: string }
-      | undefined;
-    return row?.counterparty_primary_pubkey ?? null;
-  }
 
-  recordCounterpartyPrimary(agentName: string, sessionId: string, primaryPubkeyHex: string): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare("UPDATE sessions SET counterparty_primary_pubkey = ?, updated_at = ? WHERE agent_id = ? AND session_id = ?")
-      .run(primaryPubkeyHex, Date.now(), this.#requireAgentId(agentName), sessionId);
-  }
 
-  /**
-   * M7-SESSION-004 (AC-005/AC-006): read the persisted seal certificate for a session.
-   * Returns the sealed root and the parsed legibility object (JSON-safe, hex pubkeys), or
-   * null if the session is unknown or not yet sealed. This is the cert-read surface a
-   * reader (operator, agent, arbitrator) — possibly in a DIFFERENT process than the one
-   * that built the certificate — uses to determine receipt-not-assent, per-party frontiers,
-   * attestation modes, and whether the final message was answered.
-   */
-  getSealCertificate(agentName: string, sessionId: string): { sealed_root: string; legibility: unknown } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT sealed_root_hex, seal_legibility FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { sealed_root_hex?: string | null; seal_legibility?: string | null } | undefined;
-    if (!row || !row.seal_legibility || !row.sealed_root_hex) return null;
-    let legibility: unknown;
-    try {
-      legibility = JSON.parse(row.seal_legibility);
-    } catch {
-      return null;
-    }
-    return { sealed_root: row.sealed_root_hex, legibility };
-  }
+
+
+
 
   /**
    * DOD-M15-INCLUSION-1: keep the leaf set the certificate is signed over, so one message can later
@@ -5785,7 +3967,7 @@ export class SessionNodeManager {
       // this row, `sealed_leaves_root_disagrees` (a directory contradicting its own FROST signature)
       // and "this side was simply absent" are the same `null` downstream, and the operator is told
       // the second.
-      this.#noteCertifiedLeafState(agentName, sessionId, resolved.reason, resolved.detail);
+      this.#queries.noteCertifiedLeafState(agentName, sessionId, resolved.reason, resolved.detail);
       // LOUD, and it names which of the two it is. `sealed_leaves_root_disagrees` in particular is
       // the directory shipping a leaf set that is not the one it signed — the receipt still stands
       // (its own signature is checked elsewhere), but nothing in this session can be proved at
@@ -5840,7 +4022,7 @@ export class SessionNodeManager {
         throw err;
       }
     } catch (err: unknown) {
-      this.#noteCertifiedLeafState(agentName, sessionId, "persist_failed", extractErrorMessage(err));
+      this.#queries.noteCertifiedLeafState(agentName, sessionId, "persist_failed", extractErrorMessage(err));
       this.#logger.error("seal.certified_leaves.persist.failed", {
         agentName,
         sessionId,
@@ -5852,7 +4034,7 @@ export class SessionNodeManager {
       });
       return false;
     }
-    this.#noteCertifiedLeafState(agentName, sessionId, "stored", null);
+    this.#queries.noteCertifiedLeafState(agentName, sessionId, "stored", null);
     this.#logger.info("seal.certified_leaves.recorded", {
       agentName,
       sessionId,
@@ -5876,57 +4058,14 @@ export class SessionNodeManager {
     state: "not_carried_absent_party" | "not_carried_present_party",
     detail: string,
   ): void {
-    this.#noteCertifiedLeafState(agentName, sessionId, state, detail);
+    this.#queries.noteCertifiedLeafState(agentName, sessionId, state, detail);
   }
 
-  /**
-   * The last thing that happened to this session's certified leaf set, or null if nothing has.
-   *
-   * Null here and a null from `getCertifiedLeafSet` together mean "no seal has been processed on
-   * this side yet" — which is a different sentence again from any of the recorded states.
-   */
-  getCertifiedLeafSetState(agentName: string, sessionId: string): { state: string; detail: string | null } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT state, detail FROM session_certified_leaves_state WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { state: string; detail: string | null } | undefined;
-    return row ? { state: row.state, detail: row.detail } : null;
-  }
 
-  /** Best-effort: a failure to record WHY must never be the thing that breaks a seal. */
-  #noteCertifiedLeafState(agentName: string, sessionId: string, state: string, detail: string | null): void {
-    if (!this.#db) return;
-    try {
-      this.#db
-        .prepare(
-          `INSERT OR REPLACE INTO session_certified_leaves_state
-             (agent_id, session_id, state, detail, recorded_at)
-           VALUES (?, ?, ?, ?, ?)`,
-        )
-        .run(this.#requireAgentId(agentName), sessionId, state, detail, Date.now());
-    } catch (err: unknown) {
-      this.#logger.warn("seal.certified_leaves.state.write.failed", {
-        agentName, sessionId, state, reason: extractErrorMessage(err),
-        impact: "the inclusion-proof surface will not be able to name WHY this session has no certified leaf set; it still refuses rather than proving anything",
-      });
-    }
-  }
 
-  /**
-   * The certified leaf set, in order, or null when none was stored for this session.
-   *
-   * Null is a REFUSAL upstream, never a fallback to the local tree: the two cover different leaves
-   * and substituting one for the other is how a proof comes to land on a root nobody signed.
-   */
-  getCertifiedLeafSet(agentName: string, sessionId: string): string[] | null {
-    if (!this.#db) return null;
-    const rows = this.#db
-      .prepare(
-        "SELECT content_hash_hex FROM session_certified_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index ASC",
-      )
-      .all(this.#requireAgentId(agentName), sessionId) as Array<{ content_hash_hex: string }>;
-    return rows.length > 0 ? rows.map((r) => r.content_hash_hex) : null;
-  }
+
+
+
 
   /**
    * M7-SESSION-001: Mark a session as interrupted with message count and timestamp.
@@ -5956,7 +4095,7 @@ export class SessionNodeManager {
     // A late or forged relay frame must NOT revert a 'sealed', 'seal_interrupted_pending',
     // or already-'interrupted' session back to 'interrupted'. This mirrors the
     // stream-close guard in #watchRelayStream below — the two paths must agree.
-    const existing = this.getSessionRecord(agentName, sessionId);
+    const existing = this.#queries.getSessionRecord(agentName, sessionId);
     if (!existing || existing.status !== "active") {
       this.#logger.warn("session.interrupt.ignored", {
         sessionId,
@@ -6041,7 +4180,7 @@ export class SessionNodeManager {
        * reads must not stay alive. A revived session mints a fresh one and re-keys, which is
        * Decisions Carried #5 and is only true because of this line.
        */
-      this.#destroySessionEphemeralFor(agentName, sessionId, entry.correlationId);
+      this.#ephemerals.destroySessionEphemeralFor(agentName, sessionId, entry.correlationId);
       this.#logger.info("session.node.destroyed", {
         sessionId,
         agentName,
@@ -6159,195 +4298,23 @@ export class SessionNodeManager {
     return landed;
   }
 
-  /**
-   * M7-SESSION-001 (H-1): read back the persisted bilateral commitment artifacts
-   * for a session. Returns null when none exist.
-   */
-  /**
-   * M12-P17: durably record verified content that arrived for an ALREADY-ENDED session.
-   *
-   * Returns true only when the row is committed — the caller confirm-deletes the relay copy on the
-   * strength of this answer, and the ORDER is load-bearing: annex first, delete second. A crash
-   * between them must lose nothing, so a failure here MUST report false and leave the relay copy
-   * alone. Getting that backwards converts a noisy re-pull loop into permanent silent loss, which is
-   * the outcome this whole unit exists to prevent.
-   */
-  recordSealedAnnex(agentName: string, sessionId: string, contentHashHex: string, content: Uint8Array, senderPubkeyHex: string | null): boolean {
-    if (!this.#db) return false;
-    try {
-      this.#db
-        .prepare(
-          `INSERT OR IGNORE INTO sealed_session_annex (agent_id, content_hash, session_id, sender_pubkey, content, arrived_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(this.#requireAgentId(agentName), contentHashHex, sessionId, senderPubkeyHex, Buffer.from(content), Date.now());
-      return true;
-    } catch (err: unknown) {
-      // FAILS LOUD and reports false: the relay copy is the only other one in existence.
-      this.#logger.error("content.annex.write.failed", {
-        agentName, sessionId, contentHash: contentHashHex,
-        impact: "content NOT annexed — the relay copy must be kept, or the message is lost",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    }
-  }
 
-  /**
-   * M12-P18: record that this agent refused a session, so parked content that later arrives for it
-   * (and fails `counterparty_unknown`, because no session row exists) can be swept instead of
-   * re-pulled forever. Keeps the most recent REFUSED_SESSIONS_CAP per agent.
-   */
-  recordRefusedSession(agentName: string, sessionId: string, reason: string): void {
-    if (!this.#db) return;
-    const agentId = this.#requireAgentId(agentName);
-    try {
-      this.#db.prepare(
-        `INSERT OR REPLACE INTO refused_sessions (agent_id, session_id, reason, refused_at) VALUES (?, ?, ?, ?)`,
-      ).run(agentId, sessionId, reason, Date.now());
-      // Prune to the cap — oldest first.
-      this.#db.prepare(
-        `DELETE FROM refused_sessions WHERE agent_id = ? AND session_id NOT IN (
-           SELECT session_id FROM refused_sessions WHERE agent_id = ? ORDER BY refused_at DESC LIMIT ${REFUSED_SESSIONS_CAP}
-         )`,
-      ).run(agentId, agentId);
-    } catch (err: unknown) {
-      this.#logger.warn("session.refused.record.failed", {
-        agentName, sessionId, error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
-  /** M12-P18: did this agent refuse this session? Consulted at drain to sweep orphaned parked content. */
-  wasSessionRefused(agentName: string, sessionId: string): boolean {
-    if (!this.#db) return false;
-    const row = this.#db
-      .prepare("SELECT 1 AS present FROM refused_sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { present: number } | undefined;
-    return row !== undefined;
-  }
 
-  /** M12-P17: read the annex. Operator-initiated ONLY — never wired to a wake path or inbox count. */
-  readSealedAnnex(agentName: string, sessionId?: string): Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; text: string; arrived_at: number }> {
-    if (!this.#db) return [];
-    const rows = (sessionId === undefined
-      ? this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName))
-      : this.#db.prepare("SELECT session_id, content_hash, sender_pubkey, content, arrived_at FROM sealed_session_annex WHERE agent_id = ? AND session_id = ? ORDER BY arrived_at ASC").all(this.#requireAgentId(agentName), sessionId)
-    ) as Array<{ session_id: string; content_hash: string; sender_pubkey: string | null; content: Buffer; arrived_at: number }>;
-    return rows.map((r) => ({
-      session_id: r.session_id, content_hash: r.content_hash, sender_pubkey: r.sender_pubkey,
-      text: new TextDecoder().decode(new Uint8Array(r.content)), arrived_at: r.arrived_at,
-    }));
-  }
 
-  getSealInterruptedArtifacts(agentName: string, sessionId: string): {
-    role: string;
-    ownLeaf: unknown;
-    counterpartyLeaf: unknown;
-    merkleRoot: string;
-    nonce: string;
-  } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT * FROM seal_interrupted_artifacts WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as
-      | {
-          role: string;
-          own_leaf: string;
-          counterparty_leaf: string;
-          merkle_root: string;
-          nonce: string;
-        }
-      | undefined;
-    if (!row) return null;
-    return {
-      role: row.role,
-      ownLeaf: JSON.parse(row.own_leaf),
-      counterpartyLeaf: JSON.parse(row.counterparty_leaf),
-      merkleRoot: row.merkle_root,
-      nonce: row.nonce,
-    };
-  }
 
-  /**
-   * Return the session record for a specific sessionId, regardless of status.
-   * Used by cello_close_session to inspect session state.
-   */
-  getSessionRecord(agentName: string, sessionId: string): SessionRecord | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT * FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as unknown as SessionRecord | undefined;
-    // `agent_name` is display-only and no longer stored on the row; stamp back the name whose
-    // agent_id scoped this lookup (~50 daemon call sites read `record.agent_name`).
-    return row ? { ...row, agent_name: agentName } : null;
-  }
 
-  /**
-   * DOD-SESSION-NAME-1: set (string) or clear (null) THIS agent's name for a session.
-   *
-   * Returns false when the (agent_id, session_id) row does not exist — i.e. the session is not this
-   * agent's — so the caller refuses with session_not_found rather than reporting a silent success on
-   * a write that landed nowhere. Same contract as setContactMoniker.
-   *
-   * Ownership is the ONLY scope: the composite key IS the ownership check, and status is deliberately
-   * not consulted. A sealed session can be named — naming one long after the fact is the point — and
-   * a name is a local column, so writing it cannot touch the seal, a Merkle leaf, or the wire.
-   *
-   * The caller validates (validateSessionName) before calling; this stores what it is given.
-   */
-  setSessionName(agentName: string, sessionId: string, sessionName: string | null): boolean {
-    if (!this.#db) throw new Error(`setSessionName('${agentName}'): database not initialized`);
-    const res = this.#db
-      .prepare("UPDATE sessions SET session_name = ? WHERE agent_id = ? AND session_id = ?")
-      .run(sessionName, this.#requireAgentId(agentName), sessionId);
-    return res.changes > 0;
-  }
 
-  /**
-   * MSG-2 startup-flush: the persisted relay endpoint for a session, or null if none was
-   * recorded. Used by the crash-backstop flush, which runs at startup BEFORE the in-memory
-   * session entries exist, so it cannot use `entry.relayPeerId`.
-   */
-  getPersistedRelayEndpoint(agentName: string, sessionId: string): { relayPeerId: string; relayAddrs: string[] } | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { relay_peer_id?: string | null; relay_addrs?: string | null } | undefined;
-    if (!row?.relay_peer_id || !row?.relay_addrs) return null;
-    try {
-      const addrs = JSON.parse(row.relay_addrs) as unknown;
-      if (!Array.isArray(addrs) || addrs.length === 0) return null;
-      return { relayPeerId: row.relay_peer_id, relayAddrs: addrs as string[] };
-    } catch {
-      return null;
-    }
-  }
 
-  /**
-   * DOD-MSG-4 (auto-recover): the DISTINCT relay endpoints this agent has sessions on, so the daemon
-   * can pull the agent's parked mailbox from each on reconnect (the relay mailbox is keyed by recipient
-   * pubkey, so one pull per relay drains all of the agent's parked content there). Distinct by relay
-   * peer id.
-   */
-  getAgentRelayEndpoints(agentName: string): Array<{ relayPeerId: string; relayAddrs: string[] }> {
-    if (!this.#db) return [];
-    const rows = this.#db
-      .prepare("SELECT DISTINCT relay_peer_id, relay_addrs FROM sessions WHERE agent_id = ? AND relay_peer_id IS NOT NULL")
-      .all(this.#requireAgentId(agentName)) as Array<{ relay_peer_id?: string | null; relay_addrs?: string | null }>;
-    const byPeer = new Map<string, { relayPeerId: string; relayAddrs: string[] }>();
-    for (const row of rows) {
-      if (!row.relay_peer_id || !row.relay_addrs) continue;
-      try {
-        const addrs = JSON.parse(row.relay_addrs) as unknown;
-        if (!Array.isArray(addrs) || addrs.length === 0) continue;
-        if (!byPeer.has(row.relay_peer_id)) byPeer.set(row.relay_peer_id, { relayPeerId: row.relay_peer_id, relayAddrs: addrs as string[] });
-      } catch {
-        /* skip malformed */
-      }
-    }
-    return [...byPeer.values()];
-  }
+
+
+
+
+
+
+
+
+
 
   // ─── DAEMON-004: daemon-owned Merkle tree ──────────────────────────────────
 
@@ -6515,7 +4482,7 @@ export class SessionNodeManager {
     const key = this.#k(agentName, sessionId);
     const cached = this.#trees.get(key);
     if (cached) return cached;
-    const tree = this.#loadTreeFromDb(agentName, sessionId);
+    const tree = this.#queries.loadTreeFromDb(agentName, sessionId);
     this.#trees.set(key, tree);
     return tree;
   }
@@ -7152,7 +5119,7 @@ export class SessionNodeManager {
               ...(witnessed.detail === undefined ? {} : { detail: witnessed.detail }),
               impact, guidance,
             });
-            this.noteContentRefusal(agentName, sessionId, witnessed.reason, {
+            this.#notices.noteContentRefusal(agentName, sessionId, witnessed.reason, {
               kind: REFUSAL_KINDS.REFUSED, impact, guidance,
             });
           }
@@ -7270,7 +5237,7 @@ export class SessionNodeManager {
        */
       // FAIL FAST, before a stream is opened for a message that cannot go out. The key this reads is
       // NOT the one that seals the body — see the read beside `sealSessionContent` below.
-      const preflight = this.#contentEncryptionState(agentName, sessionId);
+      const preflight = this.#ephemerals.contentEncryptionState(agentName, sessionId);
       if (preflight.key === null) {
         throw new Error(
           `content_not_encryptable: ${preflight.reason} — ${CONTENT_ENCRYPTION_GUIDANCE[preflight.reason]}`,
@@ -7325,7 +5292,7 @@ export class SessionNodeManager {
        * the same false tamper report. What is removed is the part this side controls; the rest is a
        * property of there being two machines.
        */
-      const sealState = this.#contentEncryptionState(agentName, sessionId);
+      const sealState = this.#ephemerals.contentEncryptionState(agentName, sessionId);
       if (sealState.key === null) {
         // Reachable only if the key vanished between the preflight and here — a re-key or a
         // teardown mid-send. Named as its own cause rather than reusing the preflight's, so a log
@@ -7405,7 +5372,7 @@ export class SessionNodeManager {
        * refused by them for a reason that names tampering.
        */
       if (ownClaimAwaitingSend) this.#advanceOwnChain(agentName, sessionId, entry, contentHash);
-      this.#clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
+      this.#liveness.clearSessionImpairment(agentName, sessionId, "direct_send", correlationId);
       return { ok: true, delivered: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
     } catch (err: unknown) {
       /**
@@ -7415,7 +5382,7 @@ export class SessionNodeManager {
        * about this machine's key state.
        */
       const failure = err instanceof Error ? err.message : String(err);
-      this.#markSessionImpaired(agentName, sessionId, {
+      this.#liveness.markSessionImpaired(agentName, sessionId, {
         cause: failure.startsWith("content_not_encryptable") ? "content_key" : "direct_send",
         error: failure, correlationId,
       });
@@ -7482,7 +5449,7 @@ export class SessionNodeManager {
          * briefly unreachable.
          */
         if (ownClaimAwaitingSend) this.#advanceOwnChain(agentName, sessionId, entry, contentHash);
-        this.#noteImpairmentRetention(agentName, sessionId, "parked");
+        this.#liveness.noteImpairmentRetention(agentName, sessionId, "parked");
         return { ok: true, delivered: false, parked: true, ...(assignedSeq === undefined ? {} : { sequenceNumber: assignedSeq }), ...(sentAuthorship === undefined ? {} : { authorship: sentAuthorship }), ...(relayRefusal === undefined ? {} : { relayRefusal }) };
       }
       // M12-P12: the deposit was refused, and #untrackAwaitingAck above already dropped the
@@ -7564,7 +5531,7 @@ export class SessionNodeManager {
       // The same distinction is recorded on the session, because `cello_receive` will be asked
       // about this later and would otherwise have to guess — and its guess ("it was parked, do not
       // resend") is the exact opposite of what the lost case needs.
-      this.#noteImpairmentRetention(agentName, sessionId, durable ? "durable" : "lost");
+      this.#liveness.noteImpairmentRetention(agentName, sessionId, durable ? "durable" : "lost");
       return {
         ok: false,
         reason: "session_stream_unavailable",
@@ -7791,7 +5758,7 @@ export class SessionNodeManager {
    * reconciliation — same documented limitation as the UP-2 gate above.
    */
   getSealUpgradeReadiness(agentName: string, sessionId: string): SealUpgradeReadiness {
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     return {
       known: !!record,
       /**
@@ -7835,7 +5802,7 @@ export class SessionNodeManager {
     const ackKey = this.#k(agentName, sessionId);
     // Idempotency: at most one responder seal per session (auto-ack or agent close).
     if (this.#responderSealSubmitted.has(ackKey)) return;
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     // Only an ACTIVE session auto-acks. A committed/sealing/sealed/interrupted session is out of
     // scope (already sealing, or needs the interrupted/upgrade path), not an auto-ack candidate.
     if (!record || record.status !== "active") return;
@@ -7969,487 +5936,19 @@ export class SessionNodeManager {
 
   
 
-  /**
-   * ─── DOD-M15-NO-SILENT-REFUSAL-1: refusals the RECEIVING operator can actually see ────────────
-   *
-   * Every inbound refusal already logs a `reason`, an `impact` and a `guidance` — and they are
-   * good. They had no reader. From the receiving operator's chair a refused message simply never
-   * arrives: the conversation goes quiet with a full explanation sitting in a file they have no
-   * reason to open, and they conclude the other person stopped replying.
-   *
-   * **DURABLE, and that is the half that makes this useful.** The predecessor kept notices in a
-   * `Map` on this instance and drained them on the receive path for one session. So a restart lost
-   * them, and an agent NOBODY IS ATTENDING lost them too — the connection is live, the daemon is
-   * up, and the notice only ever reaches whoever happens to call `cello_receive` on that exact
-   * session. `cello_check_notifications` now reads them as its own inbox category.
-   *
-   * **DEDUPLICATED PER SESSION PER REASON, and that is the design, not an optimisation.** A skewed
-   * peer turns one problem into a flood: the first refusal of a kind is the signal, the ninetieth is
-   * noise that trains the operator to ignore the surface. `count` keeps the scale visible without
-   * repeating the alert.
-   *
-   * **NEVER carries the content.** It failed verification; surfacing it is the injection path the
-   * cross-check exists to close. The operator learns that a message was refused and why — never
-   * what it said.
-   */
-  /**
-   * Record an inbound refusal for the operator. First of its kind per session is the signal.
-   *
-   * ⚠️ **DOES NOT THROW, and that is a decision with a cost — stated so it is not mistaken for an
-   * oversight.** Every call site here has already decided to refuse and is about to return a reason
-   * to its caller; a throw would replace that clean refusal with an exception on the ingest path,
-   * changing what the SENDER observes because this daemon could not file a note. So a persistence
-   * failure is logged at ERROR under `session.refusal.persist.failed`, carrying the reason, the
-   * impact and the guidance verbatim — the forensic record survives even when the operator-facing
-   * one does not. It is not silent; it is one surface short, and the log says which notice was lost.
-   */
-  noteContentRefusal(
-    agentName: string,
-    sessionId: string,
-    reason: string,
-    /**
-     * ALL THREE REQUIRED, and that is the enforcement rather than the convention.
-     *
-     * The DoD clause is "every reason calls this with an impact and a guidance", and an optional
-     * field makes that a thing a reviewer checks by reading thirteen call sites. `kind` is required
-     * for the same reason one level up: the header over a list of refusals is composed from it, and
-     * a notice that could omit it would silently inherit whichever header happened to be first.
-     */
-    detail: { kind: RefusalKind; impact: string; guidance: string },
-  ): void {
-    try {
-      if (!this.#db) throw new Error("database is not open");
-      const agentId = this.#requireAgentId(agentName);
-      const now = Date.now();
-      /**
-       * ⚠️ **BOTH WRITES OR NEITHER — review F6, and the comment this replaces was wrong.**
-       *
-       * It argued that putting the totals insert in the same `try` made the two "fail together".
-       * It does not: each `.run()` autocommits, so the notice could persist and the total throw —
-       * and the `catch` then ALSO writes an in-memory fallback entry for a notice that is already
-       * in the table. The drain unions the two halves without deduplicating on (session, reason),
-       * so the operator would see the same refusal TWICE, once with a lifetime figure and once
-       * without, one of them blaming a disk fault. Before this unit a single statement made that
-       * state impossible; the second statement is what created it.
-       *
-       * `ROLLBACK` is best-effort because SQLite may have aborted the transaction already — the
-       * same shape `agent-id-migration.ts` uses — and it must never mask the original error.
-       */
-      this.#db.exec("BEGIN");
-      try {
-      // `count` grows on conflict; impact and guidance are refreshed, because a later refusal of the
-      // same reason may know more than the first (the salt branch has four causes and names them).
-      this.#db
-        .prepare(
-          `INSERT INTO content_refusal_notices
-             (agent_id, session_id, reason, kind, impact, guidance, count, first_at, last_at)
-           VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-           ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
-             count = count + 1, kind = excluded.kind, impact = excluded.impact,
-             guidance = excluded.guidance, last_at = excluded.last_at`,
-        )
-        .run(agentId, sessionId, reason, detail.kind, detail.impact, detail.guidance, now, now);
-      /**
-       * DOD-M15-REFUSALTERMINAL-1 — the lifetime tally, in the SAME `try` on purpose.
-       *
-       * If the notice write failed there is no notice to hang a total off, and the fallback below
-       * has no durable counterpart to read — so the two must fail together. A total that survived a
-       * failed notice would be a number nobody could see, and one that was written twice for a
-       * retried notice would be worse than absent.
-       */
-      this.#db
-        .prepare(
-          // `seeded` stays whatever the row already has. A row seeded at upgrade remains a LOWER
-          // BOUND for the life of that (session, reason) — counting forward from an incomplete
-          // figure does not recover the refusals dismissal already erased, and clearing the flag
-          // would turn "at least 58" into a claimed total of 59.
-          `INSERT INTO content_refusal_totals
-             (agent_id, session_id, reason, total, first_at, last_at, seeded)
-           VALUES (?, ?, ?, 1, ?, ?, 0)
-           ON CONFLICT(agent_id, session_id, reason) DO UPDATE SET
-             total = total + 1, last_at = excluded.last_at`,
-        )
-        .run(agentId, sessionId, reason, now, now);
-        this.#db.exec("COMMIT");
-      } catch (inner: unknown) {
-        try { this.#db.exec("ROLLBACK"); } catch { /* already aborted by SQLite */ }
-        throw inner;
-      }
-    } catch (err: unknown) {
-      this.#logger.error("session.refusal.persist.failed", {
-        agentName, sessionId, reason,
-        impact: detail.impact,
-        guidance: detail.guidance,
-        error: extractErrorMessage(err),
-        consequence:
-          "this refusal could not be written to the notice store, so it will not survive a restart. It is held in memory for this process instead, so the operator is still told while this daemon runs. The reason, impact and guidance above are the whole notice.",
-      });
-      /**
-       * DOD-M15-NO-SILENT-REFUSAL-1 review F6 — the fallback, and why it is not the silent kind.
-       *
-       * The store this replaced was an in-memory Map, which could not fail: recording a refusal was
-       * a `set`, so the receive door always had the notice for the life of the process. Making the
-       * store durable made it, in the failure case, LESS available than before — a DB write failure
-       * left no operator-facing surface at all, only a log line.
-       *
-       * So a failed write falls back to exactly what the Map did. This is not a fallback that hides
-       * a fault: the ERROR above fires every time, naming the notice and the cause, and what is lost
-       * is only the restart property — which is the property the database was unavailable for
-       * anyway. A silent fallback is one that makes a broken system look healthy; this one is
-       * announced, and it preserves the surface rather than substituting for it.
-       */
-      const key = this.#k(agentName, sessionId);
-      let perSession = this.#refusalFallback.get(key);
-      if (!perSession) { perSession = new Map(); this.#refusalFallback.set(key, perSession); }
-      const existing = perSession.get(reason);
-      if (existing) { existing.count += 1; existing.kind = detail.kind; existing.impact = detail.impact; existing.guidance = detail.guidance; return; }
-      perSession.set(reason, { ...detail, count: 1, surfacedTo: new Map<string, number>() });
-    }
-  }
 
-  /**
-   * DOD-M15-NO-SILENT-REFUSAL-1: the operator has seen these and does not want to see them again.
-   *
-   * ⚠️ **WITHOUT THIS THE NOTICES ARE PERMANENT, and that is what makes people stop reading the
-   * inbox.** "Already shown you" is tracked per WINDOW — a new MCP connection has been told nothing,
-   * so it is told everything. Someone on an older build messages you, you sort it out with them,
-   * they upgrade, and every new session you ever open still opens with that refusal.
-   *
-   * Dismissing does NOT turn anything off. If the cause fires again the notice comes back, because
-   * a fresh refusal writes a fresh row. The operator is saying "I know", not "stop telling me".
-   *
-   * Returns how many were cleared, so the caller can say so rather than claiming a silent success.
-   */
-  dismissContentRefusals(agentName: string, sessionId: string): number {
-    if (!this.#db) return 0;
-    let agentId: string;
-    try { agentId = this.#requireAgentId(agentName); } catch { return 0; }
-    this.#refusalFallback.delete(this.#k(agentName, sessionId));
-    const res = this.#db
-      .prepare("DELETE FROM content_refusal_notices WHERE agent_id = ? AND session_id = ?")
-      .run(agentId, sessionId);
-    this.#db
-      .prepare("DELETE FROM content_refusal_reads WHERE agent_id = ? AND session_id = ?")
-      .run(agentId, sessionId);
-    return Number(res.changes);
-  }
 
-  /**
-   * Drain the refusals a GIVEN CONSUMER has not been shown yet, and remember what it was shown.
-   *
-   * ─── Why this is keyed by consumer, and not by a single flag ──────────────────────────────────
-   *
-   * It used to set one `surfaced: boolean` on the notice. Two MCP windows attending the same agent
-   * is the ordinary case, and under that flag whoever read FIRST consumed the notice — the second
-   * window was told nothing, permanently. **That is the same defect `takeReceivedContent` had**, and
-   * the comment above the delivery loop in `session-content-handlers.ts` spells out why it was
-   * removed: *"reading is non-destructive by construction. Nothing one consumer does mutates state
-   * another consumer reads."*
-   *
-   * ─── Why the count has a reader ───────────────────────────────────────────────────────────────
-   *
-   * A reason RE-ANNOUNCES to a consumer when its count has grown by an order of magnitude since that
-   * consumer last saw it (1 → 10 → 100 → …), marked `repeat: true`. That keeps the first refusal the
-   * signal and the ninetieth silent, which is the dedup's point, while still making a skew that has
-   * swallowed hundreds of messages visible — at a handful of announcements per session, not one per
-   * message.
-   *
-   * ─── What a restart does, deliberately ────────────────────────────────────────────────────────
-   *
-   * The notices survive; the read state is keyed by IPC connection id, which does not. So after a
-   * restart every notice is unseen again and the next reader is told. That is the correct direction:
-   * a fresh window has not been told anything, and re-announcing costs one line where staying silent
-   * costs the whole point of storing it.
-   */
-  takeContentRefusals(
-    agentName: string,
-    sessionId: string,
-    /**
-     * REQUIRED, deliberately — no default.
-     *
-     * It had one (`"default"`), and a default is the defect this method was rewritten to remove,
-     * lying in wait: any future call site that omits the argument silently shares ONE bucket across
-     * every window, the first reader consumes the notice for all the others, and nothing fails to
-     * compile and no test goes red. The parameter existing is not the protection; being unable to
-     * forget it is.
-     */
-    consumerId: string,
-  ): Array<Omit<RefusalNotice, "sessionId">> {
-    // `sessionId` is dropped from each entry: the caller passed it in and every entry carries the
-    // same one, so repeating it back would be a field that can never say anything. The agent-wide
-    // door below keeps it, because there it is the only thing that says WHICH conversation.
-    //
-    // `truncated` is dropped too, and only here: one session's notices cannot reach the cap (the
-    // reasons are a bounded set), so a flag that can never be true is a field readers learn to skip.
-    return this.#drainRefusals(agentName, consumerId, sessionId).notices.map(({ sessionId: _drop, ...rest }) => rest);
-  }
 
-  /**
-   * DOD-M15-NO-SILENT-REFUSAL-1: every unshown refusal for an agent, ACROSS its sessions.
-   *
-   * The inbox's door. `takeContentRefusals` answers for one session because its caller already holds
-   * one; `cello_check_notifications` holds an agent and nothing else, and the case this whole line
-   * exists for is that nobody is attending any of that agent's sessions — so a per-session read
-   * cannot reach it. Same store, same per-consumer rule, same re-announce.
-   */
-  takeAgentContentRefusals(
-    agentName: string,
-    consumerId: string,
-  ): { notices: RefusalNotice[]; truncated: boolean } {
-    return this.#drainRefusals(agentName, consumerId);
-  }
 
-  /**
-   * The one read path behind both doors. `sessionId` narrows it; omitted, it spans the agent.
-   *
-   * A single implementation on purpose: the per-consumer rule and the order-of-magnitude rule are
-   * the two properties this unit must not lose, and two copies of them is two things to keep true.
-   */
-  #drainRefusals(
-    agentName: string,
-    consumerId: string,
-    sessionId?: string,
-  ): { notices: RefusalNotice[]; truncated: boolean } {
-    const out: RefusalNotice[] = [];
-    let truncated = false;
-    const now = Date.now();
-    let agentId: string | null = null;
-    if (this.#db) {
-      try {
-        agentId = this.#requireAgentId(agentName);
-      } catch {
-        // A name that resolves to no active agent has no notices by construction. Already logged by
-        // #requireAgentId; re-throwing would fail a read that has nothing to report.
-        agentId = null;
-      }
-    }
-    if (agentId !== null && this.#db) {
-      /**
-       * ⚠️ NEWEST FIRST, AND CAPPED — review F3, and the ordering is the load-bearing half.
-       *
-       * Read state is keyed on IPC connection id, so every new window and every restart is a
-       * consumer that has been told nothing, and the drain returns every notice ever recorded for
-       * that agent. Oldest-first and uncapped, the first thing an operator saw after a restart was a
-       * chronological archive whose top entry was the oldest refusal on record and whose newest —
-       * the one explaining the conversation that just went quiet — was at the bottom. That is a
-       * section people learn to scroll past, which is the failure this whole line exists to end.
-       *
-       * `LIMIT` is `+ 1` so the cap can be DETECTED rather than assumed; the extra row is dropped
-       * and `truncated` is reported to the caller, which says so on the list itself.
-       *
-       * ⚠️ `rowid DESC` is the TIEBREAK and it is load-bearing, not tidiness. `last_at` is
-       * `Date.now()`, so notices recorded in the same millisecond have no defined order and "newest
-       * first" was true only on average — measured by a test that recorded 30 notices in one tick
-       * and got them back in an order SQLite was free to choose. rowid is monotonic per insert, so
-       * the tiebreak is insertion order, which for a same-millisecond batch is exactly recency.
-       */
-      const rows = (
-        sessionId === undefined
-          ? this.#db
-              .prepare(
-                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
-                   FROM content_refusal_notices n
-                   LEFT JOIN content_refusal_reads r
-                     ON r.agent_id = n.agent_id AND r.session_id = n.session_id
-                    AND r.reason = n.reason AND r.consumer_id = ?
-                   LEFT JOIN content_refusal_totals t
-                     ON t.agent_id = n.agent_id AND t.session_id = n.session_id
-                    AND t.reason = n.reason
-                  WHERE n.agent_id = ?
-                    AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
-                  ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
-              )
-              .all(consumerId, agentId, MAX_REFUSALS_PER_READ + 1)
-          : this.#db
-              .prepare(
-                `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
-                   FROM content_refusal_notices n
-                   LEFT JOIN content_refusal_reads r
-                     ON r.agent_id = n.agent_id AND r.session_id = n.session_id
-                    AND r.reason = n.reason AND r.consumer_id = ?
-                   LEFT JOIN content_refusal_totals t
-                     ON t.agent_id = n.agent_id AND t.session_id = n.session_id
-                    AND t.reason = n.reason
-                  WHERE n.agent_id = ? AND n.session_id = ?
-                    AND (r.seen_count IS NULL OR n.count >= r.seen_count * 10)
-                  ORDER BY n.last_at DESC, n.rowid DESC LIMIT ?`,
-              )
-              .all(consumerId, agentId, sessionId, MAX_REFUSALS_PER_READ + 1)
-      ) as Array<{
-        session_id: string; reason: string; kind: string; impact: string;
-        guidance: string; count: number; seen_count: number | null;
-        lifetime_total: number | null; lifetime_seeded: number | null;
-      }>;
-      if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
-      for (const row of rows) {
-        const firstTime = row.seen_count === null;
-        /**
-         * ⚠️ The unseen test is IN THE QUERY (review N4), and this line is a belt, not the gate.
-         *
-         * Applied only here, the `LIMIT` cut the newest 25 notices and THEN discarded the ones this
-         * consumer had already seen — so a consumer holding read rows for the newest 25 got an empty
-         * answer forever and a genuinely unseen notice at position 26 could never be reached. The
-         * cap has to cut UNSHOWN notices, which means the filter has to run before it.
-         *
-         * `seen_count` is at least 1 whenever it is set, so this cannot loop on zero.
-         */
-        if (!firstTime && row.count < row.seen_count! * 10) continue;
-        this.#db
-          .prepare(
-            `INSERT INTO content_refusal_reads
-               (agent_id, session_id, reason, consumer_id, seen_count, seen_at)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(agent_id, session_id, reason, consumer_id) DO UPDATE SET
-               seen_count = excluded.seen_count, seen_at = excluded.seen_at`,
-          )
-          .run(agentId, row.session_id, row.reason, consumerId, row.count, now);
-        this.#evictOldestReads(agentId, row.session_id, row.reason);
-        out.push({
-          sessionId: row.session_id,
-          reason: row.reason,
-          kind: row.kind as RefusalKind,
-          impact: row.impact,
-          guidance: row.guidance,
-          timesSinceDismissed: row.count,
-          /**
-           * DOD-M15-REFUSALTERMINAL-1 — three states, and they are three different claims.
-           *
-           * A counted total is a FIGURE. A seeded row is a FLOOR, and says so by using a different
-           * field name (review F1c). `null` means no totals row at all, which after the upgrade
-           * backfill can only happen when the notice write itself failed — reported as ABSENT
-           * rather than as the smaller number, because substituting it is the defect this unit
-           * exists to remove.
-           */
-          ...(row.lifetime_total === null
-            ? {}
-            : row.lifetime_seeded === 1
-              ? { timesTotalAtLeast: row.lifetime_total }
-              : { timesTotal: row.lifetime_total }),
-          ...(firstTime ? {} : { repeat: true }),
-        });
-      }
-    }
-    /**
-     * The unpersisted notices (review F6), under the SAME per-consumer and order-of-magnitude rules.
-     * Reading them differently would make a database failure change WHAT the operator is told rather
-     * than only how long it survives — and that difference is the thing hardest to notice.
-     *
-     * Collected separately and REVERSED before joining, not appended in place — review N2. A Map
-     * yields insertion order, which is oldest-first, so appending them straight after the DB half
-     * (which is newest-first) put the newest notices at the bottom on exactly the daemon where the
-     * fallback is the only half there is.
-     */
-    const fromFallback: typeof out = [];
-    for (const [key, perSession] of this.#refusalFallback) {
-      const sid = this.#unk(key, agentName);
-      if (sid === null) continue;
-      if (sessionId !== undefined && sid !== sessionId) continue;
-      for (const [reason, notice] of perSession) {
-        const shownAt = notice.surfacedTo.get(consumerId);
-        const firstTime = shownAt === undefined;
-        if (!firstTime && notice.count < shownAt * 10) continue;
-        notice.surfacedTo.set(consumerId, notice.count);
-        // Bounded like the table's read rows are (review N2): a consumer id is an IPC connection id,
-        // so without this a long-running daemon grows one entry per reconnect, in memory, on the
-        // very path that exists because the disk is already failing.
-        if (notice.surfacedTo.size > MAX_REFUSAL_READERS) {
-          const oldest = notice.surfacedTo.keys().next();
-          if (!oldest.done) notice.surfacedTo.delete(oldest.value);
-        }
-        // `timesTotal` is deliberately absent: this notice exists because the durable write failed,
-        // so there is no lifetime record to report and inventing one from `notice.count` would
-        // restore the exact misreading this unit removes.
-        fromFallback.push({
-          sessionId: sid, reason, kind: notice.kind, impact: notice.impact,
-          guidance: notice.guidance, timesSinceDismissed: notice.count,
-          ...(firstTime ? {} : { repeat: true }),
-        });
-      }
-    }
-    out.push(...fromFallback.reverse());
-    /**
-     * ONE cap over BOTH halves — review N2.
-     *
-     * `LIMIT` governs the table only. A persistent database fault (a full disk, which is also the
-     * likeliest cause of `transcript_write_failed`) routes EVERY refusal to the fallback, so the cap
-     * this unit added was undone for exactly the daemon already in trouble.
-     *
-     * The truncation keeps the DB half preferentially, and that is the right bias: those rows are
-     * the ones that survive a restart, and they are already ordered newest-first.
-     */
-    if (out.length > MAX_REFUSALS_PER_READ) {
-      truncated = true;
-      out.length = MAX_REFUSALS_PER_READ;
-    }
-    return { notices: out, truncated };
-  }
 
-  #evictOldestReads(agentId: string, sessionId: string, reason: string): void {
-    if (!this.#db) return;
-    this.#db
-      .prepare(
-        `DELETE FROM content_refusal_reads
-          WHERE agent_id = ? AND session_id = ? AND reason = ? AND consumer_id NOT IN (
-            SELECT consumer_id FROM content_refusal_reads
-             WHERE agent_id = ? AND session_id = ? AND reason = ?
-             ORDER BY seen_at DESC LIMIT ${MAX_REFUSAL_READERS}
-          )`,
-      )
-      .run(agentId, sessionId, reason, agentId, sessionId, reason);
-  }
 
-  /**
-   * DOD-M15-NO-SILENT-REFUSAL-1 — the per-session byte cap, from the operator's chair.
-   *
-   * This is the harshest refusal on the inbound path and the one that reads least like a fault:
-   * once the cap is crossed, EVERY later message from that sender on that session is refused, for
-   * the life of the session. The counterparty is told nothing either, so from both chairs the other
-   * person simply stopped replying.
-   *
-   * One method rather than two copies because the cap is checked twice — once before the screening
-   * await and once after, against freshly-read totals — and a notice that differs between the two
-   * would describe a different refusal depending on timing.
-   */
-  /**
-   * DOD-M15-REFUSEDEVIDENCE-1 — **THE BYTE CAP RETAINS NOTHING, and that is a ruling, not an
-   * oversight.**
-   *
-   * Retention is universal everywhere else in this method. Here it is not, because retaining would
-   * defeat the very bound it enforces: a session already over its storage budget cannot be given
-   * more storage as a reward for exceeding it, and `#getReceivedBytesTotal` counts quarantined bytes
-   * precisely so that budget is honest.
-   *
-   * Andre, 2026-09-03: *"The message limit is the message limit, already handled by the cap. If
-   * you're unknown and you have 25 MB and you just tried to send me one gig, well that's it."*
-   *
-   * The ABUSE is still evidenced — this notice records the reason, the cap and the tier, and every
-   * message the session did retain is still there. What is not kept is the oversized payload.
-   */
-  #noteSizeCapRefusal(agentName: string, sessionId: string, cap: number, tier: number): void {
-    /**
-     * ⚠️ **IN MEGABYTES, WITH THE BYTES BESIDE THEM.** "26214400 bytes" is not a number anyone reads
-     * as 25 MB, and the operator being told a conversation just ended deserves to understand the
-     * limit that ended it at a glance. The raw figure stays because it is the exact bound.
-     */
-    const mb = Math.round((cap / 1_048_576) * 10) / 10;
-    /**
-     * The access level as a QUOTED LOWERCASE LABEL, never a bare word.
-     *
-     * `their tier is UNKNOWN` reads as "we could not determine their tier" — the opposite of what it
-     * says. UNKNOWN is the NAME of the level a sender has before the operator adds them as a
-     * contact. Quoting it and lowercasing it makes it a label rather than a failure.
-     */
-    const level = (Object.entries(TIER).find(([, v]) => v === tier)?.[0] ?? String(tier)).toLowerCase();
-    this.noteContentRefusal(agentName, sessionId, "session_size_limit_exceeded", {
-      kind: REFUSAL_KINDS.REFUSED,
-      impact:
-        `This conversation has hit its size limit for this sender: ${mb} MB (${cap} bytes), which is the limit at their access level ("${level}"). The message was not delivered, and neither will anything else they send in this conversation. They were not told — from their side it sent normally.`,
-      guidance:
-        `The limit is per conversation and does not reset, so waiting will not clear it. Start a NEW conversation with them to keep talking. If you trust them, raising their access level with cello_contact_set_tier gives them a larger limit next time — it does not revive this one. Tell them what happened: they have no way to know.`,
-    });
-  }
+
+
+
+
+
+
+
 
   #markContentUnverifiable(agentName: string, sessionId: string, why: "tampered" | "unverifiable"): void {
     const key = this.#k(agentName, sessionId);
@@ -8522,7 +6021,7 @@ export class SessionNodeManager {
     // the local view to match the counterparty BEFORE the bilateral seal — it is not a resumption
     // (no new activity, no re-accept) and its root was never committed. So allow 'active' AND
     // 'interrupted'; reject only the two committed states.
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     // DOD-UNREAD-1 D4a: NEVER record content you cannot attribute. With no sessions row there is
     // no counterparty — the transcript has no counterparty column, so a row written here is
     // unattributable forever, counted unread by getUnreadSummary, and unreadable by cello_receive
@@ -8586,7 +6085,7 @@ export class SessionNodeManager {
       // the store is keyed (agent_id, session_id) and holds no foreign key to `sessions` precisely
       // so this case can be recorded. A refusal for a session that does not exist here is the one
       // the operator has the least other way to learn about.
-      this.noteContentRefusal(agentName, sessionId, "session_orphaned", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "session_orphaned", {
         kind: REFUSAL_KINDS.REFUSED,
         impact: triage.impact,
         guidance: triage.guidance,
@@ -8633,7 +6132,7 @@ export class SessionNodeManager {
       // DOD-M15-NO-SILENT-REFUSAL-1. `currentStatus` on the log line carries the REAL status —
       // sealed, seal_interrupted_pending or abandoned — and the notice must not flatten those into
       // one claim, so it names the record as frozen rather than asserting which way it ended.
-      this.noteContentRefusal(agentName, sessionId, "session_committed", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "session_committed", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
           `This conversation is closed (it ended as "${record.status}"), so the message could not be delivered and neither can anything else they send to it. A closed conversation is signed and cannot be added to — that is what closing it means. Nothing is wrong on your side.`,
@@ -8691,7 +6190,7 @@ export class SessionNodeManager {
       // DOD-M15-REFUSED-INBOUND-SILENT-1: the SAME strings the log just carried, to the operator.
       // This reason is a version skew, so it affects every message from that counterparty — without
       // this the conversation goes permanently quiet and they conclude the peer stopped replying.
-      this.noteContentRefusal(agentName, sessionId, "content_hash_alg_unknown", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "content_hash_alg_unknown", {
         kind: REFUSAL_KINDS.REFUSED,
         impact: "this message could not be verified, so it was NOT ingested and NOT shown. The algorithm name is a claim by the sender and is not covered by any signature, so it does not establish what they actually did. This session will not auto-co-sign at close.",
         guidance: "Almost always their CELLO build is newer than this one: ask which version they are running, and upgrade. If they are on the SAME version as you, that explanation does not hold and the frame was malformed or crafted — do not close the session by auto-acknowledgement.",
@@ -8704,7 +6203,7 @@ export class SessionNodeManager {
         alg: algResolved.alg,
         // The salt is OURS — the sender's frame never carries one, and could not be trusted if it
         // did. A salted frame we hold no salt for throws below and is refused by name.
-        salt: this.#getSessionSalt(agentName, sessionId),
+        salt: this.#salts.getSessionSalt(agentName, sessionId),
       });
     } catch (err: unknown) {
       // Reached when the peer named the salted algorithm and this side holds no salt for the
@@ -8754,7 +6253,7 @@ export class SessionNodeManager {
       //
       // The guidance is passed by reference to the log's own text rather than duplicated: a second
       // copy is a second thing to keep true, and the log's version is the one that gets maintained.
-      this.noteContentRefusal(agentName, sessionId, "content_hash_salt_unavailable", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "content_hash_salt_unavailable", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
           "this message could not be verified — the sender says it is salted and this side holds no salt for the session — so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
@@ -8794,7 +6293,7 @@ export class SessionNodeManager {
       });
       // DOD-M15-REFUSED-INBOUND-SILENT-1. Deliberately does NOT include the content or the hashes:
       // it failed verification, and showing it is the injection path this cross-check closes.
-      this.noteContentRefusal(agentName, sessionId, "content_hash_mismatch", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "content_hash_mismatch", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
           "a message arrived whose bytes do not match the hash the sender committed to, so it was NOT ingested and NOT shown. This session will not auto-co-sign at close.",
@@ -8816,7 +6315,7 @@ export class SessionNodeManager {
       // is to report. Bounded at the UNKNOWN tier — there is no contact to look a tier up on, which
       // is the same fact that made it unattributable.
       const keptUnresolved = this.#refusals.quarantineRefusedContent(agentName, sessionId, "sender_unresolved", content, contentHashHex, { correlationId });
-      this.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "sender_unresolved", {
         kind: REFUSAL_KINDS.REFUSED,
         impact:
           "A message arrived that this daemon could not attribute to anyone, so it was not delivered. This conversation's record does not say who the other party is, which a conversation opened normally always does. TREAT THIS AS HOSTILE: a message that cannot be tied to a sender is far more likely to be a probe or an attack than a fault.",
@@ -8972,8 +6471,8 @@ export class SessionNodeManager {
       // "exempt entirely". A stranger (no row → UNKNOWN) keeps the 25 MB cap; KNOWN+ get more.
       const senderTier = this.#records.getTier(agentName, senderPubkey);
       const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
-      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
-      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      const priorTotal = this.#queries.getReceivedBytesTotal(agentName, sessionId);
+      const heldTotal = this.#held.getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
@@ -8986,7 +6485,7 @@ export class SessionNodeManager {
           tier: senderTier,
           correlationId,
         });
-        this.#noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
+        this.#notices.noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
         return { ok: false, reason: "session_size_limit_exceeded" };
       }
     }
@@ -9081,7 +6580,7 @@ export class SessionNodeManager {
       // value of the notice. Nothing was recorded and nothing was acked, so the sender's daemon
       // redelivers on its own. An operator who reads the silence as delivery, or who asks the
       // counterparty to resend, is acting on the opposite of what happened.
-      this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+      this.#notices.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
         kind: REFUSAL_KINDS.DEFERRED,
         impact:
           "the screener could not reach a verdict on an inbound message, so it was NOT ingested and NOT shown. Nothing was recorded and nothing was acknowledged — the message is still with the sender and their daemon will redeliver it once screening works again. Do not read this silence as delivery.",
@@ -9161,7 +6660,7 @@ export class SessionNodeManager {
        * where before the operator got both stories at once.
        */
       noteTerminalBlock = (stored: number | null): void => {
-        this.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
+        this.#notices.noteContentRefusal(agentName, sessionId, inboundVerdict.reason ?? "inbound_screen_blocked", {
           kind: REFUSAL_KINDS.BLOCKED,
           impact:
             "the screener blocked an inbound message: its content matched a detector this agent runs on everything that arrives. It was NOT shown to the agent. It IS recorded in the hash chain at its position and the sender was acknowledged, so they will not resend it and they were not told it was blocked.",
@@ -9230,8 +6729,8 @@ export class SessionNodeManager {
       // so a sender can never pass one and fail the other.
       const senderTier = this.#records.getTier(agentName, senderPubkey);
       const cap = this.#records.resolveTierBound(agentName, senderTier, "max_bytes");
-      const priorTotal = this.#getReceivedBytesTotal(agentName, sessionId);
-      const heldTotal = this.#getHeldBytesTotal(agentName, sessionId);
+      const priorTotal = this.#queries.getReceivedBytesTotal(agentName, sessionId);
+      const heldTotal = this.#held.getHeldBytesTotal(agentName, sessionId);
       if (priorTotal + heldTotal + content.length > cap) {
         this.#logger.warn("session.content.abuse_bound.session_size_exceeded", {
           sessionId,
@@ -9245,7 +6744,7 @@ export class SessionNodeManager {
           correlationId,
           recheck: true,
         });
-        this.#noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
+        this.#notices.noteSizeCapRefusal(agentName, sessionId, cap, senderTier);
         return { ok: false, reason: "session_size_limit_exceeded" };
       }
     }
@@ -9268,7 +6767,7 @@ export class SessionNodeManager {
       : this.#witnessedSeq.get(key)?.get(contentHashHex);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
     if (canonicalSeq !== undefined && canonicalSeq > nextExpected) {
-      this.#ensureHeldRestored(agentName, sessionId);
+      this.#held.ensureHeldRestored(agentName, sessionId);
       let held = this.#heldContent.get(key);
       if (!held) { held = new Map(); this.#heldContent.set(key, held); }
       // A terminal block out of canonical order is held WITHOUT delivery (screenedOut): #releaseHeld
@@ -9282,7 +6781,7 @@ export class SessionNodeManager {
       held.set(canonicalSeq, { content: deliverContent, originalContent: content, contentHashHex, correlationId, ...(terminalBlock ? { screenedOut: true } : {}) });
       // DOD-M12B-STRAND-1: and to disk, before we answer. The in-memory Map is the working copy;
       // this row is the one that survives the teardown that used to destroy it.
-      this.#persistHeldContent(agentName, sessionId, canonicalSeq, deliverContent, content, contentHashHex, terminalBlock === true, correlationId);
+      this.#queries.persistHeldContent(agentName, sessionId, canonicalSeq, deliverContent, content, contentHashHex, terminalBlock === true, correlationId);
       // DOD-M15-REFUSEDEVIDENCE-1 (site 1 of 2 for a terminal block): a block held behind an
       // ordering gap. `#releaseHeld` appends its leaf later WITHOUT re-entering this method, so
       // retaining at release is not available — it is retained here, at the position the leaf will
@@ -9396,7 +6895,7 @@ export class SessionNodeManager {
       // same hash now dedups against a leaf whose plaintext is not there. Two reasons, because a
       // reader fixing the disk fault needs to know both that the text is gone and that the sender
       // is retrying into a hole.
-      this.noteContentRefusal(agentName, sessionId, "transcript_write_failed", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "transcript_write_failed", {
         kind: REFUSAL_KINDS.LOST,
         impact:
           "A message reached this agent, was verified, and was committed to the conversation's record — and then its text could not be written to local storage, so it can never be delivered. There is a permanent gap in your copy of this conversation. This is a fault on THIS machine; the counterparty did nothing wrong and cannot fix it.",
@@ -9454,7 +6953,7 @@ export class SessionNodeManager {
     // A just-appended leaf may unblock held out-of-order arrivals whose turn is now next.
     // appendedCount = this leaf + any held leaves released by it, so a caller (recover) can tally the
     // leaves ACTUALLY written, not just the directly-ingested one (review #3).
-    const released = this.#releaseHeld(agentName, sessionId, senderPubkey);
+    const released = this.#held.releaseHeld(agentName, sessionId, senderPubkey);
     return { ok: true, leafIndex, sequenceNumber: leafIndex, appendedCount: 1 + released, ...(terminalBlock ? { screenedOut: true } : {}) };
   }
 
@@ -9633,7 +7132,7 @@ export class SessionNodeManager {
     // active session — and a read that appends leaves, advances the root and rings the doorbell is
     // a diagnostic command that delivers messages. The release still runs on every path that was
     // going to mutate anyway.
-    this.#ensureHeldRestored(agentName, sessionId, { release: false });
+    this.#held.ensureHeldRestored(agentName, sessionId, { release: false });
     const treeSize = this.getSessionTree(agentName, sessionId).size();
     const highWaterSeq = this.#highWaterSeq.get(key) ?? -1;
     const heldCount = this.#heldContent.get(key)?.size ?? 0;
@@ -9712,7 +7211,7 @@ export class SessionNodeManager {
       return { state: "unknown", reason: "record_diverged_from_relay" };
     }
     if (!r.ready) {
-      const oldestHeldMs = this.#oldestHeldMs(agentName, sessionId);
+      const oldestHeldMs = this.#queries.oldestHeldMs(agentName, sessionId);
       return {
         state: "blocked",
         // The witness map counts a held frame until it is appended, so subtract the RECEIVED holds
@@ -9736,44 +7235,9 @@ export class SessionNodeManager {
 
 
 
-  #ownPubkeyHex(agentName: string): string | null {
-    if (!this.#db) return null;
-    try {
-      // BY agent_id, never by agent_name. The name is a mutable, reuse-freed display label, and
-      // scoping on it hands one identity's rows to another keypair (DOD-AGENT-ID-JOINKEY-1).
-      const row = this.#db
-        .prepare("SELECT k_local_pubkey FROM agents WHERE agent_id = ?")
-        .get(this.#requireAgentId(agentName)) as { k_local_pubkey: string } | undefined;
-      return row?.k_local_pubkey ?? null;
-    } catch (err: unknown) {
-      // An unattributed annex row is truthful; an unattributed row nobody knows about is not. This
-      // throws for a retired agent, and without a line here EVERY own held message would land in
-      // the record that outlives the session with no sender and no explanation.
-      this.#logger.warn("session.own_pubkey.unresolved", {
-        agentName,
-        error: err instanceof Error ? err.message : String(err),
-        impact: "this agent's own held content will be annexed without a sender",
-      });
-      return null;
-    }
-  }
 
-  /** DOD-M12B-SEAL-STUCK-1 — how long the oldest held frame for this session has been waiting, or
-   *  null when nothing is held. This is what separates "stuck since this morning" from "in flight
-   *  40 ms ago", and without it a healthy mid-conversation window reads as a stranded session. */
-  #oldestHeldMs(agentName: string, sessionId: string): number | null {
-    if (!this.#db) return null;
-    try {
-      const row = this.#db.prepare(
-        "SELECT MIN(held_at) AS oldest FROM held_content WHERE agent_id = ? AND session_id = ?",
-      ).get(this.#requireAgentId(agentName), sessionId) as { oldest: number | null } | undefined;
-      if (!row || row.oldest === null) return null;
-      return Date.now() - row.oldest;
-    } catch {
-      // A diagnostic detail must not be able to break the surface it decorates.
-      return null;
-    }
-  }
+
+
 
   /** DOD-MSG-4 / DAEMON-004: append a verified message leaf and buffer it for cello_receive. */
   #appendVerifiedContent(
@@ -9918,7 +7382,7 @@ export class SessionNodeManager {
       // cello_receive exit that reports it. `#undeliverableSeqs` is in memory, so the receive exit
       // stops being able to say this after a restart while the transcript hole stays permanent —
       // and the exit only runs if somebody is attending, which is the case this whole line is for.
-      this.noteContentRefusal(agentName, sessionId, "content_undeliverable", {
+      this.#notices.noteContentRefusal(agentName, sessionId, "content_undeliverable", {
         kind: REFUSAL_KINDS.LOST,
         impact:
           `a message arrived and was committed to the hash chain at sequence ${leafIndex}, and then its text could not be written to the local transcript. Delivery reads the transcript, so that message can never be handed to any session — it is a permanent hole in this side's copy of the conversation.`,
@@ -10037,7 +7501,7 @@ export class SessionNodeManager {
    * created: an authenticated stream proves who is speaking, not that a session exists.
    */
   async retireOnCounterpartyAbandon(agentName: string, sessionId: string, correlationId?: string): Promise<boolean> {
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     if (!record) {
       this.#logger.warn("session.abandon.notice.unknown_session", { agentName, sessionId, correlationId });
       return false;
@@ -10061,7 +7525,7 @@ export class SessionNodeManager {
     //
     // What the DoD actually asks for is that we stop calling them. That is a transport concern:
     // mark it, stop re-dialling, stop retrying delivery — and leave the session sealable.
-    const marked = this.#markCounterpartyAbandoned(agentName, sessionId);
+    const marked = this.#queries.markCounterpartyAbandoned(agentName, sessionId);
     if (!marked) return false;
     // The addresses go, so the demand-driven re-dial has nothing to dial. This is the storm.
     const key = this.#k(agentName, sessionId);
@@ -10078,26 +7542,7 @@ export class SessionNodeManager {
     return true;
   }
 
-  /** DOD-M12B-ABANDON-NOTIFY-1 — durable "they hung up" marker. Not a status: the session stays
-   *  sealable, which is the whole point of not making this terminal. */
-  #markCounterpartyAbandoned(agentName: string, sessionId: string): boolean {
-    if (!this.#db) return false;
-    try {
-      const res = this.#db
-        .prepare("UPDATE sessions SET counterparty_abandoned_at = ?, updated_at = ? WHERE agent_id = ? AND session_id = ? AND counterparty_abandoned_at IS NULL")
-        .run(Date.now(), Date.now(), this.#requireAgentId(agentName), sessionId) as unknown as { changes?: number | bigint };
-      // No rows changed means it was already marked — a duplicated notice, which must not
-      // re-announce. "Did not throw" is not "landed"; the row count is the answer.
-      return Number(res?.changes ?? 0) > 0;
-    } catch (err: unknown) {
-      this.#logger.error("session.counterparty.abandoned.write.failed", {
-        agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
-        impact: "this side will go on trying to reach a counterparty that has hung up",
-      });
-      return false;
-    }
-  }
+
 
   /**
    * DOD-CAP-SELF-HEAL-1 — the numbers behind a cap refusal, for the OPERATOR'S alarm only.
@@ -10110,7 +7555,7 @@ export class SessionNodeManager {
   capDiagnostics(agentName: string, counterpartyPubkey: string): { tier: number; cap: number; counted: number; mustClear: number; blocked: boolean } {
     const tier = this.#records.getTier(agentName, counterpartyPubkey);
     const cap = this.#records.resolveTierBound(agentName, tier, "max_sessions");
-    const counted = this.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
+    const counted = this.#queries.countActiveSessionsForCounterparty(agentName, counterpartyPubkey);
     return {
       tier, cap, counted,
       // How many to close to get UNDER the cap — not how many exist. At 5 against a cap of 3 the
@@ -10120,34 +7565,9 @@ export class SessionNodeManager {
     };
   }
 
-  /** DOD-CAP-SELF-HEAL-1: the sessions with this counterparty that are consuming cap slots, oldest
-   *  first. The operator is told to close some — this is WHICH, because "close three of them" with
-   *  no list is not an instruction they can follow. */
-  sessionsConsumingCap(agentName: string, counterpartyPubkey: string, limit = 10): string[] {
-    if (!this.#db) return [];
-    try {
-      const rows = this.#db.prepare(
-        `SELECT session_id FROM sessions WHERE agent_id = ? AND counterparty_pubkey = ? AND ${CAP_COUNTS()}
-         ORDER BY updated_at ASC LIMIT ?`,
-      ).all(this.#requireAgentId(agentName), counterpartyPubkey, capStaleBefore(), limit) as Array<{ session_id: string }>;
-      return rows.map((r) => r.session_id);
-    } catch {
-      return [];
-    }
-  }
 
-  /** DOD-M12B-ABANDON-NOTIFY-1: has the counterparty told us they hung up? */
-  counterpartyAbandonedAt(agentName: string, sessionId: string): number | null {
-    if (!this.#db) return null;
-    try {
-      const row = this.#db
-        .prepare("SELECT counterparty_abandoned_at FROM sessions WHERE agent_id = ? AND session_id = ?")
-        .get(this.#requireAgentId(agentName), sessionId) as { counterparty_abandoned_at: number | null } | undefined;
-      return row?.counterparty_abandoned_at ?? null;
-    } catch {
-      return null;
-    }
-  }
+
+
 
   /**
    * DOD-M12B-REDIAL-1 — open a content stream, re-dialling once if the connection has gone.
@@ -10284,7 +7704,7 @@ export class SessionNodeManager {
   ): { placed: true; leafIndex: number; diverged?: true; unwitnessed?: true } | { placed: false; heldAt: number } {
     // Hydrate before reading the frontier: a durable hold this process has not read back yet would
     // make the tree look further along than it is.
-    this.#ensureHeldRestored(agentName, sessionId);
+    this.#held.ensureHeldRestored(agentName, sessionId);
     const nextExpected = this.getSessionTree(agentName, sessionId).size();
 
     if (assignedSeq === undefined) {
@@ -10370,7 +7790,7 @@ export class SessionNodeManager {
     let held = this.#heldContent.get(key);
     if (!held) { held = new Map(); this.#heldContent.set(key, held); }
     held.set(assignedSeq, { content: sentBytes, contentHashHex, correlationId, origin: "sent", kind, ...(authorship ? { authorship } : {}) });
-    this.#persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent", kind);
+    this.#queries.persistHeldContent(agentName, sessionId, assignedSeq, sentBytes, sentBytes, contentHashHex, false, correlationId, "sent", kind);
     this.#logger.info("session.content.held", {
       sessionId, canonicalSeq: assignedSeq, nextExpected, gap: assignedSeq - nextExpected,
       origin: "sent", correlationId,
@@ -10378,315 +7798,15 @@ export class SessionNodeManager {
     return { placed: false, heldAt: assignedSeq };
   }
 
-  /**
-   * DOD-M12B-STRAND-1 — write one held frame to the durable store.
-   *
-   * LOGS LOUD, does not refuse. The caller answers `held: true` either way, and that is correct:
-   * held content is never `persisted`-acked, so the sender keeps its copy and retries whether or
-   * not this row lands. What a failure costs is the restart case — the frame is memory-only again,
-   * exactly as it was before this unit — so it is reported at ERROR here and counted again by the
-   * teardown alarm, and never allowed to look like a success.
-   */
-  #persistHeldContent(
-    agentName: string,
-    sessionId: string,
-    canonicalSeq: number,
-    deliverContent: Uint8Array,
-    originalContent: Uint8Array,
-    contentHashHex: string,
-    screenedOut: boolean,
-    correlationId?: string,
-    origin: "received" | "sent" = "received",
-    leafKind: WritableSessionTreeLeafKind = "msg",
-  ): void {
-    if (!this.#db) return;
-    try {
-      // A position may legitimately be re-written by a redelivery of the SAME frame. Different
-      // content at the same relay position means the relay contradicted itself, and destroying the
-      // first copy silently is not an option for verified content.
-      const existing = this.#db.prepare(
-        "SELECT content_hash_hex FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
-      ).get(this.#requireAgentId(agentName), sessionId, canonicalSeq) as { content_hash_hex: string } | undefined;
-      if (existing && existing.content_hash_hex !== contentHashHex) {
-        this.#logger.error("session.content.held.position_conflict", {
-          agentName, sessionId, canonicalSeq, correlationId,
-          existingContentHash: existing.content_hash_hex, incomingContentHash: contentHashHex,
-          impact: "two different frames claim one canonical position — the earlier held copy is being replaced",
-        });
-      }
-      this.#db.prepare(
-        `INSERT OR REPLACE INTO held_content
-           (agent_id, session_id, canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, held_at, origin, leaf_kind)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(
-        this.#requireAgentId(agentName), sessionId, canonicalSeq,
-        Buffer.from(deliverContent), Buffer.from(originalContent), contentHashHex,
-        screenedOut ? 1 : 0, correlationId ?? null, Date.now(), origin, leafKind,
-      );
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.persist.failed", {
-        agentName, sessionId, canonicalSeq, contentHash: contentHashHex, correlationId,
-        impact: "this frame is held IN MEMORY ONLY and will be destroyed if the daemon restarts",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
-  /** DOD-M12B-STRAND-1 — drop one held frame from the durable store, on release or on a refusal
-   *  that supersedes it. A row that outlives its release re-appends on the next boot. */
-  #deleteHeldContent(agentName: string, sessionId: string, canonicalSeq: number): void {
-    if (!this.#db) return;
-    try {
-      this.#db.prepare(
-        "DELETE FROM held_content WHERE agent_id = ? AND session_id = ? AND canonical_seq = ?",
-      ).run(this.#requireAgentId(agentName), sessionId, canonicalSeq);
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.delete.failed", {
-        agentName, sessionId, canonicalSeq,
-        impact: "the released frame's durable row survives and will be re-appended on the next boot",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
 
-  /**
-   * DOD-M12B-STRAND-1 — restore this session's held frames into memory.
-   *
-   * Called when a session node is (re)created, which is the moment the session becomes able to
-   * append again. Loading at daemon boot instead would be wrong for the same reason the old code
-   * was wrong: a frame is only releasable against a tree, and the tree is loaded per session.
-   *
-   * A frame whose content the tree ALREADY HOLDS at that position is dropped — re-appending it
-   * would change the root a seal signs over. That test is `hashAt`, not `canonical_seq < frontier`:
-   * the two counters are different spaces and this file documents them drifting, so the index
-   * comparison alone would destroy a frame the tree never held. See the drift branch below.
-   */
-  #ensureHeldRestored(agentName: string, sessionId: string, opts?: { release?: boolean }): void {
-    const key = this.#k(agentName, sessionId);
-    if (!this.#heldRestored.has(key)) {
-      // Set BEFORE restoring, so the #ensureHeldRestored inside #releaseHeld below returns straight
-      // away instead of recursing.
-      this.#heldRestored.add(key);
-      this.#restoreHeldContent(agentName, sessionId);
-    }
-    // A RESTORED FRAME MAY ALREADY BE IN ORDER, and nothing else would ever notice.
-    //
-    // #releaseHeld has one caller: the tail of a successful inbound ingest. Every other way the tree
-    // grows — an outbound send leaf, a queued or rejected leaf — advances the frontier without
-    // draining. While holds died with the session node that cost seconds; now the hold is durable,
-    // so the stall is durable too: the counterparty's message sits on disk at exactly the next slot,
-    // is never delivered, and `sealReadiness` counts it, so the session cannot close either.
-    // Undeliverable AND unsealable, forever, from one restart.
-    //
-    // TRACKED SEPARATELY FROM THE HYDRATION. A read-only caller (the status surface) hydrates and
-    // must NOT release — otherwise `cello status` appends leaves, advances the session root, writes
-    // transcript rows and rings the doorbell, which makes a diagnostic command the thing that
-    // delivers messages. One shared flag would also let that read CONSUME the release the next real
-    // ingest was going to perform, which is the stall above, reintroduced.
-    if (opts?.release === false) return;
-    if (this.#heldReleased.has(key)) return;
-    this.#heldReleased.add(key);
-    if (this.#heldContent.get(key)?.size) {
-      const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey;
-      if (counterparty) this.#releaseHeld(agentName, sessionId, counterparty);
-    }
-  }
 
-  #restoreHeldContent(agentName: string, sessionId: string): void {
-    if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; original_blob: Buffer | null; content_hash_hex: string; screened_out: number; correlation_id: string | null; origin: string; leaf_kind: string }>;
-    try {
-      rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, original_blob, content_hash_hex, screened_out, correlation_id, origin, leaf_kind
-           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
-      ).all(this.#requireAgentId(agentName), sessionId) as never;
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.restore.failed", {
-        agentName, sessionId,
-        impact: "verified content held before the restart is not in memory and cannot be released",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
-    if (rows.length === 0) return;
-    const key = this.#k(agentName, sessionId);
-    let held = this.#heldContent.get(key);
-    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    const tree = this.getSessionTree(agentName, sessionId);
-    const frontier = tree.size();
-    let restored = 0;
-    let superseded = 0;
-    let drifted = 0;
-    for (const row of rows) {
-      // ASK THE TREE WHAT IS AT THAT POSITION — do not infer it from the index.
-      //
-      // `canonical_seq` is the RELAY's sequence space; `frontier` is this tree's msg-leaf count.
-      // The two drift, on purpose and by documented cases: the relay counts CTRL leaves the tree
-      // never appends, and a first message whose relay submit failed leaves the tree one ahead.
-      // Under drift `canonical_seq < frontier` is TRUE for a frame the tree has never held, and
-      // deleting on that comparison destroys verified content while reporting it as tidy-up —
-      // the exact failure this unit exists to end, reintroduced on the recovery path.
-      const occupant = tree.hashAt(row.canonical_seq);
-      if (occupant === row.content_hash_hex) {
-        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        superseded++;
-        continue;
-      }
-      if (row.canonical_seq < frontier) {
-        // The position is taken by DIFFERENT content. The frame cannot be appended (that would
-        // rewrite a committed leaf) and must not be deleted (it is verified content nobody else
-        // holds), so it goes to the annex that exists for exactly this — content that arrived for
-        // a chain that can no longer carry it — and only then does the row go.
-        const annexed = this.recordSealedAnnex(
-          agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob),
-          // DOD-M12B-INDEX-1: our own held send is attributed to US, never to the counterparty.
-          row.origin === "sent"
-            ? this.#ownPubkeyHex(agentName)
-            : this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null,
-        );
-        this.#logger.error("session.content.held.position_drifted", {
-          agentName, sessionId, canonicalSeq: row.canonical_seq, frontier,
-          contentHash: row.content_hash_hex, occupant, annexed,
-          correlationId: row.correlation_id ?? undefined,
-          impact: annexed
-            ? "the relay's position for this frame is occupied by different content — it cannot join the chain and is readable only from the annex"
-            : "the relay's position for this frame is occupied by different content AND the annex write failed — the durable row is kept rather than destroyed",
-        });
-        if (annexed) this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        drifted++;
-        continue;
-      }
-      held.set(row.canonical_seq, {
-        content: new Uint8Array(row.content_blob),
-        ...(row.original_blob ? { originalContent: new Uint8Array(row.original_blob) } : {}),
-        contentHashHex: row.content_hash_hex,
-        ...(row.correlation_id ? { correlationId: row.correlation_id } : {}),
-        ...(row.screened_out ? { screenedOut: true } : {}),
-        ...(row.origin === "sent" ? { origin: "sent" as const } : {}),
-        ...(row.leaf_kind === "doc" ? { kind: "doc" as const } : {}),
-        /**
-         * ⚠️ `restoredAcrossRestart` EXISTS TO NAME A LOSS, NOT TO CHANGE BEHAVIOUR — review pass 2, H1.
-         *
-         * `held_content` has no authorship columns, so a SENT message held behind a gap and released
-         * after a daemon restart comes back with **no signature** — its transcript row records
-         * `self_authored` with no proof, indistinguishable from an unwitnessed send. That is the
-         * defect bullet 5 exists to end, reappearing on the recovery path, and it was silent.
-         *
-         * The proof cannot be reconstructed here: it was made over Structure-1 bytes this process no
-         * longer holds. **So the honest move is to say so, not to fabricate one** — a proof that
-         * cannot be checked, presented as one that can, is worse than the absence.
-         *
-         * Two BLOB columns would close it properly (this table already carries two `ALTER TABLE …
-         * ADD COLUMN` migrations, so the pattern exists). Under a frozen gate a log is additive and
-         * tightenable where a schema change is neither, so this announces the loss now and
-         * `DOD-M15-HELD-AUTHORSHIP-1` carries the column.
-         */
-        restoredAcrossRestart: true,
-      });
-      restored++;
-    }
-    if (held.size === 0) this.#heldContent.delete(key);
-    this.#logger.info("session.content.held.restored", {
-      agentName, sessionId, restored, superseded, drifted, frontier,
-      canonicalSeqs: [...held.keys()].sort((a, b) => a - b),
-      // The flow ids of the frames that came back, so a restored message ties to the
-      // `session.content.held` that opened its flow before the restart.
-      correlationIds: rows.map((r) => r.correlation_id).filter((c): c is string => c !== null),
-    });
-  }
 
-  /**
-   * DOD-MSG-4: drain held out-of-order content in canonical order. After a leaf is appended, any
-   * held entry whose canonical sequence equals the new next-expected index is now in order — append
-   * it, then check again (a single fill can release a run of consecutive held messages).
-   */
-  #releaseHeld(agentName: string, sessionId: string, senderPubkey: string): number {
-    const key = this.#k(agentName, sessionId);
-    // DOD-M12B-STRAND-1: hydrate before scanning. Restoring eagerly at session-node creation put
-    // it behind writes that can fail — one failed `sessions` row upsert and the frames stayed on
-    // disk, invisible, which is the same outcome as losing them.
-    this.#ensureHeldRestored(agentName, sessionId);
-    const held = this.#heldContent.get(key);
-    if (!held) return 0;
-    let released = 0;
-    for (;;) {
-      const nextExpected = this.getSessionTree(agentName, sessionId).size();
-      const entry = held.get(nextExpected);
-      if (!entry) break;
-      held.delete(nextExpected);
-      // DOD-M12B-STRAND-1: released content leaves the durable store in the same breath. A row
-      // that outlives its release would re-append the same content on the next boot — growing the
-      // tree and changing a root that has already been signed.
-      this.#deleteHeldContent(agentName, sessionId, nextExpected);
-      // DOD-M12B-INDEX-1: OUR OWN held message. It leafs at its canonical index and is transcribed
-      // as SENT — never routed down the received path, which would attribute our words to the
-      // counterparty in the sealed record and hand them back to our own agent as inbound.
-      if (entry.origin === "sent") {
-        // The KIND the leaf was placed with, not a hardcoded "msg" — a document leaf that had to
-        // wait for its position must come back as a document leaf, or the two sides disagree about
-        // what the chain contains.
-        this.appendSessionLeaf(agentName, sessionId, entry.kind ?? "msg", entry.contentHashHex, entry.correlationId);
-        // A DOCUMENT frame takes a leaf and NO transcript row — matching what the immediate-append
-        // path does for one. Writing one would put raw CBOR into the operator's transcript as
-        // something they said, which is the same attribution failure as releasing it inbound.
-        if (entry.kind === "doc") {
-          released++;
-          this.#logger.info("session.content.released", {
-            sessionId, sequenceNumber: nextExpected, leafKind: "doc", correlationId: entry.correlationId,
-          });
-          if (held.size === 0) { this.#heldContent.delete(key); break; }
-          continue;
-        }
-        // OBSERVED, not assumed — the received path already does this. The leaf commits either way,
-        // so a dropped transcript write means the operator's OWN message is missing from their own
-        // transcript with the chain saying it is there, and nothing anywhere said so.
-        // bullet 5: the proof was captured at submit time and rides the held entry — see #heldContent.
-        /**
-         * THE RESTART LOSS, ANNOUNCED — review pass 2, H1. Only for an entry that actually crossed a
-         * restart: an in-memory held entry carries its proof, and an unwitnessed send legitimately
-         * has none, so warning on every absent proof would fire on a designed benign state and bury
-         * the one occurrence that means something.
-         */
-        if (entry.restoredAcrossRestart === true && entry.authorship === undefined) {
-          this.#logger.warn("session.content.released.authorship.lost", {
-            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
-            impact:
-              "this message was held behind a gap, survived a daemon restart, and is now committed with " +
-              "attribution 'self_authored' and NO signature. Its transcript row asserts its author rather " +
-              "than proving one, and is indistinguishable from a send the relay never witnessed.",
-            guidance:
-              "Not recoverable after the fact — the signature covered Structure-1 bytes this process no longer " +
-              "holds, and fabricating one would be worse than the absence. Tracked as DOD-M15-HELD-AUTHORSHIP-1: " +
-              "held_content needs the two proof columns so a restart carries them.",
-          });
-        }
-        if (!this.#records.recordTranscriptMessage(agentName, sessionId, nextExpected, "sent", entry.content, entry.correlationId, entry.authorship)) {
-          this.#logger.error("session.content.released.transcript.failed", {
-            agentName, sessionId, sequenceNumber: nextExpected, correlationId: entry.correlationId,
-            impact: "this side's own message is committed to the chain but missing from its transcript",
-          });
-        }
-      } else if (entry.screenedOut) {
-        this.appendSessionLeaf(agentName, sessionId, "msg", entry.contentHashHex, entry.correlationId);
-        // The SAME witness leak as the immediate-append terminal-block branch (see the block comment
-        // at the `if (terminalBlock)` append in `ingestReceivedContent`), on the held path. This
-        // branch also bypasses `#appendVerifiedContent`, where the drop lives — so a blocked message
-        // that arrived out of order left `missingLeaves` stuck at 1 and the session unsealable.
-        this.#witnessedSeq.get(key)?.delete(entry.contentHashHex);
-      } else {
-        this.#appendVerifiedContent(agentName, sessionId, entry.content, entry.contentHashHex, senderPubkey, entry.correlationId, entry.originalContent);
-      }
-      released++;
-      this.#logger.info("session.content.released", {
-        sessionId,
-        sequenceNumber: nextExpected,
-        screenedOut: entry.screenedOut === true,
-        correlationId: entry.correlationId,
-      });
-      if (held.size === 0) { this.#heldContent.delete(key); break; }
-    }
-    return released;
-  }
+
+
+
+
+
 
   /** DAEMON-004: pop the oldest verified received content for cello_receive. */
   takeReceivedContent(agentName: string, sessionId: string): ReceivedContentEntry | null {
@@ -10761,23 +7881,12 @@ export class SessionNodeManager {
     // Only 'sealed' answers here. 'abandoned' forfeited its receipt and 'interrupted' /
     // 'seal_interrupted_pending' can still complete, so none of them may claim a seal — the
     // DOD-SEALED-INBOX-2 lesson, which is what makes this a status read and not a "is it over" read.
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     if (record?.status !== "sealed") return null;
     return { type: "sealed", unreadCount: this.#records.getUnreadReceivedCount(agentName, sessionId) };
   }
 
-  /**
-   * F1-b: the durable sealed root hex for a session (written by recordSealCertificate on the
-   * bilateral path), or null if not recorded. Lets cello_receive echo the sealed root in its
-   * terminal answer without threading it through destroySessionNode.
-   */
-  getSealedRootHex(agentName: string, sessionId: string): string | null {
-    if (!this.#db) return null;
-    const row = this.#db
-      .prepare("SELECT sealed_root_hex FROM sessions WHERE agent_id = ? AND session_id = ?")
-      .get(this.#requireAgentId(agentName), sessionId) as { sealed_root_hex?: string | null } | undefined;
-    return row?.sealed_root_hex ?? null;
-  }
+
 
   // ─── CELLO-M7-MSG-001: delivery ACK / TTF tracking (send side) ──────────────
 
@@ -10947,7 +8056,7 @@ export class SessionNodeManager {
       // An agent that mostly LISTENS sends content rarely and ACKs constantly. Clearing only on the
       // content path would leave exactly those sessions reporting a broken conversation forever
       // after one bad ACK — the one-way door, on the other send path.
-      this.#clearSessionImpairment(agentName, sessionId, "delivery_ack", correlationId);
+      this.#liveness.clearSessionImpairment(agentName, sessionId, "delivery_ack", correlationId);
     } catch (err: unknown) {
       this.#logger.warn("content.delivery.ack.send.failed", {
         sessionId,
@@ -10961,7 +8070,7 @@ export class SessionNodeManager {
       });
       // The ACK travels the same direct path as our own content, so a failure here is the same
       // evidence: writes to this counterparty are not landing.
-      this.#markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: err instanceof Error ? err.message : String(err), correlationId });
+      this.#liveness.markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: err instanceof Error ? err.message : String(err), correlationId });
       if (ackStream !== undefined) {
         try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -10989,31 +8098,7 @@ export class SessionNodeManager {
     this.#awaitingAck.delete(ackKey);
   }
 
-  #loadTreeFromDb(agentName: string, sessionId: string): SessionTree {
-    if (!this.#db) return SessionTree.empty();
-    const rows = this.#db
-      .prepare(
-        "SELECT leaf_kind, leaf_hash_hex FROM session_tree_leaves WHERE agent_id = ? AND session_id = ? ORDER BY leaf_index ASC",
-      )
-      .all(this.#requireAgentId(agentName), sessionId) as Array<{ leaf_kind: string; leaf_hash_hex: string }>;
-    return SessionTree.fromLeaves(
-      rows.map((r, leafIndex) => {
-        const kind = sessionTreeLeafKindFromDb(r.leaf_kind);
-        if (kind === "unknown") {
-          // A leaf kind written by a newer build. The tree stays intact and sealable (the
-          // stored hash carries its own domain), but an operator must be able to see that
-          // this daemon is behind the one that wrote the row.
-          this.#logger.error("session.tree.leaf_kind.unrecognized", {
-            agentName,
-            sessionId,
-            leafIndex,
-            value: r.leaf_kind,
-          });
-        }
-        return { kind, hashHex: r.leaf_hash_hex };
-      }),
-    );
-  }
+
 
   /**
    * DAEMON-004: register the /cello/content/1.0.0 handler on a session node so
@@ -11173,241 +8258,11 @@ export class SessionNodeManager {
     }));
   }
 
-  /**
-   * DOD-M15-FRAME-1 — a proven identity failure ends the session, and says so as an OBSERVATION.
-   *
-   * SESSION-ENDING, NOT PER-MESSAGE. One frame that fails to verify against the expected
-   * counterparty is not a bad message to drop while hoping the next is better — it is evidence
-   * about the CONNECTION. Dropping the frame and continuing leaves the same peer able to try again
-   * with a frame that omits the proof entirely.
-   *
-   * THE WORDING IS NOT A VERDICT, and that is deliberate rather than squeamish. The identical
-   * signal comes from a real impersonation attempt and from our own infrastructure mishandling a
-   * fallback — a relay bug, a bad deploy, an uncovered edge in the direct-connection failover. The
-   * daemon cannot tell those apart from this signal, so it must not pretend to. This mirrors the
-   * account-recovery pattern already in the codebase, which anchors a compromise window to logged
-   * events and accepts that some evidence cannot separate misconduct from an innocent cause.
-   *
-   * IT MUST NEVER FEED A TRUST SIGNAL. An automatic reputation consequence driven by a signal this
-   * ambiguous would let a hostile peer — or a bad deploy of ours — manufacture a mark against an
-   * innocent counterparty. Recorded here because the absence of that wiring is a decision, not an
-   * omission, and the next person to reach for it should find this comment first.
-   *
-   * The accusatory half stays local for the same reason. Freezing what THIS daemon trusts is always
-   * safe unilaterally; asserting on the record that a counterparty misbehaved needs corroboration
-   * from a party the accusing client does not control, which is `DOD-M15-CORROBORATE-1` (the relay
-   * holds the sender's signed hash independently and never routes it through the receiver).
-   */
-  /**
-   * DOD-M15-SEALWIRE-1 bullet 6 (part A) — THE SALT AGREEMENT, the I/O half.
-   *
-   * The decisions live in `session-salt-agreement.ts` as a pure function; everything here is the
-   * three things that function cannot do: read and write the durable row, put a frame on the wire,
-   * and stop a session.
-   *
-   * ─── Where a contribution may travel, and it is the one rule that cannot be fixed later ───────
-   *
-   * `/cello/content/1.0.0` ONLY. It rides circuit-relay-v2 carrying its own Noise session, so a
-   * relay forwarding it sees ciphertext. It must never be added to `session_offer` /
-   * `session_offer_accept` or anything a DIRECTORY brokers — and that is the trap, because the only
-   * round trip at session open today runs on the directory's signaling stream, which makes it the
-   * obvious place to put one. A session that shipped it there could not be repaired: the relay
-   * would already hold the salt and every hash it protects.
-   */
-  /**
-   * MINT THIS SESSION'S THROWAWAY KEYPAIR — once, at the moment the session becomes active.
-   *
-   * Idempotent on purpose. Three paths make a session active (open, hand-off from the standing
-   * receiver, revive) and a reconnect can re-enter them; minting a second keypair mid-session would
-   * leave the two sides deriving against a moving value, and the symptom — a session that reconnects
-   * and still cannot agree — reads as a network fault rather than as a bug here. `#saltContributionFor`
-   * mints once for exactly the same reason.
-   *
-   * A REVIVED session is not an exception, and this guard is why it took a fix to make that true.
-   * Revival requires status `interrupted`, and the producer of `interrupted` drops the entry without
-   * evicting — so while the secret outlived that path, this guard found it still present and
-   * silently kept a key that had been resident for hours, on the one path where re-keying was
-   * explicitly decided. The interrupt path now destroys it, so the map really is empty by the time
-   * a revival reaches here and it mints fresh (Decisions Carried #5).
-   */
-  #mintSessionEphemeral(agentName: string, sessionId: string, correlationId?: string): void {
-    const key = this.#k(agentName, sessionId);
-    if (this.#sessionEphemerals.has(key)) return;
-    this.#sessionEphemerals.set(key, generateSessionEphemeral());
-    this.#logger.debug("session.ephemeral.minted", {
-      agentName, sessionId, correlationId,
-      // The PUBLIC half only, and only a prefix of it. The secret must never reach a log line, and
-      // an operator correlating two daemons needs an identifier rather than the value.
-      publicKeyPrefix: Buffer.from(this.#sessionEphemerals.get(key)!.publicKey.subarray(0, 8)).toString("hex"),
-    });
-  }
 
-  /**
-   * DESTROY THIS SESSION'S THROWAWAY SECRET — 006-CRYPTO, and this is what forward secrecy IS.
-   *
-   * ⚠️ CALLED FROM EVERY SITE THAT DROPS THE `#activeNodes` ENTRY, not from `#evictSessionCaches`,
-   * and review pass 2 finding 2 is why. The first version rode the evict, which sounded right and
-   * was wrong on the path an interrupted session actually takes:
-   *
-   *   `markInterruptedWithDetails` drops the entry and DELIBERATELY does not evict — the received
-   *   plaintext has to stay drainable and the TTF park timers have to stay armed. So the secret
-   *   survived. Then, when that session later sealed, `destroySessionNode` returned at its
-   *   `if (!entry) return` — the entry was already gone — and never reached the evict either. The
-   *   receipt landed, the session was over, and the secret stayed resident until the process exited.
-   *
-   * A relay blip is the ORDINARY way a session ends badly, so that was the common path, not a corner.
-   * The evict's reasons for keeping the other caches are real and do not transfer: buffered plaintext
-   * must stay readable, and a secret nothing reads must not stay alive.
-   *
-   * Zero THEN drop. Dropping alone leaves the bytes wherever the collector last moved them;
-   * `destroySessionEphemeral` overwrites the one copy this process controls.
-   */
-  #destroySessionEphemeralFor(agentName: string, sessionId: string, correlationId?: string): void {
-    const key = this.#k(agentName, sessionId);
-    // 007-CRYPTO: the AGREED KEY goes with the ephemeral it was derived from. It is the same secret
-    // one step on — leaving it behind would keep the thing the destruction exists to remove.
-    const agreed = this.#sessionContentKeys.get(key);
-    if (agreed) {
-      agreed.fill(0);
-      this.#sessionContentKeys.delete(key);
-    }
-    this.#sessionContentKeyPeerHalf.delete(key);
-    this.#contentEncryptionReasons.delete(key);
-    const ephemeral = this.#sessionEphemerals.get(key);
-    if (!ephemeral) return;
-    destroySessionEphemeral(ephemeral);
-    this.#sessionEphemerals.delete(key);
-    this.#logger.debug("session.ephemeral.destroyed", { agentName, sessionId, correlationId });
-  }
 
-  /**
-   * AN INBOUND SIGNED EPHEMERAL — verify, THEN derive. Never the other way round.
-   *
-   * 🚨 A FAILED VERIFICATION IS A SECURITY EVENT AND IT STOPS THE SESSION. It is not a degradation
-   * to unencrypted, and the difference is the whole unit: an unsigned or wrongly-signed key is what
-   * a relay substituting its own looks like, and carrying on unencrypted would hand that relay
-   * exactly the plaintext it was reaching for. Missing, malformed and mismatched take this same
-   * path — a check that is lenient about a missing proof is a check an attacker skips.
-   *
-   * Contrast with a peer that says NOTHING at all: that is an old build, it is not evidence of
-   * anything about them, and it is recorded as `PEER_SILENT` — which still blocks sending, because
-   * there is no unencrypted path to fall back to.
-   */
-  async #handleEphemeralFrame(
-    agentName: string,
-    sessionId: string,
-    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
-    correlationId?: string,
-  ): Promise<void> {
-    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!entry) return;
 
-    /**
-     * THE IDENTITY WE EXPECT is the session's own counterparty record — and its provenance differs
-     * by side, which review F10 measured and an earlier version of this comment overstated.
-     *
-     *   INITIATOR: what the OPERATOR asked for (`initiate-session-handler` takes `target_pubkey`).
-     *   RESPONDER: the initiator identity the DIRECTORY attested in the offer/assignment.
-     *
-     * So this binds the ephemeral to that identity, whichever it is. The attack it closes is the
-     * RELAY substituting its own key — a different actor from the directory — and that is closed in
-     * both directions. What it does NOT do is move the responder's trust off the directory; the
-     * inbound path says as much itself ("a single compromised directory still controls both frames
-     * here"), and that is a separate line.
-     *
-     * The distinction is written down rather than smoothed over because this is a public repo and
-     * the sentence it replaces — "never from anything the directory handed back" — was absolute and
-     * false on one of the two sides.
-     */
-    const expected = Buffer.from(entry.counterpartyPubkey, "hex");
-    const sessionIdBytes = Buffer.from(sessionId, "hex");
-    const verdict = verifySessionEphemeral({
-      expectedIdentityPublic: new Uint8Array(expected),
-      sessionId: sessionIdBytes,
-      peerEphemeralPublic: frame.ephemeralPublic,
-      peerSignature: frame.signature,
-    });
 
-    if (!verdict.ok) {
-      this.#logger.error("session.key.refused", {
-        agentName, sessionId, correlationId,
-        reason: verdict.reason,
-        detail: verdict.detail,
-        guidance:
-          "STOPPED ON PURPOSE. The session key your counterparty sent could not be tied to them, so " +
-          "this session has been stopped rather than continued in the open. The ordinary cause is a " +
-          "build mismatch; the one that matters is something in the middle of your connection " +
-          "substituting its own key so it can read what you send. Confirm with your counterparty OUT " +
-          "OF BAND — not over CELLO — before opening another session with them.",
-      });
-      // Session-ending, not per-message: one proven wrong signer is evidence about the CONNECTION,
-      // not about the frame that carried it.
-      await this.#freezeSessionForKeyRefusal(agentName, sessionId, verdict.reason, correlationId);
-      return;
-    }
 
-    /**
-     * ALREADY AGREED WITH **THIS** PEER HALF — idempotence keyed on the bytes, not on presence.
-     *
-     * ⚠️ KEYING IT ON PRESENCE WAS A DEFECT, and a routine relay roll was enough to trigger it.
-     * Only the side whose witness stream closed interrupts, so only that side destroys its key and
-     * re-keys on revival. The OTHER side is never torn down — nothing else clears this map — so it
-     * saw the peer's NEW ephemeral, found a key already present, and kept the old one.
-     *
-     * Two different keys, and the damage is worse than a dead path: every message then fails GCM,
-     * and the receiving daemon reports *"the message did not decrypt — it was modified in flight, or
-     * encrypted under a different key"* and tells the operator to confirm OUT OF BAND. Nothing was
-     * modified. Two people have a security conversation about a local key skew.
-     *
-     * I MEASURED THIS TWICE AND CALLED IT A HARNESS QUIRK — the notes in `seam-4` and `m9-core-001`
-     * about seeding "before the settle" leaving the two ends on different keys are this defect,
-     * observed and worked around instead of read.
-     *
-     * So: the same half re-announced on every connect is still a no-op, and a DIFFERENT half — which
-     * only a re-keying peer sends — is adopted. The peer is identity-authenticated by the time we
-     * get here, so letting them move the key is not a new capability.
-     */
-    const peerHalfHex = Buffer.from(frame.ephemeralPublic!).toString("hex");
-    if (this.#sessionContentKeyPeerHalf.get(this.#k(agentName, sessionId)) === peerHalfHex) return;
-
-    const ownEphemeral = this.#sessionEphemeralFor(agentName, sessionId);
-    if (!ownEphemeral) {
-      this.#logger.error("session.key.refused", {
-        agentName, sessionId, correlationId, reason: "no_local_ephemeral",
-        detail: "the peer's key verified but this side holds no throwaway keypair to agree with, so nothing can be derived. This is a LOCAL defect, not something the peer did.",
-      });
-      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
-      return;
-    }
-
-    try {
-      const secrets = deriveSessionSecrets({
-        ownEphemeralSecret: ownEphemeral.secretKey,
-        peerEphemeralPublic: frame.ephemeralPublic!,
-        sessionId: sessionIdBytes,
-      });
-      const prior = this.#sessionContentKeyPeerHalf.get(this.#k(agentName, sessionId));
-      this.#sessionContentKeys.set(this.#k(agentName, sessionId), secrets.contentKey);
-      this.#sessionContentKeyPeerHalf.set(this.#k(agentName, sessionId), peerHalfHex);
-      this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
-      this.#logger.info("session.key.agreed", {
-        agentName, sessionId, correlationId,
-        // A RE-KEY is a different event from a first agreement and an operator correlating two
-        // daemons needs to tell them apart: a re-key means the other side restarted.
-        rekey: prior !== undefined && prior !== peerHalfHex,
-        impact: "message bodies on this session are now encrypted by CELLO under a key both sides agreed and neither sent, and which is destroyed when the session ends",
-      });
-    } catch (err: unknown) {
-      // The primitive owns every rule about the peer's half — a degenerate point, a non-canonical
-      // encoding, a reflection — and owns the WORDING. Substituting a code of our own here would
-      // destroy the only explanation that exists at the only moment anyone reads it.
-      this.#logger.error("session.key.refused", {
-        agentName, sessionId, correlationId, reason: "derivation_failed",
-        detail: err instanceof Error ? err.message : String(err),
-      });
-      await this.#freezeSessionForKeyRefusal(agentName, sessionId, "derivation_failed", correlationId);
-    }
-  }
 
   /**
    * Stop a session whose counterparty's key could not be tied to them.
@@ -11430,7 +8285,7 @@ export class SessionNodeManager {
      * held"* — a reassurance, for the one detection in this unit that means someone may be
      * substituting keys on the connection. Its only real consumer was a log line.
      */
-    this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.KEY_REFUSED);
+    this.#ephemerals.noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.KEY_REFUSED);
     /**
      * ⚠️ `"key_refused"`, NOT `"stream_close"` — review F3, and this is error substitution of the
      * exact kind Invariant 3 names. `stream_close` is written to the row as
@@ -11472,180 +8327,19 @@ export class SessionNodeManager {
     this.#keyProviderResolver = resolver;
   }
 
-  /**
-   * The agreed content key for a session, or `null` with the reason there is none.
-   *
-   * ONE place decides this, so the send path, the receive path and the status surface cannot
-   * disagree about whether a session is encrypted — the failure `wire-content-hash.ts` already
-   * records for the hash, where the expression was written out at five call sites and the two added
-   * last got it wrong.
-   */
-  #contentEncryptionState(
-    agentName: string,
-    sessionId: string,
-  ): { key: Uint8Array; reason?: undefined } | { key: null; reason: ContentEncryptionReason } {
-    const k = this.#k(agentName, sessionId);
-    const agreed = this.#sessionContentKeys.get(k);
-    if (agreed) return { key: agreed };
-    // No recorded fault means the exchange simply has not finished yet — the ordinary state in the
-    // instant between a session opening and its first connect completing.
-    return { key: null, reason: this.#contentEncryptionReasons.get(k) ?? CONTENT_ENCRYPTION_REASONS.NOT_YET_AGREED };
-  }
 
-  #noteContentEncryptionReason(agentName: string, sessionId: string, reason: ContentEncryptionReason): void {
-    const k = this.#k(agentName, sessionId);
-    // FIRST reason wins. A later, vaguer one must not overwrite the specific cause already recorded
-    // — "they never answered" written over "we could not sign" points the operator at the wrong
-    // machine, which is the substitution this closed set exists to end.
-    if (!this.#contentEncryptionReasons.has(k)) this.#contentEncryptionReasons.set(k, reason);
-  }
 
-  /**
-   * ANNOUNCE THIS SIDE'S SIGNED EPHEMERAL — `DOD-M15-EPHEMERAL-AUTH-1`.
-   *
-   * 🚨 ON THE PEER-TO-PEER CONTENT STREAM ONLY, exactly like the salt contribution and for the same
-   * unrepairable reason: it rides circuit-relay-v2 carrying its own Noise session, so a forwarding
-   * relay sees ciphertext. It must NEVER be added to `session_offer` / `session_offer_accept` or
-   * anything a DIRECTORY brokers — and that is the trap, because the only round trip at session open
-   * is the directory's signaling stream.
-   *
-   * Fire-and-forget on the connect handler, like the salt: a failed announcement must not turn a
-   * peer-connect handler into a rejected promise, and we re-announce on the next connect.
-   */
-  async #sendEphemeralFrame(agentName: string, sessionId: string, correlationId?: string): Promise<void> {
-    const entry = this.#activeNodes.get(this.#k(agentName, sessionId));
-    if (!entry) return;
-    const ephemeral = this.#sessionEphemeralFor(agentName, sessionId);
-    if (!ephemeral) {
-      this.#logger.error("session.key.announce.failed", {
-        agentName, sessionId, correlationId, reason: "no_ephemeral",
-        impact: "this session is active with no throwaway keypair, so there is nothing to announce; content stays unencrypted by CELLO",
-      });
-      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
-      return;
-    }
-    const signer = this.#keyProviderResolver?.(agentName);
-    if (!signer) {
-      /**
-       * A LOCAL fault, and it is named as one. Without this branch the peer simply never hears from
-       * us and blames a build that is fine — the operator whose machine cannot sign reads a message
-       * about their counterparty, which is the exact substitution the salt work already paid for.
-       */
-      this.#logger.error("session.key.announce.failed", {
-        agentName, sessionId, correlationId, reason: "no_identity_key",
-        impact: "this machine has no identity key for the agent, so it cannot sign its half of the session key; every session it opens is unencrypted by CELLO and the counterparty is not involved",
-        guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY],
-      });
-      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.NO_LOCAL_IDENTITY);
-      return;
-    }
 
-    let stream: Awaited<ReturnType<typeof entry.node.newStream>> | null = null;
-    try {
-      const sessionIdBytes = Buffer.from(sessionId, "hex");
-      const signature = await signSessionEphemeral(signer, sessionIdBytes, ephemeral.publicKey);
-      stream = await entry.node.newStream(entry.counterpartySessionPeerId, CELLO_CONTENT_PROTOCOL_ID);
-      stream.send(lp.encode.single(encodeCbor({
-        type: "session_key_agreement",
-        session_id: sessionId,
-        ephemeral_public: ephemeral.publicKey,
-        ephemeral_sig: signature,
-      }) as Uint8Array).subarray());
-      await stream.close();
-      this.#logger.debug("session.key.announced", {
-        agentName, sessionId, correlationId,
-        publicKeyPrefix: Buffer.from(ephemeral.publicKey.subarray(0, 8)).toString("hex"),
-      });
-    } catch (err: unknown) {
-      // The frame never left. Say so as a LOCAL fault rather than letting the session look like a
-      // counterparty on an old build — a re-announce rides the next connect.
-      this.#logger.error("session.key.announce.failed", {
-        agentName, sessionId, correlationId, reason: "stream_failed",
-        error: err instanceof Error ? err.message : String(err),
-        impact: "this side's half of the session key never reached the counterparty, so content stays unencrypted by CELLO until a later connect succeeds",
-      });
-      this.#noteContentEncryptionReason(agentName, sessionId, CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED);
-      /**
-       * ABORT, don't just close — review F13. A `close()` on a broken stream can itself fail and
-       * leave the slot held, which is the per-protocol stream-cap failure this file's longest
-       * comment documents. Every other failed write on this protocol aborts.
-       */
-      if (stream) { try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ } }
-      /**
-       * AND RETRY — review F5, and without it a single failed stream open kills encryption for the
-       * life of the session.
-       *
-       * The announce otherwise rides `onPeerConnect` only. If the connection then stays up there is
-       * no next connect, so nothing re-announces, every send parks forever, and the guidance's
-       * "it re-announces on the next connect" names an event that never arrives. It also compounds
-       * the re-key path: a revived session announces its FRESH half exactly once, and if that one
-       * attempt loses the race with the reconnect, the two ends sit on different keys.
-       *
-       * Bounded and self-cancelling: it stops when the session is no longer active, when a key has
-       * been agreed, and after `SESSION_KEY_ANNOUNCE_RETRIES` attempts.
-       */
-      this.#retryEphemeralAnnounce(agentName, sessionId, correlationId, 1);
-    }
-  }
 
-  /**
-   * Re-announce this side's ephemeral after a failed attempt — review F5.
-   *
-   * Backs off, and gives up rather than looping: a peer that is simply gone must not have a timer
-   * chasing it for the life of the process.
-   */
-  #retryEphemeralAnnounce(agentName: string, sessionId: string, correlationId: string | undefined, attempt: number): void {
-    if (attempt > SESSION_KEY_ANNOUNCE_RETRIES) {
-      this.#logger.warn("session.key.announce.gave_up", {
-        agentName, sessionId, correlationId, attempts: SESSION_KEY_ANNOUNCE_RETRIES,
-        impact: "this side never managed to send its half of the session key, so every message on this session takes the relay mailbox instead of the direct path",
-        guidance: CONTENT_ENCRYPTION_GUIDANCE[CONTENT_ENCRYPTION_REASONS.OUR_ANNOUNCE_FAILED],
-      });
-      return;
-    }
-    const timer = setTimeout(() => {
-      // Stop if the session went away, or if a key has since been agreed by any route.
-      if (!this.#activeNodes.has(this.#k(agentName, sessionId))) return;
-      if (this.#sessionContentKeys.has(this.#k(agentName, sessionId))) return;
-      void this.#sendEphemeralFrame(agentName, sessionId, correlationId);
-    }, SESSION_KEY_ANNOUNCE_RETRY_MS * attempt);
-    // Never hold the process open for a retry.
-    if (typeof timer.unref === "function") timer.unref();
-  }
 
-  /**
-   * Our throwaway keypair for a session, WITHOUT minting one — the read-only counterpart.
-   *
-   * `null` means the session is not active here. It never means "mint one now": minting outside
-   * `#mintSessionEphemeral` is how a second keypair appears mid-session.
-   */
-  #sessionEphemeralFor(agentName: string, sessionId: string): SessionEphemeral | null {
-    return this.#sessionEphemerals.get(this.#k(agentName, sessionId)) ?? null;
-  }
 
-  #saltContributionFor(agentName: string, sessionId: string): Uint8Array {
-    const key = this.#k(agentName, sessionId);
-    let contribution = this.#saltContributions.get(key);
-    if (!contribution) {
-      contribution = generateSaltContribution();
-      this.#saltContributions.set(key, contribution);
-    }
-    return contribution;
-  }
 
-  /**
-   * Our half for a session, **without minting one** — review F1, and the distinction is the whole
-   * safety of the repair.
-   *
-   * A session that already holds a salt must never mint a fresh half. If it did, the repair would
-   * offer the peer a half the stored salt was NOT derived from, they would compute a different salt,
-   * and both sides would believe they had agreed — silently, which is the one outcome worse than
-   * refusing. So `null` from here means exactly "we hold a salt and the half behind it is gone",
-   * and that is the only state the agreement is allowed to call unrepairable.
-   */
-  #ownSaltHalf(agentName: string, sessionId: string): Uint8Array | null {
-    return this.#saltContributions.get(this.#k(agentName, sessionId)) ?? null;
-  }
+
+
+
+
+
+
 
   /**
    * Test seam: force this session's own salt half, so the LOCAL-defect path is reachable.
@@ -11674,66 +8368,15 @@ export class SessionNodeManager {
     this.#maybeAutoAcknowledgeSeal(agentName, sessionId, correlationId);
   }
 
-  setSaltContributionForTest(agentName: string, sessionId: string, contribution: Uint8Array): void {
-    this.#saltContributions.set(this.#k(agentName, sessionId), contribution);
-  }
 
-  /**
-   * Test seams: re-enter the mint path, and read back the PUBLIC half — 006-CRYPTO.
-   *
-   * `#mintSessionEphemeral` is idempotent because a reconnect can re-enter an activation path, and a
-   * second keypair mid-session would leave the two sides deriving against a moving value. Proving
-   * that needs the path called TWICE, and the alternative — driving a real reconnect — drags in node
-   * rebuild and relay reconnection, none of which the property is about. Same justification as
-   * `forgetSaltContributionForTest` above.
-   *
-   * It calls the REAL private method, so a test cannot pass against a decision production does not
-   * make. The reader returns the public half ONLY: a seam that could hand out the secret is a way
-   * for the secret to leave this object, which is the one thing the whole unit is about.
-   */
-  mintSessionEphemeralForTest(agentName: string, sessionId: string): void {
-    this.#mintSessionEphemeral(agentName, sessionId);
-  }
 
-  sessionEphemeralPublicForTest(agentName: string, sessionId: string): Uint8Array | null {
-    const e = this.#sessionEphemeralFor(agentName, sessionId);
-    return e ? Uint8Array.from(e.publicKey) : null;
-  }
 
-  /**
-   * Test seam: INSTALL a keypair the caller already holds — the only way to prove ZEROING.
-   *
-   * Presence is easy to assert and is not the property. `destroySessionEphemeral` overwrites the
-   * buffer before the entry is dropped, and a mutant that drops without overwriting leaves the
-   * secret wherever the collector last moved it while passing every presence check — which is
-   * exactly what happened: the shutdown zeroing shipped with a surviving mutant, and the transport
-   * seeds four lines above it have the same untested gap today.
-   *
-   * The direction matters. Nothing here HANDS OUT a secret — the test supplies an object it already
-   * owns and then inspects its own reference. A reader that returned the live keypair would be a
-   * path for the secret to leave this object, which is the one thing this unit exists to prevent.
-   */
-  setSessionEphemeralForTest(agentName: string, sessionId: string, ephemeral: SessionEphemeral): void {
-    this.#sessionEphemerals.set(this.#k(agentName, sessionId), ephemeral);
-  }
 
-  /**
-   * Test seam: put a session into the state a COMPLETED exchange leaves it in — 007-CRYPTO.
-   *
-   * A live send now requires an agreed key, because there is no plaintext path to fall back to. In
-   * production the exchange completes on connect, before any send. A fixture with no real peer never
-   * completes it, so without this every content test in the repo would be exercising the refusal
-   * path instead of the thing it was written for.
-   *
-   * ⚠️ IT SHORT-CIRCUITS HOW THE KEY GOT THERE, NEVER WHAT THE KEY IS FOR. The state it produces —
-   * a session holding an agreed content key — is exactly the production state, which is what makes
-   * it legitimate; `setSaltContributionForTest` exists for the same reason. Tests of the EXCHANGE
-   * itself drive the real signed frames and must not use this.
-   */
-  setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void {
-    this.#sessionContentKeys.set(this.#k(agentName, sessionId), Uint8Array.from(key));
-    this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
-  }
+
+
+
+
+
 
 
   /**
@@ -11848,21 +8491,7 @@ export class SessionNodeManager {
     entry?.relayClient?.noteReceivedLeaf(sessionIdHex, relaySeq, contentHash);
   }
 
-  /**
-   * Test seam: put an own leaf in the HELD state instead of the tree — 033-ACKEMIT.
-   *
-   * The state `placeOwnLeaf` produces when the relay assigns a position ahead of our tail: the leaf
-   * exists on this side and is not in the tree, while the counterparty already has it from the relay
-   * and can acknowledge it. Reproducing it through the real hold map rather than by asserting the
-   * tree is short is what makes the acknowledgement test measure the case instead of a neighbour of
-   * it.
-   */
-  holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, contentHashHex: string): void {
-    const key = this.#k(agentName, sessionId);
-    let held = this.#heldContent.get(key);
-    if (!held) { held = new Map(); this.#heldContent.set(key, held); }
-    held.set(canonicalSeq, { content: new Uint8Array(), contentHashHex, origin: "sent", kind: "msg" });
-  }
+
 
   /**
    * Test seam: put the session's genesis prev_root where a completed session open leaves it —
@@ -11905,54 +8534,11 @@ export class SessionNodeManager {
     } catch { /* see above — the in-memory half is the load-bearing one */ }
   }
 
-  /**
-   * Test seam: drop the agreed key while leaving the session up — the state before an exchange
-   * completes, and after a teardown evicts one. Its mirror above is what a completed exchange
-   * leaves; both are needed, or a status field stuck in one position passes either test alone.
-   */
-  forgetSessionContentKeyForTest(agentName: string, sessionId: string): void {
-    this.#sessionContentKeys.delete(this.#k(agentName, sessionId));
-  }
 
-  /**
-   * Test seam: produce THIS side's signed ephemeral, using the manager's own identity resolver.
-   *
-   * For harnesses whose connectivity is one-directional — one side dials, so only one announce ever
-   * lands. Carrying the other side's half across with a REAL signature is what completes the
-   * exchange, and it beats seeding a key: a seeded key has no peer half recorded against it, so the
-   * first genuine announce replaces it and the two ends drift apart (which is correct behaviour —
-   * see the re-key guard — and exactly what made seeding fragile here).
-   *
-   * It signs with the same provider production signs with, so a test cannot pass against a signature
-   * production would have refused.
-   */
-  async signOwnEphemeralForTest(
-    agentName: string,
-    sessionId: string,
-  ): Promise<{ ephemeralPublic: Uint8Array; signature: Uint8Array } | null> {
-    const eph = this.#sessionEphemeralFor(agentName, sessionId);
-    const signer = this.#keyProviderResolver?.(agentName);
-    if (!eph || !signer) return null;
-    const signature = await signSessionEphemeral(signer, Buffer.from(sessionId, "hex"), eph.publicKey);
-    return { ephemeralPublic: Uint8Array.from(eph.publicKey), signature };
-  }
 
-  /**
-   * Test seam: deliver a peer's signed ephemeral, exactly as the content-stream decoder does.
-   *
-   * For harnesses whose connectivity is one-directional — one side dials, so only one announce ever
-   * lands — this is what completes the exchange instead of stuffing a key in. It runs the REAL
-   * verification and the REAL derivation, so a test cannot pass against a signature production would
-   * have refused.
-   */
-  async handleEphemeralFrameForTest(
-    agentName: string,
-    sessionId: string,
-    frame: { ephemeralPublic?: Uint8Array; signature?: Uint8Array },
-    correlationId = "test",
-  ): Promise<void> {
-    await this.#handleEphemeralFrame(agentName, sessionId, frame, correlationId);
-  }
+
+
+
 
   /**
    * Test seam: deliver an inbound salt frame, exactly as the content-stream decoder does.
@@ -11973,456 +8559,16 @@ export class SessionNodeManager {
     frame: SaltAgreementFrame,
     correlationId = "test",
   ): Promise<void> {
-    await this.#handleSaltFrame(agentName, sessionId, frame, correlationId);
+    await this.#salts.handleSaltFrame(agentName, sessionId, frame, correlationId);
   }
 
-  /**
-   * Test seam: drop this session's own half while leaving the stored salt in place — the state every
-   * teardown produces, because `#evictSessionCaches` clears the map and the row survives.
-   *
-   * It clears the SAME map the eviction clears rather than a stand-in, so a test cannot pass against
-   * a state the daemon never reaches. Reproducing it through a real teardown/revive would also drag
-   * in node rebuild and relay reconnection, none of which this is about.
-   */
-  forgetSaltContributionForTest(agentName: string, sessionId: string): void {
-    this.#saltContributions.delete(this.#k(agentName, sessionId));
-  }
+
 
   /**
-   * The pair the agreement reasons over: our salt, and the half that goes with it.
-   *
-   * Minting is deliberate and conditional. With NO salt we are certain to need a half — to offer, or
-   * to derive with — so minting here is what makes the exchange work at all. WITH a salt we must
-   * never mint; see `#ownSaltHalf`.
-   */
-  #saltState(agentName: string, sessionId: string): { ownSalt: Uint8Array | null; ownContribution: Uint8Array | null } {
-    const ownSalt = this.#getSessionSalt(agentName, sessionId);
-    return {
-      ownSalt,
-      ownContribution: ownSalt
-        ? this.#ownSaltHalf(agentName, sessionId)
-        : this.#saltContributionFor(agentName, sessionId),
-    };
-  }
+  
 
   /**
-   * THE ONE PLACE THAT DECIDES HOW A SESSION'S OUTBOUND CONTENT IS HASHED —
-   * `DOD-M15-SEALWIRE-1` part B2b.
-   *
-   * Returns the hash AND the algorithm that produced it, together, because the two must not be
-   * decided separately. `wire-content-hash.ts` exists for exactly this reason and says so in its own
-   * header: the expression was written out at five call sites, the two added last got it wrong, and
-   * the failure was invisible — *"the send succeeds, `parked: false`, the sender's log says the frame
-   * left, and the receiver discards it at the authenticity check."* It took two real daemons.
-   *
-   * There are FOUR outbound sites (`session-content-handlers.ts`, two in `daemon.ts`,
-   * `document-delivery-transport.ts`). Once salting is switchable, each of them independently
-   * deciding whether to salt is that defect again with a worse failure mode — a message hashed one
-   * way and LABELLED another is refused by every peer, including a correct one.
-   *
-   * ⚠️ ASYNC, AND THAT IS THE POINT — B2b-2 constraint 2, not an implementation detail.
-   *
-   * The agreement is in flight while the operator composes their first message. Hash without waiting
-   * and it comes out unsalted, and that first unsalted hash closes adoption for the LIFE of the
-   * session (Decision #8, unit 1). Every session would fall back permanently while every log line
-   * about it stayed true — the feature present, wired, tested, and never once reached.
-   *
-   * The wait lives HERE rather than at the four call sites for the same reason `contentHashAlg` is a
-   * required parameter rather than a defaulted one: a site that forgets it must fail to compile. A
-   * caller that drops the `await` gets a `Promise` where bytes belong, which is a typecheck error;
-   * a caller that forgot to call a separate `awaitSaltSettled()` would silently send unsalted.
-   */
-  async contentHashForSession(
-    agentName: string,
-    sessionId: string,
-    content: Uint8Array,
-  ): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> {
-    const { salt, reason } = await this.#saltForHashing(agentName, sessionId);
-    if (salt !== null) {
-      /**
-       * ⚠️ THE SALTED HASH MARKS ITSELF SPENT — `DOD-M15-SALTSPLIT-1` review pass 1, HIGH-2.
-       *
-       * The unsalted branch below has counted itself since review pass 2 F1, for a reason stated
-       * there in full: between hashing and `#trackAwaitingAck` there is a relay round trip, and in
-       * that window leaves, held content and awaiting-ack ALL read zero. **The salted direction was
-       * left with no counterpart**, which was harmless while nothing acted on the answer — and
-       * `#discardUnspentSalt` is the first code that acts on it destructively.
-       *
-       * Without this, a peer's `adoption_closed` frame arriving inside that window finds adoption
-       * "open", discards the salt, and the message already on the wire carries
-       * `content_hash_alg: hmac-salt-v1` with a hash **nobody — including this daemon — can ever
-       * recompute**. The alg is copied verbatim into the parked envelope on TTF expiry, so it
-       * survives the round trip that would otherwise have hidden it.
-       *
-       * A COUNT, not a bit, for the same reason the unsalted side is a count: two connections can be
-       * mid-send at once, and one finishing must not clear the claim the other is still relying on.
-       */
-      const key = this.#k(agentName, sessionId);
-      this.#hashedWithSalt.set(key, (this.#hashedWithSalt.get(key) ?? 0) + 1);
-      const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
-      return { hash: contentHashFor(content, { alg, salt }), alg };
-    }
     /**
-     * ⚠️ MARKED BEFORE THE HASH IS RETURNED, and this closes a window the row cannot see.
-     *
-     * `#saltAdoptionClosed` counts leaves, held content and in-flight sends. For the FIRST message of
-     * a session none of the three exists at this moment — the leaf lands after `sendContent` returns,
-     * which is a network round trip later. A peer contribution arriving in that gap would be adopted,
-     * and the message already on the wire would become the single unsalted leaf in an otherwise
-     * salted transcript: the exact split Decision #8 forbids, reached by the one route every count
-     * reads as empty.
-     *
-     * In memory rather than in a column, and that is sufficient rather than convenient: if this
-     * process survives, the flag holds; if it does not, the message it protects either reached a
-     * durable form (leaf, held row, queued row — all of which the counts see) or never left, in which
-     * case there is nothing to split. The one remaining case — hashed, sent, and no local record —
-     * is covered from the other side, because the peer DID leaf it and closes its own adoption, and
-     * the wire state added in unit 1 tells us so.
-     */
-    /**
-     * ⚠️ NOT FOR A TORN-DOWN SESSION — review Finding 5. `#evictSessionCaches` settles the wait and
-     * clears both of these sets; a `.add()` afterwards re-populates a map whose eviction has already
-     * run, and the entries then outlive the session they describe. There is also nothing to protect:
-     * a session that no longer exists cannot adopt a salt or split a transcript.
-     */
-    /**
-     * ⚠️ THE DEFERRED ERASE — `DOD-M15-SALTSPLIT-1`. This is the moment a suspended salt becomes both
-     * harmless to erase and NECESSARY to erase, and it must run BEFORE the count below.
-     *
-     * Harmless: this session has hashed nothing under the salt, which is what let it be suspended.
-     * Necessary: we are about to hash unsalted, and a salt left on disk reads back fine after a
-     * restart — so the next process would hash salted and the transcript would be split down the
-     * middle by a reboot rather than by any frame.
-     *
-     * **Before the `#hashedWithoutSalt` increment on purpose.** `#discardUnspentSalt` refuses to erase
-     * once adoption is closed, and that counter is one of the things that closes it — increment first
-     * and the erase we just decided is correct gets refused by our own guard, leaving exactly the
-     * split this ordering exists to prevent.
-     */
-    if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN && this.#saltSuspended.has(this.#k(agentName, sessionId))) {
-      /**
-       * ⚠️ GOING UNSALTED AND ERASING THE SALT ARE ONE DECISION — pass 2, F2 (HIGH), and this is my
-       * regression, not a pre-existing one.
-       *
-       * The note above claimed the ordering was sufficient because `#hashedWithoutSalt` is what
-       * closes adoption. **It is one of FOUR contributors.** Leaves, held rows and awaiting-ack close
-       * it too — and the most ordinary event in the protocol closes it: *the peer sends us its next
-       * message.* Reproduced through the real inbound path: suspend, peer's message lands as leaf 0,
-       * we hash `sha256`, and the erase is REFUSED with `already_hashing` while the bytes stay on
-       * disk. One teardown-and-revive later — no process restart required — we hash `hmac` again.
-       * That is the split transcript, produced by the fix for the split transcript.
-       *
-       * Worth naming precisely: **the immediate-erase design this replaced could NOT produce it.**
-       * There, a refused discard simply kept the session salted — one rule throughout, and loud.
-       * Suspension is what made "unsalted now, salted later" reachable. Same shape as pass 1: the fix
-       * worse than the defect on one path.
-       *
-       * So the two are atomic. If the salt cannot be erased, we do **not** go unsalted — we keep
-       * hashing under the held salt, which is one rule for the whole session, and say so at ERROR.
-       * The counterparty may refuse those messages, and that is the honest failure: a dead session
-       * beats a transcript no single rule can verify. The durable column remains the real answer.
-       */
-      if (!this.#discardUnspentSalt(agentName, sessionId)) {
-        const stillHeld = this.#getSessionSalt(agentName, sessionId);
-        if (stillHeld !== null) {
-          const key = this.#k(agentName, sessionId);
-          this.#logger.error("session.salt.split", {
-            agentName, sessionId, reason: "suspended_but_unerasable",
-            impact: "this session stays SALTED even though the counterparty says it can never hold a salt, because the salt could not be erased and hashing unsalted now would leave half this transcript under each rule — verifiable by nobody. Expect the counterparty to refuse messages sent from here.",
-            guidance: "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed. This one cannot be repaired — look for session.salt.discard.refused immediately above for why the salt could not be released.",
-          });
-          this.#hashedWithSalt.set(key, (this.#hashedWithSalt.get(key) ?? 0) + 1);
-          const alg = CONTENT_HASH_ALGS.HMAC_SALT_V1;
-          return { hash: contentHashFor(content, { alg, salt: stillHeld }), alg };
-        }
-      }
-    }
-    if (reason !== UNSALTED_REASONS.SESSION_TORN_DOWN) {
-      /**
-       * ⚠️ A COUNT, NOT A BIT — review pass 2, F1 (HIGH). It was a `Set`, and that made it ONE FLAG
-       * PER SESSION for a fact that is per MESSAGE.
-       *
-       * The `sibling_send_in_flight` refusal path exists precisely when another connection is
-       * mid-send with an unsalted hash it computed itself — and `sendContent` awaits a full relay
-       * round trip before `#trackAwaitingAck` records anything. So: connection A hashes and sets the
-       * flag; A enters that round trip, visible in no count; connection B hashes, sees A's claim,
-       * refuses, and calls `abandonUnsaltedHash` — **deleting the flag A is still relying on.** The
-       * frontier then reads entirely empty, a salt frame arriving in that window is adopted, and A's
-       * message lands as leaf 0 hashed sha256 in a session that hashes everything after it under
-       * HMAC.
-       *
-       * That is the split transcript this unit exists to prevent, through a window a relay round
-       * trip wide. A count makes each in-flight hash hold its own claim.
-       */
-      const key = this.#k(agentName, sessionId);
-      this.#hashedWithoutSalt.set(key, (this.#hashedWithoutSalt.get(key) ?? 0) + 1);
-    }
-    /**
-     * NO `??` DEFAULT — review pass 2, F6. It read `reason ?? ADOPTION_CLOSED_LOCALLY`, which is the
-     * shape the closed set was built to eliminate: a seventh return path forgetting its reason would
-     * have been silently labelled *"you already hashed"* and inherited guidance about a frontier that
-     * never moved. `#saltForHashing` returns a discriminated union now, so a null salt without a
-     * reason does not compile.
-     */
-    this.#announceUnsaltedOnce(agentName, sessionId, reason);
-    const alg = CONTENT_HASH_ALGS.SHA256;
-    return { hash: contentHashFor(content, { alg, salt: null }), alg };
-  }
-
-  /**
-   * The salt to hash this session's next message under, waiting for a pending agreement if one is
-   * genuinely in flight — B2b-2 constraints 2 and 5.
-   *
-   * Three exits, and the order matters:
-   *
-   *   1. We already hold one. No wait, ever.
-   *   2. Adoption is closed — this session has hashed or leafed something already, so a salt could
-   *      never be adopted now even if one arrived. Waiting would be waiting for a value we would
-   *      then have to refuse.
-   *   3. Nothing is pending. **This is the park-only case (constraint 5)**: the announcement hangs
-   *      off `onPeerConnect`, an offline counterparty never connects, so no agreement was ever
-   *      started. Waiting the full bound there pauses every message to an offline peer and falls
-   *      back anyway — a stall bought for nothing.
-   *
-   * Only a session with an agreement actually in flight waits, and only until it settles or the
-   * bound expires.
-   */
-  async #saltForHashing(
-    agentName: string,
-    sessionId: string,
-  ): Promise<{ salt: Uint8Array; reason?: undefined } | { salt: null; reason: UnsaltedReason }> {
-    const key = this.#k(agentName, sessionId);
-    const held = this.#getSessionSalt(agentName, sessionId);
-    if (held !== null) {
-      /**
-       * SUSPENDED BEATS HELD — `DOD-M15-SALTSPLIT-1`. The peer has said it can never hold a salt, so
-       * hashing under ours produces a message it must refuse. We hold one and deliberately do not
-       * use it.
-       *
-       * ⚠️ An earlier note here said `PEER_CLOSED_ADOPTION` "already carries exactly the right
-       * guidance, so no new reason is needed and none is invented." That was right about not
-       * inventing a reason and wrong about which one applies: the peer can suspend us for any of
-       * four reasons, and the one hardcoded here asserted the most flattering of them. It now asks
-       * the same mapping every other closed path asks (006-CRYPTO finding 2).
-       */
-      if (this.#saltSuspended.has(key)) {
-        return { salt: null, reason: this.#peerClosedReason(key) };
-      }
-      return { salt: held };
-    }
-    if (this.#saltAdoptionClosed(agentName, sessionId).closed) {
-      return { salt: null, reason: UNSALTED_REASONS.ADOPTION_CLOSED_LOCALLY };
-    }
-
-    const pending = this.#saltPending.get(key);
-    if (pending === undefined) {
-      // An agreement that already ENDED is not an agreement that never started. Only the second is
-      // "your counterparty was not connected", and only an absent entry means it.
-      const last = this.#saltLastOutcome.get(key);
-      if (last !== undefined) return { salt: null, reason: this.#reasonForOutcome(key, last) };
-      return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
-    }
-
-    const settled = await pending.settled;
-    if (settled === "agreed") {
-      const agreed = this.#getSessionSalt(agentName, sessionId);
-      /**
-       * A settled-`agreed` that reads back NULL is a READ failure, not a persist failure — pass 2,
-       * F4. `persist_failed` has its own outcome now, so the only way to arrive here empty is
-       * `#getSessionSalt` returning null after the salt was stored: a throwing read, or a
-       * wrong-width row, with the cache evicted in the microtask between settle and resume. Rare —
-       * and labelling it `our_persist_failed` sent the operator to look for a
-       * `session.salt.persist.failed` line that will not be there.
-       */
-      return agreed !== null
-        ? { salt: agreed }
-        : { salt: null, reason: UNSALTED_REASONS.OUR_READ_FAILED };
-    }
-    if (settled === "announce_failed") {
-      return { salt: null, reason: UNSALTED_REASONS.ANNOUNCE_FAILED };
-    }
-    if (settled === "persist_failed") {
-      // Named separately from the timeout on purpose: the peer answered in time and OUR write
-      // failed, so nothing about their build is involved and sending the operator there wastes them.
-      return { salt: null, reason: UNSALTED_REASONS.OUR_PERSIST_FAILED };
-    }
-    if (settled === "closed") {
-      /**
-       * Two very different things reach `closed`, and only one of them is about the counterparty.
-       *
-       * `#handleSaltFrame`'s terminal branch — the peer told us it cannot adopt — is a settled
-       * bilateral outcome and the session is fine. `#evictSessionCaches` — this session is being
-       * torn down underneath us — is not: there is no session left to be unsalted, and a caller that
-       * marks `#hashedWithoutSalt` for it re-populates a map whose eviction has already run
-       * (review Finding 5). `#saltPending` is gone by the time we look, so the live node is what
-       * distinguishes them.
-       */
-      return {
-        salt: null,
-        reason: this.#activeNodes.has(key)
-          ? UNSALTED_REASONS.PEER_CLOSED_ADOPTION
-          : UNSALTED_REASONS.SESSION_TORN_DOWN,
-      };
-    }
-    if (settled === "timeout") {
-      /**
-       * A DECISION, NOT A RETRY. Logged once, here, because this is the moment the session became
-       * permanently unsalted — and an operator reading a later `session.content.unsalted` needs to
-       * be able to find out WHY this session has no salt when their others do.
-       */
-      this.#logger.warn("session.salt.agreement.timeout", {
-        agentName, sessionId, waitedMs: pending.boundMs,
-        impact: "the counterparty did not answer the salt agreement in time, so this session is unsalted FOR ITS LIFE — the message is being sent now rather than held any longer. Nothing is lost and nothing is degraded relative to any shipped release.",
-        // Review F4: `session.salt.persist.failed` reaches this same timeout by a completely
-        // different route — the peer answered promptly and OUR OWN write failed, so we returned
-        // before announcing and nothing came back. Omitting it sent that operator to ask their
-        // counterparty about a version mismatch that was never involved.
-        guidance: "Most often the counterparty is on a build that predates the salt agreement, in which case this is expected and permanent for this session — a newer one will agree normally. If you know they are on the same version, look for session.salt.persist.failed on THIS side first (our own write failing produces this same timeout), then session.salt.announce.failed on either side.",
-      });
-      return { salt: null, reason: UNSALTED_REASONS.AGREEMENT_TIMED_OUT };
-    }
-    return { salt: null, reason: UNSALTED_REASONS.AGREEMENT_TIMED_OUT };
-  }
-
-  /**
-   * Decision #15's fallback announcement — ONCE per session, never per message.
-   *
-   * A warning that fires on every message of every unsalted session is not a signal, it is a reason
-   * to build a filter; and the operator who filters it also filters the one session where it meant
-   * something. Stated once, with what the session actually loses.
-   */
-  #announceUnsaltedOnce(agentName: string, sessionId: string, reason: UnsaltedReason): void {
-    const key = this.#k(agentName, sessionId);
-    if (this.#unsaltedAnnounced.has(key)) return;
-    this.#unsaltedAnnounced.add(key);
-    this.#logger.info("session.content.unsalted", {
-      agentName, sessionId,
-      // The REASON is the field that makes this line diagnosable, and it was the missing one. The
-      // impact is the same for all six; what to do about it is not.
-      reason,
-      impact: "this session hashes its messages the way every build before this feature did. Nothing is degraded relative to any shipped release and no message is affected — it only means a relay holding the hashes could confirm a guess at a short message in THIS conversation, which a salt would have prevented.",
-      guidance: UNSALTED_GUIDANCE[reason],
-    });
-  }
-
-  /**
-   * Register that a salt agreement is IN FLIGHT for this session, so the first send waits for it.
-   *
-   * Called where we announce our own state — not at session creation. That distinction is
-   * constraint 5: an agreement exists to be waited for only once a frame has actually gone out.
-   */
-  #markSaltPending(agentName: string, sessionId: string, boundMs = SALT_AGREEMENT_WAIT_MS): void {
-    const key = this.#k(agentName, sessionId);
-    if (this.#saltPending.has(key)) return;
-    let resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed") => void = () => { };
-    const settled = new Promise<"agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed">((r) => { resolve = r; });
-    const timer = setTimeout(() => this.#settleSaltPending(agentName, sessionId, "timeout"), boundMs);
-    // The daemon must be able to exit with this outstanding — a pending agreement is not a reason to
-    // hold the process open.
-    if (typeof timer.unref === "function") timer.unref();
-    this.#saltPending.set(key, { settled, resolve, timer, boundMs });
-  }
-
-  /**
-   * ONE mapping from a settled outcome to the operator-facing reason, so the send that WAITED and the
-   * send that arrived afterwards cannot disagree about what happened.
-   */
-  #reasonForOutcome(
-    key: string,
-    outcome: "timeout" | "closed" | "persist_failed" | "announce_failed",
-  ): UnsaltedReason {
-    if (outcome === "announce_failed") return UNSALTED_REASONS.ANNOUNCE_FAILED;
-    if (outcome === "persist_failed") return UNSALTED_REASONS.OUR_PERSIST_FAILED;
-    if (outcome === "closed") return this.#peerClosedReason(key);
-    return UNSALTED_REASONS.AGREEMENT_TIMED_OUT;
-  }
-
-  /**
-   * WHICH of the four terminal answers the peer actually gave — 006-CRYPTO finding 2.
-   *
-   * The default is the NON-ASSERTING reason, not the most common one. An unknown label means a build
-   * we do not understand, and rendering that as "they had already hashed messages" states something
-   * about a counterparty that may be untrue — which is what sends an operator to raise a
-   * non-problem with them. The label is peer-supplied, so nothing outside the known set is repeated
-   * back as our own diagnosis.
-   *
-   * A missing entry maps to the already-hashing case: `PEER_CLOSED_FIRST` and an absent label both
-   * mean the peer is answering a closure of OURS, and `#saltForHashing` answers that with
-   * `ADOPTION_CLOSED_LOCALLY` one branch earlier — this is only the fallback if it did not.
-   */
-  #peerClosedReason(key: string): UnsaltedReason {
-    const label = this.#saltPeerClosedLabel.get(key);
-    if (label === undefined || label === SALT_ADOPTION_LABELS.PEER_CLOSED_FIRST) {
-      return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
-    }
-    if (label === SALT_ADOPTION_LABELS.ALREADY_HASHING) return UNSALTED_REASONS.PEER_CLOSED_ADOPTION;
-    if (label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE) return UNSALTED_REASONS.PEER_FRONTIER_UNREADABLE;
-    if (label === SALT_ADOPTION_LABELS.EXCHANGE_STALLED) return UNSALTED_REASONS.PEER_EXCHANGE_STALLED;
-    return UNSALTED_REASONS.PEER_CLOSED_UNSPECIFIED;
-  }
-
-  /** Resolve a pending agreement. Idempotent: the first outcome wins and the timer is cleared. */
-  #settleSaltPending(agentName: string, sessionId: string, outcome: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed"): void {
-    const key = this.#k(agentName, sessionId);
-    const pending = this.#saltPending.get(key);
-    if (pending === undefined) return;
-    this.#saltPending.delete(key);
-    // `agreed` is not recorded: the salt itself is the record, and `#getSessionSalt` answers first.
-    if (outcome !== "agreed") this.#saltLastOutcome.set(key, outcome);
-    clearTimeout(pending.timer);
-    pending.resolve(outcome);
-  }
-
-  /**
-   * THIS SESSION'S UNSALTED HASH NEVER BECAME A MESSAGE — release the permanent closure it caused.
-   *
-   * ⚠️ REVIEW FINDING 3, and it is the opposite of the direction the flag was written to defend.
-   * `#hashedWithoutSalt` closes adoption at hash time, because for a session's first message the
-   * leaf is a network round trip away and every frontier count reads zero in between. Correct — but
-   * `cello_send` has three paths that compute the hash and then produce NOTHING: a sibling send
-   * holding the in-flight claim, the frontier moving under the send, and a non-durable send failure
-   * whose bytes go to a queue with no production consumer.
-   *
-   * In all three the session was permanently unsalted for a message that exists nowhere: no leaf, no
-   * wire, no copy at the peer. And B2b-2 made two of them MORE likely on a first message, because
-   * the five-second wait widens the very window the frontier re-check is watching.
-   *
-   * Only safe because it is called on paths that provably sent nothing. It deliberately does NOT
-   * clear `#unsaltedAnnounced`: the announcement was true when it fired and re-announcing on the
-   * retry would be the per-message flood Decision #15 forbids.
-   *
-   * ─── THREE OTHER SITES HASH AND MAY SEND NOTHING, AND ARE EXEMPT ON PURPOSE (pass 2, F8) ──────
-   *
-   * `daemon.ts`'s one-shot rejection and away reply, and `document-delivery-transport.ts`'s frame
-   * send, can all fail after hashing. None of them needs to abandon, and the reason is the same in
-   * each: every one is a REPLY. The inbound message that triggered it has already been leafed on
-   * this side, so `#saltAdoptionClosed` is already closed by the leaf count and would stay closed
-   * whatever this flag said. Calling abandon there would be a no-op that looks like a guarantee.
-   *
-   * Written down rather than left to be re-derived: the next reader's first question is why the
-   * list is three and not six.
-   */
-  abandonUnsaltedHash(agentName: string, sessionId: string): void {
-    const key = this.#k(agentName, sessionId);
-    const held = this.#hashedWithoutSalt.get(key) ?? 0;
-    if (held === 0) return;
-    // DECREMENT, never delete — F1. Deleting released a sibling's claim along with this one.
-    if (held > 1) { this.#hashedWithoutSalt.set(key, held - 1); return; }
-    this.#hashedWithoutSalt.delete(key);
-    /**
-     * INFO, not DEBUG — review pass 2, F3. `session.content.unsalted` has already told this operator
-     * at INFO that the session is unsalted *"permanently… start a new session if you want the
-     * protection."* That statement is now false, and a retraction logged below the level of the
-     * claim it retracts is not a retraction. The announcement itself is deliberately NOT re-armed —
-     * re-announcing on the retry is the per-message flood Decision #15 forbids.
-     */
-    this.#logger.info("session.content.unsalted.retracted", {
-      agentName, sessionId,
-      impact: "a hash computed unsalted never became a message — no leaf, nothing on the wire, no copy at the counterparty — so this session CAN still adopt a salt. An earlier session.content.unsalted line said the session was permanently unsalted; that no longer applies.",
-    });
-  }
-
-  /**
    * TEST SEAM — put a session into the state a real one is in between announcing and being answered.
    *
    * Reaching that state for real needs a live counterparty connection, which the daemon-level
@@ -12430,39 +8576,13 @@ export class SessionNodeManager {
    * the same private registration the announce path calls, so it cannot drift from it.
    */
   markSaltAgreementPendingForTest(agentName: string, sessionId: string, boundMs?: number): void {
-    this.#markSaltPending(agentName, sessionId, boundMs);
+    this.#salts.markSaltPending(agentName, sessionId, boundMs);
   }
 
-  /**
-   * PUBLIC read of a session's agreed salt — `DOD-M15-SEALWIRE-1` part B2a.
-   *
-   * `content-park.ts` runs a SECOND, independent content-hash verifier (the park signature does not
-   * cover the envelope content, so it checks before `ingestReceivedContent` is ever reached), and it
-   * hardcoded `sha256`. It needs the salt to verify a v3 envelope, and it is outside this class.
-   *
-   * Read-only and cache-backed, so exposing it adds no way to CHANGE the salt from outside — the
-   * only writer remains `#persistSessionSalt`, behind the one-salt-per-session predicate.
-   */
-  /**
-   * IS THIS SESSION ACTUALLY PROTECTED BY ITS SALT RIGHT NOW — pass 2, F3.
-   *
-   * Distinct from `getSessionContentSalt`, which is POSSESSION and is what the verifier needs: a
-   * message parked before suspension was hashed under this salt and must still be checkable against
-   * it, so that accessor must keep answering with the bytes.
-   *
-   * This one answers the OPERATOR's question, and it is a different question. A suspended session
-   * holds a salt it will not use, so every hash it produces is `sha256` — reporting `contentSalted:
-   * true` there is not a gap, it is an affirmatively false security claim on the surface whose own
-   * comment reads *"a security property must not be inferable from a gap."* Same predicate
-   * `#saltForHashing` uses, so the flag cannot drift from the behaviour it describes.
-   */
-  isContentSaltActive(agentName: string, sessionId: string): boolean {
-    if (this.#saltSuspended.has(this.#k(agentName, sessionId))) return false;
-    return this.#getSessionSalt(agentName, sessionId) !== null;
-  }
+
 
   getSessionContentSalt(agentName: string, sessionId: string): Uint8Array | null {
-    return this.#getSessionSalt(agentName, sessionId);
+    return this.#salts.getSessionSalt(agentName, sessionId);
   }
 
   /**
@@ -12491,7 +8611,7 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
   ): { salt: Uint8Array } | { salt: null; reason: "none" | "unreadable" } {
-    const salt = this.#getSessionSalt(agentName, sessionId);
+    const salt = this.#salts.getSessionSalt(agentName, sessionId);
     if (salt) return { salt };
     if (!this.#db) return { salt: null, reason: "unreadable" };
     try {
@@ -12509,455 +8629,17 @@ export class SessionNodeManager {
     }
   }
 
-  /**
-   * This session's agreed salt, or null. Reads the durable row through a cache, because Decision #8
-   * persists it for exactly one reason: *"a restart silently splits the transcript"* if the lookup
-   * misses and a fresh salt is minted.
-   *
-   * A read failure returns null WITH a log rather than throwing — except the bare `!this.#db` guard,
-   * which is this file's convention at 60+ sites and only reachable during shutdown. Null means "we
-   * hold no salt", which drives the agreement to offer a contribution — and against a peer that does
-   * hold one that is a named, loud `salt_state_divergent` refusal. So the degraded path ends in a
-   * diagnosis, not in a session that quietly hashes under the wrong value.
-   *
-   * ⚠️ THIS PARAGRAPH SPENT A UNIT STRANDED 180 LINES AWAY, directly above `contentHashForSession`
-   * and followed by that method's own block — so a reader hovering the hash decision got prose about
-   * salt read failures. Harmless and exactly the kind of drift that makes a comment stop being read.
-   */
-  #getSessionSalt(agentName: string, sessionId: string): Uint8Array | null {
-    const key = this.#k(agentName, sessionId);
-    const cached = this.#sessionSalts.get(key);
-    if (cached) return cached;
-    if (!this.#db) return null;
-    try {
-      const row = this.#db
-        .prepare("SELECT content_salt FROM sessions WHERE agent_id = ? AND session_id = ?")
-        .get(this.#requireAgentId(agentName), sessionId) as { content_salt?: Uint8Array | null } | undefined;
-      const stored = row?.content_salt;
-      if (!stored || stored.length === 0) return null;
-      /**
-       * A WRONG-WIDTH ROW IS NOT A SALT — review F8.
-       *
-       * Any non-empty blob used to be accepted, so a truncated row became "our salt", the digests
-       * then differed, and the operator was told *"one of you is running an older build — compare
-       * versions with them"*: sent to their counterparty over corruption on their own disk. Refusing
-       * it here makes this side hold NO salt, which re-offers a contribution and repairs.
-       */
-      if (stored.length !== SESSION_SALT_BYTES) {
-        this.#logger.error("session.salt.read.failed", {
-          agentName, sessionId, storedBytes: stored.length, expected: SESSION_SALT_BYTES,
-          reason: "wrong_width",
-          impact: "the stored salt is the wrong size, so it is not used; this session is treated as holding no salt and will re-agree one with the counterparty rather than comparing a corrupt value and blaming their build",
-        });
-        return null;
-      }
-      const salt = new Uint8Array(stored);
-      this.#sessionSalts.set(key, salt);
-      return salt;
-    } catch (err: unknown) {
-      this.#logger.error("session.salt.read.failed", {
-        agentName, sessionId, error: extractErrorMessage(err),
-        impact: "this session is treated as holding no salt, so it will offer a fresh contribution; against a counterparty that still holds theirs the agreement refuses by name rather than hashing under a value only one side has",
-      });
-      return null;
-    }
-  }
 
-  /**
-   * Is this session past the point where a salt can be adopted? — Decision #8, part B2b-2.
-   *
-   * ⚠️ THE PREDICATE IS "HAS ANYTHING BEEN HASHED", NOT "IS THERE A LEAF" — review F5. A leaf is
-   * APPENDED after `await sendContent(...)` returns, so a message can be hashed, put on the wire, and
-   * still be invisible to `tree.size()`. Adopting inside that window makes leaf 0 unsalted and the
-   * rest salted — the exact split this exists to prevent, with the guard green.
-   *
-   * ⚠️ HELD CONTENT COUNTS, AND MUST BE HYDRATED FIRST — review F6. `#ensureHeldRestored` is lazy and
-   * is not called at session-node creation, so a revived session whose first inbound frame is the
-   * salt frame reads a frontier that excludes durable `held_content` rows — rows already hashed
-   * unsalted, which `#releaseHeld` will append moments later. Every other frontier reader in this
-   * file hydrates first, for this reason. `release: false`, because a salt frame must never deliver
-   * messages as a side effect.
-   *
-   * ⚠️ "CANNOT TELL" IS CLOSED, NOT OPEN. `#requireAgentId` throws for a retired agent, and inferring
-   * "zero leaves" from a failure to count them is how a guard becomes a formality. The cost of
-   * refusing is an unsalted session; the cost of permitting is a transcript neither rule can verify.
-   */
-  #saltAdoptionClosed(agentName: string, sessionId: string): { closed: boolean; label: string; leafCount: number; why: string } {
-    try {
-      this.#ensureHeldRestored(agentName, sessionId, { release: false });
-    } catch { /* hydration is best-effort; the counts below still refuse on their own failure */ }
-    try {
-      const key = this.#k(agentName, sessionId);
-      const leaves = this.getSessionTree(agentName, sessionId).size();
-      const held = this.#heldContent.get(key)?.size ?? 0;
-      const inFlight = this.#awaitingAck.get(key)?.size ?? 0;
-      /**
-       * ⚠️ THE HASH ITSELF COUNTS — B2b-2, and none of the three counts above can see it.
-       *
-       * Decision #8 closes adoption when content is HASHED. For a session's first message the leaf
-       * lands after `sendContent` returns, a network round trip later; there is no held row and no
-       * in-flight entry yet either. So between the hash and the leaf every count reads zero, and a
-       * peer contribution arriving in that window would be adopted — leaving the message already on
-       * the wire as the one unsalted leaf in a salted transcript.
-       */
-      const hashed = this.#hashedWithoutSalt.get(key) ?? 0;
-      const total = leaves + held + inFlight + hashed;
-      return {
-        closed: total > 0,
-        // The label crosses the WIRE, so it carries no counts and no error text — only which of the
-        // two refusals this is. The counts stay in `why`, which stays local.
-        label: SALT_ADOPTION_LABELS.ALREADY_HASHING,
-        leafCount: total,
-        why: `leaves=${leaves} held=${held} awaiting_ack=${inFlight} hashed=${hashed}`,
-      };
-    } catch (err: unknown) {
-      return {
-        closed: true,
-        label: SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE,
-        leafCount: -1,
-        why: `frontier_unreadable: ${extractErrorMessage(err)}`,
-      };
-    }
-  }
 
-  /**
-   * Persist the agreed salt, and DO NOT ANNOUNCE ONE WE FAILED TO STORE.
-   *
-   * The caller sends its fingerprint only if this returns true. A salt held in memory and not on
-   * disk would confirm agreement to the counterparty and then be gone at the next restart — turning
-   * a loud `salt_state_divergent` refusal, which is the whole point of Decision #10, into the silent
-   * split it exists to prevent, one restart later.
-   *
-   * ⚠️ SECOND ORPHAN OF THE SAME KIND. This paragraph was stranded above `#saltAdoptionClosed` and
-   * followed by that method's own block, exactly like the `#getSessionSalt` one re-homed in the
-   * previous pass — which walked straight past this one sixty lines below it. Two in one file is not
-   * coincidence: inserting a method between a doc block and its subject leaves no error, no lint,
-   * and no test, so the drift is invisible until someone reads for it.
-   */
-  #persistSessionSalt(agentName: string, sessionId: string, salt: Uint8Array): boolean {
-    if (!this.#db) {
-      // NOT a silent return — review F7. The other two persist failures each emit an event, so a
-      // derive that could not store because the handle is closed was the ONE salt path producing no
-      // record at all. Only reachable during shutdown, which is exactly when a lone unexplained
-      // gap in the log is hardest to account for later.
-      this.#logger.error("session.salt.persist.failed", {
-        agentName, sessionId, reason: "db_closed",
-        impact: "the salt was NOT stored and is not announced; the agreement stays open and re-runs on the next connect",
-      });
-      return false;
-    }
-    try {
-      /**
-       * ORDER MATTERS HERE, and getting it wrong cost three findings — review F3, F4, F7.
-       *
-       * The adoption guard used to run FIRST, above `!this.#db` and outside this `try`. That:
-       *   - short-circuited the `salt_already_stored` discrimination below, so a session that DOES
-       *     hold a valid salt was told it "stays unsalted FOR THE LIFE of the session" after a
-       *     transient read failure — a refusal asserting something false about the row (F4);
-       *   - put `getSessionTree`'s `#requireAgentId` throw outside the `try`, where it surfaced as
-       *     *"the stream read failed"* instead of a named salt-persist failure (F7).
-       *
-       * So the row's own state is established first, and only a session with no salt at all reaches
-       * the adoption question.
-       */
-      const existingRow = this.#db
-        .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
-        .get(this.#requireAgentId(agentName), sessionId) as { n: number | null } | undefined;
-      if (existingRow?.n === SESSION_SALT_BYTES) {
-        this.#logger.error("session.salt.persist.failed", {
-          agentName, sessionId, reason: "salt_already_stored",
-          impact: "this session already has a salt and it was NOT replaced — Decision #8 is one salt per session. Reaching here means a read failure made this side believe it had none; the stored salt is intact, nothing was announced, and the agreement re-runs against it on the next connect.",
-        });
-        return false;
-      }
-      const adoption = this.#saltAdoptionClosed(agentName, sessionId);
-      if (adoption.closed) {
-        this.#logger.warn("session.salt.adoption.refused", {
-          agentName, sessionId, reason: "already_hashing", leafCount: adoption.leafCount, frontier: adoption.why,
-          impact: "this session has already hashed content under the unsalted rule, so the salt was NOT adopted — it stays unsalted FOR THE LIFE of the session. Adopting now would hash the rest of the conversation differently and leave a transcript that neither rule can verify end to end.",
-          guidance: "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
-        });
-        return false;
-      }
-      /**
-       * THE ROW COUNT IS THE CHECK, and without it this method reported success for a write that
-       * stored nothing.
-       *
-       * An `UPDATE` that matches no row does not throw — it returns `changes: 0`. So a session whose
-       * row is missing (retired agent, a row that failed to write at creation, an id that does not
-       * line up) took the success branch, cached the salt in memory, and announced our fingerprint
-       * to the counterparty. Agreement confirmed, nothing on disk, and the failure surfaces at the
-       * next restart as the divergence this whole design exists to make loud — except one restart
-       * late and with both sides believing they had agreed.
-       *
-       * Found by a mutant that removed the caller's `if (!persisted) return`: the suite stayed green,
-       * because nothing could produce a false from here.
-       */
-      /**
-       * ONE SALT PER SESSION, ENFORCED AT THE WRITE — review F18.
-       *
-       * This `UPDATE` was unconditional, so it could replace an already-stored VALID salt. The path
-       * is real: `#getSessionSalt` returns null on a transient read failure, which sends this side
-       * down the derive path, which then overwrote the perfectly good salt on disk. The read error
-       * was logged; the destruction of the durable value was not — and the read log actively said
-       * the wrong thing, promising only that we would "offer a fresh contribution".
-       *
-       * The predicate has to allow ONE overwrite: a wrong-width blob is refused by `#getSessionSalt`
-       * (F8) precisely so a corrupt row can be replaced rather than stranding the session forever.
-       * So: write when there is nothing there, or when what is there is not a salt.
-       */
-      const written = this.#db
-        .prepare(
-          "UPDATE sessions SET content_salt = ? WHERE agent_id = ? AND session_id = ? " +
-          "AND (content_salt IS NULL OR length(content_salt) <> ?)",
-        )
-        .run(Buffer.from(salt), this.#requireAgentId(agentName), sessionId, SESSION_SALT_BYTES);
-      if (Number(written.changes) !== 1) {
-        // WHICH of the two it was. "No row" is a broken session record; "a salt is already there" is
-        // this guard doing its job, and telling an operator the row is missing when it is not would
-        // send them to look at the wrong thing.
-        // The `salt_already_stored` case is decided above now, before the adoption question, so
-        // reaching here with a valid salt in the row is not possible. Re-read anyway rather than
-        // assume: a wrong-width blob also fails the predicate and must not be reported as a missing
-        // row, which would send the operator to look at session state for a corrupt value.
-        const existing = this.#db
-          .prepare("SELECT length(content_salt) AS n FROM sessions WHERE agent_id = ? AND session_id = ?")
-          .get(this.#requireAgentId(agentName), sessionId) as { n: number | null } | undefined;
-        const alreadyStored = existing?.n === SESSION_SALT_BYTES;
-        this.#logger.error("session.salt.persist.failed", {
-          agentName, sessionId, changes: Number(written.changes),
-          reason: alreadyStored ? "salt_already_stored" : "no_session_row",
-          impact: alreadyStored
-            ? "this session already has a salt and it was NOT replaced — Decision #8 is one salt per session. Reaching here means a read failure made this side believe it had none; the stored salt is intact, nothing was announced, and the agreement re-runs against it on the next connect."
-            : "the salt was NOT stored — no session row matched — so it is not announced either; the agreement stays open rather than being confirmed against a value that exists only in memory",
-        });
-        return false;
-      }
-      this.#sessionSalts.set(this.#k(agentName, sessionId), salt);
-      return true;
-    } catch (err: unknown) {
-      this.#logger.error("session.salt.persist.failed", {
-        agentName, sessionId, error: extractErrorMessage(err),
-        impact: "the salt was NOT stored, so it is not announced to the counterparty either; the agreement stays open rather than being confirmed against a value that would vanish at the next restart",
-      });
-      return false;
-    }
-  }
 
-  /**
-   * DROP AN UNSPENT SALT — `DOD-M15-SALTSPLIT-1`. The second writer of `content_salt`, and the only
-   * one that clears it.
-   *
-   * Reached when the counterparty tells us it can never adopt a salt for this session. Keeping ours
-   * would mean every message we send from here is refused by them with
-   * `content_hash_salt_unavailable` — a conversation that dies while looking merely quiet, which is
-   * the failure this exists to prevent.
-   *
-   * ⚠️ THE ADOPTION CHECK IS REPEATED HERE ON PURPOSE, not because the caller is untrusted.
-   *
-   * The caller has already computed `adoption`, so this looks redundant — and it is, for today's one
-   * call site. It stays because the cost of a future caller getting it wrong is a transcript that no
-   * single rule can verify: leaves hashed under a salt that has just been erased, with nothing
-   * recording that they were. A guard whose failure mode is silent and permanent belongs next to the
-   * destructive act, not only at the place that currently decides to perform it. Same reasoning that
-   * made `placeOwnLeaf`'s authorship parameter required rather than optional.
-   *
-   * Returns true only if a salt was actually cleared.
-   */
-  /**
-   * SUSPEND, don't destroy — `DOD-M15-SALTSPLIT-1`, the authorization argument. Returns true if a
-   * salt is now suspended (or already was).
-   *
-   * This is the frame handler's entry point. It runs the same two refusals as the erase below —
-   * a spent salt and one mid-flight are not ours to set aside either, because the messages already
-   * hashed under them would become unverifiable the moment we stop using it — and where they do not
-   * fire it records the suspension instead of doing anything irreversible.
-   */
-  #suspendSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
-    const key = this.#k(agentName, sessionId);
-    if (this.#getSessionSalt(agentName, sessionId) === null) return false;
-    if (this.#saltSuspended.has(key)) return true;
 
-    const inFlight = this.#hashedWithSalt.get(key) ?? 0;
-    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
-    if (inFlight > 0 || adoption.closed) {
-      /**
-       * SPENT, or mid-send. Suspending is not destructive, but it IS a split: content already hashed
-       * under this salt stays hashed under it while everything after would be hashed the other way,
-       * in one session, with nothing recording where the change happened. That is the one thing
-       * Decision #8 forbids outright, so the salt keeps being used and the session stays honestly
-       * broken rather than becoming dishonestly half-verifiable.
-       */
-      this.#logger.info("session.salt.suspend.refused", {
-        agentName, sessionId, correlationId,
-        reason: inFlight > 0 ? "salted_hash_in_flight" : adoption.label,
-        ...(inFlight > 0 ? { inFlight } : { frontier: adoption.why }),
-        impact: "the salt stays IN USE, because content in this session is already hashed under it and switching now would split the transcript — half verifiable by one rule, half by another. The counterparty cannot hold this salt, so it will keep refusing messages sent from here. See session.salt.split.",
-      });
-      return false;
-    }
 
-    this.#saltSuspended.add(key);
-    this.#logger.info("session.salt.suspended", {
-      agentName, sessionId, correlationId,
-      impact: "the counterparty can never adopt a salt for this session, so this side has STOPPED USING its own — messages are hashed the way every build before content salting hashed them, and every message continues to be accepted. Nothing was hashed under it, so nothing is split.",
-      guidance: "No action. The salt bytes are kept, not erased: if the counterparty was merely unable to read its own state for a moment, its next announcement carrying a matching fingerprint restores this session to salted automatically. The bytes are erased only when this session actually hashes a message unsalted, which is the point after which keeping them would re-salt the session at the next restart.",
-    });
-    return true;
-  }
 
-  /** Un-suspend: the peer answered with a fingerprint matching the salt we kept. */
-  #resumeSalt(agentName: string, sessionId: string, correlationId?: string): void {
-    const key = this.#k(agentName, sessionId);
-    if (!this.#saltSuspended.has(key)) return;
 
-    /**
-     * ⚠️ REFUSE THE RESUME IF THIS SESSION HAS ALREADY HASHED UNSALTED — pass 2, F1 (HIGH).
-     *
-     * `#resumeSalt` deleted the mark unconditionally, and the reviewer produced the counter-example
-     * in ONE process with no restart: suspend, the peer keeps talking so a leaf lands, we send `m1`
-     * under `sha256`, the peer's frontier recovers and announces `fingerprint(S)`, we resume, and
-     * `m2` goes out under `hmac`. Two rules, one session — and `session.salt.resumed` asserted
-     * *"No message was hashed while suspended, so the transcript is uniform"* while it was happening.
-     * **The code never checked the thing its own log line claimed**, which is this milestone's
-     * signature defect committed inside the fix for it.
-     *
-     * `#unsaltedAnnounced` is exactly that fact and is already maintained, so the check costs a
-     * lookup. Once it is set the salt can never be used again, so it is erased here rather than left
-     * to be found by a later restart.
-     */
-    if (this.#unsaltedAnnounced.has(key)) {
-      this.#logger.warn("session.salt.resume.refused", {
-        agentName, sessionId, correlationId,
-        impact: "the counterparty now confirms a salt this side is holding, but this session has ALREADY hashed at least one message unsalted. Resuming would put half the transcript under each rule, which no single rule can verify — so the session stays unsalted for its whole life and the salt is released.",
-        guidance: "Nothing to do here, and nothing is lost: the transcript stays uniform and every message is intact. If you want the salt protection with this counterparty, start a new session — the agreement runs at open, before anything is hashed.",
-      });
-      this.#saltSuspended.delete(key);
-      this.#discardUnspentSalt(agentName, sessionId, correlationId);
-      return;
-    }
 
-    this.#saltSuspended.delete(key);
-    /**
-     * THE RECOVERY THE ERASE MADE IMPOSSIBLE. Keeping the bytes is what allows this line to exist:
-     * the peer's earlier terminal frame was wrong (a frontier it could not read for a moment), it can
-     * read again, and the fingerprints match — so the session resumes salted with nothing lost. An
-     * erased salt cannot be re-derived from one side.
-     */
-    this.#logger.info("session.salt.resumed", {
-      agentName, sessionId, correlationId,
-      impact: "the counterparty now confirms the same salt this side kept, so this session is salted again. It was suspended earlier because the counterparty reported it could never hold one; that has resolved. No message was hashed while suspended, so the transcript is uniform.",
-    });
-  }
 
-  #discardUnspentSalt(agentName: string, sessionId: string, correlationId?: string): boolean {
-    const held = this.#getSessionSalt(agentName, sessionId);
-    if (held === null) return false;
 
-    /**
-     * ⚠️ IN-FLIGHT FIRST — `DOD-M15-SALTSPLIT-1` review HIGH-2. `#saltAdoptionClosed` cannot see a
-     * hash that has been computed under the salt but has not yet become a leaf, a hold or an
-     * awaiting-ack entry, and that gap is a full relay round trip wide.
-     */
-    /**
-     * ⚠️ MEASURED UNREACHABLE FROM TODAY'S CALLERS, AND KEPT ANYWAY — pass 2 test-teeth, survivor 2.
-     *
-     * Deleting this block leaves the whole salt suite GREEN. That is the definition this unit has
-     * used all along for *"not a guard, a comment that happens to execute"*, so it is labelled rather
-     * than quietly left to look load-bearing. `#suspendSalt` refuses on `inFlight > 0` before a
-     * session can ever be marked, and both callers of this method require the mark — so the deferred
-     * erase cannot observe a non-zero count.
-     *
-     * It stays for one reason: **it sits at an irreversible write.** The earlier instance of this
-     * question in this same unit was resolved by making the guard the actual decision-maker, and that
-     * option does not exist here — `#suspendSalt` genuinely must refuse early, so the duplication is
-     * structural rather than a mistake about where responsibility lives. For a destructive act, the
-     * safe direction is to keep a check that cannot fire over removing one that turns out it could.
-     *
-     * What must NOT happen is claiming it as coverage. It is not tested and it is not testable from
-     * outside; if a third caller ever reaches this method without the suspension mark, this becomes
-     * reachable and needs a test in the same commit.
-     */
-    const inFlight = this.#hashedWithSalt.get(this.#k(agentName, sessionId)) ?? 0;
-    if (inFlight > 0) {
-      this.#logger.info("session.salt.discard.refused", {
-        agentName, sessionId, correlationId, reason: "salted_hash_in_flight", inFlight,
-        impact: "the salt was NOT dropped: a message has already been hashed under it and is mid-send, so erasing it now would put a hash on the wire that nothing — including this daemon — could ever recompute. The session stays salted and the counterparty, which cannot adopt, will refuse what is in flight.",
-      });
-      return false;
-    }
 
-    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
-    if (adoption.closed) {
-      /**
-       * SPENT. Something is already hashed under this salt, so it is not ours to drop.
-       *
-       * INFO, not ERROR, and the level is a judgement rather than a downgrade: this is the guard
-       * doing its job correctly, and the FAILURE it accompanies — the session is split and unusable
-       * — is reported by `session.salt.split` at ERROR from the caller that has the operator-facing
-       * detail. Two ERRORs for one condition trains people to read neither. This line stays so the
-       * refusal itself is correlatable when someone asks why the salt is still on disk.
-       */
-      this.#logger.info("session.salt.discard.refused", {
-        agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
-        impact: "the salt was NOT dropped, because content in this session is already hashed under it and erasing it would leave a transcript no single rule can verify. The session stays split: the counterparty holds no salt and refuses everything sent from here.",
-      });
-      return false;
-    }
-
-    if (!this.#db) {
-      this.#logger.error("session.salt.discard.failed", {
-        agentName, sessionId, correlationId, reason: "db_closed",
-        impact: "the salt is still stored, so after the next restart this side hashes salted while the counterparty refuses every message. Only reachable during shutdown; the agreement re-runs on the next connect, which discards it then.",
-      });
-      return false;
-    }
-
-    try {
-      const cleared = this.#db
-        .prepare("UPDATE sessions SET content_salt = NULL WHERE agent_id = ? AND session_id = ?")
-        .run(this.#requireAgentId(agentName), sessionId);
-      if (Number(cleared.changes) !== 1) {
-        // The row-count check that `#persistSessionSalt` learned the hard way: an UPDATE matching no
-        // row does not throw, and reporting success here would leave the durable salt in place while
-        // the cache said otherwise — salted after a restart, unsalted before one.
-        this.#logger.error("session.salt.discard.failed", {
-          agentName, sessionId, correlationId, changes: Number(cleared.changes), reason: "no_session_row",
-          impact: "the stored salt was NOT cleared, so this side hashes unsalted now and salted again after a restart — the transcript splits at the restart rather than here",
-        });
-        return false;
-      }
-    } catch (err: unknown) {
-      this.#logger.error("session.salt.discard.failed", {
-        agentName, sessionId, correlationId, error: extractErrorMessage(err),
-        impact: "the stored salt was NOT cleared, so this side hashes unsalted now and salted again after a restart — the transcript splits at the restart rather than here",
-      });
-      return false;
-    }
-
-    /**
-     * CACHE AFTER ROW, and both or the session is worse off than before.
-     *
-     * `#saltForHashing` reads the cache on its first line and never consults the row, so clearing
-     * one without the other produces a session that hashes one way in this process and the other way
-     * in the next — the split transcript, arriving at a daemon restart instead of at a frame.
-     */
-    this.#sessionSalts.delete(this.#k(agentName, sessionId));
-    /**
-     * ⚠️ THE MARK GOES WITH THE BYTES — pass 2, F5. Leaving the key in `#saltSuspended` after a
-     * successful erase means a LATER agreed salt is silently never used: `#persistSessionSalt`'s
-     * predicate explicitly allows a write when the column is NULL, and `abandonUnsaltedHash` can
-     * re-open adoption — so the session would log `session.salt.agreed`, surface as protected, and
-     * hash `sha256` for the rest of its life. A stale suppression is indistinguishable from a
-     * feature that does not work.
-     */
-    this.#saltSuspended.delete(this.#k(agentName, sessionId));
-    this.#logger.info("session.salt.discarded", {
-      agentName, sessionId, correlationId,
-      impact: "the counterparty can never adopt a salt for this session, so this side dropped its own before spending it. Both sides now hash unsalted — exactly as verifiable as every session shipped before content salting existed, and every message continues to be accepted. Nothing was hashed under the discarded salt.",
-    });
-    return true;
-  }
 
   /**
    * Announce our state to the counterparty: a contribution if we hold no salt, a fingerprint if we
@@ -12986,7 +8668,7 @@ export class SessionNodeManager {
      * `#saltState`, NOT a direct call to the minting accessor — review F15, and this one line was
      * the difference between the safety argument written for the repair and the code that ran.
      *
-     * It read `ownContribution: this.#saltContributionFor(...)`, which mints unconditionally. Both
+     * It read `ownContribution: this.#salts.saltContributionFor(...)`, which mints unconditionally. Both
      * arguments are evaluated, so a session that already held a salt got a fresh half minted into
      * `#saltContributions` even though `ownSaltFrame` discards it on that branch — and
      * `#evictSessionCaches` drops the half on every teardown while the salt stays on disk, so ANY
@@ -12997,7 +8679,7 @@ export class SessionNodeManager {
      * never built from — then both sides froze on `salt_fingerprint_mismatch`, whose guidance sends
      * the operator to compare build versions with a counterparty that did nothing wrong.
      */
-    const state = this.#saltState(agentName, sessionId);
+    const state = this.#salts.saltState(agentName, sessionId);
     const frame = override ?? ownSaltFrame(state);
     if (!frame) {
       // Neither a salt nor a half. `#saltState` does not produce this, so it is a defect rather
@@ -13026,7 +8708,7 @@ export class SessionNodeManager {
      * the catch below rather than leaving a send to sit out the full bound for a frame that never
      * left.
      */
-    if (!frame.adoptionClosed) this.#markSaltPending(agentName, sessionId);
+    if (!frame.adoptionClosed) this.#salts.markSaltPending(agentName, sessionId);
     // Held outside the try so the catch can retire a stream that was opened and then failed to
     // write — the same leak, and the same fix, as `#sendDeliveryAck`.
     let saltStream: Stream | undefined;
@@ -13061,7 +8743,7 @@ export class SessionNodeManager {
        * makes the failure cost one dial attempt instead of the whole bound, and B2b-2 turned this
        * from theory into something a user feels: it is the pause before their first message.
        */
-      this.#settleSaltPending(agentName, sessionId, "announce_failed");
+      this.#salts.settleSaltPending(agentName, sessionId, "announce_failed");
       this.#logger.warn("session.salt.announce.failed", {
         agentName, sessionId, correlationId, error: extractErrorMessage(err),
         // Review F1: this used to end "so no message is affected", which was FALSE in the situation
@@ -13081,298 +8763,7 @@ export class SessionNodeManager {
     }
   }
 
-  /** Apply one inbound salt-agreement frame. The verdict is the pure function's; this executes it. */
-  async #handleSaltFrame(
-    agentName: string,
-    sessionId: string,
-    frame: SaltAgreementFrame,
-    correlationId?: string,
-  ): Promise<void> {
-    const key = this.#k(agentName, sessionId);
-    const peerHalfHex = frame.contribution ? Buffer.from(frame.contribution).toString("hex") : null;
-    const peerFingerprintHex = frame.fingerprint ? Buffer.from(frame.fingerprint).toString("hex") : null;
-    // WHY the peer closed, kept for the operator-facing reason — 006-CRYPTO finding 2. Recorded here
-    // rather than in the `adoption_closed` handler because that action fires for OUR closure too,
-    // and only the frame says what the PEER said.
-    if (typeof frame.adoptionClosed === "string") {
-      this.#saltPeerClosedLabel.set(key, frame.adoptionClosed);
-    }
-    const adoption = this.#saltAdoptionClosed(agentName, sessionId);
-    const action = onPeerSaltFrame({
-      ...this.#saltState(agentName, sessionId),
-      // Review F2: the frontier is what decides whether THIS side can still adopt, and only the
-      // caller can count it. Without this the state machine derives, the persist refuses, and the
-      // peer never learns — which is how the two sides end up on opposite verdicts.
-      ownAdoption: adoption.closed
-        ? { closed: true, label: adoption.label, why: adoption.why }
-        : { closed: false },
-      // Keyed on the peer's BYTES, not on a repair counter: a genuinely NEW half from the peer must
-      // still get our contribution back, and only an identical re-offer is the loop (review F14).
-      alreadyRepairedAgainstPeerHalf: peerHalfHex !== null && this.#saltRepairedAgainst.get(key) === peerHalfHex,
-      // The mirror, 006-CRYPTO finding 1: without it a saltless side answers a latched holder's
-      // fingerprint forever. Same keying rule — an identical re-offer is the loop, a new one is not.
-      alreadyRepairedAgainstPeerFingerprint:
-        peerFingerprintHex !== null && this.#saltRepairedAgainstFingerprint.get(key) === peerFingerprintHex,
-      frame,
-    });
-    if (action.action === "confirmed") {
-      // DOD-M15-SALTSPLIT-1: the peer confirms the salt we KEPT while suspended — resume before logging
-      // agreement, so a resumed session is never reported as agreed while still suspended.
-      this.#resumeSalt(agentName, sessionId, correlationId);
-      this.#logger.info("session.salt.agreed", {
-        agentName, sessionId, correlationId, via: "fingerprint_match",
-      });
-      // B2b-2: release a first send that is waiting on this agreement. Both `confirmed` and
-      // `derive_and_announce` end with a salt this side can hash under, so both settle the wait.
-      this.#settleSaltPending(agentName, sessionId, "agreed");
-      return;
-    }
-    if (action.action === "derive_and_announce") {
-      /**
-       * ⚠️ I DEFENDED THE OPPOSITE OF THIS TWICE, AND BOTH DEFENCES WERE WRONG. The code now does
-       * what the "surviving mutant" did; recording that rather than quietly switching, because the
-       * reasoning is the useful part.
-       *
-       * A failed persist used to fall through with no settle, so a waiting first send sat out the
-       * FULL FIVE SECONDS and was then told, by the timeout path, to go and check its counterparty's
-       * build version — for a fault that was this machine's own disk.
-       *
-       * Defence #1 said releasing the waiter "would hand it a null it would hash unsalted under."
-       * True, and not a consequence: that is exactly what the timeout does. Defence #2 said the
-       * remaining bound gave a repair a chance to land — and the review showed that essentially
-       * cannot fire. This branch returns BEFORE the announce, so nothing goes out and nothing comes
-       * back; all five of `#sendSaltFrame`'s callers are triggered by a peer connect or an inbound
-       * frame. Only a counterparty reconnect inside those seconds could do it.
-       *
-       * So the real trade was a rare reconnect-within-five-seconds repair against five seconds of
-       * visible latency on the operator's first message AND a diagnosis pointing at the wrong
-       * machine. The repair loses. Settle immediately under its own name, so `#saltForHashing` can
-       * say *our own write failed* instead of *they did not answer*.
-       */
-      if (!this.#persistSessionSalt(agentName, sessionId, action.salt)) {
-        this.#settleSaltPending(agentName, sessionId, "persist_failed");
-        return;
-      }
-      this.#logger.info("session.salt.agreed", {
-        agentName, sessionId, correlationId, via: "derived",
-      });
-      this.#settleSaltPending(agentName, sessionId, "agreed");
-      // `void`, not `await` — review F10. This runs inside the INBOUND content-stream handler, so
-      // awaiting an outbound `newStream` here lets a stalled dial hold up the stream we are reading.
-      // The connect-side call is `void`-ed for the same reason and this is now consistent with it.
-      void this.#sendSaltFrame(agentName, sessionId, correlationId);
-      return;
-    }
-    if (action.action === "adoption_closed") {
-      // B2b-2: terminal means there is nothing left to wait for. A send still holding on the bound
-      // would otherwise sit out the full five seconds for an answer that has already arrived and
-      // said no — the slowest possible way to reach a decision both sides already agree on.
-      this.#settleSaltPending(agentName, sessionId, "closed");
-      /**
-       * Terminal, and NOT a freeze — review F1/F2. Both sides stay unsalted, which is exactly as
-       * verifiable as every session shipped before the salt existed; the thing that was broken was
-       * them disagreeing about it silently.
-       *
-       * WHICH SIDE DECLINED decides the level, and it is not decoration.
-       *
-       * If WE closed, an operator has lost a protection they could otherwise have had, and there is
-       * something they can do about it — that is a WARN under `session.salt.adoption.refused`, which
-       * keeps meaning what it has always meant.
-       *
-       * If we are merely LEARNING the peer closed, nothing about this machine is at fault and there
-       * is nothing for its operator to do. Logging that at WARN would fire on the innocent side of
-       * every such session and train them to ignore the name.
-       */
-      /**
-       * DOD-M15-SALTSPLIT-1 — ONE PLACE DECIDES WHETHER THE SALT GOES, and it is not here.
-       *
-       * ⚠️ THIS CALL WAS INSIDE THE `else` BELOW, AND THE REVERT TEST CAUGHT IT.
-       *
-       * Guarding it by `adoption.closed` here meant `#discardUnspentSalt`'s own adoption check could
-       * never be reached, so deleting that check left all three tests GREEN — the survivor. A guard
-       * nothing can redden is not a guard; it is a comment that happens to execute, which is the
-       * shape this milestone keeps finding.
-       *
-       * Called unconditionally now. The method owns the spent/unspent decision, both outcomes run
-       * through it, and deleting its check reddens the spent test immediately. That also removes the
-       * duplicated condition: two places deciding the same thing is one place being wrong later.
-       */
-      /**
-       * The return is CONSUMED, not decorative — review LOW-5. `true` means a salt was actually
-       * cleared, which settles the question below without a second read; `false` is ambiguous (we
-       * held none, or we refused to drop one), so that case still asks.
-       */
-      const suspended = this.#suspendSalt(agentName, sessionId, correlationId);
-      /**
-       * "Still holds a salt it is USING" — suspension is what settles it, not possession. A suspended
-       * session keeps the bytes on disk deliberately, and reporting that as an unrecoverable split
-       * would fire the ERROR below on the one case that recovers by itself.
-       */
-      const stillHoldsSalt = !suspended && this.#getSessionSalt(agentName, sessionId) !== null;
 
-      const shared = {
-        agentName, sessionId, correlationId, detail: action.detail,
-        /**
-         * ⚠️ *"no message is affected"* IS FALSE WHEN WE ARE STILL HOLDING A SALT — review MEDIUM-4,
-         * second instance. The sentence was written for a session where neither side ever adopted
-         * one, and it stayed attached to a branch that now also covers the case where this side
-         * kept a spent salt and every message it sends is about to be refused. Two log lines from
-         * one event contradicting each other is worse than either alone.
-         */
-        impact: stillHoldsSalt
-          ? "the counterparty will not use a content salt, and this side is still holding one it cannot drop — see session.salt.split on the next line for what that costs and what to do about it."
-          : "neither side will use a content salt for this session, and both now know it. Messages are hashed the way every build before this feature hashed them — nothing is degraded relative to any shipped release, and no message is affected.",
-      };
-      if (adoption.closed) {
-        /**
-         * ⚠️ TWO REFUSALS, TWO DIFFERENT THINGS TO DO — and this used to report both as
-         * `already_hashing`.
-         *
-         * A session that has already sent messages is the feature working: the fix is a new session,
-         * and it will work. A frontier this side could not READ is local storage trouble: a new
-         * session will refuse in exactly the same way, so sending the operator to open one is
-         * sending them somewhere that cannot help. `frontier` carries the counts (or the error) so
-         * the two are separable from the log alone.
-         */
-        const unreadable = adoption.label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE;
-        this.#logger.warn("session.salt.adoption.refused", {
-          ...shared,
-          reason: adoption.label,
-          leafCount: adoption.leafCount,
-          frontier: adoption.why,
-          guidance: unreadable
-            ? "This side could not read its own message frontier, so it refused the salt rather than risk hashing half the session one way and half the other. Starting a new session will NOT help — it will refuse the same way. Look for session.content.held.restore.failed or other storage errors around this line; the conversation still works and every message is intact, it is just unsalted."
-            : "Nothing is broken and no message was lost: an unsalted session is exactly as verifiable as every session before this feature existed. It only means a relay holding the hashes could confirm a guess at a short message in THIS conversation. If you want the protection, start a new session — the agreement runs at open, before anything is hashed.",
-        });
-      } else {
-        /**
-         * DOD-M15-SALTSPLIT-1 — CARRY OUT THE CLAIM ABOVE INSTEAD OF ONLY STATING IT.
-         *
-         * `shared.impact` says *"neither side will use a content salt for this session, and both now
-         * know it."* Nothing made that true: a salt already agreed on this side stayed on disk and in
-         * the cache, and `#saltForHashing` returns it before it ever looks at adoption. Our adoption
-         * is still open here, so nothing has been hashed under it and dropping it is free.
-         *
-         * Ordering matters — discard BEFORE the log, so the line cannot claim an outcome that the
-         * write then failed to produce.
-         */
-        this.#logger.info("session.salt.adoption.closed", shared);
-      }
-
-      /**
-       * ⚠️ OUTSIDE THE ADOPTION BRANCH — pass 2, F4. This used to live inside `if (adoption.closed)`,
-       * so the one case that needed it most never got it: suspension refused for
-       * `salted_hash_in_flight` while adoption is still OPEN leaves us holding a salt the peer can
-       * never accept, and it took the `else` path. Measured on that exact scenario:
-       * `suspend.refused = 1`, `adoption.closed = 1`, **`split = 0`** — while two other log lines
-       * told the operator to *"see session.salt.split on the next line"*, a line that was never
-       * written. Guidance pointing at an event that does not fire is worse than no guidance: it
-       * spends the reader's trust and their time.
-       *
-       * The condition was always `stillHoldsSalt`; only its placement disagreed.
-       *
-       * ─── What this event means, moved here with the code it describes ─────────────────────────
-       *
-       * We hold a salt AND the peer has told us it can never hold one. Either our frontier closed
-       * with the salt already spent, or a salted hash is mid-flight — both mean the salt cannot be
-       * released, so the peer will refuse every message we send with `content_hash_salt_unavailable`.
-       *
-       * `session.salt.adoption.refused` may fire alongside, saying *"nothing is degraded relative to
-       * any shipped release, and no message is affected"* — true for the ordinary refusal and FALSE
-       * here, at the exact moment every message stops being accepted. Hence its own event at ERROR
-       * rather than a tightened sentence on that one: an operator filtering for the refusal is
-       * looking at a benign condition, and this is not it.
-       */
-      if (stillHoldsSalt) {
-          /**
-           * ⚠️ TWO REASONS REACH `adoption.closed`, AND ONLY ONE IS ABOUT CONTENT — review MEDIUM-4.
-           *
-           * This fired for both with a single impact asserting *"content here is already hashed
-           * under a salt"*. For `frontier_unreadable` that is a claim about content made from a
-           * database read that FAILED — we do not know what was hashed; that is the whole condition.
-           *
-           * The WARN twenty lines above was explicitly corrected for this exact collapse — its
-           * comment reads *"TWO REFUSALS, TWO DIFFERENT THINGS TO DO — and this used to report both
-           * as `already_hashing`"* — and I reintroduced it one severity level up, with the guidance
-           * that WARN was fixed to stop giving. Branching on the label the way it already does.
-           */
-          const unreadable = adoption.label === SALT_ADOPTION_LABELS.FRONTIER_UNREADABLE;
-          this.#logger.error("session.salt.split", {
-            agentName, sessionId, correlationId, reason: adoption.label, frontier: adoption.why,
-            impact: unreadable
-              ? "this side holds a salt, the counterparty can never hold one, and this side could NOT read its own message frontier — so whether anything has been hashed under that salt is unknown. The salt is kept rather than dropped, because dropping one that HAS been spent leaves a transcript no single rule can verify. Until the read succeeds, expect the counterparty to refuse messages sent from here."
-              : "this session cannot continue. Content here is already hashed under a salt the counterparty can never hold, so they refuse every message sent from this side — the conversation looks quiet rather than broken, and the session can never be sealed because the two transcripts no longer agree on a leaf.",
-            guidance: unreadable
-              ? "Do NOT start a new session yet — it would refuse in exactly the same way, because the fault is this side's storage rather than this conversation. Look for session.content.held.restore.failed or other storage errors around this line. Once the frontier reads again, this resolves to either an ordinary salted session or the split case, and the log will say which."
-              : "Start a new session with this counterparty: the salt agreement runs at open, before anything is hashed, so a fresh session agrees or declines cleanly on both sides. This one cannot be repaired — the salt cannot be dropped without leaving a transcript no single rule can verify, and it cannot be shared with a peer that has already closed adoption.",
-          });
-        }
-      if (action.announce) {
-        void this.#sendSaltFrame(agentName, sessionId, correlationId, action.announce);
-      }
-      return;
-    }
-    if (action.action === "repair") {
-      /**
-       * THE REPAIR — review F1. The two sides are out of step and CAN converge, so re-send our half
-       * rather than destroying the session.
-       *
-       * At INFO because it is a real event an operator may need to correlate with a
-       * `session.salt.announce.failed` or `session.salt.persist.failed` on either machine, and
-       * because a session that repairs REPEATEDLY is a signal even though each repair is benign.
-       */
-      this.#logger.info("session.salt.repair", {
-        agentName, sessionId, correlationId, detail: action.detail,
-        answeredWith: action.frame.contribution ? "contribution" : "fingerprint",
-      });
-      // Recorded ONLY for a repair that sent our half, because that is the one a second identical
-      // offer must not repeat (review F14).
-      if (peerHalfHex && action.frame.contribution) this.#saltRepairedAgainst.set(key, peerHalfHex);
-      // AND THE MIRROR (006-CRYPTO finding 1): we answered the peer's FINGERPRINT with our half. An
-      // earlier note here said recording this "says nothing, that branch is already terminal for the
-      // peer" — it is terminal only for a peer that HOLDS a salt, and the loop is the case where we
-      // do not. A second identical fingerprint now closes adoption instead of repairing again.
-      if (peerFingerprintHex && action.frame.contribution) {
-        this.#saltRepairedAgainstFingerprint.set(key, peerFingerprintHex);
-      }
-      void this.#sendSaltFrame(agentName, sessionId, correlationId, action.frame);
-      return;
-    }
-    // `detail` is the primitive's own sentence wherever the primitive produced it — never a code of
-    // ours substituted for it (Invariant 2). `guidance` is what the operator can DO, and it comes
-    // from the total map so a reason can never reach a log without one.
-    this.#logger.error("session.salt.disagreement", {
-      agentName, sessionId, correlationId,
-      reason: action.reason,
-      detail: action.detail,
-      guidance: SALT_FREEZE_GUIDANCE[action.reason],
-    });
-    /**
-     * TELL THE PEER BEFORE TEARING DOWN — review F1's mirror.
-     *
-     * Only the fingerprint mismatch carries a notice, and only it can: the peer holds everything
-     * needed to run the identical comparison and has simply not been given our side of it. Without
-     * this the session stops answering and the far operator gets no reason at all, while ours gets a
-     * full explanation — Decision #10 asks for BOTH sides to refuse by name.
-     *
-     * Awaited, unlike the other sends, because `destroySessionNode` on the next line takes the node
-     * away and an un-awaited write would race its own transport. A failure is already handled
-     * inside — the refusal here has happened either way.
-     */
-    if (action.notifyPeer) {
-      await this.#sendSaltFrame(agentName, sessionId, correlationId, action.notifyPeer);
-    }
-    await this.#freezeSession(agentName, sessionId, action.reason, {
-      event: "session.salt.frozen",
-      observation: `the salt agreement could not be completed with this counterparty: ${action.detail}`,
-      impact: "the session was stopped rather than left to hash under a value the two sides do not share; no message was lost and the transcript is unaffected — only a NEW session moves this forward",
-      reviveReason: `session_frozen_${action.reason}`,
-      // The operator-facing sentence comes from the TOTAL guidance map, so a reason can never reach
-      // this refusal without one — and it is what stops a salt disagreement being reported to them
-      // as their counterparty failing a key check.
-      reviveGuidance: SALT_FREEZE_GUIDANCE[action.reason],
-    }, correlationId);
-  }
 
   async #freezeOnIdentityFailure(
     agentName: string,
@@ -13619,7 +9010,7 @@ export class SessionNodeManager {
       entry.relayClient.noteOwnLeaf(relayHex, contentHash);
       return;
     }
-    const ownPubkeyHex = this.#ownPubkeyHex(agentName);
+    const ownPubkeyHex = this.#queries.ownPubkeyHex(agentName);
     if (!ownPubkeyHex) return;
     this.#ownChainStore?.record(ownPubkeyHex, sessionId, contentHash, Date.now());
   }
@@ -13673,7 +9064,7 @@ export class SessionNodeManager {
     // never written into a caller's literal, where it would be a promise nobody re-checked.
     const guidance = `${detail.guidance} ${this.#mailboxRouteAvailable(agentName) ? REFUSAL_MAY_STILL_ARRIVE : REFUSAL_NO_OTHER_ROUTE}`;
     this.#logger.error("session.content.refused", { agentName, sessionId, correlationId, reason, ...detail, guidance });
-    this.noteContentRefusal(agentName, sessionId, reason, {
+    this.#notices.noteContentRefusal(agentName, sessionId, reason, {
       kind: REFUSAL_KINDS.REFUSED, impact: detail.impact, guidance,
     });
     /**
@@ -13847,7 +9238,7 @@ export class SessionNodeManager {
       if (frame["type"] === "session_key_agreement") {
         const ephemeralPublic = frame["ephemeral_public"];
         const signature = frame["ephemeral_sig"];
-        await this.#handleEphemeralFrame(agentName, sessionId, {
+        await this.#ephemerals.handleEphemeralFrame(agentName, sessionId, {
           ...(ephemeralPublic instanceof Uint8Array ? { ephemeralPublic } : {}),
           ...(signature instanceof Uint8Array ? { signature } : {}),
         }, correlationId);
@@ -13857,7 +9248,7 @@ export class SessionNodeManager {
         const contribution = frame["contribution"];
         const fingerprint = frame["fingerprint"];
         const adoptionClosed = frame["adoption_closed"];
-        await this.#handleSaltFrame(agentName, sessionId, {
+        await this.#salts.handleSaltFrame(agentName, sessionId, {
           ...(contribution instanceof Uint8Array ? { contribution } : {}),
           ...(fingerprint instanceof Uint8Array ? { fingerprint } : {}),
           // A non-string stays ABSENT rather than being coerced, exactly like the other two: the
@@ -13921,7 +9312,7 @@ export class SessionNodeManager {
        * absent proof is a check that gets skipped.
        */
       const declaredEncryption = frame["content_encryption"];
-      const encState = this.#contentEncryptionState(agentName, sessionId);
+      const encState = this.#ephemerals.contentEncryptionState(agentName, sessionId);
       let plaintextBody: Uint8Array;
       if (declaredEncryption !== SESSION_CONTENT_ENCRYPTION_V1) {
         this.#refuseInboundContent(agentName, sessionId, "content_encryption_absent_or_unknown", contentHash, {
@@ -14358,7 +9749,7 @@ export class SessionNodeManager {
     // AC-005: stream closed without a session_interrupted frame
     if (!receivedInterruptFrame) {
       // Only mark interrupted if this session is still active in SQLite
-      const record = this.getSessionRecord(agentName, sessionId);
+      const record = this.#queries.getSessionRecord(agentName, sessionId);
       if (record && record.status === "active") {
         await this.markInterruptedWithDetails(agentName, sessionId, messageCount, "stream_close");
       }
@@ -14628,7 +10019,7 @@ export class SessionNodeManager {
   #reservationCircuitAddrs(agentName: string): { addrs: string[]; relayPeerIds: string[] } {
     let persisted: Array<{ relayPeerId: string; relayAddrs: string[] }>;
     try {
-      persisted = this.getAgentRelayEndpoints(agentName);
+      persisted = this.#queries.getAgentRelayEndpoints(agentName);
     } catch (err: unknown) {
       // No DB / unknown agent — persisted source unavailable. The directory
       // source may still serve; reachability degrades only if both are empty.
@@ -16085,7 +11476,7 @@ export class SessionNodeManager {
     // them shipped past a green suite for two days.
     this.clearOfferedDialer(agentName, sessionId);
 
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     if (!record) return { ok: false, reason: "session_not_found" };
     /**
      * A REVIVED SESSION GETS ITS SEAL CHANCES BACK — `DOD-M15-SEAL-FAILED-TERMINAL-1` review
@@ -16280,12 +11671,12 @@ export class SessionNodeManager {
     // here and again inside the relay reconnect, and both logged `session.revive.relay.absent` with
     // different `impact` text — one event name standing for two meanings, fired twice for a single
     // condition. `#reconnectRevivedSessionRelay` takes it as a parameter now.
-    const persistedRelay = this.getPersistedRelayEndpoint(agentName, sessionId);
+    const persistedRelay = this.#queries.getPersistedRelayEndpoint(agentName, sessionId);
     // 006-CRYPTO: a REVIVED session mints a FRESH keypair and re-keys — Decisions Carried #5. That
     // holds because the interrupt path destroys the old secret when it drops the entry; until it
     // did, this call found the stale key still in the map and quietly kept it. The salt, which IS
     // persisted, is re-read from the row instead — opposite lifetimes, deliberately.
-    this.#mintSessionEphemeral(agentName, sessionId);
+    this.#ephemerals.mintSessionEphemeral(agentName, sessionId);
     /**
      * AND ANNOUNCE IT — review F1, second half. Minting a fresh key achieves nothing on its own: the
      * COUNTERPARTY has to hear about it, and it is the side that did NOT restart, so it is not
@@ -16298,7 +11689,7 @@ export class SessionNodeManager {
      * what is a local key skew. Deferred a tick so the revived node's handlers are registered before
      * the frame goes out.
      */
-    setTimeout(() => { void this.#sendEphemeralFrame(agentName, sessionId, "revive-rekey"); }, 0);
+    setTimeout(() => { void this.#ephemerals.sendEphemeralFrame(agentName, sessionId, "revive-rekey"); }, 0);
     this.#activeNodes.set(key, {
       node,
       agentName,
@@ -16323,7 +11714,7 @@ export class SessionNodeManager {
      * is dead — this milestone's founding defect, one revival later, and with no status change left
      * to trigger the next revival either.
      */
-    this.#wireSessionLiveness(
+    this.#liveness.wireSessionLiveness(
       agentName,
       sessionId,
       node,
@@ -16374,7 +11765,7 @@ export class SessionNodeManager {
       this.#activeNodes.delete(key);
       // 006-CRYPTO: the revival FAILED, so the key it just minted belongs to a session that never
       // came back. Dropping the entry without this would strand it for the daemon's lifetime.
-      this.#destroySessionEphemeralFor(agentName, sessionId);
+      this.#ephemerals.destroySessionEphemeralFor(agentName, sessionId);
       try {
         await node.stop();
       } catch { /* best-effort: the status write already failed and is logged with its cause */ }
@@ -16431,7 +11822,7 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
   ): Promise<{ ok: true } | { ok: false; reason: string; guidance?: string }> {
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     if (!record) return { ok: false, reason: "session_not_found" };
     // The overwhelmingly common case: nothing to do, and no node was disturbed to find that out.
     if (record.status === "active" && this.#activeNodes.has(this.#k(agentName, sessionId))) return { ok: true };
@@ -16481,7 +11872,7 @@ export class SessionNodeManager {
     agentName: string,
     sessionId: string,
   ): Promise<{ ok: true } | { ok: false; reason: string; guidance?: string }> {
-    const record = this.getSessionRecord(agentName, sessionId);
+    const record = this.#queries.getSessionRecord(agentName, sessionId);
     if (!record) return { ok: false, reason: "session_not_found" };
     if (record.status === "active" && this.#activeNodes.has(this.#k(agentName, sessionId))) return { ok: true };
     // Reading the transcript of an ended session is normal and must keep working — the CALLER does
@@ -16687,16 +12078,10 @@ export class SessionNodeManager {
     const held = this.#db
       .prepare("SELECT COUNT(*) AS n FROM held_content WHERE agent_id = ? AND session_id = ? AND origin = 'received'")
       .get(agentId, sessionId) as { n: number };
-    return this.countReceivedMessages(agentName, sessionId) + (held?.n ?? 0);
+    return this.#queries.countReceivedMessages(agentName, sessionId) + (held?.n ?? 0);
   }
 
-  countReceivedMessages(agentName: string, sessionId: string): number {
-    if (!this.#db) return 0;
-    const row = this.#db
-      .prepare("SELECT COUNT(*) AS n FROM transcript WHERE agent_id = ? AND session_id = ? AND direction = 'received'")
-      .get(this.#requireAgentId(agentName), sessionId) as { n: number };
-    return row.n;
-  }
+
 
   /** CC-5/F21: unilaterally mark a session locally-terminal ("abandoned") — retire its live node and
    *  set the DB status, with NO bilateral seal (a dead half-open handshake has nothing to notarize).
@@ -16711,69 +12096,7 @@ export class SessionNodeManager {
     return flipped;
   }
 
-  /** @returns true iff the UPDATE was executed without error (a failed write is logged, never thrown). */
-  /**
-   * DOD-M12B-STRAND-1 — move a terminal session's held frames to the annex.
-   *
-   * A held frame is content this agent RECEIVED and VERIFIED. When its session ends it can never
-   * join that chain (appending behind a committed root is not an option, and ingest refuses a
-   * terminal session outright), but it is still the operator's mail and no other copy exists —
-   * the sender was never acknowledged for it. `sealed_session_annex` is where M12-P17 already puts
-   * content that arrives for an ended session; this is the same content arriving slightly earlier.
-   *
-   * ANNEX FIRST, DELETE SECOND, per row. A crash between them costs a duplicate the annex's
-   * INSERT OR IGNORE absorbs; the other order costs the message. A row whose annex write fails is
-   * KEPT — the retention sweep will find it again, and a leftover row is cheaper than a lost one.
-   */
-  #annexHeldContentOnTerminal(agentName: string, sessionId: string, status: "sealed" | "abandoned"): void {
-    if (!this.#db) return;
-    let rows: Array<{ canonical_seq: number; content_blob: Buffer; content_hash_hex: string; held_at: number; origin: string }>;
-    try {
-      rows = this.#db.prepare(
-        `SELECT canonical_seq, content_blob, content_hash_hex, held_at, origin
-           FROM held_content WHERE agent_id = ? AND session_id = ? ORDER BY canonical_seq ASC`,
-      ).all(this.#requireAgentId(agentName), sessionId) as never;
-    } catch (err: unknown) {
-      this.#logger.error("session.content.held.annex.scan.failed", {
-        agentName, sessionId, status,
-        impact: "held frames for a terminal session were not moved to the annex and remain unreadable",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      return;
-    }
-    if (rows.length === 0) return;
-    const counterparty = this.getSessionRecord(agentName, sessionId)?.counterparty_pubkey ?? null;
-    let annexed = 0;
-    let kept = 0;
-    for (const row of rows) {
-      // DOD-M12B-INDEX-1: ATTRIBUTION. A `sent` row is our own message. Stamping the counterparty's
-      // pubkey on it would put our words in their mouth in the one record that survives the
-      // session — the same failure the release path was changed to avoid, on the drain it did not
-      // touch. `#ownPubkeyHex` is null only when the identity cannot be resolved, and a null sender
-      // reads as "unattributed", which is true, rather than as a false attribution.
-      const sender = row.origin === "sent" ? this.#ownPubkeyHex(agentName) : counterparty;
-      if (this.recordSealedAnnex(agentName, sessionId, row.content_hash_hex, new Uint8Array(row.content_blob), sender)) {
-        this.#deleteHeldContent(agentName, sessionId, row.canonical_seq);
-        // AND OUT OF THE IN-MEMORY MAP. Measured live 2026-08-17 on daemon 0.0.170: this frame is
-        // now safe in the annex and its durable row is gone — but teardown still found it in the
-        // map, counted `held_content` for the session, got 0, and fired
-        // `session.content.held.lost`: "verified content was destroyed". Ten frames were annexed
-        // and the same ten were reported destroyed, in the same second. A false alarm on the most
-        // serious event in the system is worse than no alarm, because the next investigation goes
-        // looking for content that was never lost.
-        this.#heldContent.get(this.#k(agentName, sessionId))?.delete(row.canonical_seq);
-        annexed++;
-      } else {
-        kept++;
-      }
-    }
-    this.#logger.warn("session.content.held.annexed", {
-      agentName, sessionId, status, annexed, kept,
-      // The consumer of `held_at`: how long the oldest frame waited before its session ended.
-      oldestHeldMs: Date.now() - Math.min(...rows.map((r) => r.held_at)),
-      impact: "these messages arrived and verified but never joined the chain — they are readable from the annex, not the transcript",
-    });
-  }
+
 
   #updateSessionStatus(
     agentName: string,
@@ -16831,7 +12154,7 @@ export class SessionNodeManager {
     //   sealed → sealed     REFUSED. Nothing to write, and re-running the terminal disposition
     //     hooks for a no-op should not be reported as a status that landed.
     if (status === "sealed") {
-      const current = this.getSessionRecord(agentName, sessionId)?.status;
+      const current = this.#queries.getSessionRecord(agentName, sessionId)?.status;
       if (current === "abandoned" || current === "sealed") {
         this.#logger.info("session.seal.status.not_written", {
           agentName, sessionId, currentStatus: current,
@@ -16904,7 +12227,7 @@ export class SessionNodeManager {
         // Left alone the rows sit on disk, unreachable by any surface, while the teardown alarm
         // reports `lost: 0`: a success message for content that has just become permanently
         // unreadable. The annex is the store built for exactly this shape.
-        this.#annexHeldContentOnTerminal(agentName, sessionId, status);
+        this.#held.annexHeldContentOnTerminal(agentName, sessionId, status);
         try {
           this.#onSessionTerminal?.(sessionId, status);
         } catch (hookErr: unknown) {
