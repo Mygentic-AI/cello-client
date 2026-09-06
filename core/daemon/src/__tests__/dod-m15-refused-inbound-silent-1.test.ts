@@ -273,6 +273,10 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const mgr = h.getSessionNodeManager();
     const sid = "s-producer";
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-refused");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
 
     const content = new TextEncoder().encode(SECRET);
     const wrongHash = msgLeafHash(new TextEncoder().encode("not what was sent"));
@@ -317,6 +321,10 @@ describe("DOD-M15-REFUSED-INBOUND-SILENT-1 — the operator hears about a refuse
     const mgr = h.getSessionNodeManager();
     const sid = "s-skew";
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-skew");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
 
     const content = new TextEncoder().encode("a message from a newer build");
     // The hash is CORRECT — nothing is tampered with. The refusal is purely "I cannot verify this

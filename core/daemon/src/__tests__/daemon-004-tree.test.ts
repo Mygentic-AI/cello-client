@@ -291,6 +291,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
@@ -304,6 +308,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode({ newStreamFails: true });
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const rootBefore = mgr.getSessionTreeRootHex("alice", sid);
@@ -324,6 +332,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #2: appendSessionLeaf keeps sessions.message_count synced to the tree size", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     expect(mgr.getSessionRecord("alice", sid)!.message_count ?? 0).toBe(0);
@@ -343,6 +355,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("AC-001 receive: ingestReceivedContent cross-checks, appends the leaf, buffers, fires session.content.received", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("from-bob");
@@ -368,6 +384,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("AC-001 receive (tamper): a content_hash MISMATCH is rejected — no append, no buffer, warn event", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("real");
@@ -388,6 +408,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     const node = new ConfigurableFakeNode();
     const mgr = await makeManager(logger, join(tempDir, "s.db"), node);
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("hello");
@@ -416,6 +440,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
     return mgr.initialize().then(async () => {
       await seedAgents(mgr.getDb(), ["alice"]);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // `createSessionNode` sits below the paths that record a session's starting point, so a
+      // fixture using it directly builds a shape production cannot. Seed it the way production
+      // derives it — see `setSessionAnchorForTest`.
+      mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
       const content = new TextEncoder().encode("from-bob");
@@ -475,6 +503,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "inject.db"), node as unknown as CelloNode);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // `createSessionNode` sits below the paths that record a session's starting point, so a
+      // fixture using it directly builds a shape production cannot. Seed it the way production
+      // derives it — see `setSessionAnchorForTest`.
+      mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
@@ -505,6 +537,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
       const node = new LoopbackFakeNode();
       const mgr = await makeManager(logger, join(tempDir, "omit.db"), node as unknown as CelloNode);
       await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+      // `createSessionNode` sits below the paths that record a session's starting point, so a
+      // fixture using it directly builds a shape production cannot. Seed it the way production
+      // derives it — see `setSessionAnchorForTest`.
+      mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
@@ -791,6 +827,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("eviction: destroySessionNode clears the buffered received content (no plaintext retention)", async () => {
     const mgr = await makeManager(logger, join(tempDir, "ev.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("secret-payload");
@@ -814,6 +854,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #5: ingestReceivedContent rejects late content once the session is frozen (not active)", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
 
@@ -847,6 +891,10 @@ describe("DAEMON-004: SessionNodeManager content send/receive", () => {
   it("finding #7: markInterruptedWithDetails keeps message_count synced to the daemon-owned tree, not a stale value", async () => {
     const mgr = await makeManager(logger, join(tempDir, "s.db"), new ConfigurableFakeNode());
     await mgr.createSessionNode(sid, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", sid, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     mgr.setSessionContentKeyForTest("alice", sid, new Uint8Array(32).fill(0x7e));
     for (const m of ["a", "b", "c"]) {

@@ -49,7 +49,7 @@ import { ensureIdentitySchema } from "./db-identity-store.js";
 import { migrateSessionTablesToAgentId } from "./agent-id-migration.js";
 import { TIER, normalizeTier, isKnownTierValue, tierBoundsFor, DEFAULT_TIER_BOUNDS, migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { normalizeContactPubkey, foldContactPubkeyCase } from "./contact-pubkey-case.js";
-import { REFUSAL_KINDS, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
+import { REFUSAL_KINDS, REFUSAL_REASONS, REFUSAL_GUIDANCE, relayAckHashRefusalNotice, type RefusalKind } from "./refusal-reasons.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
 import { boundSettingKey, settableTierName, isValidSettingKey, awayTierSettingKey, AWAY_DEFAULT_KEY } from "./agent-settings-keys.js";
@@ -5446,6 +5446,51 @@ export class SessionNodeManager {
         guidance:
           "The daemon has reached its maximum of 32 concurrent session nodes. " +
           "Close an existing session before starting a new one.",
+      };
+    }
+
+    /**
+     * ─── A SESSION WITH NO DIRECTORY ASSIGNMENT IS REFUSED, AND THE OPERATOR IS TOLD ─────────────
+     *
+     * `DOD-M15-SELFCHAIN-1`, ruled 2026-09-06: *"An attempt to create a session without an
+     * assignment is suspicious and should be treated like other oddities that indicate the
+     * counterparty may be a malicious agent. It should be refused"* — and surfaced.
+     *
+     * ⚠️ WHAT THE ASSIGNMENT CARRIES THAT MAKES THIS A SECURITY REFUSAL RATHER THAN A MISSING
+     * OPTIONAL. Every real session is brokered: the directory FROST-signs an establishment record
+     * and each side verifies that signature before the session begins. Field 4 of those signed
+     * bytes is the conversation's STARTING POINT, and every first message chains to it. A session
+     * without one is a conversation whose order could never be proven — by either party, ever.
+     *
+     * Nothing legitimate produces it. Both production paths that create a session hold a verified
+     * assignment: the inbound accept path refuses an assignment it cannot parse or verify, and the
+     * initiate path builds from one. So reaching here means either a peer opening a conversation
+     * that would leave no provable record, or software that cannot participate in one.
+     *
+     * ⚠️ REFUSED **AND** SURFACED. A detection that only logs is not a control (M15 invariant 2):
+     * the durable refusal is what reaches `cello_inbox`, carrying `REFUSAL_GUIDANCE`'s sentence,
+     * which tells the operator to confirm out of band before accepting anything from them.
+     *
+     * ⚠️ AND IT NAMES WHAT WAS OBSERVED, NEVER A VERDICT. The same signal is produced by a hostile
+     * peer and by a counterparty running a build that predates brokered sessions, and this side
+     * cannot tell them apart — so the wording says what is missing and what it costs, and never
+     * that anyone is malicious.
+     */
+    if (!relay?.assignment && !this.#sessionGenesisPrevRoot(agentName, sessionId)) {
+      this.#logger.error("session.node.refused.no_assignment", {
+        agentName,
+        sessionId,
+        counterpartyPubkey,
+        impact:
+          "a session was offered with no directory assignment, so it has no agreed starting point " +
+          "and no message on it could ever be placed in a provable order. It was REFUSED and " +
+          "recorded for the operator's inbox.",
+      });
+      this.recordRefusedSession(agentName, sessionId, REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT);
+      return {
+        ok: false,
+        reason: REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT,
+        guidance: REFUSAL_GUIDANCE[REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT],
       };
     }
 
@@ -14188,6 +14233,52 @@ export class SessionNodeManager {
   setSessionContentKeyForTest(agentName: string, sessionId: string, key: Uint8Array): void {
     this.#sessionContentKeys.set(this.#k(agentName, sessionId), Uint8Array.from(key));
     this.#contentEncryptionReasons.delete(this.#k(agentName, sessionId));
+  }
+
+  /**
+   * Record a session's STARTING POINT, for a fixture that built the session below the paths that
+   * record it — `DOD-M15-SELFCHAIN-1`. Same seam idiom, same rules, as
+   * `setSessionContentKeyForTest` above.
+   *
+   * ─── What the starting point IS, because it is not an arbitrary seed ───────────────────────────
+   *
+   * Every message signs two chain links. The first message of a session has nothing before it, so
+   * both links carry this value — and it is not invented:
+   * `computeGenesisPrevRoot(pubA, pubB, sessionId, sessionTimestamp)` is **field 4 of the bytes the
+   * directory FROST-signs at session establishment**, which each side independently verifies before
+   * the session begins (`assignment-verify.ts`). The chain's first link is therefore anchored to the
+   * opening ceremony rather than to arithmetic the two sides happen to agree on.
+   *
+   * ⚠️ **A SESSION WITHOUT ONE CANNOT EXIST IN PRODUCTION** — ruled 2026-09-06. Both production
+   * paths that create a session hold a verified assignment and write this column from it
+   * (`inbound-sessions.ts` on accept; the initiate path on the other side). Unit fixtures call
+   * `createSessionNode` directly, BELOW those paths, and so produce a shape production cannot.
+   *
+   * ⚠️ IT SHORT-CIRCUITS HOW THE ANCHOR GOT THERE, NEVER WHAT THE ANCHOR IS. The state it produces
+   * is exactly the production state, which is what makes it legitimate — and it DERIVES rather than
+   * invents, so a fixture cannot accidentally anchor two sessions alike, and cannot anchor to a
+   * constant that would be presentable for any session. A second derivation would be a protocol
+   * change, not a test-seam change.
+   *
+   * Write-once, matching the production writer: the value cannot legitimately change for the life of
+   * a session, so a second writer is either redundant or wrong.
+   */
+  setSessionAnchorForTest(
+    agentName: string,
+    sessionId: string,
+    participantAPubkeyHex: string,
+    participantBPubkeyHex: string,
+    sessionTimestamp: number,
+  ): void {
+    const genesis = computeGenesisPrevRoot(
+      new Uint8Array(Buffer.from(participantAPubkeyHex, "hex")),
+      new Uint8Array(Buffer.from(participantBPubkeyHex, "hex")),
+      new Uint8Array(Buffer.from(sessionId, "hex")),
+      sessionTimestamp,
+    );
+    this.#db
+      ?.prepare("UPDATE sessions SET genesis_prev_root = ? WHERE agent_id = ? AND session_id = ? AND genesis_prev_root IS NULL")
+      .run(Buffer.from(genesis), this.#requireAgentId(agentName), sessionId);
   }
 
   /**

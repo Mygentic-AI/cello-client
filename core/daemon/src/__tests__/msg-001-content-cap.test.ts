@@ -119,6 +119,10 @@ describe("MSG-001: content size cap (send side, daemon)", () => {
     const h = await start(logger, node);
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     const rootBefore = snm.getSessionTreeRootHex("alice", SID);
 
     const client = await connectToDaemon(join(tempDir, "daemon.sock"));

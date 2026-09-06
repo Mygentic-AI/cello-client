@@ -416,6 +416,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     // M8C-CONTACT-1: pre-register as known so this test stays focused on AWAY-1's own template
@@ -454,6 +458,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     await connectAs("alice"); // attended
@@ -477,9 +485,17 @@ describe("M8C-AWAY-1: away response", () => {
     const SID_1 = "aa".repeat(32);
     const SID_2 = "bb".repeat(32);
     await snm.createSessionNode(SID_1, "alice", "cp1pubkeyhex", "peer-1", "corr-1");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_1, "cp1pubkeyhex", "cp1pubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_1, new Uint8Array(32).fill(0x7e));
     await snm.createSessionNode(SID_2, "alice", "cp2pubkeyhex", "peer-2", "corr-2");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_2, "cp2pubkeyhex", "cp2pubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_2, new Uint8Array(32).fill(0x7e));
 
@@ -498,6 +514,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -525,6 +545,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -545,6 +569,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -568,6 +596,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -589,6 +621,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -611,6 +647,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -687,6 +727,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -734,6 +778,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -766,6 +814,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -805,6 +857,10 @@ describe("M8C-AWAY-1: away response", () => {
     const SID_A = "aa".repeat(32);
     const SID_B = "bb".repeat(32);
     await snm.createSessionNode(SID_A, "alice", "bobpubkeyhex", "bob-peer-id", "corr-a");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_A, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_A, new Uint8Array(32).fill(0x7e));
     snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -822,6 +878,10 @@ describe("M8C-AWAY-1: away response", () => {
 
     // Away period 2: new session, same agent. Dedup was cleared so a fresh ack fires.
     await snm.createSessionNode(SID_B, "alice", "bobpubkeyhex", "bob-peer-id", "corr-b");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_B, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_B, new Uint8Array(32).fill(0x7e));
     const m2 = new TextEncoder().encode("hi again [[OVER]]");
@@ -853,6 +913,10 @@ describe("M8C-AWAY-1: away response", () => {
       const snm = h.getSessionNodeManager();
 
       await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+      // A session production could not create: `createSessionNode` sits below the paths that record
+      // the session's starting point. Seed it the way production derives it — see
+      // `setSessionAnchorForTest`.
+      snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
       // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
       snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
       snm.addContact("alice", "bobpubkeyhex", undefined, null, TIER.KNOWN);
@@ -942,6 +1006,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, node);
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
@@ -976,6 +1044,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
@@ -1005,6 +1077,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
@@ -1040,6 +1116,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 
@@ -1069,6 +1149,10 @@ describe("M8C-AWAY-1: away response", () => {
     const h = await start(logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID_HEX, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // A session production could not create: `createSessionNode` sits below the paths that record
+    // the session's starting point. Seed it the way production derives it — see
+    // `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID_HEX, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID_HEX, new Uint8Array(32).fill(0x7e));
 

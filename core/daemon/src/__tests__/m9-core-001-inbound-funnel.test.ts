@@ -109,6 +109,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     // real `agents` row — production always has one by the time a session exists.
     await seedAgents(mgr.getDb(), ["alice"]);
     await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-1");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
     return mgr;
   }
 
@@ -289,6 +293,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
     it("regression: with a sessions row, ingest still delivers and attributes the sender from the record", async () => {
       const { mgr } = await setupCapturing();
       await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-2");
+      // `createSessionNode` sits below the paths that record a session's starting point, so a
+      // fixture using it directly builds a shape production cannot. Seed it the way production
+      // derives it — see `setSessionAnchorForTest`.
+      mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
       const content = enc("attributed message");
       const res = await mgr.ingestReceivedContent("alice", SID, content, msgLeafHash(content), "corr-2");
       expect(res.ok).toBe(true);
@@ -306,6 +314,10 @@ describe("M9-CORE-001 INV-5: every inbound producer passes the gateway screen", 
       const { mgr } = await setupCapturing();
       mgr.getDb().exec("DROP TABLE sessions"); // force the row write to fail
       const res = await mgr.createSessionNode(SID, "alice", "bobpubkey", "bob-peer-id", "corr-f1");
+ // `createSessionNode` sits below the paths that record a session's starting point, so a
+ // fixture using it directly builds a shape production cannot. Seed it the way production
+ // derives it — see `setSessionAnchorForTest`.
+ mgr.setSessionAnchorForTest("alice", SID, "bobpubkey", "bobpubkey", 1_700_000_000_000);
       expect(res.ok).toBe(false);
       expect((res as { reason: string }).reason).toBe("session_persist_failed");
       // No live node remains — a rowless session is a dead session by definition after D4a.

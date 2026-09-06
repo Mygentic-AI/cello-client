@@ -137,6 +137,18 @@ export const REFUSAL_REASONS = {
   COUNTERPARTY_PRIMARY_KEY_CHANGED: "counterparty_primary_key_changed",
   /** The inbound assignment failed verification (signature, signer, or shape). */
   INBOUND_ASSIGNMENT_INVALID: "inbound_assignment_invalid",
+  /**
+   * `DOD-M15-SELFCHAIN-1` — a session was offered with NO directory assignment to anchor it.
+   *
+   * ⚠️ TREATED AS SUSPICIOUS, NOT AS A MISSING OPTIONAL. Every real session is brokered: the
+   * directory FROST-signs an establishment record and each side verifies it before the session
+   * begins. That record carries the conversation's STARTING POINT — the value every first message
+   * chains to — so a session without one is a conversation whose order could never be proven.
+   *
+   * Nothing legitimate produces it. A counterparty that offers one is either running software that
+   * cannot participate in the record, or trying to open a conversation that leaves none.
+   */
+  SESSION_WITHOUT_ASSIGNMENT: "session_without_assignment",
 } as const;
 
 export type RefusalReason = (typeof REFUSAL_REASONS)[keyof typeof REFUSAL_REASONS];
@@ -194,6 +206,35 @@ export type AnyRefusalReason = RefusalReason | CapacityReason;
  * `session_refused` frame, which goes to the side that can act on it.
  */
 export const REFUSAL_GUIDANCE: Record<RefusalReason, string> = {
+  /**
+   * ⛔ THE REPORTING LINE IS OWED AND IS DELIBERATELY ABSENT — `CELLO_Reporting` DOES NOT EXIST YET.
+   *
+   * Andre asked (2026-09-06) for this notice to tell the operator to report the attempt to
+   * `CELLO_Reporting`, which he expected to be in every address book. It is designed and not
+   * provisioned — `orphan-triage.ts` carries the same standing trigger, and
+   * `dod-m15-no-silent-refusal-1.test.ts` asserts that no guidance names it.
+   *
+   * Naming it now would be an affordance that resolves to nothing: the reader would go looking for
+   * a contact they do not have, which is worse than no advice because they will try to follow it.
+   *
+   * ⚠️ AND IT IS THE ADVICE A STRANGER ACTUALLY NEEDS. The notice below branches on whether the
+   * operator recognises them, because you cannot reach an unknown agent out of band — there is no
+   * channel and no one to ask. Reporting is the only action that would work for the stranger case,
+   * and it is precisely the one that does not exist yet, so today that branch can only say "do not
+   * accept". That is what makes provisioning it worth doing rather than a nicety.
+   *
+   * ⛔ TRIGGER: when `CELLO_Reporting` is provisioned and its pubkey published, add a sentence here
+   * telling the operator to report the attempt to it, and drop the assertion in that test.
+   */
+  [REFUSAL_REASONS.SESSION_WITHOUT_ASSIGNMENT]:
+    "REFUSED ON PURPOSE, AND TREAT IT AS SUSPICIOUS. Somebody tried to open a conversation with " +
+    "you without the directory record that every real session carries. That record is what fixes " +
+    "the conversation's starting point, and every message chains to it — so a session without one " +
+    "is a conversation whose order could never be proven afterwards, by you or by anyone. NOTHING " +
+    "LEGITIMATE PRODUCES THIS. IF THEY LOOK LIKE SOMEONE YOU KNOW, reach them OUT OF BAND — send " +
+    "an email or a direct message, some channel that is not this one — and tell them their agent " +
+    "cannot hold a provable conversation with anyone while it is in this state. IF YOU DO NOT KNOW " +
+    "THEM, there is nobody to ask and nothing to confirm: do not accept a session from them.",
   [REFUSAL_REASONS.COUNTERPARTY_PRIMARY_KEY_CHANGED]:
     "REFUSED ON PURPOSE. The directory named a different signing identity for a contact you have " +
     "completed sessions with before. Either they genuinely re-registered — confirm that with them " +

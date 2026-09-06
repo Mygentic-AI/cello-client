@@ -237,6 +237,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -334,6 +338,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -376,6 +384,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     const content = new TextEncoder().encode("from-bob");
@@ -678,6 +690,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
     snm.appendSessionLeaf("alice", SID, "msg", Buffer.from(msgLeafHash(new TextEncoder().encode("m1"))).toString("hex"));
@@ -706,6 +722,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -733,6 +753,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -777,6 +801,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -820,6 +848,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h = await start({ logger, node });
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 
@@ -855,6 +887,10 @@ describe("DAEMON-004 IPC: cello_send / cello_receive / active seal", () => {
     const h1 = await start({ logger, node });
     const snm = h1.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "bobpubkeyhex", "bob-peer-id", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     // 007-CRYPTO: the state a completed key exchange leaves — a live send needs an agreed key.
     snm.setSessionContentKeyForTest("alice", SID, new Uint8Array(32).fill(0x7e));
 

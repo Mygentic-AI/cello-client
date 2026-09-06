@@ -144,6 +144,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const h = await start(makeLogger().logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "strangerpubkeyhex", "peer-1", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "strangerpubkeyhex", "strangerpubkeyhex", 1_700_000_000_000);
 
     // Seed prior received bytes just under the cap (same producer as the real inbound path:
     // appendSessionLeaf + recordTranscriptMessage). Leave headroom SMALLER than the next
@@ -163,6 +167,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const snm = h.getSessionNodeManager();
     const db = snm.getDb();
     await snm.createSessionNode(SID, "alice", "friendpubkeyhex", "peer-1", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "friendpubkeyhex", "friendpubkeyhex", 1_700_000_000_000);
     snm.addContact("alice", "friendpubkeyhex");
     // 'exempt entirely' is gone (INV-TIER-BOUND: no tier unbounded). Set the contact to KNOWN (100 MB
     // cap) explicitly — cello_contact_set_tier is Step 3. Prior received == exactly UNKNOWN's 25 MB
@@ -613,6 +621,10 @@ describe("M8C-ABUSE-1: persistence bounds", () => {
     const h = await start(makeLogger().logger, new FakeNode());
     const snm = h.getSessionNodeManager();
     await snm.createSessionNode(SID, "alice", "strangerpubkeyhex", "peer-1", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", SID, "strangerpubkeyhex", "strangerpubkeyhex", 1_700_000_000_000);
 
     const bigChunk = new Uint8Array(ABUSE_MAX_SESSION_RECEIVED_BYTES + 100); // over the cap alone
     const hashHex = Buffer.from(msgLeafHash(bigChunk)).toString("hex");

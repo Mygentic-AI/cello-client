@@ -178,6 +178,10 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const snm = h.getSessionNodeManager();
     const sid = "cc".repeat(16);
     await snm.createSessionNode(sid, "alice", "bobpubkeyhex", "peer-1", "corr");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", sid, "bobpubkeyhex", "bobpubkeyhex", 1_700_000_000_000);
     snm.addContact("alice", "bobpubkeyhex"); // known — no AWAY-1 auto-ack noise in this test
 
     await snm.ingestReceivedContent("alice", sid, new TextEncoder().encode("m1"), msgLeafHash(new TextEncoder().encode("m1")), "c1");
@@ -285,7 +289,15 @@ describe("M8C-TGDOOR-1: Telegram doorbell", () => {
     const sidA = "f1".repeat(16);
     const sidB = "f2".repeat(16);
     await snm.createSessionNode(sidA, "alice", "cp-a-pubkeyhex", "peer-a", "corr-a");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", sidA, "cp-a-pubkeyhex", "cp-a-pubkeyhex", 1_700_000_000_000);
     await snm.createSessionNode(sidB, "alice", "cp-b-pubkeyhex", "peer-b", "corr-b");
+    // `createSessionNode` sits below the paths that record a session's starting point, so a
+    // fixture using it directly builds a shape production cannot. Seed it the way production
+    // derives it — see `setSessionAnchorForTest`.
+    snm.setSessionAnchorForTest("alice", sidB, "cp-b-pubkeyhex", "cp-b-pubkeyhex", 1_700_000_000_000);
     snm.addContact("alice", "cp-a-pubkeyhex");
     snm.addContact("alice", "cp-b-pubkeyhex");
 
