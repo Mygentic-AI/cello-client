@@ -34,6 +34,7 @@ import * as lp from "it-length-prefixed";
 import { startTwoConnectionFixture, type TwoConnectionFixture } from "./helpers/two-connection-fixture.js";
 import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { wireContentHash } from "../wire-content-hash.js";
+import { LEAF_KIND_MSG } from "../session-relay-client.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
 
 const SID = "5e".repeat(32);
@@ -74,6 +75,10 @@ async function frameFrom(
     content_encryption: SESSION_CONTENT_ENCRYPTION_V1,
     structure1_cbor: structure1,
     sender_signature: await kp.sign(structure1),
+    // 034-CARRYLEAF: WHICH leaf domain this content belongs to. A frame without it is refused
+    // before authorship is judged, because a leaf kind selects a HASH DOMAIN — so a fixture that
+    // omits it never reaches the check this file is about.
+    leaf_kind: LEAF_KIND_MSG,
   }) as Uint8Array).subarray();
   return { frame, contentHash };
 }
