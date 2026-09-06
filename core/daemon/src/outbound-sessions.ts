@@ -528,12 +528,17 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.error("session.assignment.target_mismatch", {
           agentName, correlationId,
           askedForPrefix: targetHex.toLowerCase().slice(0, 16), namedPrefix: namedTarget.slice(0, 16),
-          impact: "the directory returned a validly-signed assignment naming a counterparty other than the one requested; it was refused before any dial, so no session was established and no message was sent",
+          impact: "the directory returned a validly-signed assignment naming a counterparty other than the one requested; it was refused before any dial, so no conversation was opened and nothing was sent",
         });
         return {
           ok: false,
           reason: "assignment_names_different_counterparty",
-          guidance: "The directory returned a session assignment for a different counterparty than the one you asked for. Nothing was established and no message was sent — your first message would have gone to them. Re-check the public key with the counterparty's operator out of band, then retry cello_initiate_session; cello_status names the directory node that answered.",
+          // ⚠️ LEAD WITH THE ATTRIBUTION, and the reason is measurable rather than stylistic (review
+          // F1). The directory echoes the `target_pubkey` we sent it straight back into
+          // `participant_b`, so an operator TYPO cannot produce this — a typo puts the same wrong
+          // key on both sides and matches. This fault is 100% directory-side. Guidance that opened
+          // by telling the operator to re-check the key sent them to the one place it cannot be.
+          guidance: "The directory returned a session assignment naming a counterparty other than the one you asked for. No conversation was opened and nothing you wrote was sent. This is not a typo on your side — the directory echoes back the key you sent it, so a mismatch means the node that answered departed from the protocol. Run cello_status to see which directory node answered, then retry cello_initiate_session; a different node will serve the request. Only if it repeats across nodes is it worth confirming the key with the counterparty's operator out of band.",
         };
       }
       const namedSelf = Buffer.from(assignment.participant_a.pubkey).toString("hex").toLowerCase();
@@ -541,12 +546,15 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
         logger.error("session.assignment.self_mismatch", {
           agentName, correlationId,
           ownPrefix: ownPubkeyHex.toLowerCase().slice(0, 16), namedPrefix: namedSelf.slice(0, 16),
-          impact: "the directory returned a validly-signed assignment putting a different agent in this agent's own seat; it was refused before any dial, so no session was established and no message was sent",
+          impact: "the directory returned a validly-signed assignment putting a different agent in this agent's own seat; it was refused before any dial, so no conversation was opened and nothing was sent",
         });
         return {
           ok: false,
           reason: "assignment_names_different_self",
-          guidance: "The directory returned a session assignment that names a different agent as this side of the conversation. Nothing was established and no message was sent. Run cello_status to confirm which agent is selected, then retry cello_initiate_session; if it repeats, the directory node that answered is brokering sessions in this agent's name and its id is in that output.",
+          // Same correction as above (review F1): the directory derives `participant_a` from the key
+          // the signaling stream AUTHENTICATED with, not from anything the operator typed, so "check
+          // which agent is selected" names a cause that cannot produce this either.
+          guidance: "The directory returned a session assignment naming a different agent as this side of the conversation. No conversation was opened and nothing you wrote was sent. This is not a local selection problem — the directory derives this side from the key your daemon authenticated with, so a mismatch means the node that answered is brokering sessions in another agent's name. Run cello_status to see which directory node answered, then retry cello_initiate_session; a different node will serve the request.",
         };
       }
       logger.info("session.negotiate.assignment.received", { agentName, correlationId, signatureType: assignment.signature_type, signatureVerified: true });
