@@ -19,12 +19,17 @@
  * the INITIATOR's own threshold group key, which is why the verifier compares `signer_pubkey`
  * against this agent's persisted `primaryPubkey` before trusting it.
  *
- * **The responder verifies it too, but asymmetrically** (`verifyInboundAssignment`,
- * `DOD-M15-RESPONDER-VERIFY-1`). It has no key of its own to compare against, so for a REPEAT
- * counterparty it verifies under the key this daemon pinned during an earlier session, and on FIRST
- * CONTACT it can only prove the signature holds over the assignment's own recomputed contents —
- * which catches tampering but cannot authenticate a directory. Said plainly rather than left for
- * the next reader to assume symmetry, because assuming symmetry is what the original sentence cost.
+ * **The responder verifies it too** (`verifyInboundAssignment`, `DOD-M15-RESPONDER-VERIFY-1`), and
+ * 038-KEYBIND changed what that is worth on FIRST CONTACT. The old sentence here said the responder
+ * *"can only prove the signature holds over the assignment's own recomputed contents — which catches
+ * tampering but cannot authenticate a directory"*, and that was accurate: with no pin it verified
+ * against `signer_pubkey`, a field of the frame under verification.
+ *
+ * The frame now carries `participant_a_key_binding` — a signature by the INITIATOR's own K_local
+ * naming their group key. The responder checks that FIRST and verifies the threshold signature under
+ * the key it proved, so a directory can no longer name a group key of its choosing. What first
+ * contact still cannot tell you is whether `participant_a` is who you think: the identity key itself
+ * is the out-of-band value, and no field on this frame can vouch for it.
  */
 
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
