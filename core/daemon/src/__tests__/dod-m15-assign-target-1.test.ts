@@ -219,6 +219,10 @@ describe("DOD-M15-ASSIGN-TARGET-1: the assignment must name who the operator ask
     expectNothingDialled(h);
 
     expect(h.events.find((e) => e.event === "session.assignment.self_mismatch")?.level).toBe("error");
+    expect(
+      h.events.find((e) => e.event === "session.negotiate.assignment.received"),
+      "an assignment naming someone else as this side must not be logged as received",
+    ).toBeUndefined();
   });
 
   it("gives the two substitutions DISTINCT reasons — they are different events", async () => {
