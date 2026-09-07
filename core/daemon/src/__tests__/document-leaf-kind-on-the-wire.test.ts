@@ -111,7 +111,9 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     // that fails when someone re-writes the adapter with the shorter signature. A behavioural test
     // here would have to stand up the whole daemon, and a mock of this seam is precisely what hid
     // the defect the first time.
-    const root = readFileSync(new URL("../daemon.ts", import.meta.url), "utf8");
+    // 040-DAEMONROOT unit 4: the sendContent/appendLeaf adapters moved out of daemon.ts into
+    // document-wiring.ts. The file changed; what is asserted about the adapter did not.
+    const root = readFileSync(new URL("../document-wiring.ts", import.meta.url), "utf8");
 
     /**
      * `matchAll`, not `exec` — `DOD-M15-SEALWIRE-1` B2b-1 pass-2 F5. `exec` returns the FIRST match,

@@ -22,6 +22,10 @@ import { fileURLToPath } from "node:url";
 const PKG_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const REPO_ROOT = join(PKG_ROOT, "..", "..");
 const DAEMON_DIST = join(PKG_ROOT, "dist", "daemon.js");
+// 040-DAEMONROOT unit 4: the document layer's wiring — the classifier hand-off and the semantic
+// screen — moved out of daemon.js into document-wiring.js. Both are read and searched as ONE text,
+// because what is asserted is that the call site exists in WHAT SHIPS, not which file it sits in.
+const DOCUMENT_WIRING_DIST = join(PKG_ROOT, "dist", "document-wiring.js");
 const DAEMON_BIN_DIST = join(PKG_ROOT, "dist", "bin", "cello-daemon.js");
 const GATEWAY_DIST = join(REPO_ROOT, "core", "gateway", "dist", "bin", "cello-gateway.js");
 
@@ -33,9 +37,10 @@ beforeAll(async () => {
   // A missing artifact must FAIL, never skip. "The build was not run" is indistinguishable from
   // "the wiring is gone" if the assertion quietly passes.
   expect(existsSync(DAEMON_DIST), `${DAEMON_DIST} — run pnpm build`).toBe(true);
+  expect(existsSync(DOCUMENT_WIRING_DIST), `${DOCUMENT_WIRING_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(GATEWAY_DIST), `${GATEWAY_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(DAEMON_BIN_DIST), `${DAEMON_BIN_DIST} — run pnpm build`).toBe(true);
-  daemon = await readFile(DAEMON_DIST, "utf8");
+  daemon = (await readFile(DAEMON_DIST, "utf8")) + "\n" + (await readFile(DOCUMENT_WIRING_DIST, "utf8"));
   daemonBin = await readFile(DAEMON_BIN_DIST, "utf8");
   gateway = await readFile(GATEWAY_DIST, "utf8");
 });
