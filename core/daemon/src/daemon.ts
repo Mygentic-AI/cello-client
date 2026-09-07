@@ -72,6 +72,7 @@ import { createDocumentSurface } from "./document-surface.js";
 import { createIpcSurface } from "./ipc-surface.js";
 import { createDaemonStatusReport } from "./daemon-status-report.js";
 import { createWhoResolver } from "./who-resolver.js";
+import { NO_CURRENT_AGENT_RESPONSE, registrationGuidance } from "./operator-guidance.js";
 import { wireDisconnectCleanup } from "./disconnect-cleanup.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
@@ -409,11 +410,6 @@ async function startDaemonHoldingLock(
       openVisitingConnection, crossNodeBrokerBySession,
     });
 
-  const NO_CURRENT_AGENT_RESPONSE = {
-    ok: false,
-    reason: "no_current_agent",
-    guidance: "No current agent is set for this connection. Call cello_start_agent to bring an agent online, then call cello_use_agent to set it as the current agent for this connection.",
-  };
 
   // The inbound seal-interrupted REQUEST (inbound-seal-request.ts): the counterparty asks us to
   // co-sign the seal of a session neither side can finish normally. We answer with our own signed
@@ -578,32 +574,7 @@ async function startDaemonHoldingLock(
     perAgentSignaling,
   });
 
-  // `detail` carries the ACTUAL cause when one is known. The wire code stays `dkg_failed` — it is a
-  // closed protocol union — but this string is a local daemon→IPC message, so it can say what really
-  // happened instead of asserting a guess.
-  const registrationGuidance = (reason: string, detail?: string): string => {
-    switch (reason) {
-      case "already_registered":
-        return "This agent is already registered with the directory. No action needed.";
-      case "directory_unreachable":
-        return "The directory signaling stream is not connected (or its bootstrap endpoint could not be resolved). Wait for directory_signaling to show connected in cello status, then retry.";
-      case "dkg_failed":
-        // NOT "this usually means the pre-auth token". That diagnosis is confidently wrong for the
-        // causes that actually occur — a colliding NODE_ID across two directory boxes, a commitment
-        // that does not match the client's primary_pubkey, a node dropping mid-ceremony — and it sends
-        // the operator to the wrong subsystem. The cause is now captured one call frame away
-        // (registration.dkg.failed), so it is reported rather than guessed at.
-        return detail
-          ? `The FROST DKG ceremony with the directory failed: ${detail}`
-          : "The FROST DKG ceremony with the directory failed, and no underlying cause was captured. Check the daemon log for registration.dkg.failed, which carries the reason.";
-      case "timeout":
-        return "The directory did not respond within the registration timeout. Retry once directory_signaling is connected.";
-      default:
-        return detail
-          ? `Registration failed: ${reason} — ${detail}`
-          : `Registration failed: ${reason}. Check the daemon logs (registration.* events).`;
-    }
-  };
+  // 040-DAEMONROOT unit 19: what the daemon says when a call cannot proceed → operator-guidance.ts.
 
   // cello_register (register-handler.ts): T-of-N DKG with the consortium. NO SINGLE NODE can
   // complete it alone — that is the sovereign-node invariant, and it is the point of the protocol.
