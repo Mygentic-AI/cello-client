@@ -18,7 +18,11 @@ const repo = resolve(here, "../../../..");
  * defect is textual — a name on one side that no longer matches the name on the other.
  */
 describe("DOD-END-SURFACE-1 — consent verb parameters reach the handler", () => {
-  const daemon = readFileSync(resolve(repo, "core/daemon/src/daemon.ts"), "utf8");
+  // 040-DAEMONROOT unit 1: the consent verbs moved out of daemon.ts into signal-handlers.ts. This
+  // guard is the only thing checking that the names the MCP tool and the CLI SEND are the names the
+  // handler READS, and it lives in a different package from the code it reads — so a move that runs
+  // only the daemon package's tests leaves it red and the parity unchecked.
+  const daemon = readFileSync(resolve(repo, "core/daemon/src/signal-handlers.ts"), "utf8");
   const mcp = readFileSync(resolve(repo, "core/adapter-claude-code/src/bin/cello-mcp.ts"), "utf8");
   const cli = readFileSync(resolve(repo, "core/cli/src/parity-commands.ts"), "utf8");
 

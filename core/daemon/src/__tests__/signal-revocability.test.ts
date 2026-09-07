@@ -89,7 +89,12 @@ describe("the refusal happens before anything leaves, and nothing is destroyed",
   // changed; the property asserted below did not.
   const daemon = readFileSync(join(import.meta.dirname, "..", "signal-handlers.ts"), "utf8");
   const handler = daemon.slice(daemon.indexOf('handlers.set("wallet_revoke_signal"'));
-  const withComments = handler.slice(0, handler.indexOf('handlers.set("', 10));
+  // The revoke handler is now LAST in its file, so "the next handler" does not exist and an
+  // unguarded indexOf returns -1 — which slice reads as "to the end, minus one character". That is
+  // correct today only by accident: the first thing appended below this handler would enter the
+  // absence-scan window below and redden this test for a reason its message does not name.
+  const end = handler.indexOf('handlers.set("', 10);
+  const withComments = handler.slice(0, end === -1 ? handler.length : end);
   // CODE ONLY. The absence assertions below name the very things the comments EXPLAIN — the health
   // port, the old route — so matching raw text makes the handler's own documentation fail the test.
   // Exactly the trap the SELECT * guard hit earlier today, one layer along: comments are prose, and

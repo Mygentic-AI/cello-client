@@ -8,11 +8,20 @@
  * inside `startDaemonHoldingLock`, reaching the daemon's state by closing over it. Here they NAME
  * what they need, which is the point of the move.
  *
- * ⚠️ THE CONTEXT IS FOURTEEN MEMBERS, TWO OVER THE ORDER'S BOUND, AND THAT IS RECORDED RATHER
- * THAN HIDDEN. The bound exists to stop a module becoming the composition root with an extra hop.
- * Splitting this in two is worse: both halves need the signing key, the manifest, the retry queue,
- * the roster and the visiting connection, and the order's own rule is that two modules needing the
- * same values are one module. Fourteen names, each used, is the smaller violation.
+ * ⚠️ THE CONTEXT IS FOURTEEN MEMBERS, TWO OVER THE ORDER'S BOUND, AND THERE *IS* A SEAM — measured,
+ * because the first version of this note claimed there was not and that is how a wrong comment
+ * survives. Four of the fourteen have exactly ONE consumer between them: the roster, the visiting
+ * connection and `waitForSignalingConnected` are used only by `wallet_fetch_results`, and the
+ * manifest only by `submitForAgent`. Lift `wallet_fetch_results` out and what remains needs ELEVEN,
+ * under the bound.
+ *
+ * It is not lifted, and the reason is arithmetic rather than taste. `wallet_fetch_results` calls
+ * `resolveSelectedAgent`, so the split either exports a helper that is private on purpose or adds a
+ * third module — and every module costs the composition root another ~15-line call site, which is
+ * the failure the order names in bold: extraction that makes the root BIGGER. Two members saved is
+ * not worth a call site, and "ask every directory what it holds about me" is the same topic as the
+ * rest of this file. Fourteen names, each used, is the smaller violation — but the seam is real and
+ * is written down here so the next reader does not have to re-measure it to find out.
  *
  * Behavior is unchanged — the handler bodies moved verbatim, comments included. The one edit is
  * that the per-connection state Map became `getConnState`: these handlers only ever read a single
