@@ -43,6 +43,16 @@ export const PARK_REFUSAL_REASONS = {
   ANNEX_SCREEN_UNAVAILABLE: "annex_screen_unavailable",
   /** The annex write itself ran and failed. */
   ANNEX_WRITE_FAILED: "annex_write_failed",
+  /**
+   * The inbound screener TERMINALLY blocked the content. Retained as quarantined evidence and
+   * deleted from the relay — the only park branch that destroys the remote copy on purpose.
+   *
+   * ⚠️ IT HAD NO OPERATOR SURFACE AT ALL — review M9. It is the branch with the strongest claim on
+   * an operator's attention (hostile bytes aimed at a conversation that is already closed) and the
+   * only one that deletes the relay's copy in silence, and its `impact` field was addressed to
+   * nobody. Unit 2's scope is every `content.recover.*` refusal, not only the one that loops.
+   */
+  ANNEX_SCREENED_OUT: "annex_screened_out",
 } as const;
 
 export type ParkRefusalReason = (typeof PARK_REFUSAL_REASONS)[keyof typeof PARK_REFUSAL_REASONS];
@@ -142,11 +152,30 @@ function saltGuidance(ctx: ParkRefusalContext): string {
       `not this one — to say it again in a NEW conversation.`
     );
   }
+  /**
+   * ⚠️ **IT DOES NOT ASK THE READER TO WORK OUT SOMETHING IT ALREADY KNOWS — review L10.**
+   *
+   * This read *"if the conversation is still open, staying connected is what fixes it; if it is
+   * already closed, nothing will"* — a hedge over a status this function is handed. In production
+   * the branch is reachable only when ingest returned `session_committed`, so the status is
+   * `seal_interrupted_pending` or a record that could not be read; the hedge is right for the
+   * second and lazy for the first.
+   */
+  if (ctx.sessionStatus === null) {
+    return (
+      `${cause} The relay still holds this message and it is pulled again on every drain. This ` +
+      `agent could not read its own record of the conversation, so it cannot tell you whether the ` +
+      `conversation is still open — and that unreadable record is itself worth looking at. If the ` +
+      `conversation IS still open, being connected at the same time as your counterparty is what ` +
+      `agrees a salt and clears this.`
+    );
+  }
   return (
-    `${cause} The relay still holds this message and it is pulled again on every drain. It cannot ` +
-    `be checked until a salt exists for this conversation, and a salt is agreed when the two of you ` +
-    `are connected — so if the conversation is still open, staying connected is what fixes it. If it ` +
-    `is already closed, nothing will: ask the sender to say it again in a NEW conversation.`
+    `${cause} The relay still holds this message and it is pulled again on every drain. A salt is ` +
+    `agreed while both sides are connected, so being online at the same time as your counterparty ` +
+    `is what clears this — the message is then checked and delivered on a later drain. This ` +
+    `conversation is "${ctx.sessionStatus}", so if it never reopens, ask the sender OUT OF BAND to ` +
+    `say it again in a NEW conversation.`
   );
 }
 
@@ -218,6 +247,22 @@ export const PARK_REFUSAL_NOTICE: Record<
       "Nothing to do unless it keeps happening. If it does, the screener on THIS machine is not " +
       "running — look for content.recover.annex.screen_unavailable in the daemon log. Do not ask " +
       "the sender for anything; they cannot see this and there is nothing for them to resend.",
+  }),
+  [PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT]: (ctx) => ({
+    // BLOCKED, not REFUSED: it was checked, it IS retained, and the operator is not being asked to
+    // do anything about it. The kind is what carries "this is the protection working".
+    kind: REFUSAL_KINDS.BLOCKED,
+    impact:
+      "A message that arrived for this closed conversation was BLOCKED by this agent's screener — " +
+      "its content was rejected outright, not merely unrecognised. It was never shown to the agent " +
+      "and never added to the conversation's record. It is KEPT as evidence, and the relay's copy " +
+      "has been dropped so it stops arriving." +
+      (ctx.released ? "" : " The relay copy could not be dropped, so it may arrive again."),
+    guidance:
+      "This is the protection working, and there is nothing to repair. Do not turn screening off " +
+      "to read it and do not ask the sender about it — if the content was hostile, telling them " +
+      "what was caught tells whoever sent it what to change. cello_quarantined shows it if you " +
+      "need to produce it.",
   }),
   [PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED]: (ctx) => ({
     kind: REFUSAL_KINDS.DEFERRED,

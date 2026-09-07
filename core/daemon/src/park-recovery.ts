@@ -389,6 +389,24 @@ export class ParkRecovery {
     correlationId?: string,
   ): Promise<
     | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
+    /**
+     * `retained` — `041-PARKSTUCK` review H1. Did this daemon actually keep a local copy of the
+     * refused bytes?
+     *
+     * ⚠️ **A FACT ABOUT THIS ATTEMPT, NOT A PROMISE, and the park drain's release is gated on it.**
+     * `quarantineRefusedContent` answers `null` on four reachable paths — no database, the
+     * conversation's byte budget already spent, the row not stored, and a throwing write — each
+     * logging, in its own words, that nothing holds a copy of it. Its return was discarded, which
+     * was harmless while every caller kept the relay's copy regardless.
+     *
+     * It stopped being harmless when the drain gained an exit that DELETES the relay copy: that
+     * exit reasoned "the bytes are already retained" from the call having been MADE rather than
+     * from it having worked, so on a conversation that had spent its budget the message would have
+     * existed nowhere. `content-park.ts` forbids exactly that by name — *"annex FIRST,
+     * confirm-delete SECOND, and only if the annex committed."*
+     *
+     * Absent on every refusal that does not retain; only `session_committed` sets it today.
+     */
     | { ok: false; reason: string; retained?: boolean }
   > {
     const contentHashHex = Buffer.from(contentHash).toString("hex");

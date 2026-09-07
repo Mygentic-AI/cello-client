@@ -631,12 +631,34 @@ export function createContentPark(deps: ContentParkDeps) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
         } else if (screenedOut) {
-          // Terminal block: nothing to keep and nothing to store. Delete so it stops being re-pulled.
+          // Terminal block: identical bytes are rejected identically forever, so the relay copy goes
+          // or the re-pull loop returns. The content is retained as quarantined evidence above.
+          let screenReleased = false;
           try {
             await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+            screenReleased = true;
           } catch (err: unknown) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
+          /**
+           * ⚠️ **THIS BRANCH TOLD THE OPERATOR NOTHING — review M9.**
+           *
+           * It is the only park branch that DELETES the relay's copy on purpose, and it is the one
+           * with the strongest claim on an operator's attention: content rejected outright by the
+           * screener, aimed at a conversation that has already closed. Its `impact` field was
+           * written for a person and read by nobody, which is the pattern this whole unit exists to
+           * end — and leaving it here while fixing the neighbouring branches would have been the
+           * class fixed one instance at a time.
+           *
+           * Deliberately NOT pushed into `refusals`: that list is what the drain reports as STUCK,
+           * and this entry is resolved — retained, and gone from the relay. The operator surface is
+           * the part that was missing, not the stuck-list entry.
+           */
+          noteParkRefusal(
+            recipientAgent.name, e.sessionIdHex, e.contentHashHex,
+            PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT,
+            { sessionStatus, released: screenReleased, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
+          );
         } else if (screenDeferred) {
           refusals.push(
             noteParkRefusal(

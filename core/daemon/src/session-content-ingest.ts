@@ -299,28 +299,9 @@ export class SessionContentIngest {
       // before this: `sealed_session_annex` covers the park-drain and held-drift routes, not this
       // exit. Something arriving into a signed, closed conversation is exactly the kind of thing an
       // operator later wants to produce.
-      /**
-       * ⚠️ **THE RETURN VALUE IS LOAD-BEARING NOW — `041-PARKSTUCK` review H1.**
-       *
-       * `quarantineRefusedContent` answers `null` on four reachable paths: no database, the
-       * session's byte budget already spent, the row not stored, and a throwing write — each with
-       * its own log line saying, in its own words, that *nothing holds a copy of it*. The value was
-       * discarded here, which was harmless while every caller kept the relay's copy regardless.
-       *
-       * It stopped being harmless when the park drain gained an exit that DELETES the relay copy:
-       * that exit reasoned "the bytes are already retained" from this call having been made, not
-       * from it having worked. On a conversation that had spent its budget the message would then
-       * exist nowhere. The comment forty lines above the delete states the rule it broke —
-       * *"annex FIRST, confirm-delete SECOND, and only if the annex committed."*
-       *
-       * So the outcome travels with the refusal. `retained` is a FACT about this attempt, not a
-       * promise, and the only caller that acts on it is the one that would otherwise destroy the
-       * last copy.
-       */
-      const retainedSeq = this.#ctx.refusals.quarantineRefusedContent(
-        agentName, sessionId, "session_committed", content, contentHashHex,
-        { senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId },
-      );
+      const retainedSeq = this.#ctx.refusals.quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
+        senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
+      });
       /**
        * DOD-M15-REFUSALTERMINAL-1 — the retention call above is also what STOPS THE WORK: it runs
        * the terminal funnel, and `session_committed` is the one reason in it.
