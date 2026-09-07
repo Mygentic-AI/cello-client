@@ -26,6 +26,7 @@ import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto"
 
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance } from "./co-attendance.js";
+import { NO_AGENTS_GUIDANCE } from "./onboarding-guidance.js";
 
 export interface AgentHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -594,7 +595,14 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
 
   // ─── MCP-001: cello_list_agents handler ───
   handlers.set("cello_list_agents", async (_params, connectionId) => {
-    return { agents: getAgentsForConnection(connectionId) };
+    const agents = getAgentsForConnection(connectionId);
+    // An empty roster is the one answer that needs words rather than data. The CLI imports
+    // NO_AGENTS_GUIDANCE directly (cli depends on daemon), but `connect` depends on no
+    // @cello-protocol package at all — so the shim can only learn this over the wire, and an
+    // operator who never opens a terminal would otherwise get an empty list and no explanation
+    // of the cohort gate standing between them and a registration token.
+    if (agents.length === 0) return { agents, onboarding: NO_AGENTS_GUIDANCE };
+    return { agents };
   });
 
   // ─── M7-REGISTRATION (Action 2): cello_register handler ───

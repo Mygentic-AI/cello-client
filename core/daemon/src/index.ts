@@ -102,3 +102,7 @@ export type { AgentStateInputs } from "./agent-state.js";
 // the daemon itself cannot do it, because it would be holding the database open.
 export { createBackup, restoreBackup, inspectBackup } from "./backup-restore.js";
 export type { BackupResult, RestoreResult } from "./backup-restore.js";
+
+// The empty-roster affordance. Exported so the CLI renders the SAME words the daemon hands the
+// MCP shim — two surfaces, one string, no chance of one of them quietly omitting the cohort gate.
+export { NO_AGENTS_GUIDANCE, WAITLIST_URL } from "./onboarding-guidance.js";

@@ -19,6 +19,7 @@ import {
   isProcessAlive,
   probeSingletonLock,
   SINGLETON_LOCK_FILENAME,
+  NO_AGENTS_GUIDANCE,
   type DaemonStatusResponse,
   type IpcClient,
   type Logger,
@@ -134,7 +135,12 @@ export function formatLoginSummary(result: { started: string[]; failed: Array<{ 
       "Run 'cello status' to check; a failed agent stays offline and can be retried with cello_use_agent.",
     );
   }
-  if (result.started.length === 0 && result.failed.length === 0) parts.push("No registered agents to start.");
+  // The empty case is a NEW OPERATOR'S FIRST SCREEN far more often than it is a veteran's, and
+  // "No registered agents to start." told them nothing: not the next command, not that a token is
+  // needed, and not that tokens only exist for someone a cohort has admitted. That last omission
+  // is the expensive one — it sent people to the Telegram operations agent to ask for something it
+  // could not give them, with nothing in the product having warned them. See onboarding-guidance.ts.
+  if (result.started.length === 0 && result.failed.length === 0) parts.push(NO_AGENTS_GUIDANCE);
   return parts.join("\n");
 }
 

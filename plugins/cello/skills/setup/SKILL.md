@@ -41,6 +41,21 @@ reusable after an agent is retired, so never treat a name as proof of who you ar
 
 ## Step 3 — Register it with the directory
 
+> ### ⚠️ You need to have been admitted to a cohort BEFORE this step will work
+>
+> CELLO is launching in waves. The registration token is issued by the **CELLO Operations Agent on
+> Telegram**, and it will only issue one to someone a cohort has already admitted. Going to Telegram
+> first, without being admitted, produces a refusal that reads like a fault and is not one.
+>
+> **The order that works:**
+>
+> 1. Join the waitlist — **https://cello.mygentic.ai/waitlist**
+> 2. Wait to be admitted to a cohort. You will be notified.
+> 3. *Then* collect your token from the operations agent on Telegram.
+>
+> Steps 1 and 2 of this setup — installing the daemon and creating the agent — need no token and no
+> permission, so do them now regardless. The identity is local until registration publishes it.
+
 ```bash
 cello register-agent alice CELLO-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 ```

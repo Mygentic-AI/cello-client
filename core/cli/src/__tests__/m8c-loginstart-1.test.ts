@@ -110,7 +110,15 @@ describe("M8C-LOGINSTART-1 CORE: autoStartAllAgents", () => {
     const s = formatLoginSummary({ started: ["alice"], failed: [{ name: "bob", reason: "boom" }] });
     expect(s).toContain("Started 1 agent(s): alice.");
     expect(s).toContain("bob (boom)"); // the enumeration the operator sees
-    expect(formatLoginSummary({ started: [], failed: [] })).toContain("No registered agents");
+    // The empty case now carries the onboarding affordance rather than "No registered agents to
+    // start." — which named no command, no token and, most expensively, not the cohort gate. This
+    // asserts the DECISION (that a new operator is told where to start), not the prose; the wording
+    // itself is pinned in core/daemon's onboarding-guidance tests, which is where an edit to it
+    // belongs.
+    const empty = formatLoginSummary({ started: [], failed: [] });
+    expect(empty).toContain("No agents on this machine");
+    expect(empty).toContain("cello create-agent");
+    expect(empty).toMatch(/cohort/i);
   });
 
   // F2 (reviewer): the login() boundary — exit 0 with the summary appended, against a REAL in-process

@@ -353,6 +353,35 @@ describe("daemon", () => {
     }
   });
 
+  it("an EMPTY roster carries the onboarding guidance over the wire, not just an empty list", async () => {
+    /**
+     * The shim cannot import this text. `connect` depends on NO @cello-protocol package — it is a
+     * 233 KB socket proxy, and giving it the 7.8 MB daemon would put a native SQLCipher build on
+     * every session start. So an operator who only ever uses Claude Code learns about the cohort
+     * gate from THIS field or not at all, and "not at all" is what shipped until now: they would
+     * see `{"agents":[]}`, go ask the Telegram operations agent for a registration token, and be
+     * refused because tokens only exist for someone a cohort has already admitted.
+     *
+     * A fresh daemon in a temp dir has zero agents, which is exactly the new-machine case.
+     */
+    const config = makeConfig();
+    handle = await startDaemon(config);
+    const client = await connectToDaemon(config.socketPath);
+    await client.send("ipc.connect", { clientType: "mcp" });
+
+    const res = (await client.send("cello_list_agents", {})) as {
+      agents?: unknown[];
+      onboarding?: string;
+    };
+    client.close();
+
+    expect(res.agents, "precondition: a fresh daemon has no agents").toEqual([]);
+    expect(res.onboarding, "the empty list must arrive WITH words explaining it").toBeTypeOf("string");
+    expect(res.onboarding).toMatch(/cohort/i);
+    expect(res.onboarding).toContain("cello create-agent");
+    expect(res.onboarding).toContain("https://cello.mygentic.ai/waitlist");
+  });
+
   it("DOD-M15-IPCVISIBLE-1: the disconnect line carries WHO was attending, in ONE line", async () => {
     /**
      * Neither half of this had a test — review, and both failed the revert test: deleting the
