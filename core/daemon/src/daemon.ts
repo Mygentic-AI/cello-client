@@ -50,7 +50,7 @@ import {
   classifyRosterReading,
   describeRosterFreshness
   } from "./roster-freshness.js";
-import { SessionNodeManager, REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS } from "./session-node-manager.js";
+import { SessionNodeManager } from "./session-node-manager.js";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
 import { NotificationDispatcher } from "./notification-dispatcher.js";
@@ -84,6 +84,7 @@ import { startBootCore } from "./boot-core.js";
 import { startBootAgents } from "./boot-agents.js";
 import { startBootConnectionState } from "./boot-connection-state.js";
 import { startBootParkedContent } from "./boot-parked-content.js";
+import { startBootSweeps } from "./boot-sweeps.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
@@ -2358,49 +2359,8 @@ async function startDaemonHoldingLock(
   });
   restartSealResolver.start();
 
-  /**
-   * DOD-M12B-REVIVAL-BOUND-1 — close the interrupted sessions the revival window has expired.
-   *
-   * Runs at boot beside the restart-seal resolver, and is its complement: the resolver takes the
-   * sessions we can describe truthfully (`interrupted_by = 'local'`) and gets them a receipt; this
-   * takes everything else and shuts the door without asserting a cause.
-   *
-   * It must run even though nothing has revived a session yet — the reason is Andre's 2026-08-18
-   * tenet, *"leave nothing open that is no longer needed."* `ingestReceivedContent` accepts content
-   * into an `interrupted` session by design, so a session that can never be revived is a write
-   * surface a reprogrammed peer can use for as long as the row exists. Boot is where the store is
-   * swept for exactly that.
-   *
-   * NOT AWAITED, and caught: this is a best-effort sweep over rows that have already waited a day.
-   * Blocking the daemon's startup on a directory-free DB walk buys nothing, and a throw here would
-   * take down a daemon that is otherwise healthy.
-   */
-  const runRevivalBoundSweep = (): void => {
-    void sessionNodeManager
-      .closeExpiredUnrevivableSessions(Date.now(), REVIVAL_WINDOW_MS)
-      .catch((err: unknown) => {
-        logger.warn("session.revival_bound.sweep.failed", {
-          error: err instanceof Error ? err.message : String(err),
-          impact: "expired sessions were not closed this pass and still accept content",
-        });
-      });
-  };
-  runRevivalBoundSweep();
-
-  /**
-   * RE-ARMED, because boot alone is not a bound.
-   *
-   * A session interrupted at 09:00 on a daemon that stays up all week would otherwise be writable
-   * for the whole week — and a long-lived daemon is the normal case, not the exception. Boot-only
-   * would have made the control fire exactly when it is least needed (a machine that restarts often
-   * is a machine whose sessions get swept often) and never when it is most needed.
-   *
-   * Hourly against a 24-hour window: the overshoot is at most an hour on a bound measured in days,
-   * and the pass is a single indexed DB walk with no network in it. `unref` so a pending timer
-   * never holds the process open, matching `reconcileSweepTimer` beside it.
-   */
-  const revivalBoundSweepTimer = setInterval(runRevivalBoundSweep, REVIVAL_BOUND_SWEEP_MS);
-  revivalBoundSweepTimer.unref?.();
+  // 040-DAEMONROOT unit 9: the revival-bound sweep and its re-arming timer → boot-sweeps.ts.
+  const { revivalBoundSweepTimer } = startBootSweeps({ logger, sessionNodeManager });
 
   /**
    * The live handler map.
