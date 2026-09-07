@@ -148,15 +148,16 @@ export default [
     rules: { "max-lines": ["error", { max: 3392, skipBlankLines: false, skipComments: false }] },
   },
   {
-    // 040-DAEMONROOT: 6,080 → 5,120 at unit 1, 4892 at unit 2 (the trust-signal surface left). Lower this with
-    // every unit; the target is under 1,000 and the ratchet is what stops the ground being given
-    // back between them.
+    // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
+    // ground being given back between units. 6,080 → 5,120 (unit 1, the trust-signal surface) →
+    // 4,891 (unit 2, the test-support verbs). EXACT, never with slack: a ratchet with give is a
+    // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 4892, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 4891, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/test-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 324, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 331, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/signal-handlers.ts"],

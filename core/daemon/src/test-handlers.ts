@@ -4,9 +4,12 @@
  * Two groups with different guards, and the difference is why this file has a header. The seven
  * `__test_*` verbs sit inside `CELLO_ENV === "test"` and cannot be reached in production. The six
  * above them — `queue_failed_send`, `debug_inject_park_fault`, `enqueue_awaiting_content`,
- * `mark_content_acked`, `check_nonce`, `drain_session` — are NOT gated, and three of them mutate
- * session state. Their only callers are tests (measured: nothing in the CLI, nothing in the MCP
- * shim), so a production daemon answers six verbs nobody outside a test has a use for.
+ * `mark_content_acked`, `check_nonce`, `drain_session` — are NOT gated, and FOUR of them write state.
+ * `check_nonce` is the one to notice: it does not merely read, it `checkAndAdd`s, which INSERTs into
+ * `session_seen_nonces` and survives a restart — so pre-registering a nonce makes the real message
+ * carrying it arrive and be discarded as a duplicate, logged at debug and nowhere else. Their only
+ * callers are tests (measured: nothing in the CLI, nothing in the MCP shim), so a production daemon
+ * answers six verbs nobody outside a test has a use for.
  *
  * ⚠️ THE ASYMMETRY IS RECORDED, NOT FIXED HERE. Gating them changes behaviour and this is a movement
  * order; the guard structure moved exactly as it was. It is written into the order's *Newly
@@ -15,7 +18,12 @@
  *
  * ⚠️ TWO PRODUCTION REGISTRATIONS DID NOT COME WITH IT. `contentPark.registerHandlers(handlers)` and
  * `registerInboundSessionHandlers(handlers)` sit between the two groups in the original file and are
- * real surfaces. They stay in the composition root; only the test verbs on either side moved.
+ * real surfaces. They stay in the composition root; only the test verbs on either side moved. That
+ * DOES change registration order — those two now run after all thirteen instead of between them —
+ * and it is inert: dispatch resolves against the live map on each request rather than snapshotting
+ * it, the IPC server is not created until every registration has run, and none of these verb names
+ * collides. Written down because "do not reorder registration" is a rule of this order, and the
+ * next reader deserves the measurement rather than the worry.
  */
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";

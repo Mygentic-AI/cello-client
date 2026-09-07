@@ -718,5 +718,4 @@ export function registerSessionReadHandlers(deps: SessionReadDeps): void {
     );
   });
 
-  // DAEMON-003 IPC handlers: queue_failed_send and check_nonce (AC-010)
 }
