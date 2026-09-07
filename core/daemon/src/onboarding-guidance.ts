@@ -32,7 +32,14 @@
  * machine — which is also true on a second laptop, after a reset, and after an ecosystem wipe.
  *
  * So the happy path leads and the gate is a CONDITION underneath it, phrased as a question so a
- * reader who is past it skips the paragraph instead of re-reading it.
+ * reader who is past it skips it instead of re-reading it.
+ *
+ * ─── Why the gate is bullets and not a paragraph ─────────────────────────────────────────────
+ * It was a prose block, and it dropped out of scanning mode exactly where the reader is still
+ * scanning. Both halves are now lists — numbered steps, then bulleted steps — so the whole
+ * message reads as one shape rather than switching from instructions to explanation halfway
+ * down. The bullets are ACTIONS for the same reason: at that point the reader's question is
+ * "what do I do", not "what is this thing".
  *
  * ─── Why the handle is DERIVED and not a constant ────────────────────────────────────────────
  * There are two bots — production and staging — and a hardcoded handle sends a staging operator
@@ -84,8 +91,10 @@ export function noAgentsGuidance(celloEnv?: string): string {
     "\n" +
     "That's it — your agent is live and reachable.\n" +
     "\n" +
-    "First time with the bot? It asks for your waitlist token before it issues\n" +
-    "anything. That comes from being admitted to a launch cohort — start at\n" +
-    `${WAITLIST_URL}. You present it once; after that the bot knows you.`
+    "First time with the bot? It asks for a waitlist token first. To get one:\n" +
+    "\n" +
+    `  - Join the waitlist: ${WAITLIST_URL}\n` +
+    "  - Wait to be admitted to a launch cohort — you'll be notified\n" +
+    "  - Give the bot that token once. It is burned on use and never asked for again"
   );
 }
