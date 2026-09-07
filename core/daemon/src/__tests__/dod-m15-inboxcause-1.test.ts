@@ -1,0 +1,511 @@
+/**
+ * DOD-M15-INBOXCAUSE-1 / `041-PARKSTUCK` Unit 2 — the park drain's refusals reach a PERSON.
+ *
+ * ─── The failure, measured on Andre's own daemon 2026-09-07 ────────────────────────────────────
+ *
+ * One parked message on session `dcec3c3f…` was pulled, verified and refused 731 times over 64
+ * hours. What the operator could see was a count and the reason `session_committed`, plus *"Nothing
+ * is wrong on your side. There is nothing to repair here."* Both true, and neither about the loop:
+ * `session_committed` is where the message was turned away ON ARRIVAL; `annex_salt_unavailable` is
+ * why it never LEAVES the mailbox. The second one existed — with an `impact` and a `guidance`
+ * written for a person — at ERROR, in `daemon.log`, addressed to nobody.
+ *
+ * That is error substitution in the one place there is no upstream to chase. Everywhere else in
+ * this system naming the exit point instead of the cause costs an engineer an hour of tracing;
+ * pointed at an operator it is a dead end, because `daemon.log` is not an operator affordance. The
+ * diagnosis had to be done by a coding agent grepping a log file, which is the whole reason this
+ * unit exists.
+ *
+ * Three properties, and the third is the one that bites.
+ */
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { mkdtemp, rm, mkdir } from "node:fs/promises";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { PassthroughGatewayClient } from "@cello-protocol/gateway/testing";
+import { startDaemon, type DaemonHandle } from "../daemon.js";
+import { connectToDaemon, type IpcClient } from "../ipc-client.js";
+import { FileKeyProvider } from "@cello-protocol/crypto";
+import {
+  PARK_REFUSAL_REASONS,
+  PARK_REFUSAL_NOTICE,
+  TERMINAL_SESSION_STATUSES,
+  refusalRecurrence,
+  type ParkRefusalReason,
+} from "../park-refusals.js";
+import type { Logger, DaemonConfig } from "../types.js";
+
+const SRC = join(dirname(fileURLToPath(import.meta.url)), "..");
+const ALL_PARK_REASONS = Object.values(PARK_REFUSAL_REASONS) as ParkRefusalReason[];
+
+/**
+ * ⚠️ **EVERY DAEMON SOURCE FILE, GLOBBED — never a hand-typed list.**
+ *
+ * `DOD-M15-GUARD-HEARD-1` records why in its own words: a loop over a maintained list gets SHORTER
+ * when someone forgets an entry, never red, and three separate guards in this suite went blind that
+ * way during the 036/037 god-file split. A glob cannot shrink, and the next file to refuse a parked
+ * message is scanned the day it is written.
+ */
+function daemonSources(): string {
+  return readdirSync(SRC)
+    /**
+     * ⚠️ **`park-refusals.ts` IS EXCLUDED, AND WITHOUT THAT THIS SCAN CANNOT FAIL.**
+     *
+     * `PARK_REFUSAL_NOTICE` keys its total map on `[PARK_REFUSAL_REASONS.<MEMBER>]`, so every
+     * reason references itself inside the very file that DECLARES it — and because the map is
+     * typed total, a new reason must appear there. The emission check below therefore found a
+     * reference for every reason no matter what any refusal site did, and reported coverage that
+     * had never been earned. A false CAUGHT, which is the worse half of the pair: a false green
+     * leaves the suspicion alive, a false caught retires it.
+     *
+     * ⚠️ **AND THIS EXCLUSION WAS WRITTEN ONCE ALREADY AND LOST BEFORE IT WAS COMMITTED.** The
+     * mutation loop that found the defect restores mutated paths with `git checkout --`, which
+     * reads the INDEX — and this file's fix was not yet staged, so a later mutant's cleanup
+     * silently reverted it while the commit message went on claiming it. That is the lost-work
+     * shape M15-PROCEDURE §2 rule 1 exists for: commit the fix BEFORE the loop exists. Recorded
+     * here rather than in the journal alone because the next person to add a mutation loop to this
+     * file is the one who needs it.
+     *
+     * The declaring file is not an emitter. Only the files that REFUSE are scanned.
+     */
+    .filter((f) => f.endsWith(".ts") && f !== "park-refusals.ts")
+    .map((f) =>
+      // Comments do not emit. A commented-out reference would otherwise satisfy the scan while the
+      // real emission was replaced by a bare literal.
+      readFileSync(join(SRC, f), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, ""),
+    )
+    .join("\n");
+}
+
+describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none is a bare literal", () => {
+  it("the scan can SEE — a positive control before any negative is believed", () => {
+    /**
+     * An empty search result is evidence only if the search was shown capable of finding something.
+     * Without this, a broken `SRC` path or a filter that matches nothing makes every assertion
+     * below pass by finding no violations in no files.
+     */
+    const sources = daemonSources();
+    expect(sources.length, "the daemon source glob read nothing at all").toBeGreaterThan(10_000);
+    expect(
+      /PARK_REFUSAL_REASONS\./.test(sources),
+      "no daemon source references PARK_REFUSAL_REASONS — the emitter scan is matching nothing, so " +
+        "everything it proves below is vacuous",
+    ).toBe(true);
+  });
+
+  it("EVERY declared park reason is actually emitted by a refusal site", () => {
+    // The direction that rots quietly: a reason nobody emits is dead weight that still reads as
+    // coverage, and the inbox tests below would happily prove that an unreachable reason surfaces
+    // beautifully.
+    const sources = daemonSources();
+    const memberFor: Record<string, string> = Object.fromEntries(
+      Object.entries(PARK_REFUSAL_REASONS).map(([member, value]) => [value, member]),
+    );
+    const unemitted = ALL_PARK_REASONS.filter((v) => !sources.includes(`PARK_REFUSAL_REASONS.${memberFor[v]}`));
+    expect(
+      unemitted,
+      `Declared, given a notice, and emitted by nothing: ${unemitted.join(", ")}. Either wire the ` +
+        `refusal or delete the reason — a reason with guidance and no emitter reads as a control ` +
+        `that exists.`,
+    ).toEqual([]);
+  });
+
+  it("no daemon source writes a park reason as a bare string literal", () => {
+    /**
+     * The park drain used to push free-form strings into its refusal list, so a renamed reason
+     * would miss the notice lookup in silence and the operator would be back to a bare code — the
+     * exact defect the notice table exists to end, reintroduced by a typo with every test green.
+     *
+     * `park-refusals.ts` is excluded because it is where the values are DECLARED.
+     */
+    const offenders: string[] = [];
+    for (const file of readdirSync(SRC).filter((f) => f.endsWith(".ts") && f !== "park-refusals.ts")) {
+      const text = readFileSync(join(SRC, file), "utf8")
+        .replace(/\/\*[\s\S]*?\*\//g, "")
+        .replace(/^\s*\/\/.*$/gm, "");
+      for (const value of ALL_PARK_REASONS) {
+        if (text.includes(`"${value}"`)) offenders.push(`${file}: "${value}"`);
+      }
+    }
+    expect(
+      offenders,
+      `These write a park refusal reason as a literal: ${offenders.join(", ")}. Use ` +
+        `PARK_REFUSAL_REASONS.<MEMBER> so a rename is a compile error rather than a silently missed ` +
+        `notice lookup.`,
+    ).toEqual([]);
+  });
+
+  it("★ no park reason enters the refusal list without the operator being told — structurally", () => {
+    /**
+     * Review H3, second half. The emission scan above asks only whether a reason NAME appears in a
+     * source file, and a bare `refusals.push({ reason })` satisfies that on its own — so a branch
+     * that reported a refusal to its IPC caller and told the operator NOTHING would pass it. That
+     * is the very defect this unit exists to remove, reachable one branch over.
+     *
+     * `noteParkRefusal` now writes the notice AND returns the record, so the pairing is structural.
+     * This asserts the structure holds: nothing may build a refusal record carrying a park reason
+     * except that helper.
+     */
+    const text = readFileSync(join(SRC, "content-park.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    // Positive control: the pushes this is reasoning about must actually be in the file.
+    expect(
+      (text.match(/refusals\.push\(/g) ?? []).length,
+      "no refusals.push( in content-park.ts — this check is reasoning about code that is not there",
+    ).toBeGreaterThan(0);
+
+    /**
+     * ⚠️ **INVERTED, because the first version missed the shape it was written for — verification
+     * NEW-4.** It flagged a push only when the push TEXT contained a reason string or the constant
+     * prefix, so a push carrying the reason in a VARIABLE sailed through — and a variable is exactly
+     * what the code did before this fix (`reason: stuckReason`), and the likeliest shape for a new
+     * branch. The claim in the test name was stronger than what it checked, and none of the mutants
+     * exercised its negative path: a checker that has never been made to fail is indistinguishable
+     * from one that cannot.
+     *
+     * So it asserts the WHOLE-LIST property instead of hunting for known-bad text. Every push must
+     * either hand over `noteParkRefusal(`'s return value, or be the one passthrough that carries
+     * ingest's own reason — which has its own operator surface in `session-content-ingest.ts` and
+     * is not a park reason at all.
+     */
+    const pushes = text.match(/refusals\.push\(\s*[\s\S]{0,160}?\)/g) ?? [];
+    const offenders = pushes.filter(
+      (push) => !push.includes("noteParkRefusal(") && !push.includes("ingest.reason"),
+    );
+    expect(
+      offenders,
+      `A refusal record reaches the drain's list without going through noteParkRefusal, so the IPC ` +
+        `caller is told and the OPERATOR is not: ${offenders.join(" | ")}. Push the helper's return ` +
+        `value — it writes the notice first, which is what makes the pairing impossible to forget.`,
+    ).toEqual([]);
+  });
+
+  it("every park reason has a notice with all three parts filled in", () => {
+    // The map is typed total, so this cannot drift — but the test tsconfig is separate, and a
+    // runtime check survives someone widening the type to make an error go away.
+    for (const reason of ALL_PARK_REASONS) {
+      const notice = PARK_REFUSAL_NOTICE[reason]({
+        sessionStatus: "abandoned", released: false, declaredAlg: "sha256", saltReason: "none", errorDetail: null,
+      });
+      expect(notice.kind, `${reason} has no kind`).toBeTruthy();
+      expect(notice.impact.length, `${reason} has no impact`).toBeGreaterThan(40);
+      expect(notice.guidance.length, `${reason} has no guidance`).toBeGreaterThan(40);
+    }
+  });
+
+  it("★ NO notice tells an operator to close a conversation that is already closed", () => {
+    /**
+     * Property 3, and the one that bites. The log's remedy for this loop was *"This message will
+     * keep being re-pulled and re-refused until the session is closed, so close it and start a new
+     * one"* — printed 731 times about a session closed three days earlier, where closing it is what
+     * made the refusal permanent.
+     *
+     * A remedy whose action the reader has already taken is worse than none: it spends the trust
+     * they would have brought to the next notice. The notice knows the status; it must use it.
+     */
+    /**
+     * ⚠️ **WIDENED BY VERIFICATION NEW-1, WHICH THIS REGEX WALKED PAST.** It iterated exactly the
+     * right combinations and grepped only the "close it" family — so when the release gate gained
+     * two conditions, two new paths into the non-released guidance started telling operators to
+     * *"be online at the same time as your counterparty"* on a `sealed` conversation, and *"if it
+     * never reopens"* about one that cannot. Naming an action the reader cannot perform is the same
+     * defect as naming one they already took; the enforcer was only looking for one wording of it.
+     */
+    const forbidden =
+      /close (it|this|the) (session|conversation)|start a new one|cello_close_session|being online at the same time|if it never reopens|staying connected/i;
+    for (const status of TERMINAL_SESSION_STATUSES) {
+      for (const reason of ALL_PARK_REASONS) {
+        for (const released of [true, false]) {
+          const { guidance } = PARK_REFUSAL_NOTICE[reason]({
+            sessionStatus: status, released, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+          });
+          expect(
+            forbidden.test(guidance),
+            `${reason} tells an operator to close a session that is already "${status}": ${guidance}`,
+          ).toBe(false);
+        }
+      }
+    }
+  });
+});
+
+describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence", () => {
+  it("★ 731 refusals over 64 hours reads as one recurring refusal every 5 minutes", () => {
+    // The exact figures from the live daemon. `731` beside nothing is read as 731 things going
+    // wrong; the row already held the span that says otherwise and nothing divided by it.
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
+    expect(r).toContain("731 TIMES");
+    expect(r).toContain("about once every 5 minutes");
+    expect(r).toContain("3 days");
+    expect(r, "and it must say the count is one refusal recurring").toContain("ONE recurring refusal");
+  });
+
+  it("★ a SEEDED row is reported as a FLOOR, never as a figure", () => {
+    /**
+     * Review M5. A row seeded at upgrade takes its total from a notice's `count`, which resets on
+     * dismissal — so both the count and the span are lower bounds. The drain reports such a row as
+     * `times_total_at_least` five lines from where this sentence is built, and the first version
+     * asserted the same number as an exact figure right beside it.
+     *
+     * On the daemon this unit was written for the row IS seeded: the inbox reported
+     * `times_total_at_least: 731`.
+     */
+    const seeded = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
+    expect(seeded).toContain("AT LEAST 731 TIMES");
+    expect(seeded, "and it must say why the figure is a floor").toContain("may be far higher");
+
+    const exact = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
+    expect(exact, "an unseeded row is an exact count and must not hedge").not.toContain("AT LEAST");
+    expect(exact).not.toContain("may be far higher");
+  });
+
+  it("★ it does not claim the refusals are one message, nor that the loop will continue", () => {
+    /**
+     * Review M6, two claims the row cannot support.
+     *
+     * This function serves EVERY reason in the drain. A counterparty who keeps writing into a
+     * closed conversation produces N genuinely separate `session_committed` refusals, and the first
+     * version told the operator they were "NOT N SEPARATE EVENTS" — beside guidance saying the
+     * sender "may not realise it ended". Its own doc comment already said a reason can fire for
+     * several messages.
+     *
+     * And notices are durable and re-drained for every new consumer, so "it will keep firing until
+     * the cause is dealt with" prints long after a cause is resolved — including on the released
+     * message whose impact in the SAME row says it is gone and will stop being reported.
+     */
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
+    expect(r, "a reason can fire for several different messages — the row cannot tell them apart").not.toContain("SEPARATE EVENTS");
+    expect(r, "a durable notice must not promise the future").not.toContain("will keep firing");
+  });
+
+  it("claims nothing it cannot support", () => {
+    /**
+     * Two points are not a cadence, and a zero span would print an interval that is an artifact of
+     * the clock rather than of the behaviour. Absent is the honest answer for both — the same rule
+     * `timesTotal` follows when there is no durable row.
+     */
+    expect(refusalRecurrence(2, 0, 60_000, false), "two refusals cannot establish a rate").toBeNull();
+    expect(refusalRecurrence(50, 1000, 1000, false), "a zero span divides into nonsense").toBeNull();
+    expect(refusalRecurrence(50, 2000, 1000, false), "a negative span is a broken row, not a fast loop").toBeNull();
+  });
+});
+
+/**
+ * ─── The path to `cello_inbox`, driven through a REAL daemon ─────────────────────────────────────
+ *
+ * The two describes above prove the reasons exist and are emitted. This one proves the last hop:
+ * a reason recorded by the drain is READ BACK by the door `cello_check_notifications` uses. Without
+ * it, everything above could hold while the notice sat in a store nothing opens — which is the
+ * shape of the defect this whole unit is about.
+ */
+describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_inbox", () => {
+  let tempDir: string;
+  let handle: DaemonHandle | null;
+  let clients: IpcClient[];
+  let logger: Logger;
+
+  beforeEach(async () => {
+    process.env["CELLO_ENV"] = "test";
+    tempDir = await mkdtemp(join(tmpdir(), "cello-inboxcause-"));
+    const noop = (): void => {};
+    logger = { debug: noop, info: noop, warn: noop, error: noop };
+    handle = null;
+    clients = [];
+  });
+
+  afterEach(async () => {
+    for (const c of clients) { try { c.close(); } catch { /* closed */ } }
+    if (handle) { try { await handle.stop("test_cleanup"); } catch { /* stopped */ } }
+    await rm(tempDir, { recursive: true, force: true });
+    delete process.env["CELLO_ENV"];
+  });
+
+  async function boot(): Promise<DaemonHandle> {
+    await mkdir(join(tempDir, "agents", "alice"), { recursive: true });
+    await FileKeyProvider.load(join(tempDir, "agents", "alice", "key"));
+    const config: DaemonConfig = {
+      securityGateway: new PassthroughGatewayClient(),
+      celloDir: tempDir,
+      socketPath: join(tempDir, "daemon.sock"),
+      lockFilePath: join(tempDir, "daemon.lock"),
+      maxConnections: 16,
+      version: "0.0.1-test",
+      logger,
+    };
+    handle = await startDaemon(config);
+    return handle;
+  }
+
+  async function connect(): Promise<IpcClient> {
+    const client = await connectToDaemon(join(tempDir, "daemon.sock"));
+    clients.push(client);
+    await client.send("ipc.connect", { clientType: "mcp" });
+    return client;
+  }
+
+  /**
+   * A real `sessions` row, so `cello_receive` reaches its catch-up exit instead of refusing
+   * `session_not_found`. DOD-AGENT-ID-JOINKEY-1: keyed by the STABLE `agent_id`, never `agent_name`.
+   */
+  function insertSessionRow(sessionId: string, status = "abandoned"): void {
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const row = db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get("alice") as { agent_id: string } | undefined;
+    if (!row) throw new Error("test fixture bug: agent 'alice' has no 'agents' row yet");
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
+    ).run(sessionId, row.agent_id, "bb".repeat(32), status, now, now);
+  }
+
+  type Refusal = {
+    session_id: string; reason: string; kind: string; impact: string; guidance: string;
+    times_since_dismissed: number; times_total?: number; recurrence?: string;
+  };
+
+  async function inboxRefusals(client: IpcClient): Promise<Refusal[]> {
+    await client.send("cello_use_agent", { name: "alice" });
+    const res = (await client.send("cello_check_notifications", {})) as {
+      agents: Array<{ refusals?: Refusal[] }>;
+    };
+    return res.agents[0]?.refusals ?? [];
+  }
+
+  it("★ EVERY declared park reason comes back out of cello_check_notifications", async () => {
+    await boot();
+    const mgr = handle!.getSessionNodeManager();
+    // One session per reason, so the notice store's (session, reason) key cannot hide one behind
+    // another and every reason has to survive the read on its own.
+    ALL_PARK_REASONS.forEach((reason, i) => {
+      mgr.noteContentRefusal(
+        "alice",
+        `${i.toString(16).padStart(2, "0")}`.repeat(16),
+        reason,
+        PARK_REFUSAL_NOTICE[reason]({
+          sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+        }),
+      );
+    });
+
+    const seen = await inboxRefusals(await connect());
+
+    const missing = ALL_PARK_REASONS.filter((r) => !seen.some((s) => s.reason === r));
+    expect(
+      missing,
+      `Recorded by the drain and NOT readable from cello_inbox: ${missing.join(", ")}. A refusal ` +
+        `whose only consumer is the daemon log is not a control — nothing in the running system ` +
+        `changes behaviour on it, and the operator concludes their counterparty went quiet.`,
+    ).toEqual([]);
+    for (const row of seen) {
+      expect(row.impact, `${row.reason} arrived with no impact`).toBeTruthy();
+      expect(row.guidance, `${row.reason} arrived with no guidance`).toBeTruthy();
+    }
+  });
+
+  it("★ the annex cause and the ingest exit point arrive SIDE BY SIDE, not one instead of the other", async () => {
+    /**
+     * The live defect exactly: the operator had `session_committed` and nothing else. Both belong
+     * — one says the conversation is closed, the other says why the message cannot leave — and the
+     * notice store keys on (session, reason) precisely so the second does not overwrite the first.
+     */
+    await boot();
+    const mgr = handle!.getSessionNodeManager();
+    const sid = "dc".repeat(16);
+    mgr.noteContentRefusal("alice", sid, "session_committed", {
+      kind: "refused", impact: "the conversation is closed", guidance: "there is nothing to repair here",
+    });
+    mgr.noteContentRefusal("alice", sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE,
+      PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
+        sessionStatus: "abandoned", released: true, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+      }));
+
+    const seen = (await inboxRefusals(await connect())).filter((r) => r.session_id === sid);
+
+    expect(seen.map((r) => r.reason).sort()).toEqual(["annex_salt_unavailable", "session_committed"]);
+  });
+
+  it("★ the cadence reaches the OTHER door too — cello_receive, not just the inbox", async () => {
+    /**
+     * Review M8. Two doors surface refusals and only one was asserted, so the `cello_receive` line
+     * could be deleted with the full suite green — the two-writers-one-assertion shape
+     * M15-PROCEDURE's NAME THE WRITER box was written for. The module's own comment says "the
+     * counts need their sentence at BOTH doors" and nothing held it.
+     *
+     * Driven through the real IPC handler, because what is under test is the door's own mapping:
+     * `refusalsField` maps rather than spreads, so a field can be silently dropped there while the
+     * store returns it perfectly.
+     */
+    await boot();
+    const mgr = handle!.getSessionNodeManager();
+    const sid = "cd".repeat(16);
+    insertSessionRow(sid);
+    const notice = PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
+      sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+    });
+    for (let i = 0; i < 3; i++) mgr.noteContentRefusal("alice", sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE, notice);
+    const db = mgr.getDb()!;
+    const now = Date.now();
+    db.prepare(
+      "UPDATE content_refusal_totals SET first_at = ?, last_at = ? WHERE session_id = ? AND reason = ?",
+    ).run(now - 10 * 60_000, now, sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE);
+
+    const client = await connect();
+    await client.send("cello_use_agent", { name: "alice" });
+    /**
+     * `since_seq: -1`, and the value is chosen from the PREDICATE rather than from intent. The
+     * catch-up batch is the exit that carries `refusalsField`, and it is entered only when
+     * `since_seq` is present — `-1` is the value the handler's own comment names for "everything",
+     * where `0` would mean "after the genesis leaf" and take a different path through the batch.
+     */
+    const res = (await client.send("cello_receive", { session_id: sid, since_seq: -1 })) as {
+      refusals?: Array<{ reason: string; recurrence?: string }>;
+    };
+
+    const row = (res.refusals ?? []).find((r) => r.reason === "annex_salt_unavailable");
+    expect(row, "cello_receive surfaces refusals and must carry the same fields the inbox does").toBeDefined();
+    expect(
+      row!.recurrence,
+      "the cadence is dropped at this door — an operator reading here sees a count with nothing " +
+        "saying it is one refusal recurring, which is the misreading this field exists to end",
+    ).toContain("about once every 5 minutes");
+  });
+
+  it("★ a repeated refusal arrives labelled as a LOOP with its cadence", async () => {
+    /**
+     * Driven through the real notice store rather than the pure function, because the cadence is
+     * computed from the lifetime totals row and a function tested alone proves nothing about
+     * whether the door reads that row.
+     */
+    await boot();
+    const mgr = handle!.getSessionNodeManager();
+    const sid = "ab".repeat(16);
+    const notice = PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
+      sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+    });
+    // Three real refusals five minutes apart, written the way the drain writes them, then the
+    // totals row's span widened to the one measured in production. The COUNT stays what the store
+    // actually recorded — inventing a total is the misreading DOD-M15-REFUSALTERMINAL-1 removed.
+    for (let i = 0; i < 3; i++) mgr.noteContentRefusal("alice", sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE, notice);
+    const db = mgr.getDb()!;
+    const now = Date.now();
+    db.prepare(
+      "UPDATE content_refusal_totals SET first_at = ?, last_at = ? WHERE session_id = ? AND reason = ?",
+    ).run(now - 10 * 60_000, now, sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE);
+
+    const row = (await inboxRefusals(await connect())).find((r) => r.session_id === sid)!;
+
+    expect(row.times_total, "three refusals were recorded, so three is what is reported").toBe(3);
+    expect(row.recurrence, "a count with no cadence beside it is read as that many separate problems").toBeTruthy();
+    expect(row.recurrence).toContain("about once every 5 minutes");
+    expect(row.recurrence).toContain("3 TIMES");
+    expect(
+      row.recurrence,
+      "this row was written by three real refusals, not seeded at upgrade, so the count is exact",
+    ).not.toContain("AT LEAST");
+  });
+});

@@ -30,6 +30,12 @@ import type { ParkDialFailure } from "./content-park-client.js";
 import { extractErrorMessage } from "./error-message.js";
 import { decodeParkEnvelope, sealParkEnvelope } from "./park-envelope.js";
 import { contentHashFor, resolveContentHashAlg, isKnownContentHashAlg, CONTENT_HASH_ALGS } from "./wire-content-hash.js";
+import {
+  PARK_REFUSAL_REASONS,
+  PARK_REFUSAL_NOTICE,
+  TERMINAL_SESSION_STATUSES,
+  type ParkRefusalReason,
+} from "./park-refusals.js";
 
 export interface ContentParkDeps {
   logger: Logger;
@@ -54,6 +60,48 @@ export interface ContentParkDeps {
 export function createContentPark(deps: ContentParkDeps) {
   const { logger, sessionNodeManager, agents, getKeyProvider, securityGateway } = deps;
   const newParkClient = deps.makeContentParkClient ?? ((o) => new ContentParkClient(o));
+
+  /**
+   * `041-PARKSTUCK` Unit 2 — **THE PARK DRAIN'S REFUSALS REACH A PERSON.**
+   *
+   * Every branch below already wrote a `reason`, an `impact` and a `guidance`, at ERROR, addressed
+   * to nobody: the drain runs unattended, its return value goes to an IPC caller that in production
+   * is `autoRecoverForAgent`, and that only tallies counts into a log line. So the operator's whole
+   * account of a message that never leaves the mailbox was the INGEST reason recorded one layer up
+   * — `session_committed`, which is where the message was turned away on arrival, not why it is
+   * stuck. Naming the exit point instead of the cause is the substitution this project's debugging
+   * discipline is written against, and pointed at an operator it is a dead end: there is no next
+   * hop, and `daemon.log` is not an affordance.
+   *
+   * ⚠️ **BOTH REASONS REACH THE INBOX, and neither replaces the other.** They answer different
+   * questions — one says the conversation is closed, this one says why the message cannot leave —
+   * and the notice store keys on (session, reason), so they sit side by side rather than
+   * overwriting.
+   */
+  /**
+   * ⚠️ **IT RETURNS THE REFUSAL RECORD, AND THAT IS THE ENFORCEMENT — review H3, second half.**
+   *
+   * The first version only wrote the notice, and the caller pushed its own `{ reason }` object
+   * separately. So a future branch could push a reason and forget to note it, and the enforcer
+   * could not see the difference: its scan asked only whether the reason NAME appeared somewhere in
+   * the file, which a bare `refusals.push({ reason })` satisfies on its own.
+   *
+   * Constructing the record HERE makes the pairing structural rather than remembered — the only way
+   * to get a park reason into the drain's refusal list is to have already told the operator about
+   * it. `dod-m15-inboxcause-1.test.ts` then has something it can actually check.
+   */
+  function noteParkRefusal(
+    agentName: string,
+    sessionId: string,
+    contentHash: string,
+    reason: ParkRefusalReason,
+    ctx: Parameters<(typeof PARK_REFUSAL_NOTICE)[ParkRefusalReason]>[0],
+  ): { contentHash: string; sessionId: string; reason: ParkRefusalReason } {
+    // `noteContentRefusal` does not throw — a persistence failure logs and falls back to memory —
+    // so this needs no guard of its own, and adding one would hide the ERROR it already emits.
+    sessionNodeManager.noteContentRefusal(agentName, sessionId, reason, PARK_REFUSAL_NOTICE[reason](ctx));
+    return { contentHash, sessionId, reason };
+  }
 
   // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
   // ContentParkClient directly so the daemon↔relay store-and-forward transport can be
@@ -320,6 +368,16 @@ export function createContentPark(deps: ContentParkDeps) {
         // That exact confusion was injected and the test goes red on it.
         let annexed = false;
         let screenedOut = false;
+        /**
+         * Did the terminal-screen branch actually KEEP the bytes? — verification NEW-2, which is
+         * H1's defect one branch over and in the code H1 was written for.
+         *
+         * `quarantineRefusedInbound` answers `null` on the same four reachable paths, and this
+         * branch confirm-deleted the relay copy regardless while its notice said "It is KEPT as
+         * evidence" unconditionally. Declared out here rather than inside the `try` so the delete
+         * and the notice can both read it.
+         */
+        let screenRetained = false;
         let screenDeferred = false;
         /**
          * WHY the entry is stuck, for the caller — review B2a F5.
@@ -330,9 +388,45 @@ export function createContentPark(deps: ContentParkDeps) {
          * label that named none of them, and the pre-existing hash-mismatch branch — a genuine
          * tamper — was one of the four.
          */
-        let annexRefusal: string | null = null;
+        let annexRefusal: ParkRefusalReason | null = null;
+        /** The thrown message, carried into the operator's notice rather than left in the log. */
+        let annexErrorDetail: string | null = null;
+        /**
+         * `041-PARKSTUCK` — CAN THIS EVER BE CHECKED AGAIN, or is the answer fixed for the rest of
+         * time? Two different states, and only one of them is worth retrying.
+         *
+         * The status is read HERE rather than inferred from `ingest.reason`, because
+         * `session_committed` covers THREE statuses and one of them — `seal_interrupted_pending` —
+         * is documented as explicitly non-terminal. Collapsing them would release a message on a
+         * session still moving toward a notarization.
+         *
+         * `null` when the record cannot be read, and that is NOT treated as terminal: an
+         * unreadable record is "we do not know", and releasing on it would delete the only
+         * surviving copy of a message on an assumption. Fail-closed costs another drain.
+         */
+        const sessionRecord = sessionNodeManager.getSessionRecord(recipientAgent.name, e.sessionIdHex);
+        const sessionStatus = sessionRecord?.status ?? null;
+        const sessionTerminal = sessionStatus !== null && TERMINAL_SESSION_STATUSES.has(sessionStatus);
+        let saltReason: "none" | "unreadable" | null = null;
+        let declaredAlgSeen = "(absent)";
+        /**
+         * ⚠️ **WHICH STEP THREW — review M4, and without it one label spoke for four.**
+         *
+         * The `try` below opens at the decode and does not close until after the screen, the
+         * quarantine and the annex write, so a throw from ANY of them was reported as
+         * `annex_decode_failed`. This unit then promoted that label to an operator notice asserting
+         * *"a wire or version difference, not a claim about the sender"* and sending them to a log
+         * event that had not fired. It also contradicted the sibling comment below, which promises
+         * `annex_write_failed` is *"only what it says — the annex write ran and failed"*.
+         *
+         * And the mislabel is the common case, not the rare one: `decodeParkEnvelope` already
+         * succeeded on these exact bytes in `recoverParkedEntry` before ingest returned
+         * `session_committed`, so a genuine decode failure here is close to unreachable.
+         */
+        let decoded = false;
         try {
           const env = decodeParkEnvelope(unsealed);
+          decoded = true;
           /**
            * ⚠️ THE SECOND CONTENT-HASH VERIFIER — `DOD-M15-SEALWIRE-1` part B1 review F3, closed by
            * part B2a.
@@ -366,22 +460,33 @@ export function createContentPark(deps: ContentParkDeps) {
            * null salt is the DEFAULT for exactly the sessions whose content arrives this way.
            */
           const alg = resolveContentHashAlg(env.contentHashAlg);
-          const sessionSalt = alg.ok
-            ? sessionNodeManager.getSessionContentSalt(recipientAgent.name, e.sessionIdHex)
+          declaredAlgSeen = env.contentHashAlg ?? "(absent)";
+          /**
+           * `getSessionContentSaltState`, NOT `getSessionContentSalt` — `041-PARKSTUCK` Unit 2.
+           *
+           * A bare `null` answers "no salt was ever agreed" and "a salt row is here and this
+           * machine cannot read it" identically, and those send the operator to opposite places:
+           * one to the conversation, the other to their own disk. The hashing path is unchanged —
+           * this reads the same salt through the same method, and only the REASON is new.
+           */
+          const saltState = alg.ok
+            ? sessionNodeManager.getSessionContentSaltState(recipientAgent.name, e.sessionIdHex)
             : null;
+          const sessionSalt = saltState?.salt ?? null;
+          if (saltState !== null && saltState.salt === null) saltReason = saltState.reason;
           let computed: Uint8Array | null = null;
           // Discriminated BEFORE the call rather than recovered from a thrown string, so the two
           // causes are branches rather than message-matching.
-          let algFailure: null | { reason: "annex_alg_unknown" | "annex_salt_unavailable"; detail: string } = null;
+          let algFailure: null | { reason: ParkRefusalReason; detail: string } = null;
           if (!alg.ok) {
             // A name this build cannot read. NOT a hash mismatch: there is no value to compare
             // against, and reporting it as one would be a tamper claim for a version difference —
             // the same substitution `DOD-M15-SEALWIRE-1` part B1 removed on the direct path.
-            algFailure = { reason: "annex_alg_unknown", detail: `the sender named "${alg.value}"` };
+            algFailure = { reason: PARK_REFUSAL_REASONS.ANNEX_ALG_UNKNOWN, detail: `the sender named "${alg.value}"` };
           } else if (alg.alg !== CONTENT_HASH_ALGS.SHA256 && !sessionSalt) {
             algFailure = {
-              reason: "annex_salt_unavailable",
-              detail: `the sender used ${alg.alg} and this side holds no salt for the session`,
+              reason: PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE,
+              detail: `the sender used ${alg.alg} and this side holds no salt for the session (${saltReason ?? "unknown"})`,
             };
           } else {
             try {
@@ -394,34 +499,46 @@ export function createContentPark(deps: ContentParkDeps) {
             } catch (err: unknown) {
               // Unreachable given the two checks above; kept so a future algorithm that throws for a
               // third reason cannot fall through into the mismatch branch and be called a tamper.
-              algFailure = { reason: "annex_alg_unknown", detail: extractErrorMessage(err) };
+              algFailure = { reason: PARK_REFUSAL_REASONS.ANNEX_ALG_UNKNOWN, detail: extractErrorMessage(err) };
             }
           }
           if (algFailure !== null) {
             annexRefusal = algFailure.reason;
             logger.error(
-              algFailure.reason === "annex_salt_unavailable"
+              algFailure.reason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE
                 ? "content.recover.annex.salt_unavailable"
                 : "content.recover.annex.alg_unknown",
               {
                 sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
                 declaredAlg: env.contentHashAlg ?? "(absent)",
                 detail: algFailure.detail,
-                impact: "this parked message could not be CHECKED — not that it failed a check. It was not annexed and the relay copy is kept, so nothing is lost. Nothing here says the sender did anything wrong.",
-                guidance: algFailure.reason === "annex_salt_unavailable"
+                sessionStatus: sessionStatus ?? "(unreadable)",
+                impact: "this parked message could not be CHECKED — not that it failed a check. It was not annexed. Nothing here says the sender did anything wrong.",
+                guidance: algFailure.reason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE
                   // Lifted from the direct path's equivalent, because the operator needs the same
                   // answer wherever the message arrived. Deliberately does NOT promise delivery:
                   // without the salt this entry cannot be verified on any future drain either.
                   // DOD-M15-SALTSPLIT-1 review MEDIUM-3: "never completed" is now one of TWO ways to
                   // hold no salt. The discard undoes an agreement that DID complete, so an operator
                   // reading the old sentence would look for a failure that never happened.
-                  ? "This side holds no salt for the session, for one of two reasons. If session.salt.discarded is in the log, the agreement completed and this side then dropped its salt on purpose because the counterparty said it could never hold one. Otherwise the agreement never completed — look for session.salt.read.failed or session.salt.persist.failed. Either way their build is NOT the problem; do not ask them to upgrade. This message will keep being re-pulled and re-refused until the session is closed, so close it and start a new one."
+                  //
+                  // ⚠️ **THE LAST SENTENCE USED TO BE "close it and start a new one" — `041-PARKSTUCK`.**
+                  // It ran 731 times over 64 hours against a session that was ALREADY closed, and
+                  // closing it is what made the refusal permanent: the ingest side then refuses
+                  // `session_committed` on every drain. Naming an action the reader took three days
+                  // ago is worse than saying nothing. What replaces it branches on the status,
+                  // which this line has always had and never read.
+                  ? `This side holds no salt for the session, for one of two reasons. If session.salt.discarded is in the log, the agreement completed and this side then dropped its salt on purpose because the counterparty said it could never hold one. Otherwise the agreement never completed — look for session.salt.read.failed or session.salt.persist.failed. Either way their build is NOT the problem; do not ask them to upgrade. ${
+                      sessionTerminal
+                        ? `This session is "${sessionStatus}" and cannot agree a salt ever again, so this message can never be checked — the relay copy is being released so it stops being re-pulled.`
+                        : "This message stays on the relay and is re-checked on every drain; a salt is agreed while both sides are connected, so staying connected is what clears it."
+                    }`
                   : "Their CELLO build is newer than this one: ask which version they run, and upgrade. The message stays on the relay and is delivered once this daemon can read that algorithm.",
                 correlationId,
               },
             );
           } else if (Buffer.from(computed!).toString("hex") !== e.contentHashHex) {
-            annexRefusal = "annex_hash_mismatch";
+            annexRefusal = PARK_REFUSAL_REASONS.ANNEX_HASH_MISMATCH;
             logger.error("content.recover.annex.hash_mismatch", {
               sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
               // The algorithm the comparison RAN UNDER. Without it a mismatch is unfalsifiable from
@@ -471,6 +588,7 @@ export function createContentPark(deps: ContentParkDeps) {
                 env.senderPubkey ? Buffer.from(env.senderPubkey).toString("hex") : null,
                 correlationId,
               );
+              screenRetained = kept !== null;
               logger.warn("content.recover.annex.screened_out", {
                 sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
                 retained: kept !== null,
@@ -494,12 +612,20 @@ export function createContentPark(deps: ContentParkDeps) {
             }
           }
         } catch (err: unknown) {
-          annexRefusal = "annex_decode_failed";
-          logger.error("content.recover.annex.decode_failed", {
-            sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
-            impact: "envelope could not be decoded — NOT annexed, relay copy kept",
-            error: extractErrorMessage(err), correlationId,
-          });
+          annexRefusal = decoded
+            ? PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED
+            : PARK_REFUSAL_REASONS.ANNEX_DECODE_FAILED;
+          annexErrorDetail = extractErrorMessage(err);
+          logger.error(
+            decoded ? "content.recover.annex.write_failed" : "content.recover.annex.decode_failed",
+            {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+              impact: decoded
+                ? "the envelope decoded and a later step threw — screening, retention or the annex write. NOT annexed, relay copy kept."
+                : "envelope could not be decoded — NOT annexed, relay copy kept",
+              error: annexErrorDetail, correlationId,
+            },
+          );
         }
         if (annexed) {
           // Review F6: named under `content.recover.*` like its five siblings in this loop, so a
@@ -516,23 +642,182 @@ export function createContentPark(deps: ContentParkDeps) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
         } else if (screenedOut) {
-          // Terminal block: nothing to keep and nothing to store. Delete so it stops being re-pulled.
-          try {
-            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
-          } catch (err: unknown) {
-            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          /**
+           * Terminal block: identical bytes are rejected identically forever, so the relay copy goes
+           * or the re-pull loop returns.
+           *
+           * ⚠️ **AND ONLY IF THE BYTES WERE ACTUALLY KEPT — verification NEW-2.** This deleted
+           * unconditionally while asserting "retained as quarantined evidence above", which is H1's
+           * defect reproduced in the branch H1 was written for. Screener-blocked content aimed at a
+           * closed conversation is the highest-value evidence in the product; losing it because the
+           * quarantine was full is the one outcome worse than it arriving again.
+           */
+          let screenReleased = false;
+          if (screenRetained) {
+            try {
+              await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+              screenReleased = true;
+            } catch (err: unknown) {
+              logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+            }
+          } else {
+            logger.warn("content.recover.release.withheld", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              reason: PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT,
+              impact:
+                "screener-blocked content could NOT be retained locally — see session.content.quarantine.skipped or .failed above — so the relay copy is KEPT rather than deleted. It will arrive and be blocked again, which is the lesser harm: deleting it would destroy the only record that this was ever sent.",
+              guidance:
+                "Free space for this conversation and the copy is retained on a later drain. cello_quarantined shows what it is already holding.",
+              correlationId,
+            });
           }
+          /**
+           * ⚠️ **THIS BRANCH TOLD THE OPERATOR NOTHING — review M9.**
+           *
+           * It is the only park branch that DELETES the relay's copy on purpose, and it is the one
+           * with the strongest claim on an operator's attention: content rejected outright by the
+           * screener, aimed at a conversation that has already closed. Its `impact` field was
+           * written for a person and read by nobody, which is the pattern this whole unit exists to
+           * end — and leaving it here while fixing the neighbouring branches would have been the
+           * class fixed one instance at a time.
+           *
+           * Deliberately NOT pushed into `refusals`: that list is what the drain reports as STUCK,
+           * and this entry is resolved — retained, and gone from the relay. The operator surface is
+           * the part that was missing, not the stuck-list entry.
+           */
+          noteParkRefusal(
+            recipientAgent.name, e.sessionIdHex, e.contentHashHex,
+            PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT,
+            { sessionStatus, released: screenReleased, retained: screenRetained, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
+          );
         } else if (screenDeferred) {
-          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: "annex_screen_unavailable" });
+          refusals.push(
+            noteParkRefusal(
+              recipientAgent.name, e.sessionIdHex, e.contentHashHex,
+              PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE,
+              { sessionStatus, released: false, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
+            ),
+          );
         } else {
           // Keep the relay copy — it is now the only one. Review F7: name why the entry is STUCK,
           // not why ingest refused it. `annexRefusal` carries the branch that actually stopped it;
           // the bare `annex_write_failed` fallback is now only what it says — the annex write ran
           // and failed.
-          refusals.push({
-            contentHash: e.contentHashHex, sessionId: e.sessionIdHex,
-            reason: annexRefusal ?? "annex_write_failed",
-          });
+          const stuckReason = annexRefusal ?? PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED;
+          /**
+           * ─── `041-PARKSTUCK` Unit 1: THE EXIT THE SAFETY RULE DID NOT HAVE ────────────────────
+           *
+           * *"Never drop a message we could not verify"* is right, and it had no case for
+           * verification being IMPOSSIBLE FOR THE REST OF TIME rather than merely failing now.
+           * Every input to this decision is then immutable and the code re-derives the same answer
+           * forever: measured at 731 refusals in 64 hours on one message, roughly one every five
+           * minutes, with the operator never shown it once.
+           *
+           * All three conditions must hold, and the middle one is why this cannot widen:
+           *   1. the session is TERMINAL (`sealed` / `abandoned`) — no salt can ever be agreed for
+           *      it again, because agreement runs while both sides are connected;
+           *   2. the sender named a SALTED algorithm, so a salt is required to check the bytes;
+           *   3. this side holds no usable salt.
+           *
+           * ⚠️ EVERY OTHER REFUSAL IN THIS BRANCH STILL KEEPS THE RELAY COPY, deliberately. A
+           * screener that is down comes back; a build that cannot compute an algorithm gets
+           * upgraded; a decode failure is a version difference. Those answers CHANGE, so releasing
+           * one drain early would lose a message that would have gone through — which is strictly
+           * worse than the loop.
+           *
+           * ⚠️ **AND THE LOCAL COPY IS PROVEN, NEVER ASSUMED — review H1.**
+           *
+           * This comment used to assert that `ingestReceivedContent`'s `session_committed` exit
+           * *had* quarantined the bytes, and gate on nothing. That claim is true on the ordinary
+           * path and false on four reachable ones: no database, the conversation's byte budget
+           * already spent, the row not stored, and a throwing write — each logging, in its own
+           * words, that *nothing holds a copy of it*. The budget case is not exotic; it is the
+           * ordinary shape of a long conversation that then ends.
+           *
+           * Deleting the relay's copy on the strength of an unchecked retention is delete-on-
+           * best-effort, which the comment forty lines above forbids by name: *"annex FIRST,
+           * confirm-delete SECOND, and only if the annex committed… delete-on-best-effort converts
+           * the loop into PERMANENT SILENT loss — strictly worse than the bug."* So `retained` is
+           * now a fact carried out of ingest, and a failed retention keeps the relay copy. The loop
+           * is the lesser harm and it is loud while it lasts.
+           */
+          /**
+           * ⚠️ **`saltReason === "none"` IS THE THIRD CONDITION, and leaving it out was a way to
+           * destroy a message — review H2.**
+           *
+           * `getSessionContentSaltState` answers `unreadable` for THREE situations and only one of
+           * them is permanent: the database is not open (a shutdown or startup race), the read
+           * THREW, or the stored blob is the wrong width (real corruption). `getSessionSalt` also
+           * returns null on a throwing read. So a SQLCipher lock or an IO blip on one drain makes a
+           * perfectly good salt look absent — and without this clause the next line deletes the
+           * relay's last copy of a message the FOLLOWING drain would have annexed.
+           *
+           * That is the order's explicit prohibition: a release one drain too early loses a message
+           * that would have gone through. `none` is the only answer that cannot change back: no
+           * salt row exists, and on a terminal session none can ever be written.
+           *
+           * The live `dcec3c3f…` case is `none` — there is not one `session.salt.*` event for that
+           * session — so the loop this unit exists to stop still closes.
+           */
+          const releasable =
+            stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE &&
+            sessionTerminal &&
+            saltReason === "none" &&
+            ingest.retained === true;
+          if (!releasable && stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE && sessionTerminal && saltReason === "none") {
+            /**
+             * The loop continues, and the reason it continues is a LOCAL storage failure rather than
+             * anything about this message. Said out loud because otherwise this is indistinguishable
+             * from the defect this unit fixed — the same refusal, at the same cadence, forever.
+             */
+            logger.warn("content.recover.release.withheld", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              impact:
+                "this message can never be checked and the relay copy would normally be dropped, but this daemon could NOT retain a local copy of it — see session.content.quarantine.skipped or .failed above. The relay copy is kept instead, so it will keep being pulled and refused, because deleting it would leave the message nowhere at all.",
+              guidance:
+                "Free space for this conversation and the copy is retained on a later drain, after which the loop stops on its own. A conversation that has spent its storage budget cannot retain more; cello_quarantined shows what it is already holding.",
+              correlationId,
+            });
+          }
+          /**
+           * ⚠️ **REPORTED ON THE SUCCESS PATH — the notice is written AFTER the delete, never
+           * before it.** `released` is what the operator's sentence turns on ("it is now gone" vs
+           * "the relay still holds it"), and a confirm can fail. Deciding the wording from the
+           * INTENT to release rather than from the release having happened is how a notice comes to
+           * state a conclusion nothing has reached yet.
+           */
+          let released = false;
+          if (releasable) {
+            try {
+              await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+              released = true;
+              logger.warn("content.recover.released", {
+                sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+                reason: stuckReason, sessionStatus, saltReason: saltReason ?? "(unknown)",
+                impact:
+                  "this message can NEVER be checked — the conversation is closed, so no salt can ever be agreed for it — and the relay's copy has been deleted so it stops being pulled and refused on every drain. The content itself is retained locally as quarantined evidence and is readable with cello_quarantined.",
+                guidance:
+                  "Nothing to retry and nothing to repair. If the message mattered, ask the sender OUT OF BAND to say it again in a NEW conversation.",
+                correlationId,
+              });
+            } catch (err: unknown) {
+              // The relay copy survives, so the loop continues for now and nothing is lost. Named
+              // separately from `content.recover.confirm.failed` because on THIS branch the failed
+              // delete is the whole reason the entry is still there.
+              logger.warn("content.recover.release.failed", {
+                sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+                error: extractErrorMessage(err),
+                impact: "the relay copy could not be deleted, so this message will be pulled and refused again on the next drain. Nothing is lost; the loop simply has not stopped yet.",
+                correlationId,
+              });
+            }
+          }
+          refusals.push(
+            noteParkRefusal(
+              recipientAgent.name, e.sessionIdHex, e.contentHashHex, stuckReason,
+              { sessionStatus, released, declaredAlg: declaredAlgSeen, saltReason, errorDetail: annexErrorDetail },
+            ),
+          );
         }
       } else {
         // M12-P18: content for a session WE REFUSED can be swept — deleting it acts on our own

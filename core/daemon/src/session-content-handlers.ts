@@ -82,7 +82,7 @@ function refusalsField(
   refusals?: Array<{
     reason: string; kind: RefusalKind; impact: string; guidance: string;
     times_since_dismissed: number; times_total?: number; times_total_at_least?: number;
-    repeat?: boolean;
+    recurrence?: string; repeat?: boolean;
   }>;
   refusal_guidance?: string;
 } {
@@ -110,6 +110,8 @@ function refusalsField(
       times_since_dismissed: r.timesSinceDismissed,
       ...(r.timesTotal === undefined ? {} : { times_total: r.timesTotal }),
       ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
+      // `041-PARKSTUCK`: the cadence beside the count, so a loop is not read as a crowd.
+      ...(r.recurrence === undefined ? {} : { recurrence: r.recurrence }),
       ...(r.repeat === true ? { repeat: true } : {}),
     })),
     // DOD-M15-REFUSALTERMINAL-1 review F4: the counts need their sentence at BOTH doors. Without

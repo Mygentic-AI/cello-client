@@ -192,7 +192,7 @@ export class SessionContentIngest {
      * `authenticateParkedEntry` refuses `counterparty_unknown` from the same missing record first.
      */
     verifiedSignerUnmatched?: Uint8Array,
-  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }> {
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string; retained?: boolean }> {
     // The transcript is frozen ONLY once it is COMMITTED + signed — 'sealed' or
     // 'seal_interrupted_pending' (the bilateral seal commitment) — because a later FROST
     // notarization attests that exact root; a late leaf would diverge from it.
@@ -299,7 +299,7 @@ export class SessionContentIngest {
       // before this: `sealed_session_annex` covers the park-drain and held-drift routes, not this
       // exit. Something arriving into a signed, closed conversation is exactly the kind of thing an
       // operator later wants to produce.
-      this.#ctx.refusals.quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
+      const retainedSeq = this.#ctx.refusals.quarantineRefusedContent(agentName, sessionId, "session_committed", content, contentHashHex, {
         senderPubkeyHex: record.counterparty_pubkey ?? null, correlationId,
       });
       /**
@@ -321,7 +321,7 @@ export class SessionContentIngest {
         guidance:
           "There is nothing to repair here. If they still have something to say, ask them to start a NEW conversation — a closed one cannot be reopened, and it is worth telling them, because they may not realise it ended. Read what was said before it closed with cello_transcript.",
       });
-      return { ok: false, reason: "session_committed" };
+      return { ok: false, reason: "session_committed", retained: retainedSeq !== null };
     }
 
     /**
