@@ -68,7 +68,17 @@ function callSites(): Call[] {
         if (j - i > 45) break;
       }
       // The argument may be documented immediately above the call rather than inline.
-      text += "\n" + lines.slice(Math.max(0, i - 25), i).join("\n");
+      //
+      // ⚠️ THE WINDOW STOPS AT THE PREVIOUS CALL SITE, and that bound is load-bearing. 040-DAEMONROOT
+      // unit 6 put the three away-reply sites 14 lines apart in one file; a flat 25-line lookback then
+      // reached over the previous site's `sentAuthorship(sendResult)` and read it as this site's, so
+      // dropping the proof at the third site left this assertion GREEN. Measured by mutation, not
+      // argued: with the bound, all three go red.
+      let windowStart = Math.max(0, i - 25);
+      for (let k = i - 1; k >= windowStart; k--) {
+        if (lines[k]!.includes("placeOwnLeaf(")) { windowStart = k + 1; break; }
+      }
+      text += "\n" + lines.slice(windowStart, i).join("\n");
       out.push({ file, line: i + 1, text });
     });
   }

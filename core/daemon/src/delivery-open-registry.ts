@@ -46,7 +46,7 @@
  * the operator's doorbell too. It is narrow (same local agent, same peer, overlapping windows) and
  * it costs one missed notification for a session the operator started themselves and is therefore
  * already watching. The alternative — suppressing nothing — is the storm. This is the same class of
- * accepted, journaled imprecision as the away-ack coalescing guard in `daemon.ts`.
+ * accepted, journaled imprecision as the away-ack coalescing guard in `attendance-wiring.ts`.
  *
  * Counting, not a boolean: two documents can be delivering to the same peer concurrently, and a
  * boolean cleared by whichever finishes first would re-open the loop for the other.

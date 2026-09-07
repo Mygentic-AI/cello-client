@@ -29,7 +29,6 @@
 import { mkdir } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { dirname, join } from "node:path";
 import type {
   DaemonConfig,
   DaemonStatusResponse,
@@ -38,27 +37,21 @@ import type {
   InterruptedSessionInfo,
   ActiveSessionInfo,
   SealReadinessView,
-  // DOD-M15-IDLE-CONNS-1 — the factory logs what the idle sweep did.
 } from "./types.js";
 import { loadAgents } from "./agent-loader.js";
 import { RestartSealResolver } from "./restart-seal-resolver.js";
-import { acquireLock, removeLockIfOwned } from "./lock-file.js";
+import { removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
 import { renderForSurface } from "./vocabulary.js";
-import { RandomizedPollScheduler } from "./manifest-poll-scheduler.js";
-import { startManifestValidityWatch, classifyManifestValidity, describeManifestValidity, type ManifestOrigin } from "./manifest-validity.js";
-import { describeDirectoryAuth, directoryAuthRequired } from "./directory-auth-posture.js";
+import { classifyManifestValidity, describeManifestValidity } from "./manifest-validity.js";
+import { describeDirectoryAuth } from "./directory-auth-posture.js";
 import { SealFailureStore } from "./seal-failure-store.js";
 import {
-  startRosterSweep,
   classifyRosterReading,
-  describeRosterFreshness,
-  ROSTER_SWEEP_INTERVAL_MS,
-  type RosterFreshness,
-} from "./roster-freshness.js";
+  describeRosterFreshness
+  } from "./roster-freshness.js";
 import { SessionNodeManager, REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS } from "./session-node-manager.js";
-import { type SecurityGatewayClient } from "@cello-protocol/gateway";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { RetryQueue } from "./retry-queue.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
@@ -67,15 +60,13 @@ import { NotificationDispatcher } from "./notification-dispatcher.js";
 import {
   SignalingManager,
   type ConnectResult,
-  type CelloNode,
+  type CelloNode
 } from "@cello-protocol/transport";
 import { DbRegistrationPersistence, DbIdentityStore } from "./db-identity-store.js";
-import { DbManifestVersionStore } from "./manifest-version-store-db.js";
 import { sendSealedSubmission } from "./signal-submission.js";
 import { SubmissionRetryQueue, type PendingSubmission } from "./submission-retry.js";
 import type { SubmissionOp } from "@cello-protocol/protocol-types";
 
-import type { IManifestVersionStore } from "@cello-protocol/transport";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
 import { sealParkEnvelope } from "./park-envelope.js";
@@ -84,16 +75,10 @@ import { AgentRelayClient } from "./session-relay-client.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
 import { extractErrorMessage } from "./error-message.js";
 import { createReconnectDrain } from "./reconnect-drain.js";
-import {
-  resolveCelloEnv,
-  createTransportSelector,
-  isProductionVariant,
-} from "./transport-composition.js";
 import type { ITransportSelector } from "./transport-selector.js";
 import { parseSessionAssignment } from "./session-assignment-parser.js";
 import { whoLabel } from "./who-label.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
-import { verifyStartupManifest, createConsortiumRouting } from "./consortium-bootstrap.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
 import { registerSignalHandlers } from "./signal-handlers.js";
@@ -104,6 +89,7 @@ import { registerBackupRestoreHandlers } from "./backup-restore-handlers.js";
 import { createDocumentWiring } from "./document-wiring.js";
 import { createSignalingWiring } from "./signaling-wiring.js";
 import { createAttendanceWiring } from "./attendance-wiring.js";
+import { startBootCore } from "./boot-core.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
@@ -149,7 +135,6 @@ export { ProductionSessionNodeFactory } from "./session-node-factory.js";
 // this re-export is what kept the test that imports it from here working.
 export { INBOUND_SESSION_TTL_MS } from "./inbound-sessions.js";
 import type { DaemonHandle } from "./daemon-handle.js";
-import { ProductionSessionNodeFactory } from "./session-node-factory.js";
 
 /**
  * DOD-SINGLE-DAEMON-1: take the singleton lock, and make sure it is released if startup fails
@@ -178,273 +163,25 @@ async function startDaemonHoldingLock(
   singletonLock: SingletonLock,
 ): Promise<DaemonHandle> {
   const {
-    celloDir, socketPath, lockFilePath, maxConnections, version, logger,
-    manifestProvider, manifestRootKeys, manifestThreshold,
-    manifestVersionStore: injectedManifestVersionStore, manifestPollScheduler,
+    celloDir, socketPath, lockFilePath, maxConnections, logger,
+    manifestProvider, manifestPollScheduler,
     directoryHttpUrl,
-    signalingConnect, challengeVerifier, directoryEndpointResolver, sessionNodeFactory,
+    signalingConnect, challengeVerifier, directoryEndpointResolver,
     sessionNegotiator, getRelayCircuitAddress, telegramBotClient: injectedTelegramBotClient,
   } = config;
 
-  // CELLO-M7-TRANSPORT-001: composition-root selection of the transport selector.
-  // Driven by CELLO_ENV; fails fast at startup (here, not at first session) when a
-  // production environment is missing the required transport dialer (AC-010).
-  const celloEnv = resolveCelloEnv(process.env["CELLO_ENV"]);
-  const transportSelector = createTransportSelector({
-    env: celloEnv,
-    logger,
-    transportDialer: config.transportDialer,
-  });
-  logger.info("transport.adapters.wired", {
-    env: celloEnv,
-    selector: isProductionVariant(celloEnv) ? "real" : "stub",
-  });
-
-  // ADV-006 + ADV-008 (hoisted — code-review MED): pure config validation runs BEFORE any disk side
-  // effect (lock, the irreversible one-time migration, DB open). A misconfigured daemon must fail
-  // before mutating state. If manifestProvider is set, manifestRootKeys + a positive threshold are
-  // required.
-  if (manifestProvider && (!manifestRootKeys || !manifestThreshold || manifestThreshold <= 0)) {
-    throw new Error(
-      "DaemonConfig: manifestProvider requires manifestRootKeys (non-empty) and manifestThreshold (positive integer >= 1)",
-    );
-  }
-
-  /**
-   * DOD-M15-DIRAUTH-1 — an operator can DEMAND directory identity authentication.
-   *
-   * HERE, under the ADV-006/008 rule above, because this IS pure config validation: both operands
-   * are already in hand and it touches nothing.
-   *
-   * Review F1 caught me putting it ninety lines lower, next to ADV-002, on the reasoning that it
-   * "mirrors" it. It does not. ADV-002 sits down there because it MUST — it depends on
-   * `verifyStartupManifest`, which depends on the anti-rollback floor in the DB. This depends on
-   * nothing, and down there it ran AFTER: the irreversible flat-file → SQLCipher identity migration
-   * (which renames and unlinks files), the creation of `sessions.db` and its key, and the sweep that
-   * marks every `active` session `interrupted` with `interrupted_by='local'`.
-   *
-   * So a misconfigured daemon "failed to start" and changed the operator's record on the way out —
-   * two live sessions permanently interrupted, attributed to a local cause, by a config check that
-   * could have run before anything was touched.
-   */
-  if (directoryAuthRequired(process.env) && challengeVerifier === undefined) {
-    const url = config.directoryHttpUrl ?? resolveDirectoryUrl(process.env);
-    logger.error("directory.auth.required.unavailable", {
-      directoryUrl: url,
-      impact: "the daemon refused to start rather than connect without directory identity authentication.",
-      guidance:
-        "CELLO_REQUIRE_DIRECTORY_AUTH is set, but no challenge verifier could be built for this " +
-        "directory URL. Point CELLO_DIRECTORY_URL at a bundled endpoint, or supply a manifest with " +
-        "CELLO_CONSORTIUM_MANIFEST plus CELLO_CONSORTIUM_ROOT_KEYS and CELLO_CONSORTIUM_THRESHOLD " +
-        "(all three are required together), or set CELLO_REQUIRE_DIRECTORY_AUTH to 0/false/no/off " +
-        "to accept the risk.",
-    });
-    throw new Error(
-      `CELLO_REQUIRE_DIRECTORY_AUTH is set, but directory identity authentication (step 6) cannot ` +
-      `be enforced: no challenge verifier was supplied for this daemon. The directory URL is ` +
-      `compared against the bundled consortium roster after NORMALISATION (trimmed, trailing slash ` +
-      `dropped, lowercased) — so case and a trailing slash are forgiven, but a DNS hostname ` +
-      `pointing at exactly the right machine is NOT, which is the usual cause. Either use a bundled ` +
-      `endpoint address, or supply a manifest with CELLO_CONSORTIUM_MANIFEST plus ` +
-      `CELLO_CONSORTIUM_ROOT_KEYS and CELLO_CONSORTIUM_THRESHOLD (all three are required together), ` +
-      `or set CELLO_REQUIRE_DIRECTORY_AUTH to 0/false/no/off to start without step 6.`,
-    );
-  }
-
-  // ── PERSIST-002: open the encrypted store FIRST (runs the one-time flat-file → SQLCipher migration
-  // (AC-006) + creates the agents/manifest_state schema), under the single-instance lock. This must
-  // precede the manifest verification below because the manifest version is now stored in the
-  // encrypted DB (AC-008), not a manifest-version.json file. ──
-  await mkdir(celloDir, { recursive: true });
-  await mkdir(dirname(socketPath), { recursive: true });
-
-  // DOD-SINGLE-DAEMON-1: the caller already took the kernel's exclusive lock (see startDaemon) —
-  // BEFORE this function touches anything that assumes a single writer. A daemon that loses that race
-  // never reaches here at all: it never opens the database, never registers an agent, never connects
-  // to the directory. Two daemons sharing an identity is how a hash chain gets two leaves at the same
-  // index, and the seal then attests to the damage.
-  //
-  // AC4: the advisory JSON keeps its metadata role (it is how the NEXT process learns our pid), but
-  // the OS lock is what decides whether a daemon may run. This file never gates startup.
-  await acquireLock(lockFilePath, { pid: process.pid, socketPath, version });
-
-  // M9-CORE-001: one security-gateway client, shared by both seams — the outbound screen in
-  // cello_send and the inbound screen inside SessionNodeManager. REQUIRED (INV-9): there is no
-  // fallback, because the fallback WAS the bug — an always-allow default that nothing in the
-  // product ever overrode.
-  // The type says required, but tests are excluded from typecheck and JS callers exist, so the
-  // absence has to be LOUD here rather than a TypeError three lines later that names the wrong
-  // subsystem. A test that genuinely does not screen says so by passing the passthrough client.
-  if (!config.securityGateway) {
-    throw new Error(
-      "startDaemon: securityGateway is required (INV-9). The daemon no longer defaults to " +
-        "always-allow screening, because that default shipped a security layer that never ran. " +
-        "Pass a LocalSidecarGatewayClient in production, or new PassthroughGatewayClient() if " +
-        "this caller deliberately does not screen.",
-    );
-  }
-  const securityGateway: SecurityGatewayClient = config.securityGateway;
-  // Observability: announce the mode the CLIENT declares (M9B-D11), never a ternary over the
-  // config. The sidecar socket connects lazily on the first screen, so this reports which adapter
-  // is wired, not a live socket handshake — but it reports it from the object that will do the
-  // screening, so a wiring mistake shows up here instead of hiding behind a correct-looking line.
-  logger.info("security.gateway.connected", { mode: securityGateway.mode });
-
-  const sessionNodeManager = new SessionNodeManager({
-    factory: sessionNodeFactory ?? new ProductionSessionNodeFactory(logger),
-    logger,
-    dbPath: join(celloDir, "sessions.db"),
-    contentTtfMs: config.contentTtfMs,
-    autoNatProbers: () => [],
-    securityGateway,
-  });
-  await sessionNodeManager.initialize();
-
-  // AC-008: the manifest version store is DB-backed by default (encrypted manifest_state table). A
-  // test may inject an override (e.g. InMemoryManifestVersionStore) via config.
-  const manifestVersionStore: IManifestVersionStore =
-    injectedManifestVersionStore ?? new DbManifestVersionStore(sessionNodeManager.getDb(), logger);
-
-  // M7-MANIFEST-002: load and verify the consortium manifest BEFORE any directory connection.
-  // The gate REPORTS; it does not decide (consortium-bootstrap.ts). The refuse below is ours
-  // because only we hold the DB handle and the singleton lock a refusal has to release.
-  const { manifestVerified, verifiedManifestVersion, verifiedManifest, unresolvedNodes: startupUnresolvedNodes, unresolvedSweptAt: startupSweptAt } = await verifyStartupManifest({
-    manifestProvider,
-    manifestRootKeys,
-    manifestThreshold,
-    manifestVersionStore,
-    logger,
-    // DOD-M15-STALEROSTER-1: the same injected fetch the sweep uses, so the startup probe and the
-    // background probe are exercised through one seam rather than one being untestable.
-    ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
-  });
-
-  // ADV-002: an operator who configures manifestProvider has opted INTO manifest enforcement, so a
-  // failed verification is fatal — never a warning we start anyway on.
-  if (manifestProvider && !manifestVerified) {
-    // This refuse runs AFTER the DB is open and the lock is held (the DB had to open for the
-    // anti-rollback check), so release both before rethrowing — an in-process caller must not be
-    // left holding the DB handle. (In production the process exits, but be tidy.)
-    try { sessionNodeManager.getDb().close(); } catch { /* ignore */ }
-    await removeLockIfOwned(lockFilePath, process.pid, logger).catch(() => { /* best-effort */ });
-    // The singleton lock is released by startDaemon's catch — every throw out of this function goes
-    // through it, so no failure path can leak the lock by forgetting.
-    throw new Error(
-      "Manifest verification failed. The daemon cannot start with an unverified manifest when manifestProvider is configured. " +
-      "Check the logs for the specific failure reason (manifest_signature_invalid, manifest_expired, or manifest_version_rollback).",
-    );
-  }
-
-  // The manifest poll starts only AFTER the refuse above — a refused startup must not leak a timer.
-  const { resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes, getUnresolvedSweptAt, getDeclaredNodeCount, stopHttpManifestPoll } =
-    createConsortiumRouting({
-      manifestProvider,
-      manifestRootKeys,
-      manifestThreshold,
-      manifestVersionStore,
-      manifestPollScheduler,
-      directoryHttpUrl,
-      directoryEndpointResolver,
-      // Carry the boot sweep's findings into the operator surface. Without this the status block is
-      // empty until a ceremony resolves a roster — i.e. empty exactly when someone whose sessions
-      // are all failing goes looking for why.
-      initialUnresolvedNodes: startupUnresolvedNodes,
-      initialUnresolvedSweptAt: startupSweptAt,
-      logger,
-      ...(config.fetchFn ? { fetchFn: config.fetchFn } : {}),
-    });
-
-  /**
-   * DOD-M15-STALEROSTER-1 — keep measuring directory reachability even when nothing is wrong.
-   *
-   * Every existing caller of the sweep is ACTIVITY-driven — ceremonies, session setup,
-   * `cello_refresh`, the seal broker. So an IDLE daemon never re-measures, and sitting idle is what
-   * a daemon does between conversations: the reading it was seeded with at boot is the reading it
-   * still has an hour later. Measured twice, on two machines — node failures from minutes past
-   * displayed while `curl` reached all three nodes in 37–184 ms.
-   *
-   * (An earlier version of this comment said the sweep had ONE caller, the failover path, and that
-   * recovering was what stopped the measurement. That was wrong — there are ten — and it is
-   * corrected here rather than deleted because believing it is why the concurrent-sweep race in
-   * `consortium-bootstrap.ts` went unnoticed until review.)
-   *
-   * Skipped when there is no manifest provider: there is no node roster to enumerate, so a timer
-   * that can only ever re-measure nothing is noise. That case is NOT silent — `cello_status`
-   * reports `measurement: "not_configured"` and says why.
-   */
-  /**
-   * WHERE the held manifest came from, because it decides what the operator can actually DO about
-   * an expired one — `DOD-M15-MANIFEST-EXPIRY-LIVE-1` review F5.
-   *
-   * `EmbeddedManifestProvider` is the compiled-in bundled roster: there is no file to replace and no
-   * poll to adopt a replacement, so "rotate the manifest" is not an available action and telling
-   * that operator to do it routes them toward the one workaround that silently disables directory
-   * identity authentication. Detected by the provider's own constructor rather than by re-reading
-   * the env var, so a caller that injects a provider directly is classified by what it IS.
-   */
-  const manifestOrigin: ManifestOrigin =
-    manifestProvider?.constructor?.name === "EmbeddedManifestProvider" ? "bundled" : "file";
-
-  /** REVIEW F4: the last sweep failure, surfaced in `cello_status` alongside the log line. */
-  let lastRosterSweepError: RosterFreshness["last_sweep_error"] | undefined;
-
-  /**
-   * DOD-M15-MANIFEST-EXPIRY-LIVE-1 — re-check the trust anchor's validity while the daemon runs.
-   *
-   * The window is enforced at STARTUP and nowhere else. The manifest poll's expiry check looks at
-   * the manifest being FETCHED, never the one held, so a daemon past its expiry keeps polling, keeps
-   * correctly refusing expired replacements, and keeps using the lapsed anchor it already has.
-   *
-   * Rides the roster sweep rather than owning a timer: that tick already fires every 90–180 s on
-   * exactly the path where a manifest provider exists.
-   */
-  const checkManifestValidity = startManifestValidityWatch({
-    getManifest: () => manifestProvider?.getCurrentManifest() ?? null,
-    logger,
-  });
-  const rosterSweepScheduler = manifestProvider
-    ? config.rosterSweepScheduler ??
-      new RandomizedPollScheduler({ minMs: ROSTER_SWEEP_INTERVAL_MS, maxMs: ROSTER_SWEEP_INTERVAL_MS * 2 })
-    : undefined;
-  const stopRosterSweep = rosterSweepScheduler
-    ? startRosterSweep({
-        scheduler: rosterSweepScheduler,
-        // FAST_PROBE is deliberately NOT used here. It exists because the failover resolver runs
-        // inside the 10 s signaling wait; nothing waits on this sweep, so it can afford the
-        // patient probe and give the more trustworthy answer.
-        sweep: async () => {
-          /**
-           * DOD-M15-MANIFEST-EXPIRY-LIVE-1: the anchor's validity is re-checked on the same tick.
-           * BEFORE the probe, so an expired manifest is reported even on a cycle where every node is
-           * unreachable and the roster resolve throws.
-           *
-           * Its OWN try/catch — review F11. Sharing the sweep's error path meant a throw in here
-           * would surface as `directory.roster.sweep.failed` AND skip `resolveConsortiumRoster()`
-           * entirely: the roster reading would freeze while the operator was pointed at the
-           * directory. A manifest-check failure must never be reported as a directory failure, and
-           * must never cost the measurement it rides along with.
-           */
-          try {
-            checkManifestValidity();
-          } catch (err: unknown) {
-            logger.error("directory.auth.manifest.check.failed", {
-              error: err instanceof Error ? err.message : String(err),
-              impact:
-                "the manifest validity re-check did not run this cycle. cello_status still computes " +
-                "it independently on every read, so the FIELD is unaffected; what is lost is the " +
-                "unprompted log line on a transition.",
-            });
-          }
-          return resolveConsortiumRoster();
-        },
-        logger,
-        // REVIEW F4: the failure reaches the agent's response, not just the log. Without this a
-        // sweep failing every cycle is invisible for the first two or three failures, because the
-        // reading is still inside its 5-minute freshness bound and reports stale:false.
-        onSweepError: (e) => { lastRosterSweepError = e; },
-        onSweepSuccess: () => { lastRosterSweepError = undefined; },
-      })
-    : undefined;
+  // 040-DAEMONROOT unit 7 (phase 1): transport, gateway, session manager, the manifest gate, the
+  // roster sweep and the type registry → boot-core.ts. Three inputs, everything below comes out.
+  const {
+    transportSelector, securityGateway, sessionNodeManager,
+    manifestOrigin, manifestVerified, verifiedManifest, verifiedManifestVersion,
+    rosterSweepScheduler, stopRosterSweep, stopHttpManifestPoll,
+    resolveConsortiumRoster, failoverEndpointResolver, getFailoverEndpoint, getUnresolvedNodes,
+    getUnresolvedSweptAt, getDeclaredNodeCount,
+    // A READER, not a value: the sweep writes it after this returns, and `cello status` reads it
+    // later still. A snapshot here reports a healthy roster through every sweep failure.
+    lastRosterSweepError,
+  } = await startBootCore({ config, logger, directoryHttpUrl });
 
   // DOD-REGISTRY-1: type registry poll — daemon-level, runs even with zero agents.
   // When registryPubkey is configured, the daemon polls GET /registry, verifies the inner
@@ -2465,7 +2202,7 @@ async function startDaemonHoldingLock(
       // as an alarm — it would fire on every local run. It still EMITS, because the line forbids
       // hiding the field; what differs is what the operator is told.
       manifestConfigured: manifestProvider !== undefined,
-      ...(lastRosterSweepError ? { lastSweepError: lastRosterSweepError } : {}),
+      ...(lastRosterSweepError() ? { lastSweepError: lastRosterSweepError() } : {}),
     });
     if (failures.length === 0 && freshness.measurement === "current") return undefined;
     return {

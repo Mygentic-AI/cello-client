@@ -7,7 +7,8 @@
  * is why the COUNT is kept separate from the boolean and both read the same `currentAgent` map the
  * doorbell routes on. They cannot disagree about who is present.
  *
- * Seven dependencies, under the order's bound. This block was never entangled with the boot
+ * Eleven dependencies, under the order's bound of ~12 — counted, because the first version of
+ * this line said seven. This block was never entangled with the boot
  * sequence; it just happened to be written in the middle of it.
  *
  * ⚠️ IT PLACES ITS OWN LEAVES. The one-shot rejection sends content, appends the leaf and records
@@ -470,5 +471,8 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
     }
   }
 
-  return { isAttended, attendanceCount, sendAwayResponse, contentTakes, backgroundSeals, awayAckSent };
+  // `isAttended` is NOT returned: its only caller in the repo is `sendAwayResponse`, which moved
+  // with it. Returning it would make a private local reachable through an exported factory for no
+  // consumer — new surface, which Rule D forbids.
+  return { attendanceCount, sendAwayResponse, contentTakes, backgroundSeals, awayAckSent };
 }

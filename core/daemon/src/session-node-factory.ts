@@ -16,6 +16,7 @@ import {
   type ConnectionCounts,
 } from "@cello-protocol/transport";
 import type { ISessionNodeFactory, SessionNodeConfig } from "./session-node-manager.js";
+// DOD-M15-IDLE-CONNS-1 — the factory logs what the idle sweep did.
 import type { Logger } from "./types.js";
 
 // Minimal no-op KeyProvider stub for session nodes.

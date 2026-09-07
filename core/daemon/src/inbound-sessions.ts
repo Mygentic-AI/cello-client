@@ -40,7 +40,15 @@ import type { RelayAssignmentCarry } from "./session-relay-client.js";
 const CAP_ALARM_COOLDOWN_MS = 10 * 60_000;
 const capAlarmLastFired = new Map<string, { at: number; suppressed: number }>();
 
-/** How long an un-accepted inbound session request stays claimable. */
+/**
+ * How long an un-accepted inbound session request stays claimable.
+ *
+ * M8C-TTL-1: receiver-side session-request TTL. CORE ships the DoD's own 24h default; per-agent
+ * configurability is PARKED on M9-CFG-001 (D17 — same pattern as D14/D15/D16). That pointer lived on
+ * a DUPLICATE of this constant in daemon.ts, which 040-DAEMONROOT unit 8 deleted as dead; without it
+ * moving here, 24h reads as a tuning choice somebody may re-open rather than a decision already made
+ * and written down.
+ */
 export const INBOUND_SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** A session request that expired before anyone claimed it. Surfaced by the push-loss reconciler. */

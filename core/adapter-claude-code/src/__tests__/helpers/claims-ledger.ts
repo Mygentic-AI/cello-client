@@ -887,7 +887,7 @@ export const ADJUDICATED: AdjudicatedClaim[] = [
     verdict: "true",
     evidence:
       "The claim's value is the CONTRAST it draws, and the contrast is real: away messages are " +
-      "sent by a running agent's own daemon path (`daemon.ts:1489` screens the away draft through " +
+      "sent by a running agent's own daemon path (`attendance-wiring.ts` screens the away draft through " +
       "`screenOutbound`), so an agent that is not started has nothing to send them with — " +
       "`daemon.ts:2990` refuses with `agent_offline` rather than falling back to an away reply. " +
       "The help names the right alternative for the softer case, `cello stop-using-agent`, which " +
