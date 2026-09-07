@@ -44,7 +44,7 @@ const SRC = join(import.meta.dirname, "..");
  * out of `daemon.ts` and this entry is why the suite went red instead of silent. Every later unit
  * that moves leaf-placing code adds its file here in the same commit.
  */
-const CALLERS = ["daemon.ts", "session-content-handlers.ts", "document-wiring.ts"] as const;
+const CALLERS = ["daemon.ts", "session-content-handlers.ts", "document-wiring.ts", "attendance-wiring.ts"] as const;
 
 interface Call { file: string; line: number; text: string }
 
@@ -107,8 +107,11 @@ describe("DOD-M15-SEALWIRE-1 bullet 5: no call site quietly stops handing over t
   it("★ and the away-reply sites specifically, because those are the three that shipped broken", () => {
     // Named individually rather than counted: the defect was three specific sites, and a count
     // passes while the wrong three are wired.
-    const daemon = readFileSync(join(SRC, "daemon.ts"), "utf8");
-    const awayCalls = daemon
+    // 040-DAEMONROOT unit 6: the away responder moved out of daemon.ts into attendance-wiring.ts.
+    // Read from the file that HOLDS it — reading the old one would find zero sites and the
+    // `.toBe(3)` below would go red for the right number and the wrong reason.
+    const away = readFileSync(join(SRC, "attendance-wiring.ts"), "utf8");
+    const awayCalls = away
       .split("\n")
       .filter((l) => l.includes("placeOwnLeaf(") && l.includes("sendResult.sequenceNumber"));
 
