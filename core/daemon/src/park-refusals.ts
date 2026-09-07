@@ -90,6 +90,14 @@ export interface ParkRefusalContext {
    * would have told them whether this is their disk, their build, or the sender.
    */
   readonly errorDetail: string | null;
+  /**
+   * Did this daemon actually KEEP the bytes? — verification NEW-2.
+   *
+   * Only the screened-out notice reads it today, and it reads it because saying "it is KEPT as
+   * evidence" when the quarantine refused the write is the same unchecked claim H1 removed from the
+   * release. Defaults to `true` for reasons that retain nothing of their own to describe.
+   */
+  readonly retained?: boolean;
 }
 
 /**
@@ -170,12 +178,42 @@ function saltGuidance(ctx: ParkRefusalContext): string {
       `agrees a salt and clears this.`
     );
   }
+  /**
+   * ⚠️ **THREE PATHS REACH HERE NOW, AND ONLY ONE OF THEM IS ABOUT RECONNECTING — verification
+   * NEW-1.**
+   *
+   * Before the release was gated on `saltReason` and on the retention, terminal + no-salt ALWAYS
+   * released, so this branch only ever saw a non-terminal session. Those two fixes opened two more
+   * ways in — a terminal session whose bytes could not be retained, and a salt row that exists and
+   * could not be read — and the reconnection advice is wrong for both. Telling someone to get
+   * online at the same time as a counterparty on a `sealed` conversation names an action they
+   * cannot perform, which is this unit's own DoD clause turned on the unit.
+   */
+  if (ctx.saltReason === "unreadable") {
+    return (
+      `${cause} The relay still holds this message and it is pulled again on every drain, so ` +
+      `nothing is lost while this lasts. Your counterparty is not involved and there is nothing to ` +
+      `ask them for: a salt for this conversation already exists on this machine and this machine ` +
+      `could not read it. If the read succeeds on a later drain the message is checked and handled ` +
+      `normally.`
+    );
+  }
+  if (TERMINAL_SESSION_STATUSES.has(ctx.sessionStatus)) {
+    return (
+      `${cause} This conversation is "${ctx.sessionStatus}" and cannot be reopened, so no salt can ` +
+      `ever be agreed for it and this message can never be checked — there is nothing to reconnect ` +
+      `to and nothing to retry. The relay's copy would normally be dropped for exactly that reason; ` +
+      `it is being KEPT only because this agent could not store a copy of its own, and deleting it ` +
+      `would leave the message nowhere at all. Free space for this conversation and it resolves ` +
+      `itself. If the message mattered, ask the sender OUT OF BAND to say it again in a NEW ` +
+      `conversation.`
+    );
+  }
   return (
     `${cause} The relay still holds this message and it is pulled again on every drain. A salt is ` +
     `agreed while both sides are connected, so being online at the same time as your counterparty ` +
     `is what clears this — the message is then checked and delivered on a later drain. This ` +
-    `conversation is "${ctx.sessionStatus}", so if it never reopens, ask the sender OUT OF BAND to ` +
-    `say it again in a NEW conversation.`
+    `conversation is "${ctx.sessionStatus}", which is not closed, so that can still happen.`
   );
 }
 
@@ -249,15 +287,25 @@ export const PARK_REFUSAL_NOTICE: Record<
       "the sender for anything; they cannot see this and there is nothing for them to resend.",
   }),
   [PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT]: (ctx) => ({
-    // BLOCKED, not REFUSED: it was checked, it IS retained, and the operator is not being asked to
-    // do anything about it. The kind is what carries "this is the protection working".
-    kind: REFUSAL_KINDS.BLOCKED,
+    /**
+     * WITHHELD, not BLOCKED — verification NEW-3. `BLOCKED`'s header asserts the message IS in the
+     * conversation's hash chain and the sender WAS acknowledged. Both hold for the live screener
+     * and neither holds here: the conversation is closed, so nothing was appended, and deleting a
+     * mailbox blob is not an acknowledgement. The header would have contradicted this impact.
+     */
+    kind: REFUSAL_KINDS.WITHHELD,
     impact:
       "A message that arrived for this closed conversation was BLOCKED by this agent's screener — " +
       "its content was rejected outright, not merely unrecognised. It was never shown to the agent " +
-      "and never added to the conversation's record. It is KEPT as evidence, and the relay's copy " +
-      "has been dropped so it stops arriving." +
-      (ctx.released ? "" : " The relay copy could not be dropped, so it may arrive again."),
+      "and never added to the conversation's record." +
+      // ⚠️ NEW-2: retention is a FACT read back, never an assumption. Saying "it is KEPT" when the
+      // quarantine refused it is the claim H1 removed, reprinted one branch over.
+      (ctx.retained
+        ? " It is KEPT as evidence and cello_quarantined shows it."
+        : " THIS AGENT COULD NOT KEEP A COPY of it — see session.content.quarantine.skipped or .failed in the daemon log — so only this notice records that it was ever sent.") +
+      (ctx.released
+        ? " The relay's copy has been dropped so it stops arriving."
+        : " The relay still holds its copy, so it may arrive and be blocked again."),
     guidance:
       "This is the protection working, and there is nothing to repair. Do not turn screening off " +
       "to read it and do not ask the sender about it — if the content was hostile, telling them " +

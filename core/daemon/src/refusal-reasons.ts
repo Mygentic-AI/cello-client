@@ -39,6 +39,19 @@ export const REFUSAL_KINDS = {
   LOST: "lost",
   /** Nothing was received. This side's own send or acknowledgement failed to reach them. */
   OUTBOUND: "outbound",
+  /**
+   * Screened out and WITHHELD: checked, refused, kept as evidence — and NOTHING was recorded and
+   * nobody was acknowledged.
+   *
+   * ⚠️ **NOT `BLOCKED`, AND THE DIFFERENCE IS TWO FALSE CLAIMS — `041-PARKSTUCK` verification
+   * NEW-3.** `BLOCKED`'s header says the messages *"ARE recorded in the conversation's hash chain"*
+   * and *"the sender WAS acknowledged"*. Both are true of the LIVE inbound screener, which leafs at
+   * a canonical position and acks. Both are false on the park route: the conversation is already
+   * closed, so appending is precisely what that branch exists to avoid, and deleting a mailbox blob
+   * is not an acknowledgement to the sender. Reusing the kind imported a header that contradicted
+   * the notice printed underneath it.
+   */
+  WITHHELD: "withheld",
 } as const;
 
 export type RefusalKind = (typeof REFUSAL_KINDS)[keyof typeof REFUSAL_KINDS];
@@ -124,6 +137,13 @@ export const REFUSAL_KIND_GUIDANCE: Record<RefusalKind, string> = {
     "not be written to local storage, so they can never be delivered. THIS IS A FAULT ON THIS " +
     "MACHINE, not a quiet counterparty. Waiting cannot recover them; the text is gone and only its " +
     "hash remains. Fix the local fault named below, then ask them to resend.",
+  [REFUSAL_KINDS.WITHHELD]:
+    "Message(s) aimed at this agent were refused by its screener and are being WITHHELD from you. " +
+    "Unlike a blocked message on a live conversation, NOTHING was recorded and the sender was NOT " +
+    "acknowledged — these arrived for a conversation that had already closed, so there was nothing " +
+    "to add them to. They were never shown to the agent, and that is the protection working. The " +
+    "bytes are kept so you can produce them; do not turn screening off to read them, and do not " +
+    "tell the sender what was caught.",
   [REFUSAL_KINDS.OUTBOUND]:
     "NOTHING WAS REFUSED BY THIS AGENT — this is the other direction. A message YOU sent did not get " +
     "through, and could not be saved to send later, so it is gone. Do not go to the counterparty " +

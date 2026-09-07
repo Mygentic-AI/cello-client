@@ -105,7 +105,13 @@
     // weeks because `undefined` is a usable Map key and no compiler reads that file.
     "src/__tests__/dod-m15-no-silent-refusal-1.test.ts",
     // `041-PARKSTUCK`'s own two files. New and clean on creation, which is this list's admission
-    // criterion — and the trap written three times above caught me on the way in AGAIN. The root
+    // criterion — and the trap written three times above caught me on the way in AGAIN.
+    // ⚠️ AND SAY WHAT IT DOES NOT BUY (verification NEW-5): `m12-p17-annex-screening.test.ts` binds
+    // its harness as `sessionNodeManager as never`, so being in this list does NOT check that stub
+    // against the real SessionNodeManager. getSessionRecord, getSessionContentSaltState,
+    // noteContentRefusal and the `retained` field can all drift from the real signatures with the
+    // file inside the allowlist. The list buys type-checking of the test's OWN code, not of the
+    // fake it drives — a distinction worth stating, because "it is in the list" reads as more. The root
     // typecheck reported exit 0 over five call sites omitting a REQUIRED `errorDetail` field, and a
     // deliberate `const x: number = "not a number"` appended to the same file ALSO reported exit 0.
     // Without that positive control I would have read a green gate as evidence the notice contexts

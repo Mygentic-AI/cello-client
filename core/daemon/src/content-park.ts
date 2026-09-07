@@ -368,6 +368,16 @@ export function createContentPark(deps: ContentParkDeps) {
         // That exact confusion was injected and the test goes red on it.
         let annexed = false;
         let screenedOut = false;
+        /**
+         * Did the terminal-screen branch actually KEEP the bytes? — verification NEW-2, which is
+         * H1's defect one branch over and in the code H1 was written for.
+         *
+         * `quarantineRefusedInbound` answers `null` on the same four reachable paths, and this
+         * branch confirm-deleted the relay copy regardless while its notice said "It is KEPT as
+         * evidence" unconditionally. Declared out here rather than inside the `try` so the delete
+         * and the notice can both read it.
+         */
+        let screenRetained = false;
         let screenDeferred = false;
         /**
          * WHY the entry is stuck, for the caller — review B2a F5.
@@ -578,6 +588,7 @@ export function createContentPark(deps: ContentParkDeps) {
                 env.senderPubkey ? Buffer.from(env.senderPubkey).toString("hex") : null,
                 correlationId,
               );
+              screenRetained = kept !== null;
               logger.warn("content.recover.annex.screened_out", {
                 sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
                 retained: kept !== null,
@@ -631,14 +642,34 @@ export function createContentPark(deps: ContentParkDeps) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
         } else if (screenedOut) {
-          // Terminal block: identical bytes are rejected identically forever, so the relay copy goes
-          // or the re-pull loop returns. The content is retained as quarantined evidence above.
+          /**
+           * Terminal block: identical bytes are rejected identically forever, so the relay copy goes
+           * or the re-pull loop returns.
+           *
+           * ⚠️ **AND ONLY IF THE BYTES WERE ACTUALLY KEPT — verification NEW-2.** This deleted
+           * unconditionally while asserting "retained as quarantined evidence above", which is H1's
+           * defect reproduced in the branch H1 was written for. Screener-blocked content aimed at a
+           * closed conversation is the highest-value evidence in the product; losing it because the
+           * quarantine was full is the one outcome worse than it arriving again.
+           */
           let screenReleased = false;
-          try {
-            await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
-            screenReleased = true;
-          } catch (err: unknown) {
-            logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+          if (screenRetained) {
+            try {
+              await client.confirm(node, Buffer.from(recipientPubkey, "hex"), contentHashBytes, kp);
+              screenReleased = true;
+            } catch (err: unknown) {
+              logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
+            }
+          } else {
+            logger.warn("content.recover.release.withheld", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              reason: PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT,
+              impact:
+                "screener-blocked content could NOT be retained locally — see session.content.quarantine.skipped or .failed above — so the relay copy is KEPT rather than deleted. It will arrive and be blocked again, which is the lesser harm: deleting it would destroy the only record that this was ever sent.",
+              guidance:
+                "Free space for this conversation and the copy is retained on a later drain. cello_quarantined shows what it is already holding.",
+              correlationId,
+            });
           }
           /**
            * ⚠️ **THIS BRANCH TOLD THE OPERATOR NOTHING — review M9.**
@@ -657,7 +688,7 @@ export function createContentPark(deps: ContentParkDeps) {
           noteParkRefusal(
             recipientAgent.name, e.sessionIdHex, e.contentHashHex,
             PARK_REFUSAL_REASONS.ANNEX_SCREENED_OUT,
-            { sessionStatus, released: screenReleased, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
+            { sessionStatus, released: screenReleased, retained: screenRetained, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
           );
         } else if (screenDeferred) {
           refusals.push(

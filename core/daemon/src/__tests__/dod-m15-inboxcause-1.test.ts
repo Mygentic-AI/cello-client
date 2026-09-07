@@ -157,14 +157,29 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
       "no refusals.push( in content-park.ts — this check is reasoning about code that is not there",
     ).toBeGreaterThan(0);
 
-    const offenders = (text.match(/refusals\.push\(\s*\{[^}]*\}/g) ?? []).filter((push) =>
-      ALL_PARK_REASONS.some((r) => push.includes(r)) || push.includes("PARK_REFUSAL_REASONS."),
+    /**
+     * ⚠️ **INVERTED, because the first version missed the shape it was written for — verification
+     * NEW-4.** It flagged a push only when the push TEXT contained a reason string or the constant
+     * prefix, so a push carrying the reason in a VARIABLE sailed through — and a variable is exactly
+     * what the code did before this fix (`reason: stuckReason`), and the likeliest shape for a new
+     * branch. The claim in the test name was stronger than what it checked, and none of the mutants
+     * exercised its negative path: a checker that has never been made to fail is indistinguishable
+     * from one that cannot.
+     *
+     * So it asserts the WHOLE-LIST property instead of hunting for known-bad text. Every push must
+     * either hand over `noteParkRefusal(`'s return value, or be the one passthrough that carries
+     * ingest's own reason — which has its own operator surface in `session-content-ingest.ts` and
+     * is not a park reason at all.
+     */
+    const pushes = text.match(/refusals\.push\(\s*[\s\S]{0,160}?\)/g) ?? [];
+    const offenders = pushes.filter(
+      (push) => !push.includes("noteParkRefusal(") && !push.includes("ingest.reason"),
     );
     expect(
       offenders,
-      `A park refusal reason is pushed to the drain's refusal list without going through ` +
-        `noteParkRefusal, so the IPC caller is told and the OPERATOR is not: ${offenders.join(" | ")}. ` +
-        `Push the helper's return value instead — it writes the notice first.`,
+      `A refusal record reaches the drain's list without going through noteParkRefusal, so the IPC ` +
+        `caller is told and the OPERATOR is not: ${offenders.join(" | ")}. Push the helper's return ` +
+        `value — it writes the notice first, which is what makes the pairing impossible to forget.`,
     ).toEqual([]);
   });
 
@@ -191,7 +206,16 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
      * A remedy whose action the reader has already taken is worse than none: it spends the trust
      * they would have brought to the next notice. The notice knows the status; it must use it.
      */
-    const forbidden = /close (it|this|the) (session|conversation)|start a new one|cello_close_session/i;
+    /**
+     * ⚠️ **WIDENED BY VERIFICATION NEW-1, WHICH THIS REGEX WALKED PAST.** It iterated exactly the
+     * right combinations and grepped only the "close it" family — so when the release gate gained
+     * two conditions, two new paths into the non-released guidance started telling operators to
+     * *"be online at the same time as your counterparty"* on a `sealed` conversation, and *"if it
+     * never reopens"* about one that cannot. Naming an action the reader cannot perform is the same
+     * defect as naming one they already took; the enforcer was only looking for one wording of it.
+     */
+    const forbidden =
+      /close (it|this|the) (session|conversation)|start a new one|cello_close_session|being online at the same time|if it never reopens|staying connected/i;
     for (const status of TERMINAL_SESSION_STATUSES) {
       for (const reason of ALL_PARK_REASONS) {
         for (const released of [true, false]) {
