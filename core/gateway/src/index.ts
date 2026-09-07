@@ -35,7 +35,7 @@ export { screenInboundLanguage } from "./detect/language.js";
 export type { LanguageVerdict, LanguageOptions, Script } from "./detect/language.js";
 export { InjectionScanner, scoreToVerdict, BLOCK_THRESHOLD, FLAG_THRESHOLD } from "./detect/injection-scanner.js";
 export type { InjectionClassifier, InjectionVerdict, ScanResult } from "./detect/injection-scanner.js";
-export { isModelInstalled, installModel, verifyModel, sha256File } from "./detect/model-installer.js";
+export { isModelInstalled, installModel, sha256File } from "./detect/model-installer.js";
 export type { InstallResult, InstallOptions } from "./detect/model-installer.js";
 export { DEBERTA_MODEL } from "./detect/deberta-model-manifest.js";
 export { loadInjectionClassifier } from "./detect/injection-classifier-onnx.js";

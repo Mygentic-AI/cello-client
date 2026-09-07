@@ -20,7 +20,6 @@ export type {
   IDirectoryChallengeVerifier,
 } from "./types.js";
 // PassthroughGatewayClient is at `@cello-protocol/daemon/testing`, not here (DOD-M9B-WIRE-1).
-export { ErrorCodes } from "./types.js";
 
 export { startDaemon, type DaemonHandle } from "./daemon.js";
 export { readLock, acquireLock, removeLock, removeLockIfOwned, isProcessAlive } from "./lock-file.js";
@@ -87,7 +86,6 @@ export {
 // trustless-cello's directory tests can drive a real DKG against a real directory.
 export {
   NetworkDirectoryNode,
-  bootstrapNetworkKeyShares,
   runNetworkDkg,
   runNetworkRefresh,
 } from "./network-directory-node.js";

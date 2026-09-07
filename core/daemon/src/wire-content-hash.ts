@@ -131,7 +131,3 @@ export function wireContentHash(content: Uint8Array): Uint8Array {
   return new Uint8Array(createHash("sha256").update(CONTENT_HASH_DOMAIN).update(content).digest());
 }
 
-/** The same value, hex — what the Merkle leaf records. */
-export function wireContentHashHex(content: Uint8Array): string {
-  return Buffer.from(wireContentHash(content)).toString("hex");
-}

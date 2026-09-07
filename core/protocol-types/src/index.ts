@@ -225,7 +225,6 @@ export {
   buildParkContentTbs,
   isContentDeliveryAck,
   isContentResendRequest,
-  isContentParkDeposit,
 } from "./content-delivery.js";
 // M7-SESSION-003: Session-path liveness wire types + codec
 export type {

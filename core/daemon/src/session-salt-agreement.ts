@@ -125,13 +125,6 @@ export interface SaltAgreementFrame {
   adoptionClosed?: string;
 }
 
-/**
- * The state a peer announced that ends the agreement without a salt — Decision #8, review F1/F2.
- *
- * NOT a freeze. Both sides simply stay unsalted, which is exactly as verifiable as every session
- * shipped before the salt existed. The point is that they agree on it.
- */
-export const SALT_ADOPTION_CLOSED = "adoption_closed" as const;
 
 /**
  * WHY a side cannot adopt — a wire value, so it is a named constant rather than a literal typed out

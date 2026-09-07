@@ -254,13 +254,3 @@ export function isContentResendRequest(frame: unknown): frame is ContentResendRe
   );
 }
 
-export function isContentParkDeposit(frame: unknown): frame is ContentParkDeposit {
-  if (frame === null || typeof frame !== "object") return false;
-  const f = frame as Record<string, unknown>;
-  return (
-    f["type"] === "content_park_deposit" &&
-    hasBytes(f["recipient_pubkey"]) &&
-    hasBytes(f["content_hash"]) &&
-    hasBytes(f["ciphertext"])
-  );
-}

@@ -719,16 +719,3 @@ export interface SessionListResponse {
   sessions: SessionListEntry[];
 }
 
-// --- Error codes ---
-
-export const ErrorCodes = {
-  DAEMON_LOCK_STALE_REMOVED: "daemon_lock_stale_removed",
-  DAEMON_SOCKET_BIND_FAILED: "daemon_socket_bind_failed",
-  AGENT_LOAD_FAILED: "agent_load_failed",
-  IPC_CONNECTION_LIMIT: "ipc_connection_limit",
-  CONNECTION_VALIDATION_TIMEOUT: "connection_validation_timeout",
-  DIRECTORY_UNREACHABLE_AT_LOGIN: "directory_unreachable_at_login",
-  MAX_SESSIONS_REACHED: "max_sessions_reached",
-  SESSION_NODE_CREATION_FAILED: "session_node_creation_failed",
-  STANDING_RECEIVER_UNAVAILABLE: "standing_receiver_unavailable",
-} as const;

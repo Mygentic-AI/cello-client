@@ -45,9 +45,13 @@ describe("MCP-001 AC-017/SI-002: no crypto imports in adapter", () => {
     expect(src).not.toContain("SQLCipherClientStore");
   });
 
-  it("cello-mcp.ts does not import bootstrapNetworkKeyShares", () => {
+  // Was `bootstrapNetworkKeyShares` until 2026-09-07. That function has been DELETED as dead, so the
+  // assertion could never fail again — a guard naming something that cannot exist is not a guard.
+  // Repointed at `runNetworkDkg`, the real ceremony entry point, which is the thing that must stay
+  // out of the shim: the shim proxies to the daemon and must never run a DKG in its own process.
+  it("cello-mcp.ts does not import runNetworkDkg — the ceremony belongs to the daemon", () => {
     const src = readFileSync(join(adapterSrcDir, "cello-mcp.ts"), "utf8");
-    expect(src).not.toContain("bootstrapNetworkKeyShares");
+    expect(src).not.toContain("runNetworkDkg");
   });
 
   it("cello-mcp.ts does not import deriveDbKey", () => {

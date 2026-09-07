@@ -74,13 +74,16 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
    * run, and two of them are findings in their own right rather than exceptions.
    */
   const EXEMPT: Record<string, string> = {
-    wireContentHashHex: "not wiring — 'wire' here means the wire format. Separately: it is DEAD, no caller in either repo.",
-    // Test seams, not dead-but-tolerated. Both are reachable ONLY from `__tests__`, which this scan
-    // deliberately does not read: counting a test as a caller is how a deleted production call site
-    // reads green, which is the entire failure this guard exists for. So they cannot be discovered,
-    // and they cannot be silently dropped either — naming them here is the record.
+    // A test seam, not dead-but-tolerated: reachable ONLY from `__tests__`, which this scan
+    // deliberately does not read — counting a test as a caller is how a deleted production call site
+    // reads green, which is the entire failure this guard exists for. So it cannot be discovered,
+    // and it cannot be silently dropped either; naming it here is the record.
+    //
+    // Two entries left with it on 2026-09-07 by being DELETED rather than exempted:
+    // `wireContentHashHex` (a homonym — `wire` the noun) and `bootstrapNetworkKeyShares` (which threw
+    // "uses trustedDealer which is test-only" as its first statement). Both were dead in both repos.
+    // An EXEMPT entry is where a discovery goes to be forgotten; deleting is the better close.
     openEncryptedDatabaseAtPath: "test seam — production opens via openEncryptedDatabase(celloDir); only __tests__ (both repos) pass an explicit path.",
-    bootstrapNetworkKeyShares: "test-only BY ITS OWN GUARD — network-directory-node.ts throws 'uses trustedDealer which is test-only' before doing anything. Re-exported from index.ts for tests; no production caller in either repo.",
   };
 
   function sourcesUnder(dir: string): string[] {
@@ -189,11 +192,11 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
      *
      * Raise the number deliberately when a module is added. That is what makes a DROP visible.
      */
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(96);
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(94);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
-    ).toBe(3);
+    ).toBe(1);
   });
 
   for (const name of checked) {

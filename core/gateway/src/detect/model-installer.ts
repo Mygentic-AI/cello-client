@@ -38,16 +38,6 @@ export async function isModelInstalled(dir: string): Promise<boolean> {
   return true;
 }
 
-/** Re-verify the pinned-SHA files of an existing install. Returns the first mismatch, or null. */
-export async function verifyModel(dir: string): Promise<{ ok: true } | { ok: false; badFile: string }> {
-  for (const f of DEBERTA_MODEL.files) {
-    if (!f.sha256) continue;
-    const got = await sha256File(join(dir, f.path)).catch(() => "");
-    if (got !== f.sha256) return { ok: false, badFile: f.path };
-  }
-  return { ok: true };
-}
-
 export interface InstallResult {
   installed: boolean;
   /** true when the model was absent and consent was withheld — nothing was downloaded. */

@@ -22,7 +22,9 @@
  *   - If DKG fails / below threshold → register_error { reason: 'dkg_failed' }
  *
  * CLIENT → DIRECTORY (after local DKG participation):
- *   3. Client runs bootstrapNetworkKeyShares (or createInProcessStubs in test) → primary_pubkey
+ *   3. Client runs runNetworkDkg (or createInProcessStubs in test) → primary_pubkey
+ *      (this said bootstrapNetworkKeyShares until 2026-09-07; that was the trustedDealer
+ *      test shortcut, which threw outside NODE_ENV=test and has now been deleted as dead)
  *   4. Client sends dkg_complete { primary_pubkey }
  *
  * DIRECTORY verifies dkg_complete:

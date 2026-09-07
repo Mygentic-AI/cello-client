@@ -16,7 +16,6 @@ import { encodeCbor } from "@cello-protocol/protocol-types";
 import * as lp from "it-length-prefixed";
 import { ed25519_FROST, FrostThresholdSigner } from "@cello-protocol/crypto";
 import {
-  bootstrapKeyShares,
   storeDkgResult,
   getClientFrostIdentifier,
   getClientRefreshRoster,
@@ -29,7 +28,6 @@ import type {
   DirectoryNodeStub,
   StubCommitment,
   StubSignParams,
-  BootstrapResult,
 } from "@cello-protocol/crypto/frost/types.js";
 
 const NOOP_LOGGER: Logger = {
@@ -598,59 +596,6 @@ function parseU8Array(v: unknown): Uint8Array[] | null {
     result.push(b);
   }
   return result;
-}
-
-// ─── bootstrapNetworkKeyShares ────────────────────────────────────────────────
-
-/**
- * Network-aware FROST bootstrap for live e2e mode.
- *
- * Runs trustedDealer locally, then pushes each directory node's share over the
- * /cello/frost/1.0.0 network protocol. Returns a FrostThresholdSigner configured
- * to use NetworkDirectoryNodes, plus the primaryPubkey.
- *
- * TEST-ONLY: this uses the trustedDealer shortcut, so it is guarded by NODE_ENV=test. The production
- * path is runNetworkDkg.
- */
-export async function bootstrapNetworkKeyShares(
-  agentPubkey: Uint8Array,
-  opts: {
-    threshold: number;
-    participants: number;
-    directoryNodes: NetworkDirectoryNode[];
-  },
-): Promise<{ signer: FrostThresholdSigner; primaryPubkey: Uint8Array }> {
-  // bootstrapKeyShares uses trustedDealer — a test-harness shortcut, not a real DKG. This function
-  // inherits that constraint, so it must never run outside tests.
-  if (process.env.NODE_ENV !== "test") {
-    throw new Error("bootstrapNetworkKeyShares uses trustedDealer which is test-only. Real DKG (M3) required in production.");
-  }
-  const agentPubkeyHex = Buffer.from(agentPubkey).toString("hex");
-  const epochId = `${agentPubkeyHex}:epoch:1`;
-
-  // Set context on all nodes so receiveShare knows which agent/epoch to use
-  for (const node of opts.directoryNodes) {
-    node.setBootstrapContext(agentPubkeyHex, epochId);
-  }
-
-  // bootstrapKeyShares runs trustedDealer and calls node.receiveShare() on each node.
-  // For NetworkDirectoryNode, receiveShare() sends the share over the network.
-  const result: BootstrapResult = await bootstrapKeyShares(agentPubkey, {
-    threshold: opts.threshold,
-    participants: opts.participants,
-    directoryNodeStubs: opts.directoryNodes,
-  });
-
-  const signer = new FrostThresholdSigner(
-    {
-      threshold: opts.threshold,
-      participants: opts.participants,
-      directoryNodeStubs: opts.directoryNodes,
-    },
-    agentPubkey,
-  );
-
-  return { signer, primaryPubkey: result.primaryPubkey };
 }
 
 // ─── runNetworkDkg ─────────────────────────────────────────────────────────────
