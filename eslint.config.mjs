@@ -156,7 +156,7 @@ export default [
   },
   {
     files: ["core/daemon/src/signal-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 1088, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1087, skipBlankLines: false, skipComments: false }] },
   },
   {
     /**
