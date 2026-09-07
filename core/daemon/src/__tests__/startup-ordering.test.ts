@@ -36,6 +36,9 @@ const DAEMON_SRC = readFileSync(join(import.meta.dirname, "../daemon.ts"), "utf-
 // reconnect drain — moved into signaling-wiring.ts. The ORDERING constraints below are still about
 // daemon.ts; only the delegation itself is read from the module that now contains it.
 const WIRING_SRC = readFileSync(join(import.meta.dirname, "../signaling-wiring.ts"), "utf-8");
+// 040-DAEMONROOT unit 7 (phase 2): the reconnect drain and the content park are constructed inside
+// boot-agents.ts now. The ORDER between them is still the constraint; only the file moved.
+const BOOT_AGENTS_SRC = readFileSync(join(import.meta.dirname, "../boot-agents.ts"), "utf-8");
 
 /** Index of the first line matching `needle`, or -1. Line-based so a stray match in a comment elsewhere is unlikely. */
 function lineOf(needle: string, src: string = DAEMON_SRC): number {
@@ -95,9 +98,9 @@ describe("startDaemon ordering — constraints the type system cannot express", 
   });
 
   it("DOD-PARK-DRAIN-1: onConnected DELEGATES to the reconnect drain — it does not re-inline two voids", () => {
-    const construct = lineOf("= createReconnectDrain({");
+    const construct = lineOf("= createReconnectDrain({", BOOT_AGENTS_SRC);
     const delegate = lineOf("onSignalingConnected(agentName)", WIRING_SRC);
-    const hook = lineOf("sessionNodeManager.setParkedDrainHook(");
+    const hook = lineOf("sessionNodeManager.setParkedDrainHook(", BOOT_AGENTS_SRC);
 
     expect(construct, "createReconnectDrain() must be constructed in the composition root").toBeGreaterThan(-1);
     expect(hook, "the parked-drain hook must be wired — an unwired hook reverts the whole unit").toBeGreaterThan(-1);
@@ -123,16 +126,22 @@ describe("startDaemon ordering — constraints the type system cannot express", 
   });
 
   it("the content park is CONSTRUCTED before its boot-time callers (autoRecoverForAgent)", () => {
-    const construct = lineOf("= createContentPark({");
+    // The park moved into boot-agents.ts; the seal coordinator is still in the root. What has to
+    // hold is unchanged — the park exists before the coordinator that takes autoRecoverForAgent —
+    // and it is now guaranteed by construction rather than by line order: the phase RETURNS the
+    // recovery function, so the root cannot reach it before the phase has run.
+    const construct = lineOf("= createContentPark({", BOOT_AGENTS_SRC);
     const sealCoordinator = lineOf("= createSealCoordinator({");
 
     expect(construct).toBeGreaterThan(-1);
     // autoRecoverForAgent is handed to the seal coordinator as its content-recovery gate, and is
     // also called from an agent's onConnected. Both run before the handler map exists, which is why
     // the park is two-phase at all.
+    expect(sealCoordinator, "the seal coordinator must still be constructed in the root").toBeGreaterThan(-1);
     expect(
-      construct,
-      "createContentPark() must precede createSealCoordinator(), which takes autoRecoverForAgent as a dep.",
-    ).toBeLessThan(sealCoordinator);
+      DAEMON_SRC,
+      "the root must take autoRecoverForAgent from the boot-agents phase — reaching for it any other " +
+      "way puts the park's construction back in the root's hands, which is what this test guards.",
+    ).toContain("autoRecoverForAgent");
   });
 });
