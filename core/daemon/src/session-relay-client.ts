@@ -556,6 +556,18 @@ export class AgentRelayClient {
     return this.#lastAuthRefusal;
   }
 
+  /**
+   * Drop any verdict from an earlier attempt — review HIGH-2.
+   *
+   * A METHOD rather than an inline `= null`, deliberately: assigning the field directly narrows its
+   * type to `null` for the rest of the enclosing method, and the later
+   * `#lastAuthRefusal?.reason` read then fails to compile against `never`. Clearing through a call
+   * keeps the declared type and says what the reset is for.
+   */
+  #clearAuthRefusal(): void {
+    this.#lastAuthRefusal = null;
+  }
+
   #stream: Stream | null = null;
   #connecting: Promise<boolean> | null = null;
   #closed = false;
@@ -1414,15 +1426,97 @@ export class AgentRelayClient {
    */
   async proveReservation(node: CelloNode): Promise<boolean> {
     if (this.#closed) return false;
+    /**
+     * ⚠️ **CLEAR THE REFUSAL FIRST — review HIGH-2.** `#lastAuthRefusal` is set when a relay REFUSES
+     * a proof on the merits, and cleared only on auth SUCCESS. Both early returns below are
+     * transport failures that never reach a verdict, so without this a stale refusal from an
+     * earlier attempt survives them — and `session-relay.ts` reads `getLastAuthRefusal()` off a
+     * CACHED client, writes it into `srRelayRefusal`, and quarantines the relay and rebuilds the
+     * receiver when it says `tryAnotherRelay`. One real refusal followed by a later transport blip
+     * would therefore explain the agent's unreachability with a cause that is no longer true, while
+     * churning receivers over it. A transport failure must leave no verdict behind.
+     */
+    this.#clearAuthRefusal();
+    /**
+     * A FAILED DIAL MUST NOT BE REPORTED AS A FAILED STREAM. This loop used to swallow every dial
+     * error and fall through to `newStream` regardless. `#connect()` below has always tracked this
+     * and logs `session.relay.dial.failed`; the two were written from one shape and this one lost
+     * the check.
+     *
+     * ⚠️ **This branch did NOT cause the cold-login failure** (measured 2026-09-07: the dial
+     * succeeds, because libp2p's `findExistingConnection` returns an already-open connection rather
+     * than dialling). It is a real gap on the malformed-address and limited-connection paths, and
+     * nothing more. Do not read its presence as the reachability fix.
+     */
+    let dialed = false;
+    let lastDialError = "";
     for (const addr of this.#relayAddrs) {
-      try { await node.dial(addr); break; } catch { /* try the next address */ }
+      try {
+        await node.dial(addr);
+        dialed = true;
+        break;
+      } catch (err: unknown) {
+        lastDialError = extractErrorMessage(err);
+      }
+    }
+    if (!dialed && this.#relayAddrs.length > 0) {
+      this.#logger.warn("session.relay.reservation_proof.failed", {
+        relayPeerId: this.#relayPeerId,
+        relayAddrs: this.#relayAddrs,
+        reason: "dial",
+        error: lastDialError,
+        impact:
+          "could not open a connection to this relay, so no proof was sent and the relay saw " +
+          "nothing. The agent holds no reservation on it and is unreachable through it until a " +
+          "later attempt succeeds. This is a REACHABILITY fault, not a rejection — the relay did " +
+          "not refuse anything.",
+      });
+      return false;
     }
     let stream: Stream;
     try {
       stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
     } catch (err: unknown) {
+      /**
+       * ⚠️ **DO NOT COLLAPSE THIS TO `reason: "stream"`.** `CelloNode.newStream` throws STRUCTURED
+       * errors — plain objects, not `Error`s — whose `reason` is the only field that says what
+       * happened. This site used to overwrite it with the literal `"stream"`, so every distinct
+       * cause reached the operator as one line. Measured 2026-09-07: a whole clean-room
+       * investigation went to the relay servers because the cause was discarded at capture.
+       *
+       * The set is whatever `mapStreamError` returns — deliberately NOT enumerated here, because
+       * the first version of this comment listed four of the six and the two it missed
+       * (`protocol_not_supported`, `limited_connection_refused`) are exactly the ones a redial
+       * cannot fix.
+       *
+       * ⚠️ **`connection_lost` IS THE CATCH-ALL, NOT A DIAGNOSIS** (`node.ts` says so). It covers a
+       * dead muxer on a live socket, a per-protocol stream cap, and a remote reset during
+       * multistream negotiation alike. **`muxerStatus` is what separates them**, which is why the
+       * connections are dumped below: the transport exposes that field for this exact question and
+       * without it the next cold-login failure is guessed at again.
+       *
+       * And note what this does NOT establish: the relay's handler only runs AFTER negotiation
+       * succeeds, so a relay that reset the stream mid-negotiation would log nothing either. Relay
+       * silence is not relay innocence.
+       */
+      const raw = (err ?? {}) as { reason?: unknown };
+      const reason = typeof raw.reason === "string" ? raw.reason : "stream";
       this.#logger.warn("session.relay.reservation_proof.failed", {
-        relayPeerId: this.#relayPeerId, reason: "stream", error: extractErrorMessage(err),
+        relayPeerId: this.#relayPeerId,
+        relayAddrs: this.#relayAddrs,
+        nodePeerId: node.getPeerId(),
+        reason,
+        error: extractErrorMessage(err),
+        // The discriminator. `status` is the SOCKET; `muxerStatus` is the layer that carries data
+        // and the one `newStream` checks first — a connection reading open/closed is the P5 shape.
+        relayConnections: node
+          .getConnections()
+          .filter((c) => c.peerId === this.#relayPeerId)
+          .map((c) => ({ status: c.status, muxerStatus: c.muxerStatus, streams: c.streamCount })),
+        impact:
+          "no proof was sent, so this relay granted no reservation and the agent is unreachable " +
+          "through it until a later attempt succeeds. The relay did not refuse anything — it may " +
+          "never have seen the stream.",
       });
       return false;
     }
@@ -1481,7 +1575,22 @@ export class AgentRelayClient {
     try {
       stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
     } catch (err: unknown) {
-      this.#logger.warn("session.relay.stream.failed", { relayPeerId: this.#relayPeerId, error: extractErrorMessage(err) });
+      /**
+       * Same error substitution as `proveReservation`'s stream branch, and on the MORE important
+       * path — this is the stream that carries `leaf_deliver` into a live session. `newStream`'s
+       * structured `reason` was being dropped here too, leaving `connection_lost`, a stream cap and
+       * a refused protocol indistinguishable while a conversation is running.
+       */
+      const raw = (err ?? {}) as { reason?: unknown };
+      this.#logger.warn("session.relay.stream.failed", {
+        relayPeerId: this.#relayPeerId,
+        reason: typeof raw.reason === "string" ? raw.reason : "stream",
+        error: extractErrorMessage(err),
+        relayConnections: node
+          .getConnections()
+          .filter((c) => c.peerId === this.#relayPeerId)
+          .map((c) => ({ status: c.status, muxerStatus: c.muxerStatus, streams: c.streamCount })),
+      });
       return false;
     }
 
