@@ -66,7 +66,21 @@ class FakeNode implements Partial<CelloNode> {
   getDialability(): { dialable: boolean; publicAddr: string | null } { return { dialable: false, publicAddr: null }; }
   onDialabilityChange(_l: (d: { dialable: boolean; publicAddr: string | null }) => void): () => void { return () => {}; }
   async newStream(_peer: string, _proto: string): Promise<Stream> {
-    return { send() {}, async close() {}, abort() {}, status: "open" } as unknown as Stream;
+    /**
+     * ASYNC-ITERABLE, because the relay client DECODES this stream and iterates it. Without the
+     * iterator the decode throws `TypeError: decode(...)[Symbol.asyncIterator] is not a function`
+     * from `#doSubmit`, which is fire-and-forget — so it surfaces as an UNHANDLED REJECTION that
+     * fails the whole vitest run (exit 1) while every test still reports green. Measured on CI run
+     * 34166481492: 5154 passed, `Errors 1 error`, nothing published.
+     *
+     * It yields nothing and ends, so the relay submit fails cleanly the way an unreachable relay
+     * does, instead of crashing the process. Tests that need a real submit must use a relay fixture;
+     * this one only needs the away path not to explode behind it.
+     */
+    return {
+      send() {}, async close() {}, abort() {}, status: "open",
+      async *[Symbol.asyncIterator]() { /* no frames: the relay never answers */ },
+    } as unknown as Stream;
   }
 }
 class FixedFactory implements ISessionNodeFactory {
