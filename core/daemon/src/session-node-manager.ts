@@ -89,7 +89,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
-import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, type ActiveSessionEntry, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
+import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
 // importer of session-node-manager.js keeps working, and no test moves an import path.
@@ -523,9 +523,9 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
   forgetSaltContributionForTest(agentName: string, sessionId: string): void { return this.#salts.forgetSaltContributionForTest(agentName, sessionId); }
   async contentHashForSession(agentName: string, sessionId: string, content: Uint8Array): Promise<{ hash: Uint8Array; alg: ContentHashAlg }> { return this.#salts.contentHashForSession(agentName, sessionId, content); }
   abandonUnsaltedHash(agentName: string, sessionId: string): void { return this.#salts.abandonUnsaltedHash(agentName, sessionId); }
-  isContentSaltActive(agentName: string, sessionId: string): boolean { return this.#salts.isContentSaltActive(agentName, sessionId); }  // Seams for the teardown-must-settle regression (037-SESSIONCORE): arm a pending salt
-  // agreement, then observe the outcome a dropped promise would leave unreachable.
-  markSaltPendingForTest(agentName: string, sessionId: string): void { return this.#salts.markSaltPending(agentName, sessionId); }
+  isContentSaltActive(agentName: string, sessionId: string): boolean { return this.#salts.isContentSaltActive(agentName, sessionId); }  // `expectSaltAgreement` is PRODUCTION (DOD-M15-AWAYSALT-1 — the away ack calls it before hashing);
+  // it also arms the teardown-must-settle regression seam (037-SESSIONCORE) below.
+  expectSaltAgreement(agentName: string, sessionId: string): void { return this.#salts.markSaltPending(agentName, sessionId); }
   saltForHashingForTest(agentName: string, sessionId: string): Promise<{ salt: Uint8Array | null; reason?: string }> { return this.#salts.saltForHashing(agentName, sessionId); }
 
   /**
@@ -2890,12 +2890,12 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     /**
    * TEST SEAM — put a session into the state a real one is in between announcing and being answered.
    *
-   * Reaching that state for real needs a live counterparty connection, which the daemon-level
-   * fixtures do not have; without a seam the wait could only be tested by not testing it. It calls
-   * the same private registration the announce path calls, so it cannot drift from it.
+   * Reaching that state for real needs a live counterparty connection, which the daemon-level fixtures
+   * do not have. It calls the same private registration the announce path calls, so it cannot drift.
    */
   markSaltAgreementPendingForTest(agentName: string, sessionId: string, boundMs?: number): void {
-    this.#salts.markSaltPending(agentName, sessionId, boundMs);
+    // ANNOUNCED, per this seam's contract above: "between ANNOUNCING and being answered" — AWAYSALT-1's speculative arm is the other state and settles differently.
+    this.#salts.markSaltPending(agentName, sessionId, boundMs, true);
   }
 
   getSessionContentSalt(agentName: string, sessionId: string): Uint8Array | null {
@@ -3013,7 +3013,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
      * the catch below rather than leaving a send to sit out the full bound for a frame that never
      * left.
      */
-    if (!frame.adoptionClosed) this.#salts.markSaltPending(agentName, sessionId);
+    if (!frame.adoptionClosed) this.#salts.markSaltPending(agentName, sessionId, SALT_AGREEMENT_WAIT_MS, true);
     // Held outside the try so the catch can retire a stream that was opened and then failed to
     // write — the same leak, and the same fix, as `#sendDeliveryAck` in `session-content-ingest.ts`.
     let saltStream: Stream | undefined;

@@ -40,7 +40,7 @@ describe("037-SESSIONCORE: a torn-down session settles its pending salt agreemen
 
     // Arm an agreement that will never be answered: this is the state every outbound send waits in
     // between announcing its half and hearing the peer's.
-    fx.snm.markSaltPendingForTest("alice", SID);
+    fx.snm.expectSaltAgreement("alice", SID);
 
     // The send starts waiting. It must not be awaited yet — the whole defect is that it never
     // settles, so awaiting here would hang the test rather than fail it.
@@ -71,7 +71,7 @@ describe("037-SESSIONCORE: a torn-down session settles its pending salt agreemen
   it("★ and it is told the SESSION went away, not that its counterparty refused", async () => {
     fx = await startTwoConnectionFixture();
     await fx.createSession(SID, "alice");
-    fx.snm.markSaltPendingForTest("alice", SID);
+    fx.snm.expectSaltAgreement("alice", SID);
 
     const inFlight = fx.snm.saltForHashingForTest("alice", SID);
     await fx.snm.destroySessionNode("alice", SID);

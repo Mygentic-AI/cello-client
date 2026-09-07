@@ -106,9 +106,16 @@ export class SessionSalts {
   /**
    * ─── B2b-2 state: what the SEND path needs that the row cannot answer ─────────────────────────
    *
-   * `#saltPending` — an agreement that has actually gone out and not yet been answered. The first
-   * send waits on it (constraint 2). Absent means *nothing is in flight*, which is not the same as
-   * "no salt": a park-only session never starts one at all, and must not wait (constraint 5).
+   * `#saltPending` — an agreement that is outstanding. The first send waits on it (constraint 2).
+   *
+   * ⚠️ THIS SAID "an agreement that has ACTUALLY GONE OUT", and constraint 5 read that a park-only
+   * session never starts one at all. DOD-M15-AWAYSALT-1 amended both: an away ack hashes BEFORE the
+   * peer can attach, so it arms one SPECULATIVELY with no frame sent — otherwise it hashes unsalted,
+   * closes adoption, and the session can never seal. Corrected rather than deleted, because the
+   * constraint underneath still holds and is load-bearing: a park-only session must not be made to
+   * WAIT the full bound for a peer that will never answer. What carries it now is the `announced`
+   * flag — a speculative arm that times out reports `no_agreement_started` (nobody was connected),
+   * never `agreement_timed_out` (they ignored us), and stays silent.
    *
    * `#hashedWithoutSalt` — this session has already computed an unsalted content hash. Decision #8
    * closes adoption at the moment content is HASHED, and for a session's first message that is a
@@ -128,6 +135,14 @@ export class SessionSalts {
     resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed") => void;
     timer: ReturnType<typeof setTimeout>;
     boundMs: number;
+    /**
+     * DOD-M15-AWAYSALT-1 — did a frame ACTUALLY go out, or was this armed speculatively by a hash
+     * that ran before the peer could attach? Only `#sendSaltFrame` sets it. At hash time the two are
+     * indistinguishable (both have a node and a counterparty peer id — measured), but at SETTLE time
+     * they are not, and they deserve different answers: a speculative arm that times out means the
+     * counterparty was never connected, which is `no_agreement_started`, not a peer who ignored us.
+     */
+    announced: boolean;
   }>();
   /**
    * HOW THE LAST AGREEMENT ENDED, kept after `#saltPending` is cleared.
@@ -512,9 +527,10 @@ export class SessionSalts {
    *   2. Adoption is closed — this session has hashed or leafed something already, so a salt could
    *      never be adopted now even if one arrived. Waiting would be waiting for a value we would
    *      then have to refuse.
-   *   3. Nothing is pending. **This is the park-only case (constraint 5)**: the announcement hangs
-   *      off `onPeerConnect`, an offline counterparty never connects, so no agreement was ever
-   *      started. Waiting the full bound there pauses every message to an offline peer and falls
+   *   3. Nothing is pending. **The park-only case (constraint 5)**: the announcement hangs off
+   *      `onPeerConnect`, an offline counterparty never connects, so no agreement was ever started.
+   *      (An away ack now ARMS one speculatively — see `markSaltPending` — so it reaches exit 4 and
+   *      settles `no_agreement_started` on timeout, which is this same answer by a slower road.) Waiting the full bound there pauses every message to an offline peer and falls
    *      back anyway — a stall bought for nothing.
    *
    * Only a session with an agreement actually in flight waits, and only until it settles or the
@@ -597,6 +613,17 @@ export class SessionSalts {
           : UNSALTED_REASONS.SESSION_TORN_DOWN,
       };
     }
+    if (settled === "timeout" && !pending.announced) {
+      /**
+       * DOD-M15-AWAYSALT-1 review HIGH-2 — NOTHING WAS EVER ANNOUNCED, so this is not a counterparty
+       * who failed to answer. It is the park-only case: the operator is leaving a message for someone
+       * who is offline, which is the DESIGNED benign path. Reporting `agreement_timed_out` here
+       * substitutes a diagnosis — its guidance sends the operator to ask a perfectly up-to-date
+       * counterparty to upgrade — and, because it fires on the normal case, buries the one occurrence
+       * that means something. Silent for the same reason: `session.content.unsalted` already says it.
+       */
+      return { salt: null, reason: UNSALTED_REASONS.NO_AGREEMENT_STARTED };
+    }
     if (settled === "timeout") {
       /**
        * A DECISION, NOT A RETRY. Logged once, here, because this is the moment the session became
@@ -642,16 +669,66 @@ export class SessionSalts {
    * Called where we announce our own state — not at session creation. That distinction is
    * constraint 5: an agreement exists to be waited for only once a frame has actually gone out.
    */
-  markSaltPending(agentName: string, sessionId: string, boundMs = SALT_AGREEMENT_WAIT_MS): void {
+  /**
+   * ─── DOD-M15-AWAYSALT-1: WHO IS ALLOWED TO SAY "AN AGREEMENT IS COMING" ────────────────────────
+   *
+   * `saltForHashing` waits for an agreement ONLY when one is marked pending here. For a long time the
+   * only production caller was `#sendSaltFrame`, which fires on peer ATTACH — and that is later than
+   * the inbound session REQUEST which triggers an away auto-reply. So the away ack hashed with
+   * nothing pending, took `NO_AGREEMENT_STARTED`, and hashed UNSALTED.
+   *
+   * One unsalted leaf closes salt adoption for the entire session (`already_hashing`), permanently.
+   * The initiator, meanwhile, derives a salt, cannot erase it (`session.salt.split`,
+   * `suspended_but_unerasable`) and keeps labelling content `hmac-sha256-salt-v1` — which this side
+   * can then only refuse. Every message from the initiator is quarantined
+   * (`content_hash_salt_unavailable`), and the session can never seal.
+   *
+   * Measured 2026-09-07 on session 436c92f4, on the DEFAULT path (initiate to an unattended agent):
+   * the ack hashed at 22:48:03.752, the peer announced at 22:48:04.561 — 0.8s late — and the
+   * operator's first real message was quarantined. Nothing recovers it; the guidance on
+   * `session.salt.split` says to start a new session, and a new session repeats the race.
+   *
+   * So `expectSaltAgreement` on the manager now calls this BEFORE any early hash. It is idempotent
+   * (a second call is a no-op while one is outstanding) and bounded by the same `boundMs` timer as
+   * every other pending agreement, so a counterparty that never announces settles `timeout` and the
+   * content hashes unsalted exactly as it does today — the wait is a delay, never a failure.
+   *
+   * ⚠️ STILL OPEN: this covers the away reply, which is the only content this daemon emits before a
+   * peer can attach. Any FUTURE caller that hashes that early needs the same line, and nothing here
+   * enforces that.
+   */
+  markSaltPending(agentName: string, sessionId: string, boundMs = SALT_AGREEMENT_WAIT_MS, announced = false): void {
     const key = this.#ctx.sessionKey(agentName, sessionId);
-    if (this.#saltPending.has(key)) return;
+    const outstanding = this.#saltPending.get(key);
+    if (outstanding !== undefined) {
+      /**
+       * ⚠️ AN OUTSTANDING ENTRY IS UPGRADED, NEVER IGNORED — DOD-M15-AWAYSALT-1 review HIGH-1.
+       *
+       * This used to early-return. Once a speculative arm existed, the REAL announce that followed
+       * was a no-op — so the agreement inherited the speculative bound instead of its own, and a
+       * healthy-but-slow peer could time out inside it. That reproduces the exact defect this unit
+       * removes: unsalted ack, adoption closed, every later message quarantined, session unsealable.
+       *
+       * A bound may only GROW, and `announced` may only go true. Both are the safe direction: the
+       * cost of waiting longer is a delayed machine acknowledgement, the cost of waiting less is a
+       * session that can never seal.
+       */
+      if (announced && !outstanding.announced) outstanding.announced = true;
+      if (boundMs > outstanding.boundMs) {
+        clearTimeout(outstanding.timer);
+        outstanding.boundMs = boundMs;
+        outstanding.timer = setTimeout(() => this.settleSaltPending(agentName, sessionId, "timeout"), boundMs);
+        if (typeof outstanding.timer.unref === "function") outstanding.timer.unref();
+      }
+      return;
+    }
     let resolve: (v: "agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed") => void = () => { };
     const settled = new Promise<"agreed" | "timeout" | "closed" | "persist_failed" | "announce_failed">((r) => { resolve = r; });
     const timer = setTimeout(() => this.settleSaltPending(agentName, sessionId, "timeout"), boundMs);
     // The daemon must be able to exit with this outstanding — a pending agreement is not a reason to
     // hold the process open.
     if (typeof timer.unref === "function") timer.unref();
-    this.#saltPending.set(key, { settled, resolve, timer, boundMs });
+    this.#saltPending.set(key, { settled, resolve, timer, boundMs, announced });
   }
   /**
    * WHICH of the four terminal answers the peer actually gave — 006-CRYPTO finding 2.

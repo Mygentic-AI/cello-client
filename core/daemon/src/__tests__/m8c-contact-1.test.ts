@@ -318,7 +318,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
     h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: false });
@@ -354,12 +354,12 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     const strangerPubkey = fixtureIdentity().pubkeyHex;
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The stranger, still unknown, now says something on the session they just opened.
     const m1 = new TextEncoder().encode("from the stranger");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     /**
      * THE ASSERTION THAT FAILS ON A REVERT. Reverting sends "[[AUTO-REPLY]] Dispatched." twice, and
@@ -370,6 +370,74 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(events.find((e) => e.event === "session.away.response.suppressed_duplicate")?.context)
       .toMatchObject({ agentName: "bob", kind: "message" });
   });
+
+  it("DOD-M15-AWAYSALT-1: a LATE salt agreement still reaches the away ack, so adoption is never closed", async () => {
+    /**
+     * THE DEFECT, reproduced at the timing that produced it. `saltForHashing` waits for an agreement
+     * only when one is marked pending, and the only production caller that marked one was
+     * `#sendSaltFrame`, which fires on peer ATTACH. An away ack is triggered by the inbound session
+     * REQUEST, which is EARLIER — so it hashed unsalted, and that one leaf closes salt adoption for
+     * the whole session. The initiator (holding a salt it cannot erase) then labels every message
+     * `hmac-sha256-salt-v1`, which this side can only refuse: measured live 2026-09-07 on session
+     * 436c92f4, the ack hashed at 22:48:03.752 and the peer announced 0.809s later.
+     *
+     * So the peer's contribution is delivered LATE here, exactly as it arrives in production. Post-fix
+     * the ack is still waiting and the agreement completes. Pre-fix the ack has already hashed, and
+     * the same frame is refused `already_hashing` — which is the assertion that fails on a revert.
+     */
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
+
+    // The counterparty's half, arriving AFTER the request that triggers the ack — the live ordering.
+    await wait(400);
+    await snm.handleSaltFrameForTest("bob", SID_HEX, { contribution: new Uint8Array(32).fill(0x5a) });
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
+
+    /**
+     * THE REVERT ASSERTION. Pre-fix the ack has already hashed unsalted, so this frame arrives at a
+     * session that can never adopt and is refused `already_hashing`.
+     */
+    expect(
+      events.find((e) => e.event === "session.salt.adoption.refused"),
+      "the ack must not have closed adoption before the peer's contribution arrived",
+    ).toBeUndefined();
+    expect(events.find((e) => e.event === "session.salt.agreed")).toBeDefined();
+    // And the ack itself still exists — a wait that swallowed it would be worse than the bug fixed.
+    expect(snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent").length).toBe(1);
+  });
+
+  it("DOD-M15-AWAYSALT-1: a park-only session says NOBODY WAS CONNECTED, not that the peer ignored us", async () => {
+    /**
+     * REVIEW HIGH-2 — error substitution, on the most common away path there is. Leaving a message
+     * for an offline agent is the DESIGNED benign case: no peer ever attaches, so the speculative
+     * arm above times out. Reporting `agreement_timed_out` for that is a diagnosis this side cannot
+     * support — its guidance sends the operator to ask a perfectly up-to-date counterparty to
+     * upgrade — and because it fires on the normal case it also buries the occurrence that means
+     * something. The honest answer is the pre-fix one: nobody was connected.
+     */
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
+    await wait(6000); // no counterparty will ever announce: the speculative arm must time out
+
+    const unsalted = events.find((e) => e.event === "session.content.unsalted" && e.context["sessionId"] === SID_HEX);
+    expect(unsalted?.context["reason"], "nobody was connected — do not blame the counterparty").toBe("no_agreement_started");
+    // The WARN that tells the operator to chase a version mismatch must NOT fire on the benign path.
+    expect(events.find((e) => e.event === "session.salt.agreement.timeout")).toBeUndefined();
+  }, 15_000);
 
   it("DOD-M15-AWAYLEAF-1: a KNOWN contact with a CONFIGURED away message also gets ONE ack, not two", async () => {
     /**
@@ -393,10 +461,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     snm.setContactAwayMessage("bob", callerPubkey, "Back in an hour.");
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
     expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Back in an hour.")]);
@@ -422,10 +490,10 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     snm.addContact("bob", callerPubkey, undefined, null, TIER.KNOWN); // no configured message → per-kind defaults
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m1 = new TextEncoder().encode("from a known contact");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
     expect(sent.length, "two DIFFERENT acks must both be sent").toBe(2);
@@ -450,14 +518,14 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
 
     snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const m1 = new TextEncoder().encode("first");
     await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
     const m2 = new TextEncoder().encode("second, ignoring the one-shot rule");
     await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
-    await wait(200);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     // The one-shot rejection is reached on the SECOND message, exactly as it is without this fix.
     const rejected = events.filter((e) => e.event === "session.away.inbox.oneshot.rejected");
@@ -511,7 +579,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     // behaviour, but this fixture has no relay for it to park to, so nothing is recorded.
     h.getSessionNodeManager().setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
     injectRef.inject!(await assignmentFrame(knownPubkey, bobPubkey));
-    await wait(150);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const sentEvent = events.find((e) => e.event === "session.away.response.sent");
     expect(sentEvent?.context).toMatchObject({ kind: "request", isKnown: true });
@@ -546,7 +614,7 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     await snm.ingestReceivedContent("alice", SID_UNKNOWN, m1, msgLeafHash(m1), "c1");
     const m2 = new TextEncoder().encode("from known");
     await snm.ingestReceivedContent("alice", SID_KNOWN, m2, msgLeafHash(m2), "c2");
-    await wait(30);
+    await wait(5400); // AWAYSALT-1: a request-triggered ack may wait out the salt agreement first
 
     const unknownEvent = events.find((e) => e.event === "session.away.response.sent" && e.context.sessionId === SID_UNKNOWN);
     expect(unknownEvent?.context).toMatchObject({ kind: "message", isKnown: false });

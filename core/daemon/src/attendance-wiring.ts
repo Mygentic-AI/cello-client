@@ -362,6 +362,11 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       // system defaults (already marked at their source) do not pick up a second token.
       const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
         ?? systemAwayText(kind, agentName, isKnown);
+      // AWAYSALT-1 review MEDIUM-3: the salt wait widens the window in which BOTH acks are computed
+      // before either is a leaf, so the tree check below would pass both through. Claim the TEXT first.
+      const txtKey = `${agentName}:${sessionId}:txt:${awayText}`;
+      if (awayAckSent.has(txtKey)) { logger.info("session.away.response.suppressed_duplicate", { agentName, sessionId, kind, reason: "identical_ack_already_in_flight" }); return; }
+      awayAckSent.add(txtKey);
       const draftBytes = new TextEncoder().encode(awayText);
       // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
       // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn
@@ -390,19 +395,13 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       const contentBytes = new TextEncoder().encode(
         markAsAutoReply(new TextDecoder().decode(screenedBytes)),
       );
+      // AWAYSALT-1 — BEFORE hashing: unsalted here closes salt adoption for the whole session, and every later message from the peer is refused. See `markSaltPending`.
+      sessionNodeManager.expectSaltAgreement(agentName, sessionId);
       // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
       const away = await sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
-      /**
-       * DOD-M15-AWAYLEAF-1 — NEVER EMIT A LEAF THIS SESSION ALREADY HOLDS. An unattended agent acks
-       * twice (knock, then message), and the two are the SAME BYTES whenever the text does not vary
-       * by kind: the stranger default, and EVERY configured away message, since `resolveAwayMessage`
-       * above is kind-independent and overrides the per-kind default — so a known contact collides.
-       * The receiver separates duplicates by relay POSITION (DOD-FRONTIER-STRAND-1), but a parked
-       * predecessor routinely makes that record `unusable` and strips the position; it then dedups on
-       * content hash and records ONE where the sender counted two. Measured 2026-09-07, session
-       * 9b4d89f9: 4 against 3, refused `leaf_count_mismatch`; a leaf one side lacks is never co-signed.
-       * The TREE is the check: the same durable, per-session record the receiver itself dedups against.
-       */
+      // DOD-M15-AWAYLEAF-1 — the DURABLE half of the no-duplicate-leaf rule; `txtKey` is the in-flight
+      // half. Both acks carry the same bytes whenever the away text does not vary by kind, and a leaf
+      // only one side holds is never co-signed: measured on 9b4d89f9, 4 against 3, `leaf_count_mismatch`.
       const awayHashHex = Buffer.from(away.hash).toString("hex");
       if (sessionNodeManager.getSessionTree(agentName, sessionId).indexOfHash(awayHashHex) >= 0) {
         logger.info("session.away.response.suppressed_duplicate", {
@@ -414,8 +413,9 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), LEAF_KIND_MSG, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
-        // away period — clear the guard so the next inbound arrival retries the ack.
-        awayAckSent.delete(dedupKey);
+        // away period — clear the guard so the next inbound arrival retries the ack. Both guards:
+        // AWAYLEAF-1's in-flight claim would otherwise suppress the retry as its own duplicate.
+        awayAckSent.delete(dedupKey); awayAckSent.delete(txtKey);
         // M12-P13: this branch now means the reply is GONE, not merely late (the queued case is
         // handled below), so it is an error and it says what the consequence is. It was a bare warn
         // when it fired live on 2026-08-05 and read as routine churn.
