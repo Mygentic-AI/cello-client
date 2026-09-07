@@ -202,7 +202,14 @@ export class RefusalNotices {
             const r =
               row.lifetime_total === null || row.lifetime_first_at === null || row.lifetime_last_at === null
                 ? null
-                : refusalRecurrence(row.lifetime_total, row.lifetime_first_at, row.lifetime_last_at);
+                : refusalRecurrence(
+                    row.lifetime_total,
+                    row.lifetime_first_at,
+                    row.lifetime_last_at,
+                    // Review M5: the SAME flag the two fields above branch on. Reading it here is
+                    // what stops the sentence asserting a figure the row records as a floor.
+                    row.lifetime_seeded === 1,
+                  );
             return r === null ? {} : { recurrence: r };
           })(),
           ...(firstTime ? {} : { repeat: true }),

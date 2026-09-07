@@ -209,14 +209,52 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
 });
 
 describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence", () => {
-  it("★ 731 refusals over 64 hours reads as one loop every 5 minutes, not 731 events", () => {
+  it("★ 731 refusals over 64 hours reads as one recurring refusal every 5 minutes", () => {
     // The exact figures from the live daemon. `731` beside nothing is read as 731 things going
     // wrong; the row already held the span that says otherwise and nothing divided by it.
-    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000);
-    expect(r).toContain("731 times");
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
+    expect(r).toContain("731 TIMES");
     expect(r).toContain("about once every 5 minutes");
     expect(r).toContain("3 days");
-    expect(r, "and it must say the count is not a message count").toContain("NOT 731 SEPARATE EVENTS");
+    expect(r, "and it must say the count is one refusal recurring").toContain("ONE recurring refusal");
+  });
+
+  it("★ a SEEDED row is reported as a FLOOR, never as a figure", () => {
+    /**
+     * Review M5. A row seeded at upgrade takes its total from a notice's `count`, which resets on
+     * dismissal — so both the count and the span are lower bounds. The drain reports such a row as
+     * `times_total_at_least` five lines from where this sentence is built, and the first version
+     * asserted the same number as an exact figure right beside it.
+     *
+     * On the daemon this unit was written for the row IS seeded: the inbox reported
+     * `times_total_at_least: 731`.
+     */
+    const seeded = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
+    expect(seeded).toContain("AT LEAST 731 TIMES");
+    expect(seeded, "and it must say why the figure is a floor").toContain("may be far higher");
+
+    const exact = refusalRecurrence(731, 0, 64 * 3600 * 1000, false)!;
+    expect(exact, "an unseeded row is an exact count and must not hedge").not.toContain("AT LEAST");
+    expect(exact).not.toContain("may be far higher");
+  });
+
+  it("★ it does not claim the refusals are one message, nor that the loop will continue", () => {
+    /**
+     * Review M6, two claims the row cannot support.
+     *
+     * This function serves EVERY reason in the drain. A counterparty who keeps writing into a
+     * closed conversation produces N genuinely separate `session_committed` refusals, and the first
+     * version told the operator they were "NOT N SEPARATE EVENTS" — beside guidance saying the
+     * sender "may not realise it ended". Its own doc comment already said a reason can fire for
+     * several messages.
+     *
+     * And notices are durable and re-drained for every new consumer, so "it will keep firing until
+     * the cause is dealt with" prints long after a cause is resolved — including on the released
+     * message whose impact in the SAME row says it is gone and will stop being reported.
+     */
+    const r = refusalRecurrence(731, 0, 64 * 3600 * 1000, true)!;
+    expect(r, "a reason can fire for several different messages — the row cannot tell them apart").not.toContain("SEPARATE EVENTS");
+    expect(r, "a durable notice must not promise the future").not.toContain("will keep firing");
   });
 
   it("claims nothing it cannot support", () => {
@@ -225,9 +263,9 @@ describe("DOD-M15-INBOXCAUSE-1: a refusal that LOOPS says so, with its cadence",
      * the clock rather than of the behaviour. Absent is the honest answer for both — the same rule
      * `timesTotal` follows when there is no durable row.
      */
-    expect(refusalRecurrence(2, 0, 60_000), "two refusals cannot establish a rate").toBeNull();
-    expect(refusalRecurrence(50, 1000, 1000), "a zero span divides into nonsense").toBeNull();
-    expect(refusalRecurrence(50, 2000, 1000), "a negative span is a broken row, not a fast loop").toBeNull();
+    expect(refusalRecurrence(2, 0, 60_000, false), "two refusals cannot establish a rate").toBeNull();
+    expect(refusalRecurrence(50, 1000, 1000, false), "a zero span divides into nonsense").toBeNull();
+    expect(refusalRecurrence(50, 2000, 1000, false), "a negative span is a broken row, not a fast loop").toBeNull();
   });
 });
 
@@ -282,6 +320,23 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     clients.push(client);
     await client.send("ipc.connect", { clientType: "mcp" });
     return client;
+  }
+
+  /**
+   * A real `sessions` row, so `cello_receive` reaches its catch-up exit instead of refusing
+   * `session_not_found`. DOD-AGENT-ID-JOINKEY-1: keyed by the STABLE `agent_id`, never `agent_name`.
+   */
+  function insertSessionRow(sessionId: string, status = "abandoned"): void {
+    const db = handle!.getSessionNodeManager().getDb()!;
+    const row = db
+      .prepare("SELECT agent_id FROM agents WHERE agent_name = ? AND state != 'retired'")
+      .get("alice") as { agent_id: string } | undefined;
+    if (!row) throw new Error("test fixture bug: agent 'alice' has no 'agents' row yet");
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO sessions (session_id, agent_id, counterparty_pubkey, status, created_at, updated_at, message_count, interrupted_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, NULL)`,
+    ).run(sessionId, row.agent_id, "bb".repeat(32), status, now, now);
   }
 
   type Refusal = {
@@ -350,6 +405,52 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     expect(seen.map((r) => r.reason).sort()).toEqual(["annex_salt_unavailable", "session_committed"]);
   });
 
+  it("★ the cadence reaches the OTHER door too — cello_receive, not just the inbox", async () => {
+    /**
+     * Review M8. Two doors surface refusals and only one was asserted, so the `cello_receive` line
+     * could be deleted with the full suite green — the two-writers-one-assertion shape
+     * M15-PROCEDURE's NAME THE WRITER box was written for. The module's own comment says "the
+     * counts need their sentence at BOTH doors" and nothing held it.
+     *
+     * Driven through the real IPC handler, because what is under test is the door's own mapping:
+     * `refusalsField` maps rather than spreads, so a field can be silently dropped there while the
+     * store returns it perfectly.
+     */
+    await boot();
+    const mgr = handle!.getSessionNodeManager();
+    const sid = "cd".repeat(16);
+    insertSessionRow(sid);
+    const notice = PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
+      sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
+    });
+    for (let i = 0; i < 3; i++) mgr.noteContentRefusal("alice", sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE, notice);
+    const db = mgr.getDb()!;
+    const now = Date.now();
+    db.prepare(
+      "UPDATE content_refusal_totals SET first_at = ?, last_at = ? WHERE session_id = ? AND reason = ?",
+    ).run(now - 10 * 60_000, now, sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE);
+
+    const client = await connect();
+    await client.send("cello_use_agent", { name: "alice" });
+    /**
+     * `since_seq: -1`, and the value is chosen from the PREDICATE rather than from intent. The
+     * catch-up batch is the exit that carries `refusalsField`, and it is entered only when
+     * `since_seq` is present — `-1` is the value the handler's own comment names for "everything",
+     * where `0` would mean "after the genesis leaf" and take a different path through the batch.
+     */
+    const res = (await client.send("cello_receive", { session_id: sid, since_seq: -1 })) as {
+      refusals?: Array<{ reason: string; recurrence?: string }>;
+    };
+
+    const row = (res.refusals ?? []).find((r) => r.reason === "annex_salt_unavailable");
+    expect(row, "cello_receive surfaces refusals and must carry the same fields the inbox does").toBeDefined();
+    expect(
+      row!.recurrence,
+      "the cadence is dropped at this door — an operator reading here sees a count with nothing " +
+        "saying it is one refusal recurring, which is the misreading this field exists to end",
+    ).toContain("about once every 5 minutes");
+  });
+
   it("★ a repeated refusal arrives labelled as a LOOP with its cadence", async () => {
     /**
      * Driven through the real notice store rather than the pure function, because the cadence is
@@ -377,6 +478,10 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     expect(row.times_total, "three refusals were recorded, so three is what is reported").toBe(3);
     expect(row.recurrence, "a count with no cadence beside it is read as that many separate problems").toBeTruthy();
     expect(row.recurrence).toContain("about once every 5 minutes");
-    expect(row.recurrence).toContain("3 times");
+    expect(row.recurrence).toContain("3 TIMES");
+    expect(
+      row.recurrence,
+      "this row was written by three real refusals, not seeded at upgrade, so the count is exact",
+    ).not.toContain("AT LEAST");
   });
 });

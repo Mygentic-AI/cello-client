@@ -246,16 +246,54 @@ export const PARK_REFUSAL_NOTICE: Record<
  * `null` below three refusals or across a zero span: two points are not a cadence, and dividing by a
  * zero span would print an interval that is an artifact of the clock rather than of the behaviour.
  */
-export function refusalRecurrence(total: number, firstAt: number, lastAt: number): string | null {
+export function refusalRecurrence(
+  total: number,
+  firstAt: number,
+  lastAt: number,
+  /**
+   * Is `total` an exact count or a FLOOR? — review M5.
+   *
+   * A row seeded at upgrade takes its total from a notice's `count`, which resets on dismissal, so
+   * both the count and the span are lower bounds. The drain five lines away already reports a
+   * seeded row as `timesTotalAtLeast` for exactly this reason, and this sentence was asserting the
+   * same number as a figure right beside it — *"the original lie with the new name on it"*, which
+   * is the phrase `DOD-M15-REFUSALTERMINAL-1` used about the defect it removed.
+   *
+   * On the daemon this unit was written for the row IS seeded: the inbox reported
+   * `times_total_at_least: 731`, so the very first thing an unqualified sentence would have shipped
+   * is "it has fired 731 times" next to a field saying "at least".
+   */
+  seeded: boolean,
+): string | null {
   if (!Number.isFinite(total) || total < 3) return null;
   const span = lastAt - firstAt;
   if (!Number.isFinite(span) || span <= 0) return null;
   const everyMs = span / (total - 1);
+  /**
+   * ⚠️ **IT SAYS ONLY WHAT THE ROW PROVES — review M6, and the first version made two claims it
+   * could not.**
+   *
+   * Dropped: *"THIS REFUSAL IS A LOOP, NOT N SEPARATE EVENTS"*. This function serves EVERY reason
+   * in the drain, not only park ones, and a counterparty who keeps writing into a closed
+   * conversation generates N genuinely separate `session_committed` refusals — the notice would
+   * have told the operator they were not separate, beside guidance saying the sender "may not
+   * realise it ended". Its own doc comment already said a reason can fire for several messages.
+   *
+   * Dropped: *"It will keep firing at that rate until the cause is dealt with"*. Notices are
+   * durable and re-drained for every new consumer, so that prints long after a cause is resolved —
+   * including, immediately after this unit lands, on the released message whose impact in the SAME
+   * row says it is gone and will stop being reported.
+   *
+   * What is left is arithmetic over two stored timestamps and a count, which is all the row has.
+   */
+  const count = seeded ? `at least ${total} times` : `${total} times`;
   return (
-    `THIS REFUSAL IS A LOOP, NOT ${total} SEPARATE EVENTS: it has fired ${total} times, about once ` +
-    `every ${humanizeInterval(everyMs)}, across ${humanizeInterval(span)}. It will keep firing at ` +
-    `that rate until the cause named above is dealt with — the count grows on its own and is not a ` +
-    `measure of how many messages are affected.`
+    `RECORDED ${count.toUpperCase()} on this conversation, about once every ` +
+    `${humanizeInterval(everyMs)} across ${humanizeInterval(span)} — so read the number as ONE ` +
+    `recurring refusal being counted, not as that many separate problems to work through` +
+    (seeded
+      ? ". The count began when this daemon was upgraded and dismissals are not counted, so the true figure may be far higher."
+      : ".")
   );
 }
 
