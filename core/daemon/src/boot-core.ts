@@ -326,9 +326,6 @@ export async function startBootCore(deps: BootCoreDeps) {
     transportSelector,
     verifiedManifest,
     verifiedManifestVersion,
-    manifestVersionStore,
-    checkManifestValidity,
-    celloEnv,
     /** A READER. See the header — a snapshot here reports a healthy roster forever. */
     lastRosterSweepError: () => lastRosterSweepError,
   };

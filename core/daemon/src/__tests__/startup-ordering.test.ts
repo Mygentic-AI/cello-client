@@ -102,7 +102,7 @@ describe("startDaemon ordering — constraints the type system cannot express", 
     const delegate = lineOf("onSignalingConnected(agentName)", WIRING_SRC);
     const hook = lineOf("sessionNodeManager.setParkedDrainHook(", BOOT_AGENTS_SRC);
 
-    expect(construct, "createReconnectDrain() must be constructed in the composition root").toBeGreaterThan(-1);
+    expect(construct, "createReconnectDrain() must be constructed in the boot-agents phase").toBeGreaterThan(-1);
     expect(hook, "the parked-drain hook must be wired — an unwired hook reverts the whole unit").toBeGreaterThan(-1);
 
     // THE ASSERTION. The ensure→drain ORDER is the contract, and it lives in reconnect-drain.ts
@@ -138,10 +138,16 @@ describe("startDaemon ordering — constraints the type system cannot express", 
     // also called from an agent's onConnected. Both run before the handler map exists, which is why
     // the park is two-phase at all.
     expect(sealCoordinator, "the seal coordinator must still be constructed in the root").toBeGreaterThan(-1);
+    // THE ASSERTION, and it is a line comparison again on purpose. A first cut replaced it with
+    // "the root mentions autoRecoverForAgent", which is position-independent: moving the phase call
+    // below the coordinator left all three assertions green. Both needles live in daemon.ts — the
+    // phase CALL and the coordinator — so the original constraint translates directly.
+    const phaseCall = lineOf("await startBootAgents(");
+    expect(phaseCall, "the boot-agents phase must be called in the composition root").toBeGreaterThan(-1);
     expect(
-      DAEMON_SRC,
-      "the root must take autoRecoverForAgent from the boot-agents phase — reaching for it any other " +
-      "way puts the park's construction back in the root's hands, which is what this test guards.",
-    ).toContain("autoRecoverForAgent");
+      phaseCall,
+      "startBootAgents() must run BEFORE createSealCoordinator(), which takes autoRecoverForAgent " +
+      "as a dep. Below it, the coordinator reads a value the phase has not produced yet.",
+    ).toBeLessThan(sealCoordinator);
   });
 });

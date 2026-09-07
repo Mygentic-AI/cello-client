@@ -5,12 +5,21 @@
  * recovery path, the reconnect drain, and the queue that retries a submission the directory would
  * not take. Phase 1 built the machinery; this is where it acquires subjects.
  *
- * ⚠️ THREE VALUES ARRIVE AS GETTERS BECAUSE THEY DO NOT EXIST YET. `flushAwaitingContent`,
- * `onlineAgents` and `sharedSignaling` are all declared BELOW this phase in the composition root,
- * and every one of them is read from inside a callback that runs long after boot. Passed by value
- * this phase would freeze whatever they were at construction — for `onlineAgents` that is an empty
- * set, so every agent would read as offline and no submission would ever send. Unit 4 shipped that
- * class of defect once; the order now measures for it before each extraction.
+ * ⚠️ FOUR VALUES ARRIVE AS GETTERS BECAUSE THEY DO NOT EXIST YET — `flushAwaitingContent`,
+ * `onlineAgents`, `sharedSignaling` and `perAgentSignaling`, all declared BELOW this phase and all
+ * read from callbacks that run long after boot.
+ *
+ * **They are LOUD, not silent, and the difference is the thing to remember.** Three of the four are
+ * `const`, so a by-value pass is a temporal-dead-zone `ReferenceError` at boot — every test red
+ * immediately. (An earlier version of this comment said `onlineAgents` would "freeze as an empty
+ * set". It would not: it is a `const` below the call, and it is a `Set`, so even declared above it
+ * would pass by reference and track later additions. Wrong twice over.)
+ *
+ * **The SILENT shape is a `let` that is assigned further down** — still `undefined`, no error, no
+ * type complaint. That is what unit 4 shipped. Two of them are still live in the composition root
+ * and every later phase crosses them: `reconcileScheduler` and `documentOwnerKeyForHook`. The test
+ * to apply is "is this a `let` assigned below?", not "would this value freeze?" — the freezing cases
+ * announce themselves.
  */
 import { loadAgents } from "./agent-loader.js";
 import { DbRegistrationPersistence } from "./db-identity-store.js";
@@ -266,18 +275,8 @@ export async function startBootAgents(deps: BootAgentsDeps) {
     }
   }
 
-  // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
-  // are wired into every signaling manager below — and the originals were FUNCTION DECLARATIONS,
-  // so hoisting silently let them be CALLED 1,900 lines before they were DEFINED. A const in their
-  // place lands in the temporal dead zone and every one of those calls throws. The dependency on
-  // hoisting was real, load-bearing and invisible; naming the construction point makes it explicit.
-  // ─── The seal cluster (seal-coordinator.ts) ───
-  // Bilateral seal, unilateral escalation, and the returning-absent-party upgrade: five pieces of
-  // state and the listeners that drive them. Already seal-private; now that is enforced by a module
-  // boundary rather than by convention. cello_close_session still drives the waiters directly.
-  //
   return {
-    loadedAgents, failedAgents, getPersistence, agents, keyProviders, contentPark,
+    loadedAgents, getPersistence, agents, keyProviders, contentPark,
     autoRecoverForAgent, onSignalingConnected, submissionRetries, recordIssuedSubmission,
   };
 }

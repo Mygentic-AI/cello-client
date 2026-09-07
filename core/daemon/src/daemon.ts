@@ -203,8 +203,10 @@ async function startDaemonHoldingLock(
     autoRecoverForAgent, onSignalingConnected, submissionRetries, recordIssuedSubmission,
   } = await startBootAgents({
     config, logger, sessionNodeManager, securityGateway,
-    // GETTERS: all three are declared below this call and read inside callbacks that run after boot.
-    // By value `onlineAgents` freezes empty — every agent reads offline and nothing ever sends.
+    // GETTERS: all FOUR are declared below this call and read inside callbacks that run after boot.
+    // Three are `const`, so by value they are a temporal-dead-zone crash at boot, not a silent
+    // absence — the silent shape is a `let` assigned further down, which this file still has two of
+    // (`reconcileScheduler`, `documentOwnerKeyForHook`).
     getFlushAwaitingContent: () => flushAwaitingContent,
     getOnlineAgents: () => onlineAgents,
     getSharedSignaling: () => sharedSignaling,
@@ -218,6 +220,16 @@ async function startDaemonHoldingLock(
   //
   // Declared HERE rather than 600 lines below because the seal coordinator writes to it: a
   // directory refusal must survive the close call waiting on it (DOD-M15-SEALPARTIES-1).
+  // Created HERE, not where the seal code used to sit (~2,500 lines down), because the listeners
+  // are wired into every signaling manager below — and the originals were FUNCTION DECLARATIONS,
+  // so hoisting silently let them be CALLED 1,900 lines before they were DEFINED. A const in their
+  // place lands in the temporal dead zone and every one of those calls throws. The dependency on
+  // hoisting was real, load-bearing and invisible; naming the construction point makes it explicit.
+  // ─── The seal cluster (seal-coordinator.ts) ───
+  // Bilateral seal, unilateral escalation, and the returning-absent-party upgrade: five pieces of
+  // state and the listeners that drive them. Already seal-private; now that is enforced by a module
+  // boundary rather than by convention. cello_close_session still drives the waiters directly.
+  //
   const sealFailures = new SealFailureStore();
   const {
     sealKey,
