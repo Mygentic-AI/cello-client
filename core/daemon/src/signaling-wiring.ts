@@ -6,19 +6,32 @@
  * agent must hold its own; there is no shared connection borrowing one agent's identity. The single
  * shared manager that appears below exists only for the in-process test path.
  *
- * ⚠️ FOURTEEN DEPENDENCIES, TWO OVER THE ORDER'S BOUND, RECORDED. Every one is reached by
- * `getAgentSignaling`, which is not a lookup: for an agent with no manager it CONSTRUCTS one, and
- * that construction is where registration, inbound sessions, seals, the reconnect drain and the
- * submission retry queue all get wired. Splitting the file would split that constructor, and a
- * half-wired manager is the defect the CONN-001 comments below spend forty lines describing.
+ * ⚠️ NINETEEN DEPENDENCIES — seven over the order's bound, and the number is COUNTED, not typed:
+ * `signaling-wiring-deps.test.ts` asserts it against the interface, because the first two versions
+ * of this sentence said fourteen and eighteen and disagreed with each other.
  *
- * ⚠️ THIS MODULE IS BUILT AFTER TWO OF ITS CONSUMERS ARE. `createSealFlows` (seal flows) and the
- * registration retry both take `signalingFor` / `sendOver` / `dropAgentSignaling`, and they are
- * constructed EARLIER in the boot sequence than this. As function declarations inside one function
- * that worked by hoisting; across a module boundary it cannot, so those three call sites now pass a
- * lambda that resolves through this module at CALL time. They are only ever invoked after boot, so
- * the indirection costs nothing — and it is the same shape unit 4 had to use for a scheduler built
- * after its consumer.
+ * It is one constructor, not a missed seam. `getAgentSignaling` is the sole entry point that touches
+ * all nineteen, and it is not a lookup: for an unknown agent it CONSTRUCTS a manager and wires seven
+ * things onto it in one uninterruptible sequence — connect, session ceremony, seal ceremony, seal
+ * listeners, session offer, and the two inbound handlers. Any split leaves a manager observably
+ * half-wired between two calls, which is the failure the CONN-001 comments below spend forty lines
+ * describing. The four small returns look separable and are not: three of them read
+ * `perAgentSignaling`, which only `getAgentSignaling` fills, so extracting them means exporting the
+ * map instead.
+ *
+ * ⚠️ TWO VALUES ARE GETTERS, AND THE REASON IS **CORRECTNESS, NOT BLAST RADIUS**.
+ * `getWirePerAgentSessionInbound` and `getHandleTrustSignalPickup` come from `createInboundSessions`,
+ * built ~1,200 lines BELOW this wiring. They are `const`, so passing them by value does not go
+ * quiet — it throws `ReferenceError: Cannot access ... before initialization` and the daemon dies at
+ * boot with the right name in the message. **The silent shape is a `let x;` that is still
+ * `undefined`**, which is what unit 4 hit and why its defect survived 5,003 green tests. Do not read
+ * this comment as "late binding is always silent"; the detection rule is the DECLARATION, and `let`
+ * is the one that hides.
+ *
+ * ⚠️ ONE CONSUMER IS BUILT BEFORE THIS MODULE. `createSealFlows` takes `signalingFor` and `sendOver`,
+ * and it is constructed above this call, so those two arrive as lambdas that resolve here at call
+ * time. `dropAgentSignaling` is passed by value — its consumers are built ~1,900 lines below, so
+ * there is nothing to defer.
  */
 import { SignalingManager } from "@cello-protocol/transport";
 import type { CelloNode, IDirectoryChallengeVerifier } from "@cello-protocol/transport";

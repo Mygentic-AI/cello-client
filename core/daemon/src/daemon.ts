@@ -1059,8 +1059,10 @@ async function startDaemonHoldingLock(
     failoverEndpointResolver, getFailoverEndpoint, sealFailures, submissionRetries,
     registerSealListeners, challengeVerifier, directoryEndpointResolver,
     // Built ~1,200 lines BELOW this call, and only ever READ when a manager is constructed, which
-    // is later still. Getters, never values — passed by value they would be `undefined` for the
-    // life of the process and a non-primary agent would never receive an inbound session.
+    // is later still. Getters because a by-value read here is a temporal-dead-zone crash at boot —
+    // both are `const`, so it fails loudly with the right name rather than going quiet. (The shape
+    // that goes quiet is `let x;`: still `undefined`, no error. That is unit 4's defect, and this
+    // is not it.)
     getWirePerAgentSessionInbound: () => wirePerAgentSessionInbound,
     getHandleTrustSignalPickup: () => handleTrustSignalPickup,
   });

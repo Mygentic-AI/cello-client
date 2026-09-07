@@ -154,11 +154,11 @@ export default [
     //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 4102, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 4104, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/signaling-wiring.ts"],
-    rules: { "max-lines": ["error", { max: 445, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 458, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/document-wiring.ts"],
