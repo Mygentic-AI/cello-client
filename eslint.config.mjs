@@ -154,7 +154,7 @@ export default [
     //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1403, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1402, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -177,16 +177,20 @@ export default [
     rules: { "max-lines": ["error", { max: 186, skipBlankLines: false, skipComments: false }] },
   },
   {
+    files: ["core/daemon/src/operator-guidance.ts"],
+    rules: { "max-lines": ["error", { max: 47, skipBlankLines: false, skipComments: false }] },
+  },
+  {
     files: ["core/daemon/src/who-resolver.ts"],
     rules: { "max-lines": ["error", { max: 59, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-status-report.ts"],
-    rules: { "max-lines": ["error", { max: 114, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 113, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/ipc-surface.ts"],
-    rules: { "max-lines": ["error", { max: 130, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 133, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/document-surface.ts"],
@@ -194,11 +198,11 @@ export default [
   },
   {
     files: ["core/daemon/src/unresolved-nodes-report.ts"],
-    rules: { "max-lines": ["error", { max: 107, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 106, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/directory-connect.ts"],
-    rules: { "max-lines": ["error", { max: 119, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 120, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/connection-agents.ts"],

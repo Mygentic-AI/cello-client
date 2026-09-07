@@ -46,41 +46,36 @@ function lineOf(needle: string, src: string = DAEMON_SRC): number {
   return lines.findIndex((l) => l.includes(needle) && !l.trim().startsWith("//") && !l.trim().startsWith("*"));
 }
 
-describe("the composition root actually CALLS every module it depends on", () => {
+describe("every module this daemon exports a factory for is actually WIRED", () => {
   /**
    * 040-DAEMONROOT turned inline statements into call sites, and a call site can be deleted while
    * the module still compiles, still ships, and still passes its own tests. Unit 9 shipped exactly
-   * that gap: delete the revival sweep's call and 5,036 tests stayed green while the sweep never ran.
+   * that: deleting the revival sweep's call left 5,036 tests green while the sweep never ran.
    *
-   * ⚠️ THE LIST IS DERIVED, NOT TYPED, AND THAT IS THE WHOLE POINT. The first version was a
-   * hand-written array of thirteen names. Review measured the hole: `daemon.ts` has 38 factory and
-   * registration invocations, that list covered 13, and the sixteen `register*Handlers(...)` sites
-   * are droppable in exactly the same way — deleting `registerSignalHandlers({…})` unregisters ten
-   * trust-signal verbs, and `wallet_list_signals` has no functional test anywhere, so the whole
-   * suite stays green. This repo has already written down why inclusion lists fail, at the top of
-   * `capability-registration-inversion.test.ts`: "every one is a hand-maintained list trusted as
-   * complete by something downstream, where FORGETTING IS SILENT."
+   * ⚠️ THIS IS THE THIRD VERSION, AND EACH REWRITE CLOSED A HOLE THE PREVIOUS ONE HID. A hand-typed
+   * list of thirteen names missed the sixteen `register*Handlers` sites. A derived list filtered to
+   * `create|startBoot|register` missed SEVEN more — `startRegistryPoll`, `startRosterSweep`,
+   * `startManifestValidityWatch`, `startHttpManifestPoll` and the three `wire*Handler`s — four of
+   * which are sweeps or polls, the same category as the bug that caused this test to exist. And an
+   * EXEMPT entry claimed `registerInitiateSessionHandler` was wired elsewhere when it is called from
+   * the root, so the one verb the guard skipped was the one that starts every session.
    *
-   * So the exporters are discovered from the source tree and each must be CALLED somewhere. A module
-   * nobody wires reddens; a module added later needs no edit here.
+   * So: EVERY `export function` in the corpus, no prefix filter, and EXEMPT stays empty until a red
+   * run proves an entry necessary.
    */
   const SRC_DIR = join(import.meta.dirname, "..");
 
   /**
-   * Wired from inside another module rather than from the root. Each entry needs a reason, and the
-   * reason is what stops this becoming the inclusion list it replaced.
+   * An entry needs a reason AND a red run that proves it. One entry, and it is a HOMONYM rather than
+   * an exception: `wireContentHashHex` is about the WIRE FORMAT, not about wiring something up. The
+   * red run that produced it also found something worth knowing — the function has no caller
+   * anywhere in either repo, is not re-exported from the package index, and is referenced by no
+   * test. It is dead, and deleting it is a job for an order that is allowed to delete.
    */
   const EXEMPT: Record<string, string> = {
-    registerInitiateSessionHandler: "registered by the session wiring, not the root",
+    wireContentHashHex: "not wiring — 'wire' here means the wire format. Separately: it is DEAD, no caller in either repo.",
   };
 
-  /**
-   * The caller corpus includes `src/bin/`, and that is not a detail: the first run of this derived
-   * guard failed on `createDirectoryEndpointResolver`, which IS called — from `bin/cello-daemon.ts`,
-   * one directory down. A corpus that stops at the top level would have reported a wired module as
-   * dead, and the fix for that false alarm is the same as the fix for a missed one: read everything
-   * that can call.
-   */
   function sourcesUnder(dir: string): string[] {
     return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
       if (e.isDirectory()) return e.name === "__tests__" ? [] : sourcesUnder(join(dir, e.name));
@@ -88,28 +83,58 @@ describe("the composition root actually CALLS every module it depends on", () =>
     });
   }
 
-  const CALLERS = sourcesUnder(SRC_DIR).map((f) => readFileSync(f, "utf-8")).join("\n");
+  const FILES = sourcesUnder(SRC_DIR);
 
-  const exporters: string[] = [];
-  for (const file of sourcesUnder(SRC_DIR)) {
+  /**
+   * A CALL, not a mention. Block comments and string literals are stripped before the search:
+   * commenting a call site out is the natural way a unit gets reverted, and a guard that reads
+   * `/* was createX() here *​/` as a call is worse than no guard.
+   */
+  const CALLERS = FILES.map((f) => readFileSync(f, "utf-8"))
+    .join("\n")
+    // Block comments FIRST — commenting a call site out is the natural way a unit gets reverted,
+    // and a guard that reads `/* was createX() here *​/` as a call is worse than no guard.
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n")
+    .map((l) => l.replace(/\/\/.*$/, ""))
+    // A call is never preceded by a quote on its own line. Whole-string stripping was tried and is
+    // NOT safe here: an apostrophe in prose or a multi-line template ate real code and reported
+    // wired modules as dead — a false alarm is how a guard gets ignored.
+    .filter((l) => !/["'`]\s*\w+\s*\($/.test(l.trim()))
+    .join("\n");
+
+  /**
+   * WIRING verbs, not every export. The previous version filtered to `create|startBoot|register`
+   * and missed seven live call sites; this covers the verbs this codebase actually uses to mean
+   * "this does something at boot". Both declaration shapes are matched, because an arrow factory
+   * would otherwise be invisible to the discovery half AND to the call half.
+   */
+  const WIRING = /^(create|start|register|wire|make|build|install|mount|attach|setup|init)[A-Z]/;
+  const exporters = new Set<string>();
+  for (const file of FILES) {
     const src = readFileSync(file, "utf-8");
-    for (const m of src.matchAll(/^export (?:async )?function ((?:create|startBoot|register)[A-Z]\w*)/gm)) {
-      exporters.push(m[1]!);
+    for (const m of src.matchAll(/^export (?:async )?function (\w+)/gm)) {
+      if (WIRING.test(m[1]!)) exporters.add(m[1]!);
+    }
+    for (const m of src.matchAll(/^export const (\w+)\s*=\s*(?:async\s*)?\(/gm)) {
+      if (WIRING.test(m[1]!)) exporters.add(m[1]!);
     }
   }
+  const checked = [...exporters].filter((n) => !EXEMPT[n]).sort();
 
-  it("discovers the modules to check — a positive control, so an empty sweep cannot pass", () => {
-    expect(exporters.length, "no exported factories found; the pattern above stopped matching").toBeGreaterThan(15);
+  it("the corpus is the size it was when this ratchet was set — a shrinking sweep is a silent hole", () => {
+    // EXACT, like max-lines, and for the same reason: a regex that stops matching makes the loop
+    // SHORTER, never red. Raise it when modules are added; a DROP is the thing to look at.
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBeGreaterThanOrEqual(31);
+    expect(
+      exporters.size - checked.length,
+      "EXEMPT has grown — every entry needs a reason and a red run that proves it",
+    ).toBe(1);
   });
 
-  for (const name of [...new Set(exporters)].sort()) {
-    if (EXEMPT[name]) continue;
+  for (const name of checked) {
     it(`something calls ${name}`, () => {
-      // A call, not a mention: the definition line itself is excluded by requiring an open paren
-      // that is not preceded by `function `.
-      const called = new RegExp(`(?<!function )\\b${name}\\s*\\(`).test(
-        CALLERS.split("\n").filter((l) => !l.trim().startsWith("//") && !l.trim().startsWith("*")).join("\n"),
-      );
+      const called = new RegExp(`(?<!function )(?<!const )\\b${name}\\s*\\(`).test(CALLERS);
       expect(
         called,
         `${name} is exported and never called. The module compiles, ships, and passes its own tests; ` +

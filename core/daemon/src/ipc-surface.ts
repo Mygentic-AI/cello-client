@@ -28,9 +28,11 @@ export interface IpcSurfaceDeps {
   perConnectionState: ReadonlyMap<string, { clientType?: string }>;
   fallbackNoticeStore: AsyncLocalStorage<{ notice?: Record<string, unknown> }>;
   /**
-   * ⚠️ A GETTER. The daemon's own shutdown is defined BELOW this surface, and the `shutdown` verb
-   * calls it. By value it would be `undefined` at construction and the verb would answer with a
-   * crash instead of stopping the daemon.
+   * ⚠️ A GETTER, AND THE HONEST REASON IS NOT THE OBVIOUS ONE. `stop` is a hoisted `function`
+   * declaration, so passing it by value would work TODAY. The getter is there so that turning it
+   * into a `const` — which is what every other extraction in this order did to its neighbours —
+   * cannot silently break the `shutdown` verb. An earlier version of this comment claimed a crash
+   * that cannot happen, which is the wrong lesson: the silent shape is a `let` assigned below.
    */
   getStop: () => (reason: string) => Promise<void>;
 }
@@ -126,5 +128,6 @@ export function createIpcSurface(deps: IpcSurfaceDeps) {
     renderedHandlers,
   );
 
-  return { ipcServer, renderedHandlers };
+  // `renderedHandlers` is not returned: its only consumer is the server constructed here.
+  return { ipcServer };
 }

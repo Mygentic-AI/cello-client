@@ -101,7 +101,6 @@ export function createUnresolvedNodesReport(deps: UnresolvedNodesDeps) {
       },
     };
   }
-  // 040-DAEMONROOT unit 3: cello_status → status-handler.ts. `unresolvedNodesForStatus` stays here
 
   return { unresolvedNodesForStatus };
 }

@@ -88,7 +88,7 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
   // OWN directory signaling connection authenticated as itself (getAgentSignaling / signalingFor);
   // removing any agent tears down only that agent's own connection, so the daemon never holds a
   // connection authenticated as a removed agent (the Demo1 stranding bug). A single SHARED manager
-  // exists ONLY for the in-process test / backward-compat path (a single injected signalingConnect,
+  // exists ONLY for the IN-PROCESS TEST path (NOT back-compat — there is no old client, and Rule F deletes back-compat on sight) (a single injected signalingConnect,
   // no per-agent isolation) — in production it is undefined.
   //
   // The SHARED (in-process test / pre-resolver) signaling path has no directory-facing node of its
@@ -115,5 +115,6 @@ export function createDirectoryConnect(deps: DirectoryConnectDeps) {
         maxBackoffMs: 30_000,
       });
 
-  return { buildRelayConnectParams, defaultConnect, noSharedDirectoryNode, sharedSignaling };
+  // `defaultConnect` is not returned: its only consumer is the shared manager built here.
+  return { buildRelayConnectParams, noSharedDirectoryNode, sharedSignaling };
 }

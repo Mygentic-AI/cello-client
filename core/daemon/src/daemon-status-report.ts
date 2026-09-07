@@ -1,8 +1,7 @@
 /**
  * The whole-daemon status — what `cello status` at a terminal renders.
  *
- * The widest READ in the daemon, and this module is where that breadth is honest: it takes eleven
- * readers and writes nothing. The per-connection view is a different surface with a different answer
+ * The widest READ in the daemon, and this module is where that breadth is honest: it takes TWELVE readers and writes nothing — at the order's bound, not under it. The per-connection view is a different surface with a different answer
  * (`status-handler.ts`), and the difference is deliberate — collapsing them is how an operator ends
  * up reading another connection's state as their own.
  *

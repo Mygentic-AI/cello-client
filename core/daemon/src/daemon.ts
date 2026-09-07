@@ -36,8 +36,6 @@ import { removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
 import { type IpcHandler } from "./ipc-server.js";
 import { SealFailureStore } from "./seal-failure-store.js";
-import {
-  } from "./roster-freshness.js";
 import { SessionNodeManager } from "./session-node-manager.js";
 import { registerGatewayConfigHandlers } from "./gateway-config-handlers.js";
 import { NonceDedupStore } from "./nonce-dedup.js";
@@ -659,7 +657,8 @@ async function startDaemonHoldingLock(
     manifestConfigured: manifestProvider !== undefined,
   });
 
-  // because getStatus() — the CLI's surface — is its other consumer.
+  // `unresolvedNodesForStatus` is a module rather than a closure because it has TWO consumers:
+  // this handler and the daemon-wide getStatus() the CLI renders.
   registerStatusHandler({
     handlers, getAgentsForConnection, directorySignalingStatus, manifestOrigin, manifestProvider,
     directoryHttpUrl, challengeVerifier, unresolvedNodesForStatus, buildInterruptedSessions, buildActiveSessions,
