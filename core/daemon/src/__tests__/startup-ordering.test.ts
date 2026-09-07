@@ -28,7 +28,7 @@
  * the first one goes red immediately. That is the entire job.
  */
 import { describe, it, expect } from "vitest";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 const DAEMON_SRC = readFileSync(join(import.meta.dirname, "../daemon.ts"), "utf-8");
@@ -52,7 +52,7 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
    * the module still compiles, still ships, and still passes its own tests. Unit 9 shipped exactly
    * that: deleting the revival sweep's call left 5,036 tests green while the sweep never ran.
    *
-   * ⚠️ THIS IS THE THIRD VERSION, AND EACH REWRITE CLOSED A HOLE THE PREVIOUS ONE HID. A hand-typed
+   * ⚠️ THIS IS THE FOURTH VERSION, AND EACH REWRITE CLOSED A HOLE THE PREVIOUS ONE HID. A hand-typed
    * list of thirteen names missed the sixteen `register*Handlers` sites. A derived list filtered to
    * `create|startBoot|register` missed SEVEN more — `startRegistryPoll`, `startRosterSweep`,
    * `startManifestValidityWatch`, `startHttpManifestPoll` and the three `wire*Handler`s — four of
@@ -60,20 +60,27 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
    * EXEMPT entry claimed `registerInitiateSessionHandler` was wired elsewhere when it is called from
    * the root, so the one verb the guard skipped was the one that starts every session.
    *
-   * So: EVERY `export function` in the corpus, no prefix filter, and EXEMPT stays empty until a red
-   * run proves an entry necessary.
+   * The third version was checking 72 names against a ratchet of 31, so most of the sweep could be
+   * switched off without a red run; it could not see the twenty-four `acquire|poll|run|open|ensure|
+   * load|migrate|bootstrap|connect` exports at all; and its string filter matched nothing in the
+   * whole corpus. The fixes are the exact corpus count, the widened verb list, and blanking string
+   * contents rather than dropping lines — each documented at the line that carries it.
    */
   const SRC_DIR = join(import.meta.dirname, "..");
+  const CORE_DIR = join(SRC_DIR, "..", "..");
 
   /**
-   * An entry needs a reason AND a red run that proves it. One entry, and it is a HOMONYM rather than
-   * an exception: `wireContentHashHex` is about the WIRE FORMAT, not about wiring something up. The
-   * red run that produced it also found something worth knowing — the function has no caller
-   * anywhere in either repo, is not re-exported from the package index, and is referenced by no
-   * test. It is dead, and deleting it is a job for an order that is allowed to delete.
+   * An entry needs a reason AND a red run that proves it. Each of these three was produced by a red
+   * run, and two of them are findings in their own right rather than exceptions.
    */
   const EXEMPT: Record<string, string> = {
     wireContentHashHex: "not wiring — 'wire' here means the wire format. Separately: it is DEAD, no caller in either repo.",
+    // Test seams, not dead-but-tolerated. Both are reachable ONLY from `__tests__`, which this scan
+    // deliberately does not read: counting a test as a caller is how a deleted production call site
+    // reads green, which is the entire failure this guard exists for. So they cannot be discovered,
+    // and they cannot be silently dropped either — naming them here is the record.
+    openEncryptedDatabaseAtPath: "test seam — production opens via openEncryptedDatabase(celloDir); only __tests__ (both repos) pass an explicit path.",
+    bootstrapNetworkKeyShares: "test-only BY ITS OWN GUARD — network-directory-node.ts throws 'uses trustedDealer which is test-only' before doing anything. Re-exported from index.ts for tests; no production caller in either repo.",
   };
 
   function sourcesUnder(dir: string): string[] {
@@ -86,30 +93,79 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
   const FILES = sourcesUnder(SRC_DIR);
 
   /**
-   * A CALL, not a mention. Block comments and string literals are stripped before the search:
-   * commenting a call site out is the natural way a unit gets reverted, and a guard that reads
-   * `/* was createX() here *​/` as a call is worse than no guard.
+   * CALLERS is every production source in `core/*​/src`, not just the daemon's own.
+   *
+   * The daemon is a LIBRARY as well as a process — `connectOrStart` is exported from `index.ts` and
+   * called from `core/cli/src/commands.ts`, so a daemon-only scan reported the function that decides
+   * whether `cello login` connects or spawns as never called. Widening can only turn red into green,
+   * never the reverse, and it makes the scan agree with what actually runs.
+   *
+   * `__tests__` stays out on purpose: a test calling a factory is not the factory running in
+   * production, and letting one count is exactly how a deleted call site reads green.
    */
-  const CALLERS = FILES.map((f) => readFileSync(f, "utf-8"))
+  const CALLER_FILES = readdirSync(CORE_DIR, { withFileTypes: true })
+    .filter((e) => e.isDirectory() && existsSync(join(CORE_DIR, e.name, "src")))
+    .flatMap((e) => sourcesUnder(join(CORE_DIR, e.name, "src")));
+
+  /**
+   * A CALL, not a mention. Comments and string CONTENTS are removed before the search.
+   */
+  const CALLERS = CALLER_FILES.map((f) => readFileSync(f, "utf-8"))
     .join("\n")
     // Block comments FIRST — commenting a call site out is the natural way a unit gets reverted,
     // and a guard that reads `/* was createX() here *​/` as a call is worse than no guard.
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n")
     .map((l) => l.replace(/\/\/.*$/, ""))
-    // A call is never preceded by a quote on its own line. Whole-string stripping was tried and is
-    // NOT safe here: an apostrophe in prose or a multi-line template ate real code and reported
-    // wired modules as dead — a false alarm is how a guard gets ignored.
-    .filter((l) => !/["'`]\s*\w+\s*\($/.test(l.trim()))
+    /**
+     * String contents are BLANKED IN PLACE — never stripped, and no line is ever dropped.
+     *
+     * Two earlier versions of this step were wrong in opposite directions. Deleting whole strings ate
+     * real code the moment an apostrophe appeared in prose, and reported wired modules as dead; a
+     * false alarm is how a guard gets ignored. The version that replaced it — dropping lines ENDING
+     * in `"name(` — matched zero lines in the whole corpus, so the hole it claimed to close was
+     * still open: deleting a call site and leaving `logger.debug("wireDisconnectCleanup() was here")`
+     * behind kept this test green.
+     *
+     * Blanking the contents has neither failure. By this point comments are already gone, so an
+     * apostrophe can only be inside a string, which is precisely what is being emptied.
+     *
+     * The one shape left uncovered is a template literal containing `${...}` — those are skipped
+     * whole, because `${createX()}` is a REAL call and blanking it would be the apostrophe bug again.
+     * A mention parked inside an interpolated template still reads as a call. Narrow, and the safe
+     * side of the trade.
+     */
+    .map((l) =>
+      l
+        .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+        .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+        .replace(/`(?:[^`\\$]|\\.)*`/g, "``"),
+    )
     .join("\n");
 
   /**
-   * WIRING verbs, not every export. The previous version filtered to `create|startBoot|register`
-   * and missed seven live call sites; this covers the verbs this codebase actually uses to mean
-   * "this does something at boot". Both declaration shapes are matched, because an arrow factory
-   * would otherwise be invisible to the discovery half AND to the call half.
+   * WIRING verbs, not every export. The first version filtered to `create|startBoot|register` and
+   * missed seven live call sites; the second stopped at the boot verbs and could not see the twenty-
+   * four `acquire|poll|run|open|ensure|load|migrate|bootstrap|connect` exports at all — among them
+   * `acquireSingletonLock`, which is what keeps two daemons off one SQLCipher write lock. Both
+   * declaration shapes are matched, because an arrow factory would otherwise be invisible to the
+   * discovery half AND to the call half.
+   *
+   * ─── ⚠️ WHAT THIS PROVES IS REACHABILITY, NOT THAT EVERY CALL SITE SURVIVES ───────────────────
+   *
+   * A caller inside the defining file counts. `acquireSingletonLock` is the worked example: delete
+   * its call in `daemon.ts` and this stays green, because `probeSingletonLock` two hundred lines
+   * below still calls it. The daemon would boot with no lock; what notices is
+   * `dod-single-daemon-1.test.ts`, which spawns a real second process.
+   *
+   * Excluding the defining file was tried and is worse: it turns 3 exemptions into 11, because eight
+   * exports are legitimately called by a sibling in their own module (`startRegistryPoll` →
+   * `pollRegistryOverHttp`) or only from the OTHER repo (`buildRelayAuthPayload` and the wire-format
+   * builders, which the directory and relay consume). Eight standing false alarms is how a guard
+   * stops being read.
    */
-  const WIRING = /^(create|start|register|wire|make|build|install|mount|attach|setup|init)[A-Z]/;
+  const WIRING =
+    /^(create|start|register|wire|make|build|install|mount|attach|setup|init|acquire|poll|run|open|ensure|load|migrate|bootstrap|connect)[A-Z]/;
   const exporters = new Set<string>();
   for (const file of FILES) {
     const src = readFileSync(file, "utf-8");
@@ -123,13 +179,21 @@ describe("every module this daemon exports a factory for is actually WIRED", () 
   const checked = [...exporters].filter((n) => !EXEMPT[n]).sort();
 
   it("the corpus is the size it was when this ratchet was set — a shrinking sweep is a silent hole", () => {
-    // EXACT, like max-lines, and for the same reason: a regex that stops matching makes the loop
-    // SHORTER, never red. Raise it when modules are added; a DROP is the thing to look at.
-    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBeGreaterThanOrEqual(31);
+    /**
+     * ⚠️ EXACT, and it has to be. This was `toBeGreaterThanOrEqual(31)` against a real corpus of 72 —
+     * 41 names of slack — which made the one regression the comment named the one it could not catch.
+     * Measured, not argued: dropping `create` from WIRING above silently stopped checking 37 of the
+     * 72, dropping `register` stopped checking all sixteen handler modules, and dropping `start`
+     * stopped checking every sweep and poll — the exact bug class this file was written for. All
+     * three left the suite green.
+     *
+     * Raise the number deliberately when a module is added. That is what makes a DROP visible.
+     */
+    expect(exporters.size, `wiring factories discovered: ${exporters.size}`).toBe(96);
     expect(
       exporters.size - checked.length,
       "EXEMPT has grown — every entry needs a reason and a red run that proves it",
-    ).toBe(1);
+    ).toBe(3);
   });
 
   for (const name of checked) {

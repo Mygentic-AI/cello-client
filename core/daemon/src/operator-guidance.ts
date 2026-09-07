@@ -6,20 +6,24 @@
  * wire code stays `dkg_failed` because it is a closed protocol union, but this string is a local
  * daemon-to-IPC message, so it can say what actually happened instead of asserting a guess.
  *
- * ⚠️ AND THE `dkg_failed` CASE IS WHY THIS FILE EXISTS RATHER THAN A SWITCH INLINE SOMEWHERE. It used
- * to say "this usually means the pre-auth token" — confidently wrong for the causes that actually
- * occur (a colliding node id across two directory boxes, a commitment that does not match the
- * client's primary pubkey, a node dropping mid-ceremony), and it sent operators to the wrong
- * subsystem. The real cause is captured one call frame away, so it is reported rather than guessed.
+ * ⚠️ The `dkg_failed` case is why this file exists rather than a switch inline somewhere; what that
+ * case used to claim, and why it was wrong, is recorded at the case itself — once, not twice.
  */
 
-export const NO_CURRENT_AGENT_RESPONSE = {
+/**
+ * FROZEN. This used to be a per-daemon `const`; it is now one module object handed BY IDENTITY to
+ * twelve handlers across six modules. Nothing mutates it today (the CLI renderer is copy-on-write and
+ * the fallback notice merges via spread), but an in-place annotation by any one of those callers
+ * would silently rewrite every other caller's guidance, in every future response. The freeze makes
+ * that fail at the write instead.
+ */
+export const NO_CURRENT_AGENT_RESPONSE = Object.freeze({
   ok: false,
   reason: "no_current_agent",
   guidance: "No current agent is set for this connection. Call cello_start_agent to bring an agent online, then call cello_use_agent to set it as the current agent for this connection.",
-};
+});
 
-  // `detail` carries the ACTUAL cause when one is known. The wire code stays `dkg_failed` — it is a
+// `detail` carries the ACTUAL cause when one is known. The wire code stays `dkg_failed` — it is a
 // closed protocol union — but this string is a local daemon→IPC message, so it can say what really
 // happened instead of asserting a guess.
 export const registrationGuidance = (reason: string, detail?: string): string => {

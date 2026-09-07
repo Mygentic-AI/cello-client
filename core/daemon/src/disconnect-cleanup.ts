@@ -1,11 +1,9 @@
 /**
  * What the daemon forgets, and what it says, when an IPC connection closes.
  *
- * `daemon.ipc.connected` fired on every open and nothing on close, so a live client and a dead one
- * that was never cleaned up looked identical in the log. The attended agent is the field that
- * matters: attendance dropping was silent, and an agent losing its last attendee changes whether
- * away-messages fire and who receives doorbells — so a session that stopped waking is diagnosable
- * from the log rather than by guesswork.
+ * Why the close is reported at all — `DOD-M15-IPCVISIBLE-1` — is written below, at the code that
+ * builds the report. It is not repeated here: a paragraph kept in two places is one someone corrects
+ * in one of them.
  *
  * The three per-connection maps are released by the module that owns them; this is the reporting
  * half, and it returns its context rather than logging its own line, because the IPC server merges
@@ -28,8 +26,16 @@ export interface DisconnectCleanupDeps {
   /** Callers blocked in `cello_await_session` for an agent, so a dying connection releases them. */
   inboundSessionWaiters: Map<string, InboundSessionWaiter[]>;
   /**
-   * ⚠️ A GETTER. The dispatcher is constructed BELOW this wiring and a disconnect can only happen
-   * after the socket opens, which is later still.
+   * ⚠️ A GETTER, AND THE REASON IS NOT THE OBVIOUS ONE. The dispatcher is a `const` 82 lines ABOVE
+   * this wiring, so passing it by value would work today. The getter is there so that moving the
+   * construction below cannot break the disconnect path silently — the same shape as `getStop` in
+   * `ipc-surface.ts`.
+   *
+   * An earlier version of this comment said the dispatcher was constructed BELOW. It was not, and a
+   * false worked example of late binding is worse than none: the rule this order paid for is that a
+   * value assigned below a call site must be read through a getter, and the silent shape is a `let`
+   * (a `const` crashes loudly on TDZ). Teaching "getter because it is below" from a value that is
+   * above hands the next reader the wrong discriminator.
    */
   getNotificationDispatcher: () => NotificationDispatcher;
 }

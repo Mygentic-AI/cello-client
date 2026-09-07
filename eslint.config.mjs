@@ -178,15 +178,15 @@ export default [
   },
   {
     files: ["core/daemon/src/operator-guidance.ts"],
-    rules: { "max-lines": ["error", { max: 47, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 51, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/disconnect-cleanup.ts"],
-    rules: { "max-lines": ["error", { max: 102, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 108, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/who-resolver.ts"],
-    rules: { "max-lines": ["error", { max: 59, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 56, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-status-report.ts"],
@@ -214,7 +214,7 @@ export default [
   },
   {
     files: ["core/daemon/src/session-notify.ts"],
-    rules: { "max-lines": ["error", { max: 163, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 170, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-sweeps.ts"],

@@ -82,6 +82,13 @@ export function createSessionNotify(deps: SessionNotifyDeps) {
   const isDeliveryOpenToAgent = (openerPubkey: string, targetAgentName: string): boolean =>
     isDeliveryOpenInFlight(openerPubkey, pubkeyOfAgent(targetAgentName));
 
+  // Wraps notificationDispatcher.dispatchSessionStateChanged so every call site gets the
+  // Telegram state-change doorbell for free (DoD: state changes ALWAYS ring, never coalesced) —
+  // one wrapper rather than hooking each of the several existing call sites individually.
+  //
+  // (This paragraph sat above `resolveWho` in the old daemon.ts, describing a function ~2,000 lines
+  // away, and unit 18 moved it verbatim into who-resolver.ts where it read as that module's header.
+  // It belongs here, at the wrapper it is about.)
   function dispatchSessionStateChangedWithTelegram(
     agentName: string,
     sessionId: string,

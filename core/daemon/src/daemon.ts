@@ -1027,8 +1027,8 @@ async function startDaemonHoldingLock(
     forgetConnection,
     forgetTakeLedger: (connectionId: string) => contentTakes.forget(connectionId),
     inboundSessionWaiters,
-    // A GETTER: the dispatcher is built below, and a disconnect can only happen after the socket
-    // opens, which is later still.
+    // A GETTER, though the dispatcher is a const 82 lines ABOVE — so that moving its construction
+    // below this line cannot break the disconnect path silently. Reason in full at the dep.
     getNotificationDispatcher: () => notificationDispatcher,
   });
 

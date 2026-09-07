@@ -20,9 +20,6 @@ export interface WhoLabelDeps {
 export function createWhoResolver(deps: WhoLabelDeps) {
   const { logger, sessionNodeManager, getOfferedMoniker } = deps;
 
-  // Wraps notificationDispatcher.dispatchSessionStateChanged so every call site gets the
-  // Telegram state-change doorbell for free (DoD: state changes ALWAYS ring, never coalesced) —
-  // one wrapper rather than hooking each of the several existing call sites individually.
   // MONIKER-4 AC2: resolve the counterparty's display label — local pet name (MONIKER-3) ??
   // offered name for this session (MONIKER-2) ?? fingerprint. Total: any failure inside
   // resolution degrades to fingerprint via whoLabel's own tiers; a label can never block a

@@ -57,8 +57,7 @@ function build(getReconcileScheduler: () => { noteRefusal: (o: string, p: string
     getReconcileScheduler,
     notificationDispatcher: { dispatchDocumentWatch: () => {} },
     getCloseSessionHandler: () => undefined,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  } as any);
+  } as never);
 }
 
 describe("a peer refusal reaches a scheduler that did not exist when the wiring was built", () => {
