@@ -36,8 +36,7 @@ import type {
 import { RestartSealResolver } from "./restart-seal-resolver.js";
 import { removeLockIfOwned } from "./lock-file.js";
 import { acquireSingletonLock, type SingletonLock } from "./singleton-lock.js";
-import { createIpcServer, type IpcServer, type IpcHandler, type HandlerLookup } from "./ipc-server.js";
-import { renderForSurface } from "./vocabulary.js";
+import { type IpcHandler } from "./ipc-server.js";
 import { classifyManifestValidity, describeManifestValidity } from "./manifest-validity.js";
 import { describeDirectoryAuth } from "./directory-auth-posture.js";
 import { SealFailureStore } from "./seal-failure-store.js";
@@ -77,6 +76,7 @@ import { createConnectionAgents } from "./connection-agents.js";
 import { createDirectoryConnect } from "./directory-connect.js";
 import { createUnresolvedNodesReport } from "./unresolved-nodes-report.js";
 import { createDocumentSurface } from "./document-surface.js";
+import { createIpcSurface } from "./ipc-surface.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
@@ -1035,93 +1035,14 @@ async function startDaemonHoldingLock(
     startTelegramPollerIfConfigured,
   });
 
-  let shutdownPromise: Promise<void> | null = null;
-  handlers.set("shutdown", async (_params, _connectionId) => {
-    if (!shutdownPromise) {
-      shutdownPromise = stop("logout_requested").catch((err: unknown) => {
-        logger.error("daemon.shutdown.failed", {
-          signal: "logout",
-          error: err instanceof Error ? err.message : String(err),
-        });
-      });
-    }
-    return { acknowledged: true };
+  // 040-DAEMONROOT unit 16: the handler map as the IPC server sees it, and the server itself →
+  // ipc-surface.ts.
+  const { ipcServer } = createIpcSurface({
+    logger, socketPath, maxConnections, handlers, perConnectionState, fallbackNoticeStore,
+    // A GETTER: `stop` is defined below this surface and the `shutdown` verb calls it.
+    getStop: () => stop,
   });
 
-  // DOD-ONBOARD-HELP-1 §5 — render every response for the surface that asked.
-  //
-  // The daemon is where an operator actually MEETS the tool names: a refused send says "call
-  // cello_receive first". Those strings are written with the canonical MCP names, so an MCP caller
-  // gets them verbatim — but a CLI caller must be told `cello receive`, the thing they can type.
-  // (P2-7 was the one-off report of this; it is a whole CLASS, and this closes the class.)
-  //
-  // Wrapping the handler map is the ONE choke point that has both the response and the connection's
-  // clientType. Doing it per-handler would mean 60+ call sites, and the 61st would forget.
-  //
-  // RESOLVED AT DISPATCH, not copied at construction. This was a `for…of` that snapshotted
-  // `handlers` into a second map, which made the ORDER of registration load-bearing in a file
-  // 3,500 lines long: anything registered after this line was written into a map nothing
-  // dispatched from. The document surface landed 245 lines below it and every `cello_doc_*` verb
-  // answered `method_not_found` — whose guidance blames version skew between the shim and the
-  // daemon, so an operator would re-pin, reinstall and restart, and find both sides matching.
-  //
-  // A comment saying "register above this line" would have been one more rule to remember. Late
-  // binding makes the ordering unrepresentable instead: the map below reads `handlers` when a
-  // request arrives, so a handler registered at any point before the first request is dispatchable.
-  const renderedHandlers: HandlerLookup = {
-    get(method: string): IpcHandler | undefined {
-      const handler = handlers.get(method);
-      if (!handler) return undefined;
-      return async (params, connectionId) => {
-        /**
-         * ONE request, ONE store — and the fallback notice is spread in BEFORE `renderForSurface`.
-         *
-         * `DOD-M15-SELECTION-1` clause 2 first annotated the response out in `ipc-server.ts`, which
-         * is downstream of this wrapper and therefore downstream of surface rendering. The notice
-         * says *"Run cello_use_agent"*; `isInstructionKey` in `vocabulary.ts` rewrites any key
-         * ending in `guidance`, so that WOULD have become `cello use-agent` for a terminal — but it
-         * arrived after the rewrite had already run. An operator running `cello inbox` was handed a
-         * verb that does not exist in a shell, which is the exact failure the vocabulary layer was
-         * built to prevent. Annotating here puts it back in front of the renderer.
-         */
-        const store: { notice?: Record<string, unknown> } = {};
-        const result = await fallbackNoticeStore.run(store, () => handler(params, connectionId));
-        /**
-         * ⚠️ **THE NOTICE GOES FIRST, AND THAT ORDERING IS A SECURITY PROPERTY — review F2.**
-         *
-         * It used to be spread LAST, which reads as harmless because these keys are additive. It is
-         * not: `cello_get_quarantined` returns a REFUSED MESSAGE as its final key, and the framing
-         * that makes hostile content safe to read has NO CLOSING DELIMITER — the reader's one
-         * structural guarantee is that nothing follows the payload. Three keys of genuine
-         * CELLO-authored prose landing after it is exactly the shape a forged ending imitates, and
-         * once a reader has seen real framing follow the payload, a forged one is credible.
-         *
-         * Not a corner case: `withIpc` in the CLI never sends `ipc.connect`, so a single-agent
-         * daemon takes the sole-online fallback on EVERY plain `cello quarantined` invocation.
-         *
-         * Spreading first is safe in general and needs no per-handler knowledge: these keys cannot
-         * collide with a handler's own (a collision would mean a handler already answered the
-         * question the notice exists to answer), and every response then keeps its own key order at
-         * the tail — which is where a payload-terminal key has to stay.
-         */
-        const annotated =
-          store.notice && result !== null && typeof result === "object" && !Array.isArray(result)
-            ? { ...store.notice, ...(result as Record<string, unknown>) }
-            : result;
-        // Default to "cli": a connection that never sent ipc.connect has no recorded surface, and
-        // the CLI verb is the safe answer — it is at least a real command an operator can run,
-        // whereas an MCP tool name is useless in a terminal.
-        const surface = perConnectionState.get(connectionId)?.clientType === "mcp" ? "mcp" : "cli";
-        return renderForSurface(annotated, surface);
-      };
-    },
-  };
-
-  // Create and start IPC server
-  const ipcServer: IpcServer = createIpcServer(
-    { socketPath, maxConnections, logger },
-    renderedHandlers,
-  );
 
   // THE SOCKET OPENS LAST — see the deferred start below. Accepting clients here would accept
   // `cello_start_agent`, which brings an agent online, creates its standing receiver, and drains
