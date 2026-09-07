@@ -344,11 +344,14 @@ describe("DOD-M15-ENDORSE-RETRY-1 — the reconnect wake is wired into onConnect
     const { readFileSync } = await import("node:fs");
     const { fileURLToPath } = await import("node:url");
     const { dirname, resolve } = await import("node:path");
-    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", "daemon.ts"), "utf8");
+    // 040-DAEMONROOT unit 5: the per-agent manager — and with it the `onConnected` block this
+    // pin names — moved out of daemon.ts into signaling-wiring.ts. The file changed; the assertion
+    // that the reconnect wake sits in the SAME block as the park drain did not.
+    const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), "..", "signaling-wiring.ts"), "utf8");
 
     // POSITIVE CONTROL FIRST: prove this search can see. An empty result from a path that does not
     // exist reads exactly like an absent call site.
-    expect(src.length, "daemon.ts was not read").toBeGreaterThan(1000);
+    expect(src.length, "signaling-wiring.ts was not read").toBeGreaterThan(1000);
     expect(src).toContain("onSignalingConnected(agentName)");
 
     // The `onConnected` callback body, taken as the text between `onConnected: () => {` and its
