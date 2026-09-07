@@ -118,7 +118,42 @@ export const AWAY_AUTO_REPLY_TEXTS = {
   offerFor(agentName: string): string {
     return `${AWAY_AUTO_REPLY_MARKER} ${agentName}${OFFER_SUFFIX}`;
   },
+
+  /**
+   * M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — deliberately minimal and
+   * the SAME for both ack kinds, unlike the two above. That sameness is what DOD-M15-AWAYLEAF-1
+   * contains; the guard is at the send site in `attendance-wiring.ts`, which is where the content
+   * hash exists. Lives here beside its siblings for the reason the marker does: one definition, so
+   * a reword cannot desynchronise the detector.
+   */
+  stranger: `${AWAY_AUTO_REPLY_MARKER} Dispatched.`,
 } as const;
+
+/**
+ * The system default away text, per kind and per whether the caller is known. MOVED HERE from
+ * `attendance-wiring.ts` (DOD-M15-AWAYLEAF-1) so the selection sits beside the strings it selects
+ * so the selection sits beside the strings it selects.
+ *
+ * The record that travelled with it:
+ * - DOD-AWAY-WRAP-1 AC1: the request text is a leave-a-message greeting, and it names the specific
+ *   away agent — which is why it is built rather than fixed.
+ * - DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the message ack must STATE the one-shot
+ *   rule. Without it a cooperative caller LLM has no reason to stop, sends a follow-up, and eats the
+ *   DOD-INBOX-ONESHOT-1 rejection the design itself invited.
+ * - ONE definition, shared with the detector in this file. A second copy elsewhere is how a reworded
+ *   away message stops being recognised as machine traffic and the mutual-seal loop
+ *   (DOD-AWAY-MUTUAL-SEAL-1) quietly comes back.
+ *
+ * ⚠️ A STRANGER GETS THE SAME STRING FOR BOTH KINDS. That is contained by DOD-M15-AWAYLEAF-1's
+ * guard at the send site — not by varying the text, which would tell an unknown caller more than
+ * M8C-CONTACT-1 allows. Note the guard cannot live here: `resolveAwayMessage` OVERRIDES this
+ * function entirely, so a configured away message is kind-independent too and collides the same way.
+ */
+export function systemAwayText(kind: "request" | "message", agentName: string, isKnown: boolean): string {
+  if (!isKnown) return AWAY_AUTO_REPLY_TEXTS.stranger;
+  return kind === "request" ? AWAY_AUTO_REPLY_TEXTS.offerFor(agentName) : AWAY_AUTO_REPLY_TEXTS.oneShot;
+}
+
 
 /**
  * True when `text` is away auto-reply traffic — a machine, not a caller.

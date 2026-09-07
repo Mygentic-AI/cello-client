@@ -319,6 +319,137 @@ describe("M8C-CONTACT-1: contact whitelist", () => {
     expect(h.getSessionNodeManager().isContact("bob", strangerPubkey)).toBe(false);
   });
 
+  it("DOD-M15-AWAYLEAF-1: a stranger who knocks THEN sends gets ONE ack, because a second identical leaf can never be sealed", async () => {
+    /**
+     * The strand, reproduced at its source. `STRANGER_TEXT` is the same bytes for both ack kinds, so
+     * before this fix an unattended agent put TWO leaves with one content hash into its own
+     * transcript. The counterparty deduplicates them to one whenever the relay position is
+     * unavailable, and the two frontiers then differ by exactly one leaf forever.
+     *
+     * Measured live on 2026-09-07 (session 9b4d89f9): 4 leaves against 3, `close_session` refused
+     * `leaf_count_mismatch`, receipt permanently unobtainable.
+     */
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const strangerPubkey = fixtureIdentity().pubkeyHex;
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(strangerPubkey, bobPubkey));
+    await wait(150);
+
+    // The stranger, still unknown, now says something on the session they just opened.
+    const m1 = new TextEncoder().encode("from the stranger");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await wait(150);
+
+    /**
+     * THE ASSERTION THAT FAILS ON A REVERT. Reverting sends "[[AUTO-REPLY]] Dispatched." twice, and
+     * this reads two identical entries instead of one.
+     */
+    const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Dispatched.")]);
+    expect(events.find((e) => e.event === "session.away.response.suppressed_duplicate")?.context)
+      .toMatchObject({ agentName: "bob", kind: "message" });
+  });
+
+  it("DOD-M15-AWAYLEAF-1: a KNOWN contact with a CONFIGURED away message also gets ONE ack, not two", async () => {
+    /**
+     * REVIEW HIGH-1. The first version of this fix guarded on `!isKnown`, which misses the case that
+     * matters most: `resolveAwayMessage` is KIND-INDEPENDENT and overrides the per-kind system text,
+     * so an operator who sets a custom away message (`cello_contact_set_away`, a shipped feature)
+     * gets byte-identical acks for the knock and the message — for a KNOWN contact. Same two leaves,
+     * same one content hash, same unsealable session. The guard is on the content hash for this
+     * reason, so this test fails against a `!isKnown`-scoped implementation.
+     */
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const callerPubkey = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", callerPubkey, undefined, null, TIER.KNOWN);
+    snm.setContactAwayMessage("bob", callerPubkey, "Back in an hour.");
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
+    await wait(150);
+    const m1 = new TextEncoder().encode("from a known contact");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await wait(150);
+
+    const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent.map((s) => s.text)).toEqual([markAsAutoReply("Back in an hour.")]);
+  });
+
+  it("DOD-M15-AWAYLEAF-1 teeth: a KNOWN contact on the DEFAULT text still gets BOTH acks, because they differ", async () => {
+    /**
+     * THE CONTROL, and the bypass the reviewer named (MEDIUM-3). The guard must suppress only what is
+     * genuinely identical — it must NOT silence the known caller's second ack, which carries the
+     * one-shot rule that `DOD-AWAY-ACK-ONESHOT-TEXT-1` exists to guarantee. Without this test an
+     * over-broad guard (or a revert to a per-session "one ack ever" rule) passes the whole suite
+     * while quietly removing the instruction that stops a cooperative caller talking to an empty room.
+     */
+    const { logger } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    const callerPubkey = fixtureIdentity().pubkeyHex;
+    snm.addContact("bob", callerPubkey, undefined, null, TIER.KNOWN); // no configured message → per-kind defaults
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(callerPubkey, bobPubkey));
+    await wait(150);
+    const m1 = new TextEncoder().encode("from a known contact");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await wait(150);
+
+    const sent = snm.readTranscript("bob", SID_HEX).messages.filter((m) => m.direction === "sent");
+    expect(sent.length, "two DIFFERENT acks must both be sent").toBe(2);
+    expect(sent[0]?.text).toContain("is currently away. Leave a message"); // offerFor(agentName)
+    expect(sent[1]?.text).toContain("one message per visit");             // the one-shot rule
+  });
+
+  it("DOD-M15-AWAYLEAF-1: suppressing the duplicate ack does NOT disarm the one-shot rejection", async () => {
+    /**
+     * THE TEETH ON THE FIX ITSELF. The suppression returns early, and the obvious way to write it
+     * leaves the message-kind guard unset — which silently removes `DOD-INBOX-ONESHOT-1`. A stranger
+     * could then talk to an unattended agent indefinitely with nothing ever closing the session, and
+     * the ack test above would still pass. So the SECOND message must still be rejected.
+     */
+    const { logger, events } = makeLogger();
+    const bobPubkey = await makeAgentDir("bob");
+    const injectRef: { inject?: (frame: unknown) => void } = {};
+    const h = await start({ logger, node: new FakeNode(), signalingConnect: makeInjectableSignaling(injectRef) });
+    await wait(50);
+    const snm = h.getSessionNodeManager();
+    await snm.ensureStandingReceiverForAgent("bob");
+
+    snm.setSessionContentKeyForTest("bob", SID_HEX, new Uint8Array(32).fill(0x7e));
+    injectRef.inject!(await assignmentFrame(fixtureIdentity().pubkeyHex, bobPubkey));
+    await wait(150);
+
+    const m1 = new TextEncoder().encode("first");
+    await snm.ingestReceivedContent("bob", SID_HEX, m1, msgLeafHash(m1), "c1");
+    await wait(150);
+    const m2 = new TextEncoder().encode("second, ignoring the one-shot rule");
+    await snm.ingestReceivedContent("bob", SID_HEX, m2, msgLeafHash(m2), "c2");
+    await wait(200);
+
+    // The one-shot rejection is reached on the SECOND message, exactly as it is without this fix.
+    const rejected = events.filter((e) => e.event === "session.away.inbox.oneshot.rejected");
+    expect(rejected.length, "the second message must still be rejected, not silently suppressed").toBeGreaterThan(0);
+  });
+
   it("K3 (CC-1): the operator replying INTO an inbound session (cello_send) promotes the sender to a known contact", async () => {
     await makeAgentDir("alice");
     const h = await start({ logger: makeLogger().logger, node: new FakeNode() });

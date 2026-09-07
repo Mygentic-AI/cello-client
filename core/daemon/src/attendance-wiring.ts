@@ -23,7 +23,7 @@ import type { ActiveSealResult } from "./seal-flows.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SecurityGatewayClient } from "@cello-protocol/gateway";
 import { countAttendance, ContentTakeLedger } from "./co-attendance.js";
-import { isOwnAwayAutoReply, AWAY_AUTO_REPLY_TEXTS, markAsAutoReply, isAutoReplyMarked } from "./away-detection.js";
+import { isOwnAwayAutoReply, markAsAutoReply, isAutoReplyMarked, systemAwayText } from "./away-detection.js";
 import { LEAF_KIND_MSG } from "./session-relay-client.js";
 import { sentAuthorship } from "./session-content-handlers.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
@@ -98,18 +98,6 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
    * every other one.
    */
   const backgroundSeals = new Set<Promise<unknown>>();
-  // DOD-AWAY-WRAP-1 AC1: request text is a leave-a-message greeting; agentName is spliced in at
-  // the call site so it names the specific away agent.
-  // DOD-AWAY-ACK-ONESHOT-TEXT-1 (live defect 2026-07-24): the ack must state the one-shot rule —
-  // without it a cooperative caller LLM has no reason to stop, sends a follow-up, and eats the
-  // DOD-INBOX-ONESHOT-1 rejection the design itself invited.
-  // ONE definition, shared with the detector in away-detection.ts. A second copy here is how a
-  // reworded away message stops being recognised as machine traffic and the mutual-seal loop
-  // (DOD-AWAY-MUTUAL-SEAL-1) quietly comes back.
-  const AWAY_MESSAGE_TEXT = AWAY_AUTO_REPLY_TEXTS.oneShot;
-  // M8C-CONTACT-1: "unknown senders learn only 'dispatched' by default" — a single shared,
-  // deliberately minimal template regardless of kind, distinct from AWAY-1's richer per-type text.
-  const STRANGER_TEXT = "Dispatched.";
   // Coalescing: one away ack per (agent, session, kind) per away period — cleared when the agent
   // becomes attended again (cello_use_agent) so the NEXT away period gets a fresh ack rather than
   // staying silent forever. Known imprecision (journaled, not silent): clearing fires on ANY
@@ -169,8 +157,8 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
     const dedupKey = `${agentName}:${sessionId}:${kind}`;
     // F3 fix: a dedicated guard prevents re-entry after the rejection fires — without it a
     // rapid-fire sender could trigger multiple rejection sends and concurrent seal submits while
-    // the session remains active (seal failed). This key is never cleared (no re-attend resets
-    // it — once rejected, the session is closing regardless).
+    // the session remains active (seal failed). ⚠️ It said "never cleared, no re-attend resets it":
+    // FALSE — it matches the `${name}:` sweep in agent-handlers.ts, so re-attending re-arms it.
     const rejectedKey = `${agentName}:${sessionId}:rejected`;
     if (awayAckSent.has(dedupKey)) {
       // DOD-INBOX-ONESHOT-1: a second inbound message while the first away ack is still live means
@@ -358,17 +346,10 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
     }
     const record = sessionNodeManager.getSessionRecord(agentName, sessionId);
     if (!record || record.status !== "active") return;
-    // Select the ack wording by whether the sender is a known contact — STRANGER_TEXT
-    // ("Dispatched.") for unknown, system default for known. The inbound accept path does NOT
-    // auto-add the sender: an unattended stranger STAYS unknown across every inbound interaction.
-    // Promotion requires operator engagement — an outbound initiate, a cello_send reply, or an
-    // explicit contact add. This is a plain read of current contact state; nothing downstream
-    // depends on its ordering.
+    // The inbound accept path does NOT auto-add the sender: an unattended stranger STAYS unknown
+    // across every inbound interaction. Promotion requires operator engagement — an outbound
+    // initiate, a cello_send reply, or an explicit contact add. Nothing depends on its ordering.
     const isKnown = sessionNodeManager.isKnown(agentName, record.counterparty_pubkey);
-    // DOD-AWAY-WRAP-1 AC1: request kind uses a leave-a-message greeting that names the away agent.
-    const systemDefault = kind === "request"
-      ? AWAY_AUTO_REPLY_TEXTS.offerFor(agentName)
-      : AWAY_MESSAGE_TEXT;
     awayAckSent.add(dedupKey); // guard BEFORE the async send — concurrent arrivals must not double-ack
     try {
       // DOD-AWAY-TIER-1: resolve most-specific-first — per-contact away_message → per-tier away
@@ -380,7 +361,7 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       // exact-text matching could not reach by construction. markAsAutoReply is idempotent, so the
       // system defaults (already marked at their source) do not pick up a second token.
       const awayText = sessionNodeManager.resolveAwayMessage(agentName, record.counterparty_pubkey)
-        ?? (isKnown ? systemDefault : STRANGER_TEXT);
+        ?? systemAwayText(kind, agentName, isKnown);
       const draftBytes = new TextEncoder().encode(awayText);
       // SI (AWAY-TIER-1): an away message is now operator-configurable, i.e. an outbound DISCLOSURE.
       // Screen it on the outbound path like any content — it does NOT bypass the gateway. A block/warn
@@ -400,9 +381,9 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       // DOD-M12B-AWAY-MARK-1: mark AFTER screening, never before. A redact verdict REPLACES the
       // bytes, and marking the draft would let that replacement silently strip the marker — an away
       // reply back on the wire indistinguishable from a person, with no log line saying so. Marking
-      // here also means the gateway screens the operator's actual disclosure rather than a daemon
-      // token bolted to the front of it. markAsAutoReply is idempotent and the system defaults are
-      // marked at their source, so nothing gains a second token.
+      // here also means the gateway screens the OPERATOR-CONFIGURED message — the only unmarked
+      // input — rather than a daemon token bolted to its front. Every system default, the stranger
+      // ack included since AWAYLEAF-1, is marked at source; markAsAutoReply is idempotent.
       const screenedBytes = awayVerdict.disposition === "redact" && awayVerdict.content !== undefined
         ? new Uint8Array(awayVerdict.content)
         : draftBytes;
@@ -411,6 +392,25 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       );
       // B2b: one decision point for the hash AND its algorithm — see `contentHashForSession`.
       const away = await sessionNodeManager.contentHashForSession(agentName, sessionId, contentBytes);
+      /**
+       * DOD-M15-AWAYLEAF-1 — NEVER EMIT A LEAF THIS SESSION ALREADY HOLDS. An unattended agent acks
+       * twice (knock, then message), and the two are the SAME BYTES whenever the text does not vary
+       * by kind: the stranger default, and EVERY configured away message, since `resolveAwayMessage`
+       * above is kind-independent and overrides the per-kind default — so a known contact collides.
+       * The receiver separates duplicates by relay POSITION (DOD-FRONTIER-STRAND-1), but a parked
+       * predecessor routinely makes that record `unusable` and strips the position; it then dedups on
+       * content hash and records ONE where the sender counted two. Measured 2026-09-07, session
+       * 9b4d89f9: 4 against 3, refused `leaf_count_mismatch`; a leaf one side lacks is never co-signed.
+       * The TREE is the check: the same durable, per-session record the receiver itself dedups against.
+       */
+      const awayHashHex = Buffer.from(away.hash).toString("hex");
+      if (sessionNodeManager.getSessionTree(agentName, sessionId).indexOfHash(awayHashHex) >= 0) {
+        logger.info("session.away.response.suppressed_duplicate", {
+          agentName, sessionId, kind, contentHashHex: awayHashHex, reason: "identical_leaf_already_in_this_session",
+          impact: "no second ack is sent; two leaves with one content hash leave this session unable to seal",
+        });
+        return;
+      }
       const sendResult = await sessionNodeManager.sendContent(agentName, sessionId, contentBytes, new Uint8Array(away.hash), randomUUID(), LEAF_KIND_MSG, away.alg);
       if (!sendResult.ok && !sendResult.durable) {
         // Reviewer MEDIUM fix: a transient failure must NOT permanently silence the rest of this
