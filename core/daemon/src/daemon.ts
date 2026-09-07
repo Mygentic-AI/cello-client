@@ -72,6 +72,7 @@ import { createDocumentSurface } from "./document-surface.js";
 import { createIpcSurface } from "./ipc-surface.js";
 import { createDaemonStatusReport } from "./daemon-status-report.js";
 import { createWhoResolver } from "./who-resolver.js";
+import { wireDisconnectCleanup } from "./disconnect-cleanup.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
@@ -1046,63 +1047,18 @@ async function startDaemonHoldingLock(
   }
 
 
-  // MCP-001: Clean up per-connection state when a connection disconnects
-  // MCP-002: Also unregister from notification dispatcher
-  ipcServer.onDisconnect((connectionId) => {
-    /**
-     * DOD-M15-IPCVISIBLE-1: SAY THAT IT CLOSED, and say what it was attending.
-     *
-     * `daemon.ipc.connected` fired on every open and nothing on close, so a live client and a dead
-     * one that was never cleaned up looked identical in the log. The attended agent is the field
-     * that matters: attendance dropping was silent, and an agent losing its last attendee changes
-     * whether away-messages fire and who receives doorbells — so a session that stopped waking is
-     * diagnosable from the log rather than by guesswork.
-     */
-    const closing = perConnectionState.get(connectionId);
-    const stillAttending = closing?.currentAgent
-      ? countAttendance(perConnectionState, closing.currentAgent) - 1
-      : null;
-    // RETURNED, not logged here — `ipcServer` merges this into its single
-    // `daemon.ipc.disconnected` line. A second line under the same name left neither carrying the
-    // whole picture and doubled every count (review F8).
-    const disconnectContext: Record<string, unknown> = {
-      clientType: closing?.clientType ?? "unknown",
-      attendedAgent: closing?.currentAgent ?? null,
-      ...(stillAttending !== null ? { remainingAttendance: stillAttending } : {}),
-      ...(stillAttending === 0
-        ? {
-            impact:
-              "that agent has no attending session left — inbound sessions are now answered with " +
-              "its away message rather than a live reply, and its doorbells reach nobody",
-          }
-        : {}),
-    };
-    // The three per-connection maps are released by the module that owns them; the reasons each
-    // must die with its connection live there, beside the containers.
-    forgetConnection(connectionId);
-    // DOD-COATTEND-VISIBLE-1 (review HIGH): the take ledger is connection-scoped for the SAME
-    // reason and must die with the connection too. Leaving it behind made every reconnect look
-    // like a theft: a fresh connection starts at cursor -1, so every take a now-dead connection
-    // ever recorded sits above that bar and was reported as "another session took it" — on the
-    // `cello` CLI, which opens a fresh connection per command, that fired on ordinary use, forever,
-    // with no live sibling anywhere. A signal that fires on the normal case is not a signal, and
-    // this one would have taught the operator to disbelieve the real theft it exists to announce.
-    contentTakes.forget(connectionId);
-    notificationDispatcher.unregisterConnection(connectionId);
-    // Seam 2 (review H2): evict any cello_await_session waiters owned by this connection.
-    // Otherwise enqueueInboundSession would hand the next inbound session to a closed
-    // connection's waiter and the event would be lost. deliver(null) clears the waiter's
-    // timer and resolves its (now-orphaned) promise as a timeout.
-    for (const [agentName, waiters] of inboundSessionWaiters) {
-      const survivors: typeof waiters = [];
-      for (const w of waiters) {
-        if (w.connectionId === connectionId) w.deliver(null);
-        else survivors.push(w);
-      }
-      if (survivors.length > 0) inboundSessionWaiters.set(agentName, survivors);
-      else inboundSessionWaiters.delete(agentName);
-    }
-    return disconnectContext;
+  // 040-DAEMONROOT unit 20: what the daemon forgets, and what it says, when a connection closes →
+  // disconnect-cleanup.ts.
+  wireDisconnectCleanup({
+    ipcServer,
+    getConnState: (connectionId: string) => perConnectionState.get(connectionId),
+    countAttendanceFor: (agentName: string) => countAttendance(perConnectionState, agentName),
+    forgetConnection,
+    forgetTakeLedger: (connectionId: string) => contentTakes.forget(connectionId),
+    inboundSessionWaiters,
+    // A GETTER: the dispatcher is built below, and a disconnect can only happen after the socket
+    // opens, which is later still.
+    getNotificationDispatcher: () => notificationDispatcher,
   });
 
   // Log daemon.login.validation.complete (stub — all unverified until SIGNAL-001)
