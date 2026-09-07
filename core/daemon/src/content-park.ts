@@ -78,15 +78,29 @@ export function createContentPark(deps: ContentParkDeps) {
    * and the notice store keys on (session, reason), so they sit side by side rather than
    * overwriting.
    */
+  /**
+   * ⚠️ **IT RETURNS THE REFUSAL RECORD, AND THAT IS THE ENFORCEMENT — review H3, second half.**
+   *
+   * The first version only wrote the notice, and the caller pushed its own `{ reason }` object
+   * separately. So a future branch could push a reason and forget to note it, and the enforcer
+   * could not see the difference: its scan asked only whether the reason NAME appeared somewhere in
+   * the file, which a bare `refusals.push({ reason })` satisfies on its own.
+   *
+   * Constructing the record HERE makes the pairing structural rather than remembered — the only way
+   * to get a park reason into the drain's refusal list is to have already told the operator about
+   * it. `dod-m15-inboxcause-1.test.ts` then has something it can actually check.
+   */
   function noteParkRefusal(
     agentName: string,
     sessionId: string,
+    contentHash: string,
     reason: ParkRefusalReason,
     ctx: Parameters<(typeof PARK_REFUSAL_NOTICE)[ParkRefusalReason]>[0],
-  ): void {
+  ): { contentHash: string; sessionId: string; reason: ParkRefusalReason } {
     // `noteContentRefusal` does not throw — a persistence failure logs and falls back to memory —
     // so this needs no guard of its own, and adding one would hide the ERROR it already emits.
     sessionNodeManager.noteContentRefusal(agentName, sessionId, reason, PARK_REFUSAL_NOTICE[reason](ctx));
+    return { contentHash, sessionId, reason };
   }
 
   // MSG-001-3b: content-park deposit/pull IPC handlers. These drive the daemon's
@@ -598,10 +612,13 @@ export function createContentPark(deps: ContentParkDeps) {
             logger.warn("content.recover.confirm.failed", { sessionId: e.sessionIdHex, contentHash: e.contentHashHex, error: extractErrorMessage(err) });
           }
         } else if (screenDeferred) {
-          noteParkRefusal(recipientAgent.name, e.sessionIdHex, PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE, {
-            sessionStatus, released: false, declaredAlg: declaredAlgSeen, saltReason,
-          });
-          refusals.push({ contentHash: e.contentHashHex, sessionId: e.sessionIdHex, reason: PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE });
+          refusals.push(
+            noteParkRefusal(
+              recipientAgent.name, e.sessionIdHex, e.contentHashHex,
+              PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE,
+              { sessionStatus, released: false, declaredAlg: declaredAlgSeen, saltReason },
+            ),
+          );
         } else {
           // Keep the relay copy — it is now the only one. Review F7: name why the entry is STUCK,
           // not why ingest refused it. `annexRefusal` carries the branch that actually stopped it;
@@ -669,13 +686,12 @@ export function createContentPark(deps: ContentParkDeps) {
               });
             }
           }
-          noteParkRefusal(recipientAgent.name, e.sessionIdHex, stuckReason, {
-            sessionStatus, released, declaredAlg: declaredAlgSeen, saltReason,
-          });
-          refusals.push({
-            contentHash: e.contentHashHex, sessionId: e.sessionIdHex,
-            reason: stuckReason,
-          });
+          refusals.push(
+            noteParkRefusal(
+              recipientAgent.name, e.sessionIdHex, e.contentHashHex, stuckReason,
+              { sessionStatus, released, declaredAlg: declaredAlgSeen, saltReason },
+            ),
+          );
         }
       } else {
         // M12-P18: content for a session WE REFUSED can be swept — deleting it acts on our own

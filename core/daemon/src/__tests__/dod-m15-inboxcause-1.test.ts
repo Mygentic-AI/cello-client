@@ -50,7 +50,27 @@ const ALL_PARK_REASONS = Object.values(PARK_REFUSAL_REASONS) as ParkRefusalReaso
  */
 function daemonSources(): string {
   return readdirSync(SRC)
-    .filter((f) => f.endsWith(".ts"))
+    /**
+     * ⚠️ **`park-refusals.ts` IS EXCLUDED, AND WITHOUT THAT THIS SCAN CANNOT FAIL.**
+     *
+     * `PARK_REFUSAL_NOTICE` keys its total map on `[PARK_REFUSAL_REASONS.<MEMBER>]`, so every
+     * reason references itself inside the very file that DECLARES it — and because the map is
+     * typed total, a new reason must appear there. The emission check below therefore found a
+     * reference for every reason no matter what any refusal site did, and reported coverage that
+     * had never been earned. A false CAUGHT, which is the worse half of the pair: a false green
+     * leaves the suspicion alive, a false caught retires it.
+     *
+     * ⚠️ **AND THIS EXCLUSION WAS WRITTEN ONCE ALREADY AND LOST BEFORE IT WAS COMMITTED.** The
+     * mutation loop that found the defect restores mutated paths with `git checkout --`, which
+     * reads the INDEX — and this file's fix was not yet staged, so a later mutant's cleanup
+     * silently reverted it while the commit message went on claiming it. That is the lost-work
+     * shape M15-PROCEDURE §2 rule 1 exists for: commit the fix BEFORE the loop exists. Recorded
+     * here rather than in the journal alone because the next person to add a mutation loop to this
+     * file is the one who needs it.
+     *
+     * The declaring file is not an emitter. Only the files that REFUSE are scanned.
+     */
+    .filter((f) => f.endsWith(".ts") && f !== "park-refusals.ts")
     .map((f) =>
       // Comments do not emit. A commented-out reference would otherwise satisfy the scan while the
       // real emission was replaced by a bare literal.
@@ -114,6 +134,37 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
       `These write a park refusal reason as a literal: ${offenders.join(", ")}. Use ` +
         `PARK_REFUSAL_REASONS.<MEMBER> so a rename is a compile error rather than a silently missed ` +
         `notice lookup.`,
+    ).toEqual([]);
+  });
+
+  it("★ no park reason enters the refusal list without the operator being told — structurally", () => {
+    /**
+     * Review H3, second half. The emission scan above asks only whether a reason NAME appears in a
+     * source file, and a bare `refusals.push({ reason })` satisfies that on its own — so a branch
+     * that reported a refusal to its IPC caller and told the operator NOTHING would pass it. That
+     * is the very defect this unit exists to remove, reachable one branch over.
+     *
+     * `noteParkRefusal` now writes the notice AND returns the record, so the pairing is structural.
+     * This asserts the structure holds: nothing may build a refusal record carrying a park reason
+     * except that helper.
+     */
+    const text = readFileSync(join(SRC, "content-park.ts"), "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    // Positive control: the pushes this is reasoning about must actually be in the file.
+    expect(
+      (text.match(/refusals\.push\(/g) ?? []).length,
+      "no refusals.push( in content-park.ts — this check is reasoning about code that is not there",
+    ).toBeGreaterThan(0);
+
+    const offenders = (text.match(/refusals\.push\(\s*\{[^}]*\}/g) ?? []).filter((push) =>
+      ALL_PARK_REASONS.some((r) => push.includes(r)) || push.includes("PARK_REFUSAL_REASONS."),
+    );
+    expect(
+      offenders,
+      `A park refusal reason is pushed to the drain's refusal list without going through ` +
+        `noteParkRefusal, so the IPC caller is told and the OPERATOR is not: ${offenders.join(" | ")}. ` +
+        `Push the helper's return value instead — it writes the notice first.`,
     ).toEqual([]);
   });
 
