@@ -105,7 +105,7 @@ describe("DOD-M12B-REAP-HELD-1: held content proves the counterparty established
   }, 60_000);
 
   /**
-   * THE WIRING. Every case above drives the counter directly, so the reaper in `daemon.ts` could
+   * THE WIRING. Every case above drives the counter directly, so the reaper in `session-views.ts` could
    * keep calling the transcript-only count and all four would stay green — which is exactly how the
    * live session was lost while a full suite passed.
    *
@@ -113,7 +113,10 @@ describe("DOD-M12B-REAP-HELD-1: held content proves the counterparty established
    */
   it("WIRING: the reaper asks the counter that includes held content", async () => {
     const { readFileSync } = await import("node:fs");
-    const code = readFileSync(join(import.meta.dirname, "..", "daemon.ts"), "utf-8")
+    // 040-DAEMONROOT unit 10: the reaper moved out of daemon.ts into session-views.ts, with the
+    // session views it belongs to. The file changed; what is asserted — that the reaper counts held
+    // content, not only the transcript — did not.
+    const code = readFileSync(join(import.meta.dirname, "..", "session-views.ts"), "utf-8")
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     // The DEFINITION, not the first mention — earlier call sites made the window land elsewhere.
     const idx = code.indexOf("function reapDeadHalfOpenSessions");
