@@ -272,6 +272,8 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
         // A FLOOR, not a figure — a row seeded at upgrade from a notice that already existed. It
         // gets its own field name so it cannot be read as a count (review F1c).
         ...(r.timesTotalAtLeast === undefined ? {} : { times_total_at_least: r.timesTotalAtLeast }),
+        // `041-PARKSTUCK`: the cadence beside the count, so a loop is not read as a crowd.
+        ...(r.recurrence === undefined ? {} : { recurrence: r.recurrence }),
         ...(r.repeat === true ? { repeat: true } : {}),
       })),
       // Say the list was cut ON THE LIST, not only in a log nobody opens — same rule as

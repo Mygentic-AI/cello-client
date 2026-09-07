@@ -794,6 +794,14 @@ export interface RefusalNotice {
    * the original defect with the new name on it. "At least 58" is true; "58" is not.
    */
   timesTotalAtLeast?: number;
+  /**
+   * `041-PARKSTUCK` — that this refusal REPEATS, and roughly how often, in a sentence.
+   *
+   * A lifetime count on its own is read as that many separate events. On the daemon this was
+   * written for, one message had been refused 731 times over 64 hours and the notice said `731`.
+   * Absent below three refusals or across a zero span, because two points are not a cadence.
+   */
+  recurrence?: string;
   repeat?: boolean;
 }
 

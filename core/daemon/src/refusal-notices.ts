@@ -18,6 +18,7 @@ import type { Logger } from "./types.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { SessionQueries } from "./session-queries.js";
 import { REFUSAL_KINDS, type RefusalKind } from "./refusal-reasons.js";
+import { refusalRecurrence } from "./park-refusals.js";
 import { extractErrorMessage } from "./error-message.js";
 import { TIER } from "./contacts-tier-migration.js";
 import {
@@ -107,7 +108,8 @@ export class RefusalNotices {
           ? this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
+                        t.total AS lifetime_total, t.seeded AS lifetime_seeded,
+                        t.first_at AS lifetime_first_at, t.last_at AS lifetime_last_at
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
@@ -123,7 +125,8 @@ export class RefusalNotices {
           : this.#db
               .prepare(
                 `SELECT n.session_id, n.reason, n.kind, n.impact, n.guidance, n.count, r.seen_count,
-                        t.total AS lifetime_total, t.seeded AS lifetime_seeded
+                        t.total AS lifetime_total, t.seeded AS lifetime_seeded,
+                        t.first_at AS lifetime_first_at, t.last_at AS lifetime_last_at
                    FROM content_refusal_notices n
                    LEFT JOIN content_refusal_reads r
                      ON r.agent_id = n.agent_id AND r.session_id = n.session_id
@@ -140,6 +143,7 @@ export class RefusalNotices {
         session_id: string; reason: string; kind: string; impact: string;
         guidance: string; count: number; seen_count: number | null;
         lifetime_total: number | null; lifetime_seeded: number | null;
+        lifetime_first_at: number | null; lifetime_last_at: number | null;
       }>;
       if (rows.length > MAX_REFUSALS_PER_READ) { truncated = true; rows.length = MAX_REFUSALS_PER_READ; }
       for (const row of rows) {
@@ -186,6 +190,21 @@ export class RefusalNotices {
             : row.lifetime_seeded === 1
               ? { timesTotalAtLeast: row.lifetime_total }
               : { timesTotal: row.lifetime_total }),
+          /**
+           * `041-PARKSTUCK` Unit 2, property 2 — A LOOP SAYS THAT IT IS ONE.
+           *
+           * `times_total_at_least: 731` with nothing beside it reads as 731 things going wrong.
+           * The row knows better: it holds the first and last time this reason fired, so the
+           * cadence is a division rather than a guess. Absent when the row cannot support the
+           * claim — see `refusalRecurrence`.
+           */
+          ...(() => {
+            const r =
+              row.lifetime_total === null || row.lifetime_first_at === null || row.lifetime_last_at === null
+                ? null
+                : refusalRecurrence(row.lifetime_total, row.lifetime_first_at, row.lifetime_last_at);
+            return r === null ? {} : { recurrence: r };
+          })(),
           ...(firstTime ? {} : { repeat: true }),
         });
       }
