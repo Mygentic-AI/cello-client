@@ -6,7 +6,15 @@
  * has been advanced on its behalf. A connection is not an agent: several connections can attend one
  * agent at once, and each keeps its own place in the conversation.
  *
- * ONE dependency — the session manager — and nothing late-bound. This was pure state with a few guards over it, sitting in
+ * ONE dependency — the session manager — and nothing late-bound.
+ *
+ * ⚠️ `forgetConnection` LIVES HERE FOR THE SAME REASON THE MAPS DO. A first cut left the eviction in
+ * the composition root, 1,600 lines from the containers it releases, and with it the two comments
+ * that say WHY each must die with its connection: the delivery bookmark was once the one
+ * per-connection structure that outlived its connection — an unbounded leak on a daemon the CLI
+ * reconnects to on every command — and a surviving take ledger made every reconnect look like a
+ * theft, because a fresh connection starts at cursor -1 and every take the dead one recorded sits
+ * above that bar. A module holding state with no visible release path reads as a leak. This was pure state with a few guards over it, sitting in
  * the middle of the boot sequence because that is where it happened to get written.
  */
 import type { SessionNodeManager } from "./session-node-manager.js";
@@ -123,9 +131,25 @@ export function startBootConnectionState(deps: BootConnectionStateDeps) {
     while (deliveredSeqs.has(frontier + 1)) frontier += 1;
     if (frontier >= 0) sessionNodeManager.advanceLastDeliveredSeq(agentName, sessionId, frontier);
   }
+  /**
+   * Release everything this connection held. The log context is built by the CALLER — the IPC server
+   * merges it into its single `daemon.ipc.disconnected` line, and a second line under the same name
+   * left neither carrying the whole picture.
+   */
+  function forgetConnection(connectionId: string): void {
+    perConnectionState.delete(connectionId);
+    connectionCursors.delete(connectionId); // M8C-CURSOR-1: cursor is connection-scoped, dies with it
+    // ...and so is the delivery bookmark (review F1). It is a SEPARATE map from the gate's cursor
+    // and would otherwise be the one per-connection structure that outlived its connection — an
+    // unbounded leak on a daemon the `cello` CLI reconnects to on every single command.
+    connectionDeliveryBookmarks.delete(connectionId);
+  }
+
+  // The two cursor MAPS are not returned — nothing outside reads them directly now that eviction
+  // lives here. What escapes is the operations over them.
   return {
-    perConnectionState, onlineAgents, explicitlyOfflineAgents,
-    connectionCursors, getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
-    connectionDeliveryBookmarks, getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
+    perConnectionState, onlineAgents, explicitlyOfflineAgents, forgetConnection,
+    getConnectionCursor, advanceConnectionCursor, safeCursorAdvance,
+    getDeliveryBookmark, advanceDeliveryBookmark, safeWatermarkAdvance,
   };
 }

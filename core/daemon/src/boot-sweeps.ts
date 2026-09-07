@@ -1,12 +1,14 @@
 /**
- * The two background sweeps the daemon runs on itself, and the timers that re-arm them.
+ * ONE of the daemon's two background sweeps — the revival-bound sweep — and the timer that re-arms
+ * it. The other, the document reconcile sweep, is still in the composition root beside the document
+ * wiring it drives.
  *
  * A sweep is not a one-off: a session interrupted at 09:00 on a daemon that stays up all week would
- * otherwise be swept only at the next boot, and a long-lived daemon is the normal case. Both timers
- * `unref` so a pending tick never holds the process open.
+ * otherwise be swept only at the next boot, and a long-lived daemon is the normal case. The timer
+ * `unref`s so a pending tick never holds the process open.
  *
- * Returned rather than started-and-forgotten because shutdown has to clear them, and a timer nobody
- * holds a handle to is a process that will not exit.
+ * The timer is returned rather than started-and-forgotten because shutdown has to clear it, and a
+ * timer nobody holds a handle to is a process that will not exit.
  */
 import type { Logger } from "./types.js";
 import { REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS, type SessionNodeManager } from "./session-node-manager.js";
@@ -63,5 +65,7 @@ export function startBootSweeps(deps: BootSweepsDeps) {
   const revivalBoundSweepTimer = setInterval(runRevivalBoundSweep, REVIVAL_BOUND_SWEEP_MS);
   revivalBoundSweepTimer.unref?.();
 
-  return { runRevivalBoundSweep, revivalBoundSweepTimer };
+  // The sweep function itself is not returned — its only callers are here (once at construction,
+  // then on the timer). Only the timer escapes, because shutdown has to clear it.
+  return { revivalBoundSweepTimer };
 }

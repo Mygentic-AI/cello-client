@@ -154,7 +154,7 @@ export default [
     //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 2110, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1981, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -173,16 +173,20 @@ export default [
     rules: { "max-lines": ["error", { max: 241, skipBlankLines: false, skipComments: false }] },
   },
   {
+    files: ["core/daemon/src/start-agent.ts"],
+    rules: { "max-lines": ["error", { max: 180, skipBlankLines: false, skipComments: false }] },
+  },
+  {
     files: ["core/daemon/src/boot-sweeps.ts"],
-    rules: { "max-lines": ["error", { max: 67, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 71, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-parked-content.ts"],
-    rules: { "max-lines": ["error", { max: 553, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 555, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-connection-state.ts"],
-    rules: { "max-lines": ["error", { max: 131, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 155, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-agents.ts"],

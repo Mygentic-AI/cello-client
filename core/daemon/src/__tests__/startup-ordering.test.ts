@@ -46,6 +46,42 @@ function lineOf(needle: string, src: string = DAEMON_SRC): number {
   return lines.findIndex((l) => l.includes(needle) && !l.trim().startsWith("//") && !l.trim().startsWith("*"));
 }
 
+describe("the composition root actually CALLS every phase it depends on", () => {
+  /**
+   * 040-DAEMONROOT turned inline statements into call sites, and a call site can be deleted while a
+   * module still compiles, still ships, and still passes its own tests. Unit 9 shipped exactly that
+   * gap: delete the revival-bound sweep's call and 5,036 tests stayed green while the sweep never
+   * ran at boot and never re-armed — leaving open the write surface it exists to close, silently.
+   *
+   * Every phase gets a line here. This is the cheapest guard in the file and it covers the failure
+   * mode the whole order creates.
+   */
+  const PHASES = [
+    "startBootCore(",
+    "startBootAgents(",
+    "startBootConnectionState(",
+    "startBootParkedContent(",
+    "startBootSweeps(",
+    "createSessionViews(",
+    "createAgentSelection(",
+    "createStartAgent(",
+    "createSignalingWiring(",
+    "createAttendanceWiring(",
+    "createDocumentWiring(",
+  ] as const;
+
+  for (const phase of PHASES) {
+    it(`calls ${phase.replace("(", "")}`, () => {
+      expect(
+        lineOf(phase),
+        `${phase} is never called from daemon.ts. The module still compiles and still passes its own ` +
+        `tests; what it does not do is run. That is the failure this whole order creates, and this ` +
+        `line is what notices it.`,
+      ).toBeGreaterThan(-1);
+    });
+  }
+});
+
 describe("startDaemon ordering — constraints the type system cannot express", () => {
   it("the eager per-agent connect runs BEFORE `await flushAwaitingContent()`, so handshakes overlap the relay drain", () => {
     const connect = lineOf("getAgentSignaling(agent.name, agent.keyProvider, agent.pubkey)");

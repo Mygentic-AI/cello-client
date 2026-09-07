@@ -5,13 +5,15 @@
  * that drains what was waiting once an agent's link comes back. One topic: content that could not be
  * delivered when it was written, and the several distinct ways it stops being stuck.
  *
- * ⚠️ TWO VALUES ARRIVE AS GETTERS, and both for the same measured reason: the outbound-session
- * module is constructed BELOW this phase, so a park retry that has to reach a counterparty on
- * another node can only resolve through it at the moment it retries. By value they would be
- * `undefined` for the life of the process and every cross-node retry would fail silently.
- *
  * Nine dependencies, under the order's bound — counted after the extraction, not before: an earlier
- * draft of this list carried `sealFailures` and a `stop` getter that the moved code never calls.
+ * draft carried a seal-failure store and a `stop` getter the moved code never calls.
+ *
+ * ⚠️ AN EARLIER VERSION OF THIS HEADER CLAIMED TWO OF THEM HAD TO BE GETTERS "because the
+ * outbound-session module is constructed BELOW this phase". It is constructed 27 lines ABOVE it.
+ * Both are plain values now. The wrong version is recorded rather than deleted because of what it
+ * would have taught the next phase: "getter by default", when the rule that catches the real defect
+ * is narrower — check whether the value is ASSIGNED BELOW the call site, and a `let` that is, is the
+ * only shape that fails silently.
  */
 import { randomUUID } from "node:crypto";
 import { RetryQueue } from "./retry-queue.js";
@@ -31,23 +33,20 @@ export interface BootParkedContentDeps {
   keyProviders: Map<string, KeyProvider>;
   resolveConsortiumRoster: () => Promise<Array<{ peerId: string; multiaddr: string; nodeId: string }> | null>;
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
-  /**
-   * ⚠️ BOTH GETTERS. The outbound-session module is built BELOW this phase, and a park retry that has
-   * to reach a counterparty on another node resolves through it at the moment it retries.
-   */
-  getOpenVisitingConnection: () => (
+  /** Opens a transient connection to a directory that is not this agent's home node. */
+  openVisitingConnection: (
     agentName: string, kp: KeyProvider, pubkeyHex: string,
     endpoint: { peerId: string; multiaddr: string }, correlationId: string, nodeId: string,
   ) => { mgr: SignalingManager; stop: (reason: string) => Promise<void> };
   /** session key → the node id that brokered it. */
-  getCrossNodeBrokerBySession: () => Map<string, string>;
+  crossNodeBrokerBySession: Map<string, string>;
 }
 
 export function startBootParkedContent(deps: BootParkedContentDeps) {
   const {
     config, logger, sessionNodeManager, agents, keyProviders,
     resolveConsortiumRoster, waitForSignalingConnected,
-    getOpenVisitingConnection, getCrossNodeBrokerBySession,
+    openVisitingConnection, crossNodeBrokerBySession,
   } = deps;
 
   // Both use the same SQLite DB as the SessionNodeManager (daemon.db equivalent).
@@ -172,7 +171,7 @@ export function startBootParkedContent(deps: BootParkedContentDeps) {
   // Returns null for same-node sessions (no broker entry) — those reach the initiator on its home
   // stream and need no visiting connection.
   sessionNodeManager.setEnsureSealBroker(async (agentName, sessionId) => {
-    const brokerNode = getCrossNodeBrokerBySession().get(`${agentName}:${sessionId}`);
+    const brokerNode = crossNodeBrokerBySession.get(`${agentName}:${sessionId}`);
     if (!brokerNode) return null;
     const kp = keyProviders.get(agentName);
     if (!kp) {
@@ -187,7 +186,7 @@ export function startBootParkedContent(deps: BootParkedContentDeps) {
       return null;
     }
     const correlationId = randomUUID();
-    const conn = getOpenVisitingConnection()(agentName, kp, pubHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, brokerNode);
+    const conn = openVisitingConnection(agentName, kp, pubHex, { peerId: target.peerId, multiaddr: target.multiaddr }, correlationId, brokerNode);
     if (await waitForSignalingConnected(conn.mgr, 10_000)) {
       logger.info("session.seal.autoack.broker.reconnected", { agentName, brokerNode, correlationId });
       return conn;
@@ -549,5 +548,8 @@ export function startBootParkedContent(deps: BootParkedContentDeps) {
       ...(filterAgentName !== undefined ? { agentName: filterAgentName } : {}),
     });
   }
-  return { retryQueue, parkRetryTimers, scheduleParkRetry, startupParkFn, flushAwaitingContent };
+  // `scheduleParkRetry` and `startupParkFn` are NOT returned: their only callers moved with them.
+  // A returned name implies a consumer, and widening the surface for none is the same claim about
+  // coupling that an unused dependency makes.
+  return { retryQueue, parkRetryTimers, flushAwaitingContent };
 }
