@@ -4,10 +4,15 @@
  * on that agent's own signaling connection, which is why they share a module.
  *
  * ⚠️ THE WORK ORDER PUT FOUR VERBS AND `cello_status` IN THIS UNIT. They are three modules, and the
- * split is a measurement rather than taste: one module for all of it needs NINETEEN values from the
- * composition root — the shape the order calls "the root with an extra hop". Split by what each
- * actually touches: these two need eleven, `cello_status` needs nine, backup/restore needs three,
- * and they overlap on the handler map and the logger alone.
+ * split is a measurement rather than taste. Counting every member of each shipped interface,
+ * `handlers` and `logger` included: one module for all of it needs **22**. Split by what each
+ * surface touches — **12** here, **10** for `cello_status`, **3** for backup/restore, overlapping on
+ * `handlers` and `logger` alone. 22 is the shape the order calls "the root with an extra hop".
+ *
+ * ⚠️ AND THIS MODULE IS AT THE BOUND, NOT UNDER IT. Twelve is exactly the order's ~12 ceiling. A
+ * first draft of this note said eleven, which reads like room to spare; unit 7 calibrates against
+ * these numbers, so the real one is written here. Anything else that wants to live in this file
+ * needs a member it does not already have — which means it does not live in this file.
  */
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
@@ -55,6 +60,7 @@ export function registerAgentAdminHandlers(deps: AgentAdminDeps): void {
     getFailoverEndpoint, sealFailures,
   } = deps;
 
+  // ─── M8B DOD-REFRESH-1: cello_refresh_shares — proactive share refresh / epoch rollover ───
   handlers.set("cello_refresh_shares", async (params, connectionId) => {
     const connState = getConnState(connectionId);
     const agentName = resolveCurrentAgent(connState, params?.agent as string | undefined); // M8C-AUTOSTART-1 F18: sole-online fallback

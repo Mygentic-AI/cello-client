@@ -3347,7 +3347,6 @@ async function startDaemonHoldingLock(
   });
 
 
-  // ─── M8B DOD-REFRESH-1: cello_refresh_shares — proactive share refresh / epoch rollover ───
   // 040-DAEMONROOT unit 3: share rotation and relay receipts → agent-admin-handlers.ts.
   registerAgentAdminHandlers({
     handlers, logger, sessionNodeManager, loadedAgents,

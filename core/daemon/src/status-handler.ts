@@ -15,27 +15,31 @@ import { classifyManifestValidity, describeManifestValidity, type ManifestOrigin
 import { describeDirectoryAuth } from "./directory-auth-posture.js";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type { IpcHandler } from "./ipc-server.js";
+import type { AgentInfo, ActiveSessionInfo, DirectorySignalingState, InterruptedSessionInfo } from "./types.js";
+import type { IDirectoryChallengeVerifier } from "@cello-protocol/transport";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 
 export interface StatusHandlerDeps {
   handlers: Map<string, IpcHandler>;
   /** Every agent this CONNECTION may act as — not every agent the daemon holds. */
-  getAgentsForConnection: (connectionId: string) => unknown;
-  directorySignalingStatus: () => unknown;
+  getAgentsForConnection: (connectionId: string) => AgentInfo[];
+  directorySignalingStatus: () => DirectorySignalingState;
   /** Where the verified manifest came from, for a reader deciding how much the rest is worth. */
   manifestOrigin: ManifestOrigin;
   manifestProvider: { getCurrentManifest: () => Pick<ConsortiumManifest, "not_before" | "expires"> | null } | undefined;
   /** The configured directory URL, or undefined when nothing was configured. */
   directoryHttpUrl: string | undefined;
   /**
-   * Whether this daemon holds a directory challenge verifier. Its ABSENCE is the reportable state —
-   * `describeDirectoryAuth` turns it into the posture line an operator reads.
+   * The directory challenge verifier, or undefined when this daemon holds none. TYPED, not
+   * `unknown`: the posture line an operator reads is derived from `!== undefined`, so a dep loose
+   * enough to accept `null` or the wrong variable would report `directory_authentication: enforced`
+   * on a daemon that enforces nothing — the failure `DOD-M15-DIRAUTH-1` exists to prevent.
    */
-  challengeVerifier: unknown;
+  challengeVerifier: IDirectoryChallengeVerifier | undefined;
   /** Emits ONLY when something is wrong or nothing has looked recently enough to say. */
   unresolvedNodesForStatus: () => { directory_endpoints_unresolved: unknown } | undefined;
-  buildInterruptedSessions: () => unknown;
-  buildActiveSessions: () => unknown;
+  buildInterruptedSessions: () => InterruptedSessionInfo[];
+  buildActiveSessions: () => ActiveSessionInfo[];
 }
 
 export function registerStatusHandler(deps: StatusHandlerDeps): void {

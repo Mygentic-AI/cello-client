@@ -150,22 +150,23 @@ export default [
   {
     // 040-DAEMONROOT, lowered every unit; the target is under 1,000 and this pin is what stops the
     // ground being given back between units. 6,080 → 5,120 (unit 1, the trust-signal surface) →
-    // 4,891 (unit 2, the test-support verbs) → 4,732 (unit 3, admin verbs + status + backup).   EXACT, never with slack: a ratchet with give is a
+    // 4,891 (unit 2, the test-support verbs) → 4,731 (unit 3, admin verbs + status + backup).
+    //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 4732, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 4731, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/agent-admin-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 125, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 130, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/status-handler.ts"],
-    rules: { "max-lines": ["error", { max: 89, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 92, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/backup-restore-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 96, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 95, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/test-handlers.ts"],
