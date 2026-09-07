@@ -278,6 +278,8 @@ export interface CelloNode {
    * See ADR-0001.
    */
   getPeerId(): string;
+  /** TEMPORARY: libp2p lifecycle status — 'started' | 'stopping' | 'stopped'. */
+  lifecycleStatus?(): string;
 
   /**
    * Returns the libp2p protocol strings advertised by this node.
@@ -298,6 +300,8 @@ export interface CelloNode {
   getConnections(): Array<{
     /** libp2p's per-CONNECTION id — a peer may hold several, and the activity bit is per connection. */
     id: string;
+    /** TEMPORARY: protocols of the streams already open on this connection. */
+    streamProtocols?: string[];
     peerId: string;
     encryption: string | undefined;
     remoteAddr?: string;

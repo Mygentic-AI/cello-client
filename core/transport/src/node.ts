@@ -524,6 +524,17 @@ class CelloNodeImpl implements CelloNode {
     return this.#libp2p.peerId.toString();
   }
 
+  /**
+   * TEMPORARY INSTRUMENT (2026-09-07): libp2p's lifecycle status.
+   *
+   * `newStream` checks `status === "stopped"` on ENTRY only, so a node stopped DURING the call
+   * surfaces as `connection_lost` — indistinguishable from a transport fault. This is the field
+   * that separates them.
+   */
+  lifecycleStatus(): string {
+    return String(this.#libp2p.status);
+  }
+
   getProtocols(): string[] {
     return this.#libp2p.getProtocols();
   }
@@ -551,6 +562,11 @@ class CelloNodeImpl implements CelloNode {
       direction: c.direction,
       openedAt: c.timeline.open,
       streamCount: c.streams.length,
+      // TEMPORARY INSTRUMENT (2026-09-07): WHICH protocols are already open on this
+      // connection. `streamCount: 3` alone cannot say whether a second stream is being opened
+      // on a protocol that already has one — which is the live question for the cold-login
+      // reservation-proof failure.
+      streamProtocols: c.streams.map((s) => s.protocol ?? "(none)"),
       // DOD-M12-CONN-OBSERVE-1: the SOCKET status, which is not the muxer's. libp2p checks the two
       // separately in `newStream` — muxer first — so a stream failing with
       // `The connection muxer is "closed" and not "open"` returns before the socket is looked at,

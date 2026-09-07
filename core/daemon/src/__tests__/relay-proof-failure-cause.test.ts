@@ -131,3 +131,64 @@ describe("proveReservation — the failure must name its cause", () => {
     expect(node.newStream).toHaveBeenCalled();
   });
 });
+
+describe("proveReservation — retry only when no verdict was reached", () => {
+  it("retries ONCE after a transport failure and succeeds on the fresh connection", async () => {
+    /**
+     * The cold-login case. libp2p restarts its connection manager after the relay refuses its
+     * automatic reservation, destroying the connection this proof was opening on. The relay never
+     * answered, so the question is still open and asking again is legitimate.
+     */
+    let call = 0;
+    const node = fakeNode({
+      newStream: async () => {
+        call += 1;
+        if (call === 1) throw { reason: "connection_lost", message: "Unexpected EOF" } as never;
+        // Second attempt: a stream that immediately ends, so #authenticate returns false rather
+        // than hanging. The assertion here is the RETRY, not the auth outcome.
+        throw { reason: "connection_lost", message: "second" } as never;
+      },
+    });
+    const { client } = makeClient(node);
+
+    await client.proveReservation(node as never);
+
+    expect(node.newStream, "a transport failure must be retried exactly once").toHaveBeenCalledTimes(2);
+  });
+
+  it("does NOT retry when the relay reached a VERDICT", async () => {
+    /**
+     * THE GUARD THAT MATTERS. A refusal — no token, slot cap, misconfigured relay — will be
+     * identical a second later. Retrying spends the operator's reachability re-asking a question
+     * that was already answered, and doubles the load the relay's rate limits exist to bound.
+     *
+     * Modelled as the stream opening fine (no transport fault); whatever #authenticate then
+     * concludes is a verdict, and one attempt is all that may happen.
+     */
+    const ended = {
+      // An immediately-closed stream: #authenticate gets no frame and returns a verdict of false.
+      send: () => {},
+      close: async () => {},
+      [Symbol.asyncIterator]: async function* () { /* no frames */ },
+    };
+    const node = fakeNode({ newStream: (async () => ended) as never });
+    const { client } = makeClient(node);
+
+    const result = await client.proveReservation(node as never);
+
+    expect(result).toBe(false);
+    expect(node.newStream, "a verdict must never be retried").toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up after the second transport failure rather than looping", async () => {
+    const node = fakeNode({
+      newStream: async () => { throw { reason: "connection_lost" } as never; },
+    });
+    const { client } = makeClient(node);
+
+    expect(await client.proveReservation(node as never)).toBe(false);
+    // Bounded: two attempts, never a third. An unbounded retry against a relay that is genuinely
+    // unreachable is a hot loop against someone else's infrastructure.
+    expect(node.newStream).toHaveBeenCalledTimes(2);
+  });
+});

@@ -42,6 +42,17 @@ import type { SessionOwnChainStore } from "./session-own-chain-store.js";
 
 
 export const RELAY_PROTOCOL_ID = "/cello/relay/1.0.0";
+
+/**
+ * How long to wait before re-proving after a transport-class failure.
+ *
+ * Sized against the measured event, not guessed: libp2p logged
+ * `connection-manager closing 1 connections / stopped / started` inside 3ms, and the redial that
+ * followed completed ~1s later. A second is comfortably past the restart while still being
+ * invisible next to the ~5 minutes the previous behaviour cost (quarantine the relay, wait for the
+ * next reachability sweep).
+ */
+export const PROOF_RETRY_DELAY_MS = 1_000;
 export const RELAY_AUTH_DOMAIN = "CELLO-RELAY-AUTH-v1";
 /** Structure 1 leaf kind: 0x00 = message, 0x02 = control (matches the relay). */
 /**
@@ -1424,7 +1435,61 @@ export class AgentRelayClient {
    * `purpose: "reservation"` so the relay proves possession WITHOUT rebinding the agent's delivery
    * stream (which would steal the live session's inbound leaves — see the relay-side dispatch).
    */
+  /**
+   * ⚠️ **THE FIRST ATTEMPT AFTER A COLD START IS EXPECTED TO FAIL, AND THAT IS NOT A FAULT ON
+   * EITHER SIDE.** Root-caused 2026-09-07 from libp2p's own debug log:
+   *
+   * ```
+   * circuit-relay listener: making reservation on relay
+   * reservation failed with status PERMISSION_DENIED     <- the relay's gate, working as designed
+   * could not add discovered relay
+   * connection-manager closing 1 connections / stopped / started
+   * ```
+   *
+   * libp2p's circuit-relay listener asks the relay for a reservation ON ITS OWN, before any CELLO
+   * code has proven anything. The relay's gate refuses an unproven peer — deliberately; its flow is
+   * *"asks, is refused, proves itself, and asks again"*. libp2p reacts to that refusal by discarding
+   * the relay and RESTARTING ITS CONNECTION MANAGER, which closes every connection — including the
+   * healthy one this proof is being opened on. Whichever lands first decides the outcome, so the
+   * failure is intermittent (measured 5/5, 2/4, 0/4, 1/6 across cold logins).
+   *
+   * **Both components are behaving as specified, so the refusal cannot be designed away from here** —
+   * removing it means either weakening the gate or reaching into libp2p's internal
+   * `transportManager.listen` to defer the circuit listener until after the proof. What the client
+   * CAN do is survive it: a transport-class failure is retried on a fresh connection, once.
+   *
+   * A REFUSAL IS NOT RETRIED. If the relay reached a verdict — no token, slot cap, misconfigured —
+   * the answer will be identical a second later, and retrying would spend the operator's reachability
+   * on a question already answered. Only a failure that never reached a verdict is retried.
+   */
   async proveReservation(node: CelloNode): Promise<boolean> {
+    if (this.#closed) return false;
+    const first = await this.#proveReservationOnce(node);
+    if (first !== "transport_failed") return first;
+    /**
+     * The connection manager has just restarted, so the previous connection is gone and a fresh
+     * dial is required — which `#proveReservationOnce` does at its head. The brief wait is for
+     * libp2p to finish restarting; without it the redial races the restart it is recovering from.
+     */
+    await new Promise((r) => setTimeout(r, PROOF_RETRY_DELAY_MS));
+    if (this.#closed) return false;
+    this.#logger.info("session.relay.reservation_proof.retry", {
+      relayPeerId: this.#relayPeerId,
+      afterMs: PROOF_RETRY_DELAY_MS,
+      impact:
+        "the first proof never reached a verdict — the connection was destroyed under it, which is " +
+        "what libp2p does to a relay that just refused its automatic reservation. Retrying once on " +
+        "a fresh connection. If this succeeds the agent is reachable and nothing was wrong.",
+    });
+    const second = await this.#proveReservationOnce(node);
+    return second === true;
+  }
+
+  /**
+   * One attempt. `true`/`false` are VERDICTS (the relay answered); `"transport_failed"` means no
+   * verdict was reached and the question is still open — the distinction the retry above turns on.
+   */
+  async #proveReservationOnce(node: CelloNode): Promise<boolean | "transport_failed"> {
     if (this.#closed) return false;
     /**
      * ⚠️ **CLEAR THE REFUSAL FIRST — review HIGH-2.** `#lastAuthRefusal` is set when a relay REFUSES
@@ -1471,8 +1536,21 @@ export class AgentRelayClient {
           "later attempt succeeds. This is a REACHABILITY fault, not a rejection — the relay did " +
           "not refuse anything.",
       });
-      return false;
+      return "transport_failed";
     }
+    // TEMPORARY INSTRUMENT (2026-09-07): snapshot immediately BEFORE newStream. Paired with the
+    // snapshot in the catch, this localises the destruction to the newStream call itself rather
+    // than "sometime around the failure".
+    const snap = (): Array<Record<string, unknown>> =>
+      node.getConnections().map((c) => ({
+        toThisRelay: c.peerId === this.#relayPeerId,
+        peer: c.peerId.slice(0, 16),
+        status: c.status,
+        muxer: c.muxerStatus,
+        streams: c.streamCount,
+        protocols: c.streamProtocols,
+      }));
+    const before = snap();
     let stream: Stream;
     try {
       stream = await node.newStream(this.#relayPeerId, RELAY_PROTOCOL_ID);
@@ -1509,21 +1587,15 @@ export class AgentRelayClient {
         error: extractErrorMessage(err),
         // The discriminator. `status` is the SOCKET; `muxerStatus` is the layer that carries data
         // and the one `newStream` checks first — a connection reading open/closed is the P5 shape.
-        relayConnections: node
-          .getConnections()
-          .map((c) => ({
-            toThisRelay: c.peerId === this.#relayPeerId,
-            peerId: c.peerId.slice(0, 20),
-            status: c.status,
-            muxerStatus: c.muxerStatus,
-            streams: c.streamCount,
-          })),
+        connsBeforeNewStream: before,
+        connsAtFailure: snap(),
+        nodeStatusAtFailure: node.lifecycleStatus?.() ?? "(unavailable)",
         impact:
           "no proof was sent, so this relay granted no reservation and the agent is unreachable " +
           "through it until a later attempt succeeds. The relay did not refuse anything — it may " +
           "never have seen the stream.",
       });
-      return false;
+      return "transport_failed";
     }
     try {
       const iter = (lp.decode(stream as unknown as AsyncIterable<Uint8Array>) as AsyncIterable<unknown>)[
