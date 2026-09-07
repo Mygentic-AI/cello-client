@@ -3866,9 +3866,12 @@ async function startDaemonHoldingLock(
   // 040-DAEMONROOT unit 4: the document layer and its per-agent carrier → document-wiring.ts.
   const { documentLayer, documentOwnerKeyFor, documentTransportFor } = createDocumentWiring({
     logger, sessionNodeManager, loadedAgents, keyProviders,
-    securityGateway: config.securityGateway, celloDir: config.celloDir,
+    securityGateway, celloDir: config.celloDir,
     deliveryOpens, pubkeyOfAgent, openSessionFor, perAgentSignaling, runDiscoveryLookup,
-    reconcileScheduler, notificationDispatcher,
+    // The scheduler does not exist yet — it is built below, from this layer's sweep targets. A
+    // getter is what keeps the refusal backoff alive; the value would be a captured `undefined`.
+    getReconcileScheduler: () => reconcileScheduler,
+    notificationDispatcher,
     getCloseSessionHandler: () => handlers.get("cello_close_session"),
   });
 

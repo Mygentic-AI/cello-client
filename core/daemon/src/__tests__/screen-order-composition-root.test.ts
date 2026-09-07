@@ -30,6 +30,8 @@ const DAEMON_BIN_DIST = join(PKG_ROOT, "dist", "bin", "cello-daemon.js");
 const GATEWAY_DIST = join(REPO_ROOT, "core", "gateway", "dist", "bin", "cello-gateway.js");
 
 let daemon = "";
+let daemonOnly = "";
+let documentWiring = "";
 let daemonBin = "";
 let gateway = "";
 
@@ -40,7 +42,9 @@ beforeAll(async () => {
   expect(existsSync(DOCUMENT_WIRING_DIST), `${DOCUMENT_WIRING_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(GATEWAY_DIST), `${GATEWAY_DIST} — run pnpm build`).toBe(true);
   expect(existsSync(DAEMON_BIN_DIST), `${DAEMON_BIN_DIST} — run pnpm build`).toBe(true);
-  daemon = (await readFile(DAEMON_DIST, "utf8")) + "\n" + (await readFile(DOCUMENT_WIRING_DIST, "utf8"));
+  daemonOnly = await readFile(DAEMON_DIST, "utf8");
+  documentWiring = await readFile(DOCUMENT_WIRING_DIST, "utf8");
+  daemon = daemonOnly + "\n" + documentWiring;
   daemonBin = await readFile(DAEMON_BIN_DIST, "utf8");
   gateway = await readFile(GATEWAY_DIST, "utf8");
 });
@@ -53,22 +57,35 @@ describe("the shipped daemon wires document classification into the inbound scre
   it("imports the classifier from the router rather than re-deriving it", () => {
     // A second copy of the discriminator is how the ingest and the router come to disagree about
     // what a document frame is — one skipping a screen the other does not.
-    expect(daemon).toContain("isDocumentFrame");
-    expect(daemon).toContain("document-frame-router.js");
+    expect(documentWiring).toContain("isDocumentFrame");
+    expect(documentWiring).toContain("document-frame-router.js");
   });
 });
 
 describe("the shipped daemon wires the semantic screen into the document layer", () => {
   it("passes screenProjected to createDocumentLayer — without it, Layer 2 never sees document text", () => {
-    expect(daemon).toContain("screenProjected");
-    // The bridge must reach the real gateway, not a local stand-in.
-    expect(daemon).toMatch(/screenProjected[\s\S]{0,2000}securityGateway\.screenInbound/);
+    expect(documentWiring).toContain("screenProjected");
+    // The bridge must reach the real gateway, not a local stand-in. Matched WITHIN ONE FILE: run
+    // over a concatenation, a 2,000-character window can pair a token from one file with a match
+    // from the other and report a wiring that does not exist in either.
+    expect(documentWiring).toMatch(/screenProjected[\s\S]{0,2000}securityGateway\.screenInbound/);
   });
 
   it("names the degradation when the gateway cannot answer", () => {
     // A weaker guarantee that looks identical to the stronger one at every surface is how this
     // class of defect survives; the log line is the whole difference.
-    expect(daemon).toContain("document.inbound.screen.unavailable");
+    expect(documentWiring).toContain("document.inbound.screen.unavailable");
+  });
+});
+
+describe("the shipped daemon CONSTRUCTS the document wiring", () => {
+  it("the composition root calls createDocumentWiring — a module that ships but is never built is the defect this file exists to catch", () => {
+    // 040-DAEMONROOT unit 4 moved this wiring into its own module, and that quietly weakened every
+    // assertion above: `tsconfig` compiles `src` wholesale, so `dist/document-wiring.js` is emitted
+    // whether or not one line imports it. Delete the call below and the document layer is entirely
+    // unwired — no inbound classification, no semantic screen — while every string the other tests
+    // look for is still sitting in the artifact. THIS is the assertion that reddens on that.
+    expect(daemonOnly).toContain("createDocumentWiring(");
   });
 });
 

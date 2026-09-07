@@ -53,7 +53,17 @@ export interface DocumentWiringDeps {
     timeoutMs: number,
     correlationId: string,
   ) => Promise<DiscoveryOutcome>;
-  reconcileScheduler: { noteRefusal: (ownerAgentId: string, peerAgentId: string, terminal: boolean) => void } | undefined;
+  /**
+   * ⚠️ A GETTER, NOT THE VALUE. The scheduler is constructed AFTER this wiring — it consumes the
+   * layer's sweep targets — so at the moment this module is built the binding is `undefined`.
+   * Passing the value captures that `undefined` for the life of the process and
+   * `reconcileScheduler?.noteRefusal(...)` becomes a permanent no-op: refusals still log, backoff
+   * never applies, and the sweep re-asks immediately. Measured cost of that state, from the
+   * scheduler's own notes: 321 attempts against two documents in 85 minutes, refused every time.
+   * Optional chaining makes it silent and the `| undefined` in the type makes it legal, so nothing
+   * but this comment and the test beside it stands between here and that behaviour.
+   */
+  getReconcileScheduler: () => { noteRefusal: (ownerAgentId: string, peerAgentId: string, terminal: boolean) => void } | undefined;
   notificationDispatcher: NotificationDispatcher;
   /** ONE other handler, not the map it lives in. */
   getCloseSessionHandler: () => IpcHandler | undefined;
@@ -63,7 +73,7 @@ export function createDocumentWiring(deps: DocumentWiringDeps) {
   const {
     logger, sessionNodeManager, loadedAgents, keyProviders, securityGateway, celloDir,
     deliveryOpens, pubkeyOfAgent, openSessionFor, perAgentSignaling, runDiscoveryLookup,
-    reconcileScheduler, notificationDispatcher, getCloseSessionHandler,
+    getReconcileScheduler, notificationDispatcher, getCloseSessionHandler,
   } = deps;
 
   // M14 / DOD-DOC-INBOUND-2: the document layer, wired to the session content path.
@@ -170,7 +180,7 @@ export function createDocumentWiring(deps: DocumentWiringDeps) {
     // Read LAZILY: the scheduler is constructed after this layer (it consumes the layer's sweep
     // targets), so the binding must be resolved at call time rather than captured here.
     onPeerRefusal: (ownerAgentId, peerAgentId, terminal) =>
-      reconcileScheduler?.noteRefusal(ownerAgentId, peerAgentId, terminal),
+      getReconcileScheduler()?.noteRefusal(ownerAgentId, peerAgentId, terminal),
     // ONE implementation, shared with the two-party test. It was a closure here, and that is exactly
     // how the surface tests passed while the feature did nothing: the test wired this seam to
     // `async () => ({ ok: true })`, which reported success, sent nothing, and agreed with whatever
