@@ -13,7 +13,9 @@ const here = dirname(fileURLToPath(import.meta.url));
  * courtesy are separate facts, and the tests below pin the separation from both directions.
  */
 describe("M10B-D4 — refusing with a message", () => {
-  const daemon = readFileSync(resolve(here, "../daemon.ts"), "utf8");
+  // 040-DAEMONROOT unit 1: this surface moved out of daemon.ts into signal-handlers.ts. The file
+  // changed; the property asserted below did not.
+  const daemon = readFileSync(resolve(here, "../signal-handlers.ts"), "utf8");
   const handler = (() => {
     const start = daemon.indexOf('handlers.set("cello_attestation_consent_refuse"');
     expect(start, "cello_attestation_consent_refuse is registered").toBeGreaterThan(-1);
@@ -108,7 +110,9 @@ describe("M10B-D4 — refusing with a message", () => {
  * verb, which is how two paths that must agree stop agreeing.
  */
 describe("submitForAgent — the guards every submission passes through", () => {
-  const daemon = readFileSync(resolve(here, "../daemon.ts"), "utf8");
+  // 040-DAEMONROOT unit 1: this surface moved out of daemon.ts into signal-handlers.ts. The file
+  // changed; the property asserted below did not.
+  const daemon = readFileSync(resolve(here, "../signal-handlers.ts"), "utf8");
   const helper = (() => {
     const start = daemon.indexOf("async function submitForAgent(");
     expect(start, "submitForAgent exists").toBeGreaterThan(-1);

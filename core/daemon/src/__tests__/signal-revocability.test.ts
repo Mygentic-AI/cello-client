@@ -85,7 +85,9 @@ describe("which signals an operator may revoke", () => {
  * never delete the wallet copy, because a failure has to leave the operator able to retry.
  */
 describe("the refusal happens before anything leaves, and nothing is destroyed", () => {
-  const daemon = readFileSync(join(import.meta.dirname, "..", "daemon.ts"), "utf8");
+  // 040-DAEMONROOT unit 1: this surface moved out of daemon.ts into signal-handlers.ts. The file
+  // changed; the property asserted below did not.
+  const daemon = readFileSync(join(import.meta.dirname, "..", "signal-handlers.ts"), "utf8");
   const handler = daemon.slice(daemon.indexOf('handlers.set("wallet_revoke_signal"'));
   const withComments = handler.slice(0, handler.indexOf('handlers.set("', 10));
   // CODE ONLY. The absence assertions below name the very things the comments EXPLAIN — the health
