@@ -70,6 +70,7 @@ describe("the composition root actually CALLS every phase it depends on", () => 
     "createDocumentWiring(",
     "createSessionNotify(",
     "createConnectionAgents(",
+    "createDirectoryConnect(",
   ] as const;
 
   for (const phase of PHASES) {
