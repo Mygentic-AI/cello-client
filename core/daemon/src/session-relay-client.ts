@@ -1511,8 +1511,13 @@ export class AgentRelayClient {
         // and the one `newStream` checks first — a connection reading open/closed is the P5 shape.
         relayConnections: node
           .getConnections()
-          .filter((c) => c.peerId === this.#relayPeerId)
-          .map((c) => ({ status: c.status, muxerStatus: c.muxerStatus, streams: c.streamCount })),
+          .map((c) => ({
+            toThisRelay: c.peerId === this.#relayPeerId,
+            peerId: c.peerId.slice(0, 20),
+            status: c.status,
+            muxerStatus: c.muxerStatus,
+            streams: c.streamCount,
+          })),
         impact:
           "no proof was sent, so this relay granted no reservation and the agent is unreachable " +
           "through it until a later attempt succeeds. The relay did not refuse anything — it may " +
