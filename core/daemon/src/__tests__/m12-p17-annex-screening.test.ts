@@ -353,10 +353,21 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
     }
 
     /**
-     * ⚠️ THE WIDENING TEST, and it is the one that matters. A release one drain too early loses a
-     * message that would have gone through. Each of these three has an answer that CAN change —
-     * a screener comes back up, a client gets upgraded, a decoder learns a shape — so terminality
-     * of the SESSION is not enough on its own.
+     * ⚠️ THE WIDENING TESTS, and they are the ones that matter. A release one drain too early loses
+     * a message that would have gone through. Each of these has an answer that CAN change — a
+     * screener comes back up, a client gets upgraded, a decoder learns a shape — so terminality of
+     * the SESSION is not enough on its own.
+     *
+     * ⚠️ **AND THE SCREENER CASE IS PROTECTED BY THE BRANCH ORDER, NOT BY THE RELEASE CONDITION.**
+     * Measured: widening the gate to `stuckReason !== ANNEX_WRITE_FAILED && sessionTerminal`
+     * reddened the algorithm and tamper tests below and left this one GREEN, because a deferred
+     * screen takes its own branch before the release is ever reached — and a fixture cannot be both
+     * "no salt" and "screen unavailable", since the salt check runs first and returns.
+     *
+     * So what this test holds is the DoD clause in its own right (a transient annex failure keeps
+     * the relay copy and re-screens next drain), and it has teeth for exactly that: making the
+     * deferred branch confirm-delete reddens it. It is NOT evidence about the release condition,
+     * and reading it as such would retire a suspicion nothing has answered.
      */
     it("★ a TRANSIENT screen failure on a TERMINAL session still keeps the relay copy", async () => {
       const e = await realEntry("the screener is asleep and the session is closed");
