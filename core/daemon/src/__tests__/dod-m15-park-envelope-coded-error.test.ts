@@ -56,7 +56,7 @@ function envelopeArgs(alg: string) {
 /**
  * ⚠️ THE ERROR IS NOT FABRICATED — this calls the REAL producer.
  *
- * The production hook (`daemon.ts`) reaches `sealParkEnvelope` only after a live standing receiver
+ * The production hook (`boot-parked-content.ts`) reaches `sealParkEnvelope` only after a live standing receiver
  * exists, which needs a real relay reservation this fixture's fake node cannot grant. So the hook is
  * replaced by one that calls **the same production function with the same arguments**, and throws
  * whatever it throws. Nothing about the failure is invented here; what is skipped is the receiver
@@ -250,7 +250,9 @@ describe("DOD-M15-SEALWIRE-1 B2b-2 constraint 6: the park refusal is CODED, not 
      * reintroduced with a green suite. So the shape is asserted directly, and the assertion pins the
      * ANCHOR first: a check that silently matches nothing is not a check.
      */
-    const src = readFileSync(new URL("../daemon.ts", import.meta.url), "utf8");
+    // 040-DAEMONROOT unit 7 (phase 4): the park hooks moved into boot-parked-content.ts. The file
+    // changed; what is asserted — that production does not swallow the throw — did not.
+    const src = readFileSync(new URL("../boot-parked-content.ts", import.meta.url), "utf8");
     const calls = [...src.matchAll(/await sealParkEnvelope\(\{/g)];
     expect(calls.length, "anchor — if the call moved or was renamed, this test is checking nothing and must fail loudly").toBe(2);
 

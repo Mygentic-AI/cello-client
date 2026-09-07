@@ -23,7 +23,7 @@
  * ─── Why losing it matters, in the words of the code that wrote it ─────────────────────────────
  *
  * `structure1_cbor`/`structure2_cbor` are the relay's signed ordering record, carried so a parked
- * entry is self-ordering on recovery. `daemon.ts`'s backstop says what their absence costs: *"the
+ * entry is self-ordering on recovery. `boot-parked-content.ts`'s backstop says what their absence costs: *"the
  * receiver's `#witnessedSeq` map is in-memory and empty after a restart, so arrival order there means
  * a wrong leaf index and a divergent tree."*
  *
@@ -155,7 +155,7 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
      * notice because it hands the value straight to `enqueueAwaitingContent`, which nothing in
      * production does. The reviewer's words: *"it proves a plumbing segment with no upstream."*
      *
-     * The two real producers are the `onTtf` and `onParkFailed` hooks in `daemon.ts`, and neither
+     * The two real producers are the `onTtf` and `onParkFailed` hooks in `boot-parked-content.ts`, and neither
      * carried the algorithm — so every row would have been written NULL while the commit message
      * said the producer "passes it". It passed a value nothing supplied.
      *
@@ -164,12 +164,13 @@ describe("the queued row REMEMBERS how its message was hashed", () => {
      * difference is invisible while every algorithm is `sha256` — which is precisely the condition
      * that let four other mutants survive.
      */
-    const root = await readFile(new URL("../daemon.ts", import.meta.url), "utf8");
+    // 040-DAEMONROOT unit 7 (phase 4): both hooks moved into boot-parked-content.ts.
+    const root = await readFile(new URL("../boot-parked-content.ts", import.meta.url), "utf8");
     for (const hook of ["onTtf", "onParkFailed"]) {
       // The whole hook body, not a paren-capture: `resolveAgentId(agentName)` nests parentheses, so
       // a `[^)]*` group stops at the wrong one and reports a forwarded argument as missing.
       const start = root.indexOf(`${hook}: (`);
-      expect(start, `${hook} must exist in daemon.ts`).toBeGreaterThan(-1);
+      expect(start, `${hook} must exist in boot-parked-content.ts`).toBeGreaterThan(-1);
       /**
        * ⚠️ THE SLICE IS BOUNDED — B2b-1 pass-2 F2, and it was proven vacuous without this.
        *
