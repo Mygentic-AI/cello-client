@@ -76,15 +76,14 @@ import { createSessionNotify } from "./session-notify.js";
 import { createConnectionAgents } from "./connection-agents.js";
 import { createDirectoryConnect } from "./directory-connect.js";
 import { createUnresolvedNodesReport } from "./unresolved-nodes-report.js";
+import { createDocumentSurface } from "./document-surface.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
-import { registerDocumentHandlers } from "./document-handlers.js";
 // `wireContentHash` is no longer imported here: every outbound hash in this file now comes from
 // `SessionNodeManager.contentHashForSession`, which returns the hash and its ALGORITHM together
 // (`DOD-M15-SEALWIRE-1` part B2b). A direct call would be a hash computed without deciding — or
 // recording — how it was made, which is the state that made a version skew look like a tamper.
-import { DocumentPublish } from "./document-publish.js";
 import { ReconcileScheduler } from "./document-reconcile-scheduler.js";
 import { createSealFlows } from "./seal-flows.js";
 import { registerCloseSessionHandler } from "./close-session-handler.js";
@@ -1168,134 +1167,18 @@ async function startDaemonHoldingLock(
     getCloseSessionHandler: () => handlers.get("cello_close_session"),
   });
 
-  // M14 / DOD-DOC-TOOLS-1 — the OPERATOR SURFACE. Registered last of the document wiring, because
-  // it is the only part that can create a document, and everything it creates has to have somewhere
-  // to go: without the inbound path a peer's answer is unroutable, and without the delivery worker a
-  // published update never leaves.
-  const documentPublish = new DocumentPublish({
-    holdersFor: (ownerAgentId, documentId) => documentLayer.holdersFor(ownerAgentId, documentId),
-    governanceFrontierFor: (ownerAgentId, documentId) =>
-      documentLayer.governanceFrontierFor(ownerAgentId, documentId),
-    store: documentLayer.store,
-    engine: documentLayer.engine,
-    logger,
-    sign: async (ownerAgentId, tbs) => {
-      // `ownerAgentId` is the owner KEY here, and keyProviders is keyed by NAME — so it is resolved
-      // back through the same map the owner key came from rather than guessed. A miss throws: an
-      // unsigned envelope in an append-only log is worse than a failed publish.
-      const agentName = loadedAgents.find((a) => a.pubkey?.toLowerCase() === ownerAgentId)?.name;
-      const provider = agentName ? keyProviders.get(agentName) : undefined;
-      if (!provider) {
-        throw new Error(
-          `document_publish_unsigned: no key provider for owner ${ownerAgentId.slice(0, 16)}…, ` +
-            `so this update cannot be signed`,
-        );
-      }
-      return provider.sign(tbs);
-    },
-    // M14-D5: our wire sender id IS the owner key. Kept as its own callback because they are
-    // different facts that happen to coincide — see DocumentStore.pendingDeliveries.
-    senderIdFor: (ownerAgentId) => ownerAgentId,
-    canPublish: (ownerAgentId, documentId) => documentLayer.lifecycle.canPublish(ownerAgentId, documentId),
-    // SYNC-P4 (R39's first trigger): each seat gets an initiated reconcile exchange — the
-    // envelope rides the exchange's own difference computation. Fire-and-forget by contract.
-    nudgeSeats: (ownerAgentId, documentId, seats) => {
-      for (const seat of seats) {
-        void documentLayer
-          .initiateReconcile(ownerAgentId, seat, [documentId])
-          .then((sent) => {
-            if (!sent.ok) {
-              // NOT SILENT (review F3): a lost nudge is legal for correctness (any later
-              // exchange recomputes the difference — R40), but until P5's sweeps exist this
-              // line is the only trace an operator has for "my edit never arrived".
-              logger.warn("document.reconcile.nudge_failed", {
-                documentId, peerAgentId: seat, reason: sent.reason,
-              });
-            }
-          })
-          .catch((err: unknown) => {
-            logger.warn("document.reconcile.nudge_failed", {
-              documentId, peerAgentId: seat,
-              reason: err instanceof Error ? err.message : String(err),
-            });
-          });
-      }
-    },
+  // 040-DAEMONROOT unit 15: the document operator surface and the sweep that keeps shared documents
+  // converging → document-surface.ts.
+  const {
+    reconcileSweepTimer, reconcileScheduler: builtReconcileScheduler,
+  } = createDocumentSurface({
+    logger, handlers, loadedAgents, keyProviders, perConnectionState, perAgentSignaling,
+    resolveCurrentAgent, documentLayer, documentOwnerKeyFor, documentTransportFor,
   });
-  registerDocumentHandlers({
-    handlers,
-    logger,
-    layer: documentLayer,
-    publish: documentPublish,
-    transportFor: documentTransportFor,
-    resolveAgent: (connectionId, explicit) =>
-      resolveCurrentAgent(perConnectionState.get(connectionId), explicit),
-    ownerKeyFor: documentOwnerKeyFor,
-    sign: async (agentName, tbs) => {
-      const provider = keyProviders.get(agentName);
-      if (!provider) throw new Error(`document_proposal_unsigned: no key provider for ${agentName}`);
-      return provider.sign(tbs);
-    },
-    now: () => Date.now(),
-  });
+  // The scheduler is produced by the surface and assigned back here, because two modules built
+  // EARLIER hold getters over this binding. They read at call time, which is always after this.
+  reconcileScheduler = builtReconcileScheduler;
 
-  // SYNC-P5 (R39–R43) — WHEN reconciling is attempted: the periodic sweep and the party-became-
-  // reachable trigger. All state volatile (R41); a lost tick costs latency, never correctness.
-  reconcileScheduler = new ReconcileScheduler({
-    now: () => Date.now(),
-    logger,
-    sweepTargets: (ownerAgentId) => documentLayer.sweepTargets(ownerAgentId),
-    pendingFor: (ownerAgentId, documentId, partyAgentId) =>
-      documentLayer.pendingFor(ownerAgentId, documentId, partyAgentId),
-    initiateReconcile: (ownerAgentId, peerAgentId, documentIds) =>
-      documentLayer.initiateReconcile(ownerAgentId, peerAgentId, documentIds),
-    ...(Number.isFinite(Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"])) &&
-    Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"]) >= 250
-      ? { backoffBaseMs: Number(process.env["CELLO_DOCUMENT_RECONCILE_BACKOFF_MS"]) }
-      : {}),
-  });
-  // Overridable for tests (the delivery tick precedent); floored so a misread env cannot busy-loop.
-  const reconcileTickOverride = Number(process.env["CELLO_DOCUMENT_RECONCILE_SWEEP_MS"]);
-  const RECONCILE_SWEEP_MS =
-    Number.isFinite(reconcileTickOverride) && reconcileTickOverride >= 250
-      ? reconcileTickOverride
-      : 120_000;
-  // Review F2: the guard is TIME-STAMPED, not a bare boolean — a pass that never settles (a
-  // dial with no timeout) would otherwise end the sweep silently for the daemon's lifetime,
-  // the exact R42 stall one level above the module that fixed it. Past the bound the wedge is
-  // WARNED and the guard force-released; the abandoned pass's own scheduler marks are
-  // themselves time-bounded, so double-attempts are latency, never correctness.
-  const RECONCILE_PASS_BOUND_MS = 5 * 60_000;
-  let reconcileSweepStartedAt: number | null = null;
-  const reconcileSweepTimer = setInterval(() => {
-    if (reconcileSweepStartedAt !== null) {
-      if (Date.now() - reconcileSweepStartedAt < RECONCILE_PASS_BOUND_MS) return;
-      logger.warn("document.reconcile.sweep_wedged", {
-        heldMs: Date.now() - reconcileSweepStartedAt,
-        impact: "a sweep pass never settled; the guard is force-released so sweeping continues",
-      });
-    }
-    reconcileSweepStartedAt = Date.now();
-    void (async () => {
-      try {
-        for (const agentName of perAgentSignaling.keys()) {
-          const ownerAgentId = documentOwnerKeyFor(agentName);
-          if (ownerAgentId === null) continue;
-          const result = await reconcileScheduler.sweep(ownerAgentId);
-          if (result.attempted > 0 || result.failed > 0) {
-            logger.debug("document.reconcile.sweep", { agentName, ...result });
-          }
-        }
-      } catch (err: unknown) {
-        logger.warn("document.reconcile.sweep_threw", {
-          reason: err instanceof Error ? err.message : String(err),
-        });
-      } finally {
-        reconcileSweepStartedAt = null;
-      }
-    })();
-  }, RECONCILE_SWEEP_MS);
-  reconcileSweepTimer.unref?.();
   documentOwnerKeyForHook = documentOwnerKeyFor;
 
   // ── THE SOCKET OPENS ONLY NOW, and the ordering is load-bearing (2026-08-16). ──

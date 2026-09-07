@@ -13,6 +13,12 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { NotificationDispatcher } from "./notification-dispatcher.js";
 import { extractErrorMessage } from "./error-message.js";
 
+/** What starting an agent can answer. The readiness half is why this is a union and not a boolean. */
+export type StartAgentResult =
+  | { ok: true; standing_receiver: "ready" }
+  | { ok: true; standing_receiver: "starting"; standing_receiver_cause: string | undefined; guidance: string }
+  | { ok: false; reason: string; guidance: string };
+
 export interface StartAgentDeps {
   logger: Logger;
   sessionNodeManager: SessionNodeManager;

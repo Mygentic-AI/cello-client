@@ -11,6 +11,7 @@
  * "the only agent online" — that is how a write lands on the wrong agent (fixed in f00b534, and
  * the reason resolveCurrentAgent distinguishes "never chose" from "choice taken away").
  */
+import type { StartAgentResult } from "./start-agent.js";
 import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
@@ -40,7 +41,13 @@ export interface AgentHandlerDeps {
   getConnState: (connectionId: string) => ConnState | undefined;
   perConnectionState: Map<string, { currentAgent: string | null; clearedAgent?: string; clientType: string }>;
   getAgentsForConnection: (connectionId: string) => AgentInfo[];
-  startAgentInternal: (name: string) => { ok: true } | { ok: false; reason: string; guidance: string };
+  /**
+   * ⚠️ THE THREE-WAY UNION, NOT `{ ok: true }`. The readiness half is the point: an agent can be
+   * online and DEAF — marked started while its standing receiver never came up — and the two states
+   * render identically at every surface without it. Declared narrow, dropping it is invisible to the
+   * type checker.
+   */
+  startAgentInternal: (name: string) => StartAgentResult;
   dropAgentSignaling: (agentName: string) => Promise<void>;
   awayAckSent: Set<string>;
   keyProviders: Map<string, KeyProvider>;

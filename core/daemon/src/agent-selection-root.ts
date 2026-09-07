@@ -1,5 +1,5 @@
 /**
- * Which agent a call is FOR, and what to tell an operator whose agent is not registered.
+ * Which agent a call is FOR, and how a caller learns it fell back.
  *
  * One rule, in one place, because the alternative has already happened: several handlers each
  * deciding what "the current agent" means is how a call lands on an agent the operator did not

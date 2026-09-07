@@ -225,7 +225,8 @@ export function createSessionViews(deps: SessionViewsDeps) {
       // siblings are fine must not read as healthy.
       //
       // Falls back to the shared manager, mirroring directorySignalingStatus(): production gives
-      // every agent its own connection, but the M6 back-compat/test path has ONE shared manager and
+      // every agent its own connection, but the IN-PROCESS TEST path has ONE shared manager (NOT back-compat: Rule F deletes
+    // back-compat on sight, and deleting this would break every in-process test in the package) and
       // no per-agent entry at all. Reading only the per-agent map there returns undefined for every
       // agent, so all of them reported `connecting` — which then made isAgentReady false and refused
       // real commands with `selected_agent_offline`. Absent is not the same as disconnected.

@@ -14,6 +14,7 @@
  * not agent-tagged. Do not "improve" it into a per-agent map.
  */
 import { Buffer } from "node:buffer";
+import type { StartAgentResult } from "./start-agent.js";
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
@@ -34,7 +35,13 @@ export interface RegisterHandlerDeps {
   getAgentSignaling: (agentName: string, keyProvider: KeyProvider, pubkeyHex: string) => { signaling: SignalingManager; getNode: () => CelloNode | null };
   waitForSignalingConnected: (mgr: SignalingManager, timeoutMs: number) => Promise<boolean>;
   dropAgentSignaling: (agentName: string) => Promise<void>;
-  startAgentInternal: (name: string) => { ok: true } | { ok: false; reason: string; guidance: string };
+  /**
+   * ⚠️ THE THREE-WAY UNION, NOT `{ ok: true }`. The readiness half is the point: an agent can be
+   * online and DEAF — marked started while its standing receiver never came up — and the two states
+   * render identically at every surface without it. Declared narrow, dropping it is invisible to the
+   * type checker.
+   */
+  startAgentInternal: (name: string) => StartAgentResult;
   directoryEndpointResolver?: () => Promise<import("./signaling-connect.js").DirectoryEndpoint | null>;
   loadedAgents: Array<{ name: string; pubkey: string; keyProvider: KeyProvider }>;
   registrationGuidance: (reason: string, detail?: string) => string;

@@ -120,7 +120,11 @@ describe("DOD-M12B-REAP-HELD-1: held content proves the counterparty established
       .replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
     // The DEFINITION, not the first mention — earlier call sites made the window land elsewhere.
     const idx = code.indexOf("function reapDeadHalfOpenSessions");
-    const body = code.slice(idx, idx + 2000);
+    // Bounded at the NEXT function, not a fixed 2,000 characters: after 040-DAEMONROOT unit 10 the
+    // reaper is ~1,370 characters, so a fixed window ran past it into the two builders beside it and
+    // the positive assertion could in principle have been satisfied by code outside the reaper.
+    const nextFn = code.indexOf("\n  function ", idx + 1);
+    const body = code.slice(idx, nextFn === -1 ? idx + 2000 : nextFn);
 
     expect(
       body.includes("countEstablishedReceived("),
