@@ -380,6 +380,7 @@ describe("daemon", () => {
     expect(res.onboarding).toMatch(/cohort/i);
     expect(res.onboarding).toContain("cello create-agent");
     expect(res.onboarding).toContain("https://cello.mygentic.ai/waitlist");
+    expect(res.onboarding, "the bot must be named by handle, not described").toMatch(/@CelloConnect/);
   });
 
   it("DOD-M15-IPCVISIBLE-1: the disconnect line carries WHO was attending, in ONE line", async () => {

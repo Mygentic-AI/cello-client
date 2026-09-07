@@ -26,7 +26,7 @@ import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto"
 
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance } from "./co-attendance.js";
-import { NO_AGENTS_GUIDANCE } from "./onboarding-guidance.js";
+import { noAgentsGuidance } from "./onboarding-guidance.js";
 
 export interface AgentHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -601,7 +601,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     // @cello-protocol package at all — so the shim can only learn this over the wire, and an
     // operator who never opens a terminal would otherwise get an empty list and no explanation
     // of the cohort gate standing between them and a registration token.
-    if (agents.length === 0) return { agents, onboarding: NO_AGENTS_GUIDANCE };
+    if (agents.length === 0) return { agents, onboarding: noAgentsGuidance() };
     return { agents };
   });
 

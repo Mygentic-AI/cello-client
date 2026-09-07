@@ -3,52 +3,89 @@
  *
  * ─── The failure this exists to prevent ──────────────────────────────────────────────────────
  * A new operator installs the plugin, runs `cello login`, and gets `No registered agents to
- * start.` — nine words that name no next command, no token, and no gate. So they go looking,
- * find the CELLO operations agent on Telegram, ask it for a registration token, and are refused,
- * because tokens only exist for someone a cohort has already admitted.
+ * start.` — nine words that name no next command, no token, and no bot. Measured 2026-09-07: the
+ * words "waitlist", "cohort" and "wave" appeared NOWHERE in the CLI, the daemon, or any of the
+ * five plugin skills, and the bot was referred to only as "the CELLO Operations Agent on
+ * Telegram" — a description, never a handle you could search for.
  *
- * Nothing in the client said so. Measured 2026-09-07: the words "waitlist", "cohort" and "wave"
- * appeared NOWHERE in the CLI, the daemon, or any of the five plugin skills. The setup skill
- * explains the token's format and that it is single-use, and never mentions that one has to be
- * issued to you first. The wasted trip to Telegram was not a risk — it was the only path the
- * product described.
+ * ─── THERE ARE TWO TOKENS, AND CONFLATING THEM IS THE DEFECT ─────────────────────────────────
+ * The first draft of this text treated them as one thing and got the shape wrong.
  *
- * ─── Why the gate comes FIRST in the text ────────────────────────────────────────────────────
- * Ordering the steps by what the operator types (create → register → "you need a token") puts the
- * gate at the end, which is where they discover it AFTER the trip. Leading with it costs one line
- * and turns a disappointment into an expectation.
+ *   **Waitlist token** — minted by a wave when you are admitted from the waitlist. The gate
+ *   handler calls it a grant of NETWORK ACCESS. You present it to the bot ONCE and it is
+ *   BURNED; the burn links your Telegram account. It is not per-agent and you never see it again.
  *
- * ─── Why step 4 is called out as free ────────────────────────────────────────────────────────
- * `create-agent` needs no token and no permission — the identity is local until registration
- * publishes it. Someone waiting on a cohort can still get that far and see something succeed,
- * which is the difference between "gated" and "broken".
+ *   **Agent token** — the `CELLO-` pre-authorization capability the bot issues so a specific
+ *   agent may register. One per agent, single-use, 24-hour expiry.
+ *
+ * The system's own name for the first is `waitlist_tokens`, and that is what it is called here.
+ * It is deliberately NOT "telegram token": `cello-ops-agent-telegram-bot-token` already exists in
+ * the infrastructure as the bot's API credential, and giving two unrelated secrets one name is a
+ * support conversation nobody can untangle.
+ *
+ * ─── WHY THE GATE IS AT THE BOTTOM, NOT THE TOP ──────────────────────────────────────────────
+ * An earlier version led with the cohort gate on the theory that it prevents a wasted trip to
+ * Telegram. Andre's correction, and the gate handler agrees with him: the gate's first step is
+ * "is this Telegram ID already linked? → proceed". Once the waitlist token is burned, the
+ * condition is permanently satisfied. Leading with it means everyone past that point reads a
+ * standing warning about a door they already walked through, every time they have no agent on a
+ * machine — which is also true on a second laptop, after a reset, and after an ecosystem wipe.
+ *
+ * So the happy path leads and the gate is a CONDITION underneath it, phrased as a question so a
+ * reader who is past it skips the paragraph instead of re-reading it.
+ *
+ * ─── Why the handle is DERIVED and not a constant ────────────────────────────────────────────
+ * There are two bots — production and staging — and a hardcoded handle sends a staging operator
+ * to the production bot, which will refuse their staging waitlist token with a message about a
+ * grant they do hold, on a bot they should not be talking to. `CELLO_ENV` already exists in this
+ * daemon and already carries `staging`, so the handle derives from it.
+ *
+ * **The mapping is a whitelist of ONE, deliberately.** `resolveCelloEnv` defaults an unset
+ * `CELLO_ENV` to `"local"`, and the overwhelmingly common case — an operator who installed from
+ * npm and set nothing — must never be pointed at staging. So only a literal `staging` gets the
+ * staging bot and everything else gets production: a misconfiguration sends someone to the real
+ * bot, which is the recoverable direction of that error.
  *
  * ─── Why it lives in the daemon ──────────────────────────────────────────────────────────────
- * Two surfaces show it: the CLI (`cello login`, `cello status`) and the MCP shim, for the operator
- * who never opens a terminal. The CLI can import this constant because `cli` depends on `daemon`.
- * **`connect` depends on NO @cello-protocol package** — it is a 233 KB socket shim by design, and
- * making it depend on the 7.8 MB daemon would put a native SQLCipher build on every session start.
- * So the shim cannot import this, and the text has to reach it over the wire: `cello_list_agents`
- * returns it as `onboarding` when the roster is empty. One definition, two renderers, no drift.
+ * Two surfaces show it: the CLI (`cello login`) and the MCP shim, for the operator who never
+ * opens a terminal. The CLI imports this because `cli` depends on `daemon`. **`connect` depends
+ * on NO @cello-protocol package** — it is a 233 KB socket shim by design, and making it depend on
+ * the 7.8 MB daemon would put a native SQLCipher build on every session start. So the shim cannot
+ * import this, and the text reaches it over the wire: `cello_list_agents` returns it as
+ * `onboarding` when the roster is empty. One definition, two renderers, no drift.
  */
 
 /** Where someone who has not signed up starts. Live as of 2026-09-07. */
 export const WAITLIST_URL = "https://cello.mygentic.ai/waitlist";
 
+/** The operations agent on Telegram, by environment. */
+export const BOT_HANDLE_PRODUCTION = "@CelloConnectBot";
+export const BOT_HANDLE_STAGING = "@CelloConnectStagingBot";
+
+/**
+ * Which bot to send this operator to. Only an explicit `staging` diverges — see the whitelist
+ * note above for why an unrecognised or unset value must resolve to production.
+ */
+export function botHandle(celloEnv: string | undefined = process.env["CELLO_ENV"]): string {
+  return celloEnv === "staging" ? BOT_HANDLE_STAGING : BOT_HANDLE_PRODUCTION;
+}
+
 /**
  * Shown when a machine has zero agents. Plain text, terminal-width, no ANSI — it is rendered
  * verbatim by the CLI and passed through to an agent by the shim, and neither can assume a TTY.
  */
-export const NO_AGENTS_GUIDANCE =
-  "No agents on this machine yet.\n" +
-  "\n" +
-  "CELLO is in cohort launch, so registration is gated. The order is:\n" +
-  "\n" +
-  `  1. Join the waitlist          ${WAITLIST_URL}\n` +
-  "  2. Wait to be admitted to a cohort — you'll be notified\n" +
-  "  3. Collect your token from the CELLO operations agent on Telegram\n" +
-  "  4. cello create-agent <name>            <- works right now, no token needed\n" +
-  "  5. cello register-agent <name> <token>\n" +
-  "\n" +
-  "Step 4 costs nothing and needs no permission — your identity is local until you\n" +
-  "register it.";
+export function noAgentsGuidance(celloEnv?: string): string {
+  return (
+    "No agents on this machine yet. To make one:\n" +
+    "\n" +
+    `  1. Get an agent token from ${botHandle(celloEnv)} on Telegram\n` +
+    "  2. cello create-agent <name>\n" +
+    "  3. cello register-agent <name> <token>\n" +
+    "\n" +
+    "That's it — your agent is live and reachable.\n" +
+    "\n" +
+    "First time with the bot? It asks for your waitlist token before it issues\n" +
+    "anything. That comes from being admitted to a launch cohort — start at\n" +
+    `${WAITLIST_URL}. You present it once; after that the bot knows you.`
+  );
+}
