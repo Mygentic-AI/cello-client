@@ -71,6 +71,7 @@ describe("the composition root actually CALLS every phase it depends on", () => 
     "createSessionNotify(",
     "createConnectionAgents(",
     "createDirectoryConnect(",
+    "createUnresolvedNodesReport(",
   ] as const;
 
   for (const phase of PHASES) {
