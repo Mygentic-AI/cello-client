@@ -58,6 +58,14 @@ function makeHarness(
      * that breaks.
      */
     saltReason?: "none" | "unreadable";
+    /**
+     * `041-PARKSTUCK` review H1 — did ingest actually KEEP a local copy of the refused bytes?
+     *
+     * Defaults to `true`, the ordinary path. `false` is the shape the release must refuse to act
+     * on: a conversation that has spent its byte budget retains nothing, and deleting the relay's
+     * copy then leaves the message nowhere at all.
+     */
+    retained?: boolean;
   } = {},
 ) {
   const confirm = vi.fn(async () => {
@@ -72,7 +80,12 @@ function makeHarness(
   const sessionNodeManager = {
     getStandingReceiverNode: () => ({}),
     standingReceiverAbsenceReason: () => "none",
-    recoverParkedEntry: async () => ({ ok: false as const, reason: "session_committed" }),
+    recoverParkedEntry: async () => ({
+      ok: false as const,
+      reason: "session_committed",
+      // The retention outcome ingest now carries out with the refusal — the release is gated on it.
+      retained: opts.retained ?? true,
+    }),
     recordSealedAnnex: (_a: string, _s: string, _h: string, content: Uint8Array) => { annexed.push({ content }); return true; },
     /**
      * `DOD-M15-SEALWIRE-1` part B2a. The annex verifier now asks the session for its content salt,
@@ -431,6 +444,32 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
       expect((res as { refusals: Array<{ reason: string }> }).refusals[0]?.reason).toBe("annex_hash_mismatch");
     });
 
+    it("★ the relay copy is KEPT when this daemon could not retain a local copy", async () => {
+      /**
+       * Review H1, and it is the worst thing this unit could have shipped. The release reasoned
+       * "the bytes are already quarantined" from ingest having CALLED the retention, not from it
+       * having worked — and retention returns null on four reachable paths, the ordinary one being
+       * a conversation that has already spent its byte budget. Delete the relay copy on top of that
+       * and the message exists nowhere.
+       *
+       * The loop is the lesser harm, and the daemon says why it is continuing.
+       */
+      const e = await saltedEntry("the only copy of me is on the relay");
+      const h = makeHarness(
+        { disposition: "allow" } as ScreenVerdict, e.ciphertext, e.contentHashHex, e.recipient, null,
+        { sessionStatus: "abandoned", retained: false },
+      );
+
+      await recover(h, e.recipient);
+
+      expect(
+        h.confirm,
+        "nothing else holds these bytes — deleting the relay copy is permanent silent loss, which " +
+          "is strictly worse than the loop this unit exists to stop",
+      ).not.toHaveBeenCalled();
+      expect(h.notices[0]!.impact, "and the operator is not told it is gone").toContain("the relay still holds its copy");
+    });
+
     it("★ a salt that could not be READ is not treated as a salt that never existed", async () => {
       /**
        * Review H2. `unreadable` means a salt row is there and this machine could not use it — the
@@ -501,6 +540,11 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
           "closed three days earlier. Guidance whose action is already taken must not be printed.",
       ).not.toContain("close it");
       expect(h.notices[0]!.guidance).toContain("NEW conversation");
+      expect(
+        h.notices[0]!.guidance,
+        "a message that is 'gone' with no pointer to where it still is is a dead end — the log " +
+          "line for this event named cello_quarantined and the operator was the one not told",
+      ).toContain("cello_quarantined");
     });
 
     it("★ a release that FAILED does not tell the operator the message is gone", async () => {

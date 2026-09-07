@@ -112,12 +112,26 @@ function saltGuidance(ctx: ParkRefusalContext): string {
         "message against. Look for session.salt.persist.failed or session.salt.announce.failed in " +
         "the daemon log for which half never completed.";
   if (ctx.released) {
+    /**
+     * ⚠️ **IT NAMES WHERE THE BYTES STILL ARE — review M7, and the affordance was missing.**
+     *
+     * The reader is told a message existed, was never shown to them, and is gone from the relay.
+     * Without the next sentence that is a dead end, and the log line for the same event already
+     * said `cello_quarantined` — so the person who needed it was the only one not told.
+     *
+     * Safe to promise only because the release is now gated on the retention having SUCCEEDED
+     * (review H1). Before that gate this sentence would have been a lie on exactly the daemons
+     * where it mattered most.
+     */
     return (
       `${cause} THERE IS NOTHING TO REPAIR AND NOTHING TO RETRY. This conversation is closed ` +
       `("${ctx.sessionStatus}"), so no salt can ever be agreed for it and this message could never ` +
       `have been checked on any future attempt. The relay's copy has now been dropped, which is what ` +
-      `stops it being pulled and refused every few minutes forever. If the message mattered, ask the ` +
-      `sender OUT OF BAND — a channel that is not this one — to say it again in a NEW conversation.`
+      `stops it being pulled and refused every few minutes forever. THE MESSAGE ITSELF IS STILL HERE: ` +
+      `this agent kept the bytes it could not check, and cello_quarantined shows them — treat what ` +
+      `you read there as unverified, because the whole reason it is in there is that nothing could ` +
+      `confirm it arrived unaltered. If it matters, ask the sender OUT OF BAND — a channel that is ` +
+      `not this one — to say it again in a NEW conversation.`
     );
   }
   return (

@@ -646,11 +646,21 @@ export function createContentPark(deps: ContentParkDeps) {
            * one drain early would lose a message that would have gone through — which is strictly
            * worse than the loop.
            *
-           * ⚠️ AND THE BYTES ARE NOT LOST BY THIS. `recoverParkedEntry` already ran
-           * `ingestReceivedContent`, whose `session_committed` exit quarantines the content as
-           * retained evidence (`DOD-M15-REFUSEDEVIDENCE-1`) before returning the reason this branch
-           * is under. What is released is the RELAY's copy — the one being re-pulled — and the
-           * operator can still read what arrived with `cello_quarantined`.
+           * ⚠️ **AND THE LOCAL COPY IS PROVEN, NEVER ASSUMED — review H1.**
+           *
+           * This comment used to assert that `ingestReceivedContent`'s `session_committed` exit
+           * *had* quarantined the bytes, and gate on nothing. That claim is true on the ordinary
+           * path and false on four reachable ones: no database, the conversation's byte budget
+           * already spent, the row not stored, and a throwing write — each logging, in its own
+           * words, that *nothing holds a copy of it*. The budget case is not exotic; it is the
+           * ordinary shape of a long conversation that then ends.
+           *
+           * Deleting the relay's copy on the strength of an unchecked retention is delete-on-
+           * best-effort, which the comment forty lines above forbids by name: *"annex FIRST,
+           * confirm-delete SECOND, and only if the annex committed… delete-on-best-effort converts
+           * the loop into PERMANENT SILENT loss — strictly worse than the bug."* So `retained` is
+           * now a fact carried out of ingest, and a failed retention keeps the relay copy. The loop
+           * is the lesser harm and it is loud while it lasts.
            */
           /**
            * ⚠️ **`saltReason === "none"` IS THE THIRD CONDITION, and leaving it out was a way to
@@ -673,7 +683,23 @@ export function createContentPark(deps: ContentParkDeps) {
           const releasable =
             stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE &&
             sessionTerminal &&
-            saltReason === "none";
+            saltReason === "none" &&
+            ingest.retained === true;
+          if (!releasable && stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE && sessionTerminal && saltReason === "none") {
+            /**
+             * The loop continues, and the reason it continues is a LOCAL storage failure rather than
+             * anything about this message. Said out loud because otherwise this is indistinguishable
+             * from the defect this unit fixed — the same refusal, at the same cadence, forever.
+             */
+            logger.warn("content.recover.release.withheld", {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex, agentName: recipientAgent.name,
+              impact:
+                "this message can never be checked and the relay copy would normally be dropped, but this daemon could NOT retain a local copy of it — see session.content.quarantine.skipped or .failed above. The relay copy is kept instead, so it will keep being pulled and refused, because deleting it would leave the message nowhere at all.",
+              guidance:
+                "Free space for this conversation and the copy is retained on a later drain, after which the loop stops on its own. A conversation that has spent its storage budget cannot retain more; cello_quarantined shows what it is already holding.",
+              correlationId,
+            });
+          }
           /**
            * ⚠️ **REPORTED ON THE SUCCESS PATH — the notice is written AFTER the delete, never
            * before it.** `released` is what the operator's sentence turns on ("it is now gone" vs

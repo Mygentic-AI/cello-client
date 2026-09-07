@@ -56,7 +56,7 @@ export interface ParkContext {
     correlationId?: string,
     recoveredSeq?: number,
     contentHashAlgIn?: string | null,
-  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string }>;
+  ): Promise<{ ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean } | { ok: false; reason: string; retained?: boolean }>;
   witnessReceivedLeaf(
     agentName: string,
     sessionId: string,
@@ -389,7 +389,7 @@ export class ParkRecovery {
     correlationId?: string,
   ): Promise<
     | { ok: true; leafIndex: number; sequenceNumber: number; held?: boolean; appendedCount?: number; screenedOut?: boolean }
-    | { ok: false; reason: string }
+    | { ok: false; reason: string; retained?: boolean }
   > {
     const contentHashHex = Buffer.from(contentHash).toString("hex");
 
