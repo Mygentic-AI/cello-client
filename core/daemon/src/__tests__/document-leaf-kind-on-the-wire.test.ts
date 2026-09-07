@@ -111,7 +111,9 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     // that fails when someone re-writes the adapter with the shorter signature. A behavioural test
     // here would have to stand up the whole daemon, and a mock of this seam is precisely what hid
     // the defect the first time.
-    const root = readFileSync(new URL("../daemon.ts", import.meta.url), "utf8");
+    // 040-DAEMONROOT unit 4: the sendContent/appendLeaf adapters moved out of daemon.ts into
+    // document-wiring.ts. The file changed; what is asserted about the adapter did not.
+    const root = readFileSync(new URL("../document-wiring.ts", import.meta.url), "utf8");
 
     /**
      * `matchAll`, not `exec` — `DOD-M15-SEALWIRE-1` B2b-1 pass-2 F5. `exec` returns the FIRST match,
@@ -122,7 +124,7 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     const adapters = [...root.matchAll(/sendContent:\s*\(([^)]*)\)\s*=>\s*\n?\s*sessionNodeManager\.sendContent\(([^)]*)\)/g)];
     expect(
       adapters.length,
-      `expected exactly ONE sendContent adapter in daemon.ts, found ${adapters.length} — with more than one, this guard checks whichever comes first and the others are unprotected`,
+      `expected exactly ONE sendContent adapter in document-wiring.ts, found ${adapters.length} — with more than one, this guard checks whichever comes first and the others are unprotected`,
     ).toBe(1);
     const contentAdapter = adapters[0]!;
 
@@ -138,16 +140,16 @@ describe("a document leaf is witnessed as a DOCUMENT, not as a message", () => {
     for (const param of ["leafKind", "contentHashAlg"]) {
       expect(
         contentAdapter[1]!.includes(param),
-        `daemon.ts's sendContent adapter does not ACCEPT ${param} — it is dropped here`,
+        `document-wiring.ts's sendContent adapter does not ACCEPT ${param} — it is dropped here`,
       ).toBe(true);
       expect(
         contentAdapter[2]!.includes(param),
-        `daemon.ts's sendContent adapter accepts ${param} but does not PASS it on`,
+        `document-wiring.ts's sendContent adapter accepts ${param} but does not PASS it on`,
       ).toBe(true);
     }
 
     const frameAdapter = /sendFrame:\s*async\s*\(([^)]*)\)/.exec(root);
-    expect(frameAdapter, "the sendFrame adapter in daemon.ts was renamed or restructured").not.toBeNull();
+    expect(frameAdapter, "the sendFrame adapter in document-wiring.ts was renamed or restructured").not.toBeNull();
     expect(
       frameAdapter![1].includes("leafKind"),
       "daemon.ts's sendFrame adapter drops leafKind, so a refusal cannot be witnessed as 0x05",

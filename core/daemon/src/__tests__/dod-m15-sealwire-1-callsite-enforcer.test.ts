@@ -35,8 +35,16 @@ import { join } from "node:path";
 
 const SRC = join(import.meta.dirname, "..");
 
-/** Files that call `placeOwnLeaf` in production. Adding a third belongs in this list. */
-const CALLERS = ["daemon.ts", "session-content-handlers.ts"] as const;
+/**
+ * Files that call `placeOwnLeaf` in production.
+ *
+ * ⚠️ THIS LIST IS THE GUARD'S WEAK POINT AND 040-DAEMONROOT KEEPS MOVING CODE ACROSS IT. A file
+ * that leaves the list stops being SCANNED rather than going red — the guard shrinks quietly, which
+ * is the failure mode it exists to prevent, one level up. Unit 4 moved the document delivery path
+ * out of `daemon.ts` and this entry is why the suite went red instead of silent. Every later unit
+ * that moves leaf-placing code adds its file here in the same commit.
+ */
+const CALLERS = ["daemon.ts", "session-content-handlers.ts", "document-wiring.ts"] as const;
 
 interface Call { file: string; line: number; text: string }
 
