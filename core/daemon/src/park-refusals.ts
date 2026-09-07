@@ -94,11 +94,20 @@ const NOT_THEIR_FAULT =
  * inside CELLO.
  */
 function saltGuidance(ctx: ParkRefusalContext): string {
+  /**
+   * ⚠️ THE TWO CAUSES SEND THE OPERATOR TO OPPOSITE PLACES — one to the conversation, one to their
+   * own disk — and only the first can ever be released. A message is dropped from the relay solely
+   * on `none`; `unreadable` keeps its copy, because the read that failed may succeed next drain.
+   * So the `unreadable` text below never appears beside "there is nothing to retry", and review H2
+   * measured the pair contradicting each other when it could.
+   */
   const cause =
     ctx.saltReason === "unreadable"
-      ? "A salt WAS agreed for this conversation and this machine can no longer read it back — the " +
-        "row is there and is not usable. That is damage to local storage on YOUR side, not anything " +
-        "the sender did. Look for session.salt.read.failed in the daemon log."
+      ? "A salt row for this conversation EXISTS on this machine and could not be used — the read " +
+        "failed, or the stored value is the wrong shape. That is a fault on YOUR side, not anything " +
+        "the sender did, and it may simply be a database that was busy. Look for " +
+        "session.salt.read.failed in the daemon log; if it does not repeat, the next attempt will " +
+        "check this message normally."
       : "No salt was ever agreed for this conversation, so there is nothing here to check the " +
         "message against. Look for session.salt.persist.failed or session.salt.announce.failed in " +
         "the daemon log for which half never completed.";

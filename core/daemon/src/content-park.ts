@@ -652,7 +652,28 @@ export function createContentPark(deps: ContentParkDeps) {
            * is under. What is released is the RELAY's copy — the one being re-pulled — and the
            * operator can still read what arrived with `cello_quarantined`.
            */
-          const releasable = stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE && sessionTerminal;
+          /**
+           * ⚠️ **`saltReason === "none"` IS THE THIRD CONDITION, and leaving it out was a way to
+           * destroy a message — review H2.**
+           *
+           * `getSessionContentSaltState` answers `unreadable` for THREE situations and only one of
+           * them is permanent: the database is not open (a shutdown or startup race), the read
+           * THREW, or the stored blob is the wrong width (real corruption). `getSessionSalt` also
+           * returns null on a throwing read. So a SQLCipher lock or an IO blip on one drain makes a
+           * perfectly good salt look absent — and without this clause the next line deletes the
+           * relay's last copy of a message the FOLLOWING drain would have annexed.
+           *
+           * That is the order's explicit prohibition: a release one drain too early loses a message
+           * that would have gone through. `none` is the only answer that cannot change back: no
+           * salt row exists, and on a terminal session none can ever be written.
+           *
+           * The live `dcec3c3f…` case is `none` — there is not one `session.salt.*` event for that
+           * session — so the loop this unit exists to stop still closes.
+           */
+          const releasable =
+            stuckReason === PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE &&
+            sessionTerminal &&
+            saltReason === "none";
           /**
            * ⚠️ **REPORTED ON THE SUCCESS PATH — the notice is written AFTER the delete, never
            * before it.** `released` is what the operator's sentence turns on ("it is now gone" vs

@@ -49,6 +49,15 @@ function makeHarness(
     sessionStatus?: string | null;
     /** Make the relay's confirm-delete REJECT, so a release that did not happen can be told from one that did. */
     confirmFails?: boolean;
+    /**
+     * `041-PARKSTUCK` review H2 — WHY there is no salt, which the first fixture could not express.
+     *
+     * It hardcoded `reason: "none"`, so the `unreadable` shape — a salt row that EXISTS and could
+     * not be read, which a busy database produces and which must NOT be released — could not be
+     * produced by any test in the file. The neighbouring shape that works, standing in for the one
+     * that breaks.
+     */
+    saltReason?: "none" | "unreadable";
   } = {},
 ) {
   const confirm = vi.fn(async () => {
@@ -83,7 +92,7 @@ function makeHarness(
      * places. It delegates to the same read, so this stub cannot disagree with the one above.
      */
     getSessionContentSaltState: () =>
-      sessionSalt === null ? { salt: null, reason: "none" as const } : { salt: sessionSalt },
+      sessionSalt === null ? { salt: null, reason: opts.saltReason ?? "none" } : { salt: sessionSalt },
     getSessionRecord: () => {
       const status = opts.sessionStatus === undefined ? "seal_interrupted_pending" : opts.sessionStatus;
       return status === null ? null : { status };
@@ -420,6 +429,31 @@ describe("M12-P17: annex screening — the branch that deletes", () => {
 
       expect(h.confirm, "a message that failed a check is evidence — this exit is for one that could not be checked").not.toHaveBeenCalled();
       expect((res as { refusals: Array<{ reason: string }> }).refusals[0]?.reason).toBe("annex_hash_mismatch");
+    });
+
+    it("★ a salt that could not be READ is not treated as a salt that never existed", async () => {
+      /**
+       * Review H2. `unreadable` means a salt row is there and this machine could not use it — the
+       * database was not open, the read threw, or the blob is the wrong width. Only the last is
+       * permanent, and none of them is distinguishable here. Releasing on it deletes the relay's
+       * last copy of a message the NEXT drain would have annexed, which is the one outcome the
+       * order forbids outright.
+       */
+      const e = await saltedEntry("the salt is there and today it will not read");
+      const h = makeHarness(
+        { disposition: "allow" } as ScreenVerdict, e.ciphertext, e.contentHashHex, e.recipient, null,
+        { sessionStatus: "abandoned", saltReason: "unreadable" },
+      );
+
+      const res = await recover(h, e.recipient);
+
+      expect(
+        h.confirm,
+        "a read that failed may succeed next drain — this is a local fault, not an immutable input",
+      ).not.toHaveBeenCalled();
+      expect((res as { refusals: Array<{ reason: string }> }).refusals[0]?.reason).toBe("annex_salt_unavailable");
+      expect(h.notices[0]!.impact, "and the operator is not told it is gone").toContain("the relay still holds its copy");
+      expect(h.notices[0]!.guidance, "nor that there is nothing to retry").not.toContain("NOTHING TO RETRY");
     });
 
     it("★ a session record that CANNOT BE READ is not treated as terminal", async () => {
