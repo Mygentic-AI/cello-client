@@ -32,10 +32,14 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const DAEMON_SRC = readFileSync(join(import.meta.dirname, "../daemon.ts"), "utf-8");
+// 040-DAEMONROOT unit 5: `getAgentSignaling` — and the `onConnected` callback that delegates to the
+// reconnect drain — moved into signaling-wiring.ts. The ORDERING constraints below are still about
+// daemon.ts; only the delegation itself is read from the module that now contains it.
+const WIRING_SRC = readFileSync(join(import.meta.dirname, "../signaling-wiring.ts"), "utf-8");
 
 /** Index of the first line matching `needle`, or -1. Line-based so a stray match in a comment elsewhere is unlikely. */
-function lineOf(needle: string): number {
-  const lines = DAEMON_SRC.split("\n");
+function lineOf(needle: string, src: string = DAEMON_SRC): number {
+  const lines = src.split("\n");
   return lines.findIndex((l) => l.includes(needle) && !l.trim().startsWith("//") && !l.trim().startsWith("*"));
 }
 
@@ -92,7 +96,7 @@ describe("startDaemon ordering — constraints the type system cannot express", 
 
   it("DOD-PARK-DRAIN-1: onConnected DELEGATES to the reconnect drain — it does not re-inline two voids", () => {
     const construct = lineOf("= createReconnectDrain({");
-    const delegate = lineOf("onSignalingConnected(agentName)");
+    const delegate = lineOf("onSignalingConnected(agentName)", WIRING_SRC);
     const hook = lineOf("sessionNodeManager.setParkedDrainHook(");
 
     expect(construct, "createReconnectDrain() must be constructed in the composition root").toBeGreaterThan(-1);
@@ -108,10 +112,14 @@ describe("startDaemon ordering — constraints the type system cannot express", 
       "getAgentSignaling's onConnected must call onSignalingConnected(agentName) — the ensure→drain " +
       "ordering contract lives in reconnect-drain.ts, not inline here.",
     ).toBeGreaterThan(-1);
+    // The two now live in different files, so a line comparison would compare nothing. What has to
+    // hold is that the root still CONSTRUCTS the drain and passes it in — a module that resolved the
+    // drain itself would be the re-inlining this test exists to prevent.
     expect(
-      construct,
-      "createReconnectDrain() must be constructed before getAgentSignaling can call it.",
-    ).toBeLessThan(delegate);
+      DAEMON_SRC,
+      "the composition root must still hand onSignalingConnected to the signaling wiring — if the " +
+      "module reaches for the drain itself, the ensure→drain contract stops being the root's to keep.",
+    ).toContain("onSignalingConnected,");
   });
 
   it("the content park is CONSTRUCTED before its boot-time callers (autoRecoverForAgent)", () => {
