@@ -72,6 +72,14 @@ export interface ParkRefusalContext {
    * the operator somewhere completely different. `null` for every other reason.
    */
   readonly saltReason: "none" | "unreadable" | null;
+  /**
+   * The thrown message, for the two reasons that come from a `catch`.
+   *
+   * Review M4: the upstream cause must survive downstream (Invariant 3). A notice that says "it
+   * threw" without saying what it said sends the operator back to the log for the one fact that
+   * would have told them whether this is their disk, their build, or the sender.
+   */
+  readonly errorDetail: string | null;
 }
 
 /**
@@ -188,16 +196,15 @@ export const PARK_REFUSAL_NOTICE: Record<
       "is not this one — what they actually sent, and read the retained copy with cello_quarantined " +
       "to compare. If it repeats with the same counterparty, stop using this conversation.",
   }),
-  [PARK_REFUSAL_REASONS.ANNEX_DECODE_FAILED]: () => ({
+  [PARK_REFUSAL_REASONS.ANNEX_DECODE_FAILED]: (ctx) => ({
     kind: REFUSAL_KINDS.DEFERRED,
     impact:
       "A parked message could not be decoded at all, so nothing about it could be checked and it " +
       "was not shown to you. The relay still holds it. This is a wire or version difference, not a " +
-      "claim about the sender.",
+      "claim about the sender." + errorClause(ctx),
     guidance:
-      "Look for content.recover.annex.decode_failed in the daemon log — it names the decode error. " +
       "If the sender is on a newer build, upgrading this client is the fix; the relay keeps the " +
-      "message meanwhile.",
+      "message meanwhile, and it is decoded on a later drain. Nothing to ask the sender for.",
   }),
   [PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE]: () => ({
     // The one TRANSIENT reason in the set. A screener that is down comes back, and the message is
@@ -212,12 +219,13 @@ export const PARK_REFUSAL_NOTICE: Record<
       "running — look for content.recover.annex.screen_unavailable in the daemon log. Do not ask " +
       "the sender for anything; they cannot see this and there is nothing for them to resend.",
   }),
-  [PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED]: () => ({
+  [PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED]: (ctx) => ({
     kind: REFUSAL_KINDS.DEFERRED,
     impact:
-      "A parked message passed every check and then could not be written to local storage on this " +
-      "machine, so it was not shown to you. THIS IS A FAULT ON THIS MACHINE. The relay keeps its " +
-      "copy, so nothing is lost yet.",
+      "A parked message decoded and then a later step failed on THIS machine — screening it, " +
+      "keeping it, or writing it into the record — so it was not shown to you. THIS IS A FAULT ON " +
+      "THIS MACHINE, not something the sender did. The relay keeps its copy, so nothing is lost " +
+      "yet." + errorClause(ctx),
     guidance:
       "Check that this machine has disk space and that ~/.cello is writable, then wait for the next " +
       "drain — the message is still on the relay and is retried. Do not ask the sender to resend.",
@@ -249,6 +257,15 @@ export function refusalRecurrence(total: number, firstAt: number, lastAt: number
     `that rate until the cause named above is dealt with — the count grows on its own and is not a ` +
     `measure of how many messages are affected.`
   );
+}
+
+/**
+ * The upstream error's own words, appended rather than replacing anything — Invariant 3.
+ *
+ * Empty when there was no throw, so a notice never carries a dangling "it said:" with nothing after.
+ */
+function errorClause(ctx: ParkRefusalContext): string {
+  return ctx.errorDetail === null || ctx.errorDetail === "" ? "" : ` The failure said: ${ctx.errorDetail}.`;
 }
 
 /** A duration a person reads without converting it. Whole units, because a cadence is an estimate. */

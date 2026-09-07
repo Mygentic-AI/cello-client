@@ -379,6 +379,8 @@ export function createContentPark(deps: ContentParkDeps) {
          * tamper — was one of the four.
          */
         let annexRefusal: ParkRefusalReason | null = null;
+        /** The thrown message, carried into the operator's notice rather than left in the log. */
+        let annexErrorDetail: string | null = null;
         /**
          * `041-PARKSTUCK` — CAN THIS EVER BE CHECKED AGAIN, or is the answer fixed for the rest of
          * time? Two different states, and only one of them is worth retrying.
@@ -397,8 +399,24 @@ export function createContentPark(deps: ContentParkDeps) {
         const sessionTerminal = sessionStatus !== null && TERMINAL_SESSION_STATUSES.has(sessionStatus);
         let saltReason: "none" | "unreadable" | null = null;
         let declaredAlgSeen = "(absent)";
+        /**
+         * ⚠️ **WHICH STEP THREW — review M4, and without it one label spoke for four.**
+         *
+         * The `try` below opens at the decode and does not close until after the screen, the
+         * quarantine and the annex write, so a throw from ANY of them was reported as
+         * `annex_decode_failed`. This unit then promoted that label to an operator notice asserting
+         * *"a wire or version difference, not a claim about the sender"* and sending them to a log
+         * event that had not fired. It also contradicted the sibling comment below, which promises
+         * `annex_write_failed` is *"only what it says — the annex write ran and failed"*.
+         *
+         * And the mislabel is the common case, not the rare one: `decodeParkEnvelope` already
+         * succeeded on these exact bytes in `recoverParkedEntry` before ingest returned
+         * `session_committed`, so a genuine decode failure here is close to unreachable.
+         */
+        let decoded = false;
         try {
           const env = decodeParkEnvelope(unsealed);
+          decoded = true;
           /**
            * ⚠️ THE SECOND CONTENT-HASH VERIFIER — `DOD-M15-SEALWIRE-1` part B1 review F3, closed by
            * part B2a.
@@ -583,12 +601,20 @@ export function createContentPark(deps: ContentParkDeps) {
             }
           }
         } catch (err: unknown) {
-          annexRefusal = PARK_REFUSAL_REASONS.ANNEX_DECODE_FAILED;
-          logger.error("content.recover.annex.decode_failed", {
-            sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
-            impact: "envelope could not be decoded — NOT annexed, relay copy kept",
-            error: extractErrorMessage(err), correlationId,
-          });
+          annexRefusal = decoded
+            ? PARK_REFUSAL_REASONS.ANNEX_WRITE_FAILED
+            : PARK_REFUSAL_REASONS.ANNEX_DECODE_FAILED;
+          annexErrorDetail = extractErrorMessage(err);
+          logger.error(
+            decoded ? "content.recover.annex.write_failed" : "content.recover.annex.decode_failed",
+            {
+              sessionId: e.sessionIdHex, contentHash: e.contentHashHex,
+              impact: decoded
+                ? "the envelope decoded and a later step threw — screening, retention or the annex write. NOT annexed, relay copy kept."
+                : "envelope could not be decoded — NOT annexed, relay copy kept",
+              error: annexErrorDetail, correlationId,
+            },
+          );
         }
         if (annexed) {
           // Review F6: named under `content.recover.*` like its five siblings in this loop, so a
@@ -616,7 +642,7 @@ export function createContentPark(deps: ContentParkDeps) {
             noteParkRefusal(
               recipientAgent.name, e.sessionIdHex, e.contentHashHex,
               PARK_REFUSAL_REASONS.ANNEX_SCREEN_UNAVAILABLE,
-              { sessionStatus, released: false, declaredAlg: declaredAlgSeen, saltReason },
+              { sessionStatus, released: false, declaredAlg: declaredAlgSeen, saltReason, errorDetail: null },
             ),
           );
         } else {
@@ -736,7 +762,7 @@ export function createContentPark(deps: ContentParkDeps) {
           refusals.push(
             noteParkRefusal(
               recipientAgent.name, e.sessionIdHex, e.contentHashHex, stuckReason,
-              { sessionStatus, released, declaredAlg: declaredAlgSeen, saltReason },
+              { sessionStatus, released, declaredAlg: declaredAlgSeen, saltReason, errorDetail: annexErrorDetail },
             ),
           );
         }

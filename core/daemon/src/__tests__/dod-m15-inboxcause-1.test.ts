@@ -173,7 +173,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
     // runtime check survives someone widening the type to make an error go away.
     for (const reason of ALL_PARK_REASONS) {
       const notice = PARK_REFUSAL_NOTICE[reason]({
-        sessionStatus: "abandoned", released: false, declaredAlg: "sha256", saltReason: "none",
+        sessionStatus: "abandoned", released: false, declaredAlg: "sha256", saltReason: "none", errorDetail: null,
       });
       expect(notice.kind, `${reason} has no kind`).toBeTruthy();
       expect(notice.impact.length, `${reason} has no impact`).toBeGreaterThan(40);
@@ -196,7 +196,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason is emitted, and none i
       for (const reason of ALL_PARK_REASONS) {
         for (const released of [true, false]) {
           const { guidance } = PARK_REFUSAL_NOTICE[reason]({
-            sessionStatus: status, released, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none",
+            sessionStatus: status, released, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
           });
           expect(
             forbidden.test(guidance),
@@ -308,7 +308,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
         `${i.toString(16).padStart(2, "0")}`.repeat(16),
         reason,
         PARK_REFUSAL_NOTICE[reason]({
-          sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none",
+          sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
         }),
       );
     });
@@ -342,7 +342,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     });
     mgr.noteContentRefusal("alice", sid, PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE,
       PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
-        sessionStatus: "abandoned", released: true, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none",
+        sessionStatus: "abandoned", released: true, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
       }));
 
     const seen = (await inboxRefusals(await connect())).filter((r) => r.session_id === sid);
@@ -360,7 +360,7 @@ describe("DOD-M15-INBOXCAUSE-1: every park refusal reason has a path to cello_in
     const mgr = handle!.getSessionNodeManager();
     const sid = "ab".repeat(16);
     const notice = PARK_REFUSAL_NOTICE[PARK_REFUSAL_REASONS.ANNEX_SALT_UNAVAILABLE]({
-      sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none",
+      sessionStatus: "abandoned", released: false, declaredAlg: "hmac-sha256-salt-v1", saltReason: "none", errorDetail: null,
     });
     // Three real refusals five minutes apart, written the way the drain writes them, then the
     // totals row's span widened to the one measured in production. The COUNT stays what the store
