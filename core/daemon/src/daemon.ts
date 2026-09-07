@@ -47,7 +47,6 @@ import { DbIdentityStore } from "./db-identity-store.js";
 // CELLO-M7-MSG-001 (AC-013/AC-018): the single application content-size cap, enforced
 // at the send point here (the receive point lives in the transport content decode).
 import type { ITransportSelector } from "./transport-selector.js";
-import { whoLabel } from "./who-label.js";
 import { LocalAutoNatStub, type IAutoNatService } from "@cello-protocol/transport";
 import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import { registerContactHandlers } from "./contact-handlers.js";
@@ -74,6 +73,7 @@ import { createUnresolvedNodesReport } from "./unresolved-nodes-report.js";
 import { createDocumentSurface } from "./document-surface.js";
 import { createIpcSurface } from "./ipc-surface.js";
 import { createDaemonStatusReport } from "./daemon-status-report.js";
+import { createWhoResolver } from "./who-resolver.js";
 import { createSealCoordinator } from "./seal-coordinator.js";
 import { createTelegramDoorbell } from "./telegram-doorbell.js";
 import { registerSessionContentHandlers } from "./session-content-handlers.js";
@@ -323,40 +323,15 @@ async function startDaemonHoldingLock(
     injectedClient: injectedTelegramBotClient,
   });
 
-  // Wraps notificationDispatcher.dispatchSessionStateChanged so every call site gets the
-  // Telegram state-change doorbell for free (DoD: state changes ALWAYS ring, never coalesced) —
-  // one wrapper rather than hooking each of the several existing call sites individually.
-  // MONIKER-4 AC2: resolve the counterparty's display label — local pet name (MONIKER-3) ??
-  // offered name for this session (MONIKER-2) ?? fingerprint. Total: any failure inside
-  // resolution degrades to fingerprint via whoLabel's own tiers; a label can never block a
-  // doorbell (spec §8).
-  function resolveWho(agentName: string, pubkeyHex: string, sessionIdHex: string): { who: string; whoKnown: boolean } {
-    let localMoniker: string | null = null;
-    try {
-      localMoniker = sessionNodeManager.getContactMoniker(agentName, pubkeyHex);
-    } catch (err: unknown) {
-      logger.warn("moniker.local.read_failed", { agentName, pubkey: pubkeyHex, reason: err instanceof Error ? err.message : String(err) });
-    }
-    // DOD-MONIKER-6: read only the box written FOR this agent — never a co-resident agent's.
-    const resolved = whoLabel({ localMoniker, offeredMoniker: offeredMonikers.get(offerKey(agentName, sessionIdHex)) ?? null, pubkeyHex });
-    // `sessionId` is load-bearing for diagnosis, not decoration. `source:"offered"` is CORRECT for a
-    // RECEIVER and wrong only for an INITIATOR (an initiator must never find a box — see DOD-MONIKER-6),
-    // so a line cannot be judged without knowing who opened the session. Join on sessionId against
-    // `session.inbound.accepted`, which names the receiver; any other agent on that session is the
-    // initiator. Without this field the M8C live run produced a wrong verdict twice (journal Entry 76).
-    //
-    // The resolved LABEL is never logged: for an unverified offer it is an attacker-chosen string, and
-    // MONIKER-2 AC2 already forbids echoing the raw value (`moniker.rejected` logs the reason, not the
-    // name). `whoKnown` carries the trust bit without the payload.
-    logger.debug("moniker.resolved", {
-      agentName,
-      sessionId: sessionIdHex,
-      pubkey: pubkeyHex,
-      source: resolved.source,
-      whoKnown: resolved.whoKnown,
-    });
-    return { who: resolved.who, whoKnown: resolved.whoKnown };
-  }
+  // 040-DAEMONROOT unit 18: what to CALL a counterparty in a message an operator reads →
+  // who-resolver.ts.
+  const { resolveWho } = createWhoResolver({
+    logger, sessionNodeManager,
+    // Resolved at call time: the offer map is built below this, and a label is only ever rendered
+    // while serving a request.
+    getOfferedMoniker: (agentName, sessionIdHex) =>
+      offeredMonikers.get(offerKey(agentName, sessionIdHex)) ?? null,
+  });
 
   // SYNC-P5: assigned when the document layer is wired (below); the state-change hook runs for
   // sessions, which exist only after startup completes — the guard covers the boot window where
