@@ -56,9 +56,8 @@ export interface SignalHandlerDeps {
   /** Read-only: a submission needs its agent ONLINE, and this surface must not change that. */
   onlineAgents: ReadonlySet<string>;
   /**
-   * Every agent this daemon has loaded. Needed to answer one question the directory cannot be
-   * trusted to answer: is the SUBJECT of this attestation also mine? Two of your own agents
-   * vouching for each other is you vouching for yourself.
+   * Every agent this daemon has loaded — resolves the selected agent's name to its pubkey. It no
+   * longer gates attestations: a CO-OWNED subject is annotated by the portal, not refused here.
    */
   loadedAgents: ReadonlyArray<LoadedAgent>;
   /** Read this connection's agent selection. The READ, not the container. */
@@ -680,22 +679,23 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
       return { ok: false, reason: "empty_body",
         guidance: "An issued signal needs text — it is the claim you are making about them, in your own words." };
     }
-    // SELF-ISSUANCE IS REFUSED AT THE SOURCE, and across EVERY agent on this daemon — not just the
-    // selected one. The check used to compare against `sel.pubkey` alone, which let an operator
-    // running two of their own agents issue from one about the other and sail through a guard whose
-    // comment claimed certainty. That configuration is not exotic: solo multi-agent is CELLO's first
-    // wedge, so it is the most likely way to hit this, not the least.
+    // AN AGENT ABOUT ITSELF IS REFUSED. Issuer and subject are one identity, so there is no fact
+    // for a reader to weigh and no downstream annotation that rescues it.
     //
-    // The portal remains the real enforcer of INV-NO-SELF-STANDING — only it can see account
-    // linkage, and only it can catch two agents under one account on different machines. But the
-    // daemon knows its OWN agents with certainty, and refusing here gives the operator a real answer
-    // now instead of a silent rejection at intake minutes later.
-    const localSelf = loadedAgents.find((a) => a.pubkey.toLowerCase() === subject);
-    if (localSelf) {
+    // CO-OWNERSHIP IS NOT REFUSED — it is ANNOTATED. This guard used to reject ANY subject loaded on
+    // this daemon, contradicting the portal, which decides the same question the other way and
+    // deliberately (D-29, `submission-ingress.ts`): an agent-subject same-operator endorsement is
+    // MINTED and FLAGGED `same_operator: true`, because "these two agents are the same operator" is
+    // a true and useful fact for a recipient. The flag is a first-class field in the SIGNED envelope
+    // for that purpose — it caps the claim at the endorser's own tier and keeps it out of any count
+    // floor, which closes the farming hole. Minting it UNFLAGGED is the hole; refusing it discarded
+    // the fact and guaranteed the flagged form could never exist. The daemon stops short of the
+    // verdict because it cannot see account linkage (two agents under one account on different
+    // machines are invisible here) and the portal can — and refusing here closed the path CELLO's
+    // first wedge walks daily: solo multi-agent is the MOST likely way to hit this, not the least.
+    if (subject === sel.pubkey.toLowerCase()) {
       return { ok: false, reason: "self_subject",
-        guidance: localSelf.name === sel.name
-          ? "An agent cannot issue a trust signal about itself — standing has to come from somebody else."
-          : `'${sel.name}' and '${localSelf.name}' are both your agents on this machine, so a signal from one about the other would be you vouching for yourself. Standing has to come from somebody else.` };
+        guidance: "An agent cannot issue a trust signal about itself — standing has to come from somebody else." };
     }
     const res = await submitForAgent({
       connectionId,
