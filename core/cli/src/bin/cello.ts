@@ -19,8 +19,17 @@ import { KNOWN_COMMANDS, USAGE, checkArgs, helpForCommand, topLevelFlag } from "
 import { findCommand, type CommandContext } from "../registry.js";
 import type { Logger } from "@cello-protocol/daemon";
 
+// Debug is OFF unless asked for. It used to write to stderr unconditionally, which made "demote a
+// noisy line to debug" a no-op for anyone standing at a terminal — the line still printed, just with
+// a different level field. A human running `cello login` for the first time should see the welcome
+// text and nothing that looks like a stack trace; set CELLO_LOG_LEVEL=debug to get the lot back.
+// Every other level still prints, and all four still go to stderr: stdout is the data stream and a
+// log line in it breaks `cello <cmd> | jq` (DOD-M15-CLIJSON-1).
+const DEBUG_ENABLED = (process.env.CELLO_LOG_LEVEL ?? "").toLowerCase() === "debug";
+
 const logger: Logger = {
   debug(event: string, context: Record<string, unknown>): void {
+    if (!DEBUG_ENABLED) return;
     const line = JSON.stringify({ level: "debug", event, ...context, ts: new Date().toISOString() });
     process.stderr.write(line + "\n");
   },

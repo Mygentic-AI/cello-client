@@ -90,12 +90,19 @@ try {
     // separate package. A literal follower got `command not found: cello` — an instruction that
     // dead-ends into another dead end. Install first, then start, then the skill that covers the
     // rest (creating and registering an agent), which nothing pointed at.
+    //
+    // It also used to name @cello-protocol/connect alongside the cli. Under the plugin route that
+    // package is a leftover of the older `claude mcp add` install: npx fetches connect at launch on
+    // its own — verified on a wiped machine, where the npx cache was deleted and repopulated itself
+    // on first launch with no global connect present. Telling a new operator to install a package
+    // they already have, in the one message they read while something is broken, spends the only
+    // attention they will give this on a no-op.
     process.stderr.write(
       "cello-mcp: no CELLO daemon is running on this machine.\n" +
       "\n" +
       "The plugin ships this MCP shim only — the daemon and the `cello` command install separately:\n" +
       "\n" +
-      "  npm install -g @cello-protocol/cli @cello-protocol/connect\n" +
+      "  npm install -g @cello-protocol/cli\n" +
       "  cello login\n" +
       "\n" +
       "Then reconnect: run `/mcp`, pick cello, choose Reconnect. Restarting Claude Code also works,\n" +

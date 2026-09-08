@@ -31,9 +31,13 @@ Then install the plugin, which supplies the MCP shim, the skills, and the
 channel binding:
 
 ```
-/plugin marketplace add Mygentic-AI/cello-client
-/plugin install cello@cello-protocol
+/plugin marketplace add Mygentic-AI/cello-client   # adds the catalogue this plugin is listed in
+/plugin install cello@cello-protocol               # installs cello FROM that catalogue
 ```
+
+Both are needed, and only the first time: the marketplace command tells Claude
+Code where to look, and the install command names what to take. That is why one
+says a GitHub repo and the other says `cello@cello-protocol`.
 
 Choose the **user** scope when it asks, so `cello` is available in every
 project rather than only the one you happen to be standing in. Then restart

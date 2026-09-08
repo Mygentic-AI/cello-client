@@ -216,8 +216,18 @@ export function acquireSingletonLock(
  * survives.
  */
 export function probeSingletonLock(celloDir: string, logger: Logger): "held" | "free" | "unknown" {
+  // The probe genuinely TAKES the lock, so it emits the daemon's own `daemon.singleton.acquired`
+  // — except this call runs in the CLI process, so on a first ever `cello login` that JSON line
+  // lands on the operator's terminal, directly above the welcome text, as the first output of
+  // their first successful command. It reads as a fault. It is also not true in the sense a reader
+  // would take it: nothing acquired anything durably, the probe let go on the next statement.
+  //
+  // So the probe's acquire/contend lines drop to debug. The DAEMON's real acquisition still logs at
+  // info, into ~/.cello/daemon.log, which is the copy an operator debugging a two-daemon situation
+  // actually reads.
+  const quiet: Logger = { ...logger, info: logger.debug.bind(logger) };
   try {
-    acquireSingletonLock(celloDir, logger, PROBE_BUSY_TIMEOUT_MS).release();
+    acquireSingletonLock(celloDir, quiet, PROBE_BUSY_TIMEOUT_MS).release();
     return "free";
   } catch (err: unknown) {
     if (err instanceof DaemonAlreadyRunningError) return "held";
