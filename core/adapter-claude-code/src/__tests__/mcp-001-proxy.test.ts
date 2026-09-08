@@ -174,26 +174,43 @@ describe("MCP-001 AC-020: binary behaviors", () => {
     expect(output.trim()).toBe(pkg.version);
   });
 
-  it("exits 1 with daemon_not_running when no daemon socket exists", async () => {
-    const { execFileSync } = await import("node:child_process");
+  it("STAYS UP with daemon_not_running guidance when no daemon socket exists — it must not exit", async () => {
+    /**
+     * This asserted `status === 1` — it REQUIRED the shim to exit. That is the defect, not the
+     * behaviour: Claude Code reports a server that exits as `CONNECTION_CLOSED: "Connection
+     * closed"`, so the carefully written recovery message never reached anyone, and a first-time
+     * user saw a generic transport error naming neither CELLO nor a next step.
+     *
+     * Rewritten rather than deleted, because the half it got right still matters: with no daemon,
+     * the operator must be told what to run. The shim now serves its tools and answers each call
+     * with `daemon_not_running` plus the recovery (see onboarding-stranded-shim.test.ts for the MCP
+     * round-trip and the proof that it re-dials). Here we only need: it is alive, and it said so.
+     */
+    const { spawn } = await import("node:child_process");
     const tsxPath = findTsx();
     const binPath = join(import.meta.dirname, "../bin/cello-mcp.ts");
 
+    const proc = spawn(tsxPath, [binPath], {
+      env: { ...process.env, NODE_ENV: "test", HOME: "/tmp/cello-mcp001-noexist" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderr = "";
+    proc.stderr?.on("data", (c: Buffer) => { stderr += c.toString(); });
+
     try {
-      execFileSync(tsxPath, [binPath], {
-        encoding: "utf8",
-        timeout: 10000,
-        // stdin must not be a TTY (it won't be in execFileSync)
-        // HOME points to nonexistent dir → no daemon.sock → exit 1
-        env: { ...process.env, NODE_ENV: "test", HOME: "/tmp/cello-mcp001-noexist" },
-      });
-      expect.fail("should have exited with non-zero");
-    } catch (err: unknown) {
-      const e = err as { status: number; stderr: string };
-      expect(e.status).toBe(1);
-      expect(e.stderr).toContain("cello login");
+      // Long enough for the connect attempt to fail and the message to be written; the shim writes
+      // it immediately after the failed dial, so this is not a race against a slow success path.
+      await new Promise((r) => setTimeout(r, 3000));
+
+      // THE REGRESSION: exitCode null means still running. A number here means it exited, and the
+      // user is back to CONNECTION_CLOSED.
+      expect(proc.exitCode).toBeNull();
+      expect(stderr).toContain("cello login");
+      expect(stderr).toContain("npm i -g --prefer-online @cello-protocol/cli@latest");
+    } finally {
+      proc.kill("SIGKILL");
     }
-  });
+  }, 20_000);
 });
 
 // ─── CELLO-M7-DAEMON-004 (round-2 BLOCKING): producer side of the session_id

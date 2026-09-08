@@ -6,108 +6,244 @@
  *   1. They run `/plugin install cello@cello-protocol`. The plugin's .mcp.json points at
  *      `npx @cello-protocol/connect`, so the MCP SHIM arrives — and nothing else does.
  *   2. Claude Code starts the shim. There is no daemon and no `~/.cello/daemon.sock`.
- *   3. The shim writes one line to stderr and exits(1). The MCP server shows as FAILED, so there
- *      are no `cello_*` tools at all — the user never even reaches a tool call.
- *   4. That one line is the entire explanation they get.
+ *   3. The shim writes its recovery message — and, until 2026-09-08, exited 1.
+ *   4. Claude Code reports a server that exits as `CONNECTION_CLOSED: "Connection closed"`,
+ *      which names neither CELLO, nor the daemon, nor a next step.
  *
- * So the line has to carry the whole recovery. It used to say "run `cello login` to start it",
- * which names a binary this user does not have: `cello` ships in @cello-protocol/cli, a SEPARATE
- * package the plugin never installs. Following the instruction literally produced
- * `command not found: cello` — a dead end pointing at a dead end.
+ * ## What changed, and why these tests were rewritten
  *
- * There was no test on this path, which is how it survived. This is that test: it spawns the real
- * built binary against an empty CELLO_DIR and reads what an operator would actually see.
+ * The message was always good. EXITING was the defect: it made that message unreachable, so the
+ * only thing a new operator ever saw was a generic transport error. This file used to REQUIRE the
+ * exit — it asserted `code === 1` and its helper rejected if the process stayed up — so it was
+ * pinning the defect in place and would have failed anyone who fixed it. Same shape as the two
+ * tests in the waitlist email that required 404 links.
+ *
+ * The behaviour now, which the `setup` skill already documented before the binary did ("Without the
+ * daemon every tool returns `daemon_not_running`"): the shim STARTS, serves its tools, and answers
+ * every call with `daemon_not_running` plus the recovery — so the guidance reaches the model's
+ * context, where it can be acted on, instead of a log nobody opens.
+ *
+ * These tests speak MCP to the real built binary over stdio, because "the tools are reachable" is
+ * the whole property and it cannot be observed from stderr.
  */
 
 import { describe, it, expect } from "vitest";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+// Cross-package on purpose: this is THE helper for "a real daemon in its own process", and the
+// re-dial cannot be proven against an in-process stub — the shim connects over a unix socket that
+// only a separate process can be holding.
+import { spawnRealDaemon, type SpawnedDaemon } from "../../../daemon/src/__tests__/helpers/spawn-real-daemon.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const BIN = resolve(here, "../../dist/bin/cello-mcp.js");
 
-/** Spawn the built shim against a CELLO_DIR with no daemon, and collect what the operator sees. */
-async function runWithNoDaemon(): Promise<{ code: number | null; stderr: string }> {
-  // A fresh empty dir — no daemon.sock, exactly the state right after a plugin install.
+interface Shim {
+  proc: ChildProcessWithoutNullStreams;
+  /** Send one JSON-RPC request and wait for the response with that id. */
+  rpc(method: string, params: Record<string, unknown>, id: number): Promise<Record<string, unknown>>;
+  stderr(): string;
+  stop(): void;
+}
+
+/** Start the built shim against a CELLO_DIR with NO daemon — the state right after a plugin install. */
+function startWithNoDaemon(): { shim: Shim; celloDir: string; cleanup: () => void } {
   const celloDir = mkdtempSync(resolve(tmpdir(), "cello-stranded-"));
-  try {
-    return await new Promise((resolvePromise, reject) => {
-      const proc = spawn(process.execPath, [BIN], {
-        env: { ...process.env, CELLO_DIR: celloDir },
-        stdio: ["pipe", "pipe", "pipe"],
+  const proc = spawn(process.execPath, [BIN], {
+    env: { ...process.env, CELLO_DIR: celloDir },
+    stdio: ["pipe", "pipe", "pipe"],
+  }) as ChildProcessWithoutNullStreams;
+
+  let stderrBuf = "";
+  proc.stderr.on("data", (c: Buffer) => { stderrBuf += c.toString(); });
+
+  let stdoutBuf = "";
+  const waiters = new Map<number, (v: Record<string, unknown>) => void>();
+  proc.stdout.on("data", (c: Buffer) => {
+    stdoutBuf += c.toString();
+    // MCP stdio framing is one JSON object per line.
+    for (;;) {
+      const nl = stdoutBuf.indexOf("\n");
+      if (nl < 0) break;
+      const line = stdoutBuf.slice(0, nl).trim();
+      stdoutBuf = stdoutBuf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const frame = JSON.parse(line) as Record<string, unknown>;
+        const w = waiters.get(frame.id as number);
+        if (w) { waiters.delete(frame.id as number); w(frame); }
+      } catch { /* not a complete frame; the shim also tees diagnostics to stderr, not stdout */ }
+    }
+  });
+
+  const shim: Shim = {
+    proc,
+    rpc(method, params, id) {
+      return new Promise((res, rej) => {
+        const timer = setTimeout(() => rej(new Error(`no MCP response to ${method} within 10s`)), 10_000);
+        waiters.set(id, (frame) => { clearTimeout(timer); res(frame); });
+        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
       });
-      let stderr = "";
-      proc.stderr.on("data", (c: Buffer) => { stderr += c.toString(); });
-      proc.on("error", reject);
-      const timer = setTimeout(() => {
-        proc.kill("SIGKILL");
-        reject(new Error("cello-mcp did not exit within 15s with no daemon running"));
-      }, 15_000);
-      proc.on("exit", (code) => {
-        clearTimeout(timer);
-        resolvePromise({ code, stderr });
-      });
-    });
-  } finally {
-    rmSync(celloDir, { recursive: true, force: true });
-  }
+    },
+    stderr: () => stderrBuf,
+    stop: () => proc.kill("SIGKILL"),
+  };
+
+  return {
+    shim,
+    celloDir,
+    cleanup: () => {
+      proc.kill("SIGKILL");
+      rmSync(celloDir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Drive the MCP handshake so the server will answer tool calls. */
+async function handshake(shim: Shim): Promise<void> {
+  await shim.rpc("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "stranded-shim-test", version: "0" },
+  }, 1);
+  shim.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 }
 
 describe("launch triage item 5 — a plugin install must not dead-end at a missing daemon", () => {
-  it("names the install that provides `cello`, not just `cello login`", async () => {
-    const { code, stderr } = await runWithNoDaemon();
+  it("THE FIX: the shim stays up and serves its tools with no daemon, instead of exiting", async () => {
+    const { shim, cleanup } = startWithNoDaemon();
+    try {
+      await handshake(shim);
+      const listed = await shim.rpc("tools/list", {}, 2) as {
+        result?: { tools?: Array<{ name: string }> };
+      };
+      const names = (listed.result?.tools ?? []).map((t) => t.name);
 
-    // It still fails — that part is correct. The shim cannot proxy to a daemon that is not there.
-    expect(code).toBe(1);
+      // The regression in one assertion. When the shim exited, this list did not exist at all —
+      // the server showed as failed and there was nothing to call.
+      expect(names.length).toBeGreaterThan(0);
+      expect(names).toContain("cello_status");
 
-    // THE FIX: the recovery must start with the package that actually provides the binary.
-    // Without this line the user is told to run a command they have no way to have.
-    //
-    // This asserted BOTH packages until 2026-09-08, on the reasoning that someone reading this is
-    // as likely to be on the manual `claude mcp add` route. Superseded by measurement: on a
-    // genuinely wiped machine the npx cache was deleted and repopulated itself at first launch with
-    // no global `connect` present, so under the plugin route npx fetches the shim on its own. And
-    // this message can only be read BY the plugin route — it is the plugin's shim that printed it.
-    // Naming a package the reader already has spends the only attention they will give this on a
-    // no-op, in the one message they read while something is visibly broken.
-    expect(stderr).toContain("npm i -g --prefer-online @cello-protocol/cli@latest");
-    expect(stderr).not.toContain("@cello-protocol/connect");
+      // And it is still alive to answer them.
+      expect(shim.proc.exitCode).toBeNull();
+    } finally {
+      cleanup();
+    }
+  }, 30_000);
 
-    // --prefer-online and @latest are load-bearing and their absence is invisible: npm may serve a
-    // cached tarball, the install reports success, and the operator is silently on an old client —
-    // surfacing later as a protocol mismatch that looks nothing like an install problem.
-    expect(stderr).toContain("--prefer-online");
+  it("every tool answers `daemon_not_running` and carries the whole recovery", async () => {
+    const { shim, cleanup } = startWithNoDaemon();
+    try {
+      await handshake(shim);
+      const called = await shim.rpc("tools/call", { name: "cello_status", arguments: {} }, 2) as {
+        result?: { content?: Array<{ text?: string }> };
+      };
+      const text = called.result?.content?.[0]?.text ?? "";
+      const payload = JSON.parse(text) as { ok?: boolean; reason?: string; guidance?: string };
 
-    // And then the command that starts the daemon.
-    expect(stderr).toContain("cello login");
-  }, 20_000);
+      // This is what the `setup` skill has always promised. It is now true of the binary.
+      expect(payload.ok).toBe(false);
+      expect(payload.reason).toBe("daemon_not_running");
 
-  it("points at the setup skill, so a first-time user has a next step beyond the daemon", async () => {
-    const { stderr } = await runWithNoDaemon();
+      const guidance = payload.guidance ?? "";
 
-    // Starting the daemon is not the whole job — they still have no agent and no registration.
-    // The `setup` skill is the only thing that covers that end to end, and nothing pointed at it.
-    expect(stderr).toContain("setup");
+      // The recovery must name the package that actually provides `cello`. Saying only
+      // "run cello login" names a binary a plugin install does not provide — a dead end
+      // pointing at a dead end.
+      expect(guidance).toContain("npm i -g --prefer-online @cello-protocol/cli@latest");
+      expect(guidance).toContain("cello login");
 
-    // The recovery after installing is a RECONNECT, not a restart (Andre, 2026-08-09). Reaching
-    // this message means the plugin is already installed — the shim is running because the plugin
-    // launched it — so asking for a Claude Code restart costs a session for no reason.
-    expect(stderr).toContain("/mcp");
-    expect(stderr).toMatch(/Reconnect/i);
-  }, 20_000);
+      // NOT connect: under the plugin route npx fetches the shim itself, verified on a wiped
+      // machine whose npx cache repopulated with no global connect present. This message can only
+      // be read BY the plugin route — the plugin's shim is what produced it.
+      expect(guidance).not.toContain("@cello-protocol/connect");
 
-  it("teeth: `cello login` never appears as the first thing asked of the user", async () => {
-    const { stderr } = await runWithNoDaemon();
+      // --prefer-online and @latest are load-bearing and their absence is INVISIBLE: npm may serve
+      // a cached tarball, the install reports success, and the operator is silently on an old
+      // client — surfacing later as a protocol mismatch that looks nothing like an install problem.
+      expect(guidance).toContain("--prefer-online");
 
-    // The exact regression being pinned. If someone later trims this message back to the one-liner,
-    // `cello login` becomes the first instruction again and the dead end returns. The install must
-    // come first in the text a user reads top to bottom.
-    const installAt = stderr.indexOf("npm i -g --prefer-online @cello-protocol/cli@latest");
-    const loginAt = stderr.indexOf("cello login");
-    expect(installAt).toBeGreaterThanOrEqual(0);
-    expect(loginAt).toBeGreaterThan(installAt);
-  }, 20_000);
+      // Starting the daemon is not the whole job — they still have no agent and no registration.
+      expect(guidance).toContain("setup");
+
+      // Order: the install must come before the login in the text read top to bottom.
+      expect(guidance.indexOf("npm i -g")).toBeLessThan(guidance.indexOf("cello login"));
+    } finally {
+      cleanup();
+    }
+  }, 30_000);
+
+  it("tells the reader the shim re-dials, so starting the daemon is enough on its own", async () => {
+    const { shim, cleanup } = startWithNoDaemon();
+    try {
+      await handshake(shim);
+      const called = await shim.rpc("tools/call", { name: "cello_status", arguments: {} }, 2) as {
+        result?: { content?: Array<{ text?: string }> };
+      };
+      const guidance = (JSON.parse(called.result?.content?.[0]?.text ?? "{}") as { guidance?: string }).guidance ?? "";
+
+      // The compounding papercut: the first failure was opaque AND its recovery was unadvertised.
+      // Nothing told anyone that after `cello login` the tools were still dead until they ran
+      // /mcp → Reconnect. The shim now retries on the next tool call, so the honest instruction is
+      // "just call a tool again" — and Reconnect survives only as the manual override.
+      expect(guidance).toMatch(/re-dials/i);
+      expect(guidance).toMatch(/Reconnect/i);
+    } finally {
+      cleanup();
+    }
+  }, 30_000);
+
+  it("PROOF, not prose: starting the daemon is genuinely enough — the next tool call connects", async () => {
+    /**
+     * The three tests above assert the guidance SAYS the shim re-dials. That is a claim about text,
+     * and a claim about text is exactly the kind of green test that proves less than it looks: if
+     * the re-dial did not work, all three would still pass while a real operator sat with dead
+     * tools after doing everything they were told.
+     *
+     * So this one runs the sequence: shim up with no daemon → tool refused → a REAL daemon starts
+     * into the same CELLO_DIR → the same tool call now reaches it, with no /mcp Reconnect and no
+     * restart in between.
+     */
+    const { shim, celloDir, cleanup } = startWithNoDaemon();
+    let daemon: SpawnedDaemon | undefined;
+    try {
+      await handshake(shim);
+
+      const before = await shim.rpc("tools/call", { name: "cello_status", arguments: {} }, 2) as {
+        result?: { content?: Array<{ text?: string }> };
+      };
+      const beforePayload = JSON.parse(before.result?.content?.[0]?.text ?? "{}") as { reason?: string };
+      expect(beforePayload.reason).toBe("daemon_not_running");
+
+      // The one thing the guidance asks the operator to do.
+      daemon = spawnRealDaemon(celloDir);
+      await daemon.waitForEvent("daemon.started");
+
+      const after = await shim.rpc("tools/call", { name: "cello_status", arguments: {} }, 3) as {
+        result?: { content?: Array<{ text?: string }> };
+      };
+      const afterPayload = JSON.parse(after.result?.content?.[0]?.text ?? "{}") as { reason?: string };
+
+      // Reached the daemon. Whatever cello_status reports about an empty install, the ONE answer
+      // it must no longer give is "there is no daemon".
+      expect(afterPayload.reason).not.toBe("daemon_not_running");
+    } finally {
+      daemon?.kill("SIGKILL");
+      cleanup();
+    }
+  }, 60_000);
+
+  it("the recovery is ALSO on stderr, for an operator reading the log rather than the agent", async () => {
+    const { shim, cleanup } = startWithNoDaemon();
+    try {
+      await handshake(shim);
+      await shim.rpc("tools/list", {}, 2);
+      expect(shim.stderr()).toContain("npm i -g --prefer-online @cello-protocol/cli@latest");
+    } finally {
+      cleanup();
+    }
+  }, 30_000);
 });
