@@ -12,6 +12,7 @@ import type { LoadedAgent } from "./agent-loader.js";
 import type { NotificationDispatcher } from "./notification-dispatcher.js";
 import type { ReconcileScheduler } from "./document-reconcile-scheduler.js";
 import { createDeliveryOpenRegistry } from "./delivery-open-registry.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface SessionNotifyDeps {
   logger: Logger;
@@ -139,7 +140,7 @@ export function createSessionNotify(deps: SessionNotifyDeps) {
           .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
           .catch((err: unknown) => {
             logger.warn("document.reconcile.reachable_trigger_failed", {
-              agentName, reason: err instanceof Error ? err.message : String(err),
+              agentName, reason: extractErrorMessage(err),
             });
           });
       }

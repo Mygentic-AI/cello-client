@@ -1,6 +1,92 @@
 import tsPlugin from "@typescript-eslint/eslint-plugin";
 import tsParser from "@typescript-eslint/parser";
 
+// DOD-SENDRAW-1 — see the long comment at the rule's original home below. Hoisted to a const only
+// so the packages that do NOT get the error-formatting rule can still be given these three.
+const SENDRAW_SELECTORS = [
+  {
+    selector: 'ExpressionStatement > AwaitExpression > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
+    message:
+      "sendRaw never throws — it resolves {ok:false, reason}. Discarding the result hides " +
+      "every send failure. Branch on it: const res = await ...sendRaw(...); if (!res.ok) " +
+      "log the failure with res.reason. (DOD-SENDRAW-1)",
+  },
+  {
+    selector: 'ExpressionStatement > UnaryExpression[operator="void"] > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
+    message:
+      "void does not excuse ignoring sendRaw's result — it resolves {ok:false, reason} " +
+      "instead of throwing, so this hides every send failure. Branch on the result. " +
+      "(DOD-SENDRAW-1)",
+  },
+  {
+    selector: 'ExpressionStatement > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
+    message:
+      "Floating sendRaw call — the result ({ok:false, reason} on failure; it never throws) " +
+      "is discarded AND unawaited. Await it and branch on the result. (DOD-SENDRAW-1)",
+  },
+];
+
+/**
+ * DOD-M15-ERRFORMAT-1 — **`String(err)` ON A LIBP2P ERROR PRINTS `[object Object]`.**
+ *
+ * ─── Why this is a rule and not a code review note ───────────────────────────────────────────
+ *
+ * `err instanceof Error ? err.message : String(err)` looks like careful defensive code and is the
+ * opposite. libp2p and every cross-package throw in this repo lands here NOT `instanceof Error` —
+ * the realm boundary breaks the check — so the ternary takes its `String(err)` branch and writes
+ * the literal text `[object Object]` into the log. The cause never reaches the operator.
+ *
+ * **This has been discovered and written up at least seven separate times**, in
+ * `session-lifecycle.ts`, `session-content-send.ts`, `ipc-server.ts`, `boot-agents.ts`,
+ * `content-park-client.ts`, `content-park.ts` and `standing-receivers.ts` — two of those comments
+ * count the damage themselves ("the reason 100+ real failures were undiagnosable", "102 of
+ * these"). Each time it was fixed at the one site being looked at, and 327 others stayed. On
+ * 2026-09-08 it hid `DOD-M15-KEYANNOUNCE-LOOP-1` for eleven hours behind 412,274 identical
+ * `error: "[object Object]"` lines.
+ *
+ * A defect that returns seven times is not a mistake anyone is going to stop making. This is the
+ * stop. Use `extractErrorMessage(err)` from `core/daemon/src/error-message.ts`.
+ *
+ * ─── What it does NOT catch, deliberately ────────────────────────────────────────────────────
+ *
+ * `err instanceof Error ? err : new Error(String(err))` — coercing an unknown throw INTO an Error
+ * for `stream.abort()` or a re-`throw` — is correct and stays legal. So does
+ * `err instanceof Error ? err.stack : undefined`. Both selectors below key on the message-
+ * extraction shape specifically: a `.message` consequent, or a `String()` alternate.
+ */
+/**
+ * ⚠️ **TWELVE PER-FILE `max-lines` RATCHETS BELOW MOVED UP BY EXACTLY ONE ON 2026-09-08, and the
+ * rule is that they only ever shrink.** This is the exception and it is bounded: adding this rule
+ * required `import { extractErrorMessage } from "./error-message.js";` in 24 daemon files, twelve
+ * of which sit on a pinned ratchet. +1 line each, no other growth.
+ *
+ * It is recorded here rather than beside each number because the reasoning is one decision, not
+ * twelve: a ratchet exists to stop a file REGROWING through feature creep, and refusing to move it
+ * for a lint-mandated import would mean a correctness rule can never be applied to a ratcheted
+ * file — the ratchet blocking the hygiene it exists to serve. Nothing else was allowed through.
+ * `session-content-send.ts` went the other way in the same pass: fourteen lines reimplementing
+ * `extractErrorMessage` inline became one, so its ratchet SHRANK.
+ *
+ * If you are reading this while adding a feature: this is not precedent. Split the file.
+ */
+const ERROR_FORMAT_SELECTORS = [
+  {
+    selector: 'ConditionalExpression[test.operator="instanceof"][test.right.name="Error"][alternate.callee.name="String"]',
+    message:
+      "String(err) prints \"[object Object]\" for every libp2p / cross-package throw — they are " +
+      "not `instanceof Error` across the realm boundary, so this branch is the one that runs " +
+      "when it matters. Use extractErrorMessage(err) from ./error-message.js. " +
+      "(DOD-M15-ERRFORMAT-1)",
+  },
+  {
+    selector: 'ConditionalExpression[test.operator="instanceof"][test.right.name="Error"][consequent.property.name="message"]',
+    message:
+      "`err instanceof Error` is false for libp2p / cross-package throws, so the message you " +
+      "meant to log is the one you will not get. Use extractErrorMessage(err) from " +
+      "./error-message.js — it reads `.message` off a non-Error too. (DOD-M15-ERRFORMAT-1)",
+  },
+];
+
 export default [
   {
     files: ["core/*/src/**/*.ts"],
@@ -67,25 +153,42 @@ export default [
       // Three selectors close the three discard shapes (review F1): awaited-and-discarded,
       // void-wrapped, and bare-floating. sendSignalingFrame is the same contract one layer up
       // (registration-context wraps sendRaw), so it is covered by the same name regex.
-      "no-restricted-syntax": ["error", {
-        selector: 'ExpressionStatement > AwaitExpression > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
-        message:
-          "sendRaw never throws — it resolves {ok:false, reason}. Discarding the result hides " +
-          "every send failure. Branch on it: const res = await ...sendRaw(...); if (!res.ok) " +
-          "log the failure with res.reason. (DOD-SENDRAW-1)",
-      }, {
-        selector: 'ExpressionStatement > UnaryExpression[operator="void"] > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
-        message:
-          "void does not excuse ignoring sendRaw's result — it resolves {ok:false, reason} " +
-          "instead of throwing, so this hides every send failure. Branch on the result. " +
-          "(DOD-SENDRAW-1)",
-      }, {
-        selector: 'ExpressionStatement > CallExpression[callee.property.name=/^(sendRaw|sendSignalingFrame)$/]',
-        message:
-          "Floating sendRaw call — the result ({ok:false, reason} on failure; it never throws) " +
-          "is discarded AND unawaited. Await it and branch on the result. (DOD-SENDRAW-1)",
-      }],
+      "no-restricted-syntax": ["error", ...SENDRAW_SELECTORS, ...ERROR_FORMAT_SELECTORS],
     },
+  },
+  {
+    /**
+     * KNOWN DEBT — the packages `DOD-M15-ERRFORMAT-1` has NOT been paid off in yet. This list only
+     * ever shrinks; when it is empty, delete this block and the rule covers the whole client.
+     *
+     *   core/cli               24 sites
+     *   core/gateway           15
+     *   core/transport         10
+     *   core/adapter-claude-code 6
+     *   core/protocol-types     2
+     *   core/crypto             1
+     *
+     * ⚠️ THE BLOCKER IS REACH, NOT WILL. `extractErrorMessage` lives in `core/daemon/src`, and
+     * nothing outside the daemon can import it: `crypto` is the only package every other one
+     * already depends on, and an error-formatting helper does not belong in the crypto package.
+     * `core/gateway` imports no sibling package at all. Paying this off means choosing a shared
+     * home first — that is the unit of work, and it is not a mechanical edit like the daemon's 269
+     * sites were.
+     *
+     * ⚠️ AND THE SELECTORS ARE RE-STATED, NOT SWITCHED OFF. Flat config is last-wins PER RULE, so
+     * naming `no-restricted-syntax` here replaces the whole array. Without `SENDRAW_SELECTORS`
+     * below, six packages would silently lose the sendRaw guard too — a rule deleted by accident
+     * while adding one.
+     */
+    files: [
+      "core/cli/src/**/*.ts",
+      "core/gateway/src/**/*.ts",
+      "core/transport/src/**/*.ts",
+      "core/adapter-claude-code/src/**/*.ts",
+      "core/protocol-types/src/**/*.ts",
+      "core/crypto/src/**/*.ts",
+    ],
+    rules: { "no-restricted-syntax": ["error", ...SENDRAW_SELECTORS] },
   },
   {
     // KNOWN DEBT — the only production file still importing node:sqlite. Do not add to this list;
@@ -154,7 +257,7 @@ export default [
     //  EXACT, never with slack: a ratchet with give is a
     // line that can come back.
     files: ["core/daemon/src/daemon.ts"],
-    rules: { "max-lines": ["error", { max: 1329, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1330, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-handle.ts"],
@@ -170,7 +273,7 @@ export default [
   },
   {
     files: ["core/daemon/src/session-views.ts"],
-    rules: { "max-lines": ["error", { max: 242, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 243, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/start-agent.ts"],
@@ -186,7 +289,7 @@ export default [
   },
   {
     files: ["core/daemon/src/who-resolver.ts"],
-    rules: { "max-lines": ["error", { max: 56, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 57, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/daemon-status-report.ts"],
@@ -194,11 +297,11 @@ export default [
   },
   {
     files: ["core/daemon/src/ipc-surface.ts"],
-    rules: { "max-lines": ["error", { max: 133, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 134, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/document-surface.ts"],
-    rules: { "max-lines": ["error", { max: 175, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 176, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/unresolved-nodes-report.ts"],
@@ -214,15 +317,15 @@ export default [
   },
   {
     files: ["core/daemon/src/session-notify.ts"],
-    rules: { "max-lines": ["error", { max: 170, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 171, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-sweeps.ts"],
-    rules: { "max-lines": ["error", { max: 71, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 72, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-parked-content.ts"],
-    rules: { "max-lines": ["error", { max: 555, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 556, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/boot-connection-state.ts"],
@@ -234,11 +337,11 @@ export default [
   },
   {
     files: ["core/daemon/src/boot-core.ts"],
-    rules: { "max-lines": ["error", { max: 332, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 333, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/attendance-wiring.ts"],
-    rules: { "max-lines": ["error", { max: 478, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 479, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/daemon/src/signaling-wiring.ts"],
@@ -266,7 +369,7 @@ export default [
   },
   {
     files: ["core/daemon/src/signal-handlers.ts"],
-    rules: { "max-lines": ["error", { max: 1087, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1088, skipBlankLines: false, skipComments: false }] },
   },
   {
     /**
@@ -299,7 +402,7 @@ export default [
   },
   {
     files: ["core/daemon/src/session-seal.ts"],
-    rules: { "max-lines": ["error", { max: 1111, skipBlankLines: false, skipComments: false }] },
+    rules: { "max-lines": ["error", { max: 1112, skipBlankLines: false, skipComments: false }] },
   },
   {
     files: ["core/*/src/__tests__/**/*.ts"],

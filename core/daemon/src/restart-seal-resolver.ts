@@ -26,6 +26,7 @@
  * orphans must not answer a restart with hundreds of simultaneous ceremonies.
  */
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** A session our own stop left behind. */
 export interface RestartOrphan {
@@ -241,7 +242,7 @@ export class RestartSealResolver {
       // ABSENT IS NOT FINE. If we cannot read the list, say so — silence here reads exactly like
       // "there was nothing to resolve", which is the state this unit exists to end.
       this.#deps.logger.error("session.restart_seal.enumerate.failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "sessions the last shutdown orphaned will stay interrupted and unsealed",
       });
       return;
@@ -351,7 +352,7 @@ export class RestartSealResolver {
       attempt.catch(() => { /* handled below via the race */ });
       outcome = await raced;
     } catch (err: unknown) {
-      outcome = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+      outcome = { ok: false, reason: extractErrorMessage(err) };
     } finally {
       (attemptTimer as ScheduledTask | null)?.cancel();
       this.#inFlight = null;
@@ -402,7 +403,7 @@ export class RestartSealResolver {
       catch (err: unknown) {
         this.#deps.logger.warn("session.restart_seal.mark_gave_up.failed", {
           sessionId: item.orphan.sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           impact: "this session will be re-attempted on every future boot",
         });
       }

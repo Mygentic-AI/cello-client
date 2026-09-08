@@ -15,6 +15,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import { DbIdentityStore } from "./db-identity-store.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface LoadedAgent {
   name: string;
@@ -51,7 +52,7 @@ export async function loadAgents(db: DaemonDatabase, logger: Logger): Promise<Ag
       const pubkey = Buffer.from(await keyProvider.getPublicKey()).toString("hex");
       loaded.push({ name: row.agentName, pubkey, keyProvider });
     } catch (err: unknown) {
-      const error = err instanceof Error ? err.message : String(err);
+      const error = extractErrorMessage(err);
       logger.error("agent.load.failed", { agentName: row.agentName, error });
       failed.push({ name: row.agentName, error });
     }

@@ -9,6 +9,7 @@
 import { whoLabel } from "./who-label.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface WhoLabelDeps {
   logger: Logger;
@@ -29,7 +30,7 @@ export function createWhoResolver(deps: WhoLabelDeps) {
     try {
       localMoniker = sessionNodeManager.getContactMoniker(agentName, pubkeyHex);
     } catch (err: unknown) {
-      logger.warn("moniker.local.read_failed", { agentName, pubkey: pubkeyHex, reason: err instanceof Error ? err.message : String(err) });
+      logger.warn("moniker.local.read_failed", { agentName, pubkey: pubkeyHex, reason: extractErrorMessage(err) });
     }
     // DOD-MONIKER-6: read only the box written FOR this agent — never a co-resident agent's.
     const resolved = whoLabel({ localMoniker, offeredMoniker: getOfferedMoniker(agentName, sessionIdHex), pubkeyHex });

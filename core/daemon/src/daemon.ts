@@ -112,6 +112,7 @@ export { ProductionSessionNodeFactory } from "./session-node-factory.js";
 // this re-export is what kept the test that imports it from here working.
 export { INBOUND_SESSION_TTL_MS } from "./inbound-sessions.js";
 import type { DaemonHandle } from "./daemon-handle.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * DOD-SINGLE-DAEMON-1: take the singleton lock, and make sure it is released if startup fails
@@ -693,7 +694,7 @@ async function startDaemonHoldingLock(
         .onReachable(ownerAgentId, counterpartyPubkey.toLowerCase())
         .catch((err: unknown) => {
           logger.warn("document.reconcile.reachable_trigger_failed", {
-            agentName, reason: err instanceof Error ? err.message : String(err),
+            agentName, reason: extractErrorMessage(err),
           });
         });
     },
@@ -1172,7 +1173,7 @@ async function startDaemonHoldingLock(
       if (config.onShutdown) {
         await config.onShutdown().catch((err: unknown) => {
           logger.error("daemon.shutdown.hook_failed", {
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
           });
         });
       }

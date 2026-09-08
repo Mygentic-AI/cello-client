@@ -43,6 +43,7 @@ import type { DocumentGate } from "./document-gate.js";
 import type { DocumentRejections } from "./document-rejection.js";
 import { SEMANTIC_RULE_ID } from "./document-screen.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export type InboundResult =
   | { ok: true; admitted: true; envelopeHash: string; duplicate: boolean }
@@ -194,7 +195,7 @@ export class DocumentInbound {
     try {
       env = decodeDocumentUpdateEnvelope(wire);
     } catch (err: unknown) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = extractErrorMessage(err);
       this.#d.logger.warn("document.inbound.malformed", { detail, correlationId });
       // ONE reason code, with the upstream message in the detail. Two kinds of failure arrive here:
       // our own decoder's named refusals ("document_envelope_missing_field: …"), and CBOR/lib0
@@ -449,7 +450,7 @@ export class DocumentInbound {
     try {
       duplicate = verifyDocumentChainLink(env, { head, known }).duplicate;
     } catch (err: unknown) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = extractErrorMessage(err);
       this.#d.logger.warn("document.inbound.chain_refused", {
         documentId: env.document_id,
         correlationId,

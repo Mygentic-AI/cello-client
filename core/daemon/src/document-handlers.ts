@@ -95,6 +95,7 @@ import { classifyRemovals } from "./document-write-guard.js";
 import { normalizeWatchPaths } from "./document-watch.js";
 import { profileViolation } from "./document-profile.js";
 import { screenText, SCREEN_RULE_ID, SCREEN_GUIDANCE } from "./document-screen.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Document types the notification/diff path understands. Anything else is stored, not diffed. */
 const DEFAULT_DOCUMENT_TYPE = "markdown";
@@ -231,7 +232,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       const reason = err instanceof Error && "reason" in err
         ? String((err as { reason: unknown }).reason)
         : "document_file_error";
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = extractErrorMessage(err);
       logger.warn("document.file.materialize_failed", { documentId, reason, detail });
       return { path: null, reason, detail };
     }
@@ -556,7 +557,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       logger.warn("document.proposal.ack_threw", {
         documentId,
         accepted,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }
@@ -896,7 +897,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
           holderAgentId: holder,
           verb: args.verb,
           reason: "amendment_send_threw",
-          detail: err instanceof Error ? err.message : String(err),
+          detail: extractErrorMessage(err),
         });
       } finally {
         // EVERY exit path, including the throw above — a timer left armed would log a slow send for a
@@ -947,7 +948,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
     } catch (err: unknown) {
       return {
         ok: false,
-        reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+        reason: `document_chain_undecodable: ${extractErrorMessage(err)}`,
       };
     }
     const derived = deriveDocumentState(genesisArr, chain, documentGovernancePolicy, layer.verifySignature);
@@ -1446,7 +1447,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         logger.warn("document.amendment.holder_unnotified", {
           documentId, holderAgentId: holder, verb: "remove-subject",
           reason: "amendment_send_threw",
-          detail: err instanceof Error ? err.message : String(err),
+          detail: extractErrorMessage(err),
         });
       }
     }
@@ -1614,7 +1615,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
         chain = layer.amendments.chain(who.ownerAgentId, doc.documentId);
       } catch (err: unknown) {
         return underivable(
-          `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+          `document_chain_undecodable: ${extractErrorMessage(err)}`,
         );
       }
       const derived = deriveDocumentState(
@@ -1747,7 +1748,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return {
         ok: false,
         reason: "watch_path_invalid",
-        guidance: err instanceof Error ? err.message : String(err),
+        guidance: extractErrorMessage(err),
       };
     }
     layer.notifications.setWatches(who.ownerAgentId, documentId, paths);
@@ -2334,7 +2335,7 @@ export function registerDocumentHandlers(deps: DocumentHandlerDeps): void {
       return {
         ok: false,
         reason,
-        guidance: err instanceof Error ? err.message : String(err),
+        guidance: extractErrorMessage(err),
       };
     }
     if (update === null) {

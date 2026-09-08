@@ -23,6 +23,7 @@
 import { describe, it, expect } from "vitest";
 import { randomBytes } from "node:crypto";
 import * as Y from "yjs";
+import { extractErrorMessage } from "../error-message.js";
 
 /** The planned pre-parse cap: bytes are refused on LENGTH before Yjs is invoked at all. */
 const PRE_PARSE_SIZE_CAP_BYTES = 1024 * 1024; // 1 MiB
@@ -46,7 +47,7 @@ function guardedApply(doc: Y.Doc, update: Uint8Array): { ok: true } | { ok: fals
     Y.applyUpdate(doc, update);
     return { ok: true };
   } catch (err: unknown) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    return { ok: false, reason: extractErrorMessage(err) };
   }
 }
 

@@ -1526,7 +1526,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
         } catch (err: unknown) {
           this.#logger.error("session.interrupt.db.write.failed", {
             sessionId: row.session_id,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
           });
         }
       }
@@ -1917,7 +1917,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
         this.#logger.warn("session.content.held.durable_count.failed", {
           agentName, sessionId,
           impact: "cannot say whether the held frames are durable — reported as unknown, NOT as lost",
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
       const lost = durable === null ? null : strandedHolds.size - durable;
@@ -2018,7 +2018,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       } catch (err: unknown) {
         this.#logger.warn("session.relay_client.close_failed", {
           relayClientKey: key,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
           impact: "one cached relay client did not close cleanly on shutdown; the rest are still released",
         });
       }
@@ -2086,7 +2086,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       } catch (err: unknown) {
         this.#logger.error("session.interrupt.db.write.failed", {
           sessionId: "__all__",
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     }
@@ -2110,7 +2110,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
           this.#logger.error("session.node.stop.failed", {
             sessionId: entry.sessionId,
             agentName: entry.agentName,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             correlationId: entry.correlationId,
           });
         }),
@@ -2153,7 +2153,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
           this.#logger.error("session.node.stop.failed", {
             sessionId: "standing_receiver_shutdown",
             agentName: `${STANDING_RECEIVER_AGENT_NAME}:${agentName}`,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             correlationId: "n/a",
           });
         }
@@ -2221,7 +2221,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
         this.#logger.warn("session.revival_bound.close.failed", {
           agentName: s.agentName,
           sessionId: s.sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     }
@@ -2608,7 +2608,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
         this.#logger.error("session.tree.persist.failed", {
           sessionId,
           leafIndex,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           correlationId,
         });
       }
@@ -2719,7 +2719,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       this.#onAwaitingTtf?.(agentName, sessionId, hashHex, entry.content, entry.structure1Cbor, entry.structure2Cbor, entry.contentHashAlg, entry.structure1Signature, entry.leafKind);
     } catch (err: unknown) {
       this.#logger.error("content.park.backstop.failed", {
-        sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
+        sessionId, contentHash: hashHex, error: extractErrorMessage(err),
       });
     }
     // 2b: delivered to the wire but never confirmed `persisted` — deposit it to the relay
@@ -3353,7 +3353,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
     } catch (err) {
       this.#logger.warn("session.standing_receiver.teardown.failed", {
         agentName,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }

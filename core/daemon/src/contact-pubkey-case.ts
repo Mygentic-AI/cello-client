@@ -32,6 +32,7 @@
  */
 
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Minimal surface: what these two functions need from a SQLCipher handle. */
 interface MigrationDb {
@@ -151,7 +152,7 @@ export function foldContactPubkeyCase(db: MigrationDb, logger: Logger): void {
     // SQLite may have already aborted the transaction; a failing ROLLBACK must not mask the cause.
     try { db.exec("ROLLBACK"); } catch { /* the failing statement may have aborted it already */ }
     logger.error("contacts.pubkey.case.fold.failed", {
-      reason: err instanceof Error ? err.message : String(err),
+      reason: extractErrorMessage(err),
       impact:
         "contacts stored under a mixed-case public key stay split across two rows, so a tier, block " +
         "or away message set against one spelling does not apply to the other. Reads are still " +

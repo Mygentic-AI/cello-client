@@ -44,6 +44,7 @@
 import * as Y from "yjs";
 import type { DocumentEngine } from "./document-engine.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** The one accepted update encoding (§16.7-8 pins it in the protocol types). */
 export const UPDATE_ENCODING_V1 = "yjs-v1";
@@ -187,7 +188,7 @@ export class DocumentGate {
       return this.#quarantine(context, update, {
         admit: false,
         reason: "document_gate_rule_failed",
-        detail: err instanceof Error ? err.message : String(err),
+        detail: extractErrorMessage(err),
       });
     }
   }
@@ -268,7 +269,7 @@ export class DocumentGate {
       return this.#quarantine(context, update, {
         admit: false,
         reason: "document_accepted_state_unreadable",
-        detail: err instanceof Error ? err.message : String(err),
+        detail: extractErrorMessage(err),
       });
     }
 
@@ -283,7 +284,7 @@ export class DocumentGate {
       return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_malformed",
-        detail: err instanceof Error ? err.message : String(err),
+        detail: extractErrorMessage(err),
       });
     }
 
@@ -323,7 +324,7 @@ export class DocumentGate {
       return this.#quarantine(context, update, {
         admit: false,
         reason: "document_update_malformed",
-        detail: err instanceof Error ? err.message : String(err),
+        detail: extractErrorMessage(err),
       });
     }
     const reEncoded = Y.encodeStateAsUpdate(shadow);

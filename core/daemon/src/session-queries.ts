@@ -293,7 +293,7 @@ export class SessionQueries {
       this.#ctx.logger.error("session.content.held.persist.failed", {
         agentName, sessionId, canonicalSeq, contentHash: contentHashHex, correlationId,
         impact: "this frame is held IN MEMORY ONLY and will be destroyed if the daemon restarts",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }
@@ -373,7 +373,7 @@ export class SessionQueries {
       return stamped;
     } catch (err: unknown) {
       this.#ctx.logger.error("session.revival_bound.clock.stamp.failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "sessions with no interruption timestamp cannot be evaluated and stay open",
       });
       return 0;
@@ -445,7 +445,7 @@ export class SessionQueries {
       this.#ctx.logger.error("content.annex.write.failed", {
         agentName, sessionId, contentHash: contentHashHex,
         impact: "content NOT annexed — the relay copy must be kept, or the message is lost",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }
@@ -580,7 +580,7 @@ export class SessionQueries {
       ).run(agentId, agentId);
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.refused.record.failed", {
-        agentName, sessionId, error: err instanceof Error ? err.message : String(err),
+        agentName, sessionId, error: extractErrorMessage(err),
       });
     }
   }
@@ -689,7 +689,7 @@ export class SessionQueries {
       // the record that outlives the session with no sender and no explanation.
       this.#ctx.logger.warn("session.own_pubkey.unresolved", {
         agentName,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "this agent's own held content will be annexed without a sender",
       });
       return null;
@@ -729,7 +729,7 @@ export class SessionQueries {
     } catch (err: unknown) {
       this.#ctx.logger.error("session.counterparty.abandoned.write.failed", {
         agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "this side will go on trying to reach a counterparty that has hung up",
       });
       return false;
@@ -849,7 +849,7 @@ export class SessionQueries {
       this.#ctx.logger.error("session.content.held.delete.failed", {
         agentName, sessionId, canonicalSeq,
         impact: "the released frame's durable row survives and will be re-appended on the next boot",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }

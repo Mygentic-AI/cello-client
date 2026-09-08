@@ -13,6 +13,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Per-session cap. On overflow the OLDEST entry is evicted. */
 export const RETRY_QUEUE_CAP = 1000;
@@ -182,7 +183,7 @@ export class RetryQueue {
       try {
         this.#db.exec(`ALTER TABLE retry_queue ADD COLUMN ${col.name} ${col.type}`);
       } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = extractErrorMessage(err);
         if (!/duplicate column name/i.test(msg)) throw err;
       }
     }
@@ -336,7 +337,7 @@ export class RetryQueue {
         this.#logger.error("message.retry.persist.failed", {
           sessionId,
           nonce: oldest.nonceHex,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
       // Log eviction BEFORE the new entry is logged.
@@ -376,7 +377,7 @@ export class RetryQueue {
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
         nonce: nonceHex,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       // Message stays in memory only — it is not durable across a restart.
     }
@@ -419,7 +420,7 @@ export class RetryQueue {
           this.#logger.error("message.retry.persist.failed", {
             sessionId,
             nonce: entry.nonceHex,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
           });
         }
         // Halt immediately — FIFO invariant: no out-of-order delivery.
@@ -435,7 +436,7 @@ export class RetryQueue {
         this.#logger.error("message.retry.persist.failed", {
           sessionId,
           nonce: entry.nonceHex,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
 
@@ -491,7 +492,7 @@ export class RetryQueue {
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
         operation: "terminal_reap_select",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "could not read the rows to reap; nothing was deleted and retryQueueDepth stays pinned",
       });
       return 0;
@@ -529,7 +530,7 @@ export class RetryQueue {
       this.#logger.error("message.retry.persist.failed", {
         sessionId,
         operation: "terminal_reap_delete",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "terminal-session reap did not remove the rows; retryQueueDepth stays pinned",
       });
       return 0;
@@ -585,7 +586,7 @@ export class RetryQueue {
     } catch (err: unknown) {
       this.#logger.error("message.retry.persist.failed", {
         operation: "startup_terminal_reconcile",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "already-terminal sessions were not reconciled; retryQueueDepth may stay pinned",
       });
       return 0;
@@ -692,7 +693,7 @@ export class RetryQueue {
              leafKind ?? null,
              contentHashAlg ?? null);
     } catch (err: unknown) {
-      const reason = err instanceof Error ? err.message : String(err);
+      const reason = extractErrorMessage(err);
       this.#logger.error("message.retry.persist.failed", {
         agentId,
         sessionId,
@@ -724,7 +725,7 @@ export class RetryQueue {
         .run(agentId, sessionId, contentHashHex);
     } catch (err: unknown) {
       this.#logger.error("message.retry.persist.failed", {
-        sessionId, nonce: contentHashHex, error: err instanceof Error ? err.message : String(err),
+        sessionId, nonce: contentHashHex, error: extractErrorMessage(err),
       });
     }
   }
@@ -774,7 +775,7 @@ export class RetryQueue {
       try {
         result = await parkFn(entry);
       } catch (err: unknown) {
-        result = { parked: false, error: err instanceof Error ? err.message : String(err) };
+        result = { parked: false, error: extractErrorMessage(err) };
       }
       if (!result.parked) {
         if (result.retryAfterMs !== undefined && result.retryAfterMs > 0) {
@@ -805,7 +806,7 @@ export class RetryQueue {
           } catch (err: unknown) {
             this.#logger.error("message.retry.persist.failed", {
               agentId, sessionId, nonce: entry.contentHashHex, operation: "park_abandon_delete",
-              error: err instanceof Error ? err.message : String(err),
+              error: extractErrorMessage(err),
               impact: "the unparkable row was not removed and will be re-attempted at every boot",
             });
           }
@@ -827,7 +828,7 @@ export class RetryQueue {
           .run(agentId, sessionId, entry.contentHashHex);
       } catch (err: unknown) {
         this.#logger.error("message.retry.persist.failed", {
-          sessionId, nonce: entry.contentHashHex, error: err instanceof Error ? err.message : String(err),
+          sessionId, nonce: entry.contentHashHex, error: extractErrorMessage(err),
         });
       }
       parked += 1;

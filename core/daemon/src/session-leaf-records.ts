@@ -144,7 +144,7 @@ export class SessionLeafRecords {
        */
       this.#ctx.logger.error("session.genesis.derive.failed", {
         agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact:
           "this session's starting point could not be computed from its assignment, so nothing " +
           "sent on it can be chained and every send will be refused by name. The session open " +
@@ -169,7 +169,7 @@ export class SessionLeafRecords {
        */
       this.#ctx.logger.error("session.genesis.persist.failed", {
         agentName, sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact:
           "this session's starting point was not written to the database. Everything works until " +
           "this daemon restarts; after that, a send on this session is refused until the " +

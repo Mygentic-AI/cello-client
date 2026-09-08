@@ -13,6 +13,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * The five reachability tiers, ordered so `>=` is meaningful (blocked < unknown < known < whitelisted
@@ -165,7 +166,7 @@ export function migrateContactsAddTierMetadata(db: DaemonDatabase, logger: Logge
     }
     logger.error("contacts.tier.migration.failed", {
       columns: toAdd.map((c) => c.name),
-      reason: err instanceof Error ? err.message : String(err),
+      reason: extractErrorMessage(err),
     });
     throw err;
   }

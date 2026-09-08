@@ -42,6 +42,7 @@ import type { ISessionNodeFactory, SessionNodeConfig } from "../session-node-man
 import type { SessionNegotiator } from "../transport-selector.js";
 import type { ConnectResult, SignalingStream, CelloNode } from "@cello-protocol/transport";
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "../error-message.js";
 
 interface LogEvent { level: string; event: string; context: Record<string, unknown> }
 
@@ -147,7 +148,7 @@ describe("M9-CORE-001: daemon ↔ gateway seam (real gateway process)", () => {
     } catch (err) {
       // Review L7: a loud throw, never `[]` — see the note on the twin helper in m9-gate-1. An
       // unreadable audit store must not be able to masquerade as an empty one.
-      throw new Error(`could not read the gateway record store at ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(`could not read the gateway record store at ${dbPath}: ${extractErrorMessage(err)}`);
     }
   }
 

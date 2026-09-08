@@ -23,6 +23,7 @@ import type { FrontierMismatchStore } from "./frontier-mismatch.js";
 import { countAttendance } from "./co-attendance.js";
 import { renderFrontierMismatch } from "./frontier-mismatch.js";
 import { resolveAgentState } from "./agent-state.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface SessionViewsDeps {
   logger: Logger;
@@ -74,7 +75,7 @@ export function createSessionViews(deps: SessionViewsDeps) {
     try {
       return sessionNodeManager.sealReadinessView(agentName, sessionId);
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = extractErrorMessage(err);
       logger.warn("session.seal.readiness.probe.failed", { agentName, sessionId, error: message });
       return { state: "unknown", reason: `probe_failed: ${message}` };
     }
@@ -163,7 +164,7 @@ export function createSessionViews(deps: SessionViewsDeps) {
           }
         })
         .catch((err: unknown) => {
-          logger.warn("session.half_open.reap.failed", { agentName: row.agent_name, sessionId: row.session_id, reason: err instanceof Error ? err.message : String(err) });
+          logger.warn("session.half_open.reap.failed", { agentName: row.agent_name, sessionId: row.session_id, reason: extractErrorMessage(err) });
         });
     }
   }

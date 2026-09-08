@@ -18,6 +18,7 @@
 import { encodeCbor, decodeCbor } from "@cello-protocol/protocol-types";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** The columns written by both producers. Both hold CBOR; both must hold the canonical encoding. */
 const CBOR_BLOB_COLUMNS = ["frost_commitments", "frost_verifying_shares"] as const;
@@ -92,7 +93,7 @@ export function migrateCborBlobsToCanonical(db: DaemonDatabase, logger: Logger):
           agentId,
           column,
           bytes: stored.length,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
         continue;
       }

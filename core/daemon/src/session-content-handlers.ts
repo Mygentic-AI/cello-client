@@ -26,6 +26,7 @@ import type { ConnState } from "./contact-handlers.js";
 import type { ContentTakeLedger } from "./co-attendance.js";
 import { isAutoReplyMarked } from "./away-detection.js";
 import { REFUSAL_COUNT_GUIDANCE, REFUSAL_KIND_GUIDANCE, type RefusalKind } from "./refusal-reasons.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * DOD-M12B-AWAY-MARK-1 — what a reader needs to know the moment it sees a marked message.
@@ -638,7 +639,7 @@ export function registerSessionContentHandlers(deps: SessionContentDeps): void {
         } catch (err: unknown) {
           logger.error("session.content.queue.failed", {
             sessionId,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             correlationId,
           });
         }

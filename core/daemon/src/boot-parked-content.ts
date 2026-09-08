@@ -24,6 +24,7 @@ import type { Logger, DaemonConfig, AgentInfo } from "./types.js";
 import type { SignalingManager } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface BootParkedContentDeps {
   config: DaemonConfig;
@@ -238,7 +239,7 @@ export function startBootParkedContent(deps: BootParkedContentDeps) {
       void flushAwaitingContent(filterAgentName).catch((err: unknown) => {
         logger.warn("content.park.retry.timer.failed", {
           source,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
           impact: "the scheduled drain threw; the ordinary event triggers (boot, agent start, reconnect) still apply",
         });
       });
@@ -538,7 +539,7 @@ export function startBootParkedContent(deps: BootParkedContentDeps) {
       } catch (err: unknown) {
         logger.error("content.park.flush.failed", {
           sessionId: s.sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     }

@@ -46,6 +46,7 @@ import type {
   FrostRefreshRound1Response,
   FrostRefreshRound2Response,
 } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 
 const FROST_PROTOCOL_ID = "/cello/frost/1.0.0";
 
@@ -356,7 +357,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
       this.#logger.debug("frost.directory.stream.open.ok", {});
       return s;
     } catch (err1: unknown) {
-      const msg1 = err1 instanceof Error ? err1.message : String(err1);
+      const msg1 = extractErrorMessage(err1);
       this.#logger.debug("frost.directory.stream.open.retry", { error: msg1 });
       try {
         await this.#node.dial(this.#directoryMultiaddrs[0]!);
@@ -365,7 +366,7 @@ export class NetworkDirectoryNode implements DirectoryNodeStub {
         this.#logger.debug("frost.directory.stream.open.ok", {});
         return s;
       } catch (err2: unknown) {
-        const msg2 = err2 instanceof Error ? err2.message : String(err2);
+        const msg2 = extractErrorMessage(err2);
         this.#logger.debug("frost.directory.stream.open.failed", { error: msg2 });
         throw err2;
       }

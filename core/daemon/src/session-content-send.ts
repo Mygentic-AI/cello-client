@@ -27,6 +27,7 @@ import { terminalRelayRefusal } from "./session-terminal-refusal.js";
 import { AgentRelayClient, isTerminalRelayRefusal } from "./session-relay-client.js";
 import { REDIAL_COOLDOWN_MS, type ActiveSessionEntry, type SentAuthorship } from "./session-node-types.js";
 import type { SessionContentPipelineContext } from "./session-content-context.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export class SessionContentSender {
   readonly #ctx: SessionContentPipelineContext;
@@ -226,7 +227,7 @@ export class SessionContentSender {
                 // a message is unproven and not which one, in a transcript of hundreds.
                 ...(witnessed.ok ? { relaySequence: witnessed.sequence_number } : {}),
                 ...(extra ?? {}),
-                ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
+                ...(error === undefined ? {} : { error: extractErrorMessage(error) }),
                 impact:
                   "this sent message is recorded with attribution 'self_authored' and NO signature, so the row " +
                   "asserts its author rather than proving one. It is indistinguishable in the database from a " +
@@ -445,7 +446,7 @@ export class SessionContentSender {
       } catch (relayErr: unknown) {
         this.#ctx.logger.warn("session.relay.hash.submit.failed", {
           sessionId,
-          reason: relayErr instanceof Error ? relayErr.message : String(relayErr),
+          reason: extractErrorMessage(relayErr),
           correlationId,
         });
       }
@@ -698,7 +699,7 @@ export class SessionContentSender {
        * is thrown twice above — once before the stream is opened, once at the seal — and both are
        * about this machine's key state.
        */
-      const failure = err instanceof Error ? err.message : String(err);
+      const failure = extractErrorMessage(err);
       this.#ctx.liveness.markSessionImpaired(agentName, sessionId, {
         cause: failure.startsWith("content_not_encryptable") ? "content_key" : "direct_send",
         error: failure, correlationId,
@@ -733,7 +734,7 @@ export class SessionContentSender {
         sessionId,
         contentHash: hashHex,
         counterpartySessionPeerId: entry.counterpartySessionPeerId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         // "Cannot write to a stream that is closed" names where the write died, never why. The
         // why is almost always the per-protocol stream cap, and these two numbers are what turn
         // that from a log-measurement session into a grep.
@@ -823,24 +824,15 @@ export class SessionContentSender {
           this.#ctx.logger.error("content.park.durable_enqueue.failed", {
             sessionId, contentHash: hashHex, agentName,
             impact: "content is NOT durable and will NOT be retried — the message is lost",
-            error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+            error: extractErrorMessage(hookErr),
           });
         }
       }
       // error.message extracted — never [object Object]. libp2p/cross-package errors are not
       // always `instanceof Error` in this realm, so fall back to a message property / JSON.
-      const errMsg =
-        err instanceof Error
-          ? err.message
-          : err && typeof err === "object" && typeof (err as { message?: unknown }).message === "string"
-            ? (err as { message: string }).message
-            : (() => {
-                try {
-                  return JSON.stringify(err);
-                } catch {
-                  return String(err);
-                }
-              })();
+      // This was fourteen lines reimplementing `extractErrorMessage` exactly; the helper it was
+      // duplicating already existed two files away. DOD-M15-ERRFORMAT-1.
+      const errMsg = extractErrorMessage(err);
       // F3: the two failures are NOT interchangeable to the caller. `reason` is a contract string
       // and stays put; `guidance` carries the difference, because "we are retrying this" and "this
       // message is gone, send it again" demand opposite actions from the operator.
@@ -1178,7 +1170,7 @@ export class SessionContentSender {
       this.#ctx.onAwaitingPersisted?.(agentName, sessionId, hashHex);
     } catch (err: unknown) {
       this.#ctx.logger.error("content.delivery.ack.backstop.failed", {
-        sessionId, contentHash: hashHex, error: err instanceof Error ? err.message : String(err),
+        sessionId, contentHash: hashHex, error: extractErrorMessage(err),
       });
     }
   }

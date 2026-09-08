@@ -1042,7 +1042,7 @@ export class AgentRelayClient {
         } catch (err) {
           // A durable-evidence write failure must be LOUD — the relay will not re-emit this ack, so a
           // swallowed write permanently loses a verified receipt.
-          this.#logger.error("relay.receipt.store_failed", { seq, error: err instanceof Error ? err.message : String(err) });
+          this.#logger.error("relay.receipt.store_failed", { seq, error: extractErrorMessage(err) });
         }
         return false;
       }
@@ -1236,7 +1236,7 @@ export class AgentRelayClient {
               structure1Cbor: s1,
             }, Date.now());
           } catch (err) {
-            this.#logger.error("relay.seal_leaf.counterparty.store_failed", { seq, session: sidHex, error: err instanceof Error ? err.message : String(err) });
+            this.#logger.error("relay.seal_leaf.counterparty.store_failed", { seq, session: sidHex, error: extractErrorMessage(err) });
           }
         } else {
           this.#logger.warn("relay.seal_leaf.counterparty.capture_skipped", { seq, session: sidHex, hasS2: !!structure2Cbor, hasS1: s1.length > 0, hasSender: !!senderHex });
@@ -2470,7 +2470,7 @@ export class AgentRelayClient {
         } catch (err: unknown) {
           this.#logger.error("session.selfchain.record.failed", {
             session: sessionIdHex,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             impact:
               "this message was witnessed, but this agent could not record it as the link for its " +
               "next message — so the next one will chain to the wrong predecessor and the " +

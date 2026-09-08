@@ -73,6 +73,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import { createNode } from "@cello-protocol/transport";
 import { generateKeypair } from "@cello-protocol/crypto";
 import type { PeerId, MultiaddrConnection, ConnectionGater } from "@libp2p/interface";
+import { extractErrorMessage } from "../error-message.js";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -428,7 +429,7 @@ describe("SessionNodeManager — unit tests", () => {
   //
   // None of these swallow exceptions silently — they are all at network write sites
   // where the connection state is unknown. All upstream error handling extracts
-  // error.message explicitly (see line ~174: err instanceof Error ? err.message : String(err)).
+  // error.message explicitly (see line ~174: extractErrorMessage(err)).
   it("AC-013: ipc-server.ts bare catch blocks are preceded by documenting comments", async () => {
     const { readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
@@ -1620,9 +1621,7 @@ describe("SessionNodeManager — integration tests", () => {
 
     // Unconditional assertion: the error MUST surface (server is gone)
     expect(caughtError).not.toBeNull();
-    const msg = caughtError instanceof Error
-      ? caughtError.message
-      : String(caughtError);
+    const msg = extractErrorMessage(caughtError);
     // AC-012 core assertion: error.message is extractable and not '[object Object]'
     expect(msg).not.toBe("[object Object]");
     expect(msg.length).toBeGreaterThan(0);

@@ -75,6 +75,7 @@ import {
 } from "./document-reconcile-engine.js";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface DocumentLayerDeps {
   db: DaemonDatabase;
@@ -367,7 +368,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       } catch (err: unknown) {
         return {
           ok: false as const,
-          reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+          reason: `document_chain_undecodable: ${extractErrorMessage(err)}`,
         };
       }
     },
@@ -416,7 +417,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     } catch (err: unknown) {
       logger.error("document.holders.undecodable", {
         documentId,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
       });
       return null;
     }
@@ -791,7 +792,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
     } catch (err: unknown) {
       logger.warn("document.watch.nudge_failed", {
         documentId: env.document_id,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   };
@@ -811,7 +812,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
       } catch (err: unknown) {
         return {
           ok: false,
-          reason: `document_chain_undecodable: ${err instanceof Error ? err.message : String(err)}`,
+          reason: `document_chain_undecodable: ${extractErrorMessage(err)}`,
         };
       }
     },
@@ -1017,7 +1018,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         } catch (err: unknown) {
           logger.warn("document.reconcile.genesis_refused", {
             documentId: block.document_id, senderAgentId, correlationId,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: extractErrorMessage(err),
           });
           continue;
         }
@@ -1031,7 +1032,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         } catch (err: unknown) {
           logger.warn("document.reconcile.entry_refused", {
             documentId: block.document_id, senderAgentId, correlationId,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: extractErrorMessage(err),
           });
         }
       }
@@ -1061,7 +1062,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
         } catch (err: unknown) {
           logger.warn("document.reconcile.refusal_record_refused", {
             documentId: block.document_id, senderAgentId, correlationId,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: extractErrorMessage(err),
           });
         }
       }
@@ -1074,7 +1075,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           void rewriteFileImpl(ownerAgentId, envWire).catch((err: unknown) => {
             logger.warn("document.reconcile.rewrite_failed", {
               correlationId,
-              reason: err instanceof Error ? err.message : String(err),
+              reason: extractErrorMessage(err),
             });
           });
         }
@@ -1202,7 +1203,7 @@ export function createDocumentLayer(deps: DocumentLayerDeps): DocumentLayer {
           } catch (err: unknown) {
             logger.warn("document.proposal.auto_refusal_ack_failed", {
               documentId: recorded.documentId,
-              error: err instanceof Error ? err.message : String(err),
+              error: extractErrorMessage(err),
             });
           }
         })();

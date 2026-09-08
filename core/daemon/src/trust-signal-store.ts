@@ -40,6 +40,7 @@ import { verifyTrustSignalHash, type TrustSignalEnvelope } from "@cello-protocol
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import { migrateWalletAddConsentState, CONSENT_ACCEPTED, type ConsentState } from "./consent-migration.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Status lives OUTSIDE the hash — it is mutable after minting, which is exactly why it is not in
  *  the preimage. If it were hashed, revoking a signal would change its hash and the directory could
@@ -322,7 +323,7 @@ export function ensureTrustSignalSchema(db: DaemonDatabase, _logger: Logger): vo
       if (!cols.includes("same_operator")) {
         throw new Error(
           `failed to add same_operator to ${table} and the column is still absent — the daemon cannot ` +
-          `store or present trust signals in this state: ${err instanceof Error ? err.message : String(err)}`,
+          `store or present trust signals in this state: ${extractErrorMessage(err)}`,
         );
       }
       // Present: the ALTER was a genuine no-op. No backfill is needed either — 0 (not co-owned) is

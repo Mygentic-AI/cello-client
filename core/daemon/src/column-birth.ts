@@ -24,6 +24,7 @@
  */
 
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * SQLite's wording for "this column is already here", which is the whole benign case.
@@ -50,7 +51,7 @@ export function addColumnIfMissing(
   try {
     db.exec(input.sql);
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = extractErrorMessage(err);
     if (ALREADY_PRESENT.test(message)) return;
     // NAMED, at error, before the rethrow — so the cause is in the log even if something upstream
     // catches the throw and reports it as a generic startup failure.

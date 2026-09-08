@@ -35,6 +35,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
 import type { LoadedAgent } from "./agent-loader.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Cap on a refusal message (M10B-D4). Generous for prose — the point is not to police what the
@@ -176,7 +177,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     try {
       row = store.getWalletSignalByPrefix(prefix);
     } catch (err: unknown) {
-      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+      return { ok: false, reason: "ambiguous_prefix", guidance: extractErrorMessage(err) };
     }
     if (!row) {
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
@@ -216,7 +217,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     try {
       row = store.getWalletSignalByPrefix(prefix);
     } catch (err: unknown) {
-      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+      return { ok: false, reason: "ambiguous_prefix", guidance: extractErrorMessage(err) };
     }
     if (!row) {
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
@@ -248,7 +249,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     try {
       row = store.getWalletSignalByPrefix(prefix);
     } catch (err: unknown) {
-      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+      return { ok: false, reason: "ambiguous_prefix", guidance: extractErrorMessage(err) };
     }
     if (!row) {
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${prefix}'.` };
@@ -476,7 +477,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
         }),
       };
     } catch (err: unknown) {
-      const reason = err instanceof Error ? err.message : String(err);
+      const reason = extractErrorMessage(err);
       logger.warn("signal.submission.refused", { agentName: sel.name, op: opts.op, reason });
       return { queued: false, reason, guidance: `${context} ${reason}` };
     }
@@ -576,7 +577,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
       } catch (err: unknown) {
         logger.warn("signal.results.node.unreachable", {
           nodeId: node.nodeId,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
         });
         unreachable.push(node.nodeId);
       } finally {
@@ -965,7 +966,7 @@ export function registerSignalHandlers(deps: SignalHandlerDeps): void {
     try {
       row = store.getWalletSignalByPrefix(hashPrefix);
     } catch (err: unknown) {
-      return { ok: false, reason: "ambiguous_prefix", guidance: err instanceof Error ? err.message : String(err) };
+      return { ok: false, reason: "ambiguous_prefix", guidance: extractErrorMessage(err) };
     }
     if (!row) {
       return { ok: false, reason: "signal_not_found", guidance: `No wallet signal with hash prefix '${hashPrefix}'.` };

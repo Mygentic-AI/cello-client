@@ -24,6 +24,7 @@ import { RandomizedPollScheduler } from "../manifest-poll-scheduler.js";
 // rather than written down twice.
 import { DaemonAlreadyRunningError, EXIT_ALREADY_RUNNING } from "../singleton-lock.js";
 import type { Logger } from "../types.js";
+import { extractErrorMessage } from "../error-message.js";
 
 const MAX_CONNECTIONS = 16;
 
@@ -117,7 +118,7 @@ async function startSecurityLayer(correlationId?: string): Promise<{ client: Loc
       logger.error("security.gateway.exited", { code: code ?? -1, signal: signal ?? "none", ...(correlationId !== undefined ? { correlationId } : {}) });
     });
   } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = extractErrorMessage(err);
     // The gateway's own errors carry a code and actionable guidance; the spawner appends the
     // child's stderr tail. Keep BOTH, and hand them to the client so every later refusal names
     // this cause instead of the generic "could not be reached, retry" (review F2) — which points
@@ -261,14 +262,14 @@ async function main(): Promise<void> {
       shutdown(signal).catch((err: unknown) => {
         logger.error("daemon.shutdown.failed", {
           signal,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
         process.exit(1);
       });
     } catch (err: unknown) {
       logger.error("daemon.shutdown.failed", {
         signal,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       process.exit(1);
     }
@@ -325,7 +326,7 @@ main().catch((err: unknown) => {
     process.exit(EXIT_ALREADY_RUNNING);
   }
   logger.error("daemon.startup.failed", {
-    error: err instanceof Error ? err.message : String(err),
+    error: extractErrorMessage(err),
   });
   process.exit(1);
 });

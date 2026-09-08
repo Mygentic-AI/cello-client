@@ -45,6 +45,7 @@
 import type { SubmissionOp } from "@cello-protocol/protocol-types";
 import type { SendSubmissionResult, SubmissionSendFailure } from "./signal-submission.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Send failures worth retrying — the ones that are NOT a verdict on the submission.
@@ -550,7 +551,7 @@ export class SubmissionRetryQueue {
       this.#deps.logger.warn("signal.submission.retry.threw", {
         agentName: entry.item.agentName,
         submissionId: entry.item.submissionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       result = { ok: false, reason: "directory_unreachable", guidance: "" };
     } finally {
@@ -594,7 +595,7 @@ export class SubmissionRetryQueue {
           agentName: entry.item.agentName,
           submissionId: entry.item.submissionId,
           subject: entry.item.subject,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
       if (!this.#stopped) this.#armIfWork();

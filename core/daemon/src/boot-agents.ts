@@ -270,7 +270,7 @@ export async function startBootAgents(deps: BootAgentsDeps) {
       logger.error("signal.submission.record_failed", {
         agentName,
         submissionId: s.submissionId,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
       });
     }
   }

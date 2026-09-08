@@ -9,6 +9,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface IRegistryVersionStore {
   getLastSeenVersion(): number | null;
@@ -52,8 +53,8 @@ export class DbRegistryVersionStore implements IRegistryVersionStore {
         )
         .run(version, Date.now());
     } catch (err: unknown) {
-      this.#logger.error("registry.version.persist.failed", { version, error: err instanceof Error ? err.message : String(err) });
-      const e = new Error(`registry_persist_failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.#logger.error("registry.version.persist.failed", { version, error: extractErrorMessage(err) });
+      const e = new Error(`registry_persist_failed: ${extractErrorMessage(err)}`);
       (e as Error & { code?: string }).code = "registry_persist_failed";
       throw e;
     }

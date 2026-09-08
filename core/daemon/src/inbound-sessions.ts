@@ -29,6 +29,7 @@ import { extractOfferedMoniker } from "./session-assignment-parser.js";
 import { TIER } from "./contacts-tier-migration.js";
 import type { RelayConnectParams } from "./session-node-manager.js";
 import type { RelayAssignmentCarry } from "./session-relay-client.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * DOD-CAP-SELF-HEAL-1 — how often the operator's own cap may raise an alarm about one counterparty.
@@ -702,7 +703,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       } catch (err: unknown) {
         logger.warn("session.inbound.reap.db_lookup_failed", {
           agentName, sessionId: e.sessionIdHex,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
         });
       }
       const terminal = record !== null && (
@@ -900,7 +901,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       void sessionNodeManager.ensureStandingReceiverForAgent(agentName).catch((err: unknown) => {
         logger.warn("session.standing_receiver.ensure.failed", {
           agentName,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
           correlationId,
         });
       });
@@ -1083,7 +1084,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
             } catch (err: unknown) {
               logger.warn("signal.verify.decode_failed", {
                 agentName, signalHash: sig.hash.slice(0, 16),
-                reason: err instanceof Error ? err.message : String(err),
+                reason: extractErrorMessage(err),
                 correlationId,
               });
               rejected++;
@@ -1098,7 +1099,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         } catch (err: unknown) {
           logger.warn("signal.verify.store_failed", {
             agentName,
-            reason: err instanceof Error ? err.message : String(err),
+            reason: extractErrorMessage(err),
             correlationId,
           });
         }
@@ -1619,7 +1620,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         logger.error("session.inbound.accept.error", {
           sessionId: parsed.sessionIdHex,
           agentName,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           correlationId,
         });
       });
@@ -1689,7 +1690,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
       envelope = decodeTrustSignalEnvelope(recovered);
     } catch (err) {
       logger.error("daemon.trust_signal.envelope_undecodable", {
-        agentName, signalKind, correlationId, error: err instanceof Error ? err.message : String(err),
+        agentName, signalKind, correlationId, error: extractErrorMessage(err),
       });
       return;
     }
@@ -1703,7 +1704,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
         agentName,
         signalKind,
         correlationId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return;
     }
@@ -1780,7 +1781,7 @@ export function createInboundSessions(deps: InboundSessionDeps) {
           logger.warn("signal.projection.failed", {
             agentName,
             counterparty: e.counterpartyPubkeyHex.slice(0, 16),
-            reason: err instanceof Error ? err.message : String(err),
+            reason: extractErrorMessage(err),
           });
           trustSignalProjection = undefined;
         }

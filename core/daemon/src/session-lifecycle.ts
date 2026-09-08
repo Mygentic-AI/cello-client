@@ -232,7 +232,7 @@ export class SessionLifecycle {
         node = await this.#ctx.receivers.createAgentNode(agentName, { sessionId, connectionGater: gater, nodeType: "session", transportPrivateKey: seed });
         await node.start();
       } catch (err: unknown) {
-        const errorMessage = err instanceof Error ? err.message : String(err);
+        const errorMessage = extractErrorMessage(err);
         this.#ctx.logger.error("session.node.create.failed", {
           sessionId,
           agentName,
@@ -273,7 +273,7 @@ export class SessionLifecycle {
         this.#ctx.logger.warn("session.node.stop.failed", {
           sessionId,
           agentName,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           correlationId,
         });
       }
@@ -422,7 +422,7 @@ export class SessionLifecycle {
         this.#ctx.logger.warn("session.node.stop.failed", {
           sessionId,
           agentName,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           correlationId,
         });
       }
@@ -567,7 +567,7 @@ export class SessionLifecycle {
       this.#ctx.logger.error("session.node.stop.failed", {
         sessionId,
         agentName: entry.agentName,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         correlationId: entry.correlationId,
       });
       // Fall through — still remove from active map and update DB
@@ -637,7 +637,7 @@ export class SessionLifecycle {
       this.#ctx.logger.error("session.node.stop.failed", {
         sessionId,
         agentName: entry.agentName,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         correlationId: entry.correlationId,
       });
       // Fall through — still remove from active map.
@@ -764,7 +764,7 @@ export class SessionLifecycle {
     } catch (err: unknown) {
       this.#ctx.logger.error("session.interrupt.db.write.failed", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
 
@@ -781,7 +781,7 @@ export class SessionLifecycle {
         this.#ctx.logger.error("session.node.stop.failed", {
           sessionId,
           agentName,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           correlationId: entry.correlationId,
         });
         // Fall through — still remove from active map
@@ -840,7 +840,7 @@ export class SessionLifecycle {
     } catch (err: unknown) {
       this.#ctx.logger.debug("session.state.notify.failed", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
     return true;
@@ -960,7 +960,7 @@ export class SessionLifecycle {
       }
       this.#ctx.logger.warn("session.abandon.notice.failed", {
         agentName, sessionId, correlationId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "the counterparty was not told and may keep calling until it gives up",
       });
       return { told: false, reason: "send_failed" };
@@ -1345,7 +1345,7 @@ export class SessionLifecycle {
       this.#ctx.logger.error("session.revive.node.failed", {
         agentName,
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "the session stays interrupted; the next send will attempt this again",
       });
       return { ok: false, reason: "session_node_creation_failed" };
@@ -1506,7 +1506,7 @@ export class SessionLifecycle {
         this.#ctx.logger.warn("session.revive.retry_drain.failed", {
           agentName,
           sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           impact: "messages queued while this session was down are still queued",
         });
       }
@@ -1661,7 +1661,7 @@ export class SessionLifecycle {
         sessionId,
         agentName,
         status,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }
@@ -1820,7 +1820,7 @@ export class SessionLifecycle {
           this.#ctx.logger.error("session.terminal.disposition.failed", {
             sessionId,
             status,
-            error: hookErr instanceof Error ? hookErr.message : String(hookErr),
+            error: extractErrorMessage(hookErr),
             impact: "durable state keyed to this session was not disposed of and may strand",
           });
         }
@@ -1832,7 +1832,7 @@ export class SessionLifecycle {
       this.#ctx.logger.error("session.status.write.failed", {
         sessionId,
         status,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }

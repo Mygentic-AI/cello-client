@@ -15,6 +15,7 @@ import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SignalingManager } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface DocumentSurfaceDeps {
   logger: Logger;
@@ -88,7 +89,7 @@ export function createDocumentSurface(deps: DocumentSurfaceDeps) {
           .catch((err: unknown) => {
             logger.warn("document.reconcile.nudge_failed", {
               documentId, peerAgentId: seat,
-              reason: err instanceof Error ? err.message : String(err),
+              reason: extractErrorMessage(err),
             });
           });
       }
@@ -160,7 +161,7 @@ export function createDocumentSurface(deps: DocumentSurfaceDeps) {
         }
       } catch (err: unknown) {
         logger.warn("document.reconcile.sweep_threw", {
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
         });
       } finally {
         reconcileSweepStartedAt = null;

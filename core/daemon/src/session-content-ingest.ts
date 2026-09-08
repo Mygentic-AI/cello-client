@@ -1435,7 +1435,7 @@ export class SessionContentIngest {
       this.#ctx.onContentArrived?.(agentName, sessionId, senderPubkey);
     } catch (err: unknown) {
       this.#ctx.logger.warn("notification.cello_message.dispatch.failed", {
-        sessionId, agentName, reason: err instanceof Error ? err.message : String(err),
+        sessionId, agentName, reason: extractErrorMessage(err),
       });
     }
     return { leafIndex };
@@ -1521,7 +1521,7 @@ export class SessionContentIngest {
       this.#ctx.logger.warn("content.delivery.ack.send.failed", {
         sessionId,
         contentHash: Buffer.from(contentHash).toString("hex"),
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         // "Cannot write to a stream that is closed" names where the write died, never why. The
         // why is almost always the per-protocol stream cap, and these two numbers are what turn
         // that from a log-measurement session into a grep.
@@ -1530,7 +1530,7 @@ export class SessionContentIngest {
       });
       // The ACK travels the same direct path as our own content, so a failure here is the same
       // evidence: writes to this counterparty are not landing.
-      this.#ctx.liveness.markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: err instanceof Error ? err.message : String(err), correlationId });
+      this.#ctx.liveness.markSessionImpaired(agentName, sessionId, { cause: "delivery_ack", error: extractErrorMessage(err), correlationId });
       if (ackStream !== undefined) {
         try { ackStream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
       }
@@ -1556,14 +1556,14 @@ export class SessionContentIngest {
         void this.#handleContentStream(agentName, sessionId, stream, remotePeerId).catch((err: unknown) => {
           this.#ctx.logger.warn("session.content.stream.handler.failed", {
             sessionId,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
           });
         });
       }, { maxInboundStreams: CONTENT_MAX_INBOUND_STREAMS });
     } catch (err: unknown) {
       this.#ctx.logger.error("session.content.handler.register.failed", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }
@@ -2245,7 +2245,7 @@ export class SessionContentIngest {
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.content.stream.read.failed", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     } finally {
       // `close()` waits only for OUR write buffer, which is empty here, so this cannot stall the
@@ -2258,7 +2258,7 @@ export class SessionContentIngest {
         // into a 6,451-record log measurement.
         this.#ctx.logger.warn("session.content.stream.close.failed", {
           sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
         try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* already gone */ }
         return;

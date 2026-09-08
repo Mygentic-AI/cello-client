@@ -18,6 +18,7 @@ import { createIpcServer, type IpcHandler, type IpcServer, type HandlerLookup } 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { renderForSurface } from "./vocabulary.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface IpcSurfaceDeps {
   logger: Logger;
@@ -46,7 +47,7 @@ export function createIpcSurface(deps: IpcSurfaceDeps) {
       shutdownPromise = getStop()("logout_requested").catch((err: unknown) => {
         logger.error("daemon.shutdown.failed", {
           signal: "logout",
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       });
     }

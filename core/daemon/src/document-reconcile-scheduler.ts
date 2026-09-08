@@ -53,6 +53,7 @@
  */
 
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** How long one attempt may hold the in-flight mark before the sweep stops honoring it. */
 export const RECONCILE_INFLIGHT_BOUND_MS = 60_000;
@@ -354,7 +355,7 @@ export class ReconcileScheduler {
     } catch (err: unknown) {
       allOk = false;
       this.#d.logger.warn("document.reconcile.sweep_attempt_failed", {
-        peerAgentId, reason: err instanceof Error ? err.message : String(err),
+        peerAgentId, reason: extractErrorMessage(err),
       });
     } finally {
       s.inFlightUntilMs = null;

@@ -37,6 +37,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * The consent states. Anything not in this set — including NULL and including a value with stray
@@ -130,7 +131,7 @@ export function migrateWalletAddConsentState(db: DaemonDatabase, logger: Logger)
     // RETHROW. A swallowed failure here leaves the daemon running against a schema it believes has
     // consent and does not — which presents unconsented endorsements while every test passes.
     logger.error("signal.consent.migration_failed", {
-      reason: err instanceof Error ? err.message : String(err),
+      reason: extractErrorMessage(err),
     });
     throw err;
   }

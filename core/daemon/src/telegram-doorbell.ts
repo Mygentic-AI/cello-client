@@ -17,6 +17,7 @@
  */
 import { HttpTelegramBotClient, type TelegramBotClient } from "./telegram-bot-client.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface TelegramDoorbellDeps {
   logger: Logger;
@@ -78,7 +79,7 @@ export function createTelegramDoorbell(deps: TelegramDoorbellDeps): TelegramDoor
       }
       logger.info("telegram.doorbell.sent", { agentName, sessionId, kind });
     } catch (err: unknown) {
-      logger.warn("telegram.doorbell.send.failed", { agentName, sessionId, kind, error: err instanceof Error ? err.message : String(err) });
+      logger.warn("telegram.doorbell.send.failed", { agentName, sessionId, kind, error: extractErrorMessage(err) });
     }
   }
 
@@ -106,7 +107,7 @@ export function createTelegramDoorbell(deps: TelegramDoorbellDeps): TelegramDoor
         "CELLO doesn't process messages here — this channel only sends you notifications. Use your CELLO client to reply.",
       );
     } catch (err: unknown) {
-      logger.warn("telegram.inbound.ack.failed", { chatId, error: err instanceof Error ? err.message : String(err) });
+      logger.warn("telegram.inbound.ack.failed", { chatId, error: extractErrorMessage(err) });
     }
   }
 
@@ -132,7 +133,7 @@ export function createTelegramDoorbell(deps: TelegramDoorbellDeps): TelegramDoor
         }
       } catch (err: unknown) {
         if (telegramPollerGeneration !== myGeneration) break; // superseded — don't retry under a dead generation
-        logger.warn("telegram.poller.error", { error: err instanceof Error ? err.message : String(err) });
+        logger.warn("telegram.poller.error", { error: extractErrorMessage(err) });
         await new Promise((r) => setTimeout(r, 2000)); // back off before retrying
       }
     }

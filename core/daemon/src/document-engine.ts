@@ -30,6 +30,7 @@
 import * as Y from "yjs";
 import type { DocumentEnvelopeRow } from "./document-store.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export type DocumentUpdateFailure =
   | "document_update_too_large"
@@ -141,7 +142,7 @@ export class DocumentEngine {
       // so a corrupt `document_snapshots` row surfaced as "Unexpected end of array", the exact
       // lib0 string this module says must never be a reason. It named Yjs internals and pointed
       // an operator at the wrong subsystem.
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = extractErrorMessage(err);
       this.#logger.error("document.snapshot.malformed", { detail });
       throw new DocumentUpdateError("document_snapshot_malformed", detail);
     }
@@ -195,7 +196,7 @@ export class DocumentEngine {
       Y.applyUpdate(shadow, Y.encodeStateAsUpdate(doc));
       Y.applyUpdate(shadow, update);
     } catch (err: unknown) {
-      return this.#refuse("document_update_malformed", err instanceof Error ? err.message : String(err), update);
+      return this.#refuse("document_update_malformed", extractErrorMessage(err), update);
     }
 
     // THE ACCEPT CLASS. Yjs returned success — that is not evidence the update integrated. A
@@ -240,7 +241,7 @@ export class DocumentEngine {
     try {
       Y.applyUpdate(doc, update);
     } catch (err: unknown) {
-      return this.#refuse("document_update_malformed", err instanceof Error ? err.message : String(err), update);
+      return this.#refuse("document_update_malformed", extractErrorMessage(err), update);
     }
     if (doc.store.pendingStructs !== null || doc.store.pendingDs !== null) {
       return this.#refuse(

@@ -955,7 +955,7 @@ export class StandingReceivers {
     } catch (err) {
       this.#ctx.logger.warn("settings.relay_only.unreadable", {
         agentName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
         impact: "could not read this agent's relay-only posture, so the node is built WITHOUT the hole-punch",
       });
     }

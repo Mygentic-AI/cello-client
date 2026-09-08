@@ -44,6 +44,7 @@
 import type { SessionAssignment } from "@cello-protocol/protocol-types";
 import type { Logger } from "./types.js";
 import type { Dialability } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
 
 // ─── Error codes (fixed) ──────────────────────────────────────────────────────
 
@@ -184,7 +185,7 @@ function sessionIdHex(assignment: SessionAssignment): string {
 }
 
 function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return extractErrorMessage(err);
 }
 
 // ─── TransportSelector (real) ─────────────────────────────────────────────────

@@ -30,6 +30,7 @@ import { resolveDirectoryUrl } from "./directory-bootstrap.js";
 import type { RosterFreshness } from "./roster-freshness.js";
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 import type { DaemonConfig, Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface BootCoreDeps {
   config: DaemonConfig;
@@ -291,7 +292,7 @@ export async function startBootCore(deps: BootCoreDeps) {
             checkManifestValidity();
           } catch (err: unknown) {
             logger.error("directory.auth.manifest.check.failed", {
-              error: err instanceof Error ? err.message : String(err),
+              error: extractErrorMessage(err),
               impact:
                 "the manifest validity re-check did not run this cycle. cello_status still computes " +
                 "it independently on every read, so the FIELD is unaffected; what is lost is the " +

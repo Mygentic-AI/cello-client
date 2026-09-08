@@ -27,6 +27,7 @@
 
 /** A value that can live in a JSON document. */
 import { rootForDocumentType } from "./document-types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -72,7 +73,7 @@ export function parseJsonDocument(text: string): ParsedJsonDocument {
   try {
     parsed = JSON.parse(text);
   } catch (err: unknown) {
-    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+    return { ok: false, detail: extractErrorMessage(err) };
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
     return { ok: false, detail: "the top level of a JSON document must be an object" };

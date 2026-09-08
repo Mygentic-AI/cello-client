@@ -20,6 +20,7 @@
 import { verifyManifest, type ConsortiumManifestInput } from "@cello-protocol/crypto";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 import type { IManifestProvider, IManifestVersionStore, IManifestPollScheduler } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Minimal structural logger — events use the `domain.noun.verb` taxonomy. */
 export interface ManifestPollLogger {
@@ -102,7 +103,7 @@ export async function pollManifestOverHttp(
     }
     raw = await resp.json();
   } catch (err: unknown) {
-    logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_http_unreachable", directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.warn("directory.auth.manifest.poll.failed", { reason: "manifest_http_unreachable", directoryUrl, correlationId, error: extractErrorMessage(err) });
     return { ok: false, reason: "manifest_http_unreachable" };
   }
 
@@ -164,7 +165,7 @@ export async function pollManifestOverHttp(
     logger.info("directory.auth.manifest.poll.success", { oldVersion, newVersion: manifest.version, directoryUrl, correlationId });
     return { ok: true, adopted: true, oldVersion, newVersion: manifest.version };
   } catch (err: unknown) {
-    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_store_error", manifestVersion: manifest.version, directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_store_error", manifestVersion: manifest.version, directoryUrl, correlationId, error: extractErrorMessage(err) });
     return { ok: false, reason: "manifest_store_error" };
   }
 }
@@ -201,7 +202,7 @@ export function startHttpManifestPoll(
       // pollManifestOverHttp is designed never to throw (all failures return a reason). If it ever
       // does, LOG it (never swallow silently — that would hide a permanently-disabled poll) and let
       // the loop self-heal by re-arming below.
-      logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_poll_unexpected_error", directoryUrl, error: err instanceof Error ? err.message : String(err) });
+      logger.error("directory.auth.manifest.poll.failed", { reason: "manifest_poll_unexpected_error", directoryUrl, error: extractErrorMessage(err) });
     });
     if (!stopped) scheduler.scheduleNext(tick);
   };

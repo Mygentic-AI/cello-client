@@ -44,6 +44,7 @@ import {
 import { ensureIdentitySchema } from "./db-identity-store.js";
 import { ensureManifestSchema } from "./manifest-version-store-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface MigrationResult {
   migrated: boolean;
@@ -186,7 +187,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       key = resolveDbKey(dbPath, keyPath); // loads the existing key, or generates one if the DB is absent
     } catch (err) {
       throw new IdentityMigrationError(
-        `could not open the encrypted DB for in-place identity import: ${err instanceof Error ? err.message : String(err)}`,
+        `could not open the encrypted DB for in-place identity import: ${extractErrorMessage(err)}`,
         "Restore the SQLCipher key file, then restart.",
       );
     }
@@ -203,7 +204,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       if (db) { try { db.close(); } catch { /* ignore */ } }
       if (err instanceof IdentityMigrationError) throw err;
       throw new IdentityMigrationError(
-        `in-place identity import failed: ${err instanceof Error ? err.message : String(err)}`,
+        `in-place identity import failed: ${extractErrorMessage(err)}`,
         "The original flat files are untouched. Resolve the error and restart to retry.",
       );
     }
@@ -229,7 +230,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
       : resolveDbKey(migratingPath, keyPath); // generates + writes keyPath (migrating DB absent → fresh)
   } catch (err) {
     throw new IdentityMigrationError(
-      `could not establish a SQLCipher key for migration: ${err instanceof Error ? err.message : String(err)}`,
+      `could not establish a SQLCipher key for migration: ${extractErrorMessage(err)}`,
       "Ensure the CELLO directory is writable, then restart.",
     );
   }
@@ -261,7 +262,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
     }
     if (err instanceof IdentityMigrationError) throw err;
     throw new IdentityMigrationError(
-      `migration failed before commit: ${err instanceof Error ? err.message : String(err)}`,
+      `migration failed before commit: ${extractErrorMessage(err)}`,
       "The original data is untouched. Resolve the error (e.g. disk space) and restart to retry.",
     );
   }
@@ -283,7 +284,7 @@ export function migrateToEncryptedIfNeeded(dbPath: string, logger: Logger): Migr
     deleteFlatIdentity(celloDir, logger);
   } catch (err) {
     throw new IdentityMigrationError(
-      `migration failed during commit/cleanup: ${err instanceof Error ? err.message : String(err)}`,
+      `migration failed during commit/cleanup: ${extractErrorMessage(err)}`,
       "Inspect the CELLO directory: a .pre-sqlcipher.bak backup of the original DB is retained.",
     );
   }

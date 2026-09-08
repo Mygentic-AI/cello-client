@@ -27,6 +27,7 @@ import { generateKLocalSeed, InMemoryKeyProvider } from "@cello-protocol/crypto"
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { countAttendance } from "./co-attendance.js";
 import { noAgentsGuidance } from "./onboarding-guidance.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface AgentHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -118,7 +119,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // (the SignalingManager emits directory.signaling.connected when it actually authenticates).
       logger.info("agent.directory.connection.initiated", { agentName: name, agentPubkey: pubkeyHex });
     } catch (err: unknown) {
-      logger.error("persist.identity.persist.failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
+      logger.error("persist.identity.persist.failed", { agentName: name, error: extractErrorMessage(err) });
       return { ok: false, reason: "agent_create_failed", guidance: "Could not create the agent. Check the daemon log and that the CELLO directory is writable, then retry." };
     }
     // Creation is not an online/offline transition — the agent appears (cello_list_agents) but is
@@ -185,7 +186,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     } finally {
       if (createdSignaling) {
         await dropAgentSignaling(agentName).catch((err) => {
-          logger.warn("agent.revocation.signaling_teardown_failed", { agentName, error: err instanceof Error ? err.message : String(err) });
+          logger.warn("agent.revocation.signaling_teardown_failed", { agentName, error: extractErrorMessage(err) });
         });
       }
     }
@@ -249,12 +250,12 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       if (onlineAgents.has(name)) {
         onlineAgents.delete(name);
         await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
-          logger.warn("agent.removal.receiver_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+          logger.warn("agent.removal.receiver_teardown_failed", { agentName: name, agentId, error: extractErrorMessage(err) });
         });
       }
       // Stop+forget the retired agent's dedicated per-agent signaling manager (review HIGH-1).
       await dropAgentSignaling(name).catch((err) => {
-        logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: err instanceof Error ? err.message : String(err) });
+        logger.warn("agent.removal.signaling_teardown_failed", { agentName: name, agentId, error: extractErrorMessage(err) });
       });
       keyProviders.delete(name);
       const li = loadedAgents.findIndex((a) => a.name === name);
@@ -348,7 +349,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
     // swallowed catch reported the agent offline while its receiver could still be live and bound
     // to it: a stopped agent that can still be handed an inbound session, with nothing in the log.
     await sessionNodeManager.removeStandingReceiverForAgent(name).catch((err) => {
-      logger.warn("agent.stop.receiver_teardown_failed", { agentName: name, error: err instanceof Error ? err.message : String(err) });
+      logger.warn("agent.stop.receiver_teardown_failed", { agentName: name, error: extractErrorMessage(err) });
     });
 
     // M12-P16: OFFLINE MEANS STOP TALKING.
@@ -376,7 +377,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
         logger.error("agent.stop.session_teardown_failed", {
           agentName: name, sessionId: s.session_id,
           impact: "this session may still accept content from the counterparty while the agent reports offline",
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     }
@@ -556,7 +557,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       // A failed registration read must not break selection (the agent IS selected). Log the real
       // reason, and surface a softer `registration_unknown` warning so the operator's surface is NOT
       // falsely clean — we could not confirm registration, so don't imply it is fine (Finding 3).
-      logger.warn("agent.registration.read.failed", { agentName: name, reason: err instanceof Error ? err.message : String(err) });
+      logger.warn("agent.registration.read.failed", { agentName: name, reason: extractErrorMessage(err) });
       result["warning"] = "registration_unknown";
       result["warning_guidance"] = `Agent '${name}' is selected, but its registration status could not be read — run 'cello status' to check whether it is registered with the directory.`;
     }
@@ -584,7 +585,7 @@ export function registerAgentHandlers(deps: AgentHandlerDeps): void {
       }
     } catch (err: unknown) {
       logger.warn("signal.consent.count_failed", {
-        agentName: name, reason: err instanceof Error ? err.message : String(err),
+        agentName: name, reason: extractErrorMessage(err),
       });
       result["pending_consent"] = "unknown";
       result["pending_consent_guidance"] =

@@ -17,6 +17,7 @@ import type { ConnState } from "./contact-handlers.js";
 import type { InboundSessionEvent, ExpiredSessionRequest, RefusedSessionRequest } from "./inbound-sessions.js";
 import { resolveNamedAgent } from "./resolve-named-agent.js";
 import type { AgentInfo } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface NotificationHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -213,7 +214,7 @@ export function registerNotificationHandlers(deps: NotificationHandlerDeps): voi
     } catch (err: unknown) {
       logger.error("inbox.refusals.read.failed", {
         agentName, connectionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         consequence:
           "the refusal notices could not be read, so this inbox cannot say whether any message was refused. The rest of the inbox is unaffected and is answered normally. Refusals are still being RECORDED; this is a read fault.",
       });

@@ -19,6 +19,7 @@ import { verify } from "@cello-protocol/crypto";
 import type { TypeRegistry, RegistryDocument } from "./type-registry.js";
 import type { IRegistryVersionStore } from "./registry-version-store-db.js";
 import type { IManifestPollScheduler } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface RegistryPollLogger {
   info(event: string, ctx?: Record<string, unknown>): void;
@@ -109,7 +110,7 @@ export async function pollRegistryOverHttp(
     }
     rawBytes = await resp.arrayBuffer();
   } catch (err: unknown) {
-    logger.warn("registry.poll.failed", { reason: "registry_http_unreachable", directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.warn("registry.poll.failed", { reason: "registry_http_unreachable", directoryUrl, correlationId, error: extractErrorMessage(err) });
     return { ok: false, reason: "registry_http_unreachable" };
   }
 
@@ -158,7 +159,7 @@ export async function pollRegistryOverHttp(
     logger.info("registry.poll.success", { oldVersion, newVersion: version, directoryUrl, correlationId });
     return { ok: true, adopted: true, oldVersion, newVersion: version };
   } catch (err: unknown) {
-    logger.error("registry.poll.failed", { reason: "registry_store_error", version, directoryUrl, correlationId, error: err instanceof Error ? err.message : String(err) });
+    logger.error("registry.poll.failed", { reason: "registry_store_error", version, directoryUrl, correlationId, error: extractErrorMessage(err) });
     return { ok: false, reason: "registry_store_error" };
   }
 }
@@ -185,7 +186,7 @@ export function startRegistryPoll(
       registryPubkey,
       logger,
     }).catch((err: unknown) => {
-      logger.error("registry.poll.failed", { reason: "registry_poll_unexpected_error", directoryUrl, error: err instanceof Error ? err.message : String(err) });
+      logger.error("registry.poll.failed", { reason: "registry_poll_unexpected_error", directoryUrl, error: extractErrorMessage(err) });
     });
     if (!stopped) scheduler.scheduleNext(tick);
   };

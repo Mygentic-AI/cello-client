@@ -43,6 +43,7 @@ import {
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
+import { extractErrorMessage } from "./error-message.js";
 
 const DB_KEY_BYTES = 32; // AES-256
 
@@ -257,7 +258,7 @@ export function loadSignalModule(): SignalModule {
   try {
     return require("@signalapp/sqlcipher") as SignalModule;
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     throw new DbEncryptionError(
       "db_sqlcipher_unavailable",
       `SQLCipher native module unavailable: ${reason}`,
@@ -283,7 +284,7 @@ export function openEncryptedDatabase(
   try {
     inner = new Ctor(dbPath);
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     throw new DbEncryptionError("db_open_failed", reason, `Could not open the database file at ${dbPath}.`);
   }
 
@@ -305,7 +306,7 @@ export function openEncryptedDatabase(
     }
     // Do NOT echo the underlying SQLITE message into guidance verbatim, and log nothing here (the
     // caller logs). No key material may appear in the message.
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     throw new DbEncryptionError(
       "db_encryption_key_mismatch",
       `database did not decrypt with the supplied key (${reason})`,
@@ -322,7 +323,7 @@ export function openEncryptedDatabase(
       logger?.warn("persist.db.wal.unavailable", { mode: String(mode) });
     }
   } catch (err: unknown) {
-    logger?.warn("persist.db.wal.unavailable", { error: err instanceof Error ? err.message : String(err) });
+    logger?.warn("persist.db.wal.unavailable", { error: extractErrorMessage(err) });
   }
 
   // WAIT FOR A BUSY LOCK INSTEAD OF FAILING THE WRITE INSTANTLY.
@@ -341,7 +342,7 @@ export function openEncryptedDatabase(
   try {
     inner.pragma("busy_timeout=5000");
   } catch (err: unknown) {
-    logger?.warn("persist.db.busy_timeout.unavailable", { error: err instanceof Error ? err.message : String(err) });
+    logger?.warn("persist.db.busy_timeout.unavailable", { error: extractErrorMessage(err) });
   }
 
   // M10-D19: FOREIGN KEY enforcement. SQLite defaults this OFF — and with it off, a declared

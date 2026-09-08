@@ -12,6 +12,7 @@ import { Buffer } from "node:buffer";
 import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 import { verify as ed25519Verify } from "@cello-protocol/crypto";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { extractErrorMessage } from "./error-message.js";
 
 export type SealLeafVerifyReason = "nonce_mismatch" | "leaf_count_mismatch" | "leaf_signature_invalid";
 
@@ -138,7 +139,7 @@ export function verifyCounterpartySealLeaf(opts: {
     return {
       ok: false,
       reason: "leaf_signature_invalid",
-      error: verifyErr instanceof Error ? verifyErr.message : String(verifyErr),
+      error: extractErrorMessage(verifyErr),
     };
   }
 }

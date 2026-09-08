@@ -28,6 +28,7 @@ import { frameValueToHex, normalizeLegibility } from "./frame-values.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { DbRegistrationPersistence } from "./db-identity-store.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * M7-SESSION-004: the bilateral seal resolves with the sealed_root AND the legibility certificate.
@@ -161,7 +162,7 @@ function keepCertifiedLeafSet(
       sessionId: sidHex,
       agentName,
       path,
-      reason: error instanceof Error ? error.message : String(error),
+      reason: extractErrorMessage(error),
       impact: "no inclusion proof can be issued for this session; the sealed receipt is unaffected",
     });
   }
@@ -545,7 +546,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           } catch (error) {
             logger.warn("seal.certificate.persist.failed", {
               sessionId: sidHex,
-              reason: error instanceof Error ? error.message : String(error),
+              reason: extractErrorMessage(error),
             });
           }
           keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "bilateral");
@@ -564,7 +565,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         catch (err: unknown) {
           logger.error("session.seal.status.write.threw", {
             sessionId: sidHex, agentName,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
           });
         }
@@ -770,7 +771,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
           } catch (error) {
             logger.warn("seal.certificate.persist.failed", {
               sessionId: sidHex,
-              reason: error instanceof Error ? error.message : String(error),
+              reason: extractErrorMessage(error),
             });
           }
           keepCertifiedLeafSet({ logger, sessionNodeManager }, agentName, sidHex, frame, rootHex, "unilateral");
@@ -795,7 +796,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         } catch (err: unknown) {
           logger.error("session.seal.status.write.threw", {
             sessionId: sidHex, agentName,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
           });
         }
@@ -882,7 +883,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
             }
           }
         } catch (error) {
-          logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });
+          logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: extractErrorMessage(error) });
         }
       }
     } finally {
@@ -924,7 +925,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
         sessionNodeManager.recordSealCertificate(agentName, sidHex, stored.sealed_root, JSON.stringify(upgraded));
         logger.info("session.seal.receipt.upgraded", { sessionId: sidHex, agentName, party: result.party });
       } catch (error) {
-        logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: error instanceof Error ? error.message : String(error) });
+        logger.warn("seal.certificate.persist.failed", { sessionId: sidHex, reason: extractErrorMessage(error) });
       }
     }
     // STATUS FIRST — same reason as the two sites above.
@@ -932,7 +933,7 @@ export function createSealCoordinator(deps: SealCoordinatorDeps) {
     catch (err: unknown) {
       logger.error("session.seal.status.write.threw", {
         sessionId: sidHex, agentName,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "the seal COMPLETED and the certificate is stored, but this row still reads interrupted",
       });
     }

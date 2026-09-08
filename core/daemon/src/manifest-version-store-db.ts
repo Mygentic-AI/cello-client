@@ -14,6 +14,7 @@
 import type { IManifestVersionStore } from "@cello-protocol/transport";
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Idempotent schema for the singleton manifest-version row. */
 export function ensureManifestSchema(db: DaemonDatabase): void {
@@ -56,8 +57,8 @@ export class DbManifestVersionStore implements IManifestVersionStore {
     } catch (err: unknown) {
       // AC-012: a distinct, actionable failure — never a silent no-op (a lost anti-rollback version
       // would re-open a manifest-downgrade window).
-      this.#logger.error("persist.manifest.persist.failed", { version, error: err instanceof Error ? err.message : String(err) });
-      const e = new Error(`manifest_persist_failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.#logger.error("persist.manifest.persist.failed", { version, error: extractErrorMessage(err) });
+      const e = new Error(`manifest_persist_failed: ${extractErrorMessage(err)}`);
       (e as Error & { code?: string }).code = "manifest_persist_failed";
       throw e;
     }

@@ -19,6 +19,7 @@ import type { SessionQueries } from "./session-queries.js";
 import type { SessionRecords } from "./session-records.js";
 import type { SessionTree, WritableSessionTreeLeafKind } from "./session-tree.js";
 import type { SentAuthorship } from "./session-node-types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * One piece of content held behind an ordering gap.
@@ -153,7 +154,7 @@ export class HeldContent {
       this.#ctx.logger.error("session.content.held.restore.failed", {
         agentName, sessionId,
         impact: "verified content held before the restart is not in memory and cannot be released",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return;
     }
@@ -387,7 +388,7 @@ export class HeldContent {
       this.#ctx.logger.error("session.content.held.annex.scan.failed", {
         agentName, sessionId, status,
         impact: "held frames for a terminal session were not moved to the annex and remain unreadable",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return;
     }

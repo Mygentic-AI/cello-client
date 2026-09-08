@@ -40,6 +40,7 @@ import {
 } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 const SIGNALING_PROTOCOL_ID = "/cello/signaling/1.0.0";
 const AUTH_DOMAIN_DIR = "CELLO-DIR-AUTH-v1";
@@ -55,7 +56,7 @@ function toU8(v: unknown): Uint8Array {
 }
 
 function errMsg(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  return extractErrorMessage(err);
 }
 
 async function nextWithTimeout<T>(iter: AsyncIterator<T>, timeoutMs: number): Promise<IteratorResult<T>> {

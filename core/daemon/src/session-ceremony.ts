@@ -34,6 +34,7 @@ import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { SignalingSeam } from "./registration-context.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * WIRE-002: answer the directory's `session_offer` on a per-agent signaling stream. When an
@@ -94,7 +95,7 @@ export function wireSessionOfferHandler(deps: {
       deps.logger.warn("session.offer.reject.failed", {
         agentName: deps.agentName,
         reason,
-        detail: err instanceof Error ? err.message : String(err),
+        detail: extractErrorMessage(err),
       });
     }
   }
@@ -211,7 +212,7 @@ export function wireSessionOfferHandler(deps: {
       } catch (err: unknown) {
         deps.logger.warn("session.offer.accept.failed", {
           agentName: deps.agentName,
-          detail: err instanceof Error ? err.message : String(err),
+          detail: extractErrorMessage(err),
         });
       }
     })();
@@ -309,7 +310,7 @@ async function hydrateShareAndStubs(
     deps.logger.error("session.ceremony.share.load.failed", {
       agentName: deps.agentName,
       reason: "cbor_deserialize_failed",
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
     return null;
   }
@@ -327,7 +328,7 @@ async function hydrateShareAndStubs(
     deps.logger.error("session.ceremony.share.load.failed", {
       agentName: deps.agentName,
       reason: "storeDkgResult_failed",
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
     return null;
   }
@@ -439,7 +440,7 @@ export async function runAgentRefresh(
   } catch (err: unknown) {
     deps.logger.error("refresh.ceremony.failed", {
       agentName: deps.agentName,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
     return { ok: false, reason: "ceremony_failed" };
   }
@@ -489,7 +490,7 @@ export async function runAgentRefresh(
   } catch (err: unknown) {
     deps.logger.error("refresh.ceremony.persist_failed", {
       agentName: deps.agentName,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
     return { ok: false, reason: "persist_failed" };
   }
@@ -688,7 +689,7 @@ export function wireSealCeremonyHandler(deps: CeremonyWiringDeps): () => void {
         deps.logger.warn("session.seal.ceremony.failed", {
           agentName: deps.agentName,
           sessionId: sidHex,
-          detail: err instanceof Error ? err.message : String(err),
+          detail: extractErrorMessage(err),
         });
         deps.recordSealFailure(deps.agentName, sidHex, "seal_ceremony_threw");
         return;
@@ -767,7 +768,7 @@ export async function sendSealFrostSignature(
     deps.logger.warn("session.seal.frost.signature.send.failed", {
       agentName: deps.agentName,
       sessionId: sidHex,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
   }
 }
@@ -812,7 +813,7 @@ export async function verifyUnilateralCertificate(
   } catch (err: unknown) {
     deps.logger.warn("session.unilateral.certificate.share.decode.failed", {
       agentPubkey: deps.agentPubkeyHex,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     });
     return { ok: false, reason: "share_decode_failed" };
   }
@@ -951,7 +952,7 @@ export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void
         } catch (err: unknown) {
           deps.logger.warn("session.ceremony.reply.failed", {
             agentName: deps.agentName,
-            detail: err instanceof Error ? err.message : String(err),
+            detail: extractErrorMessage(err),
           });
         }
       };
@@ -990,7 +991,7 @@ export function wireSessionCeremonyHandler(deps: CeremonyWiringDeps): () => void
       } catch (err: unknown) {
         deps.logger.warn("session.ceremony.failed", {
           agentName: deps.agentName,
-          detail: err instanceof Error ? err.message : String(err),
+          detail: extractErrorMessage(err),
         });
         await reply(null);
       }

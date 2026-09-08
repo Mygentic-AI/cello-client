@@ -26,6 +26,7 @@ import { DaemonRegistrationContext } from "./registration-context.js";
 import { RegistrationManager } from "./registration-manager.js";
 import { validatorNodes } from "@cello-protocol/protocol-types";
 import { classifyManifestValidity } from "./manifest-validity.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface RegisterHandlerDeps {
   handlers: Map<string, IpcHandler>;
@@ -283,7 +284,7 @@ export function registerRegisterHandler(deps: RegisterHandlerDeps): void {
           logger.warn("registration.user_link.capture_failed", {
             agentName: name,
             agentId: result.agent_id,
-            error: linkErr instanceof Error ? linkErr.message : String(linkErr),
+            error: extractErrorMessage(linkErr),
           });
           logger.info("registration.succeeded", { agentName: name, agentId: result.agent_id, primaryPubkey: result.primary_pubkey });
           return {

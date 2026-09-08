@@ -19,6 +19,7 @@ import type { ConsortiumNode } from "@cello-protocol/protocol-types";
 import { BUNDLED_CONSORTIUM_MANIFEST } from "./bundled-consortium-manifest.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Production directory HTTP endpoint — the cold-boot fallback when CELLO_DIRECTORY_URL is unset.
@@ -137,7 +138,7 @@ function classifyFetchError(err: unknown): { reason: BootstrapFailureReason; det
     if (DNS_CODES.has(code)) return { reason: "dns_error", detail: code };
     return { reason: "connect_error", detail: code };
   }
-  return { reason: "connect_error", detail: err instanceof Error ? err.message : String(err) };
+  return { reason: "connect_error", detail: extractErrorMessage(err) };
 }
 
 /**
@@ -255,7 +256,7 @@ async function probeOnce(directoryUrl: string, fetchFn: typeof fetch, timeoutMs:
         // rather than growing a second opinion about the same error.
         return { ok: false, reason: "timeout", detail: classified.detail ?? "aborted reading the response body" };
       }
-      return { ok: false, reason: "bad_response", detail: err instanceof Error ? err.message : String(err) };
+      return { ok: false, reason: "bad_response", detail: extractErrorMessage(err) };
     }
     if (typeof json.multiaddr === "string" && json.multiaddr.includes("/p2p/")) {
       return { ok: true, multiaddr: json.multiaddr };

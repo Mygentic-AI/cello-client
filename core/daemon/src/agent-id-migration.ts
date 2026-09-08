@@ -42,6 +42,7 @@
 
 import type { Logger } from "./types.js";
 import { withForeignKeysOff, type DaemonDatabase } from "./sqlcipher-db.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** A table that must be re-keyed, with the exact shape it is re-keyed TO. */
 interface RekeyTarget {
@@ -386,7 +387,7 @@ export function migrateSessionTablesToAgentId(db: DaemonDatabase, logger: Logger
   } catch (err) {
     logger.error("daemon.migration.agent_id_backfill.failed", {
       tables: pending.map((t) => t.table),
-      reason: err instanceof Error ? err.message : String(err),
+      reason: extractErrorMessage(err),
     });
     throw err;
   }
@@ -497,7 +498,7 @@ export function migrateSessionTablesToAgentId(db: DaemonDatabase, logger: Logger
       }
       logger.error("daemon.migration.agent_id_backfill.failed", {
         tables: pending.map((t) => t.table),
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
       });
       throw err;
     }

@@ -12,6 +12,7 @@
  */
 import type { Logger } from "./types.js";
 import { REVIVAL_WINDOW_MS, REVIVAL_BOUND_SWEEP_MS, type SessionNodeManager } from "./session-node-manager.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface BootSweepsDeps {
   logger: Logger;
@@ -43,7 +44,7 @@ export function startBootSweeps(deps: BootSweepsDeps) {
       .closeExpiredUnrevivableSessions(Date.now(), REVIVAL_WINDOW_MS)
       .catch((err: unknown) => {
         logger.warn("session.revival_bound.sweep.failed", {
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           impact: "expired sessions were not closed this pass and still accept content",
         });
       });

@@ -38,6 +38,7 @@ import type { HeldContent, HeldEntry } from "./held-content.js";
 import type { SessionLeafRecords } from "./session-leaf-records.js";
 import type { StandingReceivers } from "./standing-receivers.js";
 import type { ActiveSessionEntry } from "./session-node-types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** What the seal path needs from the manager. */
 export interface SessionSealContext {
@@ -521,7 +522,7 @@ export class SessionSeal {
     } catch (err: unknown) {
       this.#ctx.logger.error("session.interrupted.db.write.failed", {
         sessionId: opts.sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }
@@ -598,7 +599,7 @@ export class SessionSeal {
         this.#ctx.logger.warn("session.seal.transport.release_failed", {
           agentName,
           sessionId,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
           impact: "a detached seal relay client could not be released; it is held until process exit",
         });
       }
@@ -831,7 +832,7 @@ export class SessionSeal {
       } catch (err: unknown) {
         this.#ctx.logger.debug("session.state.notify.failed", {
           sessionId,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
         });
       }
       return;
@@ -855,7 +856,7 @@ export class SessionSeal {
         this.#ctx.logger.warn("session.seal.autoack.broker.failed", {
           sessionId,
           correlationId,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
         });
       }
       const submitted = await this.submitSealLeaf(agentName, sessionId, correlationId);
@@ -906,7 +907,7 @@ export class SessionSeal {
       .catch((err: unknown) => {
         this.#ctx.logger.warn("session.seal.autoack.skipped", {
           sessionId,
-          reason: err instanceof Error ? err.message : String(err),
+          reason: extractErrorMessage(err),
           correlationId,
         });
       });

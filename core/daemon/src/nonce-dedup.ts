@@ -43,6 +43,7 @@
 
 import type { DaemonDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** LRU cap per outline.md Resource Caps. */
 export const NONCE_DEDUP_CAP = 10_000;
@@ -172,7 +173,7 @@ export class NonceDedupStore {
       this.#logger.error("message.nonce.persist.failed", {
         sessionId,
         nonce: nonceHex,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
 
@@ -198,7 +199,7 @@ export class NonceDedupStore {
       this.#logger.error("message.nonce.persist.failed", {
         sessionId,
         nonce: "eviction_query",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
 
@@ -223,7 +224,7 @@ export class NonceDedupStore {
       this.#logger.error("message.nonce.persist.failed", {
         sessionId,
         nonce: oldestHex,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
 

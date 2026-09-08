@@ -60,6 +60,7 @@ export type DocumentEnvelopeKind = "update" | "withdrawal" | "rejection";
  */
 export type { DocumentProperties } from "@cello-protocol/protocol-types";
 import type { DocumentProperties } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface DocumentRow {
   documentId: string;
@@ -476,7 +477,7 @@ export class DocumentStore {
         envelope.documentId,
       );
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = extractErrorMessage(err);
       // SQLite says "FOREIGN KEY constraint failed" and nothing else — not which document, not
       // which owner, not that a `documents` row is missing. That is the message an operator meets
       // when an envelope arrives before its document exists, so it has to name its own cause.

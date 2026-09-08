@@ -58,6 +58,7 @@ import { GatewayConfigStore, GatewayRecordStore, type ConfigDirection } from "@c
 import type { IpcHandler } from "./ipc-server.js";
 import type { Logger } from "./types.js";
 import { dbKeyPathFor } from "./sqlcipher-db.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** The five keys the gateway reads. Kept here so the surface can list them without a store open. */
 export const GATEWAY_CONFIG_KEYS = [
@@ -207,7 +208,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       // may never have run. "Check the daemon log" while writing nothing to the daemon log is a
       // dead end, and the project's error-path-coverage rule exists for exactly this.
       logger.error("gateway.config.store_unavailable", {
-        reason: code, error: err instanceof Error ? err.message : String(err), store: "config",
+        reason: code, error: extractErrorMessage(err), store: "config",
       });
       return { ok: false, reason: code, guidance };
     }
@@ -217,7 +218,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       // The store validates too, and it THROWS. A validation fault is the caller's input being
       // wrong, not the daemon being broken — surfacing it as `internal_error` sends the operator
       // to the logs for a problem they can fix in the command they just typed.
-      const message = err instanceof Error ? err.message : String(err);
+      const message = extractErrorMessage(err);
       if (/invalid value for config key|unknown config key/i.test(message)) {
         return { ok: false, reason: "invalid_value", guidance: message };
       }
@@ -318,7 +319,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
       // Review M4, and worse here than for config: an unopenable RECORD store means the audit trail
       // itself is unreadable, which is the one failure that must never be quiet.
       logger.error("gateway.config.store_unavailable", {
-        reason: code, error: err instanceof Error ? err.message : String(err), store: "records",
+        reason: code, error: extractErrorMessage(err), store: "records",
       });
       return { ok: false, reason: code, guidance };
     }
@@ -347,7 +348,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
         chainValid: store.verifyChain(),
       };
     } catch (err: unknown) {
-      return storeFault(err instanceof Error ? err.message : String(err));
+      return storeFault(extractErrorMessage(err));
     }
   });
 
@@ -446,7 +447,7 @@ export function registerGatewayConfigHandlers(deps: GatewayConfigHandlerDeps): G
         (err: unknown) => {
           // STORED BUT NOT APPLIED. Never a bare ok: the operator would believe a guard changed
           // when the running gateway still holds the old value.
-          const error = err instanceof Error ? err.message : String(err);
+          const error = extractErrorMessage(err);
           logger.error("gateway.config.restart_failed", { key: k, error, correlationId });
           return {
             ...base,

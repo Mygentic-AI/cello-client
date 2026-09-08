@@ -23,6 +23,7 @@ import type { DaemonRegistrationPersistence } from "./registration-persistence.j
 import type { Logger } from "./types.js";
 import type { CelloNode } from "@cello-protocol/transport";
 import type { KeyProvider } from "@cello-protocol/crypto";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Result of attempting to send a frame over the daemon's directory signaling stream. */
 export interface SignalingSendResult {
@@ -116,7 +117,7 @@ export class RegistrationManager {
       return true;
     } catch (err: unknown) {
       this.#ctx.logger.error("persist.identity.persist.failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return false;
     }
@@ -452,7 +453,7 @@ export class RegistrationManager {
       // one exit-point label standing in for a dozen unrelated causes, sending them to debug FROST
       // when the cause was a duplicate nodeId in a manifest or an unreachable node.
       this.#ctx.logger.error("registration.dkg.failed", {
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
         // WHICH registration and WHICH nodes. `reason` alone cannot be acted on: on a multi-agent
         // daemon the operator cannot tell which agent failed, and a nested
         // "dkgRound2: no response received" does not say from whom. These are also what let this line
@@ -465,7 +466,7 @@ export class RegistrationManager {
       });
       // The cause travels WITH the code. `dkg_failed` is the closed protocol union the wire needs;
       // `detail` is what lets the operator-facing guidance say which failure it actually was.
-      return { error: "dkg_failed", detail: err instanceof Error ? err.message : String(err) };
+      return { error: "dkg_failed", detail: extractErrorMessage(err) };
     }
     // SI-003/AC-005: AWAIT the share persist (was fire-and-forget) before register reports success —
     // so a register-success guarantees the share is durably committed (no can't-sign zombie).

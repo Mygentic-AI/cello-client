@@ -25,6 +25,7 @@ import { readFileSync } from "node:fs";
 import type { ConsortiumManifest } from "@cello-protocol/protocol-types";
 import { verifyManifest, type ConsortiumManifestInput } from "@cello-protocol/crypto";
 import type { IManifestProvider } from "@cello-protocol/transport";
+import { extractErrorMessage } from "./error-message.js";
 
 export class ManifestLoadError extends Error {
   readonly reason: string;
@@ -53,14 +54,14 @@ export class FileManifestProvider implements IManifestProvider {
     try {
       raw = readFileSync(this.#path, "utf8");
     } catch (err: unknown) {
-      throw new ManifestLoadError("manifest_unreadable", err instanceof Error ? err.message : String(err));
+      throw new ManifestLoadError("manifest_unreadable", extractErrorMessage(err));
     }
 
     let parsed: ConsortiumManifest;
     try {
       parsed = JSON.parse(raw) as ConsortiumManifest;
     } catch (err: unknown) {
-      throw new ManifestLoadError("manifest_malformed", err instanceof Error ? err.message : String(err));
+      throw new ManifestLoadError("manifest_malformed", extractErrorMessage(err));
     }
 
     // Threshold officer-signature verification (RFC 8032). verifyManifest also

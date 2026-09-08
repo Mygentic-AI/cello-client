@@ -20,6 +20,7 @@ import { boundSettingKey, settableTierName, isValidSettingKey } from "./agent-se
 import { MONIKER_RE, validateMoniker } from "@cello-protocol/protocol-types";
 import { type TranscriptEntry, UNREAD_RECEIVED_WHERE, TERMINAL_STATUSES } from "./session-node-types.js";
 import { quarantineRedaction } from "./quarantine-framing.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** What this module needs from the manager, stated explicitly rather than handed `this`. */
 export interface SessionRecordsContext {
@@ -599,7 +600,7 @@ export class SessionRecords {
       const level = direction === "sent" ? "warn" : "error";
       this.#ctx.logger[level]("transcript.message.record.failed", {
         sessionId, agentName, sequence, direction,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
         correlationId,
         ...(direction === "received" ? { impact: "content_undeliverable_message_lost" } : {}),
         ...(direction === "quarantined" ? { impact: "refused_message_not_retained_no_other_copy_exists" } : {}),

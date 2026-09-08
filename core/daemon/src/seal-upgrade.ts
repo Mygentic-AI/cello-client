@@ -14,6 +14,7 @@ import type { KeyProvider } from "@cello-protocol/crypto";
 import type { Logger } from "./types.js";
 import { verifyUnilateralCertificate } from "./session-ceremony.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Domain separator for the upgrade-ack TBS. B's daemon and the directory MUST build byte-identical
@@ -181,7 +182,7 @@ export async function attemptSealUpgrade(
   } catch (err: unknown) {
     deps.logger.warn("session.seal.upgrade.refused", {
       sessionId: sessionIdHex,
-      reason: err instanceof Error ? err.message : String(err),
+      reason: extractErrorMessage(err),
     });
     return { sent: false, reason: "exception" };
   }

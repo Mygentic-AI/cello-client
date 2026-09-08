@@ -458,7 +458,7 @@ export class SessionRelay {
         } catch (err: unknown) {
           this.#ctx.logger.warn("session.relay.endpoint.persist.failed", {
             sessionId,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
           });
         }
       } else {
@@ -496,7 +496,7 @@ export class SessionRelay {
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.relay.connect.error", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         correlationId,
       });
     }
@@ -1604,7 +1604,7 @@ export class SessionRelay {
       this.#ctx.logger.warn("session.revive.relay.failed", {
         agentName,
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "the session is back but without its witness — delivery falls back to the periodic poll",
       });
     }

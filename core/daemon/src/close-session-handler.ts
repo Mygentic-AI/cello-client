@@ -54,6 +54,7 @@ import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TI
 import { describeSealCommitted } from "./close-commitment.js";
 import type { DirectoryEndpoint } from "./signaling-connect.js";
 import type { ConsortiumEndpoint } from "./directory-bootstrap.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface CloseSessionDeps {
   handlers: Map<string, IpcHandler>;
@@ -580,7 +581,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
       } catch (err: unknown) {
         logger.warn("session.abandon.notice.threw", {
           agentName: record.agent_name, sessionId, correlationId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
           impact: "the counterparty was not told and may keep calling; the abandon itself proceeds",
         });
       }
@@ -667,7 +668,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // is the same answer we would have given anyway, and it is still the honest one.
         logger.warn("session.seal.readiness.drain.failed", {
           agentName: record.agent_name, sessionId,
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     }
@@ -947,7 +948,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         // Release the transient connection; the seal result stands either way.
         if (sealBrokerConn) {
           try { await sealBrokerConn.stop("seal-complete"); }
-          catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+          catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: extractErrorMessage(err) }); }
         }
         sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
       }
@@ -1280,7 +1281,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           } finally {
             if (sealBrokerConn) {
               try { await sealBrokerConn.stop("seal-complete"); }
-              catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId: sid, reason: err instanceof Error ? err.message : String(err) }); }
+              catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId: sid, reason: extractErrorMessage(err) }); }
               sealBrokerConn = null;
             }
             sealInterruptedInProgress.delete(sealKey(rec.agent_name, sid));
@@ -1349,10 +1350,10 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
           (err: unknown) => {
             // RECORDED FOR THE RESPONSE, not only the log. The caller already holds `ok: true`, so a
             // failure that lives only in daemon.log is one the agent has no way to discover.
-            sealFailures.record(rec.agent_name, sid, err instanceof Error ? err.message : String(err), new Date().toISOString(), "threw");
+            sealFailures.record(rec.agent_name, sid, extractErrorMessage(err), new Date().toISOString(), "threw");
             logger.error("session.seal.background.failed", {
             sessionId: sid, agentName: rec.agent_name, correlationId,
-            error: err instanceof Error ? err.message : String(err),
+            error: extractErrorMessage(err),
             impact: "the close already answered ok; the notarization did NOT complete and no receipt exists.",
             guidance: "The commitment is durable — a daemon restart resolves it via the restart seal resolver.",
             });
@@ -1369,7 +1370,7 @@ export function registerCloseSessionHandler(deps: CloseSessionDeps): void {
         if (!handedOff) {
           if (sealBrokerConn) {
             try { await sealBrokerConn.stop("seal-complete"); }
-            catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: err instanceof Error ? err.message : String(err) }); }
+            catch (err: unknown) { logger.warn("session.seal.broker.release_failed", { sessionId, reason: extractErrorMessage(err) }); }
           }
           sealInterruptedInProgress.delete(sealKey(record.agent_name, sessionId));
         }

@@ -29,6 +29,7 @@ import { wireSessionCeremonyHandler, wireSealCeremonyHandler } from "./session-c
 import { TrustSignalStore } from "./trust-signal-store.js";
 import { TIER } from "./contacts-tier-migration.js";
 import { encodeTrustSignalEnvelope, hashTrustSignalEnvelope } from "@cello-protocol/protocol-types";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface OutboundSessionDeps {
   logger: Logger;
@@ -280,7 +281,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
     } catch (err: unknown) {
       logger.warn("moniker.outbound.read_failed", {
         agentName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
         correlationId,
       });
       moniker = undefined;
@@ -438,7 +439,7 @@ export function createOutboundSessions(deps: OutboundSessionDeps) {
       // either, because the next reader trusts it instead of the code.
       logger.warn("signal.presentation.read_failed", {
         agentName,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
         correlationId,
       });
       trustSignals = undefined;

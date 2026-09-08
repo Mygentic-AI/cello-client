@@ -50,6 +50,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { openEncryptedDatabase, dbKeyPathFor } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Write 0600, fsync, rename — and fsync the directory so the rename itself survives a power loss.
@@ -196,7 +197,7 @@ export async function createBackup(opts: {
 
     return { ok: true, path: opts.outPath, bytes: packed.length, guidance: SENSITIVITY };
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     opts.logger.error("agent.backup.failed", { path: opts.outPath, reason });
     return {
       ok: false,
@@ -237,7 +238,7 @@ async function parseArchive(
   try {
     raw = await readFile(archivePath);
   } catch (err: unknown) {
-    return { ok: false, reason: `archive_unreadable: ${err instanceof Error ? err.message : String(err)}` };
+    return { ok: false, reason: `archive_unreadable: ${extractErrorMessage(err)}` };
   }
 
   let json: string;
@@ -345,7 +346,7 @@ export async function restoreBackup(opts: {
     await writeFileDurably(opts.dbPath, parsed.dbBytes);
     await writeFileDurably(keyPath, parsed.keyBytes);
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     opts.logger.error("agent.restore.failed", { archivePath: opts.archivePath, reason });
     return {
       ok: false,
@@ -359,7 +360,7 @@ export async function restoreBackup(opts: {
     const db = openEncryptedDatabase(opts.dbPath, new Uint8Array(parsed.keyBytes));
     db.close();
   } catch (err: unknown) {
-    const reason = err instanceof Error ? err.message : String(err);
+    const reason = extractErrorMessage(err);
     opts.logger.error("agent.restore.unopenable", { dbPath: opts.dbPath, reason });
     return {
       ok: false,

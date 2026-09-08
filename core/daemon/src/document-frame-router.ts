@@ -78,6 +78,7 @@ import {
 } from "@cello-protocol/protocol-types";
 import type { DocumentInbound } from "./document-inbound.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * What the session layer should do with the frame.
@@ -355,13 +356,13 @@ export class DocumentFrameRouter {
           } catch (err: unknown) {
             this.#d.logger.warn("document.notice.failed", {
               correlationId,
-              reason: err instanceof Error ? err.message : String(err),
+              reason: extractErrorMessage(err),
             });
           }
           void this.#d.rewriteFile(ownerAgentId, content).catch((err: unknown) => {
             this.#d.logger.warn("document.file.rewrite_threw", {
               correlationId,
-              reason: err instanceof Error ? err.message : String(err),
+              reason: extractErrorMessage(err),
             });
           });
         }
@@ -379,7 +380,7 @@ export class DocumentFrameRouter {
               .catch((err: unknown) => {
                 this.#d.logger.warn("document.rejection.send_threw", {
                   correlationId,
-                  reason: err instanceof Error ? err.message : String(err),
+                  reason: extractErrorMessage(err),
                 });
               });
           }
@@ -420,7 +421,7 @@ export class DocumentFrameRouter {
       this.#d.logger.error("document.frame.handler_threw", {
         kind,
         correlationId,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: extractErrorMessage(err),
       });
       return { consumed: true, kind, ok: false, reason: "document_frame_handler_threw" };
     }

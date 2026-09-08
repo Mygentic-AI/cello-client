@@ -50,6 +50,7 @@ import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { loadSignalModule, type SignalDatabase } from "./sqlcipher-db.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** The file the kernel lock is taken on. Holds no data — see the note above. */
 export const SINGLETON_LOCK_FILENAME = "daemon.singleton";
@@ -142,7 +143,7 @@ function openLockDb(lockDbPath: string): SignalDatabase {
     // The file could not be opened at all (permissions, unwritable dir). NOT a contended lock —
     // never let this be mistaken for "a daemon is running".
     throw new Error(
-      `Could not open the daemon singleton lock at ${lockDbPath}: ${err instanceof Error ? err.message : String(err)}`,
+      `Could not open the daemon singleton lock at ${lockDbPath}: ${extractErrorMessage(err)}`,
     );
   }
 }
@@ -171,7 +172,7 @@ export function acquireSingletonLock(
     // Some other SQLite failure. Keep the frame — a bare SQLITE_* error here reads as a database
     // problem, when what actually failed was taking the singleton lock.
     throw new Error(
-      `Could not take the daemon singleton lock at ${lockDbPath}: ${err instanceof Error ? err.message : String(err)}`,
+      `Could not take the daemon singleton lock at ${lockDbPath}: ${extractErrorMessage(err)}`,
       { cause: err },
     );
   }
@@ -187,7 +188,7 @@ export function acquireSingletonLock(
         db.close();
       } catch (err: unknown) {
         logger.warn("daemon.singleton.release.failed", {
-          error: err instanceof Error ? err.message : String(err),
+          error: extractErrorMessage(err),
         });
       }
     },
@@ -232,7 +233,7 @@ export function probeSingletonLock(celloDir: string, logger: Logger): "held" | "
   } catch (err: unknown) {
     if (err instanceof DaemonAlreadyRunningError) return "held";
     logger.warn("daemon.singleton.probe.failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: extractErrorMessage(err),
     });
     return "unknown";
   }

@@ -24,6 +24,7 @@ import { migrateContactsAddTierMetadata } from "./contacts-tier-migration.js";
 import { migrateCborBlobsToCanonical } from "./cbor-blob-migration.js";
 import { foldContactPubkeyCase } from "./contact-pubkey-case.js";
 import { ensureTrustSignalSchema } from "./trust-signal-store.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * Create every session-store table and apply every additive migration.
@@ -186,7 +187,7 @@ export function ensureSessionSchema(
       // already exists from a prior init). Any other failure — disk full,
       // SQLITE_LOCKED, corruption — must propagate, otherwise the daemon would
       // run without these columns and later silently read undefined.
-      const msg = err instanceof Error ? err.message : String(err);
+      const msg = extractErrorMessage(err);
       if (!msg.includes("duplicate column name")) throw err;
     }
   }
@@ -370,7 +371,7 @@ export function ensureSessionSchema(
   try {
     db.exec("ALTER TABLE held_content ADD COLUMN origin TEXT NOT NULL DEFAULT 'received'");
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = extractErrorMessage(err);
     if (!/duplicate column name/i.test(msg)) throw err;
   }
   // DOD-M12B-INDEX-1: and the LEAF KIND. `#releaseHeld` used to append every held frame as "msg",
@@ -380,7 +381,7 @@ export function ensureSessionSchema(
   try {
     db.exec("ALTER TABLE held_content ADD COLUMN leaf_kind TEXT NOT NULL DEFAULT 'msg'");
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = extractErrorMessage(err);
     if (!/duplicate column name/i.test(msg)) throw err;
   }
 
@@ -727,7 +728,7 @@ export function ensureSessionSchema(
   try {
     db.exec("ALTER TABLE content_refusal_totals ADD COLUMN seeded INTEGER NOT NULL DEFAULT 0");
   } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = extractErrorMessage(err);
     if (!/duplicate column name/i.test(msg)) throw err;
   }
   db.exec(`

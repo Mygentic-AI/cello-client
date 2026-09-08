@@ -32,6 +32,7 @@ import type { CelloNode } from "@cello-protocol/transport";
 import type { Stream } from "@libp2p/interface";
 import { spawnGatewaySidecar, LocalSidecarGatewayClient, type SpawnedGateway } from "@cello-protocol/gateway";
 import { seedAgents } from "./helpers/seed-agents.js";
+import { extractErrorMessage } from "../error-message.js";
 
 function makeLogger(): Logger { return { debug() {}, info() {}, warn() {}, error() {} }; }
 function msgLeafHash(content: Uint8Array): Uint8Array {
@@ -80,7 +81,7 @@ async function gatewayRecords(dbPath: string, keyPath: string): Promise<Array<{ 
     // `.some(...)).toBe(false)`) would read a store that cannot open as "correctly nothing was
     // recorded". That is the screened-but-unrecorded shape this milestone exists to prevent,
     // reproduced inside its own test helper.
-    throw new Error(`could not read the gateway record store at ${dbPath}: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`could not read the gateway record store at ${dbPath}: ${extractErrorMessage(err)}`);
   }
 }
 

@@ -23,6 +23,7 @@ import { verifyBilateralSealCertificate } from "./session-ceremony.js";
 import type { DaemonRegistrationPersistence } from "./registration-persistence.js";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /** Bounded so a close or a receipt read cannot hang on a directory that never answers. */
 const SEAL_CERTIFICATE_PULL_TIMEOUT_MS = 10_000;
@@ -226,7 +227,7 @@ export async function pullSealCertificate(
     } catch (error) {
       logger.warn("seal.certificate.persist.failed", {
         sessionId: sessionIdHex,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: extractErrorMessage(error),
       });
     }
   }
@@ -256,7 +257,7 @@ export async function pullSealCertificate(
   catch (err: unknown) {
     logger.error("session.seal.status.write.threw", {
       sessionId: sessionIdHex, agentName,
-      error: err instanceof Error ? err.message : String(err),
+      error: extractErrorMessage(err),
       impact: verdict.verified
         ? "the certificate was pulled and verified, but this row still reads interrupted"
         : "the certificate was pulled (signature NOT checked), but this row still reads interrupted",

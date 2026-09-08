@@ -22,6 +22,7 @@
 
 import { readFile, writeFile, rename, stat, unlink } from "node:fs/promises";
 import type { LockFileContent, Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export async function readLock(lockPath: string): Promise<LockFileContent | null> {
   let raw: string;
@@ -68,7 +69,7 @@ export async function removeLock(lockPath: string, logger: Logger): Promise<void
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
       logger.warn("daemon.lock.remove.failed", {
         lockPath,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }

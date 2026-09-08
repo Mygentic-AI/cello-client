@@ -64,6 +64,7 @@
  * ticks. It is the answer to "could this have changed without us noticing", and at five minutes the
  * answer is still usually no.
  */
+import { extractErrorMessage } from "./error-message.js";
 export const ROSTER_STALE_AFTER_MS = 5 * 60_000;
 
 /** How often the background sweep re-measures. Comfortably inside `ROSTER_STALE_AFTER_MS`. */
@@ -293,7 +294,7 @@ export function startRosterSweep(opts: {
       consecutive++;
       onSweepError?.({
         event: "directory.roster.sweep.failed",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         at: new Date(now()).toISOString(),
         consecutive,
       });
@@ -308,7 +309,7 @@ export function startRosterSweep(opts: {
        * is gone, or a node is refusing them.
        */
       logger.error("directory.roster.sweep.failed", {
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact:
           "directory reachability was not re-measured this cycle, so cello_status is answering " +
           "from an older reading. It will say so: a reading past its bound reports stale:true.",

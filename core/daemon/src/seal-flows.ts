@@ -16,6 +16,7 @@ import type { SealInterruptedLeaf } from "@cello-protocol/protocol-types";
 import type { KeyProvider } from "@cello-protocol/crypto";
 import type { SessionNodeManager } from "./session-node-manager.js";
 import type { AgentInfo, Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 /**
  * DOD-FRONTIER-STRAND-1 AC2: a failure may carry the numbers that caused it. `reason` stays the
@@ -618,7 +619,7 @@ export function createSealFlows(deps: SealFlowDeps) {
       logger.error("session.seal.initiate.failed", {
         sessionId,
         reason: "seal_leaf_signing_failed",
-        errorMessage: err instanceof Error ? err.message : String(err),
+        errorMessage: extractErrorMessage(err),
         correlationId,
       });
       return {

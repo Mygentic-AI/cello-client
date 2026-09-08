@@ -278,11 +278,11 @@ export class ParkRecovery {
         sessionId,
         contentHash: contentHashHex,
         ...(coded === null ? {} : { reason: coded.reason, detail: coded.detail }),
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
       return {
         outcome: "refused",
-        cause: coded?.reason ?? (err instanceof Error ? err.message : String(err)),
+        cause: coded?.reason ?? (extractErrorMessage(err)),
       };
     }
   }
@@ -326,7 +326,7 @@ export class ParkRecovery {
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.seal.leaf.recover.failed", {
         sessionId, agentName, reason: "carry_read_failed",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
       });
       return "unknown";
@@ -360,7 +360,7 @@ export class ParkRecovery {
       // unrelated things in the same log event.
       this.#ctx.logger.warn("session.seal.leaf.recover.failed", {
         sessionId, agentName, reason: "seal_root_derivation_threw",
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         impact: "cannot tell whether a SEAL ctrl leaf was already posted, so the close refuses rather than risk a second one",
       });
       return "unknown";

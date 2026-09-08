@@ -35,6 +35,7 @@ import {
   createRosterAwareEndpointResolver,
   type ConsortiumEndpoint,
 } from "./directory-bootstrap.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface ManifestGateDeps {
   manifestProvider?: IManifestProvider;
@@ -224,7 +225,7 @@ export async function verifyStartupManifest(deps: ManifestGateDeps): Promise<Man
     }
   } catch (err: unknown) {
     logger.error("directory.auth.manifest.load.failed", {
-      error: err instanceof Error ? err.message : String(err),
+      error: extractErrorMessage(err),
     });
   }
 

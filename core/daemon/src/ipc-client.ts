@@ -17,6 +17,7 @@
 import { createConnection, type Socket } from "node:net";
 import { randomUUID } from "node:crypto";
 import type { IpcRequest, IpcResponse, IpcResponseError, IpcNotification } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface IpcClient {
   send(method: string, params?: Record<string, unknown>): Promise<unknown>;
@@ -115,7 +116,7 @@ export function connectToDaemon(socketPath: string, opts?: IpcClientOptions): Pr
             }
           }
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = extractErrorMessage(err);
           if (opts?.onFrameError) {
             opts.onFrameError(msg);
           }

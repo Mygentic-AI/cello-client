@@ -24,6 +24,7 @@ import { readLock, removeLock } from "./lock-file.js";
 import { probeSingletonLock, SINGLETON_LOCK_FILENAME, EXIT_ALREADY_RUNNING } from "./singleton-lock.js";
 import { connectToDaemon, type IpcClient } from "./ipc-client.js";
 import type { Logger } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface ConnectResult {
   client: IpcClient;
@@ -121,7 +122,7 @@ async function connectWithRetry(
   const hint = holderPid === null ? "" : ` (daemon.lock names pid ${holderPid}, which may be stale)`;
   throw new Error(
     `A daemon is already running${hint} and holds the singleton lock, but is not answering on ` +
-    `${socketPath} (${lastError instanceof Error ? lastError.message : String(lastError)}). ` +
+    `${socketPath} (${extractErrorMessage(lastError)}). ` +
     "Refusing to start a second daemon beside it — two daemons on one database is the failure this " +
     `prevents. To find the real holder: \`lsof ${join(celloDir, SINGLETON_LOCK_FILENAME)}\`, then stop ` +
     "that process and try again.",

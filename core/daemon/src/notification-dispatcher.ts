@@ -35,6 +35,7 @@
  */
 
 import type { Logger, IpcNotification } from "./types.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export type NotificationSender = (connectionId: string, notification: IpcNotification) => boolean;
 
@@ -232,7 +233,7 @@ export class NotificationDispatcher {
       this.#logger.debug("notification.dispatch.failed", {
         connectionId,
         notificationType,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
       });
     }
   }

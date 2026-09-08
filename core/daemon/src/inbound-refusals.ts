@@ -945,7 +945,7 @@ export class InboundRefusals {
     } catch (err: unknown) {
       this.#ctx.logger.warn("session.content.ordering.decode_failed", {
         sessionId,
-        error: err instanceof Error ? err.message : String(err),
+        error: extractErrorMessage(err),
         correlationId,
       });
     }

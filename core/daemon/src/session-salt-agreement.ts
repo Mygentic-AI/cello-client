@@ -81,6 +81,7 @@
  */
 
 import { deriveSessionSalt, saltFingerprint, SALT_CONTRIBUTION_BYTES } from "@cello-protocol/crypto";
+import { extractErrorMessage } from "./error-message.js";
 
 function isAllZero(b: Uint8Array): boolean {
   let acc = 0;
@@ -613,7 +614,7 @@ export function onPeerSaltFrame(state: {
     return {
       action: "freeze",
       reason: SALT_FREEZE_REASONS.CONTRIBUTION_DEGENERATE,
-      detail: err instanceof Error ? err.message : String(err),
+      detail: extractErrorMessage(err),
     };
   }
 }

@@ -29,6 +29,7 @@ import { sentAuthorship } from "./session-content-handlers.js";
 import { escalateToUnilateralSeal as runUnilateralEscalation, UNILATERAL_SEAL_TIMEOUT_MS } from "./seal-escalation.js";
 import type { UnilateralResult } from "./seal-coordinator.js";
 import type { SealCompletion } from "./seal-coordinator.js";
+import { extractErrorMessage } from "./error-message.js";
 
 export interface AttendanceWiringDeps {
   logger: Logger;
@@ -467,7 +468,7 @@ export function createAttendanceWiring(deps: AttendanceWiringDeps) {
       // Reviewer MEDIUM fix: same as above — an unexpected throw must not permanently lock out
       // future retries for the rest of this away period.
       awayAckSent.delete(dedupKey);
-      logger.warn("session.away.response.failed", { agentName, sessionId, kind, error: err instanceof Error ? err.message : String(err) });
+      logger.warn("session.away.response.failed", { agentName, sessionId, kind, error: extractErrorMessage(err) });
     }
   }
 
