@@ -31,6 +31,7 @@ import {
   AUTHORSHIP_ACK_HASH_MISMATCH,
   AUTHORSHIP_ACK_HASH_UNKNOWN,
   SELF_CHAIN_MEMORY,
+  SELF_CHAIN_GAP_GRACE_MS,
   bytesEqual,
 } from "./session-node-types.js";
 
@@ -78,6 +79,15 @@ export class AuthorshipVerifier {
 
 /** The MOST RECENT of those, which is what an honest next message links to. */
   readonly #lastFromCounterparty = new Map<string, Uint8Array>();
+  /**
+   * DOD-M15-SELFCHAIN-GAP-1 — when this session first saw a predecessor it does not hold.
+   *
+   * ⚠️ NOT DURABLE, AND THAT IS THE SAFE DIRECTION. A restart forgets the clock, so the next
+   * mismatch starts a fresh grace rather than freezing immediately on a session that has been
+   * quiet for hours. The failure mode of losing it is one more grace period of refusals; the
+   * failure mode of persisting it wrongly is freezing a healthy conversation on boot.
+   */
+  readonly #selfChainGap = new Map<string, { firstSeenAt: number }>();
 
 /**
    * `DOD-M15-AUTHORSHIP-ABSENT-1` — DID THIS SENDER PROVE THEY WROTE THIS MESSAGE?
@@ -322,7 +332,11 @@ export class AuthorshipVerifier {
       });
       return undefined;
     }
-    if (bytesEqual(fields.prevOwnHash, expected)) return undefined;
+    // A satisfied chain closes any gap this session was carrying — see `#selfChainGap`. It is
+    // cleared HERE and not on receipt of the specific missing hash, because the question the gap
+    // asks is "is this sender's chain still broken from our side?", and a passing check answers no
+    // however the gap closed: the predecessor arrived, or they resumed from something we hold.
+    if (bytesEqual(fields.prevOwnHash, expected)) { this.#selfChainGap.delete(key); return undefined; }
     /**
      * ─── OUR OWN GAP IS NOT THEIR TAMPERING, AND THE DIFFERENCE IS DECIDABLE ─────────────────────
      *
@@ -344,6 +358,7 @@ export class AuthorshipVerifier {
      */
     const seen = this.#receivedFromCounterparty.get(key);
     if (seen?.has(Buffer.from(fields.prevOwnHash).toString("hex"))) {
+      this.#selfChainGap.delete(key);
       this.#ctx.logger.info("session.content.self_chain.behind", {
         agentName, sessionId,
         impact:
@@ -353,7 +368,84 @@ export class AuthorshipVerifier {
       });
       return undefined;
     }
+    /**
+     * ⚠️ THE CLOCK IS NOT STARTED HERE, and review F1 is why. This method has TWO callers: the live
+     * ingest path, which refuses on this verdict, and PARK RECOVERY (`inbound-refusals.ts` →
+     * `park-recovery.ts`), where `unusable` is SOFT and the message is ingested anyway on the park
+     * envelope's own signature. Starting the clock here therefore armed a freeze from a message
+     * that was accepted — the chain then went healthy, the clock stayed open with a stale
+     * `firstSeenAt`, and an ordinary out-of-order frame hours later froze on its FIRST occurrence.
+     * That is the exact defect this unit exists to remove, re-entering through the park door.
+     *
+     * It is started in `noteSelfChainGapAndShouldFreeze` instead, which only the refusing caller
+     * reaches — so the age is measured from the first REFUSED LIVE frame, which is what the DoD
+     * line describes. This method stays a pure verifier.
+     */
     return { verdict: "unusable", reason: AUTHORSHIP_SELF_CHAIN_MISMATCH };
+  }
+
+  /**
+   * DOD-M15-SELFCHAIN-GAP-1 — has this session's self-chain gap been open longer than the grace?
+   *
+   * `false` also when there is no gap at all, which is the ordinary answer. The caller freezes on
+   * `true` and defers on `false`; the frame is refused either way.
+   */
+  selfChainGapExpired(agentName: string, sessionId: string, graceMs: number, now: number = Date.now()): boolean {
+    const gap = this.#selfChainGap.get(this.#ctx.sessionKey(agentName, sessionId));
+    return gap !== undefined && now - gap.firstSeenAt >= graceMs;
+  }
+
+  /** Age of this session's open self-chain gap, for the log line. `null` when there is no gap. */
+  selfChainGapAgeMs(agentName: string, sessionId: string, now: number = Date.now()): number | null {
+    const gap = this.#selfChainGap.get(this.#ctx.sessionKey(agentName, sessionId));
+    return gap === undefined ? null : now - gap.firstSeenAt;
+  }
+
+  /**
+   * DOD-M15-SELFCHAIN-GAP-1 — **THE ESCALATION DECISION, kept beside the state it reads.**
+   *
+   * `true` freezes the session, `false` defers. Called only after a `self_chain_mismatch`, so the
+   * gap this reads was opened by the verify call that produced that verdict.
+   *
+   * ⚠️ THE DEFERRAL IS LOGGED, and that is not decoration. A silent wait is indistinguishable from
+   * the self-chain check not running at all, which is exactly the state this milestone spent a day
+   * failing to tell apart. The frame is REFUSED either way — the caller has already done that — so
+   * nothing enters the transcript on evidence this side cannot check.
+   */
+  noteSelfChainGapAndShouldFreeze(agentName: string, sessionId: string, correlationId?: string): boolean {
+    const key = this.#ctx.sessionKey(agentName, sessionId);
+    /**
+     * ⚠️ FIRST-WINS. Re-stamping on every mismatch would let a peer naming a fresh invented
+     * predecessor each time hold the escalation off for as long as it kept talking — the grace
+     * would never expire and the freeze would be unreachable.
+     *
+     * ⚠️ AND THE BOUND ON THAT, STATED BECAUSE IT IS NOT CLOSED (review F3): first-wins shuts the
+     * re-stamp lever, not the CLEAR lever. A peer that interleaves one correctly-chained message
+     * per grace window resets the clock and can emit mismatched frames indefinitely without ever
+     * freezing. That costs it one honest message every six minutes and buys it nothing but a
+     * longer sequence of refusals — every mismatched frame is still refused and nothing is
+     * ingested — so the bound is documented rather than closed. Closing it would mean counting
+     * consecutive mismatches beside the clock.
+     */
+    if (!this.#selfChainGap.has(key)) this.#selfChainGap.set(key, { firstSeenAt: Date.now() });
+    if (this.selfChainGapExpired(agentName, sessionId, SELF_CHAIN_GAP_GRACE_MS)) return true;
+    const ageMs = this.selfChainGapAgeMs(agentName, sessionId) ?? 0;
+    // Review F6: out-of-order relay delivery is the PREMISE of this change, so the ordinary case
+    // must not warn — a signal that fires on the normal case is not a signal. It escalates to warn
+    // once the gap has been open for half the grace, which is the point it stops being ordinary.
+    const say = ageMs * 2 >= SELF_CHAIN_GAP_GRACE_MS ? this.#ctx.logger.warn : this.#ctx.logger.info;
+    say.call(this.#ctx.logger, "session.content.self_chain.gap_open", {
+      agentName, sessionId, correlationId,
+      gapAgeMs: this.selfChainGapAgeMs(agentName, sessionId),
+      graceMs: SELF_CHAIN_GAP_GRACE_MS,
+      impact:
+        "this message names a predecessor of the counterparty's that this side does not hold. It " +
+        "is REFUSED and nothing was ingested — but the session is NOT frozen, because the " +
+        "predecessor is most often still in the relay mailbox. A refused message is re-delivered " +
+        "by the sender, so this usually resolves itself; if the gap is still open after the grace, " +
+        "the next such message freezes the session.",
+    });
+    return false;
   }
 
 noteReceivedFromCounterparty(agentName: string, sessionId: string, contentHash: Uint8Array): void {

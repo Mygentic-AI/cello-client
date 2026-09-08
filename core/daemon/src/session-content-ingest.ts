@@ -2098,20 +2098,20 @@ export class SessionContentIngest {
           contentHash, { detail: authorship.reason }, correlationId,
         );
         /**
-         * ─── AND THE SESSION FREEZES — `DOD-M15-SELFCHAIN-1`, the escalation clause ──────────────
+         * ─── AND THE SESSION FREEZES, EVENTUALLY — `DOD-M15-SELFCHAIN-1` + `-GAP-1` ──────────────
          *
-         * ⚠️ ONLY THIS ONE OF THE `unusable` CAUSES FREEZES, and the split is the whole rule.
+         * ⚠️ ONLY THIS ONE OF THE `unusable` CAUSES FREEZES. The acknowledgement causes say the
+         * sender is wrong about what WE said, which a drifted record produces honestly. This one
+         * says they are wrong about what THEY said, so continuing writes a disputed order into the
+         * receipt. The freeze is what makes the refusal an ESCALATION rather than a dropped frame.
          *
-         * The acknowledgement causes say the sender is wrong about what WE said, which a record
-         * that has drifted produces honestly, and refusing the message is proportionate. This one
-         * says they are wrong about what THEY said — the one thing a party cannot be honestly
-         * mistaken about for long — so continuing writes a disputed order into the receipt. There
-         * is nothing to gain from message N+1 on a conversation whose order is already in question.
-         *
-         * The freeze is what makes the refusal an ESCALATION rather than a dropped frame: it is
-         * visible in the session's own state, not only in a notice the operator has to go and read.
+         * ⚠️ **BUT IT IS NO LONGER IMMEDIATE.** "A party cannot be honestly mistaken about what
+         * they said" is false on the relay path — a message routinely arrives before its own
+         * predecessor, which is still in the mailbox. The decision, the grace and its log line live
+         * with the gap state, in `AuthorshipVerifier.noteSelfChainGapAndShouldFreeze`.
          */
-        if (authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH) {
+        if (authorship.reason === AUTHORSHIP_SELF_CHAIN_MISMATCH
+          && this.#ctx.authorship.noteSelfChainGapAndShouldFreeze(agentName, sessionId, correlationId)) {
           await this.#ctx.freezeOnIdentityFailure(agentName, sessionId, authorship.reason, correlationId);
         }
         return;

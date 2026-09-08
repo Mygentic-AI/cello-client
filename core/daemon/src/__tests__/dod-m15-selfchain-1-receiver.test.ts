@@ -27,7 +27,7 @@
  *      sentence, and the session FREEZES. Continuing writes a disputed order into the receipt.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { encodeCbor, encodeStructure1 } from "@cello-protocol/protocol-types";
 import { generateKeypair, sealSessionContent } from "@cello-protocol/crypto";
 import * as lp from "it-length-prefixed";
@@ -36,6 +36,7 @@ import { TEST_SESSION_GENESIS } from "./helpers/session-genesis.js";
 import { wireContentHash } from "../wire-content-hash.js";
 import { LEAF_KIND_MSG } from "../session-relay-client.js";
 import { SESSION_CONTENT_ENCRYPTION_V1 } from "../content-encryption-status.js";
+import { SELF_CHAIN_GAP_GRACE_MS } from "../session-node-types.js";
 
 const SID = "5e".repeat(32);
 const PEER = "12D3KooWQYV9dGMFoRzNStwpXztXaBUjtPqi6aMghfATmPnRAENn";
@@ -124,7 +125,7 @@ describe("DOD-M15-SELFCHAIN-1: the receiver checks the sender's link to their ow
     expect(delivered, "both messages are delivered, in order").toHaveLength(2);
   });
 
-  it("★★★ a link to a message they NEVER SENT is refused BY ITS OWN NAME, and the session freezes", async () => {
+  it("★★★ a link to a message they NEVER SENT is refused BY ITS OWN NAME — and the freeze WAITS", async () => {
     /**
      * THE LOAD-BEARING TEST. Delete the self-link check and this goes red.
      *
@@ -182,16 +183,153 @@ describe("DOD-M15-SELFCHAIN-1: the receiver checks the sender's link to their ow
     expect(delivered, "only the honest first message is in the record").toHaveLength(1);
 
     /**
-     * ⚠️ AND IT ESCALATES. The order asks for refuse + tell the operator + name a next step +
-     * FREEZE, and the freeze is the part that is visible in the session's own state rather than in
-     * a notice somebody has to go and read. Only this one of the `unusable` causes freezes: the
-     * acknowledgement causes say the sender is wrong about what WE said, which a drifted record
-     * produces honestly.
+     * ⚠️ **AND IT DOES NOT FREEZE YET — `DOD-M15-SELFCHAIN-GAP-1` CHANGED THIS ASSERTION.**
+     *
+     * This used to demand `frozen > 0` on the FIRST mismatch. That assertion was satisfied by the
+     * code and cost session `dab46e16` its receipt (2026-09-08): three of the counterparty's
+     * messages arrived before their own predecessors because the predecessors were still in the
+     * relay mailbox, the first one froze the session, and the predecessors landed seconds later
+     * with nothing left to re-evaluate.
+     *
+     * The escalation is not removed, it is DEFERRED — see the next test, which is the half that
+     * keeps this one honest. The refusal above is unchanged and is what the operator sees now.
      */
     expect(
       fx.eventsNamed("session.content.identity.frozen").length,
-      "a conversation whose order is in dispute must not keep accepting messages",
+      "the predecessor is most often still in the mailbox; freezing here strands a healthy session",
+    ).toBe(0);
+    expect(
+      fx.eventsNamed("session.content.self_chain.gap_open").length,
+      "and the wait must be VISIBLE — a silent deferral is indistinguishable from the check not running",
     ).toBeGreaterThan(0);
+  });
+
+  it("★★★ the freeze DOES fire once the gap has stayed open past the grace", async () => {
+    /**
+     * THE OTHER HALF OF THE DEFERRAL, and without it the previous test reads as "we deleted the
+     * escalation". A peer that keeps naming predecessors this side has never held, for longer than
+     * a re-delivery could plausibly take, is the case the freeze exists for.
+     *
+     * Time is moved with the system clock rather than by waiting six real minutes; the grace is
+     * read from `Date.now()` inside the verifier.
+     */
+    const them = generateKeypair();
+    fx = await session(them);
+
+    const first = await frameFrom(them, "one", {
+      lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: TEST_SESSION_GENESIS,
+    });
+    await fx.snm.handleContentFrameForTest("alice", SID, first.frame, PEER);
+    await wait(150);
+
+    const forged = await frameFrom(them, "two", {
+      lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: new Uint8Array(32).fill(0xde),
+    });
+    await fx.snm.handleContentFrameForTest("alice", SID, forged.frame, PEER);
+    await wait(200);
+    expect(fx.eventsNamed("session.content.identity.frozen").length, "not on the first one").toBe(0);
+
+    // Past the grace, and a second message that still names a predecessor we do not hold.
+    const realNow = Date.now();
+    vi.setSystemTime(realNow + SELF_CHAIN_GAP_GRACE_MS + 1_000);
+    try {
+      /**
+       * ⚠️ A DIFFERENT INVENTED PREDECESSOR (0xbe, not 0xde), AND THAT IS THE POINT. The clock is
+       * per SESSION and starts once; if it re-stamped on each new missing hash, a peer naming a
+       * fresh one every time would hold the escalation off for as long as it kept talking and this
+       * assertion would never fire.
+       */
+      const forgedAgain = await frameFrom(them, "three", {
+        lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: new Uint8Array(32).fill(0xbe),
+      });
+      await fx.snm.handleContentFrameForTest("alice", SID, forgedAgain.frame, PEER);
+      await wait(200);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(
+      fx.eventsNamed("session.content.identity.frozen").length,
+      "a gap that never fills IS the accusation the freeze exists for",
+    ).toBeGreaterThan(0);
+  });
+
+  it("★★★ TWO mismatches INSIDE the grace still do not freeze — the wait is a CLOCK, not a counter", async () => {
+    /**
+     * ⚠️ REVIEW F2 — WITHOUT THIS, THE GRACE IS UNTESTED AND `SELF_CHAIN_GAP_GRACE_MS` IS DEAD CODE.
+     *
+     * The other three tests all pass under an implementation that ignores the clock entirely and
+     * simply freezes on the SECOND mismatch: one has a single mismatch, one has two with the clock
+     * moved, one has a single mismatch. Delete the constant, count instead, and they stay green.
+     *
+     * And that implementation still loses session `dab46e16`, which is the whole point — its three
+     * out-of-order messages arrived within SECONDS of each other, not six minutes apart. This is
+     * that incident: several mismatches in quick succession, no clock movement, no freeze.
+     */
+    const them = generateKeypair();
+    fx = await session(them);
+
+    const first = await frameFrom(them, "one", {
+      lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: TEST_SESSION_GENESIS,
+    });
+    await fx.snm.handleContentFrameForTest("alice", SID, first.frame, PEER);
+    await wait(150);
+
+    for (const [label, fill] of [["two", 0xde], ["three", 0xbe], ["four", 0xab]] as const) {
+      const forged = await frameFrom(them, label, {
+        lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: new Uint8Array(32).fill(fill),
+      });
+      await fx.snm.handleContentFrameForTest("alice", SID, forged.frame, PEER);
+      await wait(200);
+    }
+
+    expect(
+      fx.eventsNamed("session.content.identity.frozen").length,
+      "three mismatches seconds apart is the MEASURED incident, not an accusation",
+    ).toBe(0);
+    expect(
+      fx.eventsNamed("session.content.self_chain.gap_open").length,
+      "and every one of them says so",
+    ).toBe(3);
+  });
+
+  it("★★★ a predecessor that ARRIVES inside the grace closes the gap, and nothing ever freezes", async () => {
+    /**
+     * THE PRODUCTION CASE, in order. Their second message reaches us before their first — which is
+     * what the relay mailbox does — and the first then arrives. This must end with a healthy
+     * session, not a frozen one, and the re-delivered second message must be accepted.
+     */
+    const them = generateKeypair();
+    fx = await session(them);
+
+    // Their FIRST message, prepared but withheld — this is the one stuck in the mailbox.
+    const first = await frameFrom(them, "one", {
+      lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: TEST_SESSION_GENESIS,
+    });
+    // Their SECOND arrives first, naming the withheld one as its predecessor.
+    const second = await frameFrom(them, "two", {
+      lastSeenHash: TEST_SESSION_GENESIS, prevOwnHash: first.contentHash,
+    });
+    await fx.snm.handleContentFrameForTest("alice", SID, second.frame, PEER);
+    await wait(200);
+    expect(fx.eventsNamed("session.content.identity.frozen").length, "the gap is open, not disputed").toBe(0);
+
+    // The mailbox delivers the predecessor.
+    await fx.snm.handleContentFrameForTest("alice", SID, first.frame, PEER);
+    await wait(200);
+    // And the refused message is re-delivered, exactly as an unacknowledged frame is.
+    await fx.snm.handleContentFrameForTest("alice", SID, second.frame, PEER);
+    await wait(200);
+
+    expect(
+      fx.eventsNamed("session.content.identity.frozen").length,
+      "nothing here is tampering — this is an ordinary out-of-order delivery",
+    ).toBe(0);
+    const delivered = fx.snm.readTranscript("alice", SID).messages.filter((m) => m.direction === "received");
+    expect(
+      delivered.map((m) => m.text),
+      "both messages end up in the record, in the order they were sent",
+    ).toEqual(["one", "two"]);
   });
 
   it("★★ a link to an EARLIER message of theirs that we DO hold is accepted, and the gap is reported as OURS", async () => {

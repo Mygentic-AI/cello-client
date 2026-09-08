@@ -934,6 +934,29 @@ export const AUTHORSHIP_SESSION_MISMATCH = "session_mismatch";
  */
 export const AUTHORSHIP_SELF_CHAIN_MISMATCH = "self_chain_mismatch";
 
+/**
+ * DOD-M15-SELFCHAIN-GAP-1 — **HOW LONG A MISSING PREDECESSOR IS TREATED AS IN FLIGHT.**
+ *
+ * The frame is REFUSED throughout this window, exactly as before. What waits is the FREEZE, and
+ * that distinction is the whole design: nothing is accepted on evidence we cannot check, so the
+ * standing ruling ("defer until evidence exists, never accept because we have evidence") holds.
+ *
+ * ⚠️ DERIVED FROM THE PARK BACKSTOP, NOT CHOSEN — AND DERIVED IN CODE (review F4). A refused frame
+ * gets no acknowledgement, so the sender parks a copy and it is re-delivered, and the slowest
+ * re-delivery path is the periodic backstop sweep. A grace shorter than one sweep freezes a healthy
+ * session whose predecessor was going to arrive on the next one. This used to say "derived" beside
+ * a hardcoded 360_000 while the sweep was an injectable option — raise the sweep and the grace
+ * silently drops below it. The arithmetic is now the definition.
+ *
+ * The measured worst case that motivates it: `witnessed_leaf_unresolved` records a leaf landing in
+ * ONE second while its bytes took 102 (2026-08-18), and session `dab46e16` (2026-09-08) lost its
+ * receipt to exactly this — three of the counterparty's messages arrived before their own
+ * predecessors, were read as a disputed order, and froze the session while the predecessors were
+ * still in the mailbox.
+ */
+export const PARKED_DRAIN_BACKSTOP_DEFAULT_MS = 300_000;
+export const SELF_CHAIN_GAP_GRACE_MS = PARKED_DRAIN_BACKSTOP_DEFAULT_MS + 60_000;
+
 /** The hash names content this side does not hold at the position the claim names. */
 export const AUTHORSHIP_ACK_HASH_MISMATCH = "ack_hash_mismatch";
 

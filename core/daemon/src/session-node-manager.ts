@@ -89,7 +89,7 @@ import { type SecurityGatewayClient } from "@cello-protocol/gateway";
  * `(witness relay, session)`, so a repeated observation raises `occurrences` rather than taking
  * another slot in a bounded list.
  */
-import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
+import { ABUSE_MAX_UNKNOWN_SESSIONS_GLOBAL, PARKED_DRAIN_BACKSTOP_DEFAULT_MS, type ActiveSessionEntry, SALT_AGREEMENT_WAIT_MS, type AwaitingAckEntry, CONTENT_MAX_INBOUND_STREAMS, type ISessionNodeFactory, LEAF_FETCH_GRACE_MS, type ParkedDrainReason, type QuarantinedRecord, type ReceivedContentEntry, type RefusalNotice, type SessionImpairment, type SessionRevivalIdentity, type TranscriptEntry, type WitnessAlertNotice } from "./session-node-types.js";
 
 // Re-exported so this module's public surface is unchanged by the split: every existing
 // importer of session-node-manager.js keeps working, and no test moves an import path.
@@ -1071,7 +1071,7 @@ holdOwnLeafForTest(agentName: string, sessionId: string, canonicalSeq: number, c
       ingestReceivedContent: (a, sid, c, h, cid, seq, alg) => this.ingestReceivedContent(a, sid, c, h, cid, seq, alg),
       witnessReceivedLeaf: (a, sid, h, s1, sig, kind, cid) => this.#contentIn.witnessReceivedLeaf(a, sid, h, s1, sig, kind, cid),
       noteAcknowledgeable: (a, sid, seq, h) => this.#contentIn.noteAcknowledgeable(a, sid, seq, h),
-    }, opts.parkedDrainBackstopMs ?? 300_000);
+    }, opts.parkedDrainBackstopMs ?? PARKED_DRAIN_BACKSTOP_DEFAULT_MS);
 
     this.#salts = new SessionSalts({
       logger: this.#logger,
