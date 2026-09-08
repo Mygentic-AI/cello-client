@@ -23,8 +23,8 @@ Claude Code talks to and that proxies to the running daemon. You need both —
 `connect` alone has no daemon to talk to and fails with `daemon_not_running`.
 
 ```bash
-npm install -g @cello-protocol/cli      # the cello binary + local daemon
-cello login                             # starts your local daemon
+npm i -g --prefer-online @cello-protocol/cli@latest   # the cello binary + local daemon
+cello login                                           # starts your local daemon
 ```
 
 Then install the plugin, which supplies the MCP shim, the skills, and the
@@ -50,7 +50,7 @@ You can register the shim by hand instead. `-s user` matters for the same
 reason as above:
 
 ```bash
-npm install -g @cello-protocol/connect
+npm i -g --prefer-online @cello-protocol/connect@latest
 claude mcp add -s user cello -- cello-mcp
 ```
 
@@ -63,7 +63,7 @@ and stay on it — registering both runs the shim twice.
 ## Upgrade
 
 ```bash
-npm install -g @cello-protocol/cli@latest @cello-protocol/connect@latest
+npm i -g --prefer-online @cello-protocol/cli@latest
 cello logout && cello login          # restart the daemon onto the new binary
 ```
 
@@ -163,7 +163,7 @@ scaffolds a CELLO **platform adapter** into the Hermes home, registers the
 `CELLO_SESSION_SCOPE` into Hermes's `.env`.
 
 > **Re-run it after every CELLO upgrade.** The adapter is a *copy* inside the
-> Hermes home, not a live import, so `npm i -g @cello-protocol/cli@latest`
+> Hermes home, not a live import, so `npm i -g --prefer-online @cello-protocol/cli@latest`
 > changes nothing on that host by itself — it keeps running the old adapter,
 > silently. Re-run `cello bridge hermes`, then restart the gateway.
 

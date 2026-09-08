@@ -69,7 +69,7 @@ A version gap surfaces as `Unknown IPC method` — that error means skew, not a 
 Upgrade both, then restart both:
 
 ```bash
-npm install -g @cello-protocol/cli@latest
+npm i -g --prefer-online @cello-protocol/cli@latest
 cello logout && cello login
 ```
 

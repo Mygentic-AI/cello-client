@@ -19,7 +19,7 @@ The plugin ships the MCP shim only. The shim holds no keys and opens no database
 local daemon over `~/.cello/daemon.sock`. Without the daemon every tool returns `daemon_not_running`.
 
 ```bash
-npm install -g @cello-protocol/cli
+npm i -g --prefer-online @cello-protocol/cli@latest
 cello login
 cello status
 ```

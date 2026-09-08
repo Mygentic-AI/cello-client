@@ -63,13 +63,23 @@ describe("launch triage item 5 — a plugin install must not dead-end at a missi
     // It still fails — that part is correct. The shim cannot proxy to a daemon that is not there.
     expect(code).toBe(1);
 
-    // THE FIX: the recovery must start with the packages that actually provide the binaries.
+    // THE FIX: the recovery must start with the package that actually provides the binary.
     // Without this line the user is told to run a command they have no way to have.
-    // BOTH packages, per the install Andre actually runs (2026-08-09): `cli` gives the `cello`
-    // binary and the daemon; `connect` gives the shim. The plugin route fetches `connect` via npx,
-    // but a user recovering from this message is as likely to be on the manual route, and naming
-    // one package when the working line names two is how this instruction drifted in the first place.
-    expect(stderr).toContain("npm install -g @cello-protocol/cli @cello-protocol/connect");
+    //
+    // This asserted BOTH packages until 2026-09-08, on the reasoning that someone reading this is
+    // as likely to be on the manual `claude mcp add` route. Superseded by measurement: on a
+    // genuinely wiped machine the npx cache was deleted and repopulated itself at first launch with
+    // no global `connect` present, so under the plugin route npx fetches the shim on its own. And
+    // this message can only be read BY the plugin route — it is the plugin's shim that printed it.
+    // Naming a package the reader already has spends the only attention they will give this on a
+    // no-op, in the one message they read while something is visibly broken.
+    expect(stderr).toContain("npm i -g --prefer-online @cello-protocol/cli@latest");
+    expect(stderr).not.toContain("@cello-protocol/connect");
+
+    // --prefer-online and @latest are load-bearing and their absence is invisible: npm may serve a
+    // cached tarball, the install reports success, and the operator is silently on an old client —
+    // surfacing later as a protocol mismatch that looks nothing like an install problem.
+    expect(stderr).toContain("--prefer-online");
 
     // And then the command that starts the daemon.
     expect(stderr).toContain("cello login");
@@ -95,7 +105,7 @@ describe("launch triage item 5 — a plugin install must not dead-end at a missi
     // The exact regression being pinned. If someone later trims this message back to the one-liner,
     // `cello login` becomes the first instruction again and the dead end returns. The install must
     // come first in the text a user reads top to bottom.
-    const installAt = stderr.indexOf("npm install -g @cello-protocol/cli @cello-protocol/connect");
+    const installAt = stderr.indexOf("npm i -g --prefer-online @cello-protocol/cli@latest");
     const loginAt = stderr.indexOf("cello login");
     expect(installAt).toBeGreaterThanOrEqual(0);
     expect(loginAt).toBeGreaterThan(installAt);

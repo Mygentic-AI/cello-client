@@ -20,7 +20,7 @@ Three properties of the system change how you should behave while operating it:
 This plugin ships the MCP shim. It does **not** ship the daemon, and nothing works without one:
 
 ```bash
-npm install -g @cello-protocol/cli
+npm i -g --prefer-online @cello-protocol/cli@latest
 cello login
 ```
 
@@ -35,7 +35,7 @@ Both halves track the latest published release — the shim is fetched fresh, th
 ```
 
 ```bash
-npm install -g @cello-protocol/cli@latest
+npm i -g --prefer-online @cello-protocol/cli@latest
 cello logout && cello login     # restart the daemon onto the new binary
 ```
 

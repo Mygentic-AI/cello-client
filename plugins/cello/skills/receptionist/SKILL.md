@@ -5,7 +5,7 @@ description: Use when staffing a CELLO agent's front desk — bring an agent onl
 
 # CELLO Receptionist
 
-Requires the `cello` CLI on PATH (`npm install -g @cello-protocol/cli`) and `jq` — the polling
+Requires the `cello` CLI on PATH (`npm i -g --prefer-online @cello-protocol/cli@latest`) and `jq` — the polling
 subagent shells out to both.
 
 Agent name requested: `$ARGUMENTS`

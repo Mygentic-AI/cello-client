@@ -102,7 +102,7 @@ try {
       "\n" +
       "The plugin ships this MCP shim only — the daemon and the `cello` command install separately:\n" +
       "\n" +
-      "  npm install -g @cello-protocol/cli\n" +
+      "  npm i -g --prefer-online @cello-protocol/cli@latest\n" +
       "  cello login\n" +
       "\n" +
       "Then reconnect: run `/mcp`, pick cello, choose Reconnect. Restarting Claude Code also works,\n" +
